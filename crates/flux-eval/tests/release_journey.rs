@@ -311,9 +311,9 @@ async fn run_release_flow(fixture: &Fixture, apply: bool, scribe_opinion: &str) 
         registry,
         PermissionManager::from_rules(&["*".into()], &[]),
         Arc::new(AllowApprover),
-        ToolContext::new(Arc::new(
-            System::new(Workspace::new(&fixture.root).unwrap()),
-        )),
+        ToolContext::new(Arc::new(System::new(
+            Workspace::new(&fixture.root).unwrap(),
+        ))),
     );
     let store = flux_flow::state::FlowStore::in_memory().unwrap();
     let mut sink = NullSink;
@@ -483,7 +483,11 @@ async fn an_unbumped_protocol_line_crate_halts_before_anything_is_written() {
         before_changelog,
         "the halt must precede any changelog mutation"
     );
-    assert_eq!(fixture.tags(), vec!["v0.37.0"], "the halt must leave no tag");
+    assert_eq!(
+        fixture.tags(),
+        vec!["v0.37.0"],
+        "the halt must leave no tag"
+    );
 }
 
 /// A red gate inside `cut-release.sh` leaves **no tag** and no phantom version section — the C-147

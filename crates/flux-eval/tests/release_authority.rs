@@ -49,7 +49,10 @@ fn ops_called_by_release_flux() -> BTreeSet<String> {
         }
     };
     let mut found = BTreeSet::new();
-    collect_ops(&serde_json::to_value(&ast).expect("AST serializes"), &mut found);
+    collect_ops(
+        &serde_json::to_value(&ast).expect("AST serializes"),
+        &mut found,
+    );
     found
 }
 
@@ -82,10 +85,16 @@ const PERMITTED_OPS: &[(&str, &str)] = &[
         "write authority scoped to the three release changelogs",
     ),
     ("task", "the scribe sub-agent; returns text, holds no tools"),
-    ("observe", "records the bump disagreement for the audit trail"),
+    (
+        "observe",
+        "records the bump disagreement for the audit trail",
+    ),
     ("fmt", "pure string interpolation"),
     ("jq", "pure field access sugar (`$plan.bump`)"),
-    ("expr", "pure comparison (`$count == 0`, `$opinion != $bump`)"),
+    (
+        "expr",
+        "pure comparison (`$count == 0`, `$opinion != $bump`)",
+    ),
 ];
 
 #[test]
@@ -110,7 +119,14 @@ fn the_release_program_calls_only_its_permitted_ops() {
 fn the_release_program_holds_no_general_process_or_write_authority() {
     let called = ops_called_by_release_flux();
     for forbidden in [
-        "bash", "proc.run", "write", "edit", "patch", "append", "git_reset", "web.fetch",
+        "bash",
+        "proc.run",
+        "write",
+        "edit",
+        "patch",
+        "append",
+        "git_reset",
+        "web.fetch",
     ] {
         assert!(
             !called.contains(forbidden),
@@ -229,7 +245,11 @@ async fn a_write_outside_the_three_changelogs_is_refused() {
 #[tokio::test]
 async fn the_three_release_changelogs_are_writable() {
     let ws = Workspace0::new("inside");
-    for target in ["CHANGELOG.md", "./WHATS-NEW.md", "website/docs/whats-new.md"] {
+    for target in [
+        "CHANGELOG.md",
+        "./WHATS-NEW.md",
+        "website/docs/whats-new.md",
+    ] {
         let result = insert(&ws, target, true).await;
         assert!(
             !result.is_error,

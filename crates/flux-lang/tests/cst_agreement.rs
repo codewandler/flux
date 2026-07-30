@@ -82,8 +82,7 @@ const LEGACY_FIXTURES: &[LegacyFixture] = &[
 /// the current parser would only assert that the parser agrees with itself. They are held to every
 /// other contract in this file (losslessness, no ERROR nodes, exact token/comment ranges, and
 /// format→parse survival of every executable AST).
-const POST_CUTOVER_FIXTURES: &[&str] =
-    &["examples/bitcoin-price.flux", "examples/release.flux"];
+const POST_CUTOVER_FIXTURES: &[&str] = &["examples/bitcoin-price.flux", "examples/release.flux"];
 
 fn ast_hash(module: &Module) -> String {
     let mut hash = Sha256::new();

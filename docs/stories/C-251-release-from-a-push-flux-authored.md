@@ -172,6 +172,43 @@ after it does `git push origin main`, runs the candidate build, verifies
 `candidate headSha == tag SHA`, and only then pushes the tag. Keeping the irreversible half in CI
 means a bug in the program cannot publish.
 
+## Progress
+- **Shipped (2026-07-30).** The Flux-Lang program (`examples/release.flux`) plus its host half
+  (`crates/flux-eval/src/release.rs`): `derive_bump` reads the bump from commit titles by regex and
+  nothing reads a version back out of a model reply, so the version decision never leaves the host.
+  Authority is narrow **by construction** rather than by policy rule — the two process-capable ops
+  carry fixed argv for `scripts/check-crate-versions.sh` and `scripts/cut-release.sh`, and
+  `changelog_insert` resolves its target through `flux-system`'s canonicalizing boundary and refuses
+  anything outside the three release changelogs. The scribe role declares `tools: []`, so the model
+  that drafts the prose holds no write op to attempt.
+  `crates/flux-eval/tests/release_authority.rs` pins each half against the shipped artifacts by
+  walking the serialized AST, not against a prompt. The workflow is
+  `.github/workflows/release-flow.yml`: `workflow_dispatch` only, `permissions: contents: read`, and
+  `apply` defaulting to false.
+- **Not shipped, so Acceptance item 1 is NOT met.** There is no `push: release` trigger, no tag push,
+  and no GitHub release creation. "Merging `main` → `release` produces a tag and a GitHub release with
+  no human step" does not describe what landed: a release is still cut by a human running
+  `scripts/cut-release.sh`, exactly as `crates/flux-sdk/PUBLISHING.md` documents. The dispatch-only
+  workflow is a reviewable preview (`apply: false`) or an in-runner rehearsal (`apply: true`); neither
+  mode releases anything.
+- **The dispatch gate is the right first step, not a shortfall.** An unattended auto-cut is precisely
+  the hazard C-252 was just fixed to avoid, and this posture cannot reach it: with
+  `permissions: contents: read` there is no write token in the job, so even `apply: true` cannot move
+  a ref on the remote — the commit and annotated tag it creates live and die inside the ephemeral
+  runner. A workflow that cannot push a tag can never leave a remote Release-less tag behind, and
+  publication (`release.yml`, `crates-io.yml`) is tag-push-triggered, so it cannot publish either.
+  Flipping the trigger is a separate, deliberate change, to be made only once this workflow has run
+  green by hand a few times.
+- **Deliberately left to a follow-up:** the `push: release` trigger, the tag push and the release
+  creation — i.e. the unattended half of Acceptance item 1.
+- **On `.flux/policies/release.toml`:** it is a checked-in **document**, not an installed policy. No
+  code path loads it; `crates/flux-eval/tests/release_authority.rs` reads it only to verify its three
+  writable paths and two exec subjects cannot drift from `WRITABLE_CHANGELOGS`/`RELEASE_SCRIPTS`. It
+  cannot be a floor today because `flux-cli` composes `[[policy.grants]]` *additively* on top of
+  `flux_policy::default_local_grants()`, which already grants `workspace.write` on `path: "*"`
+  (`crates/flux-cli/src/execution.rs:1419`). The enforcement the release flow relies on today is the
+  op set, which no policy composition can widen.
+
 ## Notes
 - **Trigger:** a push to `release`, not to `main`. Merging main → release is the deliberate act; an
   ordinary main push must not cut. This was the user's own framing and it is the safer one.

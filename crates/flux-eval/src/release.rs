@@ -54,7 +54,8 @@ use crate::util::{json_result, parse_params};
 /// (`website_customer_changelog_is_in_sync`) — a bare `WHATS-NEW.md` edit reds the gate until it is
 /// regenerated. In practice `scripts/cut-release.sh` regenerates it in the release commit; the entry
 /// exists so the authority the flow *declares* matches the files a release touches.
-pub const WRITABLE_CHANGELOGS: &[&str] = &["CHANGELOG.md", "WHATS-NEW.md", "website/docs/whats-new.md"];
+pub const WRITABLE_CHANGELOGS: &[&str] =
+    &["CHANGELOG.md", "WHATS-NEW.md", "website/docs/whats-new.md"];
 
 /// The scripts the release flow may run, and the op that owns each. Both are fixed argv — nothing
 /// here takes a program name from a caller.
@@ -566,12 +567,13 @@ impl Tool for ReleaseCutTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "release_cut".into(),
-            description: "Cut a release with `scripts/cut-release.sh <bump>` (fixed argv): roll both \
+            description:
+                "Cut a release with `scripts/cut-release.sh <bump>` (fixed argv): roll both \
                           changelogs, sweep versions, re-lock, commit, and create the LOCAL \
                           annotated tag. Never pushes and never publishes. `apply` defaults to \
                           FALSE: the predicted version is returned and nothing is cut. Returns \
                           {ok, action, version, tag, output}."
-                .into(),
+                    .into(),
             input_schema: tool_input_schema::<ReleaseCutInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem, Effect::Write],
@@ -673,7 +675,7 @@ mod tests {
     fn a_conventional_commit_bang_is_the_breaking_signal() {
         // The exact shapes this repo's own history uses.
         let log = "feat(capabilities,tools)!: gate the capability surface\nfix(core): tidy";
-        assert_eq!(breaking_titles(&log.to_string()).len(), 1);
+        assert_eq!(breaking_titles(log).len(), 1);
         assert_eq!(derive_bump(log, "0.37.0"), "minor");
 
         let log = "refactor(events,sdk,cli)!: collapse the emitter seam";
@@ -689,7 +691,10 @@ mod tests {
 
     #[test]
     fn a_breaking_footer_counts_too() {
-        assert_eq!(derive_bump("BREAKING CHANGE: the wire moved", "0.37.0"), "minor");
+        assert_eq!(
+            derive_bump("BREAKING CHANGE: the wire moved", "0.37.0"),
+            "minor"
+        );
         assert_eq!(derive_bump("BREAKING: the wire moved", "0.37.0"), "minor");
     }
 
@@ -748,10 +753,18 @@ mod tests {
     #[test]
     fn insertion_is_idempotent_so_a_rerun_after_a_failed_cut_does_not_duplicate() {
         let src = "## [Unreleased]\n\n### Fixed\n- a thing\n\n## [0.37.0]\n";
-        assert!(section_already_has(src, "Unreleased", "### Fixed\n- a thing"));
+        assert!(section_already_has(
+            src,
+            "Unreleased",
+            "### Fixed\n- a thing"
+        ));
         // …and the same body under a DIFFERENT section does not count as present.
         let other = "## [Unreleased]\n\n## [0.37.0]\n\n### Fixed\n- a thing\n";
-        assert!(!section_already_has(other, "Unreleased", "### Fixed\n- a thing"));
+        assert!(!section_already_has(
+            other,
+            "Unreleased",
+            "### Fixed\n- a thing"
+        ));
     }
 
     #[test]
