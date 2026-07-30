@@ -98,7 +98,8 @@ Filters go inside a `filters` object, and paging (`page`, `limit`) stays at the 
 shape `board.list` takes. An `each` source has to be a pure value, so bind the query to a variable
 first rather than calling it in the `in` position.
 
-Each row carries `id`, `title`, `state`, `assignee`, `runner`, `task_id`, `depends_on` and `repo`.
+Each row carries `id`, `title`, `state`, `assignee`, `runner`, `task_id`, `depends_on`, `repo` and
+`attempts`.
 **Every row carries every field** — an optional that is not set comes back as `null` rather than
 being absent — so a sweep over a half-dispatched board can read `$item.runner` on every item without
 erroring on the ones nobody has picked up. The `state` values are the same spellings
