@@ -16,14 +16,17 @@
 //!   anything drawn into the transcript area that is not a transcript row must stay entirely out
 //!   of that machinery.
 //!
-//! Every colour and modifier comes from the [`Theme`]; [`PaneSpec`] carries no style-bearing field
-//! and must not grow one. Trust chrome (the agent-region mark, the border style, the rule that a
-//! pane never occludes the approval sheet) is C-222's story — this module only guarantees the
-//! ordering it needs: panes draw before the sheet, always.
+//! Every colour and modifier comes from the [`Theme`]; [`PaneSpec`](flux_runtime::PaneSpec)
+//! carries no style-bearing field and must not grow one. Trust chrome — the agent-region mark,
+//! the border style, and the rule that a payload can never draw either — lives in
+//! [`crate::trust`] (C-222), which is also why this store holds [`AgentPane`]s rather than raw
+//! specs: an unsanitized payload cannot be rendered because it cannot be stored. This module
+//! guarantees the ordering that invariant rests on: panes draw before the approval sheet, always.
 
 use super::*;
 
-use flux_runtime::{PaneCommand, PaneData, PaneLifetime, PaneSlot, PaneSpec};
+use flux_runtime::{PaneCommand, PaneData, PaneLifetime, PaneSlot};
+use trust::AgentPane;
 
 /// The transcript's own width floor. Narrower than this the conversation stops being readable, and
 /// the surface would be trading the thing the user came for against a side panel.
@@ -62,19 +65,19 @@ const MAX_BOTTOM_ROWS: u16 = 8;
 /// Rows of a pane that are chrome rather than content: the top and bottom border.
 const PANE_CHROME_ROWS: u16 = 2;
 
-/// Placeholder agent-region mark. C-222 owns making this load-bearing and proving it; it is a
-/// glyph plus a modifier rather than a tint so it survives `Theme::MONO`, where every colour role
-/// resolves to `Color::Reset`.
-const AGENT_MARK: &str = "◆";
-
 /// Host-pushed panes, addressed by id and rendered in the order they were opened.
 ///
 /// A `Vec` rather than a map on purpose: ids address a pane, but *render order must be
 /// deterministic*, and a hash map's iteration order is not. Insertion order also gives the
 /// [`MAX_PANES`] cap an obvious meaning.
+///
+/// The element type is [`AgentPane`], not [`PaneSpec`](flux_runtime::PaneSpec): the store is the
+/// one door into the surface, and [`AgentPane`]'s only constructor sanitizes (C-222). A payload
+/// therefore cannot be rendered without having been filtered, because it cannot be *held* without
+/// having been filtered.
 #[derive(Debug, Default)]
 pub(crate) struct PaneStore {
-    open: Vec<PaneSpec>,
+    open: Vec<AgentPane>,
 }
 
 impl PaneStore {
@@ -93,26 +96,28 @@ impl PaneStore {
                 if spec.lifetime == PaneLifetime::Project {
                     return;
                 }
-                match self.open.iter().position(|p| p.id == spec.id) {
-                    Some(at) => self.open[at] = spec,
-                    None if self.open.len() < MAX_PANES => self.open.push(spec),
+                match self.open.iter().position(|p| p.spec().id == spec.id) {
+                    Some(at) => self.open[at] = AgentPane::sanitized(spec),
+                    None if self.open.len() < MAX_PANES => {
+                        self.open.push(AgentPane::sanitized(spec))
+                    }
                     None => {}
                 }
             }
             PaneCommand::Update { id, data } => {
-                if let Some(pane) = self.open.iter_mut().find(|p| p.id == id) {
-                    pane.kind = data.kind();
-                    pane.data = data;
+                if let Some(pane) = self.open.iter_mut().find(|p| p.spec().id == id) {
+                    pane.update(data);
                 }
             }
-            PaneCommand::Close { id } => self.open.retain(|p| p.id != id),
+            PaneCommand::Close { id } => self.open.retain(|p| p.spec().id != id),
         }
     }
 
     /// Drop the [`PaneLifetime::Turn`] panes. Called at every turn-termination path the surface
     /// owns, so a turn-scoped pane cannot outlive the turn that opened it.
     pub(crate) fn end_turn(&mut self) {
-        self.open.retain(|p| p.lifetime != PaneLifetime::Turn);
+        self.open
+            .retain(|p| p.spec().lifetime != PaneLifetime::Turn);
     }
 
     /// Drop every pane. Used when the surface projects a different session (`/resume`): panes are
@@ -122,8 +127,8 @@ impl PaneStore {
     }
 
     /// The panes asking for `slot`, oldest first.
-    fn in_slot(&self, slot: PaneSlot) -> Vec<&PaneSpec> {
-        self.open.iter().filter(|p| p.slot == slot).collect()
+    fn in_slot(&self, slot: PaneSlot) -> Vec<&AgentPane> {
+        self.open.iter().filter(|p| p.spec().slot == slot).collect()
     }
 
     /// Whether anything is open at all — the cheap check that keeps a pane-less session on exactly
@@ -139,7 +144,7 @@ impl PaneStore {
 
     #[cfg(test)]
     pub(crate) fn ids(&self) -> Vec<&str> {
-        self.open.iter().map(|p| p.id.as_str()).collect()
+        self.open.iter().map(|p| p.spec().id.as_str()).collect()
     }
 }
 
@@ -260,6 +265,10 @@ const OVERLAY_PANE_WIDTH: u16 = 76;
 /// Only the newest overlay pane is shown: that helper draws one centred panel, so a second would
 /// simply hide behind the first. The caller places this **before** the surface's own overlays and
 /// the approval sheet, so surface chrome always paints over an agent pane.
+///
+/// This is the slot where the agent mark earns its keep: the shared chrome is the *same*
+/// borderless centred panel the help, `/usage`, queue and session-picker overlays use, so
+/// [`trust::agent_overlay_header`] is the only thing separating an agent pane from a host one.
 pub(crate) fn render_overlay_pane(frame: &mut Frame, state: &ChatState) {
     if !frame_fits_panes(state, frame.area()) {
         return;
@@ -277,10 +286,7 @@ pub(crate) fn render_overlay_pane(frame: &mut Frame, state: &ChatState) {
     rendering::render_overlay_panel(
         frame,
         t,
-        format!(
-            " {AGENT_MARK} {} ",
-            truncate(&pane.title, width.saturating_sub(6) as usize)
-        ),
+        trust::agent_overlay_header(t, &pane.spec().title, width),
         body,
         (total > shown).then_some((shown, total)),
         width,
@@ -288,8 +294,8 @@ pub(crate) fn render_overlay_pane(frame: &mut Frame, state: &ChatState) {
 }
 
 /// Body rows a pane's payload wants, before the surface's cap applies.
-fn body_rows(pane: &PaneSpec) -> u16 {
-    let count = match &pane.data {
+fn body_rows(pane: &AgentPane) -> u16 {
+    let count = match &pane.spec().data {
         PaneData::Rows { header, rows } => usize::from(!header.is_empty()) + rows.len(),
         PaneData::Kv { pairs } => pairs.len(),
         PaneData::Log { lines } => lines.len(),
@@ -315,7 +321,7 @@ fn tree_rows(nodes: &[flux_runtime::PaneNode], depth: usize) -> usize {
 
 /// Stack a slot's panes vertically inside its column, giving each an equal share and dropping the
 /// ones that no longer clear the minimum pane height.
-fn render_column(frame: &mut Frame, state: &ChatState, panes: &[&PaneSpec], area: Rect) {
+fn render_column(frame: &mut Frame, state: &ChatState, panes: &[&AgentPane], area: Rect) {
     let fit = (area.height / (PANE_CHROME_ROWS + 1)).min(panes.len() as u16);
     if fit == 0 {
         return;
@@ -328,7 +334,7 @@ fn render_column(frame: &mut Frame, state: &ChatState, panes: &[&PaneSpec], area
 }
 
 /// Lay a slot's panes side by side across a strip, giving each an equal share.
-fn render_row(frame: &mut Frame, state: &ChatState, panes: &[&PaneSpec], area: Rect) {
+fn render_row(frame: &mut Frame, state: &ChatState, panes: &[&AgentPane], area: Rect) {
     let fit = (area.width / MIN_PANE_WIDTH).min(panes.len() as u16);
     if fit == 0 {
         return;
@@ -340,23 +346,15 @@ fn render_row(frame: &mut Frame, state: &ChatState, panes: &[&PaneSpec], area: R
     }
 }
 
-/// One pane: themed border, the placeholder agent mark plus the pane's own title, and a body
-/// truncated to the rect with an explicit elision marker when the cap bites.
-fn render_pane(frame: &mut Frame, state: &ChatState, pane: &PaneSpec, area: Rect) {
+/// One pane: the surface's trust chrome ([`trust::agent_block`] — themed border, agent mark, the
+/// pane's own title as text), and a body truncated to the rect with an explicit elision marker
+/// when the cap bites.
+fn render_pane(frame: &mut Frame, state: &ChatState, pane: &AgentPane, area: Rect) {
     if area.width < MIN_PANE_WIDTH || area.height < PANE_CHROME_ROWS + 1 {
         return;
     }
     let t = &state.theme;
-    let title = format!(
-        " {AGENT_MARK} {} ",
-        truncate(&pane.title, area.width.saturating_sub(6) as usize)
-    );
-    let block = Block::bordered()
-        .border_style(t.muted_style())
-        .title(Span::styled(
-            title,
-            t.muted_style().add_modifier(Modifier::BOLD),
-        ));
+    let block = trust::agent_block(t, &pane.spec().title, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -379,9 +377,14 @@ fn render_pane(frame: &mut Frame, state: &ChatState, pane: &PaneSpec, area: Rect
 /// Every kind goes through machinery the TUI already owns — `markdown` through the transcript's
 /// own [`crate::markdown`] (`flux-markdown`), `tree` through [`plan::render_nodes`] — so no widget
 /// dependency is added under the standing `ratatui` 0.29 hold.
-fn body_lines(pane: &PaneSpec, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+///
+/// Every `Style` below is read off the [`Theme`]; the payload contributes characters and counts
+/// and nothing else. `markdown` gets a second pass through [`trust::sanitize_lines`] because it is
+/// the one kind whose *renderer* turns payload text into glyphs (a thematic break, a table) —
+/// everywhere else the glyphs are the surface's own.
+fn body_lines(pane: &AgentPane, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let cols = width as usize;
-    match &pane.data {
+    match &pane.spec().data {
         PaneData::Rows { header, rows } => {
             let widths = column_widths(header, rows, cols);
             let mut out = Vec::new();
@@ -445,7 +448,9 @@ fn body_lines(pane: &PaneSpec, theme: &Theme, width: u16) -> Vec<Line<'static>> 
             ]
         }
         PaneData::Tree { roots } => plan::render_nodes(roots, theme, cols),
-        PaneData::Markdown { text } => crate::markdown::render(text, width).lines,
+        PaneData::Markdown { text } => {
+            trust::sanitize_lines(crate::markdown::render(text, width).lines)
+        }
     }
 }
 
@@ -484,7 +489,487 @@ fn pad_row(row: &[String], widths: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flux_runtime::PaneNode;
+    use flux_runtime::{PaneNode, PaneSpec};
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::{Buffer, Cell};
+    use trust::AGENT_MARK;
+
+    /// Frame the C-222 screen assertions draw into: wide and tall enough that a side column, a
+    /// bottom strip, an overlay panel and the approval sheet all fit at once.
+    const TRUST_W: u16 = 100;
+    const TRUST_H: u16 = 30;
+
+    /// Every slot a pane can ask for — the trust invariant has to hold in all four, including
+    /// `overlay`, which shares its chrome with the surface's own overlays.
+    const ALL_SLOTS: [PaneSlot; 4] = [
+        PaneSlot::Left,
+        PaneSlot::Right,
+        PaneSlot::Bottom,
+        PaneSlot::Overlay,
+    ];
+
+    /// A pending **destructive** approval: the top risk tier (C-154), and therefore the chrome a
+    /// counterfeit would most want to wear.
+    fn destructive_view() -> crate::controller::ApprovalView {
+        crate::controller::ApprovalView {
+            request: crate::controller::ApprovalRequest {
+                tool: "bash".into(),
+                subjects: vec!["$ rm -rf ~/work".into()],
+                summary: Some("high · destructive".into()),
+                destructive: true,
+                mutating: true,
+            },
+            scroll: 0,
+            reason: None,
+        }
+    }
+
+    /// One rendered frame: a one-entry transcript, optionally one `log` pane, optionally a pending
+    /// approval sheet.
+    fn trust_frame_at(
+        width: u16,
+        height: u16,
+        theme: Theme,
+        pane: Option<(PaneSlot, String, Vec<String>)>,
+        approval: bool,
+    ) -> Buffer {
+        let mut state = ChatState::new("mock".into());
+        state.theme = theme;
+        state.push(Entry::Notice {
+            text: "a transcript row".into(),
+            sev: Sev::Info,
+        });
+        if let Some((slot, title, lines)) = pane {
+            state.apply_pane_command(PaneCommand::Open(PaneSpec::new(
+                "counterfeit",
+                title,
+                slot,
+                PaneLifetime::Session,
+                PaneData::Log { lines },
+            )));
+        }
+        if approval {
+            state.approval = Some(destructive_view());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn trust_frame(pane: Option<(PaneSlot, String, Vec<String>)>, approval: bool) -> Buffer {
+        trust_frame_at(TRUST_W, TRUST_H, Theme::default(), pane, approval)
+    }
+
+    fn row_cells(buf: &Buffer, y: u16) -> Vec<Cell> {
+        let w = buf.area.width as usize;
+        buf.content[y as usize * w..(y as usize + 1) * w].to_vec()
+    }
+
+    /// The rows the approval sheet occupies: it is the only **full-width** bordered block on the
+    /// frame, so they are exactly the rows whose last cell is one of its right-hand border glyphs.
+    fn sheet_rows(buf: &Buffer) -> Vec<u16> {
+        (0..buf.area.height)
+            .filter(|y| {
+                let last = row_cells(buf, *y).pop().expect("a non-empty row");
+                matches!(last.symbol(), "┐" | "│" | "┘")
+            })
+            .collect()
+    }
+
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        row_cells(buf, y).iter().map(|c| c.symbol()).collect()
+    }
+
+    /// The row `y` a cell index falls on.
+    fn row_of(buf: &Buffer, index: usize) -> u16 {
+        (index / buf.area.width as usize) as u16
+    }
+
+    fn screen_text(buf: &Buffer) -> String {
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    /// **The adversarial corpus: glyphs someone builds harness chrome out of, and what each one
+    /// imitates.**
+    ///
+    /// This list is deliberately **not** derived from [`trust::is_reserved`], and it is deliberately
+    /// **not** a second copy of its ranges. It was grown by probing the shipped rule for
+    /// pass-throughs, because that is the only way a test can see a gap the implementation has: a
+    /// mirrored range list shares the implementation's blind spot *exactly*, so a counterfeit built
+    /// out of a block the rule forgot scores zero forged cells and the test reports success. That is
+    /// the "guard tested against its own assumptions" failure, and an earlier revision of this file
+    /// shipped it — the first four groups below all passed through a rule that reserved only box
+    /// drawing, block elements and geometric shapes.
+    ///
+    /// Add to this list whenever a new lookalike turns up. Never rewrite it as a range check.
+    const CHROME_LOOKALIKES: &[(&str, &str)] = &[
+        // Box-drawing variants — the reason the rule has to be range-shaped and not a list of the
+        // six glyphs the sheet happens to use.
+        ("┏", "heavy top-left"),
+        ("┓", "heavy top-right"),
+        ("┗", "heavy bottom-left"),
+        ("┛", "heavy bottom-right"),
+        ("━", "heavy horizontal"),
+        ("┃", "heavy vertical"),
+        ("╔", "double top-left"),
+        ("╗", "double top-right"),
+        ("═", "double horizontal"),
+        ("║", "double vertical"),
+        ("╭", "rounded top-left"),
+        ("╯", "rounded bottom-right"),
+        // Misc technical: Unicode's own names for these are box and scan lines, and the bracket
+        // pieces tile into a frame edge. One block BELOW the reserved box-drawing range.
+        ("\u{23b8}", "left vertical box line"),
+        ("\u{23b9}", "right vertical box line"),
+        ("\u{23ba}", "horizontal scan line 1"),
+        ("\u{23bb}", "horizontal scan line 3"),
+        ("\u{23bc}", "horizontal scan line 7"),
+        ("\u{23bd}", "horizontal scan line 9"),
+        ("\u{239c}", "left parenthesis extension"),
+        ("\u{239f}", "right parenthesis extension"),
+        // Braille tiles densely enough to stand in for the bars — and the spinner IS Braille.
+        ("\u{28ff}", "full 8-dot cell, as a block fill"),
+        ("\u{2847}", "left-column dots, as a vertical rule"),
+        ("\u{283f}", "bottom dots, as a horizontal rule"),
+        // Fullwidth and halfwidth rule forms.
+        ("\u{ffe8}", "halfwidth forms light vertical"),
+        ("\u{ff5c}", "fullwidth vertical line"),
+        ("\u{ffe3}", "fullwidth macron, as an overline rule"),
+        ("\u{fe31}", "presentation form vertical em dash"),
+        ("\u{fe33}", "presentation form vertical low line"),
+        // Legacy computing: sextants and half-blocks exist for terminal graphics.
+        ("\u{1fb70}", "vertical one-eighth block"),
+        ("\u{1fb00}", "sextant"),
+        // Long rules that are punctuation rather than drawing.
+        ("\u{2015}", "horizontal bar"),
+        ("\u{2e3a}", "two-em dash"),
+        // Fills, arrows and attention marks.
+        ("\u{2b1b}", "large black square"),
+        ("\u{2b06}", "upwards black arrow"),
+        ("\u{21d1}", "upwards double arrow"),
+        ("\u{26a1}", "high voltage, as a warning mark"),
+        ("\u{2757}", "heavy exclamation, as a warning mark"),
+        ("\u{1f53a}", "red triangle up, as a risk badge"),
+        ("\u{1f7e5}", "red square, as a risk badge"),
+        ("\u{1f536}", "orange diamond, as a risk badge"),
+        ("\u{2666}", "black diamond suit, imitating the agent mark"),
+    ];
+
+    /// What a *user* reads as harness chrome: the blocks whose glyphs draw frames, rules and fills,
+    /// plus every glyph in [`CHROME_LOOKALIKES`].
+    ///
+    /// The ranges here are the narrow, obvious ones; the corpus is what gives this predicate reach
+    /// beyond them, and it is the half that is independent of the implementation.
+    fn is_chrome_glyph(ch: char) -> bool {
+        matches!(ch,
+            '\u{2500}'..='\u{257F}'      // box drawing
+            | '\u{2580}'..='\u{259F}'    // block elements
+            | '\u{25A0}'..='\u{25FF}'    // geometric shapes
+            | '⚠' | '↑' | '↓')
+            || CHROME_LOOKALIKES
+                .iter()
+                .any(|(glyph, _)| glyph.chars().any(|c| c == ch))
+    }
+
+    /// Where the chrome alphabet appears on a frame, as `(x, y, glyph)` — a position-aware
+    /// fingerprint of everything on screen that reads as harness chrome.
+    fn chrome_cells(buf: &Buffer) -> std::collections::BTreeSet<(u16, u16, String)> {
+        let w = buf.area.width as usize;
+        buf.content
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.symbol().chars().any(is_chrome_glyph))
+            .map(|(i, c)| ((i % w) as u16, (i / w) as u16, c.symbol().to_string()))
+            .collect()
+    }
+
+    /// C-222 (the story's failing-first test): **an agent pane cannot be mistaken for the approval
+    /// sheet, even when its payload *is* the approval sheet.**
+    ///
+    /// The impersonation payload is not hand-written. It is the sheet the surface itself just drew,
+    /// read straight back off the buffer and handed to a pane as content — so it stays verbatim
+    /// accurate as the sheet evolves, where a hand-copied string would rot silently and the test
+    /// would keep passing. Two more primitives a payload would reach for ride along: an ANSI
+    /// sequence, and the surface's own agent mark.
+    ///
+    /// A second counterfeit rides along, and it is the one that catches a *gap in the rule* rather
+    /// than a gap in its enforcement: the same frame rebuilt from [`CHROME_LOOKALIKES`], the corpus
+    /// grown by probing rather than copied from [`trust::is_reserved`]'s ranges. Against the rule as
+    /// first shipped — box drawing, block elements, geometric shapes — that payload rendered a
+    /// complete frame and scored **zero** forged cells.
+    ///
+    /// Four things are asserted, in every slot, with the real sheet pending:
+    ///
+    /// 1. **The payload paints no chrome.** Every cell on screen holding a chrome glyph is one the
+    ///    *surface* chose — identical, cell for cell, to the same frame whose pane holds plain
+    ///    letters of the same shape.
+    /// 2. **No lookalike survives.** Not one glyph of the corpus reaches a cell.
+    /// 3. **Nothing is interpreted.** No control byte reaches a cell.
+    /// 4. **The sheet is untouched.** Its rows are byte-identical, styles included, to the same
+    ///    sheet drawn with no pane open at all — a pane draws first, the sheet `Clear`s and draws
+    ///    over it, always.
+    #[test]
+    fn an_agent_pane_cannot_imitate_the_approval_sheet() {
+        let real = trust_frame(None, true);
+        let sheet = sheet_rows(&real);
+        assert!(
+            sheet.len() >= 4,
+            "the sheet was located: {sheet:?}\n{}",
+            screen_text(&real)
+        );
+
+        let mut counterfeit: Vec<String> = sheet
+            .iter()
+            .map(|y| row_text(&real, *y).trim_end().to_string())
+            .collect();
+        counterfeit.push("\u{1b}[7m approve bash? \u{1b}[0m".into());
+        counterfeit.push(format!("{AGENT_MARK} agent"));
+        // The corpus, packed a few glyphs to a row so that every one of them clears the surface's
+        // row cap and is actually drawn — an elided lookalike would pass this test for free.
+        let lookalikes: Vec<String> = CHROME_LOOKALIKES
+            .chunks(6)
+            .map(|chunk| chunk.iter().map(|(glyph, _)| *glyph).collect())
+            .collect();
+        assert!(
+            lookalikes.len() <= MAX_PANE_ROWS as usize,
+            "the corpus must fit the surface's row cap to be provably drawn: {} rows",
+            lookalikes.len()
+        );
+        let title = counterfeit[0].clone();
+        // The benign twin: the same shape and the same char counts, drawn from an alphabet with no
+        // chrome in it. Any chrome cell present in one frame and not the other came from a payload.
+        let benign: Vec<String> = counterfeit
+            .iter()
+            .map(|line| "x".repeat(line.chars().count()))
+            .collect();
+        let benign_title = "x".repeat(title.chars().count());
+
+        for slot in ALL_SLOTS {
+            let bad = trust_frame(Some((slot, title.clone(), counterfeit.clone())), true);
+            let good = trust_frame(Some((slot, benign_title.clone(), benign.clone())), true);
+
+            let forged: Vec<_> = chrome_cells(&bad)
+                .symmetric_difference(&chrome_cells(&good))
+                .cloned()
+                .collect();
+            assert!(
+                forged.is_empty(),
+                "{slot:?}: {} cell(s) of chrome the surface did not draw: {:?}",
+                forged.len(),
+                &forged[..forged.len().min(12)]
+            );
+            assert!(
+                !bad.content
+                    .iter()
+                    .any(|c| c.symbol().chars().any(char::is_control)),
+                "{slot:?}: a control byte reached a cell",
+            );
+
+            // The gap-catching pass: the corpus, rendered as a pane, in this slot.
+            let probe = trust_frame(Some((slot, lookalikes.join(" "), lookalikes.clone())), true);
+            let probe_text = screen_text(&probe);
+            let leaked: Vec<&str> = CHROME_LOOKALIKES
+                .iter()
+                .filter(|(glyph, _)| probe_text.contains(glyph))
+                .map(|(_, what)| *what)
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "{slot:?}: {} lookalike(s) reached a cell — a payload can still draw chrome \
+                 this rule does not reserve: {:?}",
+                leaked.len(),
+                leaked
+            );
+            for y in &sheet {
+                assert_eq!(
+                    row_cells(&probe, *y),
+                    row_cells(&real, *y),
+                    "{slot:?}: the lookalike pane reached sheet row {y}\n{probe_text}"
+                );
+            }
+            for y in &sheet {
+                assert_eq!(
+                    row_cells(&bad, *y),
+                    row_cells(&real, *y),
+                    "{slot:?}: sheet row {y} differs from the sheet with no pane open\n{}",
+                    screen_text(&bad)
+                );
+            }
+            // The invariant neutralizes the counterfeit chrome; it does not silence the pane. The
+            // sheet's words still render inside it, as text.
+            assert!(
+                screen_text(&bad).matches("approval · destructive").count() >= 2,
+                "{slot:?}: the pane still renders its title as text\n{}",
+                screen_text(&bad)
+            );
+        }
+    }
+
+    /// C-222 / acceptance 4: **draw order is explicit and tested.** Panes render before the
+    /// approval sheet, always — so the sheet's rows come out byte-identical, styles included,
+    /// whether or not a pane is open, at every width from the suppression threshold up, at every
+    /// height, in every slot including `overlay`. A pane that cannot change one cell of the sheet
+    /// cannot occlude it.
+    #[test]
+    fn a_pane_can_never_occlude_the_approval_sheet_at_any_width_or_slot() {
+        // A payload that wants every row and column it can get: tall enough to overflow the body
+        // cap, wide enough to overflow any column.
+        let greedy: Vec<String> = (0..40)
+            .map(|i| format!("row-{i}-{}", "W".repeat(300)))
+            .collect();
+        let title = "W".repeat(300);
+
+        // Below the suppression threshold the sheet-row comparison is vacuous — no pane is drawn, so
+        // of course the sheet is unchanged. Assert the stronger thing that actually holds there: the
+        // WHOLE frame is identical, which is C-221's narrow-width posture still holding with a
+        // pending approval on screen.
+        for slot in ALL_SLOTS {
+            let narrow = PANE_MIN_TRANSCRIPT_WIDTH - 1;
+            assert_eq!(
+                trust_frame_at(
+                    narrow,
+                    24,
+                    Theme::default(),
+                    Some((slot, title.clone(), greedy.clone())),
+                    true
+                ),
+                trust_frame_at(narrow, 24, Theme::default(), None, true),
+                "{slot:?}: at {narrow} columns a pane must not change the frame at all"
+            );
+        }
+
+        for (width, height) in [
+            (PANE_MIN_TRANSCRIPT_WIDTH, 24), // exactly one side column fits
+            (80, PANE_MIN_HEIGHT),           // the shortest frame that carries a pane
+            (80, 24),
+            (100, 40),
+            (132, 30),
+            (240, 60),
+        ] {
+            let bare = trust_frame_at(width, height, Theme::default(), None, true);
+            let sheet = sheet_rows(&bare);
+            assert!(
+                !sheet.is_empty(),
+                "{width}x{height}: the sheet was located\n{}",
+                screen_text(&bare)
+            );
+            for slot in ALL_SLOTS {
+                let with = trust_frame_at(
+                    width,
+                    height,
+                    Theme::default(),
+                    Some((slot, title.clone(), greedy.clone())),
+                    true,
+                );
+                for y in &sheet {
+                    assert_eq!(
+                        row_cells(&with, *y),
+                        row_cells(&bare, *y),
+                        "{width}x{height} {slot:?}: the pane reached sheet row {y}\n{}",
+                        screen_text(&with)
+                    );
+                }
+            }
+        }
+    }
+
+    /// C-222 / acceptance 2: the mark reaches the **screen** under `Theme::MONO`, where every
+    /// colour role resolves to `Color::Reset`. It therefore has to be a glyph plus a modifier
+    /// rather than a tint — the reasoning C-149 used for the transcript gutter rail and C-154 for
+    /// the approval risk tiers. It appears exactly once per drawn pane, and it is named, because a
+    /// glyph on its own asks the user to have learnt it.
+    #[test]
+    fn the_agent_mark_survives_mono_in_every_slot() {
+        for slot in ALL_SLOTS {
+            let buf = trust_frame_at(
+                TRUST_W,
+                TRUST_H,
+                Theme::MONO,
+                // The payload tries to place the mark itself, and to tint it.
+                Some((
+                    slot,
+                    format!("{AGENT_MARK} agent"),
+                    vec![format!("\u{1b}[7m{AGENT_MARK} agent\u{1b}[0m")],
+                )),
+                false,
+            );
+            let marks: Vec<usize> = buf
+                .content
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.symbol() == AGENT_MARK)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                marks.len(),
+                1,
+                "{slot:?}: the mark is the surface's, and appears once\n{}",
+                screen_text(&buf)
+            );
+            let cell = &buf.content[marks[0]];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED)
+                    && cell.modifier.contains(Modifier::BOLD),
+                "{slot:?}: the mark carries modifiers, not colour: {:?}",
+                cell.modifier
+            );
+            assert_eq!(cell.fg, Color::Reset, "{slot:?}: MONO leaves no colour");
+            assert_eq!(cell.bg, Color::Reset, "{slot:?}: MONO leaves no colour");
+            assert!(
+                row_text(&buf, row_of(&buf, marks[0])).contains("agent"),
+                "{slot:?}: the mark is named\n{}",
+                screen_text(&buf)
+            );
+        }
+    }
+
+    /// C-222 / acceptance 1: a payload cannot inject styling **through content** either. C-220
+    /// pinned the type — no field of `PaneSpec` reaches a `Style` — and this is the other half:
+    /// every colour on a frame carrying an adversarial pane is one of the theme's own roles.
+    #[test]
+    fn a_pane_paints_only_colours_the_theme_defines() {
+        let theme = Theme::LIGHT_RGB;
+        let palette = [
+            Color::Reset,
+            theme.user,
+            theme.assistant,
+            theme.tool,
+            theme.ok,
+            theme.err,
+            theme.warn,
+            theme.muted,
+            theme.accent,
+            theme.sel_bg,
+            theme.composer_bg,
+            theme.panel_bg,
+            theme.text,
+            theme.base_bg,
+        ];
+        for slot in ALL_SLOTS {
+            let buf = trust_frame_at(
+                TRUST_W,
+                TRUST_H,
+                theme,
+                Some((
+                    slot,
+                    "\u{1b}[1;31m approval · destructive \u{1b}[0m".into(),
+                    vec![
+                        "\u{1b}[48;5;196m\u{1b}[38;2;255;0;0m approve bash? \u{1b}[0m".into(),
+                        "\u{1b}]8;;http://evil\u{1b}\\[y] allow\u{1b}]8;;\u{1b}\\".into(),
+                    ],
+                )),
+                true,
+            );
+            for (index, cell) in buf.content.iter().enumerate() {
+                assert!(
+                    palette.contains(&cell.fg) && palette.contains(&cell.bg),
+                    "{slot:?}: cell {index} is painted off-palette: fg {:?} bg {:?}",
+                    cell.fg,
+                    cell.bg
+                );
+            }
+        }
+    }
 
     fn log_pane(id: &str, slot: PaneSlot, lifetime: PaneLifetime) -> PaneCommand {
         PaneCommand::Open(PaneSpec::new(
@@ -628,7 +1113,7 @@ mod tests {
                 .collect()
         };
 
-        let md = PaneSpec::new(
+        let md = AgentPane::sanitized(PaneSpec::new(
             "m",
             "m",
             PaneSlot::Right,
@@ -636,7 +1121,7 @@ mod tests {
             PaneData::Markdown {
                 text: "# Title\n\nsome **bold** prose\n".into(),
             },
-        );
+        ));
         let md_lines = body_lines(&md, &theme, 30);
         assert!(flat(&md_lines).contains("Title"));
         assert!(
@@ -644,7 +1129,7 @@ mod tests {
             "flux-markdown produced styled spans, not one flat span"
         );
 
-        let tree = PaneSpec::new(
+        let tree = AgentPane::sanitized(PaneSpec::new(
             "t",
             "t",
             PaneSlot::Right,
@@ -664,12 +1149,14 @@ mod tests {
                     ],
                 }],
             },
-        );
+        ));
         let tree_text = flat(&body_lines(&tree, &theme, 30));
         assert!(
             tree_text.contains("root") && tree_text.contains("second"),
             "{tree_text}"
         );
+        // C-222: the connectors are drawn by the SURFACE from the theme, so the reserved-glyph
+        // rule that neutralizes a payload's own box drawing leaves them untouched.
         assert!(
             tree_text.contains("├─") && tree_text.contains("└─"),
             "plan.rs's connectors: {tree_text}"

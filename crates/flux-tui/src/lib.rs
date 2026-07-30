@@ -35,6 +35,7 @@ pub mod toolview;
 
 mod markdown;
 mod plan;
+mod trust;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
