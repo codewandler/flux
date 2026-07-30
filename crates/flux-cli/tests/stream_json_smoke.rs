@@ -1,6 +1,10 @@
 //! C-160: black-box gate for `flux run --stream-json` / `--stream-json-input` — the real binary,
 //! an isolated HOME + CWD, and the offline `-m mock` provider (same harness shape as
 //! `mock_smoke.rs`).
+//!
+//! Spawns set `FLUX_SANDBOX=off`: C-262 makes auto-approved non-interactive surfaces fail closed
+//! without an OS sandbox backend, which no stock CI runner has. Confinement posture is asserted in
+//! `sandbox_posture.rs`, not here — do not remove it, or this file only passes where `bwrap` exists.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -65,6 +69,7 @@ fn stream_json_emits_the_expected_ndjson_line_sequence_for_a_mock_run() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux");
@@ -160,6 +165,7 @@ fn provider_stage_failure_emits_a_typed_terminal_error_and_exits_nonzero() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .env("FLUX_MOCK_ERROR", "deterministic provider outage")
         .stdin(Stdio::null())
         .output()
@@ -209,6 +215,7 @@ fn stream_json_input_drives_two_sequential_turns_in_one_process() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -262,6 +269,7 @@ fn a_steer_line_with_no_turn_running_becomes_an_ordinary_turn() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -316,6 +324,7 @@ fn stream_json_input_without_yes_is_a_clear_startup_error() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux");
@@ -345,6 +354,7 @@ fn stream_json_redacts_a_registered_secret_out_of_a_tool_calls_input() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .env("FLUX_SECRET", secret)
         .env("FLUX_MOCK_TOOL", "write")
         .env(

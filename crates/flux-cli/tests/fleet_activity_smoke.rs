@@ -8,6 +8,10 @@
 //!
 //! Everything here is offline: `-m mock`, no network, no credentials (they are explicitly removed
 //! from the child environment so a developer's real keys cannot influence the run).
+//!
+//! Spawns set `FLUX_SANDBOX=off`: C-262 makes auto-approved non-interactive surfaces fail closed
+//! without an OS sandbox backend, which no stock CI runner has. Confinement posture is asserted in
+//! `sandbox_posture.rs`, not here — do not remove it, or this file only passes where `bwrap` exists.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -82,6 +86,7 @@ fn run_fleet_flow(tag: &str) -> (bool, String) {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         // Wide enough that the assertions read the whole line rather than its truncation.
         .env("COLUMNS", "400")
         .env("FLUX_CASSETTE", "0")

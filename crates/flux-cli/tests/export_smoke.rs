@@ -2,6 +2,10 @@
 //! exports to a single self-contained static HTML file — the plan tree, per-op result/diff, cost,
 //! and timeline — with no network references and no script. Runs the real binary end-to-end under
 //! an isolated HOME + CWD, mirroring `mock_smoke.rs`'s pattern.
+//!
+//! Spawns set `FLUX_SANDBOX=off`: C-262 makes auto-approved non-interactive surfaces fail closed
+//! without an OS sandbox backend, which no stock CI runner has. Confinement posture is asserted in
+//! `sandbox_posture.rs`, not here — do not remove it, or this file only passes where `bwrap` exists.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,6 +51,7 @@ fn export_renders_a_recorded_mock_run_as_one_self_contained_html_file() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux run");
@@ -64,6 +69,7 @@ fn export_renders_a_recorded_mock_run_as_one_self_contained_html_file() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux export");
@@ -125,6 +131,7 @@ fn export_renders_a_recorded_mock_run_as_one_self_contained_html_file() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux export (stdout)");

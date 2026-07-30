@@ -1,3 +1,7 @@
+//! Spawns set `FLUX_SANDBOX=off`: C-262 makes auto-approved non-interactive surfaces fail closed
+//! without an OS sandbox backend, which no stock CI runner has. Confinement posture is asserted in
+//! `sandbox_posture.rs`, not here — do not remove it, or this file only passes where `bwrap` exists.
+
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +31,7 @@ fn malformed_role_wins_before_provider_and_tool_execution() {
         .current_dir(&root)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         // This provider is deliberately invalid: if eager provider construction runs first, its
         // error masks the security-relevant role path. The mock tool hooks are a second tripwire:
         // even if startup accidentally reaches a model turn, it must not create the marker.

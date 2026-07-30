@@ -5,14 +5,14 @@
 //! Runs the real binary against the offline `mock` provider under an isolated HOME + CWD, so nothing
 //! here touches the developer's own `~/.flux` or needs a credential.
 //!
-//! `flux record` invocations pass `--no-sandbox` deliberately. C-262 makes auto-approved
-//! non-interactive surfaces — `record --yes` among them — fail closed unless an OS sandbox backend is
-//! available, so on a host without `bwrap` (every stock CI runner) the command refuses to start before
-//! doing any work. That posture is asserted in `sandbox_posture.rs`, which is also where tests that
-//! require the *absence* of a backend live; installing `bwrap` in CI would break those instead. These
-//! tests are about the record/replay fixture contract, so they declare unconfined operation rather
-//! than depending on the runner's confinement backend. Do not drop the flag to "tidy up" — without it
-//! this file passes only on a developer machine that happens to have bubblewrap installed.
+//! Every spawn sets `FLUX_SANDBOX=off`. C-262 makes auto-approved non-interactive surfaces —
+//! `record --yes` and `run --yes` among them — fail closed unless an OS sandbox backend is available,
+//! so on a host without `bwrap` (every stock CI runner) the command refuses to start before doing any
+//! work. That posture is asserted in `sandbox_posture.rs`, which is also where tests that require the
+//! *absence* of a backend live; installing `bwrap` in CI would break those instead. These tests are
+//! about behaviour other than confinement, so they declare unconfined operation rather than depending
+//! on the runner having a backend. Do not drop it to "tidy up" — without it this file passes only on a
+//! developer machine that happens to have bubblewrap installed.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -52,6 +52,7 @@ fn flux(work: &Path, args: &[&str]) -> (bool, String, String) {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux");
@@ -74,7 +75,6 @@ fn record_writes_a_fixture_that_flux_test_and_the_time_machine_both_read() {
         work,
         &[
             "record",
-            "--no-sandbox",
             "--yes",
             "-m",
             "mock",
@@ -145,7 +145,6 @@ fn flux_test_exits_non_zero_when_a_fixture_regresses() {
         work,
         &[
             "record",
-            "--no-sandbox",
             "--yes",
             "-m",
             "mock",
@@ -184,6 +183,7 @@ fn flux_test_exits_non_zero_when_a_fixture_regresses() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .env("FLUX_GOLDEN", "update")
         .stdin(Stdio::null())
         .output()
@@ -216,10 +216,7 @@ fn flux_record_rejects_names_that_are_not_a_single_plain_segment() {
     let tmp = TempDir::new("agent-lab-record-name-guard");
     let work = tmp.path();
     for bad in ["..", ".", "a/b", "../escape"] {
-        let (ok, stdout, stderr) = flux(
-            work,
-            &["record", "--no-sandbox", "--yes", "-m", "mock", bad, "hi"],
-        );
+        let (ok, stdout, stderr) = flux(work, &["record", "--yes", "-m", "mock", bad, "hi"]);
         assert!(
             !ok,
             "`flux record {bad}` should be rejected\nstdout: {stdout}\nstderr: {stderr}"

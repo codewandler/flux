@@ -1,6 +1,10 @@
 //! Gate-level guard for the offline `mock` provider: `flux run --yes -m mock` must route intent,
 //! propose an action through the native schema, approve/execute its host-built batch, and write
 //! `flux-mock.txt`. This runs the real binary end-to-end under an isolated HOME + CWD.
+//!
+//! Spawns set `FLUX_SANDBOX=off`: C-262 makes auto-approved non-interactive surfaces fail closed
+//! without an OS sandbox backend, which no stock CI runner has. Confinement posture is asserted in
+//! `sandbox_posture.rs`, not here — do not remove it, or this file only passes where `bwrap` exists.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -44,6 +48,7 @@ fn mock_run_writes_flux_mock_file() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux");
@@ -78,6 +83,7 @@ fn default_mock_run_surfaces_intent_in_plain_output() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn adaptive flux");
@@ -118,6 +124,7 @@ fn tools_disable_unmatched_entry_warns_at_startup() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux");
@@ -156,6 +163,7 @@ fn app_run_tools_disable_unmatched_entry_warns_at_startup() {
         .current_dir(work)
         .env("HOME", &home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .stdin(Stdio::null())
         .output()
         .expect("spawn flux");

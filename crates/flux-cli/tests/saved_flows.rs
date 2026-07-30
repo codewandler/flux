@@ -1,6 +1,10 @@
 //! L-79 gate-level coverage for saved-flow discovery/execution. Every test drives the real binary
 //! under an isolated HOME + CWD so provider/session/filesystem behavior cannot be faked by a unit
 //! helper.
+//!
+//! Spawns set `FLUX_SANDBOX=off`: C-262 makes auto-approved non-interactive surfaces fail closed
+//! without an OS sandbox backend, which no stock CI runner has. Confinement posture is asserted in
+//! `sandbox_posture.rs`, not here — do not remove it, or this file only passes where `bwrap` exists.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -47,6 +51,7 @@ fn run(work: &Path, home: &Path, args: &[&str], mock_response: Option<&str>) -> 
         .current_dir(work)
         .env("HOME", home)
         .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
         .env("FLUX_CASSETTE", "0")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
