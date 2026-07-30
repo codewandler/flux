@@ -80,10 +80,10 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.37.0** is released. Work sitting in `[Unreleased]` is the **adversarial review remediation**
-> and **Zendesk automation** epics below, plus the earlier tail (C-217, C-218, C-226, C-233, C-234,
-> C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for the itemized
-> history.
+> **v0.38.0** is released and `[Unreleased]` is empty. That cut carried the **adversarial review
+> remediation** and **Zendesk automation** epics below, plus the earlier tail (C-217, C-218, C-226,
+> C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
+> the itemized history.
 
 ### Adversarial review remediation (epic) — 🔄 **IN PROGRESS (C-255; C-256…C-265 all done, closure reviews pending)**
 
@@ -421,7 +421,7 @@ injection reuses the `<knowledge-base>` `ContextBlock` seam already hardened aga
 and budget-bounded (A-24). Stale entries are still injected, marked — stale means *unverified*, not
 false. Design: [designs/evidence-pinned-memory.md](designs/evidence-pinned-memory.md).
 
-### TUI polish round 2 — legibility, discoverability, one overlay language (epic) — ✅ **COMPLETE (C-149…C-158, all ten stories; nine shipped v0.33.0, C-158 in `[Unreleased]`)**
+### TUI polish round 2 — legibility, discoverability, one overlay language (epic) — ✅ **COMPLETE (C-149…C-158, all ten stories; nine shipped v0.33.0, C-158 in v0.34.0)**
 
 The first wave (C-101…C-116) delivered the TUI's *capabilities* — dense transcript, themes, approval
 sheet with diffs, focus/yank, search, live tool cards. A read of `crates/flux-tui/src` said the

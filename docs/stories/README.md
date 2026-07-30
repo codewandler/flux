@@ -10,9 +10,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.37.0 (2026-07-30) — see [CHANGELOG](../../CHANGELOG.md) and the
-  [roadmap](../roadmap.md).
-- **Unreleased on `main`:** two epics' worth of work plus the older unreleased tail.
+- **Released:** v0.38.0 (2026-07-30) — see [CHANGELOG](../../CHANGELOG.md) and the
+  [roadmap](../roadmap.md). `[Unreleased]` is empty; everything below shipped in that cut.
+- **Shipped in v0.38.0:** two epics' worth of work plus the older unreleased tail.
   **Adversarial review remediation** (C-255; C-256…C-265) closes every actionable finding from the
   three independent 2026-07-30 reviews: guard-vetted address pinning for fleet A2A / plugin HTTP /
   OAuth / TCP egress, host-selected eval execution, content-authenticated release tooling with
@@ -25,7 +25,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   flux-connectors interop layer, so D-200/D-201/D-202 revert to `blocked`.
   Plus the earlier tail: C-217, C-218, C-226, C-233, C-234, C-240, C-246, C-247, C-251 (partial),
   C-252.
-  **Next cut is a MINOR** — C-262 flips unattended and serving surfaces to fail closed on sandbox
+  **It was cut as a MINOR** — C-262 flips unattended and serving surfaces to fail closed on sandbox
   posture, so hosts with no confinement backend now refuse to start instead of running unconfined.
   The protocol line moved independently: `codewandler-flux-plugin-protocol` 1.0.0 → 1.1.0
   (additive `decode_ndjson_frame`/`MAX_FRAME_BYTES`), `codewandler-flux-spec` 1.2.0 → 1.2.1,
