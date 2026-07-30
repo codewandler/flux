@@ -57,7 +57,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flux_core::{Error, Result};
-use flux_datasource::board::{is_retry, validate_transition, BoardSchema, Item, ItemDraft, State};
+use flux_datasource::board::{
+    is_retry, validate_transition, BoardSchema, DependencyMatch, Item, ItemDraft, State,
+    DEPENDS_ON_FILTER,
+};
 use flux_datasource::live::{FilterValue, Filters, Page, PageRequest};
 use flux_runtime::ToolContext;
 use flux_system::{System, Workspace};
@@ -148,6 +151,21 @@ impl MarkdownBoard {
             return Ok(());
         }
         self.system.write_file_atomic(INDEX_FILE, &rendered)
+    }
+
+    /// Read one item file into its parsed item and its markdown body.
+    ///
+    /// The read-only half of [`edit_item`](Self::edit_item): no reservation, no write. An absent or
+    /// malformed id is the same [`absent`] error every other operation reports.
+    async fn read_document(&self, id: &str) -> Result<(Item, String)> {
+        if !is_valid_id(id) {
+            return Err(absent(id));
+        }
+        let text = self
+            .system
+            .read_optional_text(&item_path(id))?
+            .ok_or_else(|| absent(id))?;
+        parse_document(id, &text)
     }
 
     /// Read–modify–write one item file under the compare-and-set, returning the committed item.
@@ -358,6 +376,21 @@ impl WorkBoard for MarkdownBoard {
             }
             None => None,
         };
+        // The same reasoning for `depends_on` (C-236). The rule is `DependencyMatch`'s, shared with
+        // `MemoryBoard` — a property that held for only one backend would not be a port contract.
+        let dependencies = match filters.get(DEPENDS_ON_FILTER) {
+            Some(FilterValue::String(value)) => {
+                Some(DependencyMatch::parse(value).ok_or_else(|| {
+                    Error::Other(format!("work board: unknown depends_on filter `{value}`"))
+                })?)
+            }
+            Some(other) => {
+                return Err(Error::Other(format!(
+                    "work board: depends_on filter must be a string, got {other:?}"
+                )))
+            }
+            None => None,
+        };
         let offset: usize = match &page.cursor {
             Some(cursor) => cursor
                 .parse()
@@ -370,9 +403,15 @@ impl WorkBoard for MarkdownBoard {
         // the board the reader just saw, and it never feeds back into the answer.
         self.refresh_index(&all).await?;
 
+        // Dependencies resolve against the whole scan, not the filtered page: a blocker is usually
+        // in a state the caller did not ask for. One scan answers both, so the filter costs no
+        // extra IO.
+        let state_of = |id: &str| all.iter().find(|item| item.id == id).map(|item| item.state);
         let matching: Vec<Item> = all
-            .into_iter()
+            .iter()
             .filter(|item| wanted.is_none_or(|state| item.state == state))
+            .filter(|item| dependencies.is_none_or(|match_| match_.matches(item, state_of)))
+            .cloned()
             .collect();
         let rows: Vec<Item> = matching
             .iter()
@@ -520,6 +559,18 @@ impl WorkBoard for MarkdownBoard {
         })
         .await
         .map(|_| ())
+    }
+
+    async fn comments(&self, _ctx: &ToolContext, id: &str) -> Result<Vec<String>> {
+        // Read-back is the exact inverse of `comment`'s render: a note is a top-level `- ` bullet,
+        // so every top-level bullet of the document is a note, in file order. A nested bullet is
+        // prose a human wrote under a heading, not a note — indentation is the discriminator.
+        let (_, body) = self.read_document(id).await?;
+        Ok(body
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .map(str::to_string)
+            .collect())
     }
 }
 

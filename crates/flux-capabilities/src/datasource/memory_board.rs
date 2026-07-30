@@ -16,7 +16,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use flux_core::{Error, Result};
-use flux_datasource::board::{is_retry, validate_transition, BoardSchema, Item, ItemDraft, State};
+use flux_datasource::board::{
+    is_retry, validate_transition, BoardSchema, DependencyMatch, Item, ItemDraft, State,
+    DEPENDS_ON_FILTER,
+};
 use flux_datasource::live::{FilterValue, Filters, Page, PageRequest};
 use flux_runtime::ToolContext;
 
@@ -43,18 +46,6 @@ impl MemoryBoard {
     /// An empty board.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Notes left on one item, oldest first. Empty for an absent id.
-    ///
-    /// Not part of the [`WorkBoard`] contract — `comment` is write-only there — but a backend's own
-    /// tests need to see that a note landed.
-    pub fn comments(&self, id: &str) -> Vec<String> {
-        self.locked()
-            .iter()
-            .find(|entry| entry.item.id == id)
-            .map(|entry| entry.comments.clone())
-            .unwrap_or_default()
     }
 
     /// How many items the board holds.
@@ -113,6 +104,22 @@ impl WorkBoard for MemoryBoard {
             }
             None => None,
         };
+        // The same reasoning for `depends_on` (C-236): the host validated it against the closed
+        // `DependencyMatch` set, and the rule itself lives in `flux-datasource` so both backends
+        // apply one definition of "unblocked".
+        let dependencies = match filters.get(DEPENDS_ON_FILTER) {
+            Some(FilterValue::String(value)) => {
+                Some(DependencyMatch::parse(value).ok_or_else(|| {
+                    Error::Other(format!("work board: unknown depends_on filter `{value}`"))
+                })?)
+            }
+            Some(other) => {
+                return Err(Error::Other(format!(
+                    "work board: depends_on filter must be a string, got {other:?}"
+                )))
+            }
+            None => None,
+        };
 
         // Insertion order is the board's order: deterministic, and it makes the opaque cursor a
         // plain offset.
@@ -124,10 +131,19 @@ impl WorkBoard for MemoryBoard {
         };
 
         let entries = self.locked();
+        // Dependencies resolve against the whole board, not the filtered page — an item's blockers
+        // are usually in a state the caller is not asking for.
+        let state_of = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.item.id == id)
+                .map(|entry| entry.item.state)
+        };
         let matching: Vec<Item> = entries
             .iter()
             .map(|entry| entry.item.clone())
             .filter(|item| wanted.is_none_or(|state| item.state == state))
+            .filter(|item| dependencies.is_none_or(|match_| match_.matches(item, state_of)))
             .collect();
         let rows: Vec<Item> = matching
             .iter()
@@ -238,6 +254,12 @@ impl WorkBoard for MemoryBoard {
         entries[index].comments.push(text.to_string());
         Ok(())
     }
+
+    async fn comments(&self, _ctx: &ToolContext, id: &str) -> Result<Vec<String>> {
+        let entries = self.locked();
+        let index = Self::index_of(&entries, id)?;
+        Ok(entries[index].comments.clone())
+    }
 }
 
 #[cfg(test)]
@@ -279,9 +301,13 @@ mod tests {
 
         board.comment(&ctx, &item.id, "first").await.unwrap();
         board.comment(&ctx, &item.id, "second").await.unwrap();
-        assert_eq!(board.comments(&item.id), vec!["first", "second"]);
+        assert_eq!(
+            board.comments(&ctx, &item.id).await.unwrap(),
+            vec!["first", "second"]
+        );
         assert_eq!(board.get(&ctx, &item.id).await.unwrap().unwrap(), item);
-        assert!(board.comments("absent").is_empty());
+        // C-236: the read path and the write path agree about which items exist.
+        assert!(board.comments(&ctx, "absent").await.is_err());
         assert!(board.comment(&ctx, "absent", "x").await.is_err());
     }
 

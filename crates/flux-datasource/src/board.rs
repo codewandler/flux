@@ -196,6 +196,63 @@ pub const fn is_retry(from: State, to: State) -> bool {
     matches!((from, to), (State::Failed, State::Ready))
 }
 
+/// The reserved `depends_on` list filter (C-236).
+///
+/// Reserved exactly like `state`: the host declares it on the structured `query` operation and a
+/// backend may not redeclare it. The two values it takes are [`DependencyMatch`].
+pub const DEPENDS_ON_FILTER: &str = "depends_on";
+
+/// The values the reserved [`DEPENDS_ON_FILTER`] filter takes.
+///
+/// "Ready and unblocked" is the wave-selection query a coordinator runs on every sweep, so the
+/// dependency rule lives here once — beside [`validate_transition`], the board's other whole-rule
+/// — rather than being re-derived per backend: **an item is unblocked exactly when every id in its
+/// [`depends_on`](Item::depends_on) resolves to a [`Done`](State::Done) item.** No dependencies is
+/// trivially unblocked; an absent id is not `done`, so it keeps the item blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyMatch {
+    /// Every dependency is `done` (vacuously true for none) — the item is unblocked.
+    Satisfied,
+    /// At least one dependency is absent or not yet `done` — the item is still blocked.
+    Unsatisfied,
+}
+
+impl DependencyMatch {
+    /// Every value, in declaration order. Useful for the filter's schema enum and exhaustive tests.
+    pub const ALL: [DependencyMatch; 2] = [Self::Satisfied, Self::Unsatisfied];
+
+    /// The wire spelling the filter accepts.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Satisfied => "satisfied",
+            Self::Unsatisfied => "unsatisfied",
+        }
+    }
+
+    /// Parse a wire spelling produced by [`DependencyMatch::as_str`]. `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == value)
+    }
+
+    /// Whether `item` matches, resolving each dependency's current state through `state_of`.
+    pub fn matches(&self, item: &Item, state_of: impl Fn(&str) -> Option<State>) -> bool {
+        let satisfied = item
+            .depends_on
+            .iter()
+            .all(|id| state_of(id) == Some(State::Done));
+        match self {
+            Self::Satisfied => satisfied,
+            Self::Unsatisfied => !satisfied,
+        }
+    }
+}
+
+impl fmt::Display for DependencyMatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One work item — the unit the coordinator reasons about.
 ///
 /// Deliberately typed rather than an opaque row: dependency waves come from
@@ -287,6 +344,47 @@ impl Default for BoardSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C-236: the dependency rule the whole board shares — an item is unblocked exactly when every
+    /// dependency is `done`; none is trivially unblocked; an absent id never resolves.
+    #[test]
+    fn an_item_is_blocked_until_every_dependency_is_done() {
+        let mut item = Item {
+            id: "child".into(),
+            title: String::new(),
+            state: State::Ready,
+            assignee: None,
+            runner: None,
+            task_id: None,
+            depends_on: vec!["a".into(), "b".into()],
+            repo: None,
+            attempts: 0,
+            evidence: Vec::new(),
+        };
+        /// A `state_of` resolver where exactly `done` is `done` and everything else is absent.
+        fn states<'a>(done: &'a [&'a str]) -> impl Fn(&str) -> Option<State> + 'a {
+            move |id: &str| done.contains(&id).then_some(State::Done)
+        }
+
+        for spelling in ["satisfied", "unsatisfied"] {
+            assert_eq!(
+                DependencyMatch::parse(spelling).map(|m| m.as_str()),
+                Some(spelling)
+            );
+        }
+        assert_eq!(DependencyMatch::parse("maybe"), None);
+
+        // Half-done is blocked; all-done unblocks; an absent id is not `done`.
+        assert!(!DependencyMatch::Satisfied.matches(&item, states(&["a"])));
+        assert!(DependencyMatch::Unsatisfied.matches(&item, states(&["a"])));
+        assert!(DependencyMatch::Satisfied.matches(&item, states(&["a", "b"])));
+        assert!(!DependencyMatch::Satisfied.matches(&item, states(&["a", "c"])));
+
+        // No dependencies is trivially satisfied.
+        item.depends_on.clear();
+        assert!(DependencyMatch::Satisfied.matches(&item, states(&[])));
+        assert!(!DependencyMatch::Unsatisfied.matches(&item, states(&[])));
+    }
 
     #[test]
     fn the_wire_spelling_round_trips_through_parse_and_serde() {
