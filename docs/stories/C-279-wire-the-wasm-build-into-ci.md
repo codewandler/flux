@@ -2,7 +2,7 @@
 id: C-279
 title: "The wasm32 parity proof runs nowhere but a developer's machine"
 pillar: Core
-status: ready
+status: in-progress
 priority: 6
 epic: portable-wasm-runtime
 design: docs/designs/portable-wasm-runtime.md
