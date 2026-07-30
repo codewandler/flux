@@ -641,19 +641,30 @@ async fn reassign_moves_the_holder_and_drops_the_dead_run() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(conflict.contains("already claimed by `worker-a`"), "{conflict}");
+    assert!(
+        conflict.contains("already claimed by `worker-a`"),
+        "{conflict}"
+    );
 
     let moved = operation(&registry, "board.reassign")
         .execute(&ctx, json!({"id": "item-1", "assignee": "worker-b"}))
         .await
         .unwrap();
-    assert!(moved.content.contains("assignee worker-b"), "{}", moved.content);
+    assert!(
+        moved.content.contains("assignee worker-b"),
+        "{}",
+        moved.content
+    );
     assert!(
         !moved.content.contains("runner") && !moved.content.contains("task_id"),
         "the rendered item must not still advertise the dead run: {}",
         moved.content
     );
-    assert!(moved.content.contains("claimed (attempts 0)"), "{}", moved.content);
+    assert!(
+        moved.content.contains("claimed (attempts 0)"),
+        "{}",
+        moved.content
+    );
 
     // The property the story names: the claim that conflicted now succeeds.
     operation(&registry, "board.claim")
@@ -683,7 +694,10 @@ async fn record_evidence_appends_both_reference_spellings_and_refuses_an_ambiguo
         .unwrap();
 
     let recorded = operation(&registry, "board.record_evidence")
-        .execute(&ctx, json!({"id": "item-1", "entity": "commit", "entity_id": "deadbeef"}))
+        .execute(
+            &ctx,
+            json!({"id": "item-1", "entity": "commit", "entity_id": "deadbeef"}),
+        )
         .await
         .unwrap();
     assert!(
@@ -692,12 +706,18 @@ async fn record_evidence_appends_both_reference_spellings_and_refuses_an_ambiguo
         recorded.content
     );
     operation(&registry, "board.record_evidence")
-        .execute(&ctx, json!({"id": "item-1", "url": "https://example.test/pr/1"}))
+        .execute(
+            &ctx,
+            json!({"id": "item-1", "url": "https://example.test/pr/1"}),
+        )
         .await
         .unwrap();
     // A replayed record does not double the list.
     operation(&registry, "board.record_evidence")
-        .execute(&ctx, json!({"id": "item-1", "entity": "commit", "entity_id": "deadbeef"}))
+        .execute(
+            &ctx,
+            json!({"id": "item-1", "entity": "commit", "entity_id": "deadbeef"}),
+        )
         .await
         .unwrap();
 

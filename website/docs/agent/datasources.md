@@ -207,8 +207,8 @@ datasource board
 
 The declaration's **name** becomes the operation prefix, so this one generates `board.list`,
 `board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
-`board.record_dispatch`, `board.query`, and `board.comments`. Board kinds live in their own
-`board:` namespace on purpose: `markdown`
+`board.record_dispatch`, `board.query`, `board.comments`, `board.reassign`, and
+`board.record_evidence`. Board kinds live in their own `board:` namespace on purpose: `markdown`
 already means *a directory of docs to index*, so a board that happens to be backed by markdown files
 needs a name that cannot be confused with it. A knowledge kind is never promoted to a board, a board
 kind is never ingested as knowledge, and a `board:` kind naming a backend that does not exist is an
@@ -234,7 +234,7 @@ typed JSON rows (every field present, absent optionals as `null`) so a flow can 
 are all `done`. `board.comments` returns one item's notes as an array. `board.list` and `board.get`
 render prose for reading. See [Work boards and the fleet](./fleet.md#reading-the-board-as-data).
 
-The five mutating operations are gated like any other write: each reports a concrete
+The seven mutating operations are gated like any other write: each reports a concrete
 `<name>/item/<id>` approval subject—`<name>/item/new` for `create`, since no id exists yet—so a grant
 scoped to one item can never move another. `transition` validates the edge against the state machine
 *before* writing, so an illegal move is a clean error and leaves the item byte-identical.

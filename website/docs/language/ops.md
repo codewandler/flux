@@ -262,10 +262,10 @@ behind `flux serve`'s bearer token is not reachable yet.
 the point of a status call.
 
 **Work board operations are not in this catalog**, because they do not exist until a program asks for
-them. A `datasource` with a `board:` kind generates nine operations named after *that declaration*, so
-a board declared as `board` yields `board.list` … `board.comments` while one declared as `queue`
-yields `queue.list` … `queue.comments`. Nothing is callable without the declaration. They are
-documented with the declaration that creates them, in
+them. A `datasource` with a `board:` kind generates eleven operations named after *that declaration*,
+so a board declared as `board` yields `board.list` … `board.record_evidence` while one declared as
+`queue` yields `queue.list` … `queue.record_evidence`. Nothing is callable without the declaration.
+They are documented with the declaration that creates them, in
 [Work boards and the fleet](../agent/fleet.md).
 
 ## Endpoints

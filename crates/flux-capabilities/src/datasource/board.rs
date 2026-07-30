@@ -1374,7 +1374,11 @@ mod tests {
             }
         }
         assert_eq!(
-            parse_reference("board.record_evidence", &input("https://x.test/pr/1", "", "")).unwrap(),
+            parse_reference(
+                "board.record_evidence",
+                &input("https://x.test/pr/1", "", "")
+            )
+            .unwrap(),
             Reference::Url {
                 url: "https://x.test/pr/1".into()
             }
@@ -1395,8 +1399,14 @@ mod tests {
         for (case, expected) in [
             (input("", "", ""), "neither was given"),
             (input("   ", "  ", " "), "neither was given"),
-            (input("", "commit", ""), "needs both `entity` and `entity_id`"),
-            (input("", "", "deadbeef"), "needs both `entity` and `entity_id`"),
+            (
+                input("", "commit", ""),
+                "needs both `entity` and `entity_id`",
+            ),
+            (
+                input("", "", "deadbeef"),
+                "needs both `entity` and `entity_id`",
+            ),
             (
                 input("https://x.test", "commit", "deadbeef"),
                 "mutually exclusive",
