@@ -85,6 +85,45 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
 
+### The fleet runs the track / impl-coord loop (epic) — 🔄 **IN PROGRESS (C-239; F1 C-236 + F3 C-238 in flight, C-240…C-246 filed)**
+
+0.36.0 shipped a fleet *coordinator* — a Program declares a board and hands items to remote agents
+over A2A with `runner`/`task_id` written back — but not the loop the `track` plugin actually runs:
+select a wave of independent items, give each an isolated worker that implements and gates and commits
+on a scratch branch, review the returned diff **as evidence**, two rework rounds to the *same* worker,
+park after that, integrate serially with a full gate after **every** merge and revert on red, then
+write the ledger. The load-bearing decision is where that contract lives: **the model reasons, the
+host enforces.** A `WaveCoordinator` owns the irreversible, order-sensitive actions — isolation, gate,
+merge, revert, ledger — and the model owns only wave selection and diff review. The point is not
+tidiness: it means fenced ledger, gate-after-every-merge, never-implement, revert-on-red and
+park-after-two hold *even when the model is wrong or lazy*, because they are host behaviour rather
+than instructions a prompt can lose. `fleet.integrate` is the sharpest instance — it gates and merges
+or does neither, so the most-violated rule in the loop becomes unskippable; and gating per merge is
+what attributes the failure of two stories that each compile alone but not together, which is exactly
+the case that produces no git conflict. Coordination *prose* deliberately stays out of flux: the
+wave-selection and review heuristics are content, and they live in a reference `coordinator.flux` and
+its guidance. Sequenced so the data path lands before anything reasons over it — **F1** makes the
+board readable (`board.query` with a real `output_schema`; today `render_compact` drops `runner`,
+`task_id`, `depends_on`, `repo` and `evidence`, so `each`/`match` has nothing typed to iterate, and
+C-235's JSON-quoted strings break even scraping the prose), **F2** makes it correct (a `Failed→Ready`
+retry currently keeps a dead `runner`/`task_id` and the next sweep chases a corpse), then F3–F5 make
+integration possible, F6–F8 make the worker real, F9 is the product and F10 makes a running fleet
+visible. **A code-read moved the scope boundary before any code landed**, and it is the most useful
+thing the design records: per-worker filesystem isolation does not exist for remote workers and is
+*designed out* (`git_worktree_enter` is caller-local by construction), and a worker cannot return a
+branch or a diff at all — `SpawnOutcome` has no artifact field and `flux-server` never populates
+`Task.artifacts` — so "review the diff as evidence" has no channel to a remote worker, and a branch
+*name* from another filesystem is useless anyway. **The full implementation loop is therefore a
+local-worker loop for now**, which is sound because local children get real isolation via C-100; the
+distributed half (Docker isolation, artifact return over A2A, discovery, worker auth) is the
+`agent-fleet-runtime` epic and is explicitly later. Two corrections went the other way: A2A session
+continuity on `contextId` **is** implemented, so F8's rework genuinely resumes the same worker; and
+`ProcessRuntime` is not an optimization but a **prerequisite for any wave larger than one**, because
+`FlowEngine`'s `turn_gate` means one worker serves one concurrent turn. Done looks like F9's offline
+end-to-end journey — a stub A2A worker, a `MemoryBoard`, two items, one integrating and one parking,
+no network and no real model — with every loop invariant pinned by a test instead of asserted in
+prose. Design: [designs/fleet-loop.md](designs/fleet-loop.md).
+
 ### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**
 
 Three stories filed separately turned out to be one failure at three depths, and grouping them said

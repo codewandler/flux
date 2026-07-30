@@ -39,6 +39,13 @@ cron-driven reconciliation. Crash recovery is then free — restart, sweep, re-d
       covered by the existing config-completeness assertions.
 
 ## Progress
+- 2026-07-30 — **this story is F9 of the `fleet-loop` epic**
+  ([design](../designs/fleet-loop.md), tracker [C-239](C-239-fleet-loop-epic.md)), and that epic
+  exists to resolve exactly the four blockers recorded below. What unblocks it: **F1 (C-236)** gives
+  the board a structured, iterable read; **F2 (C-240)** fixes the run-state writes and adds
+  `board.record_evidence`; **F3–F5** land the merge verbs, `fleet.isolate` and `fleet.integrate`;
+  **F6–F8** land `ProcessRuntime`, the structured handoff and bounded rework. It stays `blocked`
+  until F1…F8 land — nothing in its own `fleet-coordinator` epic will unblock it.
 - **Blocked at pickup (base `6418ef81`).** No code written: the story cannot be implemented as
   specified without four decisions that belong to the epic, not to this story. Each was verified
   against the tree rather than inferred; `path:line` below is at the base commit.
