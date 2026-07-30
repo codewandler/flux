@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-07-30
+
 ### Added
 
 - **Flux can export its foundational catalogue as deterministic, versioned JSON (C-283).** `flux

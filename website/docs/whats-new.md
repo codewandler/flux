@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.40.0] - 2026-07-30
+
 ### Improved
 
 - **A confined flux now confines what it starts.** When you run flux with OS sandboxing on, the
