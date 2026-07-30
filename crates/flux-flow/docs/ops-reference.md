@@ -326,12 +326,18 @@ the working tree, while this op discards it. They are different operations with 
 radii — C-238 renamed this one out of the collision.
 
 Because `git_reset` is a *blanket* restore — `reset --hard` plus an unscoped `git clean -fd`, which
-deletes untracked files outright — it will only run against a snapshot that proves it accounts for
-the whole tree (C-278). Two things must hold, and both are checked at every call rather than assumed
-from the call site: the snapshot must carry `clean: true` (only `git_snapshot` sets it, and only
-after finding the tree clean), and its `head` must be an ancestor of the current `HEAD`. A
-hand-written `{"head": "…"}` literal, or a snapshot taken on a divergent line, is refused with the
-working tree listed and untouched. What a licensed reset did destroy comes back in `discarded`.
+deletes untracked files outright — C-278 gave it a precondition. What it guarantees is bounded and
+worth stating exactly: **a reset can only rewind within this checkout's own line of history.** Two
+things are checked, and they are not equally strong. The snapshot must carry `clean: true`, which
+only `git_snapshot` sets and only after finding the tree clean — but nothing verifies the payload
+came from `git_snapshot`, so a flow writing `git_reset({"head": h, "clean": true})` by hand is
+licensed anyway; that check catches the caller who forgot to snapshot, not one that lies. The second
+check, that `head` is an ancestor of the current `HEAD`, asks git rather than the payload and is the
+one no caller can talk its way past. A snapshot taken on a divergent line is refused with the
+working tree listed and untouched. Neither check looks at *recency*, so a snapshot reused from an
+earlier round is still honoured and the commits since are rewound. What a licensed reset destroyed
+comes back in `discarded` — though that is built from `git status --porcelain`, so it reports
+working-tree losses only, never rewound commits.
 
 `guard_protected` needs no such precondition and states the exemption instead: its `checkout` and
 `clean` argv always end in `--` and an explicit pathspec list filtered through the `PROTECTED` set,

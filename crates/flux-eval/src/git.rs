@@ -15,20 +15,27 @@
 //! dependency), so each states its own — and the statements are deliberately *different*, because
 //! the two ops are not the same kind of operation:
 //!
-//! - **`git_reset` — precondition: a verified snapshot.** The loop's licence to destroy rests on an
-//!   invariant, *everything in this tree was produced by the step I am undoing*. Before C-278 that
-//!   invariant was **trusted**: the op read `head` out of the payload and reset. It is instead
-//!   **checkable**, in two independent halves, and [`licence_to_restore`] checks both. This is what
-//!   stops a future caller from being different: the licence is proved from the payload and the
-//!   repository at each call, never inferred from where the op happens to be called today.
+//! - **`git_reset` — precondition: [`licence_to_restore`].** Before C-278 the op read `head` out of
+//!   the payload and reset, full stop. What it guarantees now is precisely this, and no more:
+//!
+//!   > **A `git_reset` can only ever rewind within this checkout's own line of history.**
+//!
+//!   That is a real bound and a strictly stronger one than "whatever sha the caller passed", but be
+//!   careful not to read it as the loop's invariant *everything in this tree was produced by the
+//!   step I am undoing*. It is **not** that. The two halves of the check are not equally strong:
+//!   the `--is-ancestor` half interrogates the repository and cannot be talked out of its answer,
+//!   while the `clean: true` half only reads the payload and a caller can simply write it. See
+//!   [`licence_to_restore`] for which guarantee comes from which, and what neither covers.
 //! - **`guard_protected` — reasoned exemption: its blast radius is bounded by construction.** It is
 //!   not a blanket restore. Both argv it builds are explicit pathspec lists it computed itself and
 //!   filtered through [`is_protected`], so it cannot touch a path outside `PROTECTED` however dirty
 //!   the tree is or whoever calls it. A clean-tree precondition would buy nothing and would break
 //!   the op's entire purpose, which is to run *after* the worker has deliberately dirtied the tree.
-//!   The exemption does not rest on the caller, so there is nothing about a future caller to
-//!   defend against — but it does rest on the pathspec filtering staying in place, which
-//!   `guard_protected_touches_nothing_outside_the_protected_paths` is what holds.
+//!   The exemption is about **which paths** it may touch, and that much no caller can widen — it
+//!   rests only on the pathspec filtering staying in place, which
+//!   `guard_protected_touches_nothing_outside_the_protected_paths` is what holds. It says nothing
+//!   about **which commit** those paths are restored *to*: `snap["head"]` is unvalidated here, and
+//!   for the anti-cheat op that is a live question rather than a settled one. Filed as C-281.
 
 use std::time::Duration;
 
@@ -251,35 +258,50 @@ impl Tool for GitTagTool {
 
 /// Whether a blanket restore is licensed, or the refusal to hand back instead.
 ///
-/// A refusal is a recoverable [`ToolResult::error`], never a raw `Err`: the whole promise of a
+/// A refusal is a recoverable [`ToolResult::error`] rather than a raw `Err`: the whole promise of a
 /// preflight is that nothing was touched, and the caller should be able to read why.
+///
+/// One gap, stated rather than implied: the two refusal branches in [`licence_to_restore`] build
+/// their message from `git status --porcelain` with `?`, so a `status` that itself fails turns what
+/// should be a readable refusal into a plan-halting error. It fails *safe* — nothing is restored
+/// either way — but it is not the shape this type promises. That `?`-propagation shape is C-277's,
+/// and it is deliberately left alone here rather than fixed under a comment-only change.
 enum Licence {
-    /// Both halves of the invariant hold. Carries the verified commit to restore to.
+    /// Both checks pass. Carries the verified commit to restore to.
     Granted(String),
-    /// They do not. Nothing was changed.
+    /// One did not. Nothing was changed.
     Refused(ToolResult),
 }
 
-/// Prove that `snap` licenses destroying everything not committed in this checkout.
+/// Decide whether `snap` licenses a blanket restore, and be exact about what that licence is worth.
 ///
-/// The loop's invariant is *everything in this tree was produced by the step I am undoing*, and it
-/// decomposes into two halves that are each independently checkable. Neither is redundant:
+/// **What this guarantees: a restore can only rewind within this checkout's own line of history.**
+/// That is the whole of it. It is emphatically *not* the loop's invariant — *everything in this
+/// tree was produced by the step I am undoing* — and the difference is the thing to keep straight,
+/// because the two checks below are not equally strong.
 ///
-/// 1. **The snapshot established a clean tree.** [`GitSnapshotTool`] refuses a dirty tree and only
-///    then emits `clean: true`, so that field is a proof-carrying token: the tree held nothing but
-///    committed work at `head`, therefore everything differing from `head` now was produced after
-///    the snapshot. A payload without it is a caller *asserting* the invariant rather than having
-///    established it — which is exactly the trust C-278 exists to remove.
-/// 2. **The snapshot is on this checkout's line.** `clean: true` is a fact about the tree at *that*
-///    commit; it says nothing about the tree we are standing in unless `head` is an ancestor of
-///    `HEAD`. Resetting to a commit off this line rewinds onto a divergent history and discards
-///    commits and working-tree state no snapshot ever accounted for. Equality counts — the loop's
-///    reject path has moved HEAD nowhere, and `--is-ancestor` is reflexive.
+/// 1. **`clean: true` — a hint, not a proof. It is forgeable.** [`GitSnapshotTool`] refuses a dirty
+///    tree and only then emits this field, so a payload that genuinely came from `git_snapshot`
+///    does carry the fact that the tree held nothing but committed work at `head`. But nothing here
+///    verifies the payload came from `git_snapshot`: [`crate::util::arg`] accepts any caller-supplied
+///    object, so a flow may write `git_reset({"head": h, "clean": true})` by hand and be licensed on
+///    a tree it never snapshotted — reproducing the exact pre-C-278 hazard. This check therefore
+///    catches the caller who *forgot* to snapshot, not the caller who lies. Do not lean on it.
+/// 2. **`--is-ancestor` — the unforgeable half, and where the real bound lives.** It asks the
+///    repository rather than the payload, so no caller can talk it out of its answer. A `head` off
+///    this checkout's line is refused, which is what confines the damage of a forged `clean` to a
+///    rewind along history we are actually on. Equality counts — the loop's reject path has moved
+///    HEAD nowhere, and `--is-ancestor` is reflexive.
 ///
-/// Both hold for every round of `examples/improve-tbench.flux` and `examples/improve-synthetic.flux`
-/// (`snapshot = git_snapshot()`, then `git_reset(snapshot)` with HEAD at or ahead of it), so the
-/// self-improvement loop is unaffected — which is the point: the precondition refuses the calls
-/// that were never licensed, not the one the loop makes.
+/// **Not covered — staleness.** The check is about lineage, not recency. A snapshot reused from an
+/// earlier round still carries `clean: true` and is still an ancestor, so the licence is granted
+/// and `reset --hard` discards the *committed* rounds since. `discarded` is built from
+/// `git status --porcelain`, so those rewound commits are reported nowhere. Not reachable from the
+/// shipped flows — both take the snapshot inside the `repeat` body — but nothing here would stop it.
+///
+/// Both checks pass on every round of `examples/improve-tbench.flux` and
+/// `examples/improve-synthetic.flux` (`snapshot = git_snapshot()`, then `git_reset(snapshot)` with
+/// HEAD at or ahead of it), so the self-improvement loop is unaffected.
 async fn licence_to_restore(ctx: &ToolContext, op: &str, snap: &Value) -> Result<Licence> {
     let head = snap
         .get("head")
@@ -331,8 +353,9 @@ async fn licence_to_restore(ctx: &ToolContext, op: &str, snap: &Value) -> Result
 /// `git_reset(snapshot)` — hard-reset to a snapshot and clean untracked files. **Destructive**: only
 /// the top-level loop resets (never a sub-agent), discarding exactly the round's own changes.
 ///
-/// Its precondition is [`licence_to_restore`] — the snapshot must *prove* it accounts for
-/// everything in the tree, rather than the call site being trusted to have passed a good one. What
+/// Its precondition is [`licence_to_restore`], which bounds the restore to this checkout's own line
+/// of history — read that doc before relying on it, because the bound is narrower than "only the
+/// round's own changes are discarded" and one of its two checks is forgeable by the caller. What
 /// the restore then consumed is reported in `discarded`, because the round's log is the only place
 /// an untracked file that `clean -fd` removed is ever visible again.
 pub struct GitResetTool;
@@ -589,13 +612,14 @@ mod tests {
     /// string. `clean -fd` deletes untracked files outright, which is precisely the case C-249
     /// rewrote the refusal wording for.
     ///
-    /// The loop's licence to destroy uncommitted work rests on an invariant — *everything in this
-    /// tree was produced by the step I am undoing* — and that invariant is **establishable**, not
-    /// merely assertable: [`GitSnapshotTool`] refuses a dirty tree, so a snapshot carrying
-    /// `clean: true` is a proof-carrying token that the tree held nothing but committed work at
-    /// `head`. This test pins both halves of the decision: a snapshot that never established
-    /// cleanliness is refused with the untracked file still on disk, and the loop's own verified
-    /// snapshot is honoured — with what it destroyed reported rather than silently swallowed.
+    /// This pins the `clean: true` half of [`licence_to_restore`] — the **weak** half. A payload
+    /// without the field is refused with the untracked file still on disk; a payload with it is
+    /// licensed. Note what the second act of this test actually does: it hand-builds
+    /// `{"head": …, "clean": true}` with no [`GitSnapshotTool`] anywhere and still receives a
+    /// blanket restore. That is not an oversight in the test, it is the honest shape of the check —
+    /// the field is *forgeable*, so it catches the caller who forgot to snapshot and nothing more.
+    /// The bound that survives a lying caller is the `--is-ancestor` half, which
+    /// `git_reset_refuses_a_snapshot_taken_off_this_checkouts_line` covers.
     #[tokio::test]
     async fn git_reset_refuses_a_snapshot_whose_cleanliness_was_never_established() {
         let (dir, ctx) = repo("flux-reset-unverified").await;
@@ -650,8 +674,9 @@ mod tests {
             r.content
         );
 
-        // The loop's own token: `git_snapshot` verified this tree was clean at `head`, so
-        // everything above was produced after it. The destruction is licensed — and reported.
+        // The same payload the loop's `git_snapshot` would produce — except assembled by hand right
+        // here, which is the point: the licence is granted on the field's presence, not on its
+        // provenance. The destruction goes ahead, and is at least reported.
         let ok = GitResetTool
             .execute(
                 &ctx,
@@ -676,10 +701,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// C-278, the other half of the invariant. `clean: true` proves the tree was clean *at that
-    /// commit*; it says nothing about the tree we are standing in now unless the snapshot is on
-    /// this checkout's own line. Resetting to a commit that is not an ancestor of `HEAD` rewinds
-    /// onto a divergent history and destroys work no snapshot ever accounted for.
+    /// C-278, the **unforgeable** half — and so the one that carries the actual guarantee. Note the
+    /// payload here sets `clean: true` and is still refused: this check asks the repository instead
+    /// of the payload, so a caller cannot assert its way past it. Resetting to a commit that is not
+    /// an ancestor of `HEAD` rewinds onto a divergent history and destroys work no snapshot ever
+    /// accounted for; confining a reset to this checkout's own line is what `git_reset` guarantees.
     #[tokio::test]
     async fn git_reset_refuses_a_snapshot_taken_off_this_checkouts_line() {
         let (dir, ctx) = repo("flux-reset-divergent").await;

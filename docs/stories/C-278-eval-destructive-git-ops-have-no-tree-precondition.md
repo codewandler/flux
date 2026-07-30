@@ -46,37 +46,49 @@ The two ops got **different** answers, because they are not the same kind of ope
 stated in `crates/flux-eval/src/git.rs`'s module doc ("What licenses these ops to destroy
 uncommitted work") and enforced by tests, not inferred from today's call sites.
 
-**`git_reset` — precondition added: a verified snapshot.** The story's sharp question was whether
-the loop's invariant ("everything in this tree was produced by the step I am undoing") can be
-*checked* rather than trusted. It can, and it now is. The invariant splits into two independently
-checkable halves, both in `licence_to_restore`:
+**`git_reset` — precondition added, and its guarantee stated exactly.** The story's sharp question
+was whether the loop's invariant ("everything in this tree was produced by the step I am undoing")
+can be *checked* rather than trusted. **Answer: only partly, and the shipped guarantee is the
+narrower one** — *a reset can only rewind within this checkout's own line of history*. That is
+strictly stronger than the pre-C-278 behaviour (reset to whatever sha the payload named), but it is
+not the loop's invariant, and review corrected an earlier draft of this note that claimed it was.
+`licence_to_restore` runs two checks of unequal strength:
 
-1. `git_snapshot` already refuses a dirty tree and only then emits `clean: true` — so that field is
-   a **proof-carrying token**: the tree held nothing but committed work at `head`, therefore
-   everything differing from `head` now was produced after the snapshot. A payload without it is a
-   caller *asserting* the invariant rather than having established it.
-2. `clean: true` is a fact about the tree at *that* commit and says nothing about the tree we stand
-   in unless `head` is an ancestor of `HEAD` (`git merge-base --is-ancestor`, reflexive so equality
-   passes). Without this, a snapshot taken on a divergent line would be honoured and would rewind
-   onto a history no snapshot accounts for.
+1. `clean: true` — **forgeable, so a hint rather than a proof.** `git_snapshot` refuses a dirty tree
+   and only then emits the field, but nothing verifies a payload *came from* `git_snapshot`:
+   `util::arg` accepts any caller-supplied object, so a flow may write
+   `git_reset({"head": h, "clean": true})` by hand and be licensed on a tree it never snapshotted,
+   reproducing the original hazard. It catches the caller who forgot to snapshot, not one that lies.
+2. `git merge-base --is-ancestor` — **unforgeable, and where the real bound lives.** It interrogates
+   the repository rather than the payload, so no caller can assert past it. This is what confines a
+   forged `clean` to a rewind along history we are actually on. Reflexive, so equality passes.
 
-This is a genuine check, not a reflex: it refuses the calls that were never licensed while leaving
-the one the loop makes untouched. Both `examples/improve-tbench.flux` and
+Neither check looks at *recency*: a snapshot reused from an earlier round still carries `clean: true`
+and is still an ancestor, so committed rounds since would be rewound — and `discarded` is built from
+`git status --porcelain`, so rewound commits are reported nowhere. Not reachable from the shipped
+flows (the snapshot is taken inside the `repeat` body), but the precondition does not prevent it.
+
+The precondition is not a reflex: both `examples/improve-tbench.flux` and
 `examples/improve-synthetic.flux` satisfy it on every reject path (`snapshot = git_snapshot()` then
 `git_reset(snapshot)`, HEAD at or ahead of the snapshot), so the self-improvement loop still
 discards candidates exactly as before. The refusal reuses C-249's tracked/untracked split. A
 licensed reset now also reports what it consumed in `discarded`, which answers the "no warning"
-half of the hazard: an untracked file `clean -fd` removed is otherwise invisible forever.
+half of the hazard for working-tree losses.
 
 **`guard_protected` — reasoned exemption, enforced.** It is *not* a blanket restore, despite
 matching C-249's `-fd` selector. Both argv it builds end in `--` followed by an explicit pathspec
 list it computed itself and filtered through `is_protected`, so its blast radius is bounded **by
 construction**, not by its caller — which is why "what stops a future caller being different" has
-no bite here: nothing about the caller can widen it. A clean-tree precondition would also be
-incoherent, since the op exists to run *after* the worker has deliberately dirtied the tree. The
-bound is now pinned by `guard_protected_touches_nothing_outside_the_protected_paths`, which
-specifically holds **untracked non-protected** files — the case an unscoped `clean -fd` would
-delete and which the pre-existing tampering test never covered.
+no bite for *which paths* it may touch: nothing about the caller can widen that. A clean-tree
+precondition would also be incoherent, since the op exists to run *after* the worker has
+deliberately dirtied the tree. The bound is now pinned by
+`guard_protected_touches_nothing_outside_the_protected_paths`, which specifically holds
+**untracked non-protected** files — the case an unscoped `clean -fd` would delete and which the
+pre-existing tampering test never covered.
+
+The exemption covers which paths are touched, **not which commit they are restored to**:
+`snap["head"]` is unvalidated in `guard_protected`, and since this is the anti-cheat op that is a
+live question rather than a settled one. Filed as **C-281**; deliberately not fixed here.
 
 Docs updated: C-249's `git_tree_policy.rs` module doc now points at this outcome and states both
 answers; `crates/flux-flow/docs/ops-reference.md` and `website/docs/language/ops.md` carry the

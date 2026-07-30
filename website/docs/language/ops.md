@@ -420,11 +420,15 @@ every member benchmark's pass rate and check rate to be at least the baseline's.
 config after each worker run, so a round cannot raise its own score by editing what measures it.
 `git_reset` carries the `Destructive` risk tier and is approval-gated accordingly. It is a *blanket*
 restore — `reset --hard` plus an unscoped `git clean -fd`, which deletes untracked files outright —
-so it runs only against a snapshot that proves it accounts for the whole tree: the snapshot must
-carry `clean: true` (set by `git_snapshot`, and only after it found the tree clean) and its `head`
-must be an ancestor of the current `HEAD`. Anything else is refused with the working tree listed and
-left untouched. `guard_protected` needs no such check: every path it restores or removes is an
-explicit pathspec filtered through the protected set, so it cannot reach outside it.
+so it checks a precondition first, guaranteeing that **a reset can only rewind within this
+checkout's own line of history**. The snapshot must carry `clean: true` (set by `git_snapshot`, and
+only after it found the tree clean) and its `head` must be an ancestor of the current `HEAD`; a
+snapshot from a divergent line is refused with the working tree listed and left untouched. Only the
+second check is unforgeable — nothing verifies that a `clean: true` payload really came from
+`git_snapshot` — so treat the guarantee as "rewinds stay on this line", not "only this round's work
+is discarded". `guard_protected` needs no such check on *which paths* it may touch: every path it
+restores or removes is an explicit pathspec filtered through the protected set, so it cannot reach
+outside it.
 
 ## Cutting a release
 
