@@ -2,7 +2,7 @@
 id: L-96
 title: Canonical control headers use call-like named options
 pillar: Language
-status: in-progress
+status: done
 priority: 17
 epic: flux-notation-workbench
 design: docs/designs/flux-notation-workbench.md

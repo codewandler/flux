@@ -2,7 +2,7 @@
 id: C-297
 title: "A skill-discovery test reads the operator's real `~/.claude/skills`, so a concurrent session reds the gate"
 pillar: Core
-status: in-progress
+status: done
 priority: 6
 areas: [flux-runtime]
 note: "found by C-213 and hit by the coordinator on the very next merge — `discover_skills` walks the machine's real home, so any agent session writing there fails an unrelated test and the log looks like a code regression"

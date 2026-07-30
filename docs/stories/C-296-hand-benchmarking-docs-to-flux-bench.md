@@ -2,7 +2,7 @@
 id: C-296
 title: "Hand the public benchmarking story to flux-bench, and make `flux eval` point at it"
 pillar: Core
-status: in-progress
+status: done
 priority: 3
 areas: [flux-cli, website]
 note: "flux-bench is a released standalone benchmark (v0.1.0, 19 stories done) that runs the SHIPPED flux binary; flux's own eval docs still read as the primary path while the pillar behind them is on hold"
