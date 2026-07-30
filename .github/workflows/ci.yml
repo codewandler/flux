@@ -189,6 +189,74 @@ jobs:
       - name: Live smoke gate — CLI shape guard, confined (hermetic, no credentials)
         run: FLUX_SANDBOX=require FLUX_BIN="$PWD/target/debug/flux" ./scripts/smoke-live.sh --shapes
 
+  portable-wasm:
+    name: the portable core still compiles to wasm32 and matches the native engine
+    runs-on: ubuntu-latest
+    # C-279. C-271 landed a real proof — the portable core built for `wasm32-unknown-unknown`, run
+    # inside a Wasm engine, asserted byte-identical to the native engine on the same `.flux` source —
+    # and then nothing ran it. `crates/flux-lang/tests/wasm_parity.rs` skips (loudly to stdout, but it
+    # PASSES) when the module is absent, and the module is absent on every machine without the wasm32
+    # target installed, which is every runner. So `cargo test --workspace` was green and the proof was
+    # decorative. Measured, at 80bb31fa: with a deliberate off-by-one in `flux_eval`'s packed return,
+    # `cargo test --workspace` exited 0 while this lane's command failed 2 of 4 parity tests.
+    #
+    # `FLUX_PORTABLE_WASM_REQUIRED=1` is what makes the lane incapable of passing vacuously: it turns
+    # "the module is not built" from a skip into a failure. `scripts/build-portable-wasm.sh` already
+    # sets it on the `cargo test` it runs; declaring it here as well states the requirement in the
+    # workflow itself, so it survives someone simplifying the script and cannot be lost silently.
+    #
+    # WHERE THIS RUNS: every push and every pull request, with NO `paths:` filter. That is deliberate
+    # and it is the expensive-looking half of this story, so the reasoning is written down:
+    #
+    #   * The regression class is feature unification, not file locality. C-271's actual blocker was
+    #     tokio's `net` feature pulling `mio`, which refuses to compile on wasm32. Cargo unifies
+    #     features across the workspace, so ANY crate adding a feature to a shared dependency can
+    #     break the wasm build. A filter on `crates/flux-lang/**` would skip precisely the PR that
+    #     did it.
+    #   * A correct filter would have to enumerate flux-lang's transitive closure plus the root
+    #     manifest and the lockfile — a second, hand-maintained copy of the dependency graph with
+    #     nothing checking it. It rots silently, and its failure mode is "the lane did not run on the
+    #     PR that broke the thing" — the exact defect class this story exists to close, and the
+    #     fourth instance of it this cycle after C-248, C-259 and C-264.
+    #   * The cost does not buy enough to justify that risk. This job is parallel and is nowhere near
+    #     the critical path: `check` builds, tests, clippies and smoke-tests the whole workspace,
+    #     while this builds one crate's dependency closure twice (wasm32 release + host debug test)
+    #     and runs four tests. Its marginal effect on CI wall-clock is ~0; it costs runner-minutes on
+    #     a job far smaller than `check`. Locally the wasm half is ~15s wall / ~71s CPU from a clean
+    #     wasm target dir with a warm registry.
+    #   * The repo has already made this trade once and written it down: `website.yml` refuses a
+    #     `paths:` filter on main because "a stale public page that contradicts the tree costs more"
+    #     than the couple of minutes it saves. Same trade, same answer.
+    env:
+      FLUX_PORTABLE_WASM_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain (with the wasm32 target)
+        # Pinned for the same reason as the `check` job — see its comment. `targets:` is what retires
+        # `rustup target add wasm32-unknown-unknown` as a manual prerequisite: the build script
+        # refuses to run (exit 2) rather than falling back to a host build, so a target this action
+        # failed to install fails the lane instead of quietly proving nothing.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # No `cargo fetch --locked` step here, unlike `check` and `sandbox-backend`: theirs exists for
+      # flux-codegate's layering lint, which resolves `cargo metadata --locked --offline` over the
+      # full lockfile closure. This lane never runs that lint, so the fetch would be cost with no
+      # corresponding failure to prevent.
+
+      # Builds the `wasm32-unknown-unknown` cdylib and then runs the parity assertion against the
+      # artifact it just produced. The script is the single recorded command (C-271 acceptance), so
+      # the lane deliberately calls it rather than re-spelling its steps — a lane that drifted from
+      # the command developers run by hand would be gating something nobody else executes.
+      - name: Build the portable core for wasm32 and assert parity with the native engine
+        run: ./scripts/build-portable-wasm.sh
+
   plugins:
     name: plugins workspace · build · test · clippy · fmt
     runs-on: ubuntu-latest
