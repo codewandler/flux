@@ -15,7 +15,25 @@
 
 ## [Unreleased]
 
+### New
+
+- Work boards can now be read as structured data, not just as text. A flow can loop over board items
+  and branch on their state, filter to the items that are ready *and* not blocked by unfinished
+  dependencies in a single call, and read back the notes it left on an item. This is what lets a flow
+  coordinate work across a board instead of only reporting on it.
+
 ### Fixed
+
+- Pulling a value out of text and feeding it straight into another step now works. Extracting a
+  single match (or taking the first, last, or first-non-empty value) used to hand back the text
+  wrapped in quote characters, so the next step received something like `"1.2.3"` instead of `1.2.3`
+  and typically failed on it.
+
+### Action needed
+
+- If you have a flow that worked around the quoting above — for example by stripping quote characters
+  from an extracted value before using it — remove that workaround, or it will now strip real
+  characters. Flows that simply passed the value along need no change and start working.
 
 - Forking a session that can't be forked no longer leaves a stray empty session behind. Previously
   the new session was created before flux checked whether the original could be forked at all, so a

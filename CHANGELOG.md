@@ -6,7 +6,39 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A board the model can actually reason over — `board.query`, `board.comments` (C-236).** First
+  story (F1) of the **fleet loop** epic, and its lynchpin: board ops returned human prose with no
+  `output_schema`, and `render_compact` exposed only `title`/`state`/`attempts`/`assignee` — dropping
+  `runner`, `task_id`, `depends_on`, `repo` and `evidence` — so Flux-Lang's `each`/`match` had nothing
+  typed to iterate and **a coordinator Program could not reason over its own board.** `board.query`
+  now returns typed rows under a real `output_schema`; `board.list` keeps its prose rendering for
+  humans, because `query` is additive rather than a rename. A `depends_on` filter makes "ready and
+  unblocked" a single call, treating an item as blocked until every dependency is `done` — **an absent
+  dependency is not `done`** — and the semantics are single-sourced as `DependencyMatch` in
+  `flux-datasource` beside `validate_transition`, then pinned for *both* backends in the shared
+  contract suite, because the port is the contract. `board.comments` reads back what `board.comment`
+  wrote, added to `WorkBoard` **with no default body** so a backend cannot silently omit it.
+  `depends_on` is also now reserved in `validate_board_contract` alongside `state`, so a backend
+  redeclaring it cannot be authoritative on `list` while being shadowed on `query`.
+
 ### Fixed
+
+- **String-returning selection ops returned their JSON encoding, so their output could not feed
+  another op (C-235).** `regex_extract` (single match), `first`, `last` and `coalesce` returned
+  `"1.2.3"` *with the quote characters*, which is why the 0.36.0 fleet smoke test re-derived `runner`
+  off the board correctly and then died in `fleet.status` with `invalid url: relative URL without a
+  base`. The defect was in the ops, not the engine, and the evidence is worth keeping: the
+  interpreter binds op output verbatim as `Value::String(result.content)`
+  (`crates/flux-lang/src/runtime.rs:466`) and never JSON-parses a bare string, while C-10's
+  string-leaf re-parse rule re-reads only objects and arrays — so array/object-returning ops
+  (`split`, `regex_extract all:true`, `keys`) were already correct and only the *selecting* ops
+  leaked. Fixed uniformly through one shared helper rather than four times.
+  **Breaking, stated plainly:** those four ops' string results lose their JSON quotes. No
+  compensating consumer existed in-repo — the only quoted expectations were the ops' own unit tests,
+  and `examples/bitcoin-price.flux` was silently wrong rather than compensating, so it becomes correct
+  with no source change.
 
 - **A refused fork left an empty orphan session behind (C-211).** Both fork sites — `Session::fork`
   in the SDK and `flux session fork` in the CLI — minted the child session *first* and only then ran

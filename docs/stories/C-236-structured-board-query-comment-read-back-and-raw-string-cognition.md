@@ -2,7 +2,7 @@
 id: C-236
 title: "Structured `board.query`, a `board.comments` read-back, and raw-string cognition results"
 pillar: Core
-status: in-progress
+status: done
 epic: fleet-loop
 areas: [flux-capabilities, flux-datasource, flux-tools, flux-sdk]
 note: "Milestone-1 story F1 of the fleet-loop plan: a coordinator Program cannot reason over a board it can only read as prose. Also fixes C-235."
