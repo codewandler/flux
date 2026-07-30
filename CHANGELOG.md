@@ -6,6 +6,42 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Guarded IO has a port a non-syscall backend can implement (C-269).** ⚠ **Breaking for out-of-tree
+  `flux_plugin::SystemSource` implementors** — that published trait's signature changed; external
+  *callers* still compile. `flux-system::System` was a concrete struct whose guarded operations were
+  inherent methods, so nothing could substitute a non-native backend. There are now three narrow ports —
+  `GuardedEnv`, `GuardedProcess`, `GuardedHostFiles` — with the native `System` as first implementor and
+  the **consumer** declaring its own bundle rather than a god trait.
+  The story asked whether that widens what the direct-IO lint can see past, and the answer is yes:
+  before this, the type system structurally guaranteed exactly one guarded-IO implementation, because
+  the seam returned a concrete `Arc<System>`. A type can now satisfy `GuardedProcess` while enforcing
+  none of argv-only / pinned-cwd / cleared-env / capped-output, and that is inherent to a substitutable
+  backend. So the widening was **closed rather than reported**: a whole-tree gate,
+  `no_unreviewed_guarded_port_backend_outside_system`, with a single-use allowance list holding only
+  flux-system's native impls — and it resolves renamed imports, grouped and module renames, and rename
+  chains to a fixed point, so a rename cannot mint a fresh unreviewed identity.
+  The traits are deliberately **unsealed** and `port.rs` says so: an out-of-repo Wasm embedder is the
+  point, and such a crate could already spawn processes itself. Inside flux the invariant is mechanically
+  enforced; outside it the consumer takes responsibility. The workspace-confined file family stays
+  unported for now.
+
+- **The SQLite driver is an opt-out feature on both paths to the engine (C-274).** With it off,
+  `cargo tree -p codewandler-flux-flow --no-default-features -e normal -i rusqlite` reports nothing,
+  where it previously reported two normal paths. The default build is unchanged and still SQLite-backed.
+  The non-obvious part: `default-features = false` on a **member** manifest is silently ignored by cargo
+  for a workspace-inherited dependency, so gating the two crates' own manifests looks complete and moves
+  nothing — the line has to sit on the root `[workspace.dependencies]` entry, with members opting back
+  in. Feature-off is a real store, not a stub: `EventBackend` is crate-private, so an embedder could
+  supply nothing, and the new driver-free backend is held to all 44 shared conformance bodies.
+  `in_memory` switches backend rather than disappearing.
+  ⚠ **Minor signal for consumers who already pinned `default-features = false`:** they previously got
+  the SQLite backend and `EventStore::open` anyway, because the crate had no features to switch off.
+  They now get neither — a compile error for `open`, and silently a forgetful store for `in_memory`.
+  No in-repo consumer is affected, and the version script cannot catch this because the crate rides the
+  workspace version.
+
 ### Fixed
 
 - **Both sides of the fail-closed sandbox switch are now proven in CI (C-266).** C-262's fail-closed

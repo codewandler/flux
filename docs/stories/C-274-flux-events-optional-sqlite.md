@@ -2,7 +2,7 @@
 id: C-274
 title: "Make flux-events' SQLite dependency optional — the actual `wasm32` prerequisite"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 epic: portable-wasm-runtime
 design: docs/designs/portable-wasm-runtime.md
@@ -85,8 +85,18 @@ So C-271 inherits no SQLite work. The blockers it still owns are the ones the de
 — it guards only the independently-versioned protocol line, and both crates inherit
 `[workspace.package].version`. The change is additive for a default-features consumer (new default-on
 feature, new `EventStore::ephemeral()`); the only surface that moves is `EventStore::open` /
-`FlowStore::open` / `SqliteState` becoming feature-conditional, which cannot affect anyone today because
-the feature did not exist to switch off. Workspace-version crates move at the release cut.
+`FlowStore::open` / `SqliteState` becoming feature-conditional.
+
+**⚠ Corrected by review — the sentence that stood here was wrong.** It claimed this "cannot affect
+anyone today because the feature did not exist to switch off". The *switch* did exist: at the merge base
+`crates/flux-events/Cargo.toml` had no `default` key at all (this diff **adds** `default = ["sqlite"]`)
+while `rusqlite.workspace = true` was unconditional. So an external consumer who already wrote
+`default-features = false` previously got the SQLite backend **and** `EventStore::open`, and after this
+change gets neither — **loud** for `open` (a compile error), **silent** for `in_memory()`, which turns
+from durable into forgetful. No in-repo consumer is affected, and
+`check-crate-versions.sh` structurally cannot catch it because flux-events rides
+`[workspace.package].version`. It is therefore a **minor signal for the next release cut**, recorded in
+the CHANGELOG rather than left to the version script.
 
 ## Notes
 

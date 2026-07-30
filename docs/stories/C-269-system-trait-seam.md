@@ -2,7 +2,7 @@
 id: C-269
 title: "A `System` trait — give guarded IO a seam a non-native backend can implement"
 pillar: Core
-status: in-progress
+status: done
 priority: 4
 epic: portable-wasm-runtime
 design: docs/designs/portable-wasm-runtime.md
