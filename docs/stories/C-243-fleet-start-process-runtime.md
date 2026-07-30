@@ -2,7 +2,7 @@
 id: C-243
 title: "`fleet.start` + `ProcessRuntime` — flux never spawns flux, so no wave can be larger than one"
 pillar: Core
-status: in-progress
+status: done
 priority: 4
 epic: fleet-loop
 design: docs/designs/fleet-loop.md

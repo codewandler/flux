@@ -6,6 +6,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`fleet.start` — flux can start a flux worker, so a wave can be larger than one (C-243).** A new
+  `AgentRuntime` port with `ProcessRuntime`/`ExternalRuntime`, plus `fleet.start`, `fleet.worker_status`
+  and `fleet.stop`. Until now flux never spawned flux, and `FlowEngine`'s turn gate means one worker
+  serves one turn — so no wave could exceed one. This is the prerequisite for parallelism, not a
+  speed-up. A worker is a guarded child process confined to a checkout that may sit **outside** the
+  workspace root (which is what `fleet.isolate` produces), reached over a returned endpoint, resumable
+  through a returned context id, and bounded: one generation deep by default and 16 workers wide, a bound
+  a worker cannot raise for itself.
+  ⚠ **`fleet.start` refuses when the OS sandbox is active without network access**, and that refusal is
+  the point: a wrapped worker binds its port inside its own network namespace, so it would announce
+  itself and be unreachable while reporting `live`. Set `FLUX_SANDBOX_NET=1` for a coordinator that
+  starts workers. ⚠ **Reaching the returned endpoint needs `--allow-private-net`** — it is a loopback
+  address, and flux does not trust loopback implicitly. Both are named in the op's own description and
+  result rather than left to be discovered.
+  Three blocking defects were found by review before this landed, each of which would have shipped
+  broken: the op could not accept the very worktree `fleet.isolate` returns, because it resolved the path
+  through the write-path resolver while that allocator deliberately works outside every workspace root;
+  the worker was silently unreachable under the unattended posture; and a worker's own catalog contained
+  `fleet.start` with auto-approval, so one operator approval fanned out without bound.
+
 ### Changed
 
 - **Guarded IO has a port a non-syscall backend can implement (C-269).** ⚠ **Breaking for out-of-tree
