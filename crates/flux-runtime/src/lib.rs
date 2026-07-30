@@ -17,6 +17,9 @@ pub use fn_tool::{tool_fn, FnTool};
 mod agent_runtime;
 pub use agent_runtime::{AgentRuntime, Worker, WorkerSpec, WorkerState, WorkerStatus};
 
+mod limits;
+pub use limits::{ConcurrencyRefusal, ResourceLimits, DEFAULT_TOOL_CALL_QUEUE_TIMEOUT};
+
 pub mod context;
 pub mod metadata;
 
@@ -2419,6 +2422,10 @@ pub struct ExecutionEnvironment {
     /// per-agent-target executors, both derived from one template) install the same resolved set
     /// without a second matching implementation.
     disabled_ops: HashSet<String>,
+    /// The host's resource ceilings (C-290), installed on every executor this environment derives.
+    /// The concurrency ceiling is a shared handle, so a surface that mints a fresh executor per run
+    /// (`FlowClient::build_executor`) still counts against one runtime-wide budget.
+    resource_limits: ResourceLimits,
 }
 
 impl ExecutionEnvironment {
@@ -2443,6 +2450,7 @@ impl ExecutionEnvironment {
             workspace: None,
             exact_context: None,
             disabled_ops: HashSet::new(),
+            resource_limits: ResourceLimits::new(),
         }
     }
 
@@ -2471,6 +2479,7 @@ impl ExecutionEnvironment {
             workspace: None,
             exact_context: Some(context),
             disabled_ops: HashSet::new(),
+            resource_limits: ResourceLimits::new(),
         }
     }
 
@@ -2575,8 +2584,24 @@ impl ExecutionEnvironment {
         &self.disabled_ops
     }
 
+    /// Install the host's resource ceilings (C-290) — a bound on simultaneously executing tool
+    /// calls and on retained result bytes. Every executor this environment derives shares them, so
+    /// the concurrency ceiling bounds the *runtime*, not one executor.
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
+    }
+
+    /// The resource ceilings this environment installs on derived executors.
+    pub fn resource_limits(&self) -> &ResourceLimits {
+        &self.resource_limits
+    }
+
     /// Build the guarded executor. No ambient path lookup or policy defaulting occurs here.
     pub fn into_executor(mut self) -> Executor {
+        // Cloned (not moved) before the rest of `self` is consumed below; the concurrency ceiling
+        // rides an `Arc`, so the clone shares the budget rather than forking it.
+        let limits = self.resource_limits.clone();
         let context = match self.exact_context.take() {
             Some(context) => context,
             None => {
@@ -2605,6 +2630,7 @@ impl ExecutionEnvironment {
         )
         .with_hooks(self.hooks)
         .with_disabled_ops(self.disabled_ops)
+        .with_resource_limits(limits)
     }
 }
 
@@ -3021,8 +3047,9 @@ pub struct Executor {
     /// identity + canonical input JSON + input-schema fingerprint + the invalidation-domain
     /// generation below. Sits AFTER the whole authorization → approval envelope in
     /// [`Executor::dispatch_outcome`], so a hit is served only to a caller the op is *currently*
-    /// admissible for; only redacted, successful results are stored.
-    op_cache: Mutex<HashMap<u64, ToolResult>>,
+    /// admissible for; only redacted, successful results are stored. Bounded by entry count and
+    /// — when the host set one (C-290) — by retained bytes.
+    op_cache: Mutex<limits::OpCache>,
     /// The invalidation-domain generation: every dispatch carrying a non-`Read` effect (a
     /// workspace/process/network mutation — conservatively, anything that could change what a
     /// read observes) starts a new generation. Keys embed the generation, so all older entries
@@ -3041,6 +3068,11 @@ pub struct Executor {
     /// still the actual security control and wins if the two ever disagree; this never widens what a
     /// call may do, only what is offered.
     disabled_ops: HashSet<String>,
+    /// The host's resource ceilings (C-290): simultaneously executing tool calls, and retained
+    /// result bytes. Unbounded by default. Shared — not copied — with every other executor derived
+    /// from the same [`ExecutionEnvironment`], so the concurrency ceiling is a property of the
+    /// *runtime* rather than of one executor instance.
+    limits: ResourceLimits,
 }
 
 /// Holds an approved-plan scope open. While alive, [`Executor::dispatch`] skips the per-op approval
@@ -3092,7 +3124,10 @@ pub struct DispatchOutcome {
     /// excluded — hook denials are meant to stay retryable/repairable rather than a terminal
     /// authorization refusal, exactly as before this flag existed (hook denials never matched the
     /// old prefix heuristic either, since their wording is `` `{op}` blocked by hook `` , not
-    /// `` `{op}` denied by `` ).
+    /// `` `{op}` denied by `` ). A [`ResourceLimits`] concurrency refusal (C-290) is excluded for
+    /// the same reason and more strongly: it is *transient by construction* — the identical call
+    /// succeeds once a slot frees — so marking it `denied` would make `retry`/`loop` give up on a
+    /// call that is merely queued behind others.
     pub denied: bool,
     /// Monotonic phase attribution measured inside the safety envelope.
     pub timing: OperationTiming,
@@ -3247,14 +3282,34 @@ impl Executor {
             plan_scope: AtomicU32::new(0),
             destructive_scope: Mutex::new(Vec::new()),
             trust_all: AtomicBool::new(false),
-            op_cache: Mutex::new(HashMap::new()),
+            op_cache: Mutex::new(limits::OpCache::default()),
             cache_gen: AtomicU64::new(0),
             dispatch_seq: AtomicU64::new(1),
             cache_enabled: std::env::var("FLUX_OP_CACHE")
                 .map(|v| v != "off" && v != "0")
                 .unwrap_or(true),
             disabled_ops: HashSet::new(),
+            limits: ResourceLimits::new(),
         }
+    }
+
+    /// Install the host's resource ceilings (C-290). Assembling through
+    /// [`ExecutionEnvironment::with_resource_limits`] is the normal door — it installs the same
+    /// ceilings on every executor it derives, which is what makes the concurrency budget shared.
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The resource ceilings this executor enforces.
+    pub fn resource_limits(&self) -> &ResourceLimits {
+        &self.limits
+    }
+
+    /// Bytes of tool results currently retained in the deterministic op cache — what
+    /// [`ResourceLimits::max_retained_result_bytes`] bounds.
+    pub fn retained_result_bytes(&self) -> usize {
+        self.op_cache.lock().unwrap().bytes()
     }
 
     /// Enable/disable the deterministic read-only op cache (overrides `FLUX_OP_CACHE`).
@@ -3965,7 +4020,7 @@ impl Executor {
         if let Some(key) = cache_key {
             // Bind the hit FIRST so the op_cache guard drops before the evidence lock below —
             // holding both pinned a lock order and serialized hits (review, 2026-07-09).
-            let hit = self.op_cache.lock().unwrap().get(&key).cloned();
+            let hit = self.op_cache.lock().unwrap().get(&key);
             if let Some(mut hit) = hit {
                 // Re-redact against the CURRENT secret set: a secret registered after this
                 // result was stored must not replay in cleartext (review, 2026-07-09).
@@ -3982,6 +4037,44 @@ impl Executor {
                 return self.finish_dispatch(name, started, approval_wait, None, hit, false);
             }
         }
+
+        // 4⅝. C-290: the host's concurrency ceiling. Taken here — AFTER the approval gate, so a
+        //    slot is never held while a human is being asked, and BEFORE the execution, so "in
+        //    flight" means exactly "inside `Tool::execute`". A cache hit returned above without
+        //    taking one: replaying a stored result is not an execution.
+        //
+        //    A saturated runtime REFUSES rather than queueing indefinitely. The refusal is not
+        //    `denied`: unlike an authorization refusal it is transient, so `retry`/`loop` are right
+        //    to try it again, exactly like a pre-tool hook's deny.
+        let slot = match self.limits.acquire_execution_slot().await {
+            Ok(slot) => slot,
+            Err(refusal) => {
+                self.ctx.evidence.lock().unwrap().record(Observation::new(
+                    "tool_concurrency_refused",
+                    Phase::Turn,
+                    json!({
+                        "tool": name,
+                        "limit": refusal.limit,
+                        "waited_ms": refusal.waited.as_millis().min(u64::MAX as u128) as u64,
+                    }),
+                ));
+                self.record_dispatch_event(
+                    "tool.concurrency_refused",
+                    dispatch,
+                    name,
+                    started,
+                    json!({ "limit": refusal.limit }),
+                );
+                return self.finish_dispatch(
+                    name,
+                    started,
+                    approval_wait,
+                    None,
+                    ToolResult::error(refusal.message(name)),
+                    false,
+                );
+            }
+        };
 
         // 4¾. A mutating dispatch starts a new invalidation generation BEFORE its IO runs (and
         //    clears again after, step 7): pre-bumping closes the window where a concurrent read
@@ -4002,7 +4095,18 @@ impl Executor {
         // reporter together; task-local scoping isolates concurrent turns and restores an outer
         // scope after a nested dispatch.
         let execution = tool.execute(&self.ctx, params);
-        let executed = scope_runtime_turn(self.ctx.runtime_turn_context(), execution).await;
+        // `slot.hold` marks the concurrency slot as held for the duration of this execution, so a
+        // nested dispatch from inside the tool is exempt from the same ceiling rather than queueing
+        // behind the execution it is part of (a deadlock at N=1).
+        let executed = slot
+            .hold(scope_runtime_turn(
+                self.ctx.runtime_turn_context(),
+                execution,
+            ))
+            .await;
+        // Free the slot the moment the execution is over — cache maintenance below is not
+        // "in flight" and must not hold the ceiling.
+        drop(slot);
         let result = match executed {
             Ok(mut r) => {
                 // Redact BOTH faces: the view can carry file content / diffs that include secrets.
@@ -4042,12 +4146,13 @@ impl Executor {
             self.op_cache.lock().unwrap().clear();
         } else if let Some(key) = cache_key {
             if !result.is_error {
-                let mut cache = self.op_cache.lock().unwrap();
-                // Crude but safe size bound: a full reset never affects correctness, only reuse.
-                if cache.len() >= 512 {
-                    cache.clear();
-                }
-                cache.insert(key, result.clone());
+                // Crude but safe size bounds — entry count, plus the host's retained-byte ceiling
+                // (C-290): a full reset never affects correctness, only reuse.
+                self.op_cache.lock().unwrap().insert(
+                    key,
+                    result.clone(),
+                    self.limits.max_retained_result_bytes(),
+                );
             }
         }
         // The op ran (successfully or not) — never a `denied` outcome, no matter what its own
