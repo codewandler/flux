@@ -2,7 +2,7 @@
 id: C-240
 title: "Board correctness — a retry leaves a stale runner, nothing can write evidence, and Blocked→Ready bypasses the attempt budget"
 pillar: Core
-status: ready
+status: in-progress
 priority: 2
 epic: fleet-loop
 design: docs/designs/fleet-loop.md

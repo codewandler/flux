@@ -200,17 +200,27 @@ is no workspace signal that could gate them honestly. `.flux/groups.toml` can st
 the group. A worker behind `flux serve`'s required bearer token is not yet reachable — the token is
 operator configuration that does not exist yet.
 
-## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch` / `.query` / `.comments`)
+## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch` / `.query` / `.comments` / `.reassign` / `.record_evidence`)
 
 A `WorkBoard` (A-113) is the write-capable sibling of a live datasource: a typed item state machine
 behind a swappable backend. A program binds one with a `board:<backend>` datasource declaration
-(A-131) and the host generates nine operations under the declaration's name — so `datasource board`
-yields `board.list` … `board.comments`. Five of them write, and each reports a concrete
+(A-131) and the host generates eleven operations under the declaration's name — so `datasource board`
+yields `board.list` … `board.record_evidence`. Seven of them write, and each reports a concrete
 `<domain>/item/<id>` permission subject (`<domain>/item/new` for `create`); `transition` validates
 the edge before writing, so an illegal edge errors and performs no write. `record_dispatch` (A-130)
 binds an item to the worker running it — the `runner` address and the worker-minted `task_id` — which
 is what makes the board a run registry rather than only a task list; it writes those two fields and
 nothing else, so `transition` stays the single entry point into the state machine.
+
+**Both edges into `ready` are retries** (C-240): `failed → ready` and `blocked → ready` each
+increment `attempts` — so a rework budget cannot be laundered by cycling through `blocked` — and each
+clears `runner`/`task_id`, because the run they name is dead and the next sweep would otherwise chase
+it. `assignee` is never cleared by either: the holder outlives one run. `reassign` (C-240) is the one
+path that *does* move the holder — a deliberately forcible takeover for when the holder is gone,
+where `claim` conflicts — and it drops the previous worker's `runner`/`task_id` on the same grounds.
+`record_evidence` (C-240) appends a weak locator for an artifact produced against the item, either a
+`url` or an `entity` + `entity_id` pair (`commit`/`<sha>`); naming both, or neither, is an error, and
+re-recording an artifact the item already cites changes nothing. Neither op moves the state machine.
 
 `list` renders prose for a human and pages with a cursor. **`query` (C-236) is its machine-readable
 sibling**: one page as a bare JSON array of typed rows under a real `output_schema`, so

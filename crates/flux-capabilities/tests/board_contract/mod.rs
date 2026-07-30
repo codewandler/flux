@@ -11,7 +11,7 @@
 //! What it pins, in the order the assertions run:
 //!
 //! 1. `create` starts an item at `Ready` with zero attempts and a backend-assigned id.
-//! 2. The whole legal spine succeeds, and `Failed → Ready` increments `attempts`.
+//! 2. The whole legal spine succeeds, and both edges into `Ready` increment `attempts`.
 //! 3. **An illegal edge errors and writes nothing** — the item is byte-identical afterwards.
 //! 4. `claim` is idempotent for the same assignee and conflicts for a different one.
 //! 5. `list` honours the declared page bounds and the `state` filter.
@@ -22,6 +22,12 @@
 //!    (C-236).
 //! 9. **A dispatch is recorded durably** — `runner` + `task_id` survive a fresh read, replace on a
 //!    redispatch, and never move the state machine (A-130).
+//! 10. **A retry leaves the next sweep no dead run to chase** — both edges into `Ready` clear
+//!     `runner`/`task_id` and spend an attempt, and neither touches `assignee` (C-240).
+//! 11. **`reassign` moves an item off a holder that is gone**, so the new holder's `claim` succeeds
+//!     where it would have conflicted (C-240).
+//! 12. **`record_evidence` appends durably**, de-duplicates a replay, and moves nothing else
+//!     (C-240).
 
 #![allow(dead_code)]
 
@@ -29,7 +35,7 @@ use std::sync::Arc;
 
 use codewandler_flux_capabilities::WorkBoard;
 use flux_datasource::board::{Item, ItemDraft, State};
-use flux_datasource::live::{FilterValue, Filters, PageRequest};
+use flux_datasource::live::{FilterValue, Filters, PageRequest, Reference};
 use flux_runtime::ToolContext;
 
 /// Drive one backend through the full port contract. Panics with the failing property.
@@ -52,6 +58,9 @@ pub async fn assert_work_board_contract(board: Arc<dyn WorkBoard>, ctx: &ToolCon
     comment_and_get_agree_about_which_items_exist(&board, ctx).await;
     comments_read_back_what_comment_wrote(&board, ctx).await;
     a_dispatch_is_recorded_and_survives_a_fresh_read(&board, ctx).await;
+    a_retry_clears_the_run_identity_and_keeps_the_holder(&board, ctx).await;
+    reassign_moves_the_holder_so_the_new_one_can_claim(&board, ctx).await;
+    recorded_evidence_accumulates_and_survives_a_fresh_read(&board, ctx).await;
 }
 
 fn draft(title: &str) -> ItemDraft {
@@ -114,20 +123,31 @@ async fn the_legal_spine_succeeds_and_a_retry_increments_attempts(
         "the bump persists"
     );
 
-    // Lap 2 — blocked, requeued, then a rejected review. Blocking is not a retry.
+    // Lap 2 — blocked, then requeued. Diverting *to* `Blocked` is free; coming back out of it
+    // re-opens work already attempted, so it spends an attempt exactly as `Failed → Ready` does
+    // (C-240). Otherwise a story could cycle through `blocked` forever and never exhaust its budget.
+    walk(board, ctx, &item.id, &[State::Blocked], 1).await;
+    let requeued = board
+        .transition(ctx, &item.id, State::Ready)
+        .await
+        .expect("Blocked -> Ready requeues the work");
+    assert_eq!(
+        requeued.attempts, 2,
+        "requeueing from blocked spends an attempt: the budget cannot be laundered through `blocked`"
+    );
+
+    // Lap 3 — a rejected review is the other retry edge, from the far end of the spine.
     walk(
         board,
         ctx,
         &item.id,
         &[
-            State::Blocked,
-            State::Ready,
             State::Claimed,
             State::InProgress,
             State::Review,
             State::Failed,
         ],
-        1,
+        2,
     )
     .await;
     assert_eq!(
@@ -136,11 +156,11 @@ async fn the_legal_spine_succeeds_and_a_retry_increments_attempts(
             .await
             .unwrap()
             .attempts,
-        2,
-        "the second retry bumps again"
+        3,
+        "the second failure bumps again"
     );
 
-    // Lap 3 — all the way to the terminal state.
+    // Lap 4 — all the way to the terminal state.
     walk(
         board,
         ctx,
@@ -151,7 +171,7 @@ async fn the_legal_spine_succeeds_and_a_retry_increments_attempts(
             State::Review,
             State::Done,
         ],
-        2,
+        3,
     )
     .await;
 }
@@ -576,5 +596,224 @@ async fn a_dispatch_is_recorded_and_survives_a_fresh_read(
             .await
             .is_err(),
         "recording a dispatch against an absent id is an error"
+    );
+}
+
+/// **C-240's failing-first property.** The retry window is worse than a stale runner: `assignee` is
+/// never cleared by any code path, so a re-claim by worker-b over a `runner`/`task_id` still naming
+/// worker-a's dead run makes the coordinator report progress on a process that no longer exists.
+///
+/// So the sweep after a retry must see **no run**: the retry edges clear `runner` and `task_id`,
+/// while `assignee` — the holder, which outlives one run — is deliberately left alone.
+async fn a_retry_clears_the_run_identity_and_keeps_the_holder(
+    board: &Arc<dyn WorkBoard>,
+    ctx: &ToolContext,
+) {
+    let item = create(board, ctx, "retried after a dead run").await;
+    board.claim(ctx, &item.id, "worker-a").await.expect("claim");
+    board
+        .transition(ctx, &item.id, State::InProgress)
+        .await
+        .expect("claimed -> in_progress");
+    board
+        .record_dispatch(ctx, &item.id, "https://worker-a.internal:8787", "t_dead")
+        .await
+        .expect("dispatch to worker-a");
+    board
+        .transition(ctx, &item.id, State::Failed)
+        .await
+        .expect("the worker died in flight");
+
+    let retried = board
+        .transition(ctx, &item.id, State::Ready)
+        .await
+        .expect("failed -> ready is the retry edge");
+    // What the next sweep reads, from the board alone — not what the transition happened to return.
+    let swept = fetch(board, ctx, &item.id).await;
+    assert_eq!(retried, swept, "the retry's answer is what the board holds");
+    assert_eq!(
+        swept.runner, None,
+        "a retried item must carry no runner; the next sweep would chase a dead run"
+    );
+    assert_eq!(
+        swept.task_id, None,
+        "a retried item must carry no task_id; the handle names a run that is gone"
+    );
+    assert_eq!(
+        swept.assignee.as_deref(),
+        Some("worker-a"),
+        "the holder outlives the run and must NOT be cleared"
+    );
+    assert_eq!(swept.attempts, 1, "the retry still spends an attempt");
+
+    // Requeueing from `blocked` re-opens work already attempted too, so it spends an attempt and
+    // drops the run identity on exactly the same terms — otherwise the rework budget could be
+    // laundered through `blocked` forever.
+    board
+        .claim(ctx, &item.id, "worker-a")
+        .await
+        .expect("re-claim after the retry");
+    board
+        .record_dispatch(ctx, &item.id, "https://worker-a.internal:8787", "t_dead_2")
+        .await
+        .expect("dispatch again");
+    board
+        .transition(ctx, &item.id, State::Blocked)
+        .await
+        .expect("claimed -> blocked");
+    board
+        .transition(ctx, &item.id, State::Ready)
+        .await
+        .expect("blocked -> ready requeues");
+    let requeued = fetch(board, ctx, &item.id).await;
+    assert_eq!(
+        requeued.attempts, 2,
+        "blocked -> ready spends an attempt: the budget cannot be laundered through `blocked`"
+    );
+    assert_eq!(requeued.runner, None, "requeueing drops the dead run too");
+    assert_eq!(requeued.task_id, None);
+    assert_eq!(requeued.assignee.as_deref(), Some("worker-a"));
+}
+
+/// C-240: the third defect. `claim` conflicts for anyone but the holder — correct for two live
+/// workers, and a dead end for the sweep's actual case, where the holder is a corpse and the work
+/// has to move. `reassign` is the one path that moves it, and it takes the dead run with it.
+async fn reassign_moves_the_holder_so_the_new_one_can_claim(
+    board: &Arc<dyn WorkBoard>,
+    ctx: &ToolContext,
+) {
+    let item = create(board, ctx, "handed to a live worker").await;
+    board.claim(ctx, &item.id, "worker-a").await.expect("claim");
+    board
+        .record_dispatch(ctx, &item.id, "https://worker-a.internal:8787", "t_dead")
+        .await
+        .expect("dispatch to worker-a");
+
+    // The state of the board today: worker-b cannot take it, however dead worker-a is.
+    let conflict = board
+        .claim(ctx, &item.id, "worker-b")
+        .await
+        .expect_err("claim still refuses a non-holder");
+    assert!(
+        conflict.to_string().contains("worker-a"),
+        "the conflict names the holder, got: {conflict}"
+    );
+
+    let moved = board
+        .reassign(ctx, &item.id, "worker-b")
+        .await
+        .unwrap_or_else(|error| panic!("reassign failed: {error}"));
+    let fresh = fetch(board, ctx, &item.id).await;
+    assert_eq!(moved, fresh, "reassign's answer is what the board holds");
+    assert_eq!(
+        fresh.assignee.as_deref(),
+        Some("worker-b"),
+        "reassign must move the holder"
+    );
+    assert_eq!(
+        fresh.runner, None,
+        "the previous worker's run must not survive the handover"
+    );
+    assert_eq!(fresh.task_id, None);
+    assert_eq!(
+        fresh.state,
+        State::Claimed,
+        "reassign is a field write; the state machine is `transition`'s job alone"
+    );
+    assert_eq!(fresh.attempts, 0, "reassign is not a retry");
+
+    // The property the story names: the same claim that conflicted now succeeds.
+    let claimed = board
+        .claim(ctx, &item.id, "worker-b")
+        .await
+        .expect("the new holder may claim what it now holds");
+    assert_eq!(claimed.assignee.as_deref(), Some("worker-b"));
+    // ...and the worker it was taken from is now the one that conflicts.
+    assert!(
+        board.claim(ctx, &item.id, "worker-a").await.is_err(),
+        "the old holder has no standing after a reassign"
+    );
+
+    // Repeating a reassign rewrites the same fields — which is what `Idempotency::Conditional`
+    // claims of it.
+    assert_eq!(
+        board.reassign(ctx, &item.id, "worker-b").await.unwrap(),
+        fetch(board, ctx, &item.id).await
+    );
+    assert!(
+        board
+            .reassign(ctx, "definitely-not-an-item", "worker-b")
+            .await
+            .is_err(),
+        "reassigning an absent id is an error"
+    );
+}
+
+/// C-240: the second defect. `Item::evidence` round-tripped through every backend from the start and
+/// nothing could write it — the same hole A-130 closed for `runner`/`task_id`. It is the
+/// diff-handoff channel, so what a worker records a coordinator must be able to read off the board.
+async fn recorded_evidence_accumulates_and_survives_a_fresh_read(
+    board: &Arc<dyn WorkBoard>,
+    ctx: &ToolContext,
+) {
+    let commit = Reference::Entity {
+        entity: "commit".to_string(),
+        id: "deadbeef".to_string(),
+    };
+    let pull_request = Reference::Url {
+        url: "https://example.test/pr/1".to_string(),
+    };
+
+    let item = create(board, ctx, "produces artifacts").await;
+    assert!(item.evidence.is_empty(), "a new item cites nothing");
+
+    let recorded = board
+        .record_evidence(ctx, &item.id, commit.clone())
+        .await
+        .unwrap_or_else(|error| panic!("record_evidence failed: {error}"));
+    assert_eq!(recorded.evidence, vec![commit.clone()]);
+    board
+        .record_evidence(ctx, &item.id, pull_request.clone())
+        .await
+        .expect("a second artifact appends rather than replacing");
+
+    // The only assertion that matters: a reader holding nothing but the board sees both, in order.
+    let fresh = fetch(board, ctx, &item.id).await;
+    assert_eq!(
+        fresh.evidence,
+        vec![commit.clone(), pull_request.clone()],
+        "evidence must be durable and append-ordered, not returned-only"
+    );
+    assert_eq!(
+        fresh.state,
+        State::Ready,
+        "recording evidence is a field write; the state machine is `transition`'s job alone"
+    );
+    assert_eq!(fresh.attempts, 0, "recording evidence is not a retry");
+    assert_eq!(fresh.assignee, None, "recording evidence claims nothing");
+
+    // Replaying a rework's record must not double the list.
+    board
+        .record_evidence(ctx, &item.id, commit.clone())
+        .await
+        .expect("re-recording the same artifact succeeds");
+    assert_eq!(
+        fetch(board, ctx, &item.id).await.evidence,
+        vec![commit, pull_request],
+        "an artifact already cited is not appended twice"
+    );
+
+    assert!(
+        board
+            .record_evidence(
+                ctx,
+                "definitely-not-an-item",
+                Reference::Url {
+                    url: "https://example.test/pr/2".to_string()
+                }
+            )
+            .await
+            .is_err(),
+        "recording evidence against an absent id is an error"
     );
 }

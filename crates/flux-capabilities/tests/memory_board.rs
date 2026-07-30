@@ -65,8 +65,9 @@ async fn an_illegal_transition_leaves_the_item_byte_identical() {
     );
 }
 
+/// The two edges into `ready` are the only ones that move the counter — and both of them do (C-240).
 #[tokio::test]
-async fn a_retry_is_the_only_edge_that_moves_the_attempt_counter() {
+async fn only_an_edge_that_reopens_work_moves_the_attempt_counter() {
     let board = MemoryBoard::new();
     let ctx = ctx();
     let item = board
@@ -115,6 +116,26 @@ async fn a_retry_is_the_only_edge_that_moves_the_attempt_counter() {
             .unwrap()
             .attempts,
         2
+    );
+
+    // And so does a lap through `blocked` — the hole C-240 closed. Diverting into `blocked` is
+    // free; coming back out of it is the retry.
+    assert_eq!(
+        board
+            .transition(&ctx, &item.id, State::Blocked)
+            .await
+            .unwrap()
+            .attempts,
+        2
+    );
+    assert_eq!(
+        board
+            .transition(&ctx, &item.id, State::Ready)
+            .await
+            .unwrap()
+            .attempts,
+        3,
+        "the rework budget cannot be laundered through `blocked`"
     );
 }
 

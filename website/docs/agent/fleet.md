@@ -31,7 +31,8 @@ datasource board
 
 The declaration's **name becomes the operation prefix**, so the example above generates
 `board.list`, `board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
-`board.record_dispatch`, `board.query` and `board.comments`.
+`board.record_dispatch`, `board.query`, `board.comments`, `board.reassign` and
+`board.record_evidence`.
 
 `board:` is its own namespace on purpose. `markdown` already means *a directory of documents to index
 as knowledge*, so a board that happens to be stored as markdown files needs a name that cannot be
@@ -73,8 +74,11 @@ cannot leave an item half-moved.
 assignee succeeds, a claim by anyone else is a conflict. That is what makes it safe for several
 coordinators to work one board.
 
-The `failed` → `ready` retry edge increments the item's attempt count. No other edge touches it, so
-"how many times has this been tried" stays trustworthy.
+Both edges into `ready` are retry edges: `failed` → `ready` and `blocked` → `ready` each increment
+the item's attempt count and clear its `runner` and `task_id`, because the run those named is over. No
+other edge touches any of the three, so "how many times has this been tried" stays trustworthy — and
+a rework budget cannot be laundered by cycling an item through `blocked`. The `assignee` is left
+alone: a holder outlives one run.
 
 An item can also declare what it waits on. `board.create` takes `depends_on` — the ids of items that
 must reach `done` first — and `board.get` shows them. Dependencies do not block a `transition` on

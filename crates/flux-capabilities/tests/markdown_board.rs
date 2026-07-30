@@ -11,6 +11,9 @@
 //!    write and the read-back through one `Arc<dyn WorkBoard>`, so it cannot tell durable bytes from
 //!    an in-memory cache; this backend is the first that can, by dropping the writer entirely and
 //!    reopening the directory. That is what makes the board a restart-survivable run registry.
+//! 5. **Recorded evidence round-trips through the file format, and a retry leaves no dead run in the
+//!    bytes** (C-240) — the same argument as (4), applied to the two fields C-240 made writable and
+//!    clearable.
 
 mod board_contract;
 
@@ -21,7 +24,7 @@ use std::sync::Arc;
 
 use codewandler_flux_capabilities::{MarkdownBoard, WorkBoard};
 use flux_datasource::board::{ItemDraft, State};
-use flux_datasource::live::{FilterValue, Filters, PageRequest};
+use flux_datasource::live::{FilterValue, Filters, PageRequest, Reference};
 use flux_runtime::ToolContext;
 use flux_system::{System, Workspace};
 
@@ -525,5 +528,112 @@ async fn a_recorded_dispatch_survives_dropping_the_board_that_wrote_it() {
         item_dir_entries(&root),
         vec![format!("{id}.md")],
         "the record left no staging debris behind"
+    );
+}
+
+/// **C-240, the markdown half of the Acceptance:** evidence must round-trip through *the file
+/// format*, not merely through the port. The shared suite drives write and read-back through one
+/// `Arc<dyn WorkBoard>`, so it cannot tell frontmatter from an in-memory `Vec`; this drops the writer
+/// and reopens the directory, which is the only way to prove the TOML round-trip A-114's format
+/// promised and nothing could exercise.
+///
+/// The retry half rides along, because it is the same file: a retried item must leave no `runner` or
+/// `task_id` **in the bytes**, while `assignee` stays in them.
+#[tokio::test]
+async fn recorded_evidence_and_a_cleared_run_survive_dropping_the_board_that_wrote_it() {
+    let root = fixture_dir("markdown-board-evidence");
+    let ctx = coordinator_ctx();
+
+    let id = {
+        let board = MarkdownBoard::new(&root).unwrap();
+        let item = board.create(&ctx, draft("produces a diff")).await.unwrap();
+        board.claim(&ctx, &item.id, "worker-1").await.unwrap();
+        board
+            .transition(&ctx, &item.id, State::InProgress)
+            .await
+            .unwrap();
+        board
+            .record_dispatch(&ctx, &item.id, "https://worker-1.internal:8787", "t_1")
+            .await
+            .unwrap();
+        board
+            .record_evidence(
+                &ctx,
+                &item.id,
+                Reference::Entity {
+                    entity: "commit".into(),
+                    id: "deadbeef".into(),
+                },
+            )
+            .await
+            .unwrap();
+        board
+            .record_evidence(
+                &ctx,
+                &item.id,
+                Reference::Url {
+                    url: "https://example.test/pr/1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // The worker died; the sweep fails it back to the queue.
+        board
+            .transition(&ctx, &item.id, State::Failed)
+            .await
+            .unwrap();
+        board
+            .transition(&ctx, &item.id, State::Ready)
+            .await
+            .unwrap();
+        item.id
+    };
+    // Nothing of the writer survives but the bytes under `root`.
+
+    let path = root.join("items").join(format!("{id}.md"));
+    let stored = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !stored.contains("worker-1.internal") && !stored.contains("t_1"),
+        "a retried item must leave no dead run in its bytes: {stored}"
+    );
+    assert!(
+        stored.contains("worker-1"),
+        "the holder is not the run and must survive the retry: {stored}"
+    );
+
+    let restarted = MarkdownBoard::new(&root).unwrap();
+    let recovered = restarted
+        .get(&coordinator_ctx(), &id)
+        .await
+        .unwrap()
+        .expect("the restarted board must still see the item");
+    assert_eq!(
+        recovered.evidence,
+        vec![
+            Reference::Entity {
+                entity: "commit".into(),
+                id: "deadbeef".into(),
+            },
+            Reference::Url {
+                url: "https://example.test/pr/1".into(),
+            },
+        ],
+        "both artifacts round-tripped through the frontmatter, in the order recorded"
+    );
+    assert_eq!(recovered.runner, None);
+    assert_eq!(recovered.task_id, None);
+    assert_eq!(recovered.assignee.as_deref(), Some("worker-1"));
+    assert_eq!(recovered.attempts, 1);
+
+    // Reassign through a restarted board: the durable holder moves and no run comes with it.
+    let moved = restarted.reassign(&ctx, &id, "worker-2").await.unwrap();
+    assert_eq!(moved.assignee.as_deref(), Some("worker-2"));
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("worker-2"), "{after}");
+    assert!(!after.contains("worker-1\""), "{after}");
+    assert_eq!(
+        item_dir_entries(&root),
+        vec![format!("{id}.md")],
+        "neither write left staging debris behind"
     );
 }

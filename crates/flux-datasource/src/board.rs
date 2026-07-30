@@ -48,8 +48,9 @@ pub enum State {
 /// The model sees this on `<domain>.transition`, so it can pick a legal target instead of guessing
 /// and getting refused. Kept beside [`EDGES`] so the two cannot drift.
 pub const EDGE_DIAGRAM: &str = "ready → claimed → in_progress → review → done; \
-     {ready, claimed, in_progress, review} → blocked → ready; \
-     {in_progress, review} → failed → ready (attempts += 1); done is terminal";
+     {ready, claimed, in_progress, review} → blocked; {in_progress, review} → failed; \
+     {blocked, failed} → ready re-opens the work (attempts += 1, runner/task_id cleared); \
+     done is terminal";
 
 /// The board's legal edges, as a single table.
 ///
@@ -61,7 +62,10 @@ pub const EDGE_DIAGRAM: &str = "ready → claimed → in_progress → review →
 ///   resume mid-flight, because the worker that held it is long gone.
 /// * **Failure and retry** — `InProgress` or `Review` may divert to `Failed` (a worker that dies is
 ///   in `InProgress`, which is exactly what the sweep journey inspects; a rejected review is
-///   `Review → Failed`), and `Failed → Ready` re-opens the work with [`Item::attempts`] bumped.
+///   `Review → Failed`), and `Failed → Ready` re-opens the work.
+///
+/// Both edges *into* `Ready` re-open work already attempted, so both are retries and carry
+/// [`is_retry`]'s two obligations — see there for what a backend owes on them.
 ///
 /// `Done` is terminal.
 ///
@@ -186,14 +190,33 @@ pub fn validate_transition(from: State, to: State) -> Result<(), IllegalTransiti
     }
 }
 
-/// Whether the edge `from → to` is a **retry**, and therefore obliges the backend to increment
-/// [`Item::attempts`].
+/// Whether the edge `from → to` **re-opens work already attempted**, and therefore obliges the
+/// backend to do two things and no others.
 ///
-/// Only `Failed → Ready` is: it is the one edge that re-opens work already attempted, and
-/// `attempts` is what lets the coordinator detect an item that keeps failing instead of retrying it
-/// forever.
+/// The two retry edges are `Failed → Ready` and `Blocked → Ready` — the only edges that put work
+/// back on the queue that has been on it before. `Ready` means "available to be picked up", and
+/// neither edge resumes mid-flight: the worker that held the item is long gone by the time either is
+/// taken.
+///
+/// The obligations, which every backend owes and the shared contract suite pins for all of them:
+///
+/// 1. **Increment [`Item::attempts`].** That counter *is* the rework budget — a coordinator parks an
+///    item once it is spent. `Blocked → Ready` counting was C-240's fourth defect: while it did not,
+///    an item could cycle `ready → blocked → ready` forever and never exhaust the budget, so the
+///    budget could be laundered through `blocked`.
+/// 2. **Clear [`Item::runner`] and [`Item::task_id`].** They name the run that was executing the
+///    item, and that run is dead. Leaving them was C-240's first defect and the worse half of it:
+///    since **no** code path clears [`Item::assignee`], a re-claim by a second worker over a stale
+///    record leaves the coordinator reporting progress on a process that no longer exists.
+///    [`Item::assignee`] is deliberately **not** cleared — the holder outlives one run, and the
+///    retried item stays owned by whoever owned it.
+///
+/// Nothing else moves on a retry edge, and no other edge touches any of the three fields.
 pub const fn is_retry(from: State, to: State) -> bool {
-    matches!((from, to), (State::Failed, State::Ready))
+    matches!(
+        (from, to),
+        (State::Failed, State::Ready) | (State::Blocked, State::Ready)
+    )
 }
 
 /// The reserved `depends_on` list filter (C-236).
@@ -459,15 +482,25 @@ mod tests {
         }
     }
 
+    /// C-240: both edges that put already-attempted work back on the queue are retries. Pinned
+    /// exhaustively because the budget is only enforceable if `blocked` cannot launder it.
     #[test]
-    fn only_the_failed_to_ready_edge_counts_as_a_retry() {
+    fn both_edges_that_reopen_work_count_as_a_retry() {
         for from in State::ALL {
             for to in State::ALL {
                 assert_eq!(
                     is_retry(from, to),
-                    from == State::Failed && to == State::Ready,
+                    to == State::Ready && matches!(from, State::Failed | State::Blocked),
                     "{from} -> {to}"
                 );
+            }
+        }
+        // Every retry edge is a legal edge — a rule about an impossible transition would be dead.
+        for from in State::ALL {
+            for to in State::ALL {
+                if is_retry(from, to) {
+                    assert!(validate_transition(from, to).is_ok(), "{from} -> {to}");
+                }
             }
         }
     }

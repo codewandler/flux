@@ -112,7 +112,7 @@ The typed state machine is the reason the port is purpose-built:
 
 ```
 spine:    Ready → Claimed → InProgress → Review → Done   (Done is terminal)
-blocked:  {Ready, Claimed, InProgress, Review} → Blocked → Ready
+blocked:  {Ready, Claimed, InProgress, Review} → Blocked → Ready  (retry, attempts += 1)
 failed:   {InProgress, Review} → Failed → Ready          (retry, attempts += 1)
 ```
 
