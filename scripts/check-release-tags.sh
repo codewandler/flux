@@ -23,18 +23,38 @@
 #
 # So: audit the whole tag/release fleet on every push to main, not just the tag being cut.
 #
+# One asymmetry the audit has to respect (C-252): the tag workflow and this push-triggered audit are
+# INDEPENDENT workflows, so anything reasoning about "the state after a release" from a push-triggered
+# job is racing by construction. A cut pushes `main`, then pushes the tag; the Release object appears
+# only when the tag workflow's promote job finishes. On the 0.36.0 cut the audit ran at 22:23:05 and
+# v0.36.0's Release published at 22:24:19 — 74 seconds of correct-but-useless red on `main`. A red
+# that heals itself every release is worse than no check, because it teaches people to ignore red.
+#
+# The fix is NOT "skip the newest tag" — that would blind this check to precisely the N-001 shape it
+# exists to catch — and NOT a sleep or a tag-age grace window, which only guesses. Instead each gap is
+# classified from evidence: `classify_release_gap` asks whether that tag's Release workflow run is
+# still in flight. Not `completed` -> a NOTE, not a failure. Completed without a Release, or no run at
+# all -> drift, and it fails. The two cases print differently, so CI output distinguishes "waiting on
+# a build" from "genuinely missing" without anyone re-running anything.
+#
 #   scripts/check-release-tags.sh              # audit the live repo
 #   scripts/check-release-tags.sh --repo o/n   # audit another repo
-#   scripts/check-release-tags.sh --self-test  # prove the check catches both defects
+#   scripts/check-release-tags.sh --self-test  # prove the check catches both defects, and that an
+#                                              # in-flight cut is distinguished from drift
 #
 # Exit 0 clean, 1 real drift (a failure), 2 the GitHub state could not be read (a logged skip —
-# a GitHub outage must not turn main red).
+# a GitHub outage must not turn main red). An unreadable workflow-run list is exit 2 like any other
+# unreadable GitHub state: never silently a pass, never conflated with real drift.
 #
 set -uo pipefail
 
 REPO="${GITHUB_REPOSITORY:-codewandler/flux}"
 
 fail() { printf '\033[31mFAIL\033[0m %s\n' "$1" >&2; }
+
+# Field separator for the internal `kind<TAB>detail` records passed between the functions below. A
+# literal tab in source is invisible and gets eaten by editors and by `cargo fmt`-adjacent tooling.
+TAB="$(printf '\t')"
 
 # Tags that deliberately have no GitHub Release. Each one is a tag whose build never produced a
 # complete asset set, so a Release object for it would advertise a download that does not exist —
@@ -78,6 +98,52 @@ newest_version() {
   printf '%s\n' "$1" | grep -v '^$' | sort -V | tail -1
 }
 
+# The Release-workflow runs for tag $2 in repo $1, one `status<TAB>conclusion` record per run, newest
+# first. Tag-triggered runs carry the tag name in `head_branch`, which is what `?branch=` filters on.
+# Returns non-zero when the API could not be read at all — the caller turns that into exit 2, never
+# into a pass or a failure.
+release_runs_for_tag() {
+  gh api "repos/$1/actions/runs?branch=$2&per_page=100" \
+    --jq '.workflow_runs[]
+          | select(.path == ".github/workflows/release.yml")
+          | "\(.status)\t\(.conclusion // "")"' 2>/dev/null
+}
+
+# Classify a version tag ($1) that has no Release, from its Release-workflow runs ($2, as produced by
+# `release_runs_for_tag`). Prints one `kind<TAB>detail` record; kind is `pending` or `missing`.
+#
+# C-252: this is the only reason a tag may lack a Release without failing, and it is decided on
+# evidence rather than on a sleep or on tag age. The tag workflow and this push-triggered audit are
+# INDEPENDENT workflows, so any push to `main` during a cut observes the tag before its Release
+# object exists — measured on the 0.36.0 cut, the audit ran 74 seconds before the Release published.
+#
+# The deferral is deliberately narrow: only a run that has not reached `completed` defers. A run that
+# finished without publishing a Release — whatever its conclusion — and a tag with no run at all are
+# both drift and both fail. That keeps the N-001 shape (the workflow died before the verify step)
+# caught on the newest tag, which "skip the newest tag" would have blinded.
+#
+# $1 is the tag. It is deliberately not interpolated into the detail text — the caller already
+# prefixes each line with the tag, and nothing here may branch on *which* tag it is.
+classify_release_gap() {
+  local runs="$2" run_status conclusion newest_conclusion='' saw_run=''
+  while IFS="$TAB" read -r run_status conclusion; do
+    [ -n "$run_status" ] || continue
+    saw_run=1
+    if [ "$run_status" != "completed" ]; then
+      printf 'pending%sits Release workflow run is %s\n' "$TAB" "$run_status"
+      return 0
+    fi
+    [ -n "$newest_conclusion" ] || newest_conclusion="${conclusion:-unknown}"
+  done <<<"$runs"
+
+  if [ -z "$saw_run" ]; then
+    printf 'missing%sno Release workflow run exists for it at all\n' "$TAB"
+  else
+    printf 'missing%sits newest Release workflow run finished (%s) without publishing a Release\n' \
+      "$TAB" "$newest_conclusion"
+  fi
+}
+
 # --self-test: the failing-first proof. Synthetic fleets drive both rules with no network, so the
 # check is shown to catch each defect rather than merely to pass on today's clean repo.
 if [ "${1:-}" = "--self-test" ]; then
@@ -114,7 +180,54 @@ v0.11.1')"
   [ "$(newest_version 'v0.9.3')" != "$(newest_version 'v0.33.0')" ] || {
     fail "self-test: v0.9.3 and v0.33.0 compared equal"; exit 1; }
 
-  printf '\033[32mPASS\033[0m self-test: tag/release drift and a stale latest pointer are both detectable\n'
+  # Rule 3 (C-252) — a gap is only drift once nothing is still building it. The newest tag having no
+  # Release *while its Release workflow is in flight* is the normal, correct mid-cut observation; the
+  # same tag with a finished-and-failed run, or with no run at all, is the N-001 shape and must still
+  # fail. These two cases are the whole point: the fix must NOT be "skip the newest tag".
+  classify() { IFS="$TAB" read -r st_kind st_detail <<<"$(classify_release_gap "$1" "$2")"; }
+
+  classify 'v0.33.0' "in_progress$TAB"
+  [ "$st_kind" = "pending" ] || {
+    fail "self-test: an in-flight Release workflow for the newest tag classified as '$st_kind', want 'pending'"
+    exit 1; }
+  case "$st_detail" in
+    *in_progress*) ;;
+    *) fail "self-test: the pending verdict must name the run state a human can act on, got '$st_detail'"; exit 1 ;;
+  esac
+  # Every non-terminal run state GitHub can report, not just in_progress.
+  for state in queued waiting requested pending; do
+    classify 'v0.33.0' "$state$TAB"
+    [ "$st_kind" = "pending" ] || {
+      fail "self-test: a '$state' Release workflow classified as '$st_kind', want 'pending'"; exit 1; }
+  done
+  # A re-run: the first attempt failed, the current one is still going. Still pending.
+  classify 'v0.33.0' "queued$TAB
+completed${TAB}failure"
+  [ "$st_kind" = "pending" ] || {
+    fail "self-test: a re-run in flight after a failed attempt classified as '$st_kind', want 'pending'"; exit 1; }
+
+  # The N-001 shape — the workflow died before it published the Release. Nothing is in flight, so
+  # this is drift and it fails, newest tag or not.
+  classify 'v0.33.0' "completed${TAB}failure"
+  [ "$st_kind" = "missing" ] || {
+    fail "self-test: a tag whose Release workflow FAILED classified as '$st_kind', want 'missing' (N-001)"
+    exit 1; }
+  case "$st_detail" in
+    *failure*) ;;
+    *) fail "self-test: the drift verdict must name why the run produced no Release, got '$st_detail'"; exit 1 ;;
+  esac
+  # A tag whose workflow never ran at all is also drift, not a deferral — otherwise "no evidence"
+  # would read as "still building" forever.
+  classify 'v0.33.0' ''
+  [ "$st_kind" = "missing" ] || {
+    fail "self-test: a tag with no Release workflow run at all classified as '$st_kind', want 'missing'"
+    exit 1; }
+  # A run that completed successfully yet left no Release is drift too (it published nothing).
+  classify 'v0.33.0' "completed${TAB}success"
+  [ "$st_kind" = "missing" ] || {
+    fail "self-test: a completed run with no Release classified as '$st_kind', want 'missing'"; exit 1; }
+
+  printf '\033[32mPASS\033[0m self-test: tag/release drift, a stale latest pointer, and an in-flight cut are all distinguishable\n'
   exit 0
 fi
 
@@ -126,7 +239,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     -h|--help)
-      sed -n '2,30p' "$0" >&2
+      sed -n '2,47p' "$0" >&2
       exit 0
       ;;
     *)
@@ -150,9 +263,34 @@ releases="$(printf '%s\n' "$all_releases" | version_tags)"
 status=0
 
 missing="$(missing_releases "$tags" "$releases" "$ALLOWED_WITHOUT_RELEASE")"
-if [ -n "$missing" ]; then
+
+# Split the gaps into "still being published" and "drift" (C-252). Only reached when there is at
+# least one gap, so a clean fleet costs no extra API calls.
+pending_report=''
+drift_report=''
+for tag in $missing; do
+  runs="$(release_runs_for_tag "$REPO" "$tag")" || {
+    printf 'skip: could not read workflow runs for %s in %s\n' "$tag" "$REPO" >&2; exit 2; }
+  IFS="$TAB" read -r kind detail <<<"$(classify_release_gap "$tag" "$runs")"
+  case "$kind" in
+    pending) pending_report="$pending_report  $tag — $detail"$'\n' ;;
+    *)       drift_report="$drift_report  $tag — $detail"$'\n' ;;
+  esac
+done
+
+# Printed even on a pass, and always distinct from the FAIL block, so CI output says which case this
+# run took: "waiting on a build" reads nothing like "genuinely missing".
+if [ -n "$pending_report" ]; then
+  printf '\033[33mNOTE\033[0m version tag(s) with no Release *yet*, still being published — not drift:\n' >&2
+  printf '%s' "$pending_report" >&2
+  printf 'The Release workflow creates the Release object asynchronously after the tag is pushed, and\n' >&2
+  printf 'it is a separate workflow from this one, so a push to main during a cut always sees this.\n' >&2
+  printf 'Re-audited on the next push; if the run fails, the tag is reported as drift from then on.\n' >&2
+fi
+
+if [ -n "$drift_report" ]; then
   fail "version tag(s) with no GitHub Release — users installing these versions get nothing:"
-  printf '  %s\n' $missing >&2
+  printf '%s' "$drift_report" >&2
   printf 'Backfill with the runbook in crates/flux-sdk/PUBLISHING.md (note: --latest=false), or add\n' >&2
   printf 'the tag to ALLOWED_WITHOUT_RELEASE in this script with the reason it is unshippable.\n' >&2
   status=1
@@ -169,8 +307,11 @@ if [ -n "$newest" ] && [ "$latest" != "$newest" ]; then
 fi
 
 if [ "$status" -eq 0 ]; then
-  printf '\033[32mPASS\033[0m %s: %s released version tag(s), /releases/latest = %s\n' \
-    "$REPO" "$(printf '%s\n' "$releases" | grep -vc '^$')" "$latest"
+  publishing=''
+  [ -z "$pending_report" ] ||
+    publishing=", $(printf '%s' "$pending_report" | grep -c .) still publishing"
+  printf '\033[32mPASS\033[0m %s: %s released version tag(s)%s, /releases/latest = %s\n' \
+    "$REPO" "$(printf '%s\n' "$releases" | grep -vc '^$')" "$publishing" "$latest"
 fi
 
 exit "$status"

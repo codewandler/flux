@@ -90,10 +90,13 @@ pub(super) fn apply_workspace_access_env(cli: &Cli, cfg: &flux_config::Config) {
 ///
 /// When the resolved mode isn't `off`, this also runs the startup preflight: `require` + no usable
 /// backend is a hard startup error (fail-closed, mirroring `Sandbox::ensure_available`'s per-spawn
-/// backstop); otherwise an unavailable backend prints ONE styled warning naming the reason, in the
-/// same style as this function's `--allow-all-paths` warning above. A *nested* run (already confined
-/// by an outer flux sandbox → `Backend::AlreadyConfined`) is neither: it satisfies `require` and is
-/// not "unavailable", so no warning fires.
+/// backstop); otherwise an `on`-mode run with no usable backend emits its **resolved-posture
+/// disclosure** (C-217) — ONE styled stderr line naming the posture that actually took effect
+/// (running unconfined) and the reason, in the same style as this function's `--allow-all-paths`
+/// warning above. The line is composed and latched once-per-process at L2 by
+/// `Sandbox::take_posture_disclosure`. A *nested* run (already confined by an outer flux sandbox →
+/// `Backend::AlreadyConfined`) gets neither: it satisfies `require` and is genuinely confined, so
+/// only a dim informational note fires.
 pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<()> {
     use flux_system::sandbox::SandboxMode;
 
@@ -205,13 +208,21 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
         .ensure_available()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if !sandbox.is_active() {
-        if let Some(reason) = sandbox.reason() {
-            eprintln!(
-                "{} OS sandbox requested but unavailable ({reason}): shell/plugin processes run \
-                 WITHOUT OS-level confinement this run. Set `[sandbox] require = true` (or \
-                 `FLUX_SANDBOX=require`) to fail closed instead.",
-                style::red("warning:")
-            );
+        // C-217: the resolved-posture disclosure. The line itself is composed at L2, next to the
+        // facts that determine it (`Sandbox::posture_disclosure`), and latched there to once per
+        // process; this surface decides only *where* it goes.
+        //
+        // It goes to stderr, unconditionally — including under `--stream-json`/`--json`. That is the
+        // channel this CLI already reserves for diagnostics precisely so stdout stays machine-
+        // parseable ("the stream is `jq`-parseable with no filtering", see `--stream-json`'s docs),
+        // so the disclosure structurally cannot corrupt a parse. It is deliberately NOT suppressed
+        // under machine-readable modes: an unattended/daemon deployment is exactly the operator who
+        // must not be left believing they are confined when they are not, and suppression would also
+        // mean enumerating every per-subcommand `--json` flag — a list that silently rots. Eval runs
+        // stay quiet on their own merits: nothing turns the sandbox on for them, and an `Off`
+        // sandbox has nothing to disclose.
+        if let Some(disclosure) = sandbox.take_posture_disclosure() {
+            eprintln!("{} {disclosure}", style::red("warning:"));
         } else if sandbox.confined_by_parent() {
             // A nested flux run: an outer sandbox already confines this whole process tree, so this
             // process adds no wrapper of its own — that satisfies `require` and is NOT an
