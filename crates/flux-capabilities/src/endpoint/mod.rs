@@ -30,7 +30,7 @@ use flux_core::{Error, Result};
 use flux_plugin::ReferenceResolver;
 use flux_secret::endpoint::{EndpointRecord, EndpointRef, ResolvedEndpoint, SourceKind};
 use flux_secret::{Kind, Material, Ref, Scheme};
-use flux_system::System;
+use flux_system::port::GuardedEnv;
 
 /// A session-scoped registry of endpoint records, keyed by reference id. Discovered endpoints live
 /// in memory; imported ones are also persisted (weak-ref only) to `~/.flux/endpoints.toml`.
@@ -201,17 +201,20 @@ struct Persisted {
 }
 
 /// Resolves **named** (config/manifest-default) endpoint references from a host-side binding map,
-/// and materializes `env`-scheme credential references through the guarded [`System`]. This is the
+/// and materializes `env`-scheme credential references through the guarded environment. This is the
 /// static first link in the resolver chain; discovery + cross-plugin (`kubernetes`-scheme)
 /// resolution layer on top in the broker (D-26/D-27).
 pub struct StaticResolver {
-    system: Arc<System>,
+    /// An `env`-scheme credential reference is an environment read and nothing else, so this depends
+    /// on the narrowest guarded port rather than on a whole `System` (C-269). The native
+    /// [`System`](flux_system::System) coerces into it at every call site.
+    system: Arc<dyn GuardedEnv>,
     bindings: HashMap<String, EndpointRef>,
 }
 
 impl StaticResolver {
     /// `bindings` maps a named reference (`"sql.endpoint"`) to its config-bound [`EndpointRef`].
-    pub fn new(system: Arc<System>, bindings: HashMap<String, EndpointRef>) -> Self {
+    pub fn new(system: Arc<dyn GuardedEnv>, bindings: HashMap<String, EndpointRef>) -> Self {
         Self { system, bindings }
     }
 
@@ -270,9 +273,9 @@ impl ReferenceResolver for StaticResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flux_system::Workspace;
+    use flux_system::{System, Workspace};
 
-    fn test_system() -> Arc<System> {
+    fn test_system() -> Arc<dyn GuardedEnv> {
         let dir = std::env::temp_dir().join(format!("flux-endpoint-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(System::new(Workspace::new(&dir).unwrap()))

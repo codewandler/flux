@@ -1046,6 +1046,81 @@ pub fn raw_project_metadata_io(src: &str) -> syn::Result<Vec<RawProjectMetadataI
     Ok(visitor.hits.into_iter().collect())
 }
 
+// ---------------------------------------------------------------------------
+// Guarded-IO port backends (C-269)
+// ---------------------------------------------------------------------------
+
+/// The `flux_system::port` traits whose implementations *are* a guarded IO backend. Implementing one
+/// is a claim to enforce the process/filesystem guarantees `System` enforces, so the set of
+/// implementors has to stay as enumerable as the set of raw `Command` constructions.
+const GUARDED_PORT_TRAITS: &[&str] = &["GuardedProcess", "GuardedHostFiles", "GuardedEnv"];
+
+/// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GuardedPortImpl {
+    pub line: usize,
+    /// The port trait's final path segment (`GuardedProcess`).
+    pub port: String,
+    /// The implementing type's final path segment (`System`), or `<generic>` for a blanket impl.
+    pub backend: String,
+}
+
+struct PortImplVisitor {
+    hits: BTreeSet<GuardedPortImpl>,
+}
+
+/// The final path segment of a type, for the shapes an `impl … for T` self-type can take. Anything
+/// that is not a plain path (a reference, tuple, generic parameter) is reported as `<generic>` so a
+/// blanket impl is still visible to the gate rather than silently dropped.
+fn self_type_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_else(|| "<generic>".to_string()),
+        _ => "<generic>".to_string(),
+    }
+}
+
+impl<'ast> Visit<'ast> for PortImplVisitor {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        if let Some((path, _)) = &item.trait_ {
+            if let Some(segment) = path.segments.last() {
+                let port = segment.ident.to_string();
+                if GUARDED_PORT_TRAITS.contains(&port.as_str()) {
+                    self.hits.insert(GuardedPortImpl {
+                        line: start_line(item.impl_token.span),
+                        port,
+                        backend: self_type_name(&item.self_ty),
+                    });
+                }
+            }
+        }
+        syn::visit::visit_item_impl(self, item);
+    }
+}
+
+/// Every production implementation of a guarded-IO port trait in `src`, `#[cfg(test)]` ones excluded.
+pub fn guarded_port_impls(src: &str) -> syn::Result<Vec<GuardedPortImpl>> {
+    let file = syn::parse_file(src)?;
+    let mut visitor = PortImplVisitor {
+        hits: BTreeSet::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.hits.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1695,6 +1770,123 @@ fn opens() {
         assert!(
             violations.is_empty(),
             "direct I/O outside flux-system in model-facing operation crates:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn port_impl_scanner_finds_production_backends_and_ignores_test_doubles() {
+        let raw = r#"
+use flux_system::port::{GuardedEnv, GuardedProcess};
+
+impl GuardedProcess for MySubstrate {}
+impl flux_system::port::GuardedEnv for MySubstrate {}
+impl SomeOtherTrait for MySubstrate {}
+
+#[cfg(test)]
+mod tests {
+    impl GuardedProcess for Double {}
+}
+
+#[cfg(test)]
+impl GuardedEnv for AnotherDouble {}
+"#;
+        let hits = guarded_port_impls(raw).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(
+            hits.iter()
+                .all(|hit| hit.backend == "MySubstrate" && hit.port.starts_with("Guarded")),
+            "only the production backends may be reported: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|hit| hit.port == "GuardedProcess"),
+            "a fully-qualified trait path must resolve by its last segment: {hits:?}"
+        );
+
+        // A blanket impl is a backend claim over every type, so it must be visible, not dropped.
+        let blanket = "impl<T: GuardedProcess> GuardedProcess for &T {}\n";
+        let hits = guarded_port_impls(blanket).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].backend, "<generic>");
+    }
+
+    /// Architecture guard (C-269): the guarded-IO port made "being a `System`" substitutable, so the
+    /// set of types that claim to *be* a guarded process/host-file/env backend must stay enumerated
+    /// exactly the way [`no_raw_process_command_outside_system`] enumerates raw command constructions.
+    ///
+    /// Without this the trait is a blind spot the older lints cannot see: they bound *syscall
+    /// construction*, never *the semantics of a guard*, so a second production backend could satisfy
+    /// `GuardedProcess` while enforcing none of the argv-only / pinned-cwd / cleared-env / capped-output
+    /// guarantees, and no gate would notice. Allowances are single-use, so a second impl of the same
+    /// port on the same type in the same file fails independently.
+    #[test]
+    fn no_unreviewed_guarded_port_backend_outside_system() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        // The reviewed backends: `flux-system`'s native delegations, and nothing else. A new entry
+        // here is a security review, not a formality — read `crates/flux-system/src/port.rs` first.
+        const ALLOW: &[(&str, &str, &str)] = &[
+            ("crates/flux-system/src/port.rs", "GuardedProcess", "System"),
+            (
+                "crates/flux-system/src/port.rs",
+                "GuardedHostFiles",
+                "System",
+            ),
+            ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
+        ];
+        let mut allowance_use = vec![0usize; ALLOW.len()];
+
+        let rs_files = workspace_source_files(repo_root);
+        assert!(
+            rs_files.len() > 20,
+            "expected to scan a representative set of source files, found {}",
+            rs_files.len()
+        );
+
+        let mut violations = Vec::new();
+        for file in &rs_files {
+            let rel = file
+                .strip_prefix(repo_root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(file).unwrap();
+            let hits = guarded_port_impls(&src).unwrap_or_else(|error| {
+                panic!("parse {} for guarded-port gate: {error}", file.display())
+            });
+            for hit in hits {
+                if let Some((index, _)) = ALLOW.iter().enumerate().find(|(_, allowed)| {
+                    allowed.0 == rel && allowed.1 == hit.port && allowed.2 == hit.backend
+                }) {
+                    allowance_use[index] += 1;
+                    if allowance_use[index] > 1 {
+                        violations.push(format!(
+                            "{rel}:{}: duplicate use of single-use allowance for {} on {}",
+                            hit.line, hit.port, hit.backend
+                        ));
+                    }
+                } else {
+                    violations.push(format!(
+                        "{rel}:{}: unreviewed guarded-IO backend — {} implemented for {}",
+                        hit.line, hit.port, hit.backend
+                    ));
+                }
+            }
+        }
+
+        for (index, count) in allowance_use.into_iter().enumerate() {
+            if count != 1 {
+                violations.push(format!(
+                    "reviewed guarded-port allowance {:?} was used {count} times (expected exactly once)",
+                    ALLOW[index]
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "guarded-IO port implemented outside the reviewed native backend:\n  {}",
             violations.join("\n  ")
         );
     }

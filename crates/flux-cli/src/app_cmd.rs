@@ -36,7 +36,7 @@ pub(super) async fn run_app_cmd(prompt: Vec<String>, flags: &AgentFlags) -> Resu
 pub(super) struct WorkspaceSystemSource(pub(super) flux_runtime::WorkspaceContext);
 
 impl flux_plugin::SystemSource for WorkspaceSystemSource {
-    fn system(&self) -> Arc<System> {
+    fn system(&self) -> Arc<dyn flux_plugin::PluginSystem> {
         self.0.active()
     }
 }
