@@ -156,11 +156,13 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         },
         ToolGroup {
             name: "fleet".into(),
-            description: "Coordinating a fleet of workers: hand a task to a remote worker without \
-                          waiting (`fleet.dispatch`), poll it (`fleet.status`), stop it \
-                          (`fleet.cancel`) — A-116 — and give one board item its own isolated \
-                          checkout to be worked in (`fleet.isolate`, C-241). The worker endpoint is \
-                          a per-call argument, not configuration, so there is no workspace signal \
+            description: "Fleet workers. Lifecycle (C-243): start a worker for one board item \
+                          (`fleet.start`), check that it is still alive (`fleet.worker_status`), \
+                          end it (`fleet.stop`). Dispatch (A-116): hand a task to a worker without \
+                          waiting (`fleet.dispatch`), poll that task (`fleet.status`), stop it \
+                          (`fleet.cancel`). Isolation (C-241): give one board item its own \
+                          checkout to be worked in (`fleet.isolate`). The worker endpoint is a \
+                          per-call argument, not configuration, so there is no workspace signal \
                           that could gate these — a predicate nothing emits would leave them \
                           registered but never advertised, which is the unreachability A-131 \
                           closed. Force-on like `cognition`; the group exists so \
@@ -173,6 +175,9 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             // costs a catalog line, and the op's own preflight — not its surfacing — is what
             // refuses that case.
             tools: names(&[
+                "fleet.start",
+                "fleet.worker_status",
+                "fleet.stop",
                 "fleet.dispatch",
                 "fleet.status",
                 "fleet.cancel",
@@ -196,6 +201,11 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             //     cannot match an existing grant and routes to approval — and an endpoint that
             //     cannot be named yields no subject at all, which forces approval rather than
             //     matching a broad one.
+            // C-243's lifecycle ops join the group on the same terms, and they need the argument most
+            // because `fleet.start` creates an OS process: it is `Risk::High` with `process.exec`
+            // authority scoped to `fleet-worker:<item>`, so a start for an item nobody has approved
+            // before cannot match an existing grant — and an unnameable worker again yields no
+            // subject at all. Advertising it is still not authority to run it.
             // So the cost of force-on is catalog size and prompt churn, not reachable authority, and
             // a workspace that wants them gone can say so in `.flux/groups.toml` without a code
             // change.

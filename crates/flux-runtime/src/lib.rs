@@ -14,6 +14,9 @@ pub use approval::{RiskApprover, DEFAULT_CONSENT_MARKER};
 mod fn_tool;
 pub use fn_tool::{tool_fn, FnTool};
 
+mod agent_runtime;
+pub use agent_runtime::{AgentRuntime, Worker, WorkerSpec, WorkerState, WorkerStatus};
+
 pub mod context;
 pub mod metadata;
 

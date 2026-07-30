@@ -250,6 +250,9 @@ reconcile them later.
 | `fleet.status` | `worker, task_id` | Read a dispatched task's current state, whether it is terminal, and its final text |
 | `fleet.cancel` | `worker, task_id` | Stop a dispatched task. An already-finished task reports that it was not cancelable |
 | `fleet.isolate` | `item` | Create branch `impl/<item>` in its own git worktree and return the checkout path — a per-item isolated workspace for one local worker. Unlike a worktree session it does not move the caller's own working root, so one call per item in a wave is legal. Requires a clean checkout and a free branch name; removing the worktree afterwards is the caller's job |
+| `fleet.start` | `item[, worktree, context_id, model]` | Start a flux worker for one board item and return the endpoint to dispatch to. `worktree` confines it to an isolated checkout; the returned context id resumes the same worker session later. Reaching the returned endpoint needs `--allow-private-net`, since it is a loopback address |
+| `fleet.worker_status` | `worker_id` | Report whether a worker is starting, live, or dead — with its exit code and the tail of its own output when it died. The worker's liveness, not a task's state |
+| `fleet.stop` | `worker_id` | Stop a worker started by `fleet.start`. An already-exited worker succeeds; an unknown worker id is an error |
 
 The `worker` address is an argument, not configuration, so it is model-reachable and gated as such.
 Every call resolves the endpoint through the same egress guard as `web.fetch` before any request,
