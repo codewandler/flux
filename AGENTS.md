@@ -53,12 +53,25 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings   # must be clean
 cargo fmt --all                                          # then commit the result
-cargo test -p flux-codegate                              # architecture layering lint
+cargo test -p flux-codegate                              # architecture + test-posture lints
 ```
 
 CI enforces all of these. Docs-only changes may use a narrower check — say explicitly in the final
 report what was and was not run. `cargo fmt --check` must also be clean in the **nested `plugins/`
 workspace** if you touched it.
+
+**Your machine is not a CI runner in one specific way: it has `bwrap`.** C-262 fails auto-approved
+and serving surfaces closed without an OS sandbox backend, so a test that spawns one and never
+declares its posture passes here and reds CI (three times over, during the 0.38.0 cut). If you added
+or changed such a spawn, run the posture CI runs in:
+
+```bash
+FLUX_BWRAP_BIN=/nonexistent/bwrap cargo test --workspace   # the no-backend side, as CI sees it
+FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend  # the with-backend side
+```
+
+`cargo test -p flux-codegate` catches the common case statically; `docs/stories/C-266-*.md` records
+exactly what that lint does and does not cover.
 
 ---
 
