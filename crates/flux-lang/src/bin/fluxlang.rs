@@ -49,6 +49,11 @@ enum Command {
         /// Path to a Flux-Lang text file; reads stdin when omitted.
         file: Option<PathBuf>,
     },
+    /// Render Flux-Lang text (from FILE, or stdin when omitted) as a Railflux ASCII dataflow diagram.
+    Rail {
+        /// Path to a Flux-Lang text file; reads stdin when omitted.
+        file: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -71,6 +76,7 @@ fn run() -> Result<()> {
         }
         Command::Render { file } => render_ast(file)?,
         Command::Compile { file } => compile_text(file)?,
+        Command::Rail { file } => rail_text(file)?,
     };
     let mut stdout = std::io::stdout();
     stdout
@@ -135,6 +141,47 @@ fn compile_text(file: Option<PathBuf>) -> Result<String> {
     compile_src(&src)
 }
 
+/// Project canonical Flux source as **Railflux** — the 7-bit ASCII dataflow diagram (L-95). Shares
+/// `compile`'s module parse entry, so malformed source reports exactly the same parser diagnostic
+/// here as it does there; this subcommand is output-only and never reads Railflux back.
+///
+/// A module that is a program has no single flow, so every top-level flow and journey flow it
+/// declares is rendered in declaration order, blank-line separated. Composite `op` declarations are
+/// operations rather than flows and are not projected.
+fn rail_src(src: &str) -> Result<String> {
+    let diagrams: Vec<String> = match flux_lang::program::Module::parse_str(src)
+        .map_err(|e| Error::Other(format!("parse error: {e}")))?
+    {
+        flux_lang::program::Module::Flow(ast) => vec![rail_one(&ast)],
+        flux_lang::program::Module::Program(prog) => prog
+            .flows
+            .iter()
+            .chain(prog.journeys.iter().map(|j| &j.flow))
+            .map(rail_one)
+            .collect(),
+    };
+    if diagrams.is_empty() {
+        return Err(Error::Other(
+            "no flow to render: the module declares no top-level flow or journey".to_string(),
+        ));
+    }
+    Ok(diagrams.join("\n"))
+}
+
+/// One flow's diagram — colored on a TTY, plain otherwise (so piped output stays byte-canonical).
+fn rail_one(ast: &DraftAst) -> String {
+    if std::io::stdout().is_terminal() {
+        flux_lang::render::render_rail_styled(ast, &ANSI)
+    } else {
+        flux_lang::render::render_rail(ast)
+    }
+}
+
+fn rail_text(file: Option<PathBuf>) -> Result<String> {
+    let src = read_source(file)?;
+    rail_src(&src)
+}
+
 /// A small ANSI palette for terminal rendering.
 const ANSI: Palette = Palette {
     keyword: ("\x1b[1;35m", "\x1b[0m"),
@@ -190,6 +237,44 @@ mod tests {
         let src = "op noop() -> string\n  return \"ok\"\n";
         let json = compile_str(src).unwrap();
         assert!(json.contains("noop"), "op survived the compile: {json}");
+    }
+
+    #[test]
+    fn rails_canonical_flux_source() {
+        // L-95: `rail` takes *source*, not a JSON AST, and projects it as the dataflow diagram.
+        let src = "flow triage(ticket: Ticket)\n  kind = classify(ticket)\n  return kind\n";
+        assert_eq!(
+            rail_src(src).unwrap(),
+            "[flow triage (ticket: Ticket)]\n  ticket --> classify(.) --> kind\n  kind --> RETURN\n"
+        );
+    }
+
+    #[test]
+    fn rail_reports_the_existing_parser_diagnostics() {
+        // Malformed source must fail with the same diagnostic `compile` reports — one parse entry,
+        // one error vocabulary.
+        let bad = "flow x\n  confirm \"y\", risk: high\n";
+        let rail = rail_src(bad)
+            .expect_err("malformed flux must not render")
+            .to_string();
+        let compile = compile_src(bad)
+            .expect_err("malformed flux must not compile")
+            .to_string();
+        assert_eq!(rail, compile);
+        assert!(rail.contains("parse error"), "got: {rail}");
+    }
+
+    #[test]
+    fn rails_every_flow_of_a_program_module() {
+        // A program has no single flow; each top-level flow and journey flow is projected in
+        // declaration order rather than the command refusing the module outright.
+        let src =
+            "agent helper\n  model \"mock\"\n\nflow first\n  return 1\n\nflow second\n  return 2\n";
+        let out = rail_src(src).unwrap();
+        assert_eq!(
+            out,
+            "[flow first]\n  --> [1] --> RETURN\n\n[flow second]\n  --> [2] --> RETURN\n"
+        );
     }
 
     /// Render from an in-memory string (test helper mirroring `render_ast`'s parse+render).

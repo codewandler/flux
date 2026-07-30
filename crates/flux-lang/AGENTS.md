@@ -67,6 +67,7 @@ and keep it in sync with your change (design + status + plan move together):
 - [`docs/PRD.md`](docs/PRD.md) — the immutable, source-of-record PRD (**don't edit**; track progress in `STATUS.md`).
 - [`docs/reference.md`](docs/reference.md) — every node kind, fields, semantics (node table generated).
 - [`docs/syntax.md`](docs/syntax.md) — the writable text-syntax spec.
+- [`docs/railflux.md`](docs/railflux.md) — the Railflux ASCII dataflow projection (`src/rail.rs`, `fluxlang rail`). **Output spec only** — the reader is deferred (L-100), so treat this file as the contract that shape must hold to.
 - [`README.md`](README.md) — what the execution layer *is* (and isn't) + the crate overview.
 
 **Forward design — the evolution**

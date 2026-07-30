@@ -5,8 +5,15 @@
 //! the form a non-ANSI surface (SVG, GUI) consumes directly — and [`render_styled`] stringifies those
 //! spans through a [`Palette`] so a terminal surface can syntax-highlight the tree. The plain
 //! [`render_pretty`] is exactly `render_styled(_, &Palette::PLAIN)` (used for `-o pretty`, logs, tests).
+//!
+//! A second, *dataflow* projection of the same AST — **Railflux**, a 7-bit ASCII rail diagram
+//! (L-95) — lives in `crate::rail` and is re-exported here: [`render_rail`], [`render_rail_styled`]
+//! and [`render_rail_spans`] mirror this module's trio and share its [`Role`]/[`Palette`] substrate,
+//! so there is one styling model for every projection.
 
 use crate::ast::{DraftAst, FlowEffect, Node, Selector, SymbolName, ThingKind, ThingRef, TypeRef};
+
+pub use crate::rail::{render_rail, render_rail_spans, render_rail_styled};
 
 /// The syntactic role of one rendered span — the presentation-independent form of a [`Palette`]
 /// field. [`render_styled_spans`] tags every fragment with its role; a surface maps roles to colors
@@ -103,7 +110,7 @@ fn bound_kw(word: &str, bind: &Option<SymbolName>) -> Vec<Span> {
 }
 
 /// Stringify one line's spans, wrapping each with its role's palette pair.
-fn spans_to_string(spans: &[Span], p: &Palette) -> String {
+pub(crate) fn spans_to_string(spans: &[Span], p: &Palette) -> String {
     let mut out = String::new();
     for (text, role) in spans {
         out.push_str(&paint(p.pair(*role), text));
