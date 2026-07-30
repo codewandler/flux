@@ -10,30 +10,36 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.34.0 (2026-07-29) — a MINOR carrying most of the **security assurance** epic
-  (C-187…C-190, C-192, C-193, C-194: SHA-pinned Actions, advisory scanning, server body/time limits,
-  an authenticated-by-construction router, the SQLite statement allowlist) and the first three
-  stories of the **typed session log** epic (A-99…A-101), which fixed three live invalid-history
-  bugs on the way. Breaking (embedders only): the `flux-server` router constructors. See
-  [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Unreleased on `main`:** C-191 (ToolSpec coherence gated on every build), C-206 (flat fragment
-  discovery), C-207 (`KUBECONFIG` forwarded to `kubectl`), C-208 (coherence over the full production
-  catalog), C-209 (the fixture `TMPDIR` race), and A-102 (the history rewriters on `rewrite()`).
-  **Next cut is a MINOR** — A-102 removes `EventStore::record_message`/`record_compaction` from the
-  published `codewandler-flux-events`.
-- **Focus:** the **typed session log** epic (A-93) is **complete** — A-99 (shape types) → A-100
-  (the typed handle) → A-101 (flux-flow migration) → A-102 (SDK/CLI rewriters + the breaking
-  deletion). The three historical invalid provider-history shapes now have no constructor, so the
-  bug class that recurred three times is unwritable rather than test-guarded.
-- **Epics in flight:** **security assurance** (C-186) is nearly closed — C-187…C-194 are done;
-  **C-195** (approval-sheet redaction) and **C-210** (`gather_safe` ignores `semantic_effects`)
-  remain, C-205 is blocked on the ratatui 0.29 hold.
-  **Website truth and identity** (C-196; C-197…C-204) is **complete** — the public site's four
-  actively wrong claims are corrected, and its durable output is six coverage assertions in
-  `website_contract.rs` (13 → 18 tests) so an undocumented route, op, config key, subcommand or
-  keybinding now fails the gate. It filed two code bugs on the way out: **C-206** (fragment
-  discovery walks subdirectories while the contract promises a flat directory) and **C-207**
-  (`KUBECONFIG` gates surfacing but is never forwarded to `kubectl`).
+- **Released:** v0.37.0 (2026-07-30) — see [CHANGELOG](../../CHANGELOG.md) and the
+  [roadmap](../roadmap.md).
+- **Unreleased on `main`:** two epics' worth of work plus the older unreleased tail.
+  **Adversarial review remediation** (C-255; C-256…C-265) closes every actionable finding from the
+  three independent 2026-07-30 reviews: guard-vetted address pinning for fleet A2A / plugin HTTP /
+  OAuth / TCP egress, host-selected eval execution, content-authenticated release tooling with
+  artifact provenance, bounded REST SSE lifecycle, principal-aware daemon admission and spend
+  breakers, a fail-closed unattended sandbox profile, a structural direct-I/O gate, adversarial
+  CI lanes, and an immutable toolless built-in `flux review`.
+  **Zendesk automation** (D-199) ships only its integration-independent half: L-92's
+  `flux run <module.flux> --entry <flow>` and A-136's read-only `setup`/`triage`/`brief`/`eod`
+  reference flow. The typed Zendesk plugin is **removed before ever being released**, pending a
+  flux-connectors interop layer, so D-200/D-201/D-202 revert to `blocked`.
+  Plus the earlier tail: C-217, C-218, C-226, C-233, C-234, C-240, C-246, C-247, C-251 (partial),
+  C-252.
+  **Next cut is a MINOR** — C-262 flips unattended and serving surfaces to fail closed on sandbox
+  posture, so hosts with no confinement backend now refuse to start instead of running unconfined.
+  The protocol line moved independently: `codewandler-flux-plugin-protocol` 1.0.0 → 1.1.0
+  (additive `decode_ndjson_frame`/`MAX_FRAME_BYTES`), `codewandler-flux-spec` 1.2.0 → 1.2.1,
+  `codewandler-flux-host-kit` 1.0.0 → 1.0.1, `codewandler-flux-datasource` 1.2.0 → 1.3.0.
+  **No plugin-pack release is owed** — the `flux-plugin-zendesk` binary that would have needed one is
+  removed rather than shipped.
+- **Epics in flight:** **adversarial review remediation** (C-255) has all thirteen child findings
+  implemented and stays open only on its last acceptance bullet — three fresh independent reviews
+  against the integrated tree finding no reproducible High-severity containment defect.
+  **Zendesk automation** (D-199) now tracks the replacement: L-92 and A-136 are done, while
+  D-200/D-201/D-202 are `blocked` on the flux-connectors interop that supersedes the withdrawn plugin.
+  **Security assurance** (C-186) is nearly closed — **C-195** (approval-sheet redaction) and
+  **C-210** (`gather_safe` ignores `semantic_effects`) remain; C-205 is blocked on the ratatui 0.29
+  hold.
 - **Newly designed:** **the agent-authored surface** (C-219; C-220…C-225 filed, none started) — the
   agent gets typed panes on the TUI and an allowlisted config surface. Most of the plumbing already
   exists (`ToolProgressSink`/`SpawnActivitySink` are the template; `op.register` is the precedent),
@@ -43,7 +49,8 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   from `PinnableKey::ALL`. C-220 → C-221 → C-222 land before the model can reach any of it.
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
-- **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
+- **Gate:** green in **both** workspaces — `cargo test` · `clippy --all-targets -D warnings` · `fmt`
+  · the `flux-codegate` layering lint · every `scripts/check-*.sh` policy gate.
 
 <!-- BEGIN track:board -->
 <!-- Generated by /track:board (track plugin) from story frontmatter. Do not hand-edit this region; edit the stories and re-run /track:board. -->
@@ -52,6 +59,8 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 - [C-239 — The fleet runs the track / impl-coord loop — complete and usable (epic)](C-239-fleet-loop-epic.md) · Core · EPIC — the model reasons, the host enforces: a WaveCoordinator does isolation/gate/merge/revert/ledger so the loop's invariants hold even when the model is wrong
+- [C-255 — Adversarial review remediation — close every actionable finding from the three 2026-07-30 reviews (epic)](C-255-adversarial-review-remediation-epic.md) · Core · REVIEW EPIC — three independent passes rated 5.5/10, 6/10, and 7/10; all reject Flux as a standalone unattended boundary
+- [D-199 — Zendesk automation — deterministic support workflows with bounded AI (epic)](D-199-zendesk-automation-epic.md) · Agent · EPIC — L-92 (--entry) and A-136 (reference flow) shipped; the plugin is withdrawn, so D-200/D-201/D-202 await the flux-connectors interop
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-248 — `ops-reference.md` documents none of the eval op family, so a rename there has one unguarded reference](C-248-ops-reference-does-not-cover-the-eval-op-family.md) · Core · found while renaming git_revert→git_reset for C-238: only the website file is coverage-tested, so the in-repo op reference can silently rot for any eval op
@@ -87,7 +96,6 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 
 ### Security assurance — close the gap between the envelope and its proof
 - [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
-- [C-218 — `git_diff` honours external diff drivers, so its I1 exemption claims more than it can hold](C-218-git-diff-external-driver.md) · Core · the exemption's stated grounds are 'argv is fixed by the op, never a caller-supplied program name' — but `git diff` without --no-ext-diff runs whatever diff.external names, so fixed argv does not mean fixed behaviour
 
 ### Transactional turns — a compensating undo for the world, not just the session
 - [A-103 — The Compensation contract on ToolSpec — every mutating op declares how it is reversed](A-103-compensation-contract-on-toolspec.md) · Agent · Inverse | Snapshot | NotNeeded | None{why}; a registry-walk test fails on any mutating built-in with no declaration, which is what stops the contract rotting as ops are added
@@ -97,13 +105,15 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 
 ### Unattended run integrity — surviving provider transport failure, and being honest when you don't
 - [C-229 — Unattended run integrity — survive provider transport failure, and be honest when you don't (epic)](C-229-unattended-run-integrity-epic.md) · Core · three separately-filed stories are one failure at three depths — a provider bug, no resume, and no way to tell a dead turn from a live one; C-228 must be DIAGNOSED before C-227 is designed, or the retry masks a deterministic codec bug as a flaky network
-- [C-226 — A failed turn is indistinguishable from a successful one to every machine consumer](C-226-failed-turn-is-indistinguishable-from-a-successful-one.md) · Core · detect_intent/explore convert a provider Err into an Ok value tagged kind=error (loop_host.rs:563-586) — so a turn that never ran exits 0, emits no NDJSON `error` line, and reports the failure as prose inside `turn_end.answer`
 - [C-228 — Gemini 3.x over OpenRouter drops the stream mid-exploration, reproducibly](C-228-gemini-3x-over-openrouter-drops-the-stream-mid-exploration.md) · Core · gemini-3.6-flash and gemini-3.5-flash both die with `stream closed before completion` during exploration at 12-21k ctx; gemini-2.5-flash (no reasoning stream) survives the same workload — points at reasoning-delta handling on the Messages path, not at OpenRouter generally
 - [C-227 — A dropped provider stream ends the whole turn — no automatic resume for a transport-class failure](C-227-no-automatic-resume-on-transport-class-provider-failure.md) · Core · `stream closed before completion` mid-exploration kills a 34-step run outright; flux has `--continue` but nothing retries, so long headless runs are a coin flip on provider transport
 
 ## Blocked
 - [A-117 — The coordinator.flux reference Program + offline end-to-end journey test](A-117-coordinator-program.md) · Agent · the epic's headline proof — intake → dispatch → sweep → done against MemoryBoard and a stub A2A worker, no credentials, no network
 - [C-205 — Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore](C-205-bump-lru-drop-unsound-ignore.md) · Core · SURFACED BY C-188 — lru 0.12.5 carries an *unsound* (not vulnerable) advisory reachable only via LruCache::iter_mut; the clean fix is a Cargo.lock bump, which was out of C-188's fence
+- [D-200 — Zendesk plugin foundation and read-side ticket API](D-200-zendesk-plugin-read-api.md) · Agent · WITHDRAWN before release — plugin removed pending flux-connectors interop; re-do against that layer
+- [D-201 — Safe Zendesk triage mutations](D-201-safe-zendesk-triage-writes.md) · Agent · WITHDRAWN before release — plugin removed pending flux-connectors interop; write-safety rules carry over
+- [D-202 — Zendesk tutorial, catalog integration, and release proof](D-202-zendesk-docs-and-release-proof.md) · Agent · WITHDRAWN before release — plugin docs/catalog/smoke entries removed with the plugin; redo for flux-connectors
 
 ## Backlog
 - [C-161 — User-defined review checks — project criteria layered over the built-in reviewer roles](C-161-user-defined-review-checks.md) · Core · flux review runs three embedded reviewer roles (review.rs:100-108) overridable only wholesale via .flux/agents/review-*.md — there is no per-CRITERION project check with its own severity and path scope, though --fail-on <severity> already exists (args.rs:381-384) so the severity plumbing is done
@@ -163,10 +173,6 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 
 ### Remote Approvals
 - [C-127 — Remote approvals — the approval gate over Slack / webhook (epic)](C-127-remote-approvals-epic.md) · Core · EPIC — pluggable approver transport for headless/serve agents: approval requests post to Slack (Block Kit buttons) or a signed webhook, timeout = deny, decision lands in the audit trail; complements quorum approval (C-96) — that changes how many approvers, this changes where they are
-
-### Security assurance — close the gap between the envelope and its proof
-- [C-233 — The published risk-column drift guard silently skips every non-built-in op, so `fleet.*`, `browser.*`, `web.*` and `consult` are unverified](C-233-risk-column-guard-skips-every-non-builtin-op.md) · Core · filed from A-131's implementor report — the_published_risk_column_matches_the_registry only checks rows whose op is in try_register_builtins, so a wrong published risk tier on any pack op passes green
-- [C-234 — The catalog-coherence registration-seam scan only reads `execution.rs`, so a pack registered from `app_cmd.rs` escapes the census](C-234-registration-seam-scan-only-reads-execution-rs.md) · Core · filed from A-131's implementor report — the board seam was caught only because build_datasources' doc comment happens to name try_register_work_board; that is a textual accident, not a property
 
 ### Taint Flow Policy
 - [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
@@ -288,6 +294,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-129 — Bound delivery concurrency — the mpsc capacity was the only backpressure](A-129-bound-delivery-concurrency.md) · Agent · filed from A-112's implementor report — concurrency was the point of A-112, but it removed the one thing that bounded it
 - [A-130 — Board write-back of runner and task_id — make "the board is the run registry" true](A-130-board-run-state-writeback.md) · Agent · filed from A-116's implementor report — design §5 says the board IS the run registry, but no op can write the two fields that make it one
 - [A-131 — Wire the fleet into a running flux — register the fleet.* ops and bind a WorkBoard from config](A-131-wire-the-fleet-into-a-running-flux.md) · Agent · SURFACED BY A-117, verified: FleetDispatchTool/A2aSpawner are constructed nowhere outside their own module (only re-exported at flux-orchestrate/src/lib.rs:18), and build_datasources knows only markdown|openapi — so the fleet exists in code and is unreachable from a running flux
+- [A-136 — The runnable Zendesk triage reference workflow](A-136-zendesk-triage-reference-flow.md) · Agent · flow RETAINED and provider-free-tested, but NOT runnable until the flux-connectors interop replaces the removed plugin
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`
@@ -483,10 +490,14 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-210 — gather_safe never reads semantic_effects, so an op can be pre-approval reachable and still declare a durable write](C-210-gather-safe-ignores-semantic-effects.md) · Core · SURFACED BY the C-208 review — web.fetch is the first op that is gather-safe AND self-declares write_db; is_consequence_bearing mirrors gather_safe exactly, and neither classifier looks at semantic_effects
 - [C-211 — Validate the parent history before minting the fork's child session, and test the CLI refusal](C-211-fork-validates-before-minting-child.md) · Core · SURFACED BY the A-102 review — the refusal path is new, and both fork sites create the child before they know the parent is forkable; the CLI's copy of the logic has no test at all
 - [C-217 — `sandbox on` reports its resolved posture instead of degrading silently](C-217-sandbox-on-reports-resolved-posture.md) · Core · the prerequisite the epic deferred the default-flip behind — `on` + no backend returns Ok and says nothing, so an operator who asked to be sandboxed is told nothing when they are not
+- [C-218 — `git_diff` honours external diff drivers, so its I1 exemption claims more than it can hold](C-218-git-diff-external-driver.md) · Core · the exemption's stated grounds are 'argv is fixed by the op, never a caller-supplied program name' — but `git diff` without --no-ext-diff runs whatever diff.external names, so fixed argv does not mean fixed behaviour
 - [C-220 — The SurfaceSink contract at L2 — typed pane commands, redacted at the reporter](C-220-surface-sink-contract.md) · Core · third instance of a twice-proven pattern — ToolProgressSink/SpawnActivitySink (flux-runtime lib.rs:188-262) are the template: trait at L2, installed by the L6 surface, reached only via ToolContext, redaction applied at the reporter so no tool can put raw bytes on a screen
 - [C-221 — Pane slots in the TUI — layout split, bounds, and narrow-width suppression](C-221-tui-pane-slots.md) · Core · render() is a fixed six-row Layout::vertical (rendering.rs:122-171) with no horizontal split at all; panes need left/right/bottom slots that are bounded and suppressed at narrow widths rather than squeezing the transcript — host-pushed only, no model path until C-223
+- [C-226 — A failed turn is indistinguishable from a successful one to every machine consumer](C-226-failed-turn-is-indistinguishable-from-a-successful-one.md) · Core · detect_intent/explore convert a provider Err into an Ok value tagged kind=error (loop_host.rs:563-586) — so a turn that never ran exits 0, emits no NDJSON `error` line, and reports the failure as prose inside `turn_end.answer`
 - [C-230 — Two flux processes cold-booting one fresh events.db race the schema migration](C-230-sqlite-cold-boot-migration-race.md) · Core · found by accident during A-107: four processes cold-booting the SAME brand-new events.db died with `duplicate column name: account` — D-76 fixed exactly this for Postgres with a `flux:ddl` advisory lock; SQLite has no equivalent, and every existing multi-process test creates the DB first, so nothing covers it
 - [C-232 — The examples validation sweep is stricter than the runtime, so a valid Program cannot ship as an example](C-232-examples-sweep-stricter-than-runtime.md) · Core · SURFACED BY A-117: examples_validate asserts flow_named(&t.run).is_some() for every trigger, but an agent-bound trigger legitimately parses with run == \"\" and flux-app's Engine::validate explicitly exempts it — the sweep does not, so an agent-triggered Program is unshippable as an example
+- [C-233 — The published risk-column drift guard silently skips every non-built-in op, so `fleet.*`, `browser.*`, `web.*` and `consult` are unverified](C-233-risk-column-guard-skips-every-non-builtin-op.md) · Core · filed from A-131's implementor report — the_published_risk_column_matches_the_registry only checks rows whose op is in try_register_builtins, so a wrong published risk tier on any pack op passes green
+- [C-234 — The catalog-coherence registration-seam scan only reads `execution.rs`, so a pack registered from `app_cmd.rs` escapes the census](C-234-registration-seam-scan-only-reads-execution-rs.md) · Core · filed from A-131's implementor report — the board seam was caught only because build_datasources' doc comment happens to name try_register_work_board; that is a textual accident, not a property
 - [C-235 — `regex_extract` returns a JSON-quoted string, so its output cannot be fed to another op](C-235-regex-extract-returns-a-json-quoted-string.md) · Core · SURFACED BY the A-131 fleet smoke test: the sweep journey re-derived `runner` off the board correctly, then `fleet.status` failed with `invalid url: relative URL without a base` because the extracted value carried literal quote characters
 - [C-236 — Structured `board.query`, a `board.comments` read-back, and raw-string cognition results](C-236-structured-board-query-comment-read-back-and-raw-string-cognition.md) · Core · Milestone-1 story F1 of the fleet-loop plan: a coordinator Program cannot reason over a board it can only read as prose. Also fixes C-235.
 - [C-238 — The git op family cannot create a branch, merge it, or revert a merge — the serial-integration half of the fleet loop has no verbs](C-238-git-branch-merge-revert-ops.md) · Core · Milestone 2 / F3 of the fleet-loop plan: git_branch + git_merge + git_revert all land here. The name collision is resolved by renaming the eval pack's `git_revert` (which does `git reset --hard`) to `git_reset` — a BREAKING op-catalog change, clean cutover with no alias
@@ -494,6 +505,16 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-246 — Fleet observability — `SpawnActivitySink` shipped in A-79 and nothing installs it, so a running fleet is invisible](C-246-fleet-observability-spawn-activity-sink.md) · Core · F10 — the sink exists and is installed for local children only (engine.rs:527); a fleet of workers produces no visible activity at all
 - [C-247 — `WhatIf::run`'s re-plan path mints the child before validating, so a refused re-plan still leaves a trace](C-247-whatif-replan-mints-before-validating.md) · Core · the same defect C-211 fixed at both fork sites, still live in whatif.rs — and here there are TWO bails after the child exists, not one
 - [C-252 — The release-tag audit races the release it audits, so every cut reds CI on main for a minute](C-252-release-tag-audit-races-the-release-it-audits.md) · Core · found cutting 0.37.0: ci on cedef3f4 was red purely because the push-triggered audit ran at 22:23 and v0.36.0's Release was published at 22:24:19 — a red that resolves itself and therefore teaches people to ignore red CI
+- [C-256 — Pin fleet A2A egress to guard-vetted addresses and re-authorize redirects](C-256-pin-fleet-a2a-egress.md) · Core · HIGH — fleet guards one DNS answer, discards it, then A2aClient re-resolves and follows redirects
+- [C-257 — Pin plugin HTTP, OAuth, and TCP callbacks to guard-vetted addresses](C-257-pin-plugin-callback-egress.md) · Core · HIGH — redirect control is sound, but HTTP/OAuth/TCP discard vetted DNS answers before connect
+- [C-258 — Make eval execution host-selected, sandbox-honest, and credential-minimal](C-258-make-eval-run-host-selected.md) · Core · HIGH — eval_run accepts model-controlled flux_bin, exempts it from sandboxing, and injects raw provider keys
+- [C-259 — Content-authenticate core release tooling and publish verifiable artifact provenance](C-259-authenticate-core-release-tooling-and-artifacts.md) · Core · HIGH supply chain — privileged jobs pipe unsigned installers into shells; core hashes share the artifact trust root
+- [C-260 — Cancel REST SSE turns on disconnect and bound event buffering](C-260-bound-rest-sse-lifecycle.md) · Core · MEDIUM — detached REST stream work survives client disconnect and writes to an unbounded channel
+- [C-261 — Add principal-aware daemon admission and completed-usage circuit breakers](C-261-add-daemon-resource-budgets.md) · Core · MEDIUM — authentication, body caps, and timeouts do not bound request arrival, queued work, or provider spend
+- [C-262 — Make unattended execution fail closed on sandbox and network posture](C-262-fail-closed-unattended-sandbox-profile.md) · Core · MEDIUM — default process posture is unconfined and network-open; `on` may degrade and Windows has no backend
+- [C-263 — Make direct-I/O enforcement structural and cover every production model-facing pack](C-263-strengthen-direct-io-enforcement.md) · Core · MEDIUM assurance — the lexical guard excludes flux-eval under a premise contradicted by production registration
+- [C-264 — Add adversarial parser, memory-safety, and static-analysis CI lanes](C-264-add-adversarial-assurance-lanes.md) · Core · LOW/MEDIUM assurance — extensive author-written tests have no fuzz, Miri/sanitizer, or SAST complement
+- [C-265 — Keep built-in strict review immutable, toolless, and fail-closed](C-265-contain-built-in-strict-review.md) · Core · HIGH closure review — project role shadowing turned a promised read-only auto-approved command into workspace-write authority
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)
@@ -766,6 +787,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-89 — Diagnostic truth — workspace composites in the catalog, real severities, stable codes](L-89-lsp-diagnostic-truth.md) · Language · the LSP catalog stops at the file edge (authoring_registry:27, signatures_for_document:79) so a call to a composite stored in .flux/flows — which DynamicComposites::load installs for the real host (flux-flow/src/composites.rs:100) — is flagged "unknown operation"; and every analyzer finding is emitted as a bare WARNING with no code (lsp_warning:553)
 - [L-90 — Per-document parse cache, real incremental reparse, semantic-token range/delta](L-90-lsp-parse-cache-and-incrementality.md) · Language · did_change applies ranged edits then full-reparses (main.rs:237-250 → refresh:169), which is not the rowan node reuse L-70 asked for; and every handler re-parses from text per request (format_document:107, semantic_tokens:1142, signatures_for_document:81) — semantic tokens are full-only, `range: Some(false)` at main.rs:211
 - [L-91 — Split the server into the designed modules, add a protocol-level harness, close the epic](L-91-lsp-module-split-and-protocol-harness.md) · Language · the crate is Cargo.toml + README.md + one 1800-line src/main.rs, while the design specified server/document/convert/diagnostics/completion/hover/format/catalog modules (flux-lsp.md:40-43); and every test calls an internal function directly — the "drive the server over an in-memory duplex" verification (flux-lsp.md:131) was never built, so nothing proves an advertised capability has a wired handler
+- [L-92 — Named one-shot flow entrypoints for flux run](L-92-flux-run-named-entrypoints.md) · Language · `flux run module.flux --entry name --inputs/--arg` reuses the direct-flow engine; no-entry app behavior is unchanged
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

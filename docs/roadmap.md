@@ -80,10 +80,84 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.33.0** is released — that MINOR closed the TUI polish round-2 and event-store epics and added
-> `flux export`. Work sitting in `[Unreleased]` is the C-158 live-output channel, the C-47 release-tag
-> audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
+> **v0.37.0** is released. Work sitting in `[Unreleased]` is the **adversarial review remediation**
+> and **Zendesk automation** epics below, plus the earlier tail (C-217, C-218, C-226, C-233, C-234,
+> C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
+
+### Adversarial review remediation (epic) — 🔄 **IN PROGRESS (C-255; C-256…C-265 all done, closure reviews pending)**
+
+Three independent adversarial passes were run against `cb3bb057` on 2026-07-30 and recorded under
+`docs/reviews/`. They rated the tree 5.5/10, 6/10 and 7/10, and — importantly — **all three rejected
+flux as a standalone unattended boundary**. The spread is the work: the architecture was not the
+finding, the *adapter-level exceptions to it* were.
+
+Every actionable finding became one child story with a one-to-one evidence trail. The HIGH ones are
+all the same shape — a guard produces an answer and the caller then discards it.
+**[C-256](stories/C-256-pin-fleet-a2a-egress.md)** and
+**[C-257](stories/C-257-pin-plugin-callback-egress.md)** pin fleet A2A, plugin HTTP/OAuth and plugin
+TCP to the exact DNS answers `guard_url_scoped` admitted, disable ambient proxies and automatic
+redirects, and re-authorize every supported redirect hop.
+**[C-258](stories/C-258-make-eval-run-host-selected.md)** stops `eval_run` accepting a
+model-controlled `flux_bin` that was then exempted from sandboxing and handed raw provider keys.
+**[C-259](stories/C-259-authenticate-core-release-tooling-and-artifacts.md)** removes pipe-to-shell
+bootstrap from privileged release jobs and gives core artifacts consumer-verifiable provenance.
+
+The MEDIUMs bound the daemon and the default posture:
+**[C-260](stories/C-260-bound-rest-sse-lifecycle.md)** (SSE disconnect cancels its turn, events are
+bounded), **[C-261](stories/C-261-add-daemon-resource-budgets.md)** (principal-aware admission plus
+completed-usage circuit breakers), and **[C-262](stories/C-262-fail-closed-unattended-sandbox-profile.md)**
+— the one breaking change in the release: unattended and serving surfaces now **fail closed** on
+sandbox posture rather than silently starting unconfined.
+**[C-263](stories/C-263-strengthen-direct-io-enforcement.md)** and
+**[C-264](stories/C-264-add-adversarial-assurance-lanes.md)** turn assurance structural: the
+direct-I/O gate parses Rust rather than grepping it and covers every model-facing pack, and CI gains
+adversarial parser, memory-safety and static-analysis lanes.
+**[C-265](stories/C-265-contain-built-in-strict-review.md)** came out of the *first closure review* —
+project role files could shadow the built-in `flux review` reviewers and turn a promised read-only
+auto-approved command into workspace-write authority.
+
+The epic stays open on its last acceptance bullet, deliberately: three fresh independent reviews must
+run against the integrated tree and find no reproducible High-severity containment defect. Ratings
+are evidence snapshots, not acceptance criteria. Bus factor and an external commissioned audit are
+recorded as residual **governance** risks rather than fictional code stories.
+Design: [adversarial-review-remediation-2026-07-30.md](designs/adversarial-review-remediation-2026-07-30.md).
+
+### Zendesk automation — deterministic support workflows with bounded AI (epic) — 🔄 **IN PROGRESS (D-199; L-92 + A-136 shipped, plugin WITHDRAWN — D-200/D-201/D-202 await the flux-connectors interop)**
+
+The first complete reference for deterministic third-party automation in Flux-Lang, and a deliberate
+demonstration of the vision's hard line: **the model reads evidence and never writes**.
+
+**[L-92](stories/L-92-flux-run-named-entrypoints.md)** adds `flux run <module.flux> --entry <flow>`
+with `--inputs`/`--arg`, so one `.flux` file can carry several named workflows and a caller selects
+one — reusing the strict authored-flow input and safety path rather than growing a second one.
+**[D-200](stories/D-200-zendesk-plugin-read-api.md)** and
+**[D-201](stories/D-201-safe-zendesk-triage-writes.md)** build the typed `flux-plugin-zendesk`:
+endpoint resolution and Basic API-token injection stay in the **host**, reads are bounded to one
+page and contribute `zendesk.ticket` records, and writes are typed, additively-scoped and
+concurrency-safe (mandatory `updated_stamp`, `safe_update=true`, internal comments by default).
+**[A-136](stories/A-136-zendesk-triage-reference-flow.md)** is the runnable artifact —
+`examples/zendesk.triage.flux` with `setup`, `triage`, `brief` and `eod` entrypoints exercising
+retry, parallel reads, bounded contexts, model timeouts and deterministic evidence fallback. It
+contains **no Zendesk write operation at all**; the plugin's writes exist and are separately
+callable, which is the point.
+**[D-202](stories/D-202-zendesk-docs-and-release-proof.md)** makes it reproducible for a user holding
+only a Zendesk URL, an email and one API token, and is honest about the exposure of internal notes to
+the configured model.
+
+**The plugin half is withdrawn before it ever shipped.** `flux-plugin-zendesk` is removed from the
+tree rather than released: a flux-connectors interop layer is to supersede it, and publishing a signed
+pack now would ship a binary already scheduled for replacement. Nothing is withdrawn from users — no
+pack was ever published, so the plugin existed only in a source checkout. D-200, D-201 and D-202
+therefore revert from `done` to `blocked` on that interop.
+
+**What survives is the half that was not integration-specific.** L-92's `--entry` is shipped and
+unaffected. A-136's flow is kept deliberately, marked plainly as unrunnable, because its coverage is
+provider-free — the flow tests drive all four entrypoints against stubbed operations, so the authored
+shape stays enforced while no integration exists to serve it. That shape, plus the data-exposure and
+write boundary in [zendesk-triage.md](zendesk-triage.md), is the contract the replacement inherits;
+the `zendesk.*` operation names are the only part expected to move.
+Design: [zendesk-automation.md](designs/zendesk-automation.md).
 
 ### The fleet runs the track / impl-coord loop (epic) — 🔄 **IN PROGRESS (C-239; F1 C-236 + F3 C-238 in flight, C-240…C-246 filed)**
 

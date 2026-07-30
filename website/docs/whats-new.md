@@ -14,6 +14,24 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **You can now run one named workflow out of a file that defines several.** `flux run <file>
+  --entry <name>` picks a single top-level workflow by name, with the same strict input checking and
+  safety path a single-workflow file already gets. One checked-in file can hold a related family of
+  workflows instead of needing one file each.
+
+- **Servers can now enforce per-caller admission and completed-usage limits.** REST, webhook, and
+  agent-to-agent requests share limits for request rate and simultaneous work. Completed provider
+  calls and priced spend act as circuit breakers: new work is rejected after a threshold is
+  observed, while already-running work can overshoot only within the simultaneous-work bound.
+  Long-lived streams keep their slot until they really finish. Single-process limits are built in;
+  multi-server deployments can apply the same policy at their shared proxy or control plane.
+
+- **Release downloads can be verified against GitHub's signed provenance.** The installation guide
+  now starts with a version-pinned download and an attestation check bound to the tag's exact commit.
+  The release verifier rejects unknown assets and checks every supported executable asset. Release
+  jobs also verify the exact tooling they run instead of executing an installer directly from the
+  network.
+
 - **Release notes can be drafted by a model without letting it decide the release.** A flux program can
   now read a project's commit history, have a model write both the engineering and the customer-facing
   changelog prose, and run the release — while the version number itself is worked out from the commit
@@ -36,6 +54,35 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **Server timeouts now stop work cleanly before returning.** Buffered REST, webhook, and blocking
+  agent-to-agent requests cancel and finish their owning turn before a timeout response is sent.
+  Provider call limits also count calls that report no token usage and keep overlapping callers'
+  usage assigned to the correct caller.
+
+- **Built-in code review stays read-only even in an untrusted project.** Project role files can no
+  longer replace Flux's embedded reviewers with tool-using agents, and `flux review` now requires the
+  same fail-closed operating-system confinement as other internally approved unattended commands.
+
+- **Approved network destinations stay the destinations actually contacted.** Remote helper calls
+  and plugin HTTP, sign-in refresh, and TCP callbacks now connect to the exact addresses that passed
+  Flux's private-network check. A hostname cannot pass the check with one address and silently
+  resolve to a private address a moment later; redirects and ambient proxy settings cannot bypass
+  the boundary. Native web requests follow the same direct-connection rule. A plugin socket grant
+  for one directory can no longer escape it through a wildcard and `..` path.
+
+- **Closing a streaming HTTP response now stops its work.** A disconnected client no longer leaves
+  model or tool work running in the background, and a slow reader cannot accumulate an unlimited
+  event queue. Cancelled streams still leave a session that can be resumed safely.
+
+- **Machine consumers can distinguish a failed turn from a successful answer.** A provider failure
+  before execution now returns a failure exit status and a structured stream error instead of being
+  wrapped as ordinary answer text.
+
+- **Evaluation runs no longer accept model-chosen executable, benchmark-driver, dataset, import, or
+  rebuild controls—or a bundle of unrelated provider secrets.** The operator owns those selectors,
+  benchmark children follow the normal sandbox rules, and each provider receives only the
+  credentials it needs.
+
 - **A retried task no longer looks like it is still running on the machine that dropped it.** When a
   task failed and went back to the queue, it kept pointing at the run that had died, so status could
   report progress on a process that no longer existed. A retried task now forgets the dead run while
@@ -44,6 +91,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   and ready could do so indefinitely, because only outright failures counted against its retry
   allowance. Unblocking now counts too, so a task that keeps stalling is eventually surfaced instead of
   looping forever.
+
+### Action needed
+
+- **Unattended and server operation now requires a working OS sandbox by default.** Auto-approved
+  commands and serving modes refuse to start on a host where Flux cannot establish confinement, and
+  sandboxed child processes start without network access. If you deliberately provide equivalent
+  isolation with a container or VM, pass `--no-sandbox` or set exactly `FLUX_SANDBOX=off`; Flux will
+  print a prominent unconfined warning. Interactive local use keeps its previous behavior.
 
 ## [0.37.0] - 2026-07-30
 

@@ -8,6 +8,48 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Named entrypoints select one flow from a multi-flow module (L-92).** `flux run <module.flux>
+  --entry <flow>` selects a named top-level flow and reuses the strict authored-flow input and safety
+  path, so one file can hold a related family of flows.
+
+- **The Zendesk plugin is withdrawn before its first release; its reference flow is kept (D-199,
+  D-200, D-201, A-136, D-202).** The typed `flux-plugin-zendesk` crate is **removed** rather than
+  shipped: it is to be superseded by a flux-connectors interop layer, so releasing a signed pack now
+  would publish a binary already scheduled for replacement. Nothing is withdrawn from users — no
+  signed pack was ever released, so the plugin existed only in a source checkout.
+  `examples/zendesk.triage.flux` is deliberately **retained**, with a header stating plainly that it
+  cannot run until the replacement lands. It is the authored shape that replacement must satisfy:
+  four read-only entrypoints, retry with backoff, bounded contexts with explicit budgets, model
+  timeouts, and deterministic evidence fallback. Its coverage is provider-free — the flow tests drive
+  every entrypoint against stubbed operations — so the shape stays enforced while the integration is
+  absent, and the `zendesk.*` operation names are the only part expected to move.
+  D-199 stays open as the epic tracking that replacement; D-200/D-201 revert from `done`, since the
+  read API and write envelopes they delivered no longer exist in the tree.
+
+- **Authenticated release provenance replaces executable network bootstrap (C-259).** The core
+  release workflow now installs its pinned `cargo-dist` build only after verifying a committed
+  platform digest, keeps publication/OIDC authority out of planning and build jobs, and emits a
+  GitHub artifact attestation that the release verifier checks independently of the bundled
+  checksum file. Verification binds the tag to its exact current source commit and rejects any
+  release asset outside the closed, attestation-checked distribution set. CI rejects regressions to
+  pipe-to-shell bootstrap or an unattested release, and the installation guide now leads with a
+  version-pinned, digest-bound attestation path.
+
+- **Authenticated daemon callers now have bounded request/concurrency admission and completed-usage
+  circuit breakers (C-261).** One principal/realm-aware governor rate-limits every protected route,
+  admits REST, webhook, and A2A work before session creation, holds permits for background and
+  streaming lifetimes, and returns observable `429` responses without retaining bearer values.
+  Provider-call and priced-spend thresholds reject new work once durable completed usage reaches
+  the configured ceiling; already-admitted overshoot is bounded by the concurrency limit. Its
+  in-process state is bounded and swept; multi-replica deployments are documented to enforce the
+  equivalent shared policy at a reverse proxy or control plane.
+
+- **Adversarial assurance now complements the ordinary author-written test suite (C-264).** CI adds
+  deterministic hostile-input smoke corpora for provider streams, Flux-Lang, plugin frames, URL
+  normalization, and pack archives, plus pinned static-analysis and bounded memory-safety lanes.
+  Parsed-workflow policy tests keep the lanes non-vacuous and reject silent target loss,
+  disabled-job decoys, comment-only actions, and drift in the explicit Miri exclusion inventory.
+
 - **A Flux-Lang program can now curate a release, with the host owning every irreversible decision
   (C-251, partial — the story stays open).** `examples/release.flux` reads ground truth from git, has a
   `release-scribe` role draft both changelogs, and drives the existing `cut-release.sh`; four new ops
@@ -32,6 +74,54 @@ All notable changes to this project are documented in this file. The format is b
   by policy" wording is wrong as written and is recorded as such.
 
 ### Fixed
+
+- **Daemon timeouts and resource accounting now retain turn ownership through finalization.** REST,
+  webhook, and blocking A2A deadlines cancel and await the owning turn before returning `408`;
+  provider call breakers count zero-token calls, and overlapping principals are charged by exact
+  durable turn id instead of completion-order session deltas. Git diff operations also disable
+  configured textconv programs, and the CLI registration census identifies direct registrations
+  by their tool/pack source rather than approving the method name alone.
+
+- **Built-in strict review is immutable and fail-closed in untrusted checkouts (C-265).** Project or
+  user-global role files can no longer replace its three embedded, toolless reviewers with
+  write-capable agents. Direct `flux review` now inherits the unattended `require` sandbox and
+  closed-network posture because its fixed flow and child delegation are internally auto-approved.
+
+- **Guarded outbound connections now use the exact DNS answers the guard approved (C-256, C-257).**
+  Fleet A2A calls, plugin HTTP and OAuth callbacks, and plugin TCP dials no longer validate a host
+  and then re-resolve it at connect time. HTTP clients are address-pinned with automatic redirects
+  and ambient proxies disabled; supported plugin redirects are independently guarded per hop, and
+  TCP connects directly to the vetted socket set. The native web broker enforces the same direct
+  connection rule. Unix-socket wildcard grants now match one path segment and reject traversal
+  components before connecting. Injected rebinding, redirect, proxy, and traversal fixtures pin the
+  containment boundary.
+  A Unix grant is additionally enforced against the socket's **physical** identity, because
+  rejecting `.`/`..` and confining `*` to one segment still left a dot-free, single-segment,
+  legitimately-granted name like `alias.sock` free to be a symlink the kernel then followed to a
+  listener outside the grant. Grant *and* target are both reduced, so one socket named through two
+  symlinked spellings still matches and a symlink resolving inside the grant stays authorized —
+  containment, not a blanket ban on symlinked sockets. Resolving before the check also makes the
+  checked path the dialed path, closing the window in which the link could be repointed.
+
+- **Unattended and serving surfaces no longer silently start unconfined (C-262).** Auto-approved
+  non-interactive commands and every server mode now require a working OS sandbox and deny sandbox
+  network access by default. Unsupported hosts fail before model/tool work. Operators can still
+  choose an explicitly warned `--no-sandbox` or exact `FLUX_SANDBOX=off` escape when equivalent
+  outer isolation is supplied; interactive local use retains its existing honest soft mode.
+
+- **Detached and failed turns now terminate honestly (C-226, C-260).** Dropping a REST SSE body
+  cancels its request-owned turn, bounds pending events, retains its work permit until finalization,
+  and preserves a valid provider history. Provider failures that occur before execution now produce
+  a typed failed outcome, a non-zero CLI exit, and an NDJSON error rather than successful-looking
+  answer prose.
+
+- **Model-facing execution and its structural gates now match the production catalog (C-218,
+  C-233, C-234, C-258, C-263).** `git_diff` disables external diff drivers; eval executables,
+  terminal-bench drivers, datasets, import paths, and rebuild decisions are host-selected, use the
+  ordinary sandbox path where model-reachable, and receive only provider-specific credentials;
+  risk-documentation and registration-seam checks cover production packs; and the direct-I/O gate
+  parses Rust syntax across every classified model-facing implementation crate, including eval,
+  and follows local callable aliases instead of losing a forbidden constructor stored in `let`.
 
 - **Two artifacts the release flow depends on were gitignored, which would have reddened `ci` on `main`
   (C-251).** `.flux/agents/release-scribe.md` and `.flux/policies/release.toml` were excluded by
@@ -73,8 +163,6 @@ All notable changes to this project are documented in this file. The format is b
   const's text changed, but no signature was removed and the legal edge set is unchanged, so this is not
   wire-breaking. Note for external implementors: the public `WorkBoard` trait gains two required methods
   with **no default bodies**, which is a breaking change carried by the workspace MINOR.
-
-### Fixed
 
 - **A retry no longer leaves the coordinator reporting progress on a process that no longer exists
   (C-240).** `transition` never cleared `runner`/`task_id`, so after `Failed→Ready` the next sweep read
