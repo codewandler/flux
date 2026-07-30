@@ -4105,12 +4105,63 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         }
 
+        /// A connection that reports WAL write-lock contention instead of waiting it out — the
+        /// probe [`write_lock_is_held`] answers from. `busy_timeout` must be set to zero
+        /// explicitly: rusqlite installs a **5s** default on every `Connection::open`, so a probe
+        /// left at the default would sit on the lock for five seconds before answering (and would
+        /// still answer correctly, which is exactly how it would go unnoticed).
+        fn non_waiting_connection(path: &std::path::Path) -> rusqlite::Connection {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            conn
+        }
+
+        /// Is this connection's `BEGIN IMMEDIATE` refused right now because someone else holds the
+        /// WAL write lock? The probe does not wait (see [`non_waiting_connection`]), so this
+        /// answers from the lock's *current* state. `Ok(())` means the probe took the lock instead
+        /// — it is rolled back, so the probe never disturbs what it observes.
+        fn write_lock_is_held(probe: &rusqlite::Connection) -> bool {
+            match probe.execute_batch("BEGIN IMMEDIATE") {
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    true
+                }
+                Ok(()) => {
+                    probe.execute_batch("ROLLBACK").unwrap();
+                    false
+                }
+                Err(e) => panic!("the write-lock probe failed for an unexpected reason: {e:?}"),
+            }
+        }
+
         /// C-126's other contention case: an ACTIVE WRITER (not just a pinned reader) holding the
-        /// WAL write lock. `checkpoint` must return immediately without error — never wait behind
-        /// (or itself cause) the 5s busy_timeout ordinary appends use.
+        /// WAL write lock. `checkpoint` must return without error and **without waiting the writer
+        /// out** — never behind (or itself causing) the 5s busy_timeout ordinary appends use.
+        ///
+        /// C-253: this used to assert `elapsed < 500ms`, which measured the machine rather than the
+        /// code — it reddened the gate at 918ms during an integration run with four sibling `cargo`
+        /// builds saturating the CPU, on no defect. A duration was only ever a proxy anyway, so the
+        /// test now proves the same property causally, with no clock in it at all:
+        ///
+        /// 1. The checkpoint connection's busy timeout is zero, so it has no busy handler and
+        ///    therefore *cannot* wait for a contended lock — SQLite hands it `SQLITE_BUSY` on the
+        ///    spot. `busy_timeout` is the only waiting mechanism this crate installs anywhere, so
+        ///    this is the whole of "the checkpoint cannot block". Note zero is **not** the default
+        ///    state: rusqlite sets 5s on every `Connection::open`, so dropping the explicit
+        ///    `busy_timeout(ZERO)` in `SqliteEvents::open_with_threshold` silently restores a 5s
+        ///    wait — which is precisely the regression this step catches. Asserted **first**, which
+        ///    is also what makes the rest of the test safe to run inline: a reintroduced wait is red
+        ///    here, before anything can sit on a lock.
+        /// 2. Under that guarantee, the contended `checkpoint()` still returns `Ok`.
+        /// 3. At the moment it returned, the writer was **still holding** the lock — so the
+        ///    checkpoint demonstrably did not wait for the writer to release. That is the
+        ///    happens-before the 500ms bound was standing in for, asserted directly.
+        ///
+        /// The probe is checked against a released lock too (step 4), so a probe that had somehow
+        /// degraded into always answering "held" cannot quietly pass step 3.
         #[test]
         fn checkpoint_hook_never_blocks_or_errors_under_writer_contention() {
-            use std::time::Duration;
             let path = std::env::temp_dir().join(format!(
                 "flux-events-c126-writer-contention-{}-{:?}.db",
                 std::process::id(),
@@ -4121,24 +4172,50 @@ mod tests {
             let store = EventStore::open(&path).unwrap();
             store.create_session("m").unwrap();
 
+            // 1. The checkpoint connection cannot wait for a lock, by construction.
+            let Backend::Sqlite(sqlite) = &store.backend else {
+                panic!("EventStore::open must yield the sqlite backend");
+            };
+            assert_eq!(
+                sqlite.checkpoint_busy_timeout_ms().unwrap(),
+                Some(0),
+                "the checkpoint connection must keep a zero busy timeout — with a busy handler \
+                 installed a contended checkpoint would wait the writer out instead of giving up"
+            );
+
             // Hold the WAL write lock from a separate connection, as a concurrent writer process
             // would (mirrors `concurrent_writers_wait_on_busy_timeout_instead_of_erroring` above).
             let writer = rusqlite::Connection::open(&path).unwrap();
             writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-            let start = std::time::Instant::now();
+            let probe = non_waiting_connection(&path);
+            assert!(
+                write_lock_is_held(&probe),
+                "the writer's BEGIN IMMEDIATE must actually hold the WAL write lock, or there is \
+                 no contention to test"
+            );
+
+            // 2. Contended, the checkpoint reports success rather than an error.
             let result = store.checkpoint();
-            let elapsed = start.elapsed();
-
-            writer.execute_batch("COMMIT").unwrap();
-
             assert!(
                 result.is_ok(),
                 "a checkpoint contended by an active writer must not error: {result:?}"
             );
+
+            // 3. …and it got here while the writer still held the lock, so it cannot have waited
+            //    for the writer to release. The writer is only committed below, after this.
             assert!(
-                elapsed < Duration::from_millis(500),
-                "checkpoint must not wait out the writer's lock, took {elapsed:?}"
+                write_lock_is_held(&probe),
+                "checkpoint returned only after the writer released the WAL write lock — it waited \
+                 the writer out instead of giving up immediately"
+            );
+
+            // 4. The probe is a real detector, not a constant: once the writer commits it reports
+            //    the lock free again.
+            writer.execute_batch("COMMIT").unwrap();
+            assert!(
+                !write_lock_is_held(&probe),
+                "the write-lock probe must report the lock free once the writer commits"
             );
 
             let _ = std::fs::remove_file(&path);
