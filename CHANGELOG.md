@@ -6,6 +6,140 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`fleet.start` — flux can start a flux worker, so a wave can be larger than one (C-243).** A new
+  `AgentRuntime` port with `ProcessRuntime`/`ExternalRuntime`, plus `fleet.start`, `fleet.worker_status`
+  and `fleet.stop`. Until now flux never spawned flux, and `FlowEngine`'s turn gate means one worker
+  serves one turn — so no wave could exceed one. This is the prerequisite for parallelism, not a
+  speed-up. A worker is a guarded child process confined to a checkout that may sit **outside** the
+  workspace root (which is what `fleet.isolate` produces), reached over a returned endpoint, resumable
+  through a returned context id, and bounded: one generation deep by default and 16 workers wide, a bound
+  a worker cannot raise for itself.
+  ⚠ **`fleet.start` refuses when the OS sandbox is active without network access**, and that refusal is
+  the point: a wrapped worker binds its port inside its own network namespace, so it would announce
+  itself and be unreachable while reporting `live`. Set `FLUX_SANDBOX_NET=1` for a coordinator that
+  starts workers. ⚠ **Reaching the returned endpoint needs `--allow-private-net`** — it is a loopback
+  address, and flux does not trust loopback implicitly. Both are named in the op's own description and
+  result rather than left to be discovered.
+  Three blocking defects were found by review before this landed, each of which would have shipped
+  broken: the op could not accept the very worktree `fleet.isolate` returns, because it resolved the path
+  through the write-path resolver while that allocator deliberately works outside every workspace root;
+  the worker was silently unreachable under the unattended posture; and a worker's own catalog contained
+  `fleet.start` with auto-approval, so one operator approval fanned out without bound.
+
+### Changed
+
+- **Guarded IO has a port a non-syscall backend can implement (C-269).** ⚠ **Breaking for out-of-tree
+  `flux_plugin::SystemSource` implementors** — that published trait's signature changed; external
+  *callers* still compile. `flux-system::System` was a concrete struct whose guarded operations were
+  inherent methods, so nothing could substitute a non-native backend. There are now three narrow ports —
+  `GuardedEnv`, `GuardedProcess`, `GuardedHostFiles` — with the native `System` as first implementor and
+  the **consumer** declaring its own bundle rather than a god trait.
+  The story asked whether that widens what the direct-IO lint can see past, and the answer is yes:
+  before this, the type system structurally guaranteed exactly one guarded-IO implementation, because
+  the seam returned a concrete `Arc<System>`. A type can now satisfy `GuardedProcess` while enforcing
+  none of argv-only / pinned-cwd / cleared-env / capped-output, and that is inherent to a substitutable
+  backend. So the widening was **closed rather than reported**: a whole-tree gate,
+  `no_unreviewed_guarded_port_backend_outside_system`, with a single-use allowance list holding only
+  flux-system's native impls — and it resolves renamed imports, grouped and module renames, and rename
+  chains to a fixed point, so a rename cannot mint a fresh unreviewed identity.
+  The traits are deliberately **unsealed** and `port.rs` says so: an out-of-repo Wasm embedder is the
+  point, and such a crate could already spawn processes itself. Inside flux the invariant is mechanically
+  enforced; outside it the consumer takes responsibility. The workspace-confined file family stays
+  unported for now.
+
+- **The SQLite driver is an opt-out feature on both paths to the engine (C-274).** With it off,
+  `cargo tree -p codewandler-flux-flow --no-default-features -e normal -i rusqlite` reports nothing,
+  where it previously reported two normal paths. The default build is unchanged and still SQLite-backed.
+  The non-obvious part: `default-features = false` on a **member** manifest is silently ignored by cargo
+  for a workspace-inherited dependency, so gating the two crates' own manifests looks complete and moves
+  nothing — the line has to sit on the root `[workspace.dependencies]` entry, with members opting back
+  in. Feature-off is a real store, not a stub: `EventBackend` is crate-private, so an embedder could
+  supply nothing, and the new driver-free backend is held to all 44 shared conformance bodies.
+  `in_memory` switches backend rather than disappearing.
+  ⚠ **Minor signal for consumers who already pinned `default-features = false`:** they previously got
+  the SQLite backend and `EventStore::open` anyway, because the crate had no features to switch off.
+  They now get neither — a compile error for `open`, and silently a forgetful store for `in_memory`.
+  No in-repo consumer is affected, and the version script cannot catch this because the crate rides the
+  workspace version.
+
+### Fixed
+
+- **Both sides of the fail-closed sandbox switch are now proven in CI (C-266).** C-262's fail-closed
+  default cost the 0.38.0 cut four successive fix commits, each found only by pushing and reading a red
+  run, because every developer machine has `bwrap` and no runner does. The `check` job now sets
+  `FLUX_BWRAP_BIN=/nonexistent/bwrap` job-wide, so all seven of its steps run the no-backend posture **by
+  construction** rather than by the accident of a runner image — including `smoke-live.sh --shapes`,
+  whose serving-surface step a `cargo test` run does not reach. A new `sandbox-backend` job installs
+  bubblewrap and runs the suite plus the shape guard at `FLUX_SANDBOX=require`.
+  The story's stated premise turned out to be **false**, and the implementor falsified it rather than
+  inheriting it: `sandbox_posture.rs` does *not* require the absence of a backend — every spawn there
+  already pins both discovery variables at nonexistent paths, so it is hermetic and passes on a host
+  that has `bwrap`. Nothing had to be weakened and no test relocated. The real trap was the inverse:
+  `apt-get install bubblewrap` does not mean bwrap *works* — a kernel refusing unprivileged user
+  namespaces resolves `Unsupported` and the new lane would have become a silently-green copy of `check`.
+  So the lane asserts its own premise via `flux doctor --json` and proves confinement behaviourally by
+  the child's pid inside `--unshare-pid`, not by exit status. Recurrence is guarded by
+  `every_unattended_test_spawn_declares_its_sandbox_posture`, with its non-coverage stated plainly.
+
+- **The security-assurance epic's closure is now recorded rather than re-derivable (C-267).** Every
+  2026-07-29 desk-review finding and the classification-trust concern is mapped to a commit, test name
+  and `file:line` verified against the shipped tree — landed as a dated artifact under `reviews/` with a
+  per-axis delta against that baseline, so the next reviewer verifies instead of starting over. Two
+  results worth naming: **no `done`-but-unreachable child was found** — looked for deliberately, since
+  C-233 and C-234 are prior instances of exactly that pattern — and **envelope-integrity finding 4 is
+  reported OPEN**, now filed as C-275. It had survived by never being filed rather than by decision.
+  C-186 is consequently `in-progress`, not `done`, and says why.
+
+### Added
+
+- **`fleet.isolate` — a per-item checkout the caller's root never pays for (C-241).** A coordinator can
+  now give each work item its own git worktree in a single turn, which `git_worktree_enter` structurally
+  cannot: that op moves the caller's *own* working root, so N workers could never each have one. Creates
+  `impl/<item>` off the current clean HEAD and returns `{worktree, branch, base_commit}`. Refuses a dirty
+  base, an existing branch of that name, and nesting inside a worktree session — each recoverably, and
+  the preflights are ordered so a refusal creates nothing.
+  Every git invocation goes through the single guarded `System` path, argv-only, and the item name is
+  restricted to `[A-Za-z0-9._-]` with no `/` or `..`, so the ref cannot escape `refs/heads/impl/` and
+  `git worktree add`'s argv can never receive an option-lookalike.
+  `permission_subjects` names the **branch** (`fleet.isolate:impl/<item>`), not the checkout path — the
+  directory is allocated mid-execution, after approval. Independent review confirmed that is safe:
+  nothing in the call arguments influences where the checkout lands, and with `access: [Process]` and no
+  `Filesystem` the declaration emits `process.exec` on the branch-named subject and no filesystem
+  requirement — the same shape `git_commit`, `git_checkout` and `git_worktree_enter` already have. The
+  subject is in fact more scoped than `git_worktree_enter`'s, which is the bare op name.
+  ⚠ **Cleanup is the caller's, deliberately** — the host never removes an isolated worktree, because it
+  holds the worker's unmerged diff. Nothing bounds the count, so a grant of `fleet.isolate:impl/*`
+  authorizes an unlimited number of full checkouts under `$FLUX_WORKTREE_DIR`/`~/.flux/worktrees`. Budget
+  disk accordingly.
+
+### Fixed
+
+- **The public documentation corpus had drifted, and the enumerations that keep rotting are now pinned
+  (C-250).** 37 corrections across 25 pages, each grounded in a non-doc `file:line` rather than in
+  another document's agreement — which is the failure mode the story exists to fix. Representative:
+  `getting-started` asked for Rust 1.85+ against a `rust-version` of 1.87; `opus` resolved to
+  `claude-opus-4-8` and resolves to `claude-opus-5`; the board state machine was documented as four
+  states against `State::ALL`'s seven, and its operations as six against eleven; a legacy
+  `[private_net] web_fetch` key was documented as "silently ignored" while `deny_unknown_fields` makes
+  the config **refuse to load**; `http-api` claimed `usage` reports every token tier and it reports five
+  of eight. The durable half is a new guard: board pages had rotted twice on the same axis, so the
+  operation and row-field lists are now generated from `work_board_tools`/`MemoryBoard` and the pages
+  must enumerate them — proven by breaking a page and watching the test name the exact omission.
+
+- **The engine's state store is behind a port (C-270).** `FlowStore` is now a facade over
+  `Arc<dyn FlowStateBackend>` with the SQLite implementation behind it and an in-memory second
+  implementation, both held to one conformance suite, plus a real two-operation plan executing end to
+  end over the non-SQLite backend — so the port is falsifiable rather than decorative. The trait owns
+  its own absence outcome (`Lookup::{Found, NoSuchRow}`), which is what stops it being portable in name
+  only: every `rusqlite` reference, including all four `QueryReturnedNoRows` matches, now sits inside
+  the SQLite backend. `take_suspension`'s atomicity moved from the facade into the backend and is a
+  stated trait obligation, which is stricter than the read-then-delete it replaced. Dropping the direct
+  `rusqlite` dependency is **not** part of this and is now C-274: the driver also arrives via
+  `flux-events` non-optionally, so removing one line of two buys no portability and would gate
+  `FlowStore::in_memory` behind a feature for nothing.
+
 ## [0.39.0] - 2026-07-30
 
 ### Fixed

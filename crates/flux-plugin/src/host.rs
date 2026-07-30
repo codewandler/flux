@@ -117,27 +117,45 @@ pub trait SecretSink: Send + Sync {
     fn register_secret(&self, value: &str);
 }
 
-/// Where [`SystemHostCaps`] resolves its guarded [`System`](flux_system::System) from (C-122).
+/// The guarded surface the plugin host needs, and no more (C-269).
+///
+/// `SystemHostCaps` uses exactly three of `flux-system`'s guarded families — argv-only process
+/// execution, scope-admitted host-file reads, and env lookups for `secret:env/KEY` refs — so it names
+/// those three rather than a catch-all "whole System" trait. The blanket impl means the native
+/// [`System`](flux_system::System) satisfies it for free, and so does any substrate that serves the
+/// same three ports (a Wasm embedder reaching host imports, a remote executor, a test double).
+///
+/// This is the bundle, not the seam: the operations themselves live in `flux_system::port`.
+pub trait PluginSystem: GuardedProcess + GuardedHostFiles + GuardedEnv {}
+
+impl<T: GuardedProcess + GuardedHostFiles + GuardedEnv + ?Sized> PluginSystem for T {}
+
+/// Where [`SystemHostCaps`] resolves its guarded system from (C-122).
 ///
 /// A workspace transition (`git_worktree_enter`) swaps the context's active system; host
-/// capabilities that captured an `Arc<System>` at assembly time kept executing `process.run` in
+/// capabilities that captured the system at assembly time kept executing `process.run` in
 /// the original root after the rest of the session had moved. This seam makes the resolution
 /// dynamic: each `handle()` call snapshots the source once — the same snapshot-per-operation
 /// discipline as `ToolContext::system` — so a transition is observed by the *next* op, never
 /// mid-call. Surfaces with no transitions (e.g. one-shot `flux plugin call`) use a
 /// [`FixedSystem`]; session surfaces bind an adapter over the context's workspace handle (the
 /// adapter lives at the surface — this crate stays free of a runtime dependency).
+///
+/// The two axes are deliberately separate and both needed: this trait answers **which** guarded system
+/// is active right now, [`PluginSystem`] answers **what** a guarded system is. Before C-269 the second
+/// question had no answer — the snapshot was a concrete `Arc<System>`, so no non-native backend could
+/// be plugged in behind it.
 pub trait SystemSource: Send + Sync {
     /// Snapshot the currently active guarded system.
-    fn system(&self) -> Arc<flux_system::System>;
+    fn system(&self) -> Arc<dyn PluginSystem>;
 }
 
 /// A [`SystemSource`] pinned to one system forever — the non-transitioning surfaces' source, and
 /// exactly the pre-C-122 capture semantics.
-pub struct FixedSystem(pub Arc<flux_system::System>);
+pub struct FixedSystem(pub Arc<dyn PluginSystem>);
 
 impl SystemSource for FixedSystem {
-    fn system(&self) -> Arc<flux_system::System> {
+    fn system(&self) -> Arc<dyn PluginSystem> {
         self.0.clone()
     }
 }
@@ -216,13 +234,13 @@ type ManagedProc = flux_system::ManagedChild;
 impl SystemHostCaps {
     /// Capabilities over a fixed system — the pre-C-122 semantics, right for surfaces where no
     /// workspace transition can happen (one-shot `flux plugin call`, tests).
-    pub fn new(system: Arc<flux_system::System>) -> Self {
+    pub fn new(system: Arc<dyn PluginSystem>) -> Self {
         Self::from_source(Arc::new(FixedSystem(system)))
     }
 
     /// Snapshot the active guarded system for one operation (C-122). Every handler resolves
     /// through here, so a workspace transition is observed by the next op, never mid-call.
-    fn system(&self) -> Arc<flux_system::System> {
+    fn system(&self) -> Arc<dyn PluginSystem> {
         self.system.system()
     }
 
@@ -1392,7 +1410,7 @@ impl HostCapabilities for SystemHostCaps {
                         .grants
                         .conn
                         .iter()
-                        .map(|g| physical_unix_grant(&sys, g))
+                        .map(|g| physical_unix_grant(sys.as_ref(), g))
                         .collect::<Vec<_>>();
                     (
                         flux_system::net::DialTarget::Unix { path: physical },
@@ -1582,7 +1600,7 @@ fn conn_granted(grants: &[String], target: &str) -> bool {
 /// non-unix grant, a relative one, or one whose prefix cannot be resolved passes through verbatim:
 /// failing to reduce a grant must never silently widen it, and an unreduced grant simply fails to
 /// match a reduced target.
-fn physical_unix_grant(sys: &flux_system::System, grant: &str) -> String {
+fn physical_unix_grant(sys: &dyn PluginSystem, grant: &str) -> String {
     let Some(pattern) = grant.strip_prefix("unix:") else {
         return grant.to_string();
     };
@@ -2141,9 +2159,9 @@ mod tests {
 
         /// A swappable source — what the surfaces' `WorkspaceContext` adapter looks like to this
         /// crate: `system()` snapshots whatever is active now.
-        struct Swappable(std::sync::Mutex<Arc<System>>);
+        struct Swappable(std::sync::Mutex<Arc<dyn PluginSystem>>);
         impl SystemSource for Swappable {
-            fn system(&self) -> Arc<System> {
+            fn system(&self) -> Arc<dyn PluginSystem> {
                 self.0.lock().unwrap().clone()
             }
         }

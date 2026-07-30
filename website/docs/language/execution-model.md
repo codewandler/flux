@@ -90,8 +90,8 @@ bound is left verbatim — no silent data loss. To emit a literal brace, double 
 
 ## Truthiness
 
-All condition positions — `when`, `unless`, `assert`, and the `until` guards of `repeat` and
-`loop` — use the same JSON truthiness:
+Every condition position — `when`, `unless`, `assert`, `await`'s optional `when` guard, and the
+`until` guards of `repeat` and `loop` — uses the same JSON truthiness:
 
 | value | truthy? |
 |---|---|

@@ -156,15 +156,33 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         },
         ToolGroup {
             name: "fleet".into(),
-            description: "Outbound A2A dispatch to remote flux workers (A-116): hand a task to a \
-                          worker without waiting (`fleet.dispatch`), poll it (`fleet.status`), stop \
-                          it (`fleet.cancel`). The worker endpoint is a per-call argument, not \
-                          configuration, so there is no workspace signal that could gate these — a \
-                          predicate nothing emits would leave them registered but never advertised, \
-                          which is the unreachability A-131 closed. Force-on like `cognition`; the \
-                          group exists so `.flux/groups.toml` can reassign or gate them."
+            description: "Fleet workers. Lifecycle (C-243): start a worker for one board item \
+                          (`fleet.start`), check that it is still alive (`fleet.worker_status`), \
+                          end it (`fleet.stop`). Dispatch (A-116): hand a task to a worker without \
+                          waiting (`fleet.dispatch`), poll that task (`fleet.status`), stop it \
+                          (`fleet.cancel`). Isolation (C-241): give one board item its own \
+                          checkout to be worked in (`fleet.isolate`). The worker endpoint is a \
+                          per-call argument, not configuration, so there is no workspace signal \
+                          that could gate these — a predicate nothing emits would leave them \
+                          registered but never advertised, which is the unreachability A-131 \
+                          closed. Force-on like `cognition`; the group exists so \
+                          `.flux/groups.toml` can reassign or gate them."
                 .into(),
-            tools: names(&["fleet.dispatch", "fleet.status", "fleet.cancel"]),
+            // C-241 joins `fleet.isolate` to the family rather than to `git`, even though it is
+            // built from `git worktree add` and needs a repository: gating or reassigning "the
+            // fleet" in `.flux/groups.toml` must move all of it, and a member sitting in another
+            // group could not be gated with the rest. Being advertised where there is no repository
+            // costs a catalog line, and the op's own preflight — not its surfacing — is what
+            // refuses that case.
+            tools: names(&[
+                "fleet.start",
+                "fleet.worker_status",
+                "fleet.stop",
+                "fleet.dispatch",
+                "fleet.status",
+                "fleet.cancel",
+                "fleet.isolate",
+            ]),
             // Force-on (empty predicate). A-116 asked for this to be a deliberate decision rather
             // than a default, so here is the argument, and the reason a gate is not the answer.
             //
@@ -183,6 +201,11 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             //     cannot match an existing grant and routes to approval — and an endpoint that
             //     cannot be named yields no subject at all, which forces approval rather than
             //     matching a broad one.
+            // C-243's lifecycle ops join the group on the same terms, and they need the argument most
+            // because `fleet.start` creates an OS process: it is `Risk::High` with `process.exec`
+            // authority scoped to `fleet-worker:<item>`, so a start for an item nobody has approved
+            // before cannot match an existing grant — and an unnameable worker again yields no
+            // subject at all. Advertising it is still not authority to run it.
             // So the cost of force-on is catalog size and prompt churn, not reachable authority, and
             // a workspace that wants them gone can say so in `.flux/groups.toml` without a code
             // change.

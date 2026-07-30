@@ -101,8 +101,8 @@ normal policy decides for reads outside the project.
 
 ## Slash commands
 
-Flux discovers Markdown command files from the same four directories as skills, highest precedence
-first:
+Flux discovers Markdown command files from four directories — the skill roots above minus
+`~/.agents/skills`, which has no command counterpart — highest precedence first:
 
 1. project `.flux/commands`;
 2. project `.claude/commands`;

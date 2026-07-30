@@ -32,7 +32,7 @@ attached to each release, but inspect/download them separately if you choose tha
 `latest` installer directly from the network trusts the release origin without binding it to a
 specific tag and workflow.
 
-**From source** — requires Rust 1.85+ (`rustup update stable`):
+**From source** — requires Rust 1.87+ (`rustup update stable`):
 
 ```bash
 cargo install --git https://github.com/codewandler/flux --package flux-cli

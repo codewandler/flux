@@ -78,6 +78,14 @@ fn wakeup_events_for_contract() -> Arc<flux_events::EventStore> {
     Arc::new(flux_events::EventStore::open(dir.join("events.db")).expect("open contract store"))
 }
 
+/// A worker runtime for a name-only catalog check. `ExternalRuntime` over an empty table cannot
+/// start anything, which is the point: this contract reads `Tool::spec`, it never executes an op.
+fn fleet_runtime_for_contract() -> Arc<dyn flux_runtime::AgentRuntime> {
+    Arc::new(flux_orchestrate::ExternalRuntime::new(
+        std::collections::HashMap::new(),
+    ))
+}
+
 /// A provider that records the cognition prompt and returns one deterministic answer. The tutorial
 /// flow is authored, so this provider is called exactly once by `ai.reason`.
 struct PromptCapture {
@@ -380,6 +388,20 @@ fn operations_reference_covers_the_registered_public_catalog() {
                 flux_system::net::PrivateNetAllow::None,
                 None,
             )),
+            // C-243's worker-lifecycle half, added for exactly the reason recorded above: they are
+            // in the production catalog via the same `try_register_fleet`, so leaving them out here
+            // would let them go undocumented while this contract stayed green — the third instance
+            // of that failure mode. The runtime is the `ExternalRuntime` (no process is started);
+            // only the registered names and specs matter to this check.
+            Arc::new(flux_orchestrate::FleetStartTool::new(
+                fleet_runtime_for_contract(),
+            )),
+            Arc::new(flux_orchestrate::FleetWorkerStatusTool::new(
+                fleet_runtime_for_contract(),
+            )),
+            Arc::new(flux_orchestrate::FleetStopTool::new(
+                fleet_runtime_for_contract(),
+            )),
         ]
         .into_iter()
         .map(|tool| tool.spec().name),
@@ -456,6 +478,11 @@ const NON_PUBLIC_ENV: &[&str] = &[
     "FLUX_BG_MARKER",
     "FLUX_C67_CWD_CHILD",
     "FLUX_EVAL_MARKER",
+    // C-243: the fleet-worker generation a `ProcessRuntime` child is granted. Set by flux on its own
+    // workers and read back by their runtimes to bound nesting; `build_command` clears the child's
+    // environment first, so it is not something an operator (or a model) can hand in. Raising it by
+    // hand only ever shrinks the budget, so it is not a knob worth documenting as one.
+    "FLUX_FLEET_DEPTH",
     "FLUX_SANDBOXED",
     "FLUX_SECRET",
     "FLUX_SYSTEM_ENV_TRUTHY_PROBE",
@@ -1133,5 +1160,70 @@ fn os_sandbox_page_exists_and_states_its_key_claims() {
     assert!(
         docs.contains("spawn_debug_pipe") || docs.contains("browser"),
         "must document the browser exemption"
+    );
+}
+
+/// C-250: the enumeration that has now rotted twice — the board pages listed **seven** generated ops
+/// while the code generated nine (C-236's `query`/`comments`), then nine while it generated eleven
+/// (C-240's `reassign`/`record_evidence`). Both times the docs went stale within hours and nothing
+/// went red, because a board's ops are *generated per backend* and never enter the builtin catalog
+/// `operations_reference_covers_the_registered_public_catalog` walks.
+///
+/// The generator is public, though, so the list can be read off the code rather than retyped: the
+/// same discipline that keeps the op names in that test honest applies here. Read the names and the
+/// `query` row fields off `Tool::spec`, so adding an op or a row field is a red test rather than a
+/// silent documentation gap.
+#[test]
+fn board_pages_enumerate_every_generated_board_operation_and_query_row_field() {
+    let tools = flux_capabilities::work_board_tools(
+        "board",
+        Arc::new(flux_capabilities::MemoryBoard::new()),
+    )
+    .expect("the in-memory board satisfies its own contract");
+    let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+
+    // The typed `query` rows are the half a Program consumes as data, and the field list is the same
+    // closed-enumeration hazard one level down: `attempts` was omitted next to a sentence asserting
+    // "every row carries every field".
+    let row_fields: Vec<String> = tools
+        .iter()
+        .map(|tool| tool.spec())
+        .find(|spec| spec.name == "board.query")
+        .and_then(|spec| spec.output_schema)
+        .and_then(|schema| schema["items"]["properties"].as_object().cloned())
+        .expect("`board.query` declares an output schema of typed row objects")
+        .keys()
+        .cloned()
+        .collect();
+
+    for rel in [
+        "website/docs/agent/fleet.md",
+        "website/docs/agent/datasources.md",
+    ] {
+        let page = read(rel);
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|name| !page.contains(&format!("`{name}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{rel} omits {} of the {} generated board operation(s): {missing:?}",
+            missing.len(),
+            names.len()
+        );
+    }
+
+    // Only `fleet.md` enumerates the row fields; `datasources.md` links to it rather than repeating
+    // the list, which is the right shape — a second copy is a second thing to let rot.
+    let rows = read("website/docs/agent/fleet.md");
+    let missing: Vec<&String> = row_fields
+        .iter()
+        .filter(|field| !rows.contains(&format!("`{field}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "website/docs/agent/fleet.md omits {} of the {} `board.query` row field(s): {missing:?}",
+        missing.len(),
+        row_fields.len()
     );
 }

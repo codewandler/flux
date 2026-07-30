@@ -36,7 +36,7 @@ The header uses space-keyword tokens in a fixed order:
 |---|---|---|
 | `<max>` | yes | maximum attempts, including the first |
 | `backoff none / linear / exponential` | no | inter-attempt delay strategy (default `none`) |
-| `delay <ms>` | no | base delay in milliseconds |
+| `delay <duration>` | no | base delay — `250ms` / `5s` / `1m`, or a bare integer read as milliseconds. **Defaults to 500 ms**, so a `retry` with no `delay` still waits between attempts |
 | `-> $bind` | no | binds the body's last expression on success |
 
 The backoff schedule, where `k` counts retries (`k = 1` is the wait before the second attempt):

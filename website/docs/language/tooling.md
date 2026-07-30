@@ -25,7 +25,9 @@ ops, declared parameters, and parse errors without starting an agent session. Pr
 win name collisions. `run` resolves an existing file first; otherwise it looks up the target as a
 saved filename stem or declared flow name.
 
-- Native text and JSON AST files load to the same authored program.
+- A `.flux` file is Flux-Lang **text**. JSON is an AST interchange format, not a second meaning for
+  the extension: a `.flux` file whose content is a JSON AST is refused with a parse error, not
+  sniffed. SDK, replay, and audit paths still read JSON ASTs directly.
 - A file must contain a bare flow, or a module with exactly one runnable flow/journey. Composite
   `op` declarations in that module are registered for the run.
 - Declared parameters are required. Use `--inputs` or repeatable typed `--arg key=value`; unknown,
@@ -94,7 +96,8 @@ semantic authority for required fields, placement, operation types, and bounds.
 - **JSON AST and host-derived flow records** may appear in SDK, replay, and audit storage. They are
   representations of authored or host-constructed execution, never model output.
 
-Use two-space indentation, no tabs, and one statement per line. See
+Use two-space indentation and no tabs. One statement per line is the house style rather than a
+grammar rule — an argument list, object, or array may span lines inside its delimiters. See
 [Flows & syntax](./flows-and-syntax.md) and [Examples](./examples.md).
 
 ## Editor support

@@ -14,8 +14,13 @@
 pub use flux_agent::{parse_role, try_parse_role, Role, RoleRegistry};
 
 pub mod fleet;
+pub mod worker;
 
 pub use fleet::{A2aSpawner, FleetCancelTool, FleetDispatchTool, FleetStatusTool};
+pub use worker::{
+    ExternalRuntime, FleetStartTool, FleetStopTool, FleetWorkerStatusTool, ProcessRuntime,
+    DEFAULT_WORKER_BASE_PORT,
+};
 
 use std::sync::Arc;
 

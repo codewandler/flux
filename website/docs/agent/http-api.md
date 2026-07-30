@@ -106,9 +106,16 @@ curl -X POST http://127.0.0.1:3000/sessions/s_1/messages \
 }
 ```
 
-`tool_calls` lists the operations the turn ran, in order. `usage` reports **every** token tier, not
-just input and output — a caller pricing its own spend, or measuring real context-window occupancy,
-needs the cache and reasoning tiers. It is `null` when the provider reported no usage.
+`tool_calls` lists the operations the turn ran, in order. `usage` reports the five tiers shown above
+— `input`, `output`, `cache_creation`, `cache_read`, `reasoning` — rather than just input and output,
+because a caller pricing its own spend or measuring real context-window occupancy needs the cache and
+reasoning figures. It is `null` when the provider reported no usage.
+
+Three tiers flux tracks internally are **not** on the wire, here or on the usage endpoints: the
+one-hour cache-write split, and audio input/output. They are all subsets of a tier that *is* reported,
+so no tokens go missing from a total — but a caller re-deriving cost from these numbers alone will
+price a 1h cache write as a five-minute one. The `cost_usd` the usage endpoints return is computed
+server-side from the full breakdown and does account for it.
 
 ### Stream a turn
 
@@ -204,6 +211,7 @@ come from per provider.
 | `429` | The caller exceeded request rate or live work, or completed provider usage tripped a call/spend circuit breaker. `Retry-After` and `X-Flux-Limit` identify when and which dimension may be retried. |
 | `413` | The request body exceeded the body cap. |
 | `500` | The turn failed. |
+| `503` | Principal mode only: the authentication backend was unreachable. Deliberately distinct from `401` — the token was never judged, so retrying later is the right response, not re-authenticating. |
 
 The body cap and timeout apply to the whole surface and are set at router build time, overridable
 per deployment with `FLUX_SERVER_MAX_BODY_BYTES` and `FLUX_SERVER_REQUEST_TIMEOUT_SECS` (positive

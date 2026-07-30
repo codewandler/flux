@@ -69,6 +69,12 @@ const TASK_OP_SOURCE: &str = "flux-cli sub-agent task operation";
 /// method name alone approves nothing.
 const FLEET_OP_SOURCE: &str = "flux-cli fleet dispatch";
 
+/// The audit source label `try_register_fleet` registers the C-243 worker-**lifecycle** ops under.
+/// Separate from [`FLEET_OP_SOURCE`] because the two halves have genuinely different authority — the
+/// dispatch ops make network requests, the lifecycle ops create OS processes — and an audit that
+/// lumped them under one label could not say which of the two a registration widened.
+const FLEET_LIFECYCLE_SOURCE: &str = "flux-cli fleet lifecycle";
+
 /// The domain the census binds a representative work board under (A-131).
 ///
 /// A board's real domain is the Program's `datasource` name, so no fixed name is *the* production
@@ -563,6 +569,15 @@ fn the_fleet_ops_are_reachable_from_the_production_catalog() {
              remote worker"
         );
     }
+    // C-243, the same argument one layer down: a dispatch op is only reachable for a worker that
+    // exists, and until the lifecycle ops were registered nothing could make one.
+    for op in ["fleet.start", "fleet.worker_status", "fleet.stop"] {
+        assert!(
+            catalog.get(op).is_some(),
+            "the production catalog does not register `{op}` — a Program cannot start a worker, so \
+             every wave is a wave of one"
+        );
+    }
 }
 
 /// The sub-agent registry (`child_base` in `build_agent_with`) is one of the two open registration
@@ -625,11 +640,12 @@ struct RegistrationCall {
     source: Option<String>,
 }
 
-fn covered_registration_sources() -> [String; 5] {
+fn covered_registration_sources() -> [String; 6] {
     [
         "\"flux-cli cognition pack\"".to_string(),
         format!("{TASK_OP_SOURCE:?}"),
         format!("{FLEET_OP_SOURCE:?}"),
+        format!("{FLEET_LIFECYCLE_SOURCE:?}"),
         "ConsultTool".to_string(),
         "WakeupTool".to_string(),
     ]

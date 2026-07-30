@@ -228,8 +228,6 @@ Worth knowing before you build on this:
 - **No scheduled sweep is shipped.** Recovery is available — a restarted process can re-derive
   everything — but you drive it. There is no built-in journey that periodically reconciles in-flight
   items for you.
-- **Board operations return human-readable text**, not structured rows, so a program that wants a
-  field out of an item currently has to extract it from that text rather than reading it directly.
 - **Workers behind authentication are not reachable yet.** There is no configuration for a worker
   bearer token, so a worker served with authentication required cannot be dispatched to.
 - **Two backends exist.** Issue-tracker-backed boards are not shipped.

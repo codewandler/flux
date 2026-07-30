@@ -1046,6 +1046,681 @@ pub fn raw_project_metadata_io(src: &str) -> syn::Result<Vec<RawProjectMetadataI
     Ok(visitor.hits.into_iter().collect())
 }
 
+// ---------------------------------------------------------------------------
+// Guarded-IO port backends (C-269)
+// ---------------------------------------------------------------------------
+
+/// The `flux_system::port` traits whose implementations *are* a guarded IO backend. Implementing one
+/// is a claim to enforce the process/filesystem guarantees `System` enforces, so the set of
+/// implementors has to stay as enumerable as the set of raw `Command` constructions.
+const GUARDED_PORT_TRAITS: &[&str] = &["GuardedProcess", "GuardedHostFiles", "GuardedEnv"];
+
+/// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GuardedPortImpl {
+    pub line: usize,
+    /// The **canonical** port trait name (`GuardedProcess`), whatever local spelling reached it.
+    /// Allowances match on this, so a rename cannot mint a fresh unreviewed identity.
+    pub port: String,
+    /// The implementing type's final path segment (`System`), or `<generic>` for a blanket impl.
+    pub backend: String,
+    /// The local name actually written, when it differs from [`Self::port`] — i.e. the impl came
+    /// through a renamed import. Diagnostics only; it makes an aliased violation readable.
+    pub spelled_as: Option<String>,
+}
+
+/// The canonical port trait a path names, matched on its **final segment**: reached as
+/// `GuardedProcess`, `port::GuardedProcess`, `flux_system::port::GuardedProcess`, or through a glob
+/// import, it is the same trait, and a gate that demanded the full path would miss the short spellings
+/// that are actually idiomatic. Over-reporting an unrelated same-named trait is the safe direction for
+/// a security gate — that costs a reviewed allowance, whereas under-reporting costs the invariant.
+fn direct_port_trait(segments: &[String]) -> Option<&'static str> {
+    let last = segments.last()?;
+    GUARDED_PORT_TRAITS
+        .iter()
+        .find(|port| *port == last)
+        .copied()
+}
+
+/// Local names that reach a guarded-IO port trait, so a renamed import cannot hide a backend.
+///
+/// This mirrors [`ProcessAliases`], which already resolves `use std::process::Command as Exec` for
+/// `no_raw_process_command_outside_system` — without the same treatment here the newer gate would be
+/// weaker than its sibling against the identical evasion.
+#[derive(Default)]
+struct PortAliases {
+    /// Local trait name → canonical port trait. Seeded with the identity mapping for every port
+    /// trait, so unaliased spellings resolve through the same table as renamed ones.
+    traits: HashMap<String, &'static str>,
+    /// `use <path> as <local>` pairs whose target was not itself a port trait, resolved to a fixed
+    /// point once the whole file is collected — so a rename *chain*
+    /// (`use …GuardedProcess as A; use A as B;`) still lands on the canonical name, and so a
+    /// `use` that appears textually before the one it depends on is not order-sensitive.
+    renames: Vec<(Vec<String>, String)>,
+}
+
+impl PortAliases {
+    fn new() -> Self {
+        let mut aliases = Self::default();
+        for port in GUARDED_PORT_TRAITS {
+            aliases.traits.insert((*port).to_string(), *port);
+        }
+        aliases
+    }
+
+    /// The canonical port trait an `impl … for` trait path resolves to.
+    fn resolve_path(&self, path: &syn::Path) -> Option<&'static str> {
+        let last = path.segments.last()?.ident.to_string();
+        self.traits.get(&last).copied()
+    }
+
+    fn add_use(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.add_use(&path.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                prefix.push(name.ident.to_string());
+                if let Some(port) = direct_port_trait(prefix) {
+                    self.traits.insert(name.ident.to_string(), port);
+                }
+                prefix.pop();
+            }
+            syn::UseTree::Rename(rename) => {
+                prefix.push(rename.ident.to_string());
+                match direct_port_trait(prefix) {
+                    Some(port) => {
+                        self.traits.insert(rename.rename.to_string(), port);
+                    }
+                    // Not (yet) known to be a port trait — it may be a local re-export of one, so
+                    // defer rather than drop.
+                    None => self
+                        .renames
+                        .push((prefix.clone(), rename.rename.to_string())),
+                }
+                prefix.pop();
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.add_use(item, prefix);
+                }
+            }
+            // A glob re-exports the canonical names unchanged, which the identity seeding covers.
+            syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    fn resolve_renames(&mut self) {
+        let renames = std::mem::take(&mut self.renames);
+        loop {
+            let mut changed = false;
+            for (segments, local) in &renames {
+                if self.traits.contains_key(local) {
+                    continue;
+                }
+                if let Some(port) = segments
+                    .last()
+                    .and_then(|last| self.traits.get(last).copied())
+                {
+                    self.traits.insert(local.clone(), port);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+struct PortAliasCollector<'a>(&'a mut PortAliases);
+
+impl<'ast> Visit<'ast> for PortAliasCollector<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if !has_cfg_test(&item.attrs) {
+            self.0.add_use(&item.tree, &mut Vec::new());
+        }
+    }
+}
+
+struct PortImplVisitor<'a> {
+    aliases: &'a PortAliases,
+    hits: BTreeSet<GuardedPortImpl>,
+}
+
+/// The final path segment of a type, for the shapes an `impl … for T` self-type can take. Anything
+/// that is not a plain path (a reference, tuple, generic parameter) is reported as `<generic>` so a
+/// blanket impl is still visible to the gate rather than silently dropped.
+fn self_type_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_else(|| "<generic>".to_string()),
+        _ => "<generic>".to_string(),
+    }
+}
+
+impl<'ast> Visit<'ast> for PortImplVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        if let Some((path, _)) = &item.trait_ {
+            if let Some(port) = self.aliases.resolve_path(path) {
+                let written = path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                self.hits.insert(GuardedPortImpl {
+                    line: start_line(item.impl_token.span),
+                    port: port.to_string(),
+                    backend: self_type_name(&item.self_ty),
+                    spelled_as: (written != port).then_some(written),
+                });
+            }
+        }
+        syn::visit::visit_item_impl(self, item);
+    }
+}
+
+/// Every production implementation of a guarded-IO port trait in `src`, `#[cfg(test)]` ones excluded.
+///
+/// Renamed imports are resolved back to the canonical trait, so `use …GuardedProcess as Exec;
+/// impl Exec for Rogue {}` reports as `GuardedProcess`. Only `#[cfg(test)]` is skipped — a
+/// `#[cfg(feature = "…")]` impl is production code and is reported.
+pub fn guarded_port_impls(src: &str) -> syn::Result<Vec<GuardedPortImpl>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = PortAliases::new();
+    PortAliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_renames();
+    let mut visitor = PortImplVisitor {
+        aliases: &aliases,
+        hits: BTreeSet::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.hits.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox posture of test spawns (C-266)
+// ---------------------------------------------------------------------------
+
+/// argv tokens that select an auto-approving or serving surface. Mirrors the flag arms of
+/// `unattended_sandbox_surface` (`crates/flux-cli/src/dispatch.rs`); [`unattended_surface_arms`]
+/// keeps the *flagless* half of that function from drifting away from the list below.
+pub const UNATTENDED_ARGV_FLAGS: &[&str] = &["--yes", "-y", "--serve"];
+
+/// Subcommands that are unattended with **no flag at all** — the trap `--yes`-keyed matching misses.
+/// Kept honest against `dispatch.rs` by the drift check on [`unattended_surface_arms`].
+pub const FLAGLESS_UNATTENDED_SUBCOMMANDS: &[&str] = &["review"];
+
+/// Environment variables whose appearance in a spawn's builder chain *is* a posture declaration:
+/// each one pins the resolved posture (or forces backend discovery) instead of inheriting whatever
+/// the host happens to have installed.
+pub const SANDBOX_POSTURE_ENV: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOXED",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+];
+
+/// Why one test spawn of the `flux` binary owes an explicit sandbox posture.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AmbientSandboxKind {
+    /// The literal argv already names an auto-approving / serving surface; the token is carried so
+    /// the failure message can point at it.
+    Unattended(String),
+    /// The argv is caller-supplied in bulk (`.args(expr)`), so any call site can turn this spawn
+    /// into an unattended one without touching the spawn itself.
+    ForwardedArgv,
+}
+
+/// One spawn of the `flux` binary from test code that never states which sandbox posture it needs,
+/// and therefore silently inherits the host's — green on a developer machine with `bwrap`, red on a
+/// runner without it (C-266).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AmbientSandboxSpawn {
+    pub line: usize,
+    /// Nearest containing function, or `<module>` for a module-level initializer.
+    pub function: String,
+    pub kind: AmbientSandboxKind,
+}
+
+/// Whether `token` names an auto-approving or serving surface. `--serve=<addr>` is the attached-value
+/// spelling of `--serve` and counts the same.
+fn unattended_argv_token(token: &str) -> bool {
+    UNATTENDED_ARGV_FLAGS.contains(&token)
+        || token.starts_with("--serve=")
+        || FLAGLESS_UNATTENDED_SUBCOMMANDS.contains(&token)
+}
+
+/// Everything one builder chain said about itself. Accumulated per Command *binding* so a chain
+/// split across statements (`let mut cmd = Command::new(..); cmd.args(..); cmd.env(..)`) is judged
+/// as the single spawn it is.
+#[derive(Default)]
+struct SpawnFacts {
+    line: usize,
+    function: String,
+    literal_argv: Vec<String>,
+    forwards_argv: bool,
+    declares_posture: bool,
+}
+
+impl SpawnFacts {
+    /// The finding this spawn owes, if any. A declared posture settles it; otherwise a literal
+    /// unattended token is reported in preference to the weaker "could become one" finding.
+    fn finding(&self) -> Option<AmbientSandboxKind> {
+        // `--no-sandbox` states the posture in argv rather than in the environment; it is the CLI's
+        // own kill switch and wins outright (`apply_sandbox_env`, flux-cli's dispatch.rs).
+        if self.declares_posture
+            || self
+                .literal_argv
+                .iter()
+                .any(|token| token == "--no-sandbox")
+        {
+            return None;
+        }
+        if let Some(token) = self
+            .literal_argv
+            .iter()
+            .find(|token| unattended_argv_token(token))
+        {
+            return Some(AmbientSandboxKind::Unattended(token.clone()));
+        }
+        self.forwards_argv
+            .then_some(AmbientSandboxKind::ForwardedArgv)
+    }
+}
+
+/// The string literal an expression *is*, peeling references and `.to_string()`-style wrappers.
+fn literal_str(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Str(s) => Some(s.value()),
+            _ => None,
+        },
+        syn::Expr::Reference(reference) => literal_str(&reference.expr),
+        syn::Expr::Paren(paren) => literal_str(&paren.expr),
+        syn::Expr::Group(group) => literal_str(&group.expr),
+        _ => None,
+    }
+}
+
+/// The elements of an array/slice/`vec![]` literal, or `None` when the expression is opaque.
+fn array_elements(expr: &syn::Expr) -> Option<Vec<&syn::Expr>> {
+    match expr {
+        syn::Expr::Array(array) => Some(array.elems.iter().collect()),
+        syn::Expr::Reference(reference) => array_elements(&reference.expr),
+        syn::Expr::Paren(paren) => array_elements(&paren.expr),
+        syn::Expr::Group(group) => array_elements(&group.expr),
+        _ => None,
+    }
+}
+
+struct SandboxSpawnVisitor<'a> {
+    aliases: &'a ProcessAliases,
+    /// Locals bound to `env!("CARGO_BIN_EXE_flux")`, so an indirected program path still resolves.
+    flux_bin_idents: BTreeSet<String>,
+    /// Local ident → index into `facts` for a binding holding a `flux` Command builder.
+    command_bindings: HashMap<String, usize>,
+    functions: Vec<String>,
+    facts: Vec<SpawnFacts>,
+}
+
+impl SandboxSpawnVisitor<'_> {
+    /// Does this expression evaluate to the `flux` binary's path? Keyed on the exact
+    /// `CARGO_BIN_EXE_flux` env key — the sibling `CARGO_BIN_EXE_flux_sdk_plugin_fixture` is a
+    /// different binary and must not match.
+    fn is_flux_bin(&self, expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Macro(mac) => {
+                mac.mac.path.is_ident("env")
+                    && mac
+                        .mac
+                        .parse_body::<syn::LitStr>()
+                        .is_ok_and(|lit| lit.value() == "CARGO_BIN_EXE_flux")
+            }
+            syn::Expr::Reference(reference) => self.is_flux_bin(&reference.expr),
+            syn::Expr::Paren(paren) => self.is_flux_bin(&paren.expr),
+            syn::Expr::Group(group) => self.is_flux_bin(&group.expr),
+            // `env!("…").to_string()` / `.into()` and friends stay the same program.
+            syn::Expr::MethodCall(call) => self.is_flux_bin(&call.receiver),
+            syn::Expr::Path(path) => path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.flux_bin_idents.contains(&ident.to_string())),
+            _ => false,
+        }
+    }
+
+    /// A `Command::new(<flux binary>)`-style construction, as a fresh facts record.
+    fn new_flux_command(&mut self, expr: &syn::Expr) -> Option<usize> {
+        let syn::Expr::Call(call) = expr else {
+            return None;
+        };
+        let path = transparent_expr_path(&call.func)?;
+        let mut segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        segments.pop()?;
+        self.aliases.resolve_type_segments(&segments)?;
+        if !call.args.iter().any(|arg| self.is_flux_bin(arg)) {
+            return None;
+        }
+        self.facts.push(SpawnFacts {
+            line: start_line(path.span()),
+            function: self
+                .functions
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<module>".into()),
+            ..SpawnFacts::default()
+        });
+        Some(self.facts.len() - 1)
+    }
+
+    /// The facts record a chain root belongs to: a fresh one for a constructor, the existing one for
+    /// a local already bound to a `flux` Command.
+    fn root_record(&mut self, root: &syn::Expr) -> Option<usize> {
+        if let Some(index) = self.new_flux_command(root) {
+            return Some(index);
+        }
+        let syn::Expr::Path(path) = root else {
+            return None;
+        };
+        let ident = path.path.get_ident()?.to_string();
+        self.command_bindings.get(&ident).copied()
+    }
+
+    /// Fold one builder call into a spawn's facts.
+    fn absorb(&mut self, index: usize, call: &syn::ExprMethodCall) {
+        let method = call.method.to_string();
+        let mut args = call.args.iter();
+        match method.as_str() {
+            // A single positional argument has a fixed shape at the call site: a non-literal one is
+            // a *value* (a path, a session id), never a hidden flag, so it is not "forwarded argv".
+            "arg" => {
+                if let Some(literal) = args.next().and_then(literal_str) {
+                    self.facts[index].literal_argv.push(literal);
+                }
+            }
+            // Plural: an array literal is still auditable element by element; anything else is an
+            // opaque, unbounded argv this spawn cannot vouch for.
+            "args" => match args.next() {
+                Some(expr) => match array_elements(expr) {
+                    Some(elements) => {
+                        for literal in elements.into_iter().filter_map(literal_str) {
+                            self.facts[index].literal_argv.push(literal);
+                        }
+                    }
+                    None => self.facts[index].forwards_argv = true,
+                },
+                None => self.facts[index].forwards_argv = true,
+            },
+            "env" | "env_remove" => {
+                if let Some(key) = args.next().and_then(literal_str) {
+                    if SANDBOX_POSTURE_ENV.contains(&key.as_str()) {
+                        self.facts[index].declares_posture = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a method-call chain from the outside in, folding every call into the facts of whichever
+    /// spawn the chain's root names. Returns that spawn, so a `let` can bind its ident to it.
+    fn chain(&mut self, expr: &syn::Expr) -> Option<usize> {
+        let mut calls = Vec::new();
+        let mut cursor = expr;
+        let root = loop {
+            match cursor {
+                syn::Expr::MethodCall(call) => {
+                    calls.push(call);
+                    cursor = &call.receiver;
+                }
+                syn::Expr::Reference(reference) => cursor = &reference.expr,
+                syn::Expr::Paren(paren) => cursor = &paren.expr,
+                syn::Expr::Group(group) => cursor = &group.expr,
+                syn::Expr::Try(inner) => cursor = &inner.expr,
+                other => break other,
+            }
+        };
+        let index = self.root_record(root)?;
+        for call in &calls {
+            self.absorb(index, call);
+        }
+        // The chain itself is consumed here, so recurse only into the arguments — a nested spawn
+        // inside one of them must still be seen.
+        for call in calls {
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+        }
+        if let syn::Expr::Call(call) = root {
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+        }
+        Some(index)
+    }
+}
+
+impl<'ast> Visit<'ast> for SandboxSpawnVisitor<'_> {
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        let Some(init) = &local.init else {
+            return;
+        };
+        let ident = simple_binding_ident(&local.pat);
+        if let Some(ident) = &ident {
+            if self.is_flux_bin(&init.expr) {
+                self.flux_bin_idents.insert(ident.clone());
+                return;
+            }
+        }
+        let record = self.chain(&init.expr);
+        if record.is_none() {
+            self.visit_expr(&init.expr);
+        }
+        // Bind unconditionally when the root resolved: over-binding a terminal call's result
+        // (`let out = cmd.output()`) is harmless — nothing later calls a builder method on it.
+        if let (Some(ident), Some(index)) = (ident, record) {
+            self.command_bindings.insert(ident, index);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if matches!(expr, syn::Expr::MethodCall(_) | syn::Expr::Call(_))
+            && self.chain(expr).is_some()
+        {
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+}
+
+/// Resolve every spawn of the `flux` binary in one **test** source that inherits its sandbox posture
+/// from the host instead of declaring it. Test code is the point: `cfg(test)` items are deliberately
+/// *not* skipped here, unlike the production scanners above.
+pub fn ambient_sandbox_spawns(src: &str) -> syn::Result<Vec<AmbientSandboxSpawn>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = ProcessAliases::default();
+    AliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_type_aliases();
+    let mut visitor = SandboxSpawnVisitor {
+        aliases: &aliases,
+        flux_bin_idents: BTreeSet::new(),
+        command_bindings: HashMap::new(),
+        functions: Vec::new(),
+        facts: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor
+        .facts
+        .iter()
+        .filter_map(|facts| {
+            facts.finding().map(|kind| AmbientSandboxSpawn {
+                line: facts.line,
+                function: facts.function.clone(),
+                kind,
+            })
+        })
+        .collect())
+}
+
+/// One `match` arm of `flux-cli`'s `unattended_sandbox_surface`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnattendedArm {
+    /// The `Commands::<Variant>` this arm matches, lowercased into its CLI subcommand spelling.
+    pub subcommand: String,
+    /// Whether the arm is selected by a flag (`yes`, `serve`, `"--run"`) rather than by the
+    /// subcommand alone. A flagless arm is invisible to argv-flag matching.
+    pub keyed_on_flag: bool,
+}
+
+/// Collect the surfaces `flux-cli`'s `unattended_sandbox_surface` classifies as unattended, so a
+/// newly-added *flagless* one (the `review` shape) cannot silently escape
+/// [`FLAGLESS_UNATTENDED_SUBCOMMANDS`] — the argv-flag list needs no such help.
+pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
+    #[derive(Default)]
+    struct FlagWords {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for FlagWords {
+        fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+            let ident = ident.to_string();
+            if ident == "yes" || ident == "serve" {
+                self.found = true;
+            }
+        }
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            // Any dash-prefixed literal in the pattern or guard means the arm is selected by a flag
+            // that argv matching can see (`"--run"`, `"--yes"`), not by the subcommand alone.
+            if literal.value().starts_with('-') {
+                self.found = true;
+            }
+        }
+    }
+
+    struct Arms {
+        arms: Vec<UnattendedArm>,
+    }
+    impl<'ast> Visit<'ast> for Arms {
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            // Only arms that actually classify something as unattended matter; `_ => None` does not.
+            let mut classifies = Classifies::default();
+            classifies.visit_expr(&arm.body);
+            if !classifies.found {
+                return;
+            }
+            // syn models `pat if guard` as `Pat::Guard`, so one walk of the arm's pattern covers the
+            // guard expression too.
+            let mut variant = Variant::default();
+            variant.visit_pat(&arm.pat);
+            let mut flags = FlagWords::default();
+            flags.visit_pat(&arm.pat);
+            if let Some(subcommand) = variant.name {
+                self.arms.push(UnattendedArm {
+                    subcommand: subcommand.to_lowercase(),
+                    keyed_on_flag: flags.found,
+                });
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Classifies {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Classifies {
+        fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+            if ident == "Some" {
+                self.found = true;
+            }
+        }
+    }
+
+    /// The `Commands::<Variant>` name inside a pattern.
+    #[derive(Default)]
+    struct Variant {
+        name: Option<String>,
+    }
+    impl Variant {
+        fn take(&mut self, path: &syn::Path) {
+            let segments: Vec<String> = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            if let [enum_name, variant] = segments.as_slice() {
+                if enum_name == "Commands" && self.name.is_none() {
+                    self.name = Some(variant.clone());
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Variant {
+        fn visit_pat_struct(&mut self, pat: &'ast syn::PatStruct) {
+            self.take(&pat.path);
+            syn::visit::visit_pat_struct(self, pat);
+        }
+        fn visit_pat_tuple_struct(&mut self, pat: &'ast syn::PatTupleStruct) {
+            self.take(&pat.path);
+            syn::visit::visit_pat_tuple_struct(self, pat);
+        }
+        // A bare path pattern (`Commands::Review`) is modelled as an expression path in syn.
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            self.take(&path.path);
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+
+    let file = syn::parse_file(src)?;
+    let mut arms = Arms { arms: Vec::new() };
+    for item in &file.items {
+        if let syn::Item::Fn(function) = item {
+            if function.sig.ident == "unattended_sandbox_surface" {
+                arms.visit_block(&function.block);
+            }
+        }
+    }
+    arms.arms.sort();
+    arms.arms.dedup();
+    Ok(arms.arms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,19 +1743,25 @@ mod tests {
     ];
     const EXTERNAL_CFG_TEST_MODULES: &[&str] = &["crates/flux-flow/src/voice/tests.rs"];
 
-    fn direct_io_allow_reason(source: &str, line: usize) -> Option<String> {
+    /// The non-empty reason of a `// <marker> <reason>` waiver in the comment block immediately above
+    /// `line`. A bare marker with no reason is not a waiver.
+    fn allow_reason(source: &str, line: usize, marker: &str) -> Option<String> {
         let lines = source.lines().collect::<Vec<_>>();
         let mut cursor = line.saturating_sub(1);
         while cursor > 0 {
             cursor -= 1;
             let trimmed = lines.get(cursor)?.trim();
             let comment = trimmed.strip_prefix("//")?.trim();
-            if let Some(reason) = comment.strip_prefix("flux-allow-direct-io:") {
+            if let Some(reason) = comment.strip_prefix(marker) {
                 let reason = reason.trim();
                 return (!reason.is_empty()).then(|| reason.to_string());
             }
         }
         None
+    }
+
+    fn direct_io_allow_reason(source: &str, line: usize) -> Option<String> {
+        allow_reason(source, line, "flux-allow-direct-io:")
     }
 
     /// Collect production Rust sources from both Cargo workspaces. Keeping this traversal shared
@@ -1700,6 +2381,226 @@ fn opens() {
     }
 
     #[test]
+    fn port_impl_scanner_finds_production_backends_and_ignores_test_doubles() {
+        let raw = r#"
+use flux_system::port::{GuardedEnv, GuardedProcess};
+
+impl GuardedProcess for MySubstrate {}
+impl flux_system::port::GuardedEnv for MySubstrate {}
+impl SomeOtherTrait for MySubstrate {}
+
+#[cfg(test)]
+mod tests {
+    impl GuardedProcess for Double {}
+}
+
+#[cfg(test)]
+impl GuardedEnv for AnotherDouble {}
+"#;
+        let hits = guarded_port_impls(raw).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(
+            hits.iter()
+                .all(|hit| hit.backend == "MySubstrate" && hit.port.starts_with("Guarded")),
+            "only the production backends may be reported: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|hit| hit.port == "GuardedProcess"),
+            "a fully-qualified trait path must resolve by its last segment: {hits:?}"
+        );
+
+        // A blanket impl is a backend claim over every type, so it must be visible, not dropped.
+        let blanket = "impl<T: GuardedProcess> GuardedProcess for &T {}\n";
+        let hits = guarded_port_impls(blanket).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].backend, "<generic>");
+        assert_eq!(hits[0].spelled_as, None);
+    }
+
+    /// A renamed import must not launder a backend past the gate. This is the exact evasion
+    /// [`ProcessAliases`] already defends `no_raw_process_command_outside_system` against
+    /// (`use std::process::Command as Exec`), so the port gate has to match its sibling — otherwise
+    /// the newer, security-relevant gate is the weaker of the two.
+    #[test]
+    fn port_impl_scanner_resolves_renamed_trait_imports() {
+        // The shape the reviewer used to walk straight through the first cut of this gate.
+        let renamed = r#"
+use flux_system::port::GuardedProcess as Exec;
+
+impl Exec for Rogue {}
+"#;
+        let hits = guarded_port_impls(renamed).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a renamed port trait must still be seen: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].port, "GuardedProcess",
+            "the hit must carry the CANONICAL name so an allowance cannot be dodged by renaming"
+        );
+        assert_eq!(hits[0].backend, "Rogue");
+        assert_eq!(
+            hits[0].spelled_as.as_deref(),
+            Some("Exec"),
+            "the local spelling belongs in the diagnostic"
+        );
+
+        // A grouped rename, a module rename, and a rename *chain* — the chain also proves resolution
+        // is order-insensitive, since `Hop` is defined by a later `use` than the one consuming it.
+        let harder = r#"
+use flux_system::port::{GuardedEnv as Env, GuardedHostFiles};
+use flux_system::port as p;
+use Hop as Chained;
+use flux_system::port::GuardedProcess as Hop;
+
+impl Env for A {}
+impl GuardedHostFiles for B {}
+impl p::GuardedEnv for C {}
+impl Chained for D {}
+"#;
+        let hits = guarded_port_impls(harder).unwrap();
+        let mut resolved: Vec<(&str, &str)> = hits
+            .iter()
+            .map(|hit| (hit.port.as_str(), hit.backend.as_str()))
+            .collect();
+        resolved.sort_unstable();
+        assert_eq!(
+            resolved,
+            vec![
+                ("GuardedEnv", "A"),
+                ("GuardedEnv", "C"),
+                ("GuardedHostFiles", "B"),
+                ("GuardedProcess", "D"),
+            ],
+            "every spelling must resolve to its canonical port: {hits:?}"
+        );
+
+        // A rename that has nothing to do with the ports must not be dragged in.
+        let unrelated = r#"
+use std::fmt::Display as Show;
+
+impl Show for Harmless {}
+"#;
+        assert!(guarded_port_impls(unrelated).unwrap().is_empty());
+    }
+
+    /// `#[cfg(test)]` is the *only* configuration this gate excuses. A `#[cfg(feature = "…")]` backend
+    /// ships to users, so it is production code and must be reported — including behind an alias.
+    #[test]
+    fn port_impl_scanner_excuses_only_cfg_test_not_other_cfgs() {
+        let src = r#"
+use flux_system::port::GuardedProcess as Exec;
+
+#[cfg(feature = "wasm")]
+impl GuardedProcess for WasmSubstrate {}
+
+#[cfg(all(unix, feature = "remote"))]
+impl Exec for RemoteSubstrate {}
+
+#[cfg(test)]
+impl Exec for Double {}
+"#;
+        let hits = guarded_port_impls(src).unwrap();
+        let mut backends: Vec<&str> = hits.iter().map(|hit| hit.backend.as_str()).collect();
+        backends.sort_unstable();
+        assert_eq!(
+            backends,
+            vec!["RemoteSubstrate", "WasmSubstrate"],
+            "feature-gated backends ship and must be gated; only #[cfg(test)] is excused: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.port == "GuardedProcess"),
+            "{hits:?}"
+        );
+    }
+
+    /// Architecture guard (C-269): the guarded-IO port made "being a `System`" substitutable, so the
+    /// set of types that claim to *be* a guarded process/host-file/env backend must stay enumerated
+    /// exactly the way [`no_raw_process_command_outside_system`] enumerates raw command constructions.
+    ///
+    /// Without this the trait is a blind spot the older lints cannot see: they bound *syscall
+    /// construction*, never *the semantics of a guard*, so a second production backend could satisfy
+    /// `GuardedProcess` while enforcing none of the argv-only / pinned-cwd / cleared-env / capped-output
+    /// guarantees, and no gate would notice. Allowances are single-use, so a second impl of the same
+    /// port on the same type in the same file fails independently.
+    #[test]
+    fn no_unreviewed_guarded_port_backend_outside_system() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        // The reviewed backends: `flux-system`'s native delegations, and nothing else. A new entry
+        // here is a security review, not a formality — read `crates/flux-system/src/port.rs` first.
+        const ALLOW: &[(&str, &str, &str)] = &[
+            ("crates/flux-system/src/port.rs", "GuardedProcess", "System"),
+            (
+                "crates/flux-system/src/port.rs",
+                "GuardedHostFiles",
+                "System",
+            ),
+            ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
+        ];
+        let mut allowance_use = vec![0usize; ALLOW.len()];
+
+        let rs_files = workspace_source_files(repo_root);
+        assert!(
+            rs_files.len() > 20,
+            "expected to scan a representative set of source files, found {}",
+            rs_files.len()
+        );
+
+        let mut violations = Vec::new();
+        for file in &rs_files {
+            let rel = file
+                .strip_prefix(repo_root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(file).unwrap();
+            let hits = guarded_port_impls(&src).unwrap_or_else(|error| {
+                panic!("parse {} for guarded-port gate: {error}", file.display())
+            });
+            for hit in hits {
+                if let Some((index, _)) = ALLOW.iter().enumerate().find(|(_, allowed)| {
+                    allowed.0 == rel && allowed.1 == hit.port && allowed.2 == hit.backend
+                }) {
+                    allowance_use[index] += 1;
+                    if allowance_use[index] > 1 {
+                        violations.push(format!(
+                            "{rel}:{}: duplicate use of single-use allowance for {} on {}",
+                            hit.line, hit.port, hit.backend
+                        ));
+                    }
+                } else {
+                    let via = match &hit.spelled_as {
+                        Some(alias) => format!(" (written as `{alias}`)"),
+                        None => String::new(),
+                    };
+                    violations.push(format!(
+                        "{rel}:{}: unreviewed guarded-IO backend — {} implemented for {}{via}",
+                        hit.line, hit.port, hit.backend
+                    ));
+                }
+            }
+        }
+
+        for (index, count) in allowance_use.into_iter().enumerate() {
+            if count != 1 {
+                violations.push(format!(
+                    "reviewed guarded-port allowance {:?} was used {count} times (expected exactly once)",
+                    ALLOW[index]
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "guarded-IO port implemented outside the reviewed native backend:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
     fn project_metadata_io_scanner_resolves_aliases_and_ignores_guarded_io() {
         let raw = r#"
 use std::fs as disk;
@@ -1865,6 +2766,232 @@ fn fixture() { std::fs::read_to_string(".flux/config.toml"); }
                 out.push(path);
             }
         }
+    }
+
+    /// Collect the integration-test sources of both Cargo workspaces. `CARGO_BIN_EXE_*` exists only
+    /// in test targets, so this is the whole surface where a `flux` spawn can appear.
+    fn workspace_test_files(repo_root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for workspace_dir in [repo_root.join("crates"), repo_root.join("plugins")] {
+            let Ok(entries) = std::fs::read_dir(workspace_dir) else {
+                continue;
+            };
+            for entry in entries {
+                let dir = entry.unwrap().path();
+                if dir.is_dir() {
+                    collect_rs(&dir.join("tests"), &mut files);
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn ambient_sandbox_scanner_flags_unattended_and_forwarded_spawns() {
+        // An auto-approved spawn with no posture: the exact 0.38.0 regression class.
+        let bare = r#"
+use std::process::Command;
+#[test]
+fn t() {
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["run", "--yes", "-m", "mock", "hi"])
+        .output()
+        .unwrap();
+}
+"#;
+        let hits = ambient_sandbox_spawns(bare).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].function, "t");
+        assert_eq!(
+            hits[0].kind,
+            AmbientSandboxKind::Unattended("--yes".to_string())
+        );
+
+        // The same spawn, posture declared — settled, whatever the host has installed.
+        let declared = bare.replace(
+            r#".args(["run", "--yes", "-m", "mock", "hi"])"#,
+            r#".args(["run", "--yes", "-m", "mock", "hi"]).env("FLUX_SANDBOX", "off")"#,
+        );
+        assert!(ambient_sandbox_spawns(&declared).unwrap().is_empty());
+
+        // Forcing backend discovery at a nonexistent path is equally a declaration: the spawn is
+        // hermetically no-backend and cannot read the host's posture (sandbox_posture.rs's shape).
+        let forced = bare.replace(
+            ".output()",
+            r#".env("FLUX_BWRAP_BIN", "/nonexistent/bwrap").output()"#,
+        );
+        assert!(ambient_sandbox_spawns(&forced).unwrap().is_empty());
+
+        // `--no-sandbox` states the posture in argv instead of the environment.
+        let flagged_off = bare.replace(r#""run", "--yes""#, r#""run", "--no-sandbox", "--yes""#);
+        assert!(ambient_sandbox_spawns(&flagged_off).unwrap().is_empty());
+
+        // Chain split across statements, through a `let` binding, with the posture declared last.
+        let split = r#"
+use std::process::Command;
+fn helper(args: &[&str]) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flux"));
+    cmd.arg("app").args(args);
+    cmd.env("FLUX_SANDBOXED", "1");
+    let _ = cmd.output();
+}
+"#;
+        assert!(ambient_sandbox_spawns(split).unwrap().is_empty());
+
+        // The same helper without a declaration: bulk-forwarded argv can become unattended at any
+        // call site, which is precisely why the spawn — not the caller — must state its posture.
+        let forwarding = split.replace("\n    cmd.env(\"FLUX_SANDBOXED\", \"1\");", "");
+        let hits = ambient_sandbox_spawns(&forwarding).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, AmbientSandboxKind::ForwardedArgv);
+
+        // A flagless unattended surface (`flux review`) carries no `--yes` to key on.
+        let review = bare.replace(
+            r#""run", "--yes", "-m", "mock", "hi""#,
+            r#""review", "-m", "mock""#,
+        );
+        let hits = ambient_sandbox_spawns(&review).unwrap();
+        assert_eq!(
+            hits[0].kind,
+            AmbientSandboxKind::Unattended("review".to_string()),
+            "{hits:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_sandbox_scanner_ignores_attended_spawns_and_other_binaries() {
+        // A fixed-shape array with a non-literal *value* is auditable at the site; an interactive
+        // `flux run` with no `--yes` is not an unattended surface and owes nothing.
+        let attended = r#"
+use std::process::Command;
+fn t(sid: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["fork", sid, "--at", "0", "-m", "mock"])
+        .arg("--store")
+        .arg(sid)
+        .output()
+        .unwrap();
+}
+"#;
+        assert!(ambient_sandbox_spawns(attended).unwrap().is_empty());
+
+        // A different test binary is a different program: `CARGO_BIN_EXE_flux` is matched exactly,
+        // never as a prefix of `CARGO_BIN_EXE_flux_sdk_plugin_fixture`.
+        let other_binary = r#"
+use std::process::Command;
+fn t(args: &[&str]) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_flux_sdk_plugin_fixture"))
+        .args(args)
+        .arg("--serve")
+        .output();
+}
+"#;
+        assert!(ambient_sandbox_spawns(other_binary).unwrap().is_empty());
+
+        // The binary path reached through a local binding still resolves.
+        let indirect = r#"
+use std::process::Command;
+fn t() {
+    let bin = env!("CARGO_BIN_EXE_flux");
+    let _ = Command::new(bin).arg("--serve=127.0.0.1:1").output();
+}
+"#;
+        let hits = ambient_sandbox_spawns(indirect).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+    }
+
+    /// The guard itself (C-266): a test that spawns `flux` into an auto-approving or serving surface
+    /// must say which sandbox posture it needs. Inheriting the host's is what made three rounds of
+    /// the same bug pass every developer's gate and red only CI, where no runner has `bwrap`.
+    ///
+    /// What this covers: `std`/`tokio` Command builders spawning `CARGO_BIN_EXE_flux` in any test
+    /// target of either workspace, whose literal argv names an unattended surface, or which forwards
+    /// argv in bulk so a caller could make it one.
+    ///
+    /// What it does NOT cover, deliberately: shell scripts (`scripts/smoke-live.sh` — covered
+    /// behaviorally instead, by the two sandbox lanes in `.github/workflows/ci.yml`), a spawn whose
+    /// program is computed at runtime rather than from `CARGO_BIN_EXE_flux`, argv assembled through a
+    /// helper that returns a `Vec` built elsewhere, and posture injected via `.envs(map)`.
+    #[test]
+    fn every_unattended_test_spawn_declares_its_sandbox_posture() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let mut violations = Vec::new();
+        let mut scanned = 0usize;
+        for file in workspace_test_files(repo_root) {
+            let relative_path = file
+                .strip_prefix(repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = std::fs::read_to_string(&file).unwrap();
+            scanned += 1;
+            for hit in ambient_sandbox_spawns(&source).unwrap_or_else(|error| {
+                panic!("parse {relative_path} for the sandbox-posture gate: {error}")
+            }) {
+                if allow_reason(&source, hit.line, "flux-allow-ambient-sandbox:").is_some() {
+                    continue;
+                }
+                let why = match &hit.kind {
+                    AmbientSandboxKind::Unattended(token) => {
+                        format!("argv names an unattended surface ({token})")
+                    }
+                    AmbientSandboxKind::ForwardedArgv => {
+                        "argv is forwarded in bulk, so a call site can make it unattended"
+                            .to_string()
+                    }
+                };
+                violations.push(format!(
+                    "{relative_path}:{} in {}: {why}, but the spawn declares no sandbox posture",
+                    hit.line, hit.function
+                ));
+            }
+        }
+
+        assert!(
+            scanned > 20,
+            "test-source walk scanned only {scanned} files"
+        );
+        assert!(
+            violations.is_empty(),
+            "test spawns inherit the host's sandbox posture — C-262 fails these closed on a runner \
+             without a backend while they pass on every developer machine. Declare the posture in \
+             the spawn ({}), pass --no-sandbox, or waive it with a reasoned \
+             `// flux-allow-ambient-sandbox: …` comment:\n  {}",
+            SANDBOX_POSTURE_ENV.join(" / "),
+            violations.join("\n  ")
+        );
+    }
+
+    /// The trigger table above is only as good as its agreement with the CLI. A new unattended
+    /// surface keyed on a flag is already caught by argv matching; a new *flagless* one (the `review`
+    /// shape) is invisible, so it must be taught to the scanner here.
+    #[test]
+    fn flagless_unattended_surfaces_match_the_cli_classifier() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dispatch = crates_dir.join("flux-cli/src/dispatch.rs");
+        let source = std::fs::read_to_string(&dispatch).expect("read flux-cli dispatch");
+        let arms = unattended_surface_arms(&source).expect("parse flux-cli dispatch");
+
+        assert!(
+            arms.len() > 4,
+            "did not find `unattended_sandbox_surface`'s arms — has it moved or been renamed? {arms:?}"
+        );
+        let flagless: BTreeSet<String> = arms
+            .iter()
+            .filter(|arm| !arm.keyed_on_flag)
+            .map(|arm| arm.subcommand.clone())
+            .collect();
+        let declared: BTreeSet<String> = FLAGLESS_UNATTENDED_SUBCOMMANDS
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            flagless, declared,
+            "FLAGLESS_UNATTENDED_SUBCOMMANDS has drifted from `unattended_sandbox_surface`: a \
+             subcommand that is unattended with no flag at all cannot be recognized in a test's \
+             argv unless it is listed there"
+        );
     }
 
     #[test]

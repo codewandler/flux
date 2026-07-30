@@ -85,6 +85,41 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
 > the itemized history.
 
+### Meeting rooms — a multi-party channel where humans and agents meet (epic) — 🔄 **PROPOSED (D-203; D-204…D-213 filed, none started; feasibility PROVEN live)**
+
+Every channel flux has is 1:1 or fire-and-forget — `schedule`/`webhook`/`slack`/`a2a` wake a journey and
+return, and the voice path assumes exactly one caller (`VoiceTurnHandler::turn` has no speaker parameter,
+because on a phone line there is only one candidate). There is no channel where flux is **one participant
+among several**: humans and agents co-present, the agent hearing everything but addressed by only some of
+it, able to **show** something instead of only saying it. A meeting room is that shape, and — the framing
+that motivated the epic — it is the *root* substrate in which **agents can meet**, which makes it fleet
+infrastructure (A-111, A-119/A-120) rather than a voice curiosity.
+
+**This epic is unusual in that its feasibility was measured before it was designed.** On 2026-07-30 a
+spike joined a real Brave Talk room from a plain HTTP/WebSocket client and, over the session, reached
+presence, bidirectional text, and audible speech — with the human in the call confirming each. Brave Talk
+is 8x8's Jitsi-as-a-Service with a Brave token service in front, and its client is open source, which is
+how the handshake was derived: `PUT /api/v1/rooms/<room>` hands an anonymous caller a **3-hour,
+room-scoped JaaS JWT** (creating a room needs Premium; joining one needs *nothing*), then
+`conference-request/v1` allocates focus, then XMPP-over-WebSocket with SASL `ANONYMOUS` joins the MUC.
+
+The load-bearing finding is that **presence and text are pure XMPP** — no WebRTC, no browser — while audio
+and screenshare need a browser-grade media stack. So the design splits the port: a native `Room` with
+`XmppMucRoom` (portable, what CI runs) and `JaasRoom` (vendor token acquisition) backends, plus an
+**optional feature-gated media sidecar**. Audio out is proven but every documented recipe for it failed —
+Chrome 150 ignores `--use-fake-device-for-media-capture` entirely and Jitsi's `setAudioInputDevice` does
+not stick; what worked was a private PipeWire null sink with the browser's *own* capture stream moved onto
+it per-stream, leaving the human's microphone untouched. Screenshare remains **unproven** (headless has no
+display for `getDisplayMedia`; the Xvfb fallback never loaded), and D-211 records why the next attempt
+should drive `lib-jitsi-meet` with a canvas-sourced track instead of chasing desktop capture.
+
+The hard part was never the plumbing. It is that a room has N speakers and the agent is the addressee of
+almost none of it (D-207: an address rule, or the agent answers every sentence two humans say to each
+other — observed within three messages in the spike), and that **a room link is effectively a credential**
+(D-213: anyone holding it can put a listener in the call without an account, as the spike itself
+demonstrated). D-213 owns the invariants — co-presence grants no authority, self-announcement is not
+optional, and publishing audio or a screenshare into a room full of people is an approved, redacted act.
+
 ### A portable Flux runtime — WebAssembly as a second execution substrate (epic) — 🔄 **PROPOSED (C-268; C-269…C-273 filed, none started)**
 
 Flux executes `.flux` on one substrate: a native process holding the OS's ambient authority, confined

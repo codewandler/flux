@@ -257,6 +257,10 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(GitStageHunksTool),
             Arc::new(GitWorktreeEnterTool),
             Arc::new(GitWorktreeLeaveTool),
+            // C-241: `fleet.isolate` — the per-item worktree the two ops above cannot give, since
+            // they move the caller's own root. Registered with the git family it is built from; its
+            // `fleet.*` siblings are outbound A2A ops and live in `flux-orchestrate`.
+            Arc::new(FleetIsolateTool),
         ],
     )?;
     cognition::try_register_cognition(&mut assembled)?;
@@ -553,6 +557,15 @@ struct GitWorktreeEnterInput {}
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GitWorktreeLeaveInput {}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FleetIsolateInput {
+    /// Board item id this checkout is for (e.g. `C-241`). The branch is always `impl/<item>` — the
+    /// host names it, so a worker cannot claim an isolation it was not given. One path component of
+    /// letters, digits, `.`, `_` or `-`, starting with a letter or digit.
+    item: String,
+}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2473,6 +2486,14 @@ impl Tool for GitLogTool {
 //      make the family unusable in exactly the multi-author situation `git_stage_hunks` exists to
 //      serve. Where it IS required it is **flux policy, stricter than git** — git itself only
 //      refuses a dirty index, or unstaged changes to the paths it would touch.
+//
+// The two parts are independent, so membership is not the same as being abort-capable. `fleet.isolate`
+// aborts nothing (`in_flight: &[]`) yet requires a clean tree for an entirely different reason — it
+// checks out HEAD for a worker, so uncommitted work would silently be missing from that worker's
+// copy. It belongs here anyway, and this is exactly why the reason travels with the declaration
+// rather than living in a comment: C-241 shipped that op with a hand-copied variant of `git_revert`'s
+// pre-C-249 wording ("Same wording care as `git_revert`"), which is the per-op drift this policy
+// exists to end, reappearing one commit later.
 
 /// Whether an abort-capable `git_*` op additionally requires a clean working tree before it starts.
 /// Both variants carry the *stated reason*: an op that declines the precondition has to say why it
@@ -2555,6 +2576,19 @@ const GIT_WORKTREE_LEAVE_SESSION_TREE: TreePrecondition = TreePrecondition {
          worktree",
     ),
     note: "The context stays in the worktree.",
+};
+
+const FLEET_ISOLATE_TREE: TreePrecondition = TreePrecondition {
+    op: "fleet.isolate",
+    subject: "this checkout",
+    // Nothing: this op aborts no git operation. Its only failure cleanup is the parent directory
+    // it allocated itself, which is state it unambiguously created.
+    in_flight: &[],
+    clean_tree: CleanTree::Required(
+        "an isolated checkout is made from HEAD, so uncommitted work here would silently NOT be in \
+         the worker's copy — it would build on a base the coordinator cannot see",
+    ),
+    note: "",
 };
 
 const GIT_WORKTREE_LEAVE_ORIGINAL_TREE: TreePrecondition = TreePrecondition {
@@ -4127,6 +4161,240 @@ impl Tool for GitWorktreeLeaveTool {
 }
 
 // ---------------------------------------------------------------------------
+// fleet.isolate (C-241)
+//
+// The per-item isolated checkout `git_worktree_enter` cannot give. `enter` moves the CALLER's
+// working root into the worktree and refuses to nest, so it is session-local by construction: N
+// workers in one wave would fight over one root. `fleet.isolate` instead creates `impl/<item>` in
+// its own worktree and hands `{worktree, branch}` back as DATA — the caller's root, branch, tree and
+// worktree session are all untouched, so a coordinator can issue one call per board item in a single
+// turn and give each local worker its own checkout.
+//
+// The host owns the naming: the branch is `impl/<item>` and the directory comes from
+// `flux_system::allocate_worktree_dir` (a fresh 0700 parent per call), so two concurrent calls
+// cannot collide and a worker cannot claim an isolation it was not given.
+//
+// It lives here, beside the git family it is built from, rather than in `flux-orchestrate` with its
+// `fleet.*` siblings: those three are outbound A2A calls to a REMOTE worker over `flux-a2a`, while
+// this one is a local `git worktree add` through the guarded `System` — and it belongs in the
+// built-in pack whose coherence gate (C-191) and group manifest already cover the git ops it mirrors.
+//
+// Cleanup is deliberately NOT the host's: the worktree holds the worker's unmerged diff, which is
+// the only copy of that work. `fleet.integrate` (C-242) and the caller decide when it goes.
+// ---------------------------------------------------------------------------
+
+/// The branch `fleet.isolate` creates for `item` — the one place the naming is decided.
+fn isolate_branch(item: &str) -> String {
+    format!("impl/{item}")
+}
+
+/// Whether `item` is a usable single branch component: letters, digits, `.`, `_`, `-`, opening with
+/// a letter or digit. Deliberately narrower than git's own ref rules — a board id is short and
+/// mechanical, and the value is interpolated into both a branch name and an argv, so anything that
+/// could read as an option (`-x`), a path (`../escape`, `deep/id`) or a git revision suffix (`a..b`,
+/// `x~1`) is refused rather than escaped.
+fn is_isolate_item(item: &str) -> bool {
+    !item.is_empty()
+        && item.len() <= 64
+        && item
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && item
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !item.contains("..")
+}
+
+pub struct FleetIsolateTool;
+
+#[async_trait]
+impl Tool for FleetIsolateTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fleet.isolate".into(),
+            description: "Create an isolated checkout for one board item: branch `impl/<item>` in \
+                          its own git worktree, returned as `{worktree, branch}` for a LOCAL \
+                          worker to run in. Unlike `git_worktree_enter` this does NOT move the \
+                          caller's own working root, so a coordinator can call it once per item in \
+                          the same turn. Requires a clean checkout in a git repository, no active \
+                          worktree session, and no existing `impl/<item>` branch. Removing the \
+                          worktree afterwards is the caller's job — it holds the worker's \
+                          unmerged work."
+                .into(),
+            input_schema: tool_input_schema::<FleetIsolateInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // The same tier as `git_worktree_enter`, which runs the same `git worktree add`: this
+            // one moves no context, but it creates a branch and a full second checkout of the repo
+            // OUTSIDE the workspace root, and — unlike `enter`/`leave` — nothing in the host ever
+            // removes them. Host state that outlives the call and the session is not cheaper than
+            // host state the host cleans up after itself.
+            risk: Risk::High,
+            // Every successful call creates a new branch and a new directory; a repeat for the same
+            // item is refused rather than converging.
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        // Name the branch this call creates, in the `git_branch:impl/x` shape (C-238), so a grant
+        // can be scoped to `fleet.isolate:impl/*` instead of the bare op name. The checkout path
+        // cannot appear here: the host allocates a fresh parent directory *during* execution, after
+        // approval, and a path invented at declaration time would name a directory that never
+        // exists. Falls back to the bare op name on malformed params so subjects are never empty (a
+        // write with no subjects is forced to approval).
+        params
+            .get("item")
+            .and_then(|v| v.as_str())
+            .map(|item| vec![format!("fleet.isolate:{}", isolate_branch(item.trim()))])
+            .unwrap_or_else(|| vec!["fleet.isolate".to_string()])
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let item = params
+            .get("item")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: format!(
+                    "git worktree add -b {} <allocated>/checkout <head>",
+                    isolate_branch(item)
+                ),
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: FleetIsolateInput = parse_params(params, "fleet.isolate")?;
+        let item = args.item.trim().to_string();
+        if !is_isolate_item(&item) {
+            return Ok(ToolResult::error(format!(
+                "fleet.isolate: refusing item {:?} — an item id must be one component of letters, \
+                 digits, `.`, `_` or `-` starting with a letter or digit (e.g. `C-241`), because it \
+                 becomes the branch name `impl/<item>`",
+                args.item
+            )));
+        }
+        let branch = isolate_branch(&item);
+
+        // Preflight 1: no nesting. Inside a `git_worktree_enter` session the caller's root is
+        // itself a temporary checkout that `git_worktree_leave` will remove, so an isolation
+        // allocated from there would outlive the coordinator that owns it while pointing at a
+        // branch created off a temporary one.
+        if ctx.workspace_context().worktree_session().is_some() {
+            return Ok(ToolResult::error(format!(
+                "fleet.isolate: this context is inside a temporary worktree session; run \
+                 git_worktree_leave first, then isolate {branch} from the original checkout \
+                 (nesting is not supported)"
+            )));
+        }
+        let system = ctx.system();
+        let caller_root = system.workspace().root().display().to_string();
+
+        // Preflight 2: inside a git repository.
+        let (ok, body) = run_git(&system, &["rev-parse", "--is-inside-work-tree"]).await?;
+        if !ok || body != "true" {
+            return Ok(ToolResult::error(format!(
+                "fleet.isolate: not inside a git repository: {body}"
+            )));
+        }
+        // Preflight 3: the branch is free. `git worktree add -b` would fail anyway, but only after
+        // a directory has been allocated, and its message names neither the item nor the caller.
+        // Asked as `refs/heads/…` rather than as a bare name, so the refusal below is a statement
+        // about a BRANCH and cannot be triggered by a tag or a remote-tracking ref that happens to
+        // share the name.
+        let (exists, _) = run_git(
+            &system,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .await?;
+        if exists {
+            return Ok(ToolResult::error(format!(
+                "fleet.isolate: branch {branch} already exists — item `{item}` is already isolated \
+                 (or a previous run was never cleaned up). Integrate or delete that branch first; \
+                 this op never reuses or resets an existing one"
+            )));
+        }
+        // Preflight 4: a clean base — the family's shared tree precondition (C-249), not a check
+        // of this op's own. See `FLEET_ISOLATE_TREE` for why this op needs it despite aborting
+        // nothing.
+        if let Some(refusal) = require_tree_precondition(&system, &FLEET_ISOLATE_TREE).await {
+            return Ok(refusal);
+        }
+        // The commit the worker starts from, reported so a coordinator can verify what it handed
+        // out rather than assume it.
+        let (ok, head) = run_git(&system, &["rev-parse", "HEAD"]).await?;
+        if !ok || head.is_empty() {
+            return Ok(ToolResult::error(format!(
+                "fleet.isolate: could not resolve HEAD: {head}"
+            )));
+        }
+        // The branch HEAD sits on, when it is on one — informational, and `null` on a detached
+        // HEAD, which is legal here (the base is the commit, not the branch).
+        let (on_branch, base_branch) =
+            run_git(&system, &["symbolic-ref", "--short", "HEAD"]).await?;
+
+        // One fresh 0700 parent per call: this is what makes two concurrent calls disjoint without
+        // any coordination between them.
+        let parent = flux_system::allocate_worktree_dir()?;
+        let checkout = parent.join("checkout");
+        let (ok, add_out) = run_git(
+            &system,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                &checkout.display().to_string(),
+                &head,
+            ],
+        )
+        .await?;
+        if !ok {
+            let _ = flux_system::remove_worktree_dir(&parent);
+            return Ok(ToolResult::error(format!(
+                "fleet.isolate: git worktree add failed for {branch}: {add_out}"
+            )));
+        }
+
+        let result = serde_json::json!({
+            "isolated": true,
+            "item": item,
+            "branch": branch,
+            "worktree": checkout.display().to_string(),
+            "base_commit": head,
+            "base_branch": on_branch.then_some(base_branch),
+            "caller_root": caller_root,
+            "note": format!(
+                "Hand {{worktree, branch}} to ONE worker for item `{item}`; nothing else may run \
+                 there. THIS context is unchanged — it still operates at {caller_root} — so \
+                 isolating the next item is another call, not a `git_worktree_leave`. Cleanup is \
+                 yours: the worktree holds the worker's unmerged diff, and the host will never \
+                 remove it."
+            ),
+        });
+        Ok(ToolResult::ok(
+            serde_json::to_string_pretty(&result).unwrap(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // flux_reload (dev mode only)
 // ---------------------------------------------------------------------------
 
@@ -5302,6 +5570,7 @@ mod tests {
                 "filter",
                 "first",
                 "flatten",
+                "fleet.isolate",
                 "gaps",
                 "git_branch",
                 "git_checkout",
@@ -7277,6 +7546,212 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // fleet.isolate (C-241)
+    //
+    // Driven through the registry by op NAME for the same reason the C-238 block is: that is the
+    // surface a coordinator Program's `call` uses, and it is what makes the journey below fail on
+    // the op's ABSENCE at the merge base rather than compile against a struct that is not there.
+    // -----------------------------------------------------------------------
+
+    /// Remove an isolated worktree the way its caller is expected to: unregister the checkout,
+    /// then drop the host-allocated parent. Never asserts — this is teardown, and a cleanup
+    /// hiccup must not be reported as a failure of what the test proves.
+    fn drop_isolated_worktree(repo: &std::path::Path, worktree: &str) {
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", worktree])
+            .current_dir(repo)
+            .output();
+        if let Some(parent) = std::path::Path::new(worktree).parent() {
+            let _ = flux_system::remove_worktree_dir(parent);
+        }
+    }
+
+    /// C-241, the named failing-first: two `fleet.isolate` calls in flight in ONE context hand back
+    /// two disjoint checkouts on two distinct `impl/<id>` branches, and the caller's own root is
+    /// untouched — no session, same working root, same branch, still clean.
+    ///
+    /// This is precisely what `git_worktree_enter` cannot do: it rebases the *caller's* root and
+    /// refuses to nest, so the second call would be an error and the first would have moved the
+    /// coordinator itself. The last block asserts that contrast against the real op rather than
+    /// describing it.
+    #[tokio::test]
+    async fn fleet_isolate_gives_concurrent_callers_disjoint_worktrees_and_leaves_the_root_alone() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+        let base = raw_git(&dir, &["rev-parse", "HEAD"]);
+        let root_before = c.system().workspace().root().to_path_buf();
+
+        // Both calls in flight at once, as one coordinator turn issuing a wave would.
+        let (one, two) = tokio::join!(
+            call_op(&registry, &c, "fleet.isolate", json!({"item": "C-241"})),
+            call_op(&registry, &c, "fleet.isolate", json!({"item": "C-242"})),
+        );
+        assert!(!one.is_error, "{}", one.content);
+        assert!(!two.is_error, "{}", two.content);
+
+        let parse = |r: &ToolResult| -> Value { serde_json::from_str(&r.content).unwrap() };
+        let (a, b) = (parse(&one), parse(&two));
+        let path_of = |v: &Value| v["worktree"].as_str().unwrap().to_string();
+        let (wt_a, wt_b) = (path_of(&a), path_of(&b));
+
+        assert_eq!(a["branch"], "impl/C-241");
+        assert_eq!(b["branch"], "impl/C-242");
+        assert_eq!(a["base_commit"], base);
+        assert_eq!(b["base_commit"], base);
+
+        // Disjoint: two different directories, neither inside the other, neither inside the
+        // caller's root — a worker cannot reach into a sibling's checkout by walking up.
+        assert_ne!(wt_a, wt_b, "the two calls must not share a checkout");
+        assert!(!wt_a.starts_with(&wt_b) && !wt_b.starts_with(&wt_a));
+        for wt in [&wt_a, &wt_b] {
+            assert!(
+                !std::path::Path::new(wt).starts_with(&root_before),
+                "{wt} is inside the caller's root {}",
+                root_before.display()
+            );
+        }
+
+        // Each is a real checkout of this repo, at the base commit, on its own branch.
+        for (wt, branch) in [(&wt_a, "impl/C-241"), (&wt_b, "impl/C-242")] {
+            let wt = std::path::Path::new(wt);
+            assert!(
+                wt.join("base.txt").is_file(),
+                "{} has no tree",
+                wt.display()
+            );
+            assert_eq!(raw_git(wt, &["rev-parse", "HEAD"]), base);
+            assert_eq!(raw_git(wt, &["symbolic-ref", "--short", "HEAD"]), branch);
+        }
+
+        // THE CONTRAST: the caller kept its own root, its branch and its clean tree, and holds no
+        // worktree session — so a third, fourth, Nth call is just as legal as the first two.
+        assert!(
+            c.workspace_context().worktree_session().is_none(),
+            "fleet.isolate must not open a context-local session"
+        );
+        assert_eq!(c.system().workspace().root(), root_before);
+        assert_eq!(raw_git(&dir, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), base);
+
+        drop_isolated_worktree(&dir, &wt_a);
+        drop_isolated_worktree(&dir, &wt_b);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-241: every preflight refuses as a recoverable `ToolResult` error that names what was
+    /// wrong, and leaves no branch and no directory behind — `git_worktree_enter`'s checks as the
+    /// template, minus the `main`-only rule a coordinator has no reason to obey.
+    #[tokio::test]
+    async fn fleet_isolate_preflights_refuse_recoverably_and_create_nothing() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // (1) A name that is not a usable branch component / could read as an option or a path.
+        for bad in ["", "  ", "-x", "../escape", "a..b", "with space", "deep/id"] {
+            let r = call_op(&registry, &c, "fleet.isolate", json!({"item": bad})).await;
+            assert!(r.is_error, "item {bad:?} must be refused");
+            assert!(
+                r.content.contains("fleet.isolate"),
+                "the refusal names the op: {}",
+                r.content
+            );
+        }
+
+        // (2) An `impl/<id>` branch that already exists — the collision two coordinators racing on
+        // one item produce. Refused by name, and the existing branch is left where it is.
+        raw_git(&dir, &["branch", "impl/taken"]);
+        let taken_tip = raw_git(&dir, &["rev-parse", "impl/taken"]);
+        let r = call_op(&registry, &c, "fleet.isolate", json!({"item": "taken"})).await;
+        assert!(
+            r.is_error,
+            "an existing branch must be refused: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("impl/taken"),
+            "the refusal names the branch: {}",
+            r.content
+        );
+        assert_eq!(raw_git(&dir, &["rev-parse", "impl/taken"]), taken_tip);
+
+        // (3) A dirty base: the worker would silently be given a checkout of HEAD, not of what the
+        // coordinator can see.
+        std::fs::write(dir.join("base.txt"), "uncommitted\n").unwrap();
+        let r = call_op(&registry, &c, "fleet.isolate", json!({"item": "C-9"})).await;
+        assert!(r.is_error, "a dirty base must be refused: {}", r.content);
+        assert!(
+            r.content.contains("base.txt"),
+            "the refusal shows what is dirty: {}",
+            r.content
+        );
+        assert_eq!(raw_git(&dir, &["branch", "--list", "impl/C-9"]), "");
+        raw_git(&dir, &["checkout", "-q", "--", "base.txt"]);
+
+        // (4) No nesting: from inside a `git_worktree_enter` session the parent of any worktree
+        // this op could allocate is itself temporary, so it refuses and names the way out.
+        let r = call_op(&registry, &c, "git_worktree_enter", json!({})).await;
+        assert!(!r.is_error, "{}", r.content);
+        let session = c.workspace_context().worktree_session().unwrap();
+        let r = call_op(&registry, &c, "fleet.isolate", json!({"item": "C-8"})).await;
+        assert!(r.is_error, "nesting must be refused: {}", r.content);
+        assert!(
+            r.content.contains("git_worktree_leave"),
+            "the refusal names the way out: {}",
+            r.content
+        );
+        assert_eq!(raw_git(&dir, &["branch", "--list", "impl/C-8"]), "");
+        // The refused call left the session exactly as it was.
+        let still = c.workspace_context().worktree_session().unwrap();
+        assert_eq!(still.branch, session.branch);
+        let r = call_op(&registry, &c, "git_worktree_leave", json!({})).await;
+        assert!(!r.is_error, "{}", r.content);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-241: the declaration a reviewer and the permission manager read — a coherent spec
+    /// (`flux_spec::metadata_violations`, which since C-210 reads `semantic_effects` too), a
+    /// concrete branch-scoped subject rather than the bare op name, and a declared intent.
+    #[test]
+    fn fleet_isolate_declares_coherent_branch_scoped_metadata() {
+        let tool = FleetIsolateTool;
+        let spec = tool.spec();
+        assert_eq!(spec.name, "fleet.isolate");
+        let violations = flux_spec::metadata_violations(&spec, &tool.semantic_effects());
+        assert!(violations.is_empty(), "incoherent: {violations:?}");
+        assert_eq!(
+            tool.permission_subjects(&json!({"item": "C-241"})),
+            vec!["fleet.isolate:impl/C-241".to_string()],
+            "approval must be scoped to the branch this call creates"
+        );
+        // Malformed params still yield a subject: a write with none is forced to approval, but a
+        // silently empty list is indistinguishable from "nothing to gate".
+        assert_eq!(
+            tool.permission_subjects(&json!({})),
+            vec!["fleet.isolate".to_string()]
+        );
+        let intents = tool.intents(&json!({"item": "C-241"})).intents;
+        assert_eq!(intents.len(), 1);
+        assert!(
+            matches!(&intents[0].target, flux_spec::IntentTarget::Process { command }
+                if command.contains("git worktree add") && command.contains("impl/C-241")),
+            "the intent must name the command and the branch: {:?}",
+            intents[0].target
+        );
+    }
+
+    /// C-241: the op is a member of the `fleet` group, so `.flux/groups.toml` can gate or reassign
+    /// the fleet family as one unit — a member left out of the manifest could not be gated at all.
+    #[test]
+    fn fleet_isolate_is_a_member_of_the_fleet_group() {
+        let groups = crate::groups::builtin_groups();
+        let fleet = groups.iter().find(|g| g.name == "fleet").unwrap();
+        assert!(fleet.tools.contains(&"fleet.isolate".to_string()));
+    }
+
     // C-249: the family's shared tree precondition
     // -----------------------------------------------------------------------
 

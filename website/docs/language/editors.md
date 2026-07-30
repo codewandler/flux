@@ -115,8 +115,10 @@ Finally, open a `.flux` file and check the complete experience: colour everywher
 deliberate typo, hover on an op name, completion after typing `$`, and `:format`.
 
 Diagnostics, completion, and hover understand multi-declaration modules and the stable cognition,
-datasource, and native-web operations provided by the CLI. Formatting currently applies only to a
-bare single-flow file; modules are left unchanged so declaration order is never rewritten.
+datasource, and native-web operations provided by the CLI. Formatting handles multi-declaration
+modules and commented flows, preserving declaration order and comments, and range formatting is
+available too — the formatter works from the CST, so layout is structural rather than re-derived from
+the AST.
 
 ### Working in the flux repo
 
@@ -151,7 +153,8 @@ For language intelligence, `flux-lsp` is a standard stdio server — register it
 client of choice (for example a custom [lspconfig](https://github.com/neovim/nvim-lspconfig)
 server definition with `cmd = { "flux-lsp" }` for the `flux` filetype). No packaged Neovim
 config is shipped yet. Unlike Helix, Neovim *can* layer LSP semantic tokens over tree-sitter
-colour — `flux-lsp` does not emit them yet, so tree-sitter provides all colour there too.
+colour, and `flux-lsp` does emit them — full, range, and delta — so you get server-accurate
+highlighting on top of the grammar's.
 
 ## Zed
 
