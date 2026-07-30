@@ -2,7 +2,7 @@
 id: A-103
 title: "The Compensation contract on ToolSpec — every mutating op declares how it is reversed"
 pillar: Agent
-status: in-progress
+status: blocked
 priority: 14
 epic: transactional-turns
 design: docs/designs/transactional-turns.md
