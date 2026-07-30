@@ -126,6 +126,17 @@ pub struct ChatState {
     /// outside [`ChatState::transcript_viewport`]: no layout-cache entry, no `focused` index, no
     /// scroll bookkeeping, and not found by transcript search.
     pub(super) panes: PaneStore,
+    /// The live sub-agent fleet (C-224), folded from A-79's `subagent.activity` stream by
+    /// [`crate::fleet::FleetProjection`]. This is the state; [`ChatState::fleet_rows`] is its
+    /// resolution against a particular `now`.
+    pub(super) fleet: crate::fleet::FleetProjection,
+    /// The fleet resolved against the last `now` [`ChatState::refresh_fleet`] was given — what the
+    /// host fleet pane renders.
+    ///
+    /// Held rather than derived inside `render` so the renderer stays a pure function of state and
+    /// so every test can pin the clock, which is the same reason [`crate::fleet`] takes `now` as a
+    /// parameter throughout instead of reading it.
+    pub(super) fleet_rows: Vec<crate::fleet::WorkerRow>,
 }
 
 /// One model call of the turn in progress, as the `/usage` overlay renders it (C-140). Sourced from

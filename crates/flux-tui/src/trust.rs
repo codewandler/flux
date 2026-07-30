@@ -476,7 +476,9 @@ mod tests {
         from_constants.extend(SPINNER);
         let literals = [
             "▸", // rendering.rs: the slash and `@` menus' selection marker
-            "●", // rendering.rs: the session picker's current-session mark
+            "●", // rendering.rs: the session picker's current-session mark; panes.rs: a finished
+            // worker's mark in the C-224 fleet pane
+            "◌", // panes.rs: an idle or stalled worker in the C-224 fleet pane (also RUNNING_BADGE)
             "█", // rendering.rs / panes.rs: the `/usage` and progress bars, filled
             "░", // rendering.rs / panes.rs: the same bars, empty
             "⚠", // rendering.rs: the sheet's destructive disclosure

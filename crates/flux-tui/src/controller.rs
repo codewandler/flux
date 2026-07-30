@@ -71,6 +71,13 @@ pub(super) enum UiEvent {
     },
     /// Queued steering messages the engine consumed and injected into the running turn (A-94).
     Steered(Vec<String>),
+    /// C-224: one correlated event from a live sub-agent, decoded off A-79's `subagent.activity`
+    /// observation and folded into [`crate::fleet::FleetProjection`] by the event loop.
+    ///
+    /// Boxed because [`flux_runtime::SpawnActivity`] carries a child's tool input and observation
+    /// payload — the internal half of A-79's contract — and an inline variant would set this enum's
+    /// size for every event the surface sends.
+    SpawnActivity(Box<flux_runtime::SpawnActivity>),
     Finished,
 }
 
@@ -271,6 +278,14 @@ impl AgentSink for ChannelSink {
                 name: progress.tool,
                 line: progress.line,
             });
+        } else if let Some(activity) = flux_runtime::SpawnActivity::from_observation(observation) {
+            // C-224: the live sub-agent stream. A-79 forwards a child's activity into the parent's
+            // sink as this observation (the engine's own turn-owned `AgentSinkSpawnActivitySink`),
+            // and the TUI used to fall through and drop it — the daily driver was one of the
+            // places the stream died. Only enqueued here, never folded: this runs on a live
+            // child's reporting path, which must not block and must hold no lock across an await
+            // (`docs/designs/live-sub-agent-activity.md`).
+            self.send(UiEvent::SpawnActivity(Box::new(activity)));
         } else if observation.kind == "model.retry" {
             // C-181: reported before the backoff sleep, so the footer can name the wait while the
             // user is still in it rather than explaining it afterwards.
