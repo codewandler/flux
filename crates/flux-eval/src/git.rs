@@ -1,6 +1,6 @@
-//! Git ops for the keep/commit/revert loop. All exec goes through `ctx.system().run` (argv-only, no
+//! Git ops for the keep/commit/reset loop. All exec goes through `ctx.system().run` (argv-only, no
 //! shell). These are registered on the **top-level** registry only — never a sub-agent's — so a worker
-//! can edit files but cannot itself `git reset --hard`. `git_revert` is `Risk::Destructive` and so still
+//! can edit files but cannot itself `git reset --hard`. `git_reset` is `Risk::Destructive` and so still
 //! re-confirms at dispatch unless `--yes` (the autonomous loop runs with `--yes`).
 
 use std::time::Duration;
@@ -159,31 +159,31 @@ impl Tool for GitTagTool {
 }
 
 // ---------------------------------------------------------------------------
-// git_revert
+// git_reset
 // ---------------------------------------------------------------------------
 
-/// `git_revert(snapshot)` — hard-reset to a snapshot and clean untracked files. **Destructive**: only
-/// the top-level loop reverts (never a sub-agent), discarding exactly the round's own changes.
-pub struct GitRevertTool;
+/// `git_reset(snapshot)` — hard-reset to a snapshot and clean untracked files. **Destructive**: only
+/// the top-level loop resets (never a sub-agent), discarding exactly the round's own changes.
+pub struct GitResetTool;
 
-/// Arguments for the `git_revert` op.
+/// Arguments for the `git_reset` op.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct GitRevertInput {
+struct GitResetInput {
     /// a git_snapshot result (JSON)
     #[allow(dead_code)]
     snapshot: String,
 }
 
 #[async_trait]
-impl Tool for GitRevertTool {
+impl Tool for GitResetTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "git_revert".into(),
+            name: "git_reset".into(),
             description:
                 "Hard-reset the working tree to a git_snapshot (discards the round's changes)."
                     .into(),
-            input_schema: tool_input_schema::<GitRevertInput>(),
+            input_schema: tool_input_schema::<GitResetInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Destructive,
@@ -212,12 +212,12 @@ impl Tool for GitRevertTool {
         let head = snap
             .get("head")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Other("git_revert: snapshot has no `head`".to_string()))?;
+            .ok_or_else(|| Error::Other("git_reset: snapshot has no `head`".to_string()))?;
         git(ctx, &["reset", "--hard", head]).await?;
         git(ctx, &["clean", "-fd"]).await?;
         json_result(
             &json!({ "reset_to": head }),
-            format!("reverted to {}", short(head)),
+            format!("reset to {}", short(head)),
         )
     }
 }

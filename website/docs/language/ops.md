@@ -88,6 +88,7 @@ bounded by that plugin's manifest and its Tavily credential is injected host-sid
 | `git_checkout` | `branch[, create]` | medium | Switch or create a branch |
 | `git_branch` | `name[, delete]` | medium | Create a branch without switching to it, or safe-delete one (`-d` refuses unmerged work and the checked-out branch) |
 | `git_merge` | `branch[, no_ff]` | high | Merge a ref into the current branch (`no_ff` forces a merge commit); a conflict is a recoverable error naming the conflicting files — the merge is aborted and the tree restored, never left half-merged |
+| `git_revert` | `commit[, mainline]` | high | Revert a commit by appending its inverse (`mainline`, usually 1, for a merge) — a new commit undoes the target, never a reset; a conflicted revert is aborted and left clean, naming the conflicting files |
 | `git_worktree_enter` | | high | Move this agent context into an isolated temporary git worktree (requires a clean `main`; creates a generated `flux/worktree/*` branch) |
 | `git_worktree_leave` | | high | Merge the worktree's committed work back into `main` (`--no-ff`, guarded by an aborted trial merge), remove the worktree and branch, restore the original root |
 
@@ -378,12 +379,12 @@ every member benchmark's pass rate and check rate to be at least the baseline's.
 | `gate_check` | | Run the dev gate (build/test/clippy/fmt) and return `"true"` or `"false"` |
 | `guard_protected` | snapshot | Restore grader/suite/loop/CI paths to the round snapshot after the worker runs |
 | `git_snapshot` | | Capture `HEAD` for later revert; errors if the working tree is dirty |
-| `git_revert` | snapshot | **Destructive** — hard-reset the working tree to a snapshot, discarding the round's changes |
+| `git_reset` | snapshot | **Destructive** — hard-reset the working tree to a snapshot, discarding the round's changes |
 | `git_tag` | `[message]` | Tag the current commit (annotated when a message is given) |
 
 `guard_protected` is the anti-cheat step: it restores the grader, the suite, the loop, and the CI
 config after each worker run, so a round cannot raise its own score by editing what measures it.
-`git_revert` carries the `Destructive` risk tier and is approval-gated accordingly.
+`git_reset` carries the `Destructive` risk tier and is approval-gated accordingly.
 
 ## The loop itself
 

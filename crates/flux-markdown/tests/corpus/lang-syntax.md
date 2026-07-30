@@ -1088,9 +1088,9 @@ flow improve -> EvalReport
         git_commit("improve: adopt candidate")
         $baseline = eval_adopt($candidate)
       else
-        git_revert($snapshot)
+        git_reset($snapshot)
     else
-      git_revert($snapshot)
+      git_reset($snapshot)
 
     $done       = candidates_empty($candidates)
     $candidates = candidates_advance($candidates)

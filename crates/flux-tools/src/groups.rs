@@ -45,6 +45,7 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
                 "git_diff",
                 "git_log",
                 "git_merge",
+                "git_revert",
                 "git_push",
                 "git_checkout",
                 "git_branch",

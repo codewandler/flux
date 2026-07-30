@@ -342,7 +342,7 @@
               "otherwise": [
                 {
                   "kind": "call",
-                  "op": "git_revert",
+                  "op": "git_reset",
                   "args": [
                     {
                       "kind": "var",
@@ -377,7 +377,7 @@
           "otherwise": [
             {
               "kind": "call",
-              "op": "git_revert",
+              "op": "git_reset",
               "args": [
                 {
                   "kind": "var",

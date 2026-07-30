@@ -88,7 +88,7 @@ a candidate harness fix → a `worker` sub-agent implements it → restore the p
 dev gate → re-evaluate → keep and tag **iff** strictly better, else revert.
 
 The ops that flow calls — `eval_run`, `score_compare_multi`, `painpoints_collect`,
-`guard_protected`, `git_revert`, and the rest — are documented once, with their arguments, in
+`guard_protected`, `git_reset`, and the rest — are documented once, with their arguments, in
 [Operations → Improvement loop](../language/ops.md#improvement-loop). They are registered in every
 session, so any flow can call them.
 
@@ -121,7 +121,7 @@ hidden behind a service. Two properties do the load-bearing work:
   score can hide a regression.
 - **`guard_protected` is the anti-cheat step.** After each worker run it restores the grader, the
   suite, the loop flow, and the CI config to the round's snapshot, so a round cannot raise its own
-  score by editing what measures it. `git_revert` carries the `Destructive` risk tier and is
+  score by editing what measures it. `git_reset` carries the `Destructive` risk tier and is
   approval-gated.
 
 Those make a *reported* gain trustworthy. They do not make a gain happen — which is exactly the gap

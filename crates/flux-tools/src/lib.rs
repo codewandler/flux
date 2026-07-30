@@ -248,6 +248,7 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(GitDiffTool),
             Arc::new(GitLogTool),
             Arc::new(GitMergeTool),
+            Arc::new(GitRevertTool),
             Arc::new(GitPushTool),
             Arc::new(GitCheckoutTool),
             Arc::new(GitBranchTool),
@@ -498,6 +499,17 @@ struct GitMergeInput {
     /// integration loop's audit trail
     #[serde(default)]
     no_ff: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitRevertInput {
+    /// Commit to revert (a full or abbreviated sha, or a ref)
+    commit: String,
+    /// Mainline parent (`git revert -m N`), required when reverting a merge commit — usually 1:
+    /// the branch the merge landed on
+    #[serde(default)]
+    mainline: Option<u64>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2702,6 +2714,138 @@ impl Tool for GitCheckoutTool {
         } else {
             body
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_revert
+// ---------------------------------------------------------------------------
+
+pub struct GitRevertTool;
+
+#[async_trait]
+impl Tool for GitRevertTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_revert".into(),
+            description: "Revert a commit by appending its inverse (`git revert --no-edit`); \
+                          pass `mainline` (usually 1) to revert a merge commit. This is the \
+                          integration loop's recovery op: a NEW commit undoes the target, so \
+                          history is never rewritten and never reset. Requires a clean tree. A \
+                          conflicted revert is a recoverable error naming the conflicting files; \
+                          the revert is aborted and the tree left as the call found it."
+                .into(),
+            input_schema: tool_input_schema::<GitRevertInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // High like `git_merge`: a revert moves the integration branch's tip and can
+            // conflict — the caller must be able to trust the reported outcome.
+            risk: Risk::High,
+            // Reverting the same commit twice does not converge — the second attempt conflicts
+            // against the first revert's own change.
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        // C-238: name the reverted commit — `git_revert:abc123` matches a `git_revert:*` grant
+        // the way `rm:…` matches `Bash(rm:*)`; fall back to the bare op name on malformed params
+        // so subjects are never empty (a write with no subjects is forced to approval).
+        params
+            .get("commit")
+            .and_then(|v| v.as_str())
+            .map(|c| vec![format!("git_revert:{c}")])
+            .unwrap_or_else(|| vec!["git_revert".to_string()])
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let commit = params.get("commit").and_then(|v| v.as_str()).unwrap_or("");
+        let mainline = params.get("mainline").and_then(|v| v.as_u64());
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: match mainline {
+                    Some(n) => format!("git revert --no-edit -m {n} {commit}"),
+                    None => format!("git revert --no-edit {commit}"),
+                },
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitRevertInput = parse_params(params, "git_revert")?;
+        let commit = args.commit;
+        // Same guard as `git_merge` (C-85): a model-chosen ref must never read as an option.
+        let trimmed = commit.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            return Ok(ToolResult::error(format!(
+                "git_revert: refusing commit {commit:?} — it is empty or looks like an option, \
+                 not a ref"
+            )));
+        }
+        let system = ctx.system();
+
+        // Same clean-tree discipline as git_merge: the conflict abort restores exactly this.
+        let (ok, status) = run_git(&system, &["status", "--porcelain"]).await?;
+        if !ok {
+            return Ok(ToolResult::error(format!(
+                "git_revert: git status failed: {status}"
+            )));
+        }
+        if !status.is_empty() {
+            return Ok(ToolResult::error(format!(
+                "git_revert: the checkout has uncommitted changes; commit or stash them \
+                 first:\n{status}"
+            )));
+        }
+
+        let mut argv = vec!["revert".to_string(), "--no-edit".to_string()];
+        let mainline = args.mainline.map(|n| n.to_string());
+        if let Some(n) = mainline.as_deref() {
+            argv.push("-m".to_string());
+            argv.push(n.to_string());
+        }
+        argv.push(commit.clone());
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let (ok, out) = run_git(&system, &argv).await?;
+        if ok {
+            let (_, head) = run_git(&system, &["log", "-1", "--oneline"]).await?;
+            return Ok(ToolResult::ok(if out.is_empty() {
+                format!("reverted {commit} — {head}")
+            } else {
+                format!("{out}\nreverted {commit} — {head}")
+            }));
+        }
+
+        // A revert that never started (bad rev, …) leaves no REVERT_HEAD and an untouched
+        // tree; one that started and stopped is a conflict — name the files, then abort.
+        let (started, _) =
+            run_git(&system, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]).await?;
+        if !started {
+            return Ok(ToolResult::error(format!(
+                "git_revert: git revert `{commit}` failed: {out}"
+            )));
+        }
+        let (_, conflicts) = run_git(&system, &["diff", "--name-only", "--diff-filter=U"]).await?;
+        let (aborted, abort_out) = run_git(&system, &["revert", "--abort"]).await?;
+        if !aborted {
+            return Ok(ToolResult::error(format!(
+                "git_revert: the revert of `{commit}` conflicted and the abort ALSO failed \
+                 ({abort_out}); the tree is left mid-revert — resolve it or run \
+                 `git revert --abort` manually. Conflicting files:\n{conflicts}"
+            )));
+        }
+        let count = conflicts.lines().filter(|l| !l.is_empty()).count();
+        Ok(ToolResult::error(format!(
+            "git_revert: reverting `{commit}` conflicts in {count} file(s); the revert was \
+             aborted and the tree is clean. Reconcile and retry. Conflicting files:\n{conflicts}"
+        )))
     }
 }
 
@@ -4915,6 +5059,7 @@ mod tests {
                 "git_log",
                 "git_merge",
                 "git_push",
+                "git_revert",
                 "git_stage",
                 "git_stage_hunks",
                 "git_status",
@@ -6494,6 +6639,164 @@ mod tests {
             raw_git(&dir, &["branch", "--format=%(refname:short)"]),
             "main"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: the integration rule's recovery op — revert a `--no-ff` merge with `-m 1`. A NEW
+    /// commit undoes the merge (never a reset, history preserved), and the tree is byte-identical
+    /// to the pre-merge state.
+    #[tokio::test]
+    async fn git_revert_mainline_one_restores_the_pre_merge_tree() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // A branch with work, merged into `main` with --no-ff through the family's own ops.
+        let r = call_op(&registry, &c, "git_branch", json!({"name": "impl/item-2"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_checkout",
+            json!({"branch": "impl/item-2"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        WriteTool
+            .execute(
+                &c,
+                json!({"path": "feature.txt", "content": "from the branch\n"}),
+            )
+            .await
+            .unwrap();
+        let r = call_op(
+            &registry,
+            &c,
+            "git_stage",
+            json!({"paths": ["feature.txt"]}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_commit",
+            json!({"message": "add feature.txt"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(&registry, &c, "git_checkout", json!({"branch": "main"})).await;
+        assert!(!r.is_error, "{}", r.content);
+
+        let pre_merge_tree = raw_git(&dir, &["rev-parse", "HEAD^{tree}"]);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/item-2", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let merge_sha = raw_git(&dir, &["rev-parse", "HEAD"]);
+        assert_ne!(
+            raw_git(&dir, &["rev-parse", "HEAD^{tree}"]),
+            pre_merge_tree,
+            "the merge changed the tree"
+        );
+
+        // The recovery: revert the merge with -m 1.
+        let r = call_op(
+            &registry,
+            &c,
+            "git_revert",
+            json!({"commit": merge_sha, "mainline": 1}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+
+        // The tree is byte-identical to the pre-merge state...
+        assert_eq!(
+            raw_git(&dir, &["rev-parse", "HEAD^{tree}"]),
+            pre_merge_tree,
+            "the revert restored the pre-merge tree"
+        );
+        // ...and history was NOT rewritten: HEAD is a NEW revert commit on top of the merge,
+        // which is still reachable.
+        assert_eq!(
+            raw_git(&dir, &["rev-parse", "HEAD~1"]),
+            merge_sha,
+            "the revert sits on top of the merge — no reset, no rewrite"
+        );
+        let log = raw_git(&dir, &["log", "--oneline"]);
+        assert!(log.contains("Revert"), "a new revert commit exists: {log}");
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+
+        // Concrete subjects name the reverted commit (never `*`, never empty).
+        let tool = registry.get("git_revert").unwrap();
+        assert_eq!(
+            tool.permission_subjects(&json!({"commit": "abc123"})),
+            vec!["git_revert:abc123".to_string()]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: a conflicting revert is a clean recoverable error naming the files, with the
+    /// sequencer aborted and the tree consistent — same contract as `git_merge`.
+    #[tokio::test]
+    async fn git_revert_conflict_is_recoverable_and_names_the_files() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // Two stacked edits to the same line; reverting the FIRST conflicts with the second.
+        std::fs::write(dir.join("base.txt"), "v1\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "v1"]);
+        let first = raw_git(&dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("base.txt"), "v2\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "v2"]);
+        let pre_revert = raw_git(&dir, &["rev-parse", "HEAD"]);
+
+        let r = call_op(&registry, &c, "git_revert", json!({"commit": first})).await;
+        assert!(
+            r.is_error,
+            "a conflicting revert is a recoverable error, got: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("base.txt"),
+            "the error names the conflicting file: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("aborted"),
+            "the error states the revert was aborted: {}",
+            r.content
+        );
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), pre_revert);
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+        assert!(
+            !dir.join(".git/REVERT_HEAD").exists(),
+            "no revert in progress"
+        );
+
+        // A non-conflicting (plain, non-merge) revert succeeds and appends a new commit.
+        let r = call_op(&registry, &c, "git_revert", json!({"commit": pre_revert})).await;
+        assert!(!r.is_error, "the clean revert succeeds: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            "v1\n",
+            "the v2 edit is undone"
+        );
+
+        // Option-shaped / empty commits are rejected before git ever runs.
+        for bad in ["--no-commit", "-e", ""] {
+            let r = call_op(&registry, &c, "git_revert", json!({"commit": bad})).await;
+            assert!(r.is_error, "commit {bad:?} must be refused");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
