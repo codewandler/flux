@@ -9,6 +9,7 @@ is deliberately flat and mechanical—no robot, orbit, lambda, glow, or generic 
 | Preview | File | Dimensions | Use |
 | --- | --- | --- | --- |
 | <img src="readme-hero.svg" alt="flux README hero" width="280"> | `readme-hero.svg` | Vector, 1200×360 viewBox | **README hero.** Fixed dark field with the positioning line and a labeled plan → gate → effect visual. |
+| <img src="readme-program.svg" alt="a Flux-Lang program" width="280"> | `readme-program.svg` | Vector, 561×436 viewBox | **README program figure.** A real Flux-Lang program rendered by flux itself — see regeneration below. Not hand-drawn; do not edit by hand. |
 | <img src="flux-logo.svg" alt="flux wordmark" width="220"> | `flux-logo.svg` | Vector | **Primary lockup and source of truth.** Uses vector paths only and adapts its ink/signal colors to light and dark mode. |
 | <img src="flux-logo.png" alt="flux wordmark" width="220"> | `flux-logo.png` | 1240×360 | Light-background raster fallback. |
 | <img src="flux-mark.svg" alt="flux execution-gate mark" width="140"> | `flux-mark.svg` | Vector | Standalone execution-gate mark for compact placements. |
@@ -20,6 +21,17 @@ The original generated exploration that informed the gate geometry is retained a
 ## Usage
 
 - Use `readme-hero.svg` for the repository front page and `flux-logo.svg` for other horizontal placements.
+- `readme-program.svg` is **generated output**, so regenerate it rather than editing it. It is the
+  declaration block of `crates/flux-app/examples/support-bot.flux` (comments stripped — they are not
+  semantic, and the setup preamble dominated the figure) rendered with flux's own renderer:
+
+  ```bash
+  awk 'f || (!/^#/ && NF) {f=1; print}' crates/flux-app/examples/support-bot.flux > /tmp/prog.flux
+  flux render /tmp/prog.flux --view source > assets/readme-program.svg
+  ```
+
+  ⚠ Use `--view source`, not `--view tree`: the tree renderer prints the AST's display form, which is
+  still the legacy `$`-sigil notation and would put pre-L-93 syntax on the repository front page.
 - Use `flux-mark.svg` when the wordmark would be unreadable or redundant.
 - Keep clear space around the mark of at least half the signal bar's height.
 - Prefer the adaptive SVGs. The PNGs contain the light-mode palette.
