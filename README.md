@@ -55,14 +55,28 @@ surface inside your own product.
 
 ### Prebuilt binary
 
+For sensitive environments, download a version-pinned archive and verify its GitHub provenance
+before extracting it. Replace the placeholders with a release and target listed on the release page:
+
 ```bash
-# Linux / macOS
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh | sh
+release=vX.Y.Z
+archive=flux-cli-<target>.tar.xz
+gh release download "$release" --repo codewandler/flux --pattern "$archive"
+source_digest="$(gh api "repos/codewandler/flux/commits/$release" --jq .sha)"
+gh attestation verify "$archive" --repo codewandler/flux \
+  --signer-workflow codewandler/flux/.github/workflows/release.yml \
+  --source-ref "refs/tags/$release" --source-digest "$source_digest" \
+  --deny-self-hosted-runners
+tar -xJf "$archive"
 ```
 
-```powershell
-# Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.ps1 | iex"
+Releases produced before provenance publication should be built from a reviewed tag/commit instead.
+For convenience, the latest Linux/macOS installer remains available, but downloading it separately
+makes the code visible before execution and still trusts the release origin:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf -o flux-installer.sh https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh
+sh flux-installer.sh
 ```
 
 ### From source
@@ -221,6 +235,8 @@ flux preset retry_with_backoff max=3 delay_ms=200 op=read input='"README.md"' bi
 
 flux app run support-bot.flux          # serve its declared channels until Ctrl-C
 flux run support-bot.flux              # same program, auto-detected
+flux run workflows.flux --entry triage --arg queue=new
+                                          # select one authored flow from a multi-flow module, run once
 ```
 
 ## SDK

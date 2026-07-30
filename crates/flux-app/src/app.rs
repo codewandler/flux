@@ -3395,10 +3395,11 @@ journey extract
         .unwrap();
         let mut sink = RecordingSink::default();
 
-        engine
+        let error = engine
             .start_flow_turn(&session, &flow, &mut sink)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("declared cognition failure"));
 
         assert_eq!(sink.usage, Some(expected.clone()));
         let turns = events.turns(&session).unwrap();
@@ -3481,7 +3482,23 @@ journey extract
         let turns = events.turns(&session).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].outcome, "cancelled");
-        assert_eq!(turns[0].calls, 1);
+        // Zero-usage stage calls are durable too (C-261), so `calls` counts the planner stages as
+        // well. What this test pins is that the cognition call is attributed exactly ONCE — isolate
+        // the billed fact rather than asserting the honest zero-usage ones do not exist.
+        let billed: Vec<_> = events
+            .load_stream(&session, None)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                flux_events::EventKind::CallUsage { usage, .. }
+                    if usage.input_tokens > 0 || usage.output_tokens > 0 =>
+                {
+                    Some(usage)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(billed, vec![expected.clone()]);
         assert_eq!(turns[0].call_usage, expected);
         assert_eq!(turns[0].usage, Some(expected));
     }

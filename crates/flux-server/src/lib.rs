@@ -15,6 +15,7 @@
 //! since HTTP requests have no interactive approver.
 
 mod a2a;
+mod resource;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -37,6 +38,8 @@ use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 use flux_runtime::TurnIdentity;
+
+use resource::{ResourceGovernor, WorkPermit};
 
 type Shared = Arc<FlowEngine>;
 /// Higher-level A2A task/session ordering. `FlowEngine` independently serializes turns and owns
@@ -287,16 +290,27 @@ pub(crate) async fn run_server_turn(
     input: &str,
     sink: &mut dyn AgentSink,
     cancel: &tokio_util::sync::CancellationToken,
+    permit: &mut WorkPermit,
 ) -> flux_core::Result<()> {
+    let events = engine.events.clone();
+    let session = session_id.to_string();
+    let mut turn_started = move |turn_id| permit.track_turn(events.clone(), &session, turn_id);
     match &turn.identity {
         Some(identity) => {
             engine
-                .run_turn_cancellable_as(session_id, input, sink, cancel, identity.clone())
+                .run_turn_cancellable_as_observed(
+                    session_id,
+                    input,
+                    sink,
+                    cancel,
+                    identity.clone(),
+                    &mut turn_started,
+                )
                 .await
         }
         None => {
             engine
-                .run_turn_cancellable(session_id, input, sink, cancel)
+                .run_turn_cancellable_observed(session_id, input, sink, cancel, &mut turn_started)
                 .await
         }
     }
@@ -404,6 +418,7 @@ pub struct ServerState {
     /// The in-process registry of live A2A tasks (A-54): cancel/resubscribe handles + the
     /// sweep keep-list. One per router, like the turn gate.
     tasks: Arc<a2a::TaskRegistry>,
+    resources: Arc<ResourceGovernor>,
 }
 
 impl FromRef<ServerState> for Arc<FlowEngine> {
@@ -439,6 +454,12 @@ impl FromRef<ServerState> for Arc<ServerAuth> {
 impl FromRef<ServerState> for Arc<a2a::TaskRegistry> {
     fn from_ref(s: &ServerState) -> Self {
         s.tasks.clone()
+    }
+}
+
+impl FromRef<ServerState> for Arc<ResourceGovernor> {
+    fn from_ref(s: &ServerState) -> Self {
+        s.resources.clone()
     }
 }
 
@@ -574,11 +595,22 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// stream is not a stuck request). Raise via `FLUX_SERVER_REQUEST_TIMEOUT_SECS`.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
-/// The daemon's resource limits (C-189): `SECURITY.md` names denial of service in the `--serve`
-/// daemon as in scope, and without these every mounted router accepts an unbounded body and holds
-/// a connection for as long as a handler runs. Both close that gap for the two vectors that need
-/// no keying decision; rate limiting (which does — per token / principal / realm) is deliberately
-/// out of scope for C-189.
+/// Default number of authenticated protected-route requests admitted per resource bucket/minute.
+pub const DEFAULT_REQUESTS_PER_MINUTE: u32 = 120;
+/// Default live turns per authenticated principal/shared realm/open-loopback bucket.
+pub const DEFAULT_MAX_INFLIGHT_PER_KEY: usize = 4;
+/// Default completed provider-call circuit-breaker threshold per bucket/24-hour process window.
+pub const DEFAULT_PROVIDER_CALLS_PER_DAY: u64 = 1_000;
+/// Default completed priced-spend circuit-breaker threshold per bucket/24-hour process window.
+pub const DEFAULT_PROVIDER_SPEND_USD_PER_DAY: f64 = 25.0;
+/// Maximum number of principal/realm buckets retained by one router.
+pub const DEFAULT_MAX_RESOURCE_KEYS: usize = 4_096;
+
+/// The daemon's resource limits (C-189/C-261): body and response-production bounds apply across
+/// the router; authenticated request rate, live work, and completed provider usage are keyed by
+/// principal/auth realm. Call/spend thresholds are retrospective circuit breakers, not prepaid
+/// reservations: newly admitted work stops after completed usage reaches a threshold, while work
+/// already admitted may overshoot it within the concurrency bound.
 ///
 /// Both fields default conservatively and are overridable per deployment via env (the same knob
 /// style as `FLUX_A2A_MAX_INFLIGHT_PER_REALM`), read once at router-build time.
@@ -592,6 +624,23 @@ pub struct ServerLimits {
     /// streaming — which is exactly why an SSE response, produced promptly then streamed for the
     /// life of the turn, is unharmed even where the layer is applied.
     pub request_timeout: Duration,
+    /// Authenticated protected-route requests admitted per
+    /// [`request_rate_window`](Self::request_rate_window), including reads.
+    pub requests_per_window: u32,
+    /// Fixed request-rate accounting window.
+    pub request_rate_window: Duration,
+    /// Live work admitted per principal/realm bucket across REST, webhook, and A2A.
+    pub max_inflight_per_key: usize,
+    /// Completed provider calls observed before new work is rejected for the remainder of the
+    /// [`provider_budget_window`](Self::provider_budget_window).
+    pub provider_calls_per_window: u64,
+    /// Completed priced provider spend observed before new work is rejected for the remainder of
+    /// the provider-budget window.
+    pub provider_spend_usd_per_window: f64,
+    /// Fixed call/spend accounting window.
+    pub provider_budget_window: Duration,
+    /// Cardinality cap for in-process principal/realm limit state.
+    pub max_resource_keys: usize,
 }
 
 impl Default for ServerLimits {
@@ -599,6 +648,13 @@ impl Default for ServerLimits {
         Self {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            requests_per_window: DEFAULT_REQUESTS_PER_MINUTE,
+            request_rate_window: Duration::from_secs(60),
+            max_inflight_per_key: DEFAULT_MAX_INFLIGHT_PER_KEY,
+            provider_calls_per_window: DEFAULT_PROVIDER_CALLS_PER_DAY,
+            provider_spend_usd_per_window: DEFAULT_PROVIDER_SPEND_USD_PER_DAY,
+            provider_budget_window: Duration::from_secs(24 * 60 * 60),
+            max_resource_keys: DEFAULT_MAX_RESOURCE_KEYS,
         }
     }
 }
@@ -610,6 +666,9 @@ impl ServerLimits {
     /// `0` is never read as "disable", so the daemon is never accidentally left unbounded).
     fn from_env() -> Self {
         let d = Self::default();
+        let config = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| flux_runtime::metadata::load_config(&cwd).ok());
         let max_body_bytes = std::env::var("FLUX_SERVER_MAX_BODY_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -621,17 +680,98 @@ impl ServerLimits {
             .filter(|&n| n > 0)
             .map(Duration::from_secs)
             .unwrap_or(d.request_timeout);
+        let requests_per_window = positive_env("FLUX_SERVER_REQUESTS_PER_MINUTE")
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| {
+                config
+                    .as_ref()?
+                    .server
+                    .requests_per_minute
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(d.requests_per_window);
+        let max_inflight_per_key = positive_env("FLUX_SERVER_MAX_INFLIGHT_PER_PRINCIPAL")
+            .and_then(|n| usize::try_from(n).ok())
+            .or_else(|| {
+                config
+                    .as_ref()?
+                    .server
+                    .max_inflight_per_principal
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(d.max_inflight_per_key);
+        let provider_calls_per_window = positive_env("FLUX_SERVER_PROVIDER_CALLS_PER_DAY")
+            .or_else(|| {
+                config
+                    .as_ref()?
+                    .server
+                    .provider_calls_per_day
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(d.provider_calls_per_window);
+        let provider_spend_usd_per_window = std::env::var("FLUX_SERVER_PROVIDER_SPEND_USD_PER_DAY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .or_else(|| {
+                config
+                    .as_ref()?
+                    .server
+                    .provider_spend_usd_per_day
+                    .filter(|v| v.is_finite() && *v > 0.0)
+            })
+            .unwrap_or(d.provider_spend_usd_per_window);
         Self {
             max_body_bytes,
             request_timeout,
+            requests_per_window,
+            max_inflight_per_key,
+            provider_calls_per_window,
+            provider_spend_usd_per_window,
+            ..d
         }
     }
+}
+
+fn positive_env(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// The request `TimeoutLayer` in force. `TimeoutLayer::with_status_code` (not the deprecated
 /// `::new`) so the timeout answers a real `408 Request Timeout`.
 fn request_timeout_layer(limits: ServerLimits) -> TimeoutLayer {
     TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, limits.request_timeout)
+}
+
+/// Request-owned cancellation installed on protected non-streaming work. When the deadline wins,
+/// the middleware cancels this token and waits for the handler to finalize before returning 408.
+#[derive(Clone)]
+pub(crate) struct RequestCancellation(tokio_util::sync::CancellationToken);
+
+async fn cancellable_request_timeout(
+    State(timeout): State<Duration>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    request
+        .extensions_mut()
+        .insert(RequestCancellation(cancel.clone()));
+    let response = next.run(request);
+    tokio::pin!(response);
+    tokio::select! {
+        result = &mut response => result,
+        _ = tokio::time::sleep(timeout) => {
+            cancel.cancel();
+            // The engine cancellation path closes the durable turn and shuts down child work.
+            // Await it before returning so middleware never drops the future/permit half-finalized.
+            let _ = response.await;
+            StatusCode::REQUEST_TIMEOUT.into_response()
+        }
+    }
 }
 
 /// Build the API router over `engine`, advertising `card` on the A2A discovery endpoint and
@@ -693,6 +833,7 @@ fn router_with_ttl_and_limits(
     limits: ServerLimits,
 ) -> Router {
     let auth = Arc::new(auth);
+    let resources = Arc::new(ResourceGovernor::new(limits));
     let state = ServerState {
         engine,
         card: Arc::new(card),
@@ -700,6 +841,7 @@ fn router_with_ttl_and_limits(
         a2a_ttl,
         auth: auth.clone(),
         tasks: Arc::new(a2a::TaskRegistry::default()),
+        resources,
     };
     let timeout = request_timeout_layer(limits);
 
@@ -726,19 +868,20 @@ fn router_with_ttl_and_limits(
         .route("/sessions/{id}/usage", get(get_session_usage))
         .route_layer(middleware::from_fn_with_state(state.clone(), realm_guard));
 
-    // Non-streaming protected routes + the REST session subtree carry the request TimeoutLayer: a
-    // wedged handler (or a blocking turn that overruns the generous default) yields `408` instead
-    // of pinning the connection. `/a2a` belongs here — its blocking `message/send` runs a full
-    // turn in-handler, exactly the unbounded hold the timeout bounds; its `message/stream` path
-    // returns the SSE response promptly, and the timeout bounds response PRODUCTION (not body
-    // streaming — tower-http `TimeoutLayer`), so an in-flight stream is never severed.
+    // Non-streaming protected routes + the REST session subtree carry a cancellation-aware request
+    // deadline: a wedged handler yields `408`, but only after its owning turn and children finalize.
+    // `/a2a` belongs here because blocking `message/send` runs a full turn in-handler. Its
+    // `message/stream` path returns the response promptly, so body streaming is not severed.
     let timed = Router::new()
         .route("/a2a", post(a2a::a2a_handler))
         .route("/sessions", post(create_session))
         .route("/usage", get(get_usage_all))
         .route("/webhook", post(webhook))
         .merge(sessions_rest)
-        .layer(timeout);
+        .layer(middleware::from_fn_with_state(
+            limits.request_timeout,
+            cancellable_request_timeout,
+        ));
 
     // SSE routes: DELIBERATELY exempt from the request timeout. An SSE response holds the
     // connection open for the whole turn by design — a long-lived stream is not a stuck request,
@@ -751,10 +894,15 @@ fn router_with_ttl_and_limits(
         .route("/sessions/{id}/stream", get(stream_message))
         .route_layer(middleware::from_fn_with_state(state.clone(), realm_guard));
 
-    // `require_auth` (the outer route_layer, applied after the merge) runs BEFORE `realm_guard`, so
-    // authentication always precedes any existence signal (A2A §13.1).
+    // `require_auth` is outermost and runs before request-rate admission, which in turn runs before
+    // `realm_guard`. Authentication therefore precedes both accounting and any existence signal
+    // (A2A §13.1), while every protected route is rate-limited by construction.
     let protected = timed
         .merge(sessions_stream)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_rate_guard,
+        ))
         .route_layer(middleware::from_fn_with_state(auth, require_auth));
 
     // DefaultBodyLimit over the whole surface (C-189): a body over the cap is rejected with `413`
@@ -856,6 +1004,7 @@ pub struct MultiState {
     /// Live A2A tasks across every mounted agent (A-54); entries are scoped by `agent_id`, so
     /// two agents' identical session ids can never collide.
     pub(crate) tasks: Arc<a2a::TaskRegistry>,
+    pub(crate) resources: Arc<ResourceGovernor>,
 }
 
 impl FromRef<MultiState> for TurnGate {
@@ -881,6 +1030,11 @@ impl FromRef<MultiState> for Arc<dyn AgentResolver> {
 impl FromRef<MultiState> for Arc<a2a::TaskRegistry> {
     fn from_ref(s: &MultiState) -> Self {
         s.tasks.clone()
+    }
+}
+impl FromRef<MultiState> for Arc<ResourceGovernor> {
+    fn from_ref(s: &MultiState) -> Self {
+        s.resources.clone()
     }
 }
 
@@ -931,6 +1085,7 @@ fn router_multi_with_ttl_and_limits(
         a2a_ttl,
         auth: auth.clone(),
         tasks: Arc::new(a2a::TaskRegistry::default()),
+        resources: Arc::new(ResourceGovernor::new(limits)),
     };
     let timeout = request_timeout_layer(limits);
     // Discovery card is public (structurally auth-exempt), exactly as in the single-agent mount.
@@ -945,13 +1100,19 @@ fn router_multi_with_ttl_and_limits(
             get(a2a::agent_card_multi),
         )
         .layer(timeout);
-    // The mount's one work route carries the request timeout (C-189): `/{agent_id}/a2a` bounds its
-    // blocking `message/send` full-turn hold, while its `message/stream` SSE — produced promptly,
-    // then streamed for the life of the turn — is unaffected, since the timeout bounds response
-    // production, not body streaming. There is no separate SSE-only route to exempt here.
+    // The mount's one work route carries the cancellation-aware deadline: blocking `message/send`
+    // is cancelled and finalized before 408, while promptly produced `message/stream` SSE continues
+    // for the life of the turn. There is no separate SSE-only route to exempt here.
     let protected = Router::new()
         .route("/{agent_id}/a2a", post(a2a::a2a_handler_multi))
-        .layer(timeout)
+        .layer(middleware::from_fn_with_state(
+            limits.request_timeout,
+            cancellable_request_timeout,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_rate_guard,
+        ))
         .route_layer(middleware::from_fn_with_state(auth, require_auth));
     // DefaultBodyLimit over every route (C-189), applied outermost — see [`router_with_ttl_and_limits`].
     exempt
@@ -1012,6 +1173,23 @@ async fn require_auth(
                 }
             }
         }
+    }
+}
+
+/// Count every request that crossed the authentication boundary before route-specific work. The
+/// public health and discovery routers never carry this layer. Principal authentication remains
+/// outside the in-process limiter because the principal itself selects the budget key; deployments
+/// must bound authentication/introspection traffic at their reverse proxy or identity provider.
+async fn request_rate_guard(
+    State(auth): State<Arc<ServerAuth>>,
+    State(resources): State<Arc<ResourceGovernor>>,
+    ctx: Option<Extension<AuthContext>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match resources.admit_request(&auth, ctx.as_ref().map(|extension| &extension.0)) {
+        Ok(()) => next.run(req).await,
+        Err(response) => *response,
     }
 }
 
@@ -1128,19 +1306,28 @@ struct MessageRequest {
 async fn post_message(
     State(agent): State<Shared>,
     State(auth): State<Arc<ServerAuth>>,
+    State(resources): State<Arc<ResourceGovernor>>,
     ctx: Option<Extension<AuthContext>>,
+    request_cancel: Option<Extension<RequestCancellation>>,
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, Response> {
+    let mut permit = resources
+        .admit_work(&auth, ctx.as_ref().map(|e| &e.0))
+        .map_err(|e| *e)?;
     let mut sink = Collect::default();
     let turn = server_turn_context(&auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
+    let cancel = request_cancel
+        .map(|extension| extension.0 .0)
+        .unwrap_or_default();
     run_server_turn(
         &agent,
         &turn,
         &id,
         &req.input,
         &mut sink,
-        &tokio_util::sync::CancellationToken::new(),
+        &cancel,
+        &mut permit,
     )
     .await
     .map_err(|e| err500(e).into_response())?;
@@ -1226,37 +1413,64 @@ struct StreamQuery {
     input: String,
 }
 
+/// A REST stream may queue at most this many events. [`SseSink`] cancels the owning turn when a
+/// synchronous delta cannot enter the buffer, so a stalled client cannot turn tokens into
+/// unbounded resident memory.
+const REST_SSE_CHANNEL_CAPACITY: usize = 256;
+
 /// `GET /sessions/{id}/stream?input=…` → Server-Sent Events. Emits `text` events as tokens arrive,
 /// `tool` events as tools run, and a final `done` event. The turn runs on a spawned task feeding an
 /// mpsc channel that backs the SSE stream.
 async fn stream_message(
     State(agent): State<Shared>,
     State(auth): State<Arc<ServerAuth>>,
+    State(resources): State<Arc<ResourceGovernor>>,
     ctx: Option<Extension<AuthContext>>,
     Path(id): Path<String>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     // Resolve before establishing SSE so principal mode without a context is a normal 401.
     let turn = server_turn_context(&auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let permit = resources
+        .admit_work(&auth, ctx.as_ref().map(|e| &e.0))
+        .map_err(|e| *e)?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(REST_SSE_CHANNEL_CAPACITY);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_task = cancel.clone();
+    let drop_guard = cancel.drop_guard();
     let agent = agent.clone();
     tokio::spawn(async move {
-        let mut sink = SseSink { tx: tx.clone() };
+        // The permit lives for the entire producer task, not merely until the HTTP response is
+        // established. Its drop also accounts durable provider calls/spend on every exit path.
+        let mut permit = permit;
+        let mut sink = SseSink {
+            tx: tx.clone(),
+            cancel: cancel_task.clone(),
+        };
         if let Err(e) = run_server_turn(
             &agent,
             &turn,
             &id,
             &q.input,
             &mut sink,
-            &tokio_util::sync::CancellationToken::new(),
+            &cancel_task,
+            &mut permit,
         )
         .await
         {
-            let _ = tx.send(Event::default().event("error").data(e.to_string()));
+            if !cancel_task.is_cancelled() {
+                let _ = tx.try_send(Event::default().event("error").data(e.to_string()));
+            }
         }
-        let _ = tx.send(Event::default().event("done").data("end"));
+        if !cancel_task.is_cancelled() {
+            let _ = tx.try_send(Event::default().event("done").data("end"));
+        }
     });
     let stream = async_stream::stream! {
+        // Same owner-stream rule as A2A `message/stream`: dropping the response body fires the
+        // request-owned token. `run_turn_cancellable` then finalizes a valid cancelled history and
+        // cannot begin another approved plan round.
+        let _guard = drop_guard;
         while let Some(ev) = rx.recv().await {
             yield Ok(ev);
         }
@@ -1266,15 +1480,28 @@ async fn stream_message(
 
 /// Forwards a turn's deltas as SSE events over an mpsc channel.
 struct SseSink {
-    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    tx: tokio::sync::mpsc::Sender<Event>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl AgentSink for SseSink {
     fn text_delta(&mut self, t: &str) {
-        let _ = self.tx.send(Event::default().event("text").data(t));
+        if self
+            .tx
+            .try_send(Event::default().event("text").data(t))
+            .is_err()
+        {
+            self.cancel.cancel();
+        }
     }
     fn tool_call(&mut self, name: &str, _input: &Value) {
-        let _ = self.tx.send(Event::default().event("tool").data(name));
+        if self
+            .tx
+            .try_send(Event::default().event("tool").data(name))
+            .is_err()
+        {
+            self.cancel.cancel();
+        }
     }
 }
 
@@ -1283,21 +1510,30 @@ impl AgentSink for SseSink {
 async fn webhook(
     State(agent): State<Shared>,
     State(auth): State<Arc<ServerAuth>>,
+    State(resources): State<Arc<ResourceGovernor>>,
     ctx: Option<Extension<AuthContext>>,
+    request_cancel: Option<Extension<RequestCancellation>>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, Response> {
+    let mut permit = resources
+        .admit_work(&auth, ctx.as_ref().map(|e| &e.0))
+        .map_err(|e| *e)?;
     // In principal mode the webhook's fresh session is tagged with the caller's realm, like
     // every other mint — an untagged session would be unreachable to its own creator.
     let session_id = mint_session(&agent, &auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
     let mut sink = Collect::default();
     let turn = server_turn_context(&auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
+    let cancel = request_cancel
+        .map(|extension| extension.0 .0)
+        .unwrap_or_default();
     run_server_turn(
         &agent,
         &turn,
         &session_id,
         &req.input,
         &mut sink,
-        &tokio_util::sync::CancellationToken::new(),
+        &cancel,
+        &mut permit,
     )
     .await
     .map_err(|e| err500(e).into_response())?;
@@ -1334,6 +1570,40 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use axum::routing::get;
     use tower::ServiceExt; // for `oneshot`
+
+    struct PrincipalTestAuthenticator;
+
+    #[async_trait::async_trait]
+    impl flux_auth::request::RequestAuthenticator for PrincipalTestAuthenticator {
+        async fn authenticate(
+            &self,
+            bearer: &str,
+        ) -> Result<AuthContext, flux_auth::request::AuthError> {
+            use flux_policy::{Caller, CallerKind, Principal, Trust, TrustKind, TrustLevel};
+            let id = match bearer {
+                "alice-token" => "alice",
+                "bob-token" => "bob",
+                _ => return Err(flux_auth::request::AuthError::Unauthorized),
+            };
+            Ok(AuthContext {
+                account: Some("same-account".into()),
+                caller: Caller {
+                    principal: Principal {
+                        id: id.into(),
+                        name: id.into(),
+                        kind: CallerKind::User,
+                    },
+                    groups: Vec::new(),
+                    source: "test".into(),
+                },
+                trust: Trust {
+                    kind: TrustKind::Invocation,
+                    level: TrustLevel::Verified,
+                    scopes: Vec::new(),
+                },
+            })
+        }
+    }
 
     #[test]
     fn constant_time_eq_matches() {
@@ -1750,6 +2020,78 @@ mod tests {
     struct SlowProvider {
         delay: Duration,
     }
+
+    /// Emits one prose delta and then remains pending until the request cancellation drops its
+    /// stream. This lets the REST SSE test establish the response, consume one real frame, and
+    /// model a TCP disconnect while provider work is live.
+    struct HangingAfterDeltaProvider;
+    #[async_trait::async_trait]
+    impl flux_provider::Provider for HangingAfterDeltaProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(
+            &self,
+            req: flux_provider::Request,
+        ) -> flux_core::Result<flux_provider::ChunkStream> {
+            if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+                return ProseProvider.stream(req).await;
+            }
+            use futures::StreamExt;
+            let first =
+                futures::stream::iter(vec![Ok(flux_core::Chunk::TextDelta("started".into()))]);
+            Ok(Box::pin(first.chain(futures::stream::pending())))
+        }
+    }
+
+    struct GatedProvider {
+        entered: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+        notify: tokio::sync::Notify,
+    }
+
+    impl GatedProvider {
+        fn new() -> Self {
+            Self {
+                entered: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::atomic::AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn wait_entered(&self) {
+            while !self.entered.load(std::sync::atomic::Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+        }
+
+        fn release(&self) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl flux_provider::Provider for GatedProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(
+            &self,
+            req: flux_provider::Request,
+        ) -> flux_core::Result<flux_provider::ChunkStream> {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.notify.notify_waiters();
+            while !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+            ProseProvider.stream(req).await
+        }
+    }
     #[async_trait::async_trait]
     impl flux_provider::Provider for SlowProvider {
         fn name(&self) -> &str {
@@ -1848,6 +2190,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            events
+                .turns(&sid)
+                .unwrap()
+                .last()
+                .is_some_and(|turn| turn.outcome == "cancelled"),
+            "408 is returned only after durable cancellation finalizes"
+        );
+        flux_events::ValidHistory::new(events.conversation(&sid).unwrap())
+            .expect("timeout cancellation leaves a valid provider history");
+    }
+
+    /// Blocking A2A uses the same request-owned token; its registry entry and durable turn are
+    /// finalized before the timeout response escapes the middleware.
+    #[tokio::test]
+    async fn blocking_a2a_timeout_cancels_and_finalizes_before_408() {
+        let (engine, events) = test_engine(Arc::new(SlowProvider {
+            delay: Duration::from_millis(500),
+        }));
+        let limits = ServerLimits {
+            request_timeout: Duration::from_millis(50),
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": {
+                "configuration": { "blocking": true },
+                "message": {
+                    "contextId": "timeout-context",
+                    "parts": [{ "kind": "text", "text": "hi" }]
+                }
+            }
+        });
+        let response = app
+            .oneshot(
+                HttpRequest::post("/a2a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let session = events
+            .list(10)
+            .unwrap()
+            .into_iter()
+            .find(|session| session.context.correlation_id.as_deref() == Some("timeout-context"))
+            .expect("blocking A2A minted its task session");
+        assert!(
+            events
+                .turns(&session.id)
+                .unwrap()
+                .last()
+                .is_some_and(|turn| turn.outcome == "cancelled"),
+            "A2A timeout waits for durable cancellation"
+        );
+        flux_events::ValidHistory::new(events.conversation(&session.id).unwrap())
+            .expect("A2A timeout leaves a valid provider history");
     }
 
     /// C-189: the SSE stream route is EXEMPT from the request timeout — a long-lived stream is not
@@ -1881,6 +2289,385 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// C-260 failing-first: once the REST SSE body has been polled, dropping it owns cancellation
+    /// of the still-live turn. Pre-change the producer had a fresh token nobody could fire and the
+    /// detached task remained pending forever. The durable terminal row and `ValidHistory` check
+    /// also pin the recurrent provider-session-shape invariant on this new termination path.
+    #[tokio::test]
+    async fn dropping_rest_sse_body_cancels_and_finalizes_the_turn() {
+        use futures::StreamExt;
+
+        let (engine, events) = test_engine(Arc::new(HangingAfterDeltaProvider));
+        let sid = events.create_session("claude-sonnet-4-6").unwrap();
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            ServerLimits::default(),
+        );
+        let response = app
+            .oneshot(
+                HttpRequest::get(format!("/sessions/{sid}/stream?input=hi"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        // Polling the body instantiates its cancellation guard. This provider deliberately never
+        // completes the prose model response, so no user-visible delta is forwarded yet.
+        let _ = tokio::time::timeout(Duration::from_millis(50), body.next()).await;
+        assert!(
+            !events.turns(&sid).unwrap().is_empty(),
+            "the provider turn was live before disconnect"
+        );
+        drop(body);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if events
+                    .turns(&sid)
+                    .unwrap()
+                    .last()
+                    .is_some_and(|turn| turn.outcome == "cancelled")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect cancellation reaches durable turn finalization");
+        flux_events::ValidHistory::new(events.conversation(&sid).unwrap())
+            .expect("disconnect leaves a valid provider history");
+    }
+
+    /// C-260 failing-first: the REST sink uses a finite channel and treats a full buffer as a
+    /// stalled owner. Pre-change `UnboundedSender` accepted every delta and this token stayed live.
+    #[test]
+    fn rest_sse_sink_cancels_when_the_bounded_buffer_is_full() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Event::default().data("prefill")).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut sink = SseSink {
+            tx,
+            cancel: cancel.clone(),
+        };
+        sink.text_delta("one event too many");
+        assert!(cancel.is_cancelled());
+    }
+
+    /// C-261 failing-first: rate rejection happens before `POST /sessions` mints another session.
+    /// The wire result is a real 429 with retry context, not a successful response carrying an
+    /// application-level error.
+    #[tokio::test]
+    async fn request_rate_limit_rejects_before_session_mint() {
+        let (engine, events) = usage_test_engine();
+        let limits = ServerLimits {
+            requests_per_window: 1,
+            request_rate_window: Duration::from_secs(60),
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let first = app
+            .clone()
+            .oneshot(HttpRequest::post("/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = app
+            .oneshot(HttpRequest::post("/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers()["x-flux-limit"], "request_rate");
+        assert_eq!(events.list(10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_rate_is_principal_keyed_and_never_retains_bearer_values() {
+        let (engine, events) = usage_test_engine();
+        let limits = ServerLimits {
+            requests_per_window: 1,
+            request_rate_window: Duration::from_secs(60),
+            ..ServerLimits::default()
+        };
+        let auth = ServerAuth::Principal(PrincipalAuth::new(
+            Arc::new(PrincipalTestAuthenticator),
+            "https://agents.example.test",
+        ));
+        let app =
+            router_with_ttl_and_limits(engine, auth, CardInfo::flux_coding(), A2aTtl(0), limits);
+        let request = |token: &'static str| {
+            HttpRequest::post("/sessions")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("alice-token"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("alice-token"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            app.oneshot(request("bob-token")).await.unwrap().status(),
+            StatusCode::OK,
+            "a second principal in the same account has an independent bucket"
+        );
+        assert_eq!(events.list(10).unwrap().len(), 2);
+    }
+
+    /// The authenticated boundary covers read-only protected routes too. Before the limiter was
+    /// structural, only handlers that minted sessions or ran turns called it, so repeated usage
+    /// reads bypassed request admission entirely.
+    #[tokio::test]
+    async fn request_rate_covers_authenticated_protected_reads() {
+        let (engine, _events) = usage_test_engine();
+        let limits = ServerLimits {
+            requests_per_window: 1,
+            request_rate_window: Duration::from_secs(60),
+            ..ServerLimits::default()
+        };
+        let auth = ServerAuth::Principal(PrincipalAuth::new(
+            Arc::new(PrincipalTestAuthenticator),
+            "https://agents.example.test",
+        ));
+        let app =
+            router_with_ttl_and_limits(engine, auth, CardInfo::flux_coding(), A2aTtl(0), limits);
+        let request = || {
+            HttpRequest::get("/usage")
+                .header("authorization", "Bearer alice-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let rejected = app.oneshot(request()).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()["x-flux-limit"], "request_rate");
+    }
+
+    /// Request rate is charged once at middleware, while the handler independently reserves its
+    /// work slot. With a limit of one, the first turn must run; a handler-level second charge would
+    /// reject that same request before its provider call.
+    #[tokio::test]
+    async fn work_request_is_counted_once_at_the_authenticated_boundary() {
+        let (engine, events) = test_engine(Arc::new(ProseProvider));
+        let sid = events.create_session("claude-sonnet-4-6").unwrap();
+        let limits = ServerLimits {
+            requests_per_window: 1,
+            request_rate_window: Duration::from_secs(60),
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let completed = app
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/sessions/{sid}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "input": "hi" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+
+        let rejected = app
+            .oneshot(HttpRequest::get("/usage").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()["x-flux-limit"], "request_rate");
+    }
+
+    /// C-261 closure: provider calls are circuit-breaker facts even when the provider reports no
+    /// token usage. `ProseProvider` emits no `Chunk::Usage`; the completed turn must still consume
+    /// the call budget before the next admission.
+    #[tokio::test]
+    async fn zero_usage_provider_calls_trip_the_completed_call_breaker() {
+        let (engine, events) = test_engine(Arc::new(ProseProvider));
+        let sid = events.create_session("claude-sonnet-4-6").unwrap();
+        let limits = ServerLimits {
+            requests_per_window: 100,
+            provider_calls_per_window: 1,
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let request = || {
+            HttpRequest::post(format!("/sessions/{sid}/messages"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "input": "hi" }).to_string()))
+                .unwrap()
+        };
+
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let rows = events
+            .cost_summary(&sid, &flux_credentials::load_pricing_table())
+            .unwrap();
+        assert!(
+            rows.iter().map(|row| row.calls).sum::<u64>() >= 1,
+            "zero-token provider calls remain countable durable facts"
+        );
+        let rejected = app.oneshot(request()).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()["x-flux-limit"], "provider_calls");
+    }
+
+    /// One cross-surface slot covers work rather than HTTP response production: while a REST turn
+    /// is blocked in its provider, a webhook is rejected before its fresh-session mint. A2A
+    /// background and streaming producers own the same permit type for their full task lifetime.
+    #[tokio::test]
+    async fn live_work_limit_is_shared_across_rest_and_webhook_before_mint() {
+        let provider = Arc::new(GatedProvider::new());
+        let (engine, events) = test_engine(provider.clone());
+        let sid = events.create_session("claude-sonnet-4-6").unwrap();
+        let limits = ServerLimits {
+            requests_per_window: 100,
+            max_inflight_per_key: 1,
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let first_app = app.clone();
+        let first = tokio::spawn(async move {
+            first_app
+                .oneshot(
+                    HttpRequest::post(format!("/sessions/{sid}/messages"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({ "input": "hold" }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), provider.wait_entered())
+            .await
+            .expect("first provider call starts");
+
+        let rejected = app
+            .oneshot(
+                HttpRequest::post("/webhook")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "input": "must not mint" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()["x-flux-limit"], "concurrency");
+        assert_eq!(events.list(10).unwrap().len(), 1);
+
+        provider.release();
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn nonblocking_a2a_holds_cross_surface_slot_until_background_turn_finishes() {
+        let provider = Arc::new(GatedProvider::new());
+        let (engine, events) = test_engine(provider.clone());
+        let limits = ServerLimits {
+            requests_per_window: 100,
+            max_inflight_per_key: 1,
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": { "message": { "parts": [{ "kind": "text", "text": "hold" }] } }
+        });
+        let submitted = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/a2a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submitted.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(2), provider.wait_entered())
+            .await
+            .expect("background A2A provider call starts");
+
+        let rejected = app
+            .oneshot(
+                HttpRequest::post("/webhook")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "input": "must not mint" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(events.list(10).unwrap().len(), 1);
+
+        provider.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let done = events
+                    .list(10)
+                    .unwrap()
+                    .first()
+                    .is_some_and(|session| !events.turns(&session.id).unwrap().is_empty());
+                if done {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background A2A turn finishes after release");
     }
 
     // ── Non-loopback auth by construction (C-190) ────────────────────────────

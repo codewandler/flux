@@ -2,7 +2,8 @@
 id: C-234
 title: "The catalog-coherence registration-seam scan only reads `execution.rs`, so a pack registered from `app_cmd.rs` escapes the census"
 pillar: Core
-status: backlog
+status: done
+priority: 13
 epic: security-assurance
 design: docs/designs/security-assurance.md
 areas: [flux-cli]
@@ -44,29 +45,42 @@ no test going red — and a future pack registered from `app_cmd.rs` under a *fr
 Close the documented hole rather than restating it.
 
 ## Acceptance
-- [ ] The seam scan covers every `flux-cli` module that can reach the agent's catalog, not just
+- [x] The seam scan covers every `flux-cli` module that can reach the agent's catalog, not just
       `src/execution.rs`. The obvious shape is to walk `crates/flux-cli/src/` — `app_cmd.rs` and
       `main.rs` at minimum — but whichever set is chosen must be derived, not hand-listed, so a new
       module cannot be born outside the scan.
-- [ ] Failing-first test: a registration call added to `crates/flux-cli/src/app_cmd.rs` under a
+- [x] Failing-first test: a registration call added to `crates/flux-cli/src/app_cmd.rs` under a
       **fresh** source label fails the guard as unclassified. On today's tree it passes — that is the
       bug. (A test fixture or a scan-level unit test is fine; do not leave a stray production
       registration behind to make it fail.)
-- [ ] The doc-comment coincidence is removed as a load-bearing mechanism: the scan must not depend on
+- [x] The doc-comment coincidence is removed as a load-bearing mechanism: the scan must not depend on
       a seam name appearing in prose. Either restrict matching to code (the existing production-body
       filter at `:328` already establishes that the scan reasons about which text counts), or state
       plainly in the doc comment that comments are matched deliberately and why that is sound.
-- [ ] The "What this does *not* catch" section (`:264-277`) is rewritten to match the widened scan.
+- [x] The "What this does *not* catch" section (`:264-277`) is rewritten to match the widened scan.
       The remaining hole — a new registration reusing an already-classified source label (`:274-276`)
       — stays documented; it is out of scope here, and narrowing scope silently is the failure mode
       this whole guard exists to prevent.
-- [ ] The non-vacuity floor is preserved and re-tuned for the widened scan: the existing assertion
+- [x] The non-vacuity floor is preserved and re-tuned for the widened scan: the existing assertion
       that a suspiciously small number of "seam(s) and source label(s)" means "the scan probably
       stopped early" (`:373`) must still be able to catch a scan that silently read nothing.
-- [ ] Standard gate green in both workspaces (root + `plugins/`), `cargo fmt --check` included.
+- [x] Direct `try_register` calls are classified by their registered tool/pack identity, so a fresh
+      source cannot inherit approval from the method name alone.
+- [x] Standard gate green in both workspaces (root + `plugins/`), `cargo fmt --check` included.
 
 ## Progress
-- (not started)
+- 2026-07-30 — replaced the `execution.rs` substring scan with a recursively derived `flux-cli/src`
+  Rust-AST census. It excludes `#[cfg(test)]` modules structurally, ignores comments and string
+  contents, classifies both method seams and generic-registration source labels, and asserts floors
+  for modules, calls, seams, and labels. Fixtures prove an `app_cmd.rs` fresh label fails and prose
+  cannot satisfy the guard. The only documented residual limit is deliberate reuse of an existing
+  audit label.
+- 2026-07-30 — promoted to `ready` as an existing exact-match child of the C-255 remediation epic;
+  its original security-assurance ownership and acceptance criteria remain unchanged.
+- 2026-07-30 — closure review removed the blanket approval for direct `try_register` calls. The AST
+  census now extracts the registered tool/pack identity at that seam, classifies the two existing
+  direct identities explicitly, and rejects a fixture that introduces `FreshTool` through the same
+  previously approved method name.
 
 ## Notes
 - Filed 2026-07-29 from the fleet-coordinator integration run, out of **A-131's implementor report**.

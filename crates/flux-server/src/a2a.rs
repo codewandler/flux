@@ -621,9 +621,11 @@ pub async fn a2a_handler_multi(
     State(auth): State<Arc<crate::ServerAuth>>,
     State(turn_gate): State<TurnGate>,
     State(tasks): State<Arc<TaskRegistry>>,
+    State(resources): State<Arc<crate::ResourceGovernor>>,
     State(a2a_ttl): State<A2aTtl>,
     Path(agent_id): Path<String>,
     ctx: Option<axum::Extension<flux_auth::request::AuthContext>>,
+    request_cancel: Option<axum::Extension<crate::RequestCancellation>>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Response {
     if req.jsonrpc != "2.0" {
@@ -639,9 +641,11 @@ pub async fn a2a_handler_multi(
         auth,
         turn_gate,
         tasks,
+        resources,
         agent_id,
         a2a_ttl,
         ctx,
+        request_cancel.map(|extension| extension.0 .0),
         req,
     )
     .await
@@ -655,9 +659,11 @@ async fn dispatch_rpc(
     auth: Arc<crate::ServerAuth>,
     turn_gate: TurnGate,
     registry: Arc<TaskRegistry>,
+    resources: Arc<crate::ResourceGovernor>,
     scope: String,
     a2a_ttl: A2aTtl,
     ctx: Option<flux_auth::request::AuthContext>,
+    request_cancel: Option<CancellationToken>,
     req: JsonRpcRequest,
 ) -> Response {
     // Bound/normalize the attacker-controlled id once, at the single dispatch chokepoint, so every
@@ -667,12 +673,32 @@ async fn dispatch_rpc(
         ..req
     };
     match req.method.as_str() {
-        "message/send" => send(
-            engine, auth, turn_gate, registry, scope, a2a_ttl, ctx, req.id, req.params,
-        )
-        .await
-        .into_response(),
+        "message/send" => {
+            let permit = match resources.admit_work(&auth, ctx.as_ref()) {
+                Ok(permit) => permit,
+                Err(response) => return *response,
+            };
+            send(
+                engine,
+                auth,
+                turn_gate,
+                registry,
+                scope,
+                a2a_ttl,
+                ctx,
+                req.id,
+                req.params,
+                permit,
+                request_cancel,
+            )
+            .await
+            .into_response()
+        }
         "message/stream" => {
+            let permit = match resources.admit_work(&auth, ctx.as_ref()) {
+                Ok(permit) => permit,
+                Err(response) => return *response,
+            };
             match subscribe(
                 engine,
                 auth,
@@ -683,6 +709,7 @@ async fn dispatch_rpc(
                 ctx,
                 req.id.clone(),
                 req.params,
+                permit,
             )
             .await
             {
@@ -806,13 +833,16 @@ fn status_frame(
 /// - `message/stream` → [`subscribe`] (SSE stream of `TaskStatusUpdate`s)
 /// - `tasks/get` / `tasks/cancel` / `tasks/resubscribe` → the stateful task surface (A-54/55/56)
 /// - `tasks/pushNotificationConfig/*` → per-task webhooks (A-57)
+#[allow(clippy::too_many_arguments)]
 pub async fn a2a_handler(
     State(engine): State<Shared>,
     State(auth): State<Arc<crate::ServerAuth>>,
     State(turn_gate): State<TurnGate>,
     State(tasks): State<Arc<TaskRegistry>>,
+    State(resources): State<Arc<crate::ResourceGovernor>>,
     State(a2a_ttl): State<A2aTtl>,
     ctx: Option<axum::Extension<flux_auth::request::AuthContext>>,
+    request_cancel: Option<axum::Extension<crate::RequestCancellation>>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Response {
     if req.jsonrpc != "2.0" {
@@ -824,9 +854,11 @@ pub async fn a2a_handler(
         auth,
         turn_gate,
         tasks,
+        resources,
         String::new(),
         a2a_ttl,
         ctx,
+        request_cancel.map(|extension| extension.0 .0),
         req,
     )
     .await
@@ -848,6 +880,8 @@ async fn send(
     ctx: Option<flux_auth::request::AuthContext>,
     id: Option<Value>,
     params: Option<Value>,
+    permit: crate::WorkPermit,
+    request_cancel: Option<CancellationToken>,
 ) -> Json<Value> {
     let params = match params {
         Some(p) => p,
@@ -859,12 +893,23 @@ async fn send(
     };
     if server::blocking_requested(&params) {
         send_blocking(
-            engine, auth, turn_gate, registry, scope, ttl, ctx, id, params, input,
+            engine,
+            auth,
+            turn_gate,
+            registry,
+            scope,
+            ttl,
+            ctx,
+            id,
+            params,
+            input,
+            permit,
+            request_cancel.unwrap_or_default(),
         )
         .await
     } else {
         send_nonblocking(
-            engine, auth, turn_gate, registry, scope, ttl, ctx, id, params, input,
+            engine, auth, turn_gate, registry, scope, ttl, ctx, id, params, input, permit,
         )
         .await
     }
@@ -906,6 +951,8 @@ async fn send_blocking(
     id: Option<Value>,
     params: Value,
     input: String,
+    mut permit: crate::WorkPermit,
+    request_cancel: CancellationToken,
 ) -> Json<Value> {
     let requested_context = server::extract_context_id(&params);
     // Acquire the gate BEFORE minting (C-29). Identity is request-owned and will be installed by
@@ -925,7 +972,7 @@ async fn send_blocking(
         requested_context.as_deref(),
         turn.realm.as_deref(),
         TaskState::Working,
-        CancellationToken::new(),
+        request_cancel,
     )
     .await
     {
@@ -940,6 +987,7 @@ async fn send_blocking(
         &input,
         &mut sink,
         &task.cancel,
+        &mut permit,
     )
     .await;
     let run = TaskRun::new(&registry, &scope, &task);
@@ -986,6 +1034,7 @@ async fn send_nonblocking(
     id: Option<Value>,
     params: Value,
     input: String,
+    permit: crate::WorkPermit,
 ) -> Json<Value> {
     let requested_context = server::extract_context_id(&params);
     let Ok(realm) = crate::caller_realm(&auth, ctx.as_ref()) else {
@@ -1020,7 +1069,7 @@ async fn send_nonblocking(
         }
     };
     tokio::spawn(run_background(
-        engine, auth, turn_gate, registry, scope, task, input, ctx,
+        engine, auth, turn_gate, registry, scope, task, input, ctx, permit,
     ));
     response
 }
@@ -1038,6 +1087,7 @@ async fn run_background(
     task: RegisteredTask,
     input: String,
     ctx: Option<flux_auth::request::AuthContext>,
+    mut permit: crate::WorkPermit,
 ) {
     let _turn = turn_gate.lock().await;
     // Fail-closed belt+braces: `caller_realm` already vetted the context at mint.
@@ -1076,6 +1126,7 @@ async fn run_background(
         &input,
         &mut sink,
         &task.cancel,
+        &mut permit,
     )
     .await;
     // The final frame carries no message on success — the deltas already broadcast are
@@ -1686,6 +1737,7 @@ async fn subscribe(
     ctx: Option<flux_auth::request::AuthContext>,
     id: Option<Value>,
     params: Option<Value>,
+    permit: crate::WorkPermit,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (i32, String)> {
     let params = params.ok_or((-32602, "Missing params".to_string()))?;
     let input = match server::extract_input(&params) {
@@ -1779,6 +1831,9 @@ async fn subscribe(
                 return;
             }
         };
+        // Own the cross-surface concurrency slot for the producer's complete lifetime. It is
+        // released (and provider deltas are accounted) only after cancellation/finalization.
+        let mut permit = permit;
         let session_id = task.session_id.clone();
         let context_id = task.context_id.clone();
         let task_id = session_id.clone();
@@ -1813,6 +1868,7 @@ async fn subscribe(
             &input,
             &mut sink,
             &cancel_task,
+            &mut permit,
         )
         .await;
         // The terminal state: a disconnect-cancelled run is `canceled`, otherwise the run's own
@@ -2260,9 +2316,12 @@ mod tests {
         let x_task = tokio::spawn(async move {
             let mut params = send_params("hi");
             params["configuration"] = json!({ "blocking": true });
+            let auth = Arc::new(crate::ServerAuth::Open);
+            let resources = crate::ResourceGovernor::new(crate::ServerLimits::default());
+            let permit = resources.admit_work(&auth, None).unwrap();
             send(
                 engine_x,
-                Arc::new(crate::ServerAuth::Open),
+                auth,
                 gate_x,
                 registry_x,
                 String::new(),
@@ -2270,6 +2329,8 @@ mod tests {
                 None,
                 Some(json!(1)),
                 Some(params),
+                permit,
+                None,
             )
             .await
         });

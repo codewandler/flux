@@ -2,7 +2,8 @@
 id: C-233
 title: "The published risk-column drift guard silently skips every non-built-in op, so `fleet.*`, `browser.*`, `web.*` and `consult` are unverified"
 pillar: Core
-status: backlog
+status: done
+priority: 12
 epic: security-assurance
 design: docs/designs/security-assurance.md
 areas: [flux-tools, flux-cli]
@@ -44,26 +45,33 @@ placement) — so this story should widen the risk check the same way rather tha
 mechanism.
 
 ## Acceptance
-- [ ] The published Risk column is checked against the **production** catalog, not just the built-in
+- [x] The published Risk column is checked against the **production** catalog, not just the built-in
       pack. Reuse C-208's `production_catalog` census in `crates/flux-cli/src/catalog_coherence.rs`
       rather than assembling a second one; the check moves to whichever crate can see the ops, exactly
       as C-208's did.
-- [ ] Failing-first test: flip one published tier for a **non-built-in** op in `ops-reference.md`
+- [x] Failing-first test: flip one published tier for a **non-built-in** op in `ops-reference.md`
       (`browser.*`, `web.*` or `consult` — the three the current guard names as skipped) and the gate
       must red. On today's tree it stays green, which is the failure being fixed.
-- [ ] The skip stops being silent: a reference row naming an op the census cannot resolve **fails**
+- [x] The skip stops being silent: a reference row naming an op the census cannot resolve **fails**
       with the op name, rather than `continue`. If some rows legitimately cannot be resolved, they are
       enumerated with a reason — the C-208 `EXCLUDED` pattern (`catalog_coherence.rs:296-300`) — so a
       newly published op cannot inherit an exemption it was never granted.
-- [ ] A non-vacuity assertion on the widened check: a floor on rows actually verified, in the spirit
+- [x] A non-vacuity assertion on the widened check: a floor on rows actually verified, in the spirit
       of the existing `checked` counter and of C-208's `!registry.names().is_empty()` guard. A gate
       that verifies zero rows must not be able to pass.
-- [ ] The old built-ins-only assertion is not left behind as a second, weaker copy of the same
+- [x] The old built-ins-only assertion is not left behind as a second, weaker copy of the same
       invariant — either it becomes the census-backed one or it is removed with the reason recorded.
-- [ ] Standard gate green in both workspaces (root + `plugins/`), `cargo fmt --check` included.
+- [x] Standard gate green in both workspaces (root + `plugins/`), `cargo fmt --check` included.
 
 ## Progress
-- (not started)
+- 2026-07-30 — moved the published-risk guard onto C-208's `production_catalog`, made unresolved
+  rows fail closed except for the reasoned separately-shipped `web.search` plugin row, and added
+  non-built-in drift, unresolved-row, exclusion-cardinality, and non-vacuity assertions. The
+  failing-first run exposed real drift (`web.fetch` and `web.crawl` were documented Low while their
+  production specs are Medium) plus an escaped-pipe parser bug; both reference mirrors and the
+  parser are corrected. Removed the weaker built-ins-only copy from `flux-tools`.
+- 2026-07-30 — promoted to `ready` as an existing exact-match child of the C-255 remediation epic;
+  its original security-assurance ownership and acceptance criteria remain unchanged.
 
 ## Notes
 - Filed 2026-07-29 from the fleet-coordinator integration run, out of **A-131's implementor report**.

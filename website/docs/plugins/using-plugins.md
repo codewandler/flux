@@ -43,7 +43,7 @@ Bare `flux plugin install` (no names, no `--all`, no `--dir`) is an error — it
 | Category | Plugins |
 |---|---|
 | Search & knowledge | `websearch` (Tavily + DuckDuckGo fallback), `huggingface` (Hub catalog + router chat/embed) |
-| Dev & project tracking | `gitlab`, `jira`, `confluence` |
+| Dev, project & support tracking | `gitlab`, `jira`, `confluence` |
 | Infra & observability | `kubernetes`, `docker`, `aws`, `prometheus`, `loki`, `grafana`, `alertmanager`, `opsgenie` |
 | Messaging | `slack` |
 | Data | `sql` (PostgreSQL and MySQL/MariaDB read-only query + introspection) |

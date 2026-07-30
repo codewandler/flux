@@ -158,29 +158,18 @@ impl PluginHost {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
         // Bound a single framed message so a malicious/buggy plugin can't OOM the host by emitting
         // a gigantic line with no newline. `Take` caps the bytes `read_until` will consume.
-        const MAX_FRAME: usize = 8 * 1024 * 1024;
         let mut buf = Vec::new();
         let n = (&mut self.reader)
-            .take(MAX_FRAME as u64)
+            .take(flux_plugin_protocol::MAX_FRAME_BYTES as u64)
             .read_until(b'\n', &mut buf)
             .await
             .map_err(Error::Io)?;
         if n == 0 {
             return Err(Error::Provider("plugin closed the connection".into()));
         }
-        if buf.last() != Some(&b'\n') {
-            return Err(Error::Provider(
-                "plugin frame exceeded the size limit (no newline within bound)".into(),
-            ));
-        }
-        let line = std::str::from_utf8(&buf)
-            .map_err(|e| Error::Provider(format!("plugin frame not valid UTF-8: {e}")))?;
-        let frame: Frame = serde_json::from_str(line.trim())?;
-        // Every plugin→host frame carries the wire-protocol marker; checking it here — the single
-        // choke point for inbound frames — turns an incompatible plugin into an actionable message
-        // instead of a downstream deserialization failure (C-144).
-        flux_plugin_protocol::check_protocol(&frame.protocol).map_err(Error::Provider)?;
-        Ok(frame)
+        // Every plugin→host frame carries the wire-protocol marker. Decode at the shared pure seam
+        // so the async host, property corpus, and Miri exercise one implementation.
+        flux_plugin_protocol::decode_ndjson_frame(&buf).map_err(Error::Provider)
     }
 
     async fn request(&mut self, command: &str, payload: Value) -> Result<Frame> {

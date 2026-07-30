@@ -27,7 +27,7 @@
 //! ## Egress
 //!
 //! The worker endpoint on the `fleet.*` ops is caller-supplied, so every one of them resolves it
-//! through [`flux_system::net::guard_url_scoped`] before a request is made — an unguarded,
+//! through [`flux_system::net::guard_url_scoped_pinned`] before a request is made — an unguarded,
 //! model-named URL is an SSRF hole. `permission_subjects` reports the worker's **origin**, never
 //! `*`, so a `network.fetch` grant scopes to the exact worker.
 
@@ -46,7 +46,9 @@ use flux_runtime::{
     ToolResult,
 };
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
-use flux_system::net::{guard_url_scoped, PrivateNetAllow};
+use flux_system::net::{
+    guard_url_scoped_pinned_with_resolver, HostResolver, PrivateNetAllow, SystemHostResolver,
+};
 
 use crate::parse_params;
 
@@ -69,7 +71,7 @@ fn a2a_err(context: &str, e: A2aError) -> Error {
 /// Parsed by hand rather than through the `url` crate: `permission_subjects` runs synchronously on
 /// the gating path for every invocation, so it must not depend on DNS or pull a dependency into
 /// this crate. The authoritative parse still happens on the execution path, inside
-/// [`guard_url_scoped`] — this only has to *name* the target, and it names strictly less than the
+/// [`flux_system::net::guard_url_scoped_pinned`] — this only has to *name* the target, and it names strictly less than the
 /// full URL (no path, no query, no userinfo).
 fn worker_origin(endpoint: &str) -> Option<String> {
     let (scheme, rest) = endpoint.split_once("://")?;
@@ -157,8 +159,7 @@ impl A2aSpawner {
         private_net: &PrivateNetAllow,
         token: Option<String>,
     ) -> Result<Self> {
-        guard_url_scoped(endpoint, private_net)?;
-        let client = A2aClient::new(endpoint)
+        let client = guarded_worker_client(endpoint, private_net, &SystemHostResolver)
             .map_err(|e| Error::Config(format!("a2a worker: {e}")))?
             .with_token(token);
         Ok(Self {
@@ -257,8 +258,21 @@ impl Spawner for A2aSpawner {
 
 /// Resolve a caller-supplied worker endpoint into a client, guarding egress first.
 fn worker_client(endpoint: &str, private_net: &PrivateNetAllow) -> Result<A2aClient> {
-    guard_url_scoped(endpoint, private_net)?;
-    A2aClient::new(endpoint).map_err(|e| Error::Other(format!("fleet worker endpoint: {e}")))
+    guarded_worker_client(endpoint, private_net, &SystemHostResolver)
+        .map_err(|e| Error::Other(format!("fleet worker endpoint: {e}")))
+}
+
+/// The fleet adapter's sole A2A construction path. The resolver's answer is both authorized and
+/// consumed by the client, so it is impossible to accidentally regress this adapter to a
+/// guard-then-re-resolve sequence.
+fn guarded_worker_client(
+    endpoint: &str,
+    private_net: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+) -> std::result::Result<A2aClient, String> {
+    let (url, pinned) = guard_url_scoped_pinned_with_resolver(endpoint, private_net, resolver)
+        .map_err(|e| e.to_string())?;
+    A2aClient::new_pinned(url.as_str(), &pinned).map_err(|e| e.to_string())
 }
 
 /// The subject list every `fleet.*` op reports: the worker's origin, or nothing when the endpoint
@@ -1198,6 +1212,67 @@ mod tests {
             .execute(&ctx, json!({ "worker": "http://127.0.0.1:9", "task": "x" }))
             .await
             .is_err());
+    }
+
+    struct RebindingResolver {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HostResolver for RebindingResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![if call == 0 {
+                "127.0.0.1".parse().unwrap()
+            } else {
+                "169.254.169.254".parse().unwrap()
+            }])
+        }
+    }
+
+    /// C-256: the resolver answer vetted by fleet must be the one the A2A transport consumes.
+    /// Before this story the adapter discarded that answer and `A2aClient` performed another DNS
+    /// lookup. A fake hostname proves the request can succeed only through the supplied pin, while
+    /// the call count proves the attacker's second answer is never requested.
+    #[tokio::test]
+    async fn fleet_client_consumes_the_guard_vetted_address_without_rebinding() {
+        let (base, seen) =
+            worker_stub(|_method, _params| task_json("t_pin", "completed", "ok")).await;
+        let port = base.rsplit(':').next().unwrap();
+        let endpoint = format!("http://worker.rebind.test:{port}");
+        let resolver = RebindingResolver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let allow = PrivateNetAllow::from_hosts(["worker.rebind.test".to_string()]);
+        let client = guarded_worker_client(&endpoint, &allow, &resolver).unwrap();
+
+        let task = client.get_task("t_pin").await.unwrap();
+        assert_eq!(task.id, "t_pin");
+        assert_eq!(
+            resolver.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "A2A connect must not perform a second DNS lookup"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    struct EmptyResolver;
+
+    impl HostResolver for EmptyResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn fleet_client_fails_closed_when_the_guard_vets_no_address() {
+        let err = guarded_worker_client(
+            "https://unresolved.worker.test",
+            &PrivateNetAllow::None,
+            &EmptyResolver,
+        )
+        .err()
+        .expect("fleet must not construct an A2A client that can resolve at connect time");
+        assert!(err.contains("vetted no addresses"), "{err}");
     }
 
     // ── fleet.dispatch / status / cancel behaviour (Acceptance 4) ───────────

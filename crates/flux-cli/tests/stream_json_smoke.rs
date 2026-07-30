@@ -129,12 +129,71 @@ fn stream_json_emits_the_expected_ndjson_line_sequence_for_a_mock_run() {
         .is_some_and(|s| !s.is_empty()));
     let turn_end = lines.last().unwrap();
     assert_eq!(turn_end["answer"].as_str(), Some("Finished."));
+    assert_eq!(turn_end["outcome"].as_str(), Some("ok"));
+    assert!(turn_end.get("error").is_none());
 
     // The write actually ran (same guarded execution as the human-rendered path).
     let file = work.join("flux-mock.txt");
     assert!(
         file.exists(),
         "flux-mock.txt was not written\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn provider_stage_failure_emits_a_typed_terminal_error_and_exits_nonzero() {
+    let tmp = TempDir::new("stream-json-provider-error");
+    let work = tmp.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args([
+            "--no-sandbox",
+            "run",
+            "--stream-json",
+            "--yes",
+            "-m",
+            "mock",
+            "say hi",
+        ])
+        .current_dir(work)
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .env("FLUX_MOCK_ERROR", "deterministic provider outage")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn flux");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "provider failure must make `flux run` nonzero\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let lines = parse_ndjson_lines(&stdout, &stderr);
+    let error = lines
+        .iter()
+        .find(|line| line["type"] == "error")
+        .expect("dedicated error line");
+    let turn_end = lines.last().expect("terminal turn_end line");
+    assert_eq!(turn_end["type"], "turn_end");
+    assert_eq!(turn_end["outcome"], "error");
+
+    let message = error["message"].as_str().expect("error message");
+    let terminal_error = turn_end["error"].as_str().expect("turn_end error");
+    assert_eq!(message, terminal_error, "terminal signals must agree");
+    assert!(message.contains("Intent detection failed"), "{message}");
+    assert!(
+        message.contains("deterministic provider outage"),
+        "{message}"
+    );
+    assert!(
+        turn_end["answer"]
+            .as_str()
+            .is_some_and(|answer| !answer.trim().is_empty()),
+        "the human-facing answer must survive: {turn_end}"
     );
 }
 

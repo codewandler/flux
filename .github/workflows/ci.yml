@@ -138,18 +138,20 @@ jobs:
           ./scripts/check-action-pins.sh --self-test
           ./scripts/check-action-pins.sh
 
+      - name: Release bootstrap and provenance policy
+        run: |
+          ./scripts/check-release-integrity.sh --self-test
+          ./scripts/check-release-integrity.sh
+
   no-direct-io:
     name: model-facing tool crates do not reach IO behind flux-system
     runs-on: ubuntu-latest
-    # C-194: architecture.md's "all IO goes through flux-system; tools never touch std::fs/std::process
-    # directly" was review-discipline only — which is how C-192's sqlite_query VACUUM INTO escape
-    # shipped. This makes it a gate: a direct std::fs/process/DB/socket open in a tool crate outside
-    # #[cfg(test)], without an explicit `// flux-allow-direct-io: <reason>`, fails here. Grep-only, so
-    # no Rust build is needed.
+    # C-263: one syn-based codegate resolves aliases/imports across every classified production
+    # operation pack. The wrapper has no second crate list or weaker text-pattern fallback.
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: No unannotated direct IO in flux-tools / flux-web / flux-capabilities
+      - name: Structural no-direct-IO gate and adversarial fixtures
         run: |
           ./scripts/check-no-direct-io.sh --self-test
           ./scripts/check-no-direct-io.sh

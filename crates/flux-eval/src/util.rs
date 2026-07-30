@@ -21,6 +21,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn unique_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+    // flux-allow-direct-io: eval harness owns this unpredictable process-scoped temp root before a
+    // workspace/System can exist; model input cannot choose or escape the generated path.
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

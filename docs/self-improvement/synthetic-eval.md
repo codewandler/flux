@@ -51,8 +51,8 @@ candidate is strictly better **and** no member regressed (`pass_rate` & check-ra
 
 - Loop flow: `examples/improve-multi.flux` (mirrors `improve-tbench.flux` but `adapter: "multi"` with a
   terminal-bench + synthetic member list, gated on `score_compare_multi`). Both members measure the same
-  freshly-rebuilt musl binary (terminal-bench via `flux_binary`, synthetic via the top-level `flux_bin`),
-  so the loop scores the worker's edits, not a stale binary.
+  freshly-rebuilt musl binary selected by trusted host `FLUX_EVAL_BINARY`, so neither adapter accepts
+  a model-controlled executable path and the loop scores the worker's edits, not a stale binary.
 - Ad-hoc synthetic-only flow: `examples/eval-synthetic.flux`.
 - **Synthetic-only self-improvement loop:** `examples/improve-synthetic.flux` (runner
   `bench/run-synthetic-loop.sh`) — the keep/revert loop gated on single-member `score_compare`, at

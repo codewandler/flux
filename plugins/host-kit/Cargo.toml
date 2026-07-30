@@ -7,7 +7,7 @@ rust-version.workspace = true
 # against it speak?" — a question flux releases do not change the answer to. The former lockstep
 # (bumped by scripts/cut-release.sh on every cut) republished it unchanged every release and forced
 # a plugin-pack rebuild for wire-irrelevant reasons.
-version = "1.0.0"
+version = "1.0.1"
 license.workspace = true
 description = "Shared SDK for flux integration plugins: typed host-capability calls (secret-by-purpose, http+bearer, endpoint, datasource records) + a manifest/op builder over the flux plugin wire protocol"
 repository = "https://github.com/codewandler/flux"

@@ -54,7 +54,11 @@ echo "→ building flux (native) in the worktree"
 cargo build --workspace
 
 echo "→ running improve-tbench.flux (model=$model)"
-HOME="$improve_home" ./target/debug/flux flow run examples/improve-tbench.flux --yes -m "$model"
+HOME="$improve_home" \
+FLUX_EVAL_BINARY="$wt/target/x86_64-unknown-linux-musl/release/flux" \
+FLUX_TERMINAL_BENCH_DATASET="terminal-bench-core==0.1.1" \
+FLUX_TERMINAL_BENCH_REBUILD=1 \
+  ./target/debug/flux flow run examples/improve-tbench.flux --yes -m "$model"
 
 echo
 echo "→ done on branch '$branch' ($wt)."

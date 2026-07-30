@@ -1134,6 +1134,17 @@ impl System {
         self.workspace.path_identity(path, access)
     }
 
+    /// Reduce a **host** path to its physical identity: every existing symlink followed, a
+    /// not-yet-existing tail preserved. Unlike [`path_identity`](Self::path_identity) this neither
+    /// confines to nor widens the workspace — it is the reduction step alone, for grants that
+    /// legitimately name paths outside the workspace (a plugin `conn` grant to a Unix socket under
+    /// `/var/run`). Matching a grant against the result is the caller's job; reducing *both* sides
+    /// is what makes a symlinked spelling unable to name an out-of-grant target, exactly as
+    /// [`read_file_scoped`](Self::read_file_scoped) does for files.
+    pub fn host_path_identity(&self, path: &str) -> Result<String> {
+        path_to_utf8(&canonicalize_existing_ancestor(&self.host_path(path)?)?)
+    }
+
     /// Read a host file through an explicit exact, `/*`, or `/**` scope. Both the scope anchor and
     /// requested path are reduced to physical identities before matching, so a lexical in-scope
     /// symlink cannot reach an out-of-scope target. This is the guarded host-file seam used by

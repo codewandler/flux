@@ -33,6 +33,15 @@ struct TurnContext {
     audit: Option<(Arc<flux_events::EventStore>, i64)>,
 }
 
+/// The authored adaptive loop intentionally receives stage results as values. This retains the
+/// exact tagged error value it received so the engine can make the finished turn machine-failing
+/// after the loop has rendered the same apologetic human answer.
+#[derive(Clone, Debug)]
+pub(crate) struct StageFailure {
+    pub(crate) kind: String,
+    pub(crate) text: String,
+}
+
 /// Runtime capabilities used by the authored outer loop.
 pub struct EngineLoopHost {
     executor: Weak<Executor>,
@@ -44,6 +53,7 @@ pub struct EngineLoopHost {
     turn: Mutex<TurnContext>,
     usage: Mutex<Usage>,
     calls: Mutex<Vec<(String, Usage)>>,
+    stage_failure: Mutex<Option<StageFailure>>,
     /// A-96: per-turn call counter for the `consult` op's own budget (distinct from `calls`, which
     /// tallies billed usage for every independent model call regardless of source). Reset to zero
     /// in [`Self::set_turn`] like the rest of turn accounting.
@@ -119,6 +129,7 @@ impl EngineLoopHost {
                 }),
                 usage: Mutex::new(Usage::default()),
                 calls: Mutex::new(Vec::new()),
+                stage_failure: Mutex::new(None),
                 consult_calls: AtomicU32::new(0),
                 token_budget: Mutex::new(None),
                 adaptive_policy: Mutex::new(crate::staged::AdaptiveLoopPolicy::default()),
@@ -230,6 +241,7 @@ impl EngineLoopHost {
         };
         *self.usage.lock().unwrap() = Usage::default();
         self.calls.lock().unwrap().clear();
+        *self.stage_failure.lock().unwrap() = None;
         self.consult_calls.store(0, Ordering::SeqCst);
         self.receipts.clear();
         reporter
@@ -241,6 +253,28 @@ impl EngineLoopHost {
 
     pub fn turn_calls(&self) -> Vec<(String, Usage)> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Take the first tagged stage failure observed in this turn. `set_turn` clears the slot, so a
+    /// cancellation or later turn can never inherit an earlier provider failure.
+    pub(crate) fn take_stage_failure(&self) -> Option<StageFailure> {
+        self.stage_failure.lock().unwrap().take()
+    }
+
+    fn carry_stage_failure(&self, value: &Value) {
+        let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(text) = value.get("text").and_then(Value::as_str) else {
+            return;
+        };
+        let mut failure = self.stage_failure.lock().unwrap();
+        if failure.is_none() {
+            *failure = Some(StageFailure {
+                kind: kind.to_string(),
+                text: text.to_string(),
+            });
+        }
     }
 
     pub(crate) fn record_external_call(&self, provider: &str, model: &str, usage: Usage) {
@@ -566,10 +600,14 @@ impl LoopHost for EngineLoopHost {
         self.record_stage_usages(&provider, &run.model, run.usages);
         match run.result {
             Ok(value) => Ok(value),
-            Err(error) => Ok(json!({
-                "kind": "error",
-                "text": format!("Intent detection failed: {error}"),
-            })),
+            Err(error) => {
+                let value = json!({
+                    "kind": "error",
+                    "text": format!("Intent detection failed: {error}"),
+                });
+                self.carry_stage_failure(&value);
+                Ok(value)
+            }
         }
     }
 
@@ -579,10 +617,14 @@ impl LoopHost for EngineLoopHost {
         self.record_stage_usages(&provider, &run.model, run.usages);
         match run.result {
             Ok(value) => Ok(value),
-            Err(error) => Ok(json!({
-                "kind": "error",
-                "text": format!("Exploration failed: {error}"),
-            })),
+            Err(error) => {
+                let value = json!({
+                    "kind": "error",
+                    "text": format!("Exploration failed: {error}"),
+                });
+                self.carry_stage_failure(&value);
+                Ok(value)
+            }
         }
     }
 

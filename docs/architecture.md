@@ -167,9 +167,12 @@ surfaced as events.
 
 ### Invariants worth never breaking
 - All IO goes through `flux-system`; tools never touch `std::fs`/`std::process` directly. Enforced by
-  `scripts/check-no-direct-io.sh` (CI job `no-direct-io`, C-194): a direct `std::fs`/`std::process`/
-  `tokio::fs`/`tokio::process`/DB/socket open in `flux-tools`, `flux-web` or `flux-capabilities`
-  outside `#[cfg(test)]` fails CI unless the call carries a `// flux-allow-direct-io: <reason>` marker.
+  `scripts/check-no-direct-io.sh` (CI job `no-direct-io`, C-194/C-263): one `flux-codegate` syntax
+  scanner resolves direct filesystem, process, socket, HTTP-client, and database opens through Rust
+  imports, renames, module/type aliases, local callable aliases, and multiline calls across the
+  exhaustively classified first-party production operation packs (including `flux-eval`). Test-only
+  syntax is excluded;
+  reviewed host-store/broker boundaries require a call-local `// flux-allow-direct-io: <reason>`.
 - Every tool runs through `Executor::dispatch`; nothing calls a tool's `execute` directly in prod.
 - A tool's `permission_subjects` must be accurate — a write that reports no subjects is forced to
   approval rather than silently authorized workspace-wide.

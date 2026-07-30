@@ -430,6 +430,7 @@ const NON_PUBLIC_ENV: &[&str] = &[
     "FLUX_CASSETTE_MAX_BYTES",
     "FLUX_GOLDEN",
     "FLUX_MOCK_BASH",
+    "FLUX_MOCK_ERROR",
     "FLUX_MOCK_HANG",
     "FLUX_MOCK_RESPONSE",
     "FLUX_MOCK_TOOL",
@@ -440,9 +441,17 @@ const NON_PUBLIC_ENV: &[&str] = &[
     "FLUX_WEB_SECRET_ALLOW",
     "FLUX_WEB_STOLEN_TOKEN",
     "FLUX_WEB_TEST_TOKEN",
+    // CI-only deterministic corpus size for the adversarial assurance tests; not shipped behavior.
+    "FLUX_ADVERSARIAL_CASES",
     // A `format!` prefix, not a variable: the D-116 endpoint e2e mints a per-process credential
     // key (`FLUX_D116_PGPASS_<pid>`) to prove a credential *location* is never part of the URL.
     "FLUX_D116_PGPASS_",
+    // Re-exec markers the C-256/C-257 proxy-isolation tests set on their own child test process.
+    // Proxy variables are process-global, so the assertion runs in an isolated re-exec of the test
+    // binary; the marker exists only inside those `#[cfg(test)]` modules.
+    "FLUX_A2A_PROXY_REGRESSION_CHILD",
+    "FLUX_PLUGIN_PROXY_REGRESSION_CHILD",
+    "FLUX_WEB_PROXY_REGRESSION_CHILD",
     // Markers flux sets for its own child processes — observable, but not knobs a user sets.
     "FLUX_BG_MARKER",
     "FLUX_C67_CWD_CHILD",

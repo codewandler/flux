@@ -119,7 +119,9 @@ const EXEMPT: &[Exemption] = &[
     Exemption {
         op: "git_diff",
         invariants: &["I1"],
-        reason: "fixed argv `git diff`, caller may only restrict it to a path; read-only",
+        reason: "fixed argv `git diff --no-ext-diff --no-textconv`; configured external and \
+                 textconv drivers are disabled, so the caller may only restrict the read-only \
+                 diff to a path",
     },
     Exemption {
         op: "git_log",

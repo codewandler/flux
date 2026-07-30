@@ -76,6 +76,10 @@ labels = { environment = "production" }
 [server]
 a2a_session_ttl_secs = 3600
 external_url = "https://agents.example.com"
+requests_per_minute = 120
+max_inflight_per_principal = 4
+provider_calls_per_day = 1000
+provider_spend_usd_per_day = 25.0
 
 [[policy.grants]]
 subjects  = [{ kind = "user", id = "*" }]
@@ -401,6 +405,10 @@ Inspect and cancel pending wake-ups with `flux wakeups list` and `flux wakeups c
 | `[server]` key | Meaning |
 |---|---|
 | `a2a_session_ttl_secs` | Idle lifetime for A2A-created sessions; default `3600`, `0` disables pruning. |
+| `requests_per_minute` | Authenticated protected-route requests (reads and work) admitted per principal/auth realm each minute; default `120`. Health and discovery routes are exempt. |
+| `max_inflight_per_principal` | Live REST, webhook, and A2A turns per principal/auth realm; default `4`. |
+| `provider_calls_per_day` | Completed provider-call circuit-breaker threshold per principal/auth realm in each 24-hour process window; default `1000`. Already-admitted turns can overshoot within the live-work bound. |
+| `provider_spend_usd_per_day` | Completed priced-spend circuit-breaker threshold per principal/auth realm in each 24-hour process window; default `$25`. Already-admitted turns can overshoot within the live-work bound. |
 | `external_url` | Trusted public origin advertised in agent cards; required with token introspection. |
 | `introspect_url` | RFC 7662 bearer-token introspection endpoint; enables per-principal isolation. |
 | `introspect_client_id` | Optional client id for `client_secret_basic`. |
@@ -427,6 +435,10 @@ Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values su
 | `FLUX_HOME` | The flux home directory (default `~/.flux`) that `flux usage` resolves its global events store from. It does **not** redirect `--store`/`FLUX_STORE_DIR`. |
 | `FLUX_ADD_DIRS` | Extra workspace roots, path-separator delimited; the environment form of `--add-dir`. |
 | `FLUX_WORKTREE_DIR` | Where context-local Git worktrees are created. |
+| `FLUX_EVAL_BINARY` | Trusted-host path to the flux executable evaluated by `eval_run` and `flux eval` (default: the running executable). This selector is intentionally not accepted as an `eval_run` tool argument; relative paths resolve against the host workspace before the child enters its temporary task directory. |
+| `FLUX_TERMINAL_BENCH_BINARY` | Trusted-host command/path for the terminal-bench driver used by the `terminal-bench` eval adapter (default: `tb` from the host `PATH`). Model-facing eval input cannot override it. |
+| `FLUX_TERMINAL_BENCH_DATASET` | Trusted-host terminal-bench dataset selector (default: `terminal-bench-core`). It is host-owned because selecting a dataset may fetch and execute benchmark material. |
+| `FLUX_TERMINAL_BENCH_REBUILD` | Truthy values allow terminal-bench preparation to run the fixed host-side musl `cargo build` before evaluation (default: off). This unsandboxed trusted-host build cannot be enabled through `eval_run` input. |
 
 ### Safety and permissions
 
@@ -446,6 +458,10 @@ Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values su
 | `FLUX_SERVER_TOKEN` | Shared secret for shared-secret auth mode. |
 | `FLUX_SERVER_MAX_BODY_BYTES` | Request-body cap; over it the server answers `413`. A `0` or unparseable value falls back to the default rather than disabling the bound. |
 | `FLUX_SERVER_REQUEST_TIMEOUT_SECS` | Response-production timeout; over it the server answers `408`. Same fallback rule. |
+| `FLUX_SERVER_REQUESTS_PER_MINUTE` | Overrides the per-principal/auth-realm protected-request rate. |
+| `FLUX_SERVER_MAX_INFLIGHT_PER_PRINCIPAL` | Overrides the cross-surface live-work cap. |
+| `FLUX_SERVER_PROVIDER_CALLS_PER_DAY` | Overrides the completed provider-call circuit-breaker threshold. |
+| `FLUX_SERVER_PROVIDER_SPEND_USD_PER_DAY` | Overrides the completed priced-spend circuit-breaker threshold. |
 | `FLUX_A2A_TOKEN` | Bearer token used when flux calls *out* to another agent. |
 | `FLUX_A2A_MAX_INFLIGHT_PER_REALM` | Concurrent in-flight A2A turns permitted per realm. |
 | `FLUX_A2A_PUSH_ALLOW_LOCAL` | Permits A2A push notifications to loopback targets. |

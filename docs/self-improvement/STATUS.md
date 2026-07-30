@@ -264,8 +264,9 @@ loop misbehaving — each was the machinery working and exposing a bug, which wa
    `fibonacci-server` (server up, every curl check correct) yet burned the 30-plan-iteration cap stuck
    on one step (480s, $0.58, never credited). That failure shape motivated the
    **multi-pass agent loop epic** (`docs/designs/multipass-agent-loop.md`). The full improve-loop run
-   was postponed (user call, 2026-07-02); known CLI gap: `flux eval terminal-bench` can't pass
-   `flux_binary` (workaround: an `eval_run` flow via `flux flow run`).
+   was postponed (user call, 2026-07-02). The former model-facing `flux_binary` workaround has since
+   been removed; terminal-bench now takes the evaluated binary only from trusted host
+   `FLUX_EVAL_BINARY`.
 
 6. **2026-07-06 — two eval-infrastructure defects found and fixed; the funded I-01 round launched.**
    (a) **I-04 — the shell group was OFF inside every tbench container to date**: `flux_agent.py`
@@ -406,7 +407,8 @@ was valid and the revert was correct — the loop did not reward a plausible-but
    (2026-07-02, journey entry 5):** the suite is stable but saturated (two models at 1000/1000,
    mean_iters 1.0) — zero headroom; it stays as the regression floor. The headline gain must come
    from **terminal-bench** (plumbing smoke-proven over OpenRouter same day; full loop run postponed
-   by user). When resumed: fix the `flux eval terminal-bench` `flux_binary` CLI gap, then
-   `bench/run-tbench-loop.sh` with trials ≥ 3 on tasks with a stable baseline.
+   by user). The runner now supplies its host-owned executable/dataset/rebuild settings through
+   `FLUX_EVAL_BINARY` and `FLUX_TERMINAL_BENCH_*`; resume with `bench/run-tbench-loop.sh` at trials ≥ 3
+   on tasks with a stable baseline.
 4. Optionally, a tracked pre-commit hook to mechanically block un-`fmt`'d commits (enforces the process
    rule above).

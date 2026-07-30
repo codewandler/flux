@@ -8,7 +8,7 @@
 //! The binary the agent installs into each container is the **static musl** flux build
 //! (`target/x86_64-unknown-linux-musl/release/flux`) — portable across task images. For the improve
 //! loop, that musl binary must be rebuilt from the candidate source before the candidate eval (so the
-//! benchmark measures the changed flux); the loop's flux_binary config points at it.
+//! benchmark measures the changed flux); trusted host configuration points `FLUX_EVAL_BINARY` at it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -21,15 +21,20 @@ use flux_system::{System, Workspace};
 
 use crate::adapter::{BenchmarkAdapter, Filter, RunContext};
 use crate::metrics::RunResult;
-use crate::util::str_field;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn env_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 
 /// Drives terminal-bench via its `tb` CLI with flux as a custom agent.
 pub struct TerminalBenchAdapter {
     tasks: Vec<String>,
     dataset: String,
-    flux_binary: String,
     tb_bin: String,
     agent_import_path: String,
     pythonpath: String,
@@ -41,10 +46,32 @@ pub struct TerminalBenchAdapter {
 }
 
 impl TerminalBenchAdapter {
-    /// Build from an `eval_run` suite object: `{adapter:"terminal-bench", tasks:[...], flux_binary,
-    /// dataset?, tb_bin?, agent_import_path?, pythonpath?, timeout_secs?}`. `flux_binary` (the static
-    /// musl build) and at least one task are required.
+    /// Build from an `eval_run` suite object. Executable and import paths are deliberately absent:
+    /// the flux child comes from the trusted [`RunContext`], the terminal-bench executable comes from
+    /// `FLUX_TERMINAL_BENCH_BINARY`, and the bundled agent import path is host-owned.
     pub fn from_params(params: &Value) -> Result<Self> {
+        Self::from_params_with_env(params, |key| std::env::var(key).ok())
+    }
+
+    fn from_params_with_env(
+        params: &Value,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        for field in [
+            "flux_bin",
+            "flux_binary",
+            "tb_bin",
+            "agent_import_path",
+            "pythonpath",
+            "dataset",
+            "rebuild",
+        ] {
+            if params.get(field).is_some() {
+                return Err(Error::Other(format!(
+                    "terminal-bench: `{field}` is not a tool input; executable and import paths are selected by the trusted host"
+                )));
+            }
+        }
         let tasks: Vec<String> = params
             .get("tasks")
             .and_then(|v| v.as_array())
@@ -54,27 +81,26 @@ impl TerminalBenchAdapter {
                     .collect()
             })
             .unwrap_or_default();
-        let flux_binary = str_field(params, "flux_binary")
-            .ok_or_else(|| {
-                Error::Other(
-                    "terminal-bench: `flux_binary` (path to the static musl flux build) is required"
-                        .to_string(),
-                )
-            })?
-            .to_string();
+        let tb_bin = get_env("FLUX_TERMINAL_BENCH_BINARY")
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or_else(|| "tb".to_string());
+        let dataset = get_env("FLUX_TERMINAL_BENCH_DATASET")
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "terminal-bench-core".to_string());
+        let rebuild = get_env("FLUX_TERMINAL_BENCH_REBUILD")
+            .as_deref()
+            .is_some_and(env_truthy);
+        let cwd = std::env::current_dir()
+            .map_err(|e| Error::Other(format!("terminal-bench: locate host workspace: {e}")))?;
         Ok(Self {
             tasks,
-            dataset: str_field(params, "dataset")
-                .unwrap_or("terminal-bench-core")
-                .to_string(),
-            flux_binary,
-            tb_bin: str_field(params, "tb_bin").unwrap_or("tb").to_string(),
-            agent_import_path: str_field(params, "agent_import_path")
-                .unwrap_or("flux_agent:FluxAgent")
-                .to_string(),
-            pythonpath: str_field(params, "pythonpath")
-                .unwrap_or("crates/flux-eval/terminal_bench")
-                .to_string(),
+            dataset,
+            tb_bin,
+            agent_import_path: "flux_agent:FluxAgent".to_string(),
+            pythonpath: cwd
+                .join("crates/flux-eval/terminal_bench")
+                .to_string_lossy()
+                .into_owned(),
             timeout_secs: params
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
@@ -83,23 +109,63 @@ impl TerminalBenchAdapter {
                 .get("agent_timeout_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(600),
-            rebuild: params
-                .get("rebuild")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            rebuild,
         })
     }
 
-    /// Absolute path to the flux binary the container agent installs.
-    fn flux_binary_abs(&self) -> String {
-        let p = std::path::Path::new(&self.flux_binary);
+    /// Absolute path to the trusted-host flux binary the container agent installs.
+    fn flux_binary_abs(ctx: &RunContext<'_>) -> String {
+        let p = ctx.flux_bin;
         if p.is_absolute() {
-            self.flux_binary.clone()
+            p.to_string_lossy().into_owned()
         } else {
             std::env::current_dir()
                 .map(|c| c.join(p).to_string_lossy().to_string())
-                .unwrap_or_else(|_| self.flux_binary.clone())
+                .unwrap_or_else(|_| p.to_string_lossy().into_owned())
         }
+    }
+
+    fn task_argv(&self, task_id: &str, ctx: &RunContext<'_>, out: &std::path::Path) -> Vec<String> {
+        vec![
+            self.tb_bin.clone(),
+            "run".into(),
+            "--dataset".into(),
+            self.dataset.clone(),
+            "--task-id".into(),
+            task_id.to_string(),
+            "--n-attempts".into(),
+            "1".into(),
+            "--agent-import-path".into(),
+            self.agent_import_path.clone(),
+            "--model".into(),
+            ctx.default_model.to_string(),
+            "--agent-kwarg".into(),
+            format!("flux_binary={}", Self::flux_binary_abs(ctx)),
+            "--output-path".into(),
+            out.to_string_lossy().to_string(),
+            "--global-agent-timeout-sec".into(),
+            self.agent_timeout_secs.to_string(),
+            "--no-livestream".into(),
+        ]
+    }
+
+    fn task_env(
+        &self,
+        model: &str,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Vec<(String, String)> {
+        let home = get_env("HOME").unwrap_or_default();
+        let path = format!(
+            "{}/.local/bin:{}",
+            home,
+            get_env("PATH").unwrap_or_default()
+        );
+        let mut env = vec![
+            ("PATH".into(), path),
+            ("PYTHONPATH".into(), self.pythonpath.clone()),
+        ];
+        env.extend(crate::runner::provider_credential_env(model, get_env));
+        env
     }
 }
 
@@ -119,6 +185,8 @@ struct ParsedTrial {
 fn parse_results(dir: &std::path::Path, task_id: &str) -> Option<ParsedTrial> {
     // tb writes `<output>/<run-id>/results.json`; search a couple of levels for it.
     let mut candidates = vec![dir.join("results.json")];
+    // flux-allow-direct-io: parse terminal-bench output below the harness-generated result root;
+    // this adapter owns that external tool protocol and model input cannot choose the root.
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             if e.path().is_dir() {
@@ -127,6 +195,8 @@ fn parse_results(dir: &std::path::Path, task_id: &str) -> Option<ParsedTrial> {
         }
     }
     let path = candidates.into_iter().find(|p| p.exists())?;
+    // flux-allow-direct-io: read the fixed results.json protocol file discovered below the
+    // harness-generated terminal-bench output root.
     let json: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
     let results = json.get("results")?.as_array()?;
     // Prefer the entry matching this task; else the first.
@@ -226,6 +296,8 @@ fn find_file(dir: &std::path::Path, name: &str, depth: usize) -> Option<std::pat
         return None;
     }
     let mut subdirs = Vec::new();
+    // flux-allow-direct-io: bounded traversal of the harness-generated terminal-bench result root
+    // to recover its fixed agent.cast protocol artifact.
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -243,6 +315,8 @@ fn find_file(dir: &std::path::Path, name: &str, depth: usize) -> Option<std::pat
 /// `"o"` output events, ANSI stripped — and return the last `max_chars`, so the reviewer sees what the
 /// agent actually did in the container (commands it ran, errors like `node: not found`, timeouts).
 fn decode_cast_tail(path: &std::path::Path, max_chars: usize) -> Option<String> {
+    // flux-allow-direct-io: decode the fixed agent.cast protocol artifact found only below the
+    // harness-generated terminal-bench output root.
     let content = std::fs::read_to_string(path).ok()?;
     let mut out = String::new();
     for line in content.lines().skip(1) {
@@ -344,58 +418,26 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
         let started = Instant::now();
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let out = std::env::temp_dir().join(format!("flux-tbench-{}-{n}", std::process::id()));
+        // flux-allow-direct-io: terminal-bench adapter owns this unpredictable process-scoped output
+        // root before its System can be constructed; model input cannot choose the path.
         std::fs::create_dir_all(&out).map_err(|e| Error::Other(e.to_string()))?;
 
-        let argv: Vec<String> = vec![
-            self.tb_bin.clone(),
-            "run".into(),
-            "--dataset".into(),
-            self.dataset.clone(),
-            "--task-id".into(),
-            task_id.to_string(),
-            "--n-attempts".into(),
-            "1".into(),
-            "--agent-import-path".into(),
-            self.agent_import_path.clone(),
-            "--model".into(),
-            ctx.default_model.to_string(),
-            "--agent-kwarg".into(),
-            format!("flux_binary={}", self.flux_binary_abs()),
-            "--output-path".into(),
-            out.to_string_lossy().to_string(),
-            "--global-agent-timeout-sec".into(),
-            self.agent_timeout_secs.to_string(),
-            "--no-livestream".into(),
-        ];
+        let argv = self.task_argv(task_id, ctx, &out);
 
         // tb needs PATH (to find `tb`/`docker`), PYTHONPATH (to import the flux agent), and provider
         // creds. SAFE_ENV forwards PATH/HOME; augment PATH with ~/.local/bin (uv tool installs there).
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path = format!(
-            "{}/.local/bin:{}",
-            home,
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let mut env: Vec<(String, String)> = vec![
-            ("PATH".into(), path),
-            ("PYTHONPATH".into(), self.pythonpath.clone()),
-        ];
-        for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"] {
-            if let Ok(v) = std::env::var(key) {
-                env.push((key.into(), v));
-            }
-        }
+        let env = self.task_env(ctx.default_model, |key| std::env::var(key).ok());
 
-        // tb runs in the repo/worktree root (it manages its own dataset cache + Docker).
+        // tb runs in the repo/worktree root (it manages its own dataset cache + Docker). Honour the
+        // host's resolved sandbox posture: a `require` deployment must fail closed if its sandbox
+        // cannot expose the Docker boundary terminal-bench needs, not silently turn confinement off.
         let cwd = std::env::current_dir().map_err(|e| Error::Other(e.to_string()))?;
-        // Deliberately unsandboxed: `tb` drives Docker to run each task inside its own container — that
-        // container IS the isolation boundary here. The OS sandbox masks `/run` with a tmpfs (see
-        // `Sandbox`'s confinement), which would hide `/run/docker.sock` and break the harness outright,
-        // so this host-side driver must run unconfined. `require` never reaches here (eval driver, not
-        // an agent spawn).
         let sys = System::new(
             Workspace::new(&cwd).map_err(|e| Error::Other(format!("tb workspace: {e}")))?,
-        );
+        )
+        .with_sandbox(flux_system::sandbox::Sandbox::resolve(
+            flux_system::sandbox::SandboxSettings::from_env(),
+        ));
         let run = sys
             .run_with_env(&argv, &env, Duration::from_secs(self.timeout_secs))
             .await;
@@ -470,17 +512,88 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     #[test]
-    fn from_params_requires_flux_binary() {
-        assert!(TerminalBenchAdapter::from_params(&serde_json::json!({"tasks": ["x"]})).is_err());
-        let a = TerminalBenchAdapter::from_params(&serde_json::json!({
-            "tasks": ["hello-world"], "flux_binary": "/bin/flux"
-        }))
+    fn from_params_rejects_model_controlled_program_and_dataset_fields() {
+        for field in [
+            "flux_bin",
+            "flux_binary",
+            "tb_bin",
+            "agent_import_path",
+            "pythonpath",
+            "dataset",
+            "rebuild",
+        ] {
+            let mut params = serde_json::json!({"tasks": ["hello-world"]});
+            params
+                .as_object_mut()
+                .expect("test params are an object")
+                .insert(
+                    field.to_string(),
+                    Value::String("/tmp/attacker".to_string()),
+                );
+            let error = TerminalBenchAdapter::from_params_with_env(&params, |_| None)
+                .err()
+                .expect("legacy model-controlled field must be rejected");
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn credentialed_command_uses_only_trusted_host_program_paths() {
+        let a = TerminalBenchAdapter::from_params_with_env(
+            &serde_json::json!({"tasks": ["hello-world"]}),
+            |key| match key {
+                "FLUX_TERMINAL_BENCH_BINARY" => Some("/trusted/tb".to_string()),
+                "FLUX_TERMINAL_BENCH_DATASET" => Some("trusted-suite".to_string()),
+                "FLUX_TERMINAL_BENCH_REBUILD" => Some("true".to_string()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let ctx = RunContext {
+            flux_bin: Path::new("/trusted/flux"),
+            default_model: "openai/gpt-test",
+            cancel: &cancel,
+            watch: false,
+        };
+        let argv = a.task_argv("hello-world", &ctx, Path::new("/tmp/results"));
+        assert_eq!(argv.first().map(String::as_str), Some("/trusted/tb"));
+        assert!(argv.iter().any(|arg| arg == "flux_binary=/trusted/flux"));
+        assert!(argv.iter().any(|arg| arg == "trusted-suite"));
+        assert!(argv.iter().any(|arg| arg == "flux_agent:FluxAgent"));
+        assert!(a.rebuild);
+
+        let env = a.task_env("openai/gpt-test", |key| match key {
+            "HOME" => Some("/trusted/home".to_string()),
+            "PATH" => Some("/trusted/path".to_string()),
+            "OPENAI_API_KEY" => Some("sentinel-provider-key".to_string()),
+            _ => None,
+        });
+        assert!(env
+            .iter()
+            .any(|(key, value)| { key == "OPENAI_API_KEY" && value == "sentinel-provider-key" }));
+        assert!(argv.iter().all(|arg| !arg.contains("attacker")));
+    }
+
+    #[test]
+    fn terminal_bench_defaults_are_host_owned() {
+        let a = TerminalBenchAdapter::from_params_with_env(
+            &serde_json::json!({"tasks": ["hello-world"]}),
+            |_| None,
+        )
         .unwrap();
         assert_eq!(a.name(), "terminal-bench");
+        assert_eq!(a.tb_bin, "tb");
         assert_eq!(a.dataset, "terminal-bench-core");
+        assert_eq!(a.agent_import_path, "flux_agent:FluxAgent");
+        assert!(!a.rebuild);
     }
 
     #[test]

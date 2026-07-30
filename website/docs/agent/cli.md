@@ -13,6 +13,7 @@ flux run "fix the failing test"
 flux flow list
 flux flow run deploy --arg env=dev --arg replicas=3
 flux flow run path/to/flow.flux
+flux run path/to/workflows.flux --entry triage --arg queue=new
 flux app run path/to/app.flux
 ```
 
@@ -26,6 +27,7 @@ and [Safety & approvals](./safety.md).
 | Command | What it does |
 |---|---|
 | `flux run "…"` | run an adaptive turn (`--yes` auto-approves; `-c` continues the last session) |
+| `flux run <module.flux> --entry <flow>` | select one top-level flow from a multi-flow module, execute it once with `--inputs` / repeatable `--arg`, and exit |
 | `flux` | interactive REPL |
 | `flux tui` | the full-screen [chat UI](./tui.md) with an in-UI approval sheet |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
@@ -33,7 +35,7 @@ and [Safety & approvals](./safety.md).
 | `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
 | `flux flow run <name\|file>` | execute a saved flow by name or an existing Flux-Lang file (files win) |
 | `flux render <file.flux>` | render a `.flux` file as a syntax-highlighted image (`--view source\|tree`; `-o out.svg` writes SVG, `-o out.png` rasterizes PNG with the embedded font; stdout is SVG) |
-| `flux review --files …` | run the embedded read-only multi-reviewer protocol; Markdown or JSON output |
+| `flux review --files …` | run the immutable embedded read-only multi-reviewer protocol under the fail-closed unattended sandbox; Markdown or JSON output |
 | `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |
 | `flux fork …` / `flux replay …` / `flux diff …` | branch, replay, and compare recorded runs with [Time Machine](./time-machine.md) |
 | `flux export <run> -o run.html` | render a recorded run — plan tree, per-op results/diffs, cost, timeline, nested sub-agents — as one self-contained, redacted static HTML file; the read-only, shareable sibling of `replay`/`fork`/`diff` |

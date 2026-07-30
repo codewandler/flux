@@ -220,6 +220,8 @@ struct TurnTerminal {
     cancelled: bool,
     consume_checkpoint: bool,
     suspension: Option<SuspensionWrite>,
+    /// Machine-facing failure detail returned only after the answer/session have been finalized.
+    failure: Option<String>,
 }
 
 struct TurnLifecycle {
@@ -626,7 +628,9 @@ impl FlowEngine {
             terminal.answer = format!(
                 "The turn finished, but its continuation checkpoint could not be persisted — {error}"
             );
+            terminal.failure = Some(error.to_string());
         }
+        let failure = terminal.failure.clone();
         sink.text_delta(&terminal.answer);
         let usage =
             self.record_resume_usage(session_id, accounting.turn_id, accounting.subagent_base);
@@ -645,7 +649,11 @@ impl FlowEngine {
             &terminal.answer,
             terminal.cancelled,
             usage,
-        )
+        )?;
+        match failure {
+            Some(error) => Err(Error::Other(error)),
+            None => Ok(()),
+        }
     }
 
     /// Run one user turn to completion, uninterruptible.
@@ -672,8 +680,34 @@ impl FlowEngine {
     ) -> Result<()> {
         let _turn = self.turn_gate.lock().await;
         let identity = self.executor.identity().snapshot();
-        self.run_turn_locked(session_id, user_input, sink, cancel, identity, None)
+        self.run_turn_locked(session_id, user_input, sink, cancel, identity, None, None)
             .await
+    }
+
+    /// Cancellable server-oriented turn entry point that reports the durable turn id as soon as
+    /// the lifecycle has opened it. The callback runs while the engine's single-turn gate is held,
+    /// so callers can bind request-owned accounting to the exact turn without using a racy
+    /// session-wide cursor.
+    pub async fn run_turn_cancellable_observed(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        turn_started: &mut (dyn FnMut(i64) + Send),
+    ) -> Result<()> {
+        let _turn = self.turn_gate.lock().await;
+        let identity = self.executor.identity().snapshot();
+        self.run_turn_locked(
+            session_id,
+            user_input,
+            sink,
+            cancel,
+            identity,
+            None,
+            Some(turn_started),
+        )
+        .await
     }
 
     /// Run one user turn against a PINNED cassette scope instead of the default per-turn `Record`
@@ -703,6 +737,7 @@ impl FlowEngine {
             &CancellationToken::new(),
             identity,
             Some(scope),
+            None,
         )
         .await
     }
@@ -736,13 +771,37 @@ impl FlowEngine {
         identity: TurnIdentity,
     ) -> Result<()> {
         let _turn = self.turn_gate.lock().await;
-        self.run_turn_locked(session_id, user_input, sink, cancel, identity, None)
+        self.run_turn_locked(session_id, user_input, sink, cancel, identity, None, None)
             .await
+    }
+
+    /// Explicit-identity counterpart to [`Self::run_turn_cancellable_observed`].
+    pub async fn run_turn_cancellable_as_observed(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        identity: TurnIdentity,
+        turn_started: &mut (dyn FnMut(i64) + Send),
+    ) -> Result<()> {
+        let _turn = self.turn_gate.lock().await;
+        self.run_turn_locked(
+            session_id,
+            user_input,
+            sink,
+            cancel,
+            identity,
+            None,
+            Some(turn_started),
+        )
+        .await
     }
 
     /// Run one user turn after the engine-level single-active-turn gate has been acquired.
     /// `scope_override` is `Some` only from [`Self::run_turn_pinned`]; every other caller passes
     /// `None` and gets the default per-turn `Record`/kill-switch behavior unchanged.
+    #[allow(clippy::too_many_arguments)] // one lifecycle seam; every parameter is a distinct turn input
     async fn run_turn_locked(
         &self,
         session_id: &str,
@@ -751,6 +810,7 @@ impl FlowEngine {
         cancel: &CancellationToken,
         identity: TurnIdentity,
         scope_override: Option<Arc<crate::cassette::CassetteScope>>,
+        turn_started: Option<&mut (dyn FnMut(i64) + Send)>,
     ) -> Result<()> {
         let program = match self.flow.load_suspension(session_id)? {
             Some((flow_name, body, node, _source)) => TurnProgram::Resume {
@@ -768,6 +828,7 @@ impl FlowEngine {
             cancel,
             identity,
             scope_override,
+            turn_started,
         )
         .await
     }
@@ -782,6 +843,7 @@ impl FlowEngine {
         cancel: &CancellationToken,
         identity: TurnIdentity,
         scope_override: Option<Arc<crate::cassette::CassetteScope>>,
+        turn_started: Option<&mut (dyn FnMut(i64) + Send)>,
     ) -> Result<()> {
         let lifecycle = self.begin_turn_lifecycle(
             session_id,
@@ -792,6 +854,9 @@ impl FlowEngine {
             &identity,
             scope_override,
         )?;
+        if let Some(turn_started) = turn_started {
+            turn_started(lifecycle.accounting.turn_id);
+        }
         let future = self.execute_turn_program(
             session_id,
             user_input.unwrap_or_default(),
@@ -800,7 +865,9 @@ impl FlowEngine {
             cancel,
         );
         let (outcome, accounting) = Self::race_turn(lifecycle, sink, cancel, future).await;
-        let terminal = self.turn_terminal(&program, outcome, accounting.iteration_base);
+        let stage_failure = self.loop_host.take_stage_failure();
+        let terminal =
+            self.turn_terminal(&program, outcome, accounting.iteration_base, stage_failure);
         self.finish_turn_lifecycle(session_id, sink, &accounting, terminal)
     }
 
@@ -881,6 +948,7 @@ impl FlowEngine {
         program: &TurnProgram<'_>,
         outcome: Option<Result<FlowOutcome>>,
         iteration_base: usize,
+        stage_failure: Option<crate::loop_host::StageFailure>,
     ) -> TurnTerminal {
         let kind = program.kind();
         let Some(outcome) = outcome else {
@@ -891,6 +959,7 @@ impl FlowEngine {
                 cancelled: true,
                 consume_checkpoint: false,
                 suspension: None,
+                failure: None,
             };
         };
         let outcome = match outcome {
@@ -919,9 +988,33 @@ impl FlowEngine {
                     cancelled: false,
                     consume_checkpoint: false,
                     suspension: None,
+                    failure: Some(error),
                 };
             }
         };
+
+        // `detect_intent`/`explore` hand the authored loop a tagged value so it can preserve the
+        // existing human-facing `present_results` answer. The host carries that exact value here;
+        // it is now a durable `error` terminal and a returned `Err`, not a prose-only success.
+        if let Some(failure) = stage_failure {
+            debug_assert_eq!(failure.kind, "error");
+            let rendered = outcome.result.trim();
+            return TurnTerminal {
+                outcome: "error",
+                steps: self
+                    .evidence_kind_count("turn.iteration")
+                    .saturating_sub(iteration_base) as u32,
+                answer: if rendered.is_empty() {
+                    failure.text.clone()
+                } else {
+                    rendered.to_string()
+                },
+                cancelled: false,
+                consume_checkpoint: false,
+                suspension: None,
+                failure: Some(failure.text),
+            };
+        }
 
         if let Some(suspension) = &outcome.suspension {
             let (flow_name, body) = match program {
@@ -951,6 +1044,7 @@ impl FlowEngine {
                     node: suspension.node,
                     source: suspension.source.clone(),
                 }),
+                failure: None,
             };
         }
 
@@ -977,6 +1071,7 @@ impl FlowEngine {
                     cancelled: false,
                     consume_checkpoint: false,
                     suspension: None,
+                    failure: None,
                 }
             }
             TurnProgramKind::Authored => TurnTerminal {
@@ -990,6 +1085,7 @@ impl FlowEngine {
                 cancelled: false,
                 consume_checkpoint: false,
                 suspension: None,
+                failure: None,
             },
             TurnProgramKind::Resume => TurnTerminal {
                 outcome: "resumed",
@@ -1002,6 +1098,7 @@ impl FlowEngine {
                 cancelled: false,
                 consume_checkpoint: true,
                 suspension: None,
+                failure: None,
             },
         }
     }
@@ -1333,21 +1430,15 @@ impl FlowEngine {
         turn_id: i64,
         subagent_calls: &[(String, Usage)],
     ) {
-        // Zero-usage calls (a `mock`/free provider, or one that genuinely reported nothing) are
-        // skipped — mirrors `TurnEnded.usage` staying `None` for a token-less turn, so a log doesn't
-        // fill with placeholder zero entries for every offline/no-cost call.
+        // A call is a durable fact even when a provider reports no token usage. Besides keeping
+        // call-count projections honest, this lets daemon call-count breakers bound free/mock calls
+        // and failures that occur before usage metadata arrives.
         for (model, usage) in self.loop_host.turn_calls() {
-            if usage.total() == 0 {
-                continue;
-            }
             let _ = self
                 .events
                 .record_call_usage(session_id, turn_id, &model, usage);
         }
         for (model, usage) in subagent_calls {
-            if usage.total() == 0 {
-                continue;
-            }
             let _ = self
                 .events
                 .record_call_usage(session_id, turn_id, model, usage.clone());
@@ -1436,6 +1527,7 @@ impl FlowEngine {
             sink,
             cancel,
             identity,
+            None,
             None,
         )
         .await
@@ -2151,6 +2243,19 @@ mod tests {
         }
     }
 
+    struct FailingProvider;
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        async fn stream(&self, _request: Request) -> Result<ChunkStream> {
+            Err(Error::Provider("deterministic stage failure".into()))
+        }
+    }
+
     struct EchoTool;
 
     #[async_trait]
@@ -2488,6 +2593,42 @@ mod tests {
         loop_spec: AgentLoopSpec,
     ) -> (Result<FlowEngine>, Arc<EventStore>) {
         assemble_test_engine_with_compaction(provider, loop_spec, 0)
+    }
+
+    /// C-226 failing-first: a tagged detect-intent provider failure must finalize an honest human
+    /// answer and valid history, but return a machine-visible `Err` and durable `error` outcome.
+    /// Before C-226 the same run returned `Ok(())` and stored outcome `ok`.
+    #[tokio::test]
+    async fn provider_stage_failure_is_machine_error_after_valid_turn_finalization() {
+        let (engine, events) =
+            assemble_test_engine(Arc::new(FailingProvider), AgentLoopSpec::default());
+        let engine = engine.unwrap();
+        let sid = events.create_session("failing/test-model").unwrap();
+
+        for input in ["first attempt", "second attempt"] {
+            let mut sink = CollectSink::default();
+            let error = engine.run_turn(&sid, input, &mut sink).await.unwrap_err();
+            assert!(error.to_string().contains("Intent detection failed"));
+            assert!(
+                sink.text.contains("Intent detection failed"),
+                "the authored loop's apologetic answer remains human-visible: {:?}",
+                sink.text
+            );
+            assert_eq!(sink.ended, 1, "even a failed turn has one turn_end");
+            assert_eq!(events.turns(&sid).unwrap().last().unwrap().outcome, "error");
+            flux_events::ValidHistory::new(events.conversation(&sid).unwrap())
+                .expect("a failed stage leaves a valid provider history");
+        }
+        let calls: u64 = events
+            .cost_summary(&sid, &flux_core::PricingTable::builtin())
+            .unwrap()
+            .iter()
+            .map(|row| row.calls)
+            .sum();
+        assert_eq!(
+            calls, 2,
+            "failed zero-usage provider attempts remain durable call facts"
+        );
     }
 
     /// [`assemble_test_engine`] with compaction armed (`0` disables it, which is the default).

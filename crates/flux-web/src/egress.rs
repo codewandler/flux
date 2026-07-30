@@ -17,8 +17,13 @@ pub(crate) const MAX_REDIRECTS: usize = 5;
 /// A reqwest client whose redirect policy is deliberately inert. Every redirect is followed by
 /// [`send_guarded`] only after the shared flux-system egress guard admits its target.
 pub(crate) fn redirect_disabled_client() -> Client {
+    // flux-allow-direct-io: this module is the reviewed HTTP broker; redirects are disabled here
+    // and every request is separately guarded and pinned before the client is used.
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // Guarded requests must never leave through an ambient proxy: the proxy is not part of the
+        // authorization decision and may resolve the destination behind the guard.
+        .no_proxy()
         .build()
         .expect("the redirect-disabled reqwest client uses only static options")
 }
@@ -143,8 +148,11 @@ fn pinned_client(shared: &Client, url: &Url, pinned: &[SocketAddr], op: &str) ->
              address, so the connection would re-resolve at connect time (DNS rebinding)"
         )));
     }
+    // flux-allow-direct-io: reviewed HTTP broker connection pinned to the exact addresses admitted
+    // by flux-system's egress guard above; this is the network boundary implementation itself.
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve_to_addrs(host, pinned)
         .build()
         .map_err(|e| Error::Http(format!("{op}: building a pinned client failed: {e}")))
@@ -241,5 +249,77 @@ mod tests {
         let url = Url::parse("https://rebinding.example/hook").unwrap();
         let pin = vec![SocketAddr::new("93.184.216.34".parse().unwrap(), 443)];
         assert!(pinned_client(&shared, &url, &pin, "web.fetch").is_ok());
+    }
+
+    /// The per-hop broker must connect directly to its guard-vetted address even when the host
+    /// process carries proxy variables. The child process isolates those global variables from
+    /// sibling tests.
+    #[tokio::test]
+    async fn pinned_client_ignores_ambient_proxy() {
+        const CHILD: &str = "FLUX_WEB_PROXY_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "egress::tests::pinned_client_ignores_ambient_proxy",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated proxy regression failed");
+            return;
+        }
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_once(listener: tokio::net::TcpListener, reached: Arc<AtomicBool>) {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            let Ok(Ok((mut socket, _))) = accepted else {
+                return;
+            };
+            reached.store(true, Ordering::SeqCst);
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        }
+
+        let pinned = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pinned_addr = pinned.local_addr().unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let pinned_reached = Arc::new(AtomicBool::new(false));
+        let proxy_reached = Arc::new(AtomicBool::new(false));
+        let pinned_task = tokio::spawn(serve_once(pinned, pinned_reached.clone()));
+        let proxy_task = tokio::spawn(serve_once(proxy, proxy_reached.clone()));
+
+        let proxy_url = format!("http://{proxy_addr}");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            std::env::set_var(key, &proxy_url);
+        }
+        std::env::set_var("NO_PROXY", "");
+        std::env::set_var("no_proxy", "");
+
+        let shared = redirect_disabled_client();
+        let url = Url::parse(&format!("http://web.test:{}/", pinned_addr.port())).unwrap();
+        let client = pinned_client(&shared, &url, &[pinned_addr], "web.fetch").unwrap();
+        client.get(url).send().await.unwrap();
+
+        pinned_task.await.unwrap();
+        proxy_task.await.unwrap();
+        assert!(pinned_reached.load(Ordering::SeqCst));
+        assert!(!proxy_reached.load(Ordering::SeqCst));
     }
 }

@@ -281,32 +281,42 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
 
 struct ProcessVisitor<'a> {
     aliases: &'a ProcessAliases,
+    local_bindings: Vec<HashMap<String, Option<ProcessApi>>>,
     functions: Vec<String>,
     hits: BTreeSet<RawProcessCommand>,
 }
 
 impl ProcessVisitor<'_> {
-    fn record_call(&mut self, call: &syn::ExprCall) {
-        let syn::Expr::Path(function) = call.func.as_ref() else {
-            return;
-        };
-        let mut segments: Vec<String> = function
-            .path
+    fn resolve_callable(&self, path: &syn::Path) -> Option<ProcessApi> {
+        let mut segments = path
             .segments
             .iter()
             .map(|segment| segment.ident.to_string())
-            .collect();
-        if segments.len() < 2 {
-            return;
+            .collect::<Vec<_>>();
+        if let [ident] = segments.as_slice() {
+            return self
+                .local_bindings
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(ident))
+                .copied()
+                .flatten();
         }
         // Any associated constructor on either Command type creates a raw process builder. This
         // covers `new`, `from`, and future constructors without maintaining a spelling blacklist.
         segments.pop();
-        let Some(api) = self.aliases.resolve_type_segments(&segments) else {
+        self.aliases.resolve_type_segments(&segments)
+    }
+
+    fn record_call(&mut self, call: &syn::ExprCall) {
+        let Some(function) = transparent_expr_path(&call.func) else {
+            return;
+        };
+        let Some(api) = self.resolve_callable(function) else {
             return;
         };
         self.hits.insert(RawProcessCommand {
-            line: start_line(function.path.span()),
+            line: start_line(function.span()),
             api,
             function: self
                 .functions
@@ -319,6 +329,26 @@ impl ProcessVisitor<'_> {
 
 fn start_line(span: Span) -> usize {
     span.start().line.max(1)
+}
+
+fn transparent_expr_path(expr: &syn::Expr) -> Option<&syn::Path> {
+    match expr {
+        syn::Expr::Path(path) => Some(&path.path),
+        syn::Expr::Group(group) => transparent_expr_path(&group.expr),
+        syn::Expr::Paren(paren) => transparent_expr_path(&paren.expr),
+        syn::Expr::Cast(cast) => transparent_expr_path(&cast.expr),
+        _ => None,
+    }
+}
+
+fn simple_binding_ident(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(ident) if ident.subpat.is_none() => Some(ident.ident.to_string()),
+        syn::Pat::Paren(paren) => simple_binding_ident(&paren.pat),
+        syn::Pat::Reference(reference) => simple_binding_ident(&reference.pat),
+        syn::Pat::Type(typed) => simple_binding_ident(&typed.pat),
+        _ => None,
+    }
 }
 
 impl<'ast> Visit<'ast> for ProcessVisitor<'_> {
@@ -355,6 +385,32 @@ impl<'ast> Visit<'ast> for ProcessVisitor<'_> {
         self.functions.pop();
     }
 
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.local_bindings.push(HashMap::new());
+        syn::visit::visit_block(self, block);
+        self.local_bindings.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let Some(init) = &local.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+        let Some(ident) = simple_binding_ident(&local.pat) else {
+            return;
+        };
+        let binding = local
+            .init
+            .as_ref()
+            .and_then(|init| transparent_expr_path(&init.expr))
+            .and_then(|path| self.resolve_callable(path));
+        if let Some(scope) = self.local_bindings.last_mut() {
+            scope.insert(ident, binding);
+        }
+    }
+
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         self.record_call(call);
         syn::visit::visit_expr_call(self, call);
@@ -362,8 +418,8 @@ impl<'ast> Visit<'ast> for ProcessVisitor<'_> {
 }
 
 /// Resolve production raw-process constructions in one Rust source file through imports, renamed
-/// imports, module aliases, type aliases, and multiline syntax. Test-only items are excluded by
-/// their parsed `cfg(test)` attributes; comments and string literals are naturally invisible.
+/// imports, module aliases, type aliases, local callable aliases, and multiline syntax. Test-only
+/// items are excluded by their parsed `cfg(test)` attributes; comments and strings are invisible.
 pub fn raw_process_commands(src: &str) -> syn::Result<Vec<RawProcessCommand>> {
     let file = syn::parse_file(src)?;
     let mut aliases = ProcessAliases::default();
@@ -371,6 +427,7 @@ pub fn raw_process_commands(src: &str) -> syn::Result<Vec<RawProcessCommand>> {
     aliases.resolve_type_aliases();
     let mut visitor = ProcessVisitor {
         aliases: &aliases,
+        local_bindings: Vec::new(),
         functions: Vec::new(),
         hits: BTreeSet::new(),
     };
@@ -384,6 +441,365 @@ pub fn raw_process_command_lines(src: &str) -> Vec<usize> {
     raw_process_commands(src)
         .map(|hits| hits.into_iter().map(|hit| hit.line).collect())
         .unwrap_or_else(|_| vec![1])
+}
+
+/// Direct I/O API families forbidden in model-facing operation implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DirectIoApi {
+    Filesystem,
+    Process,
+    Socket,
+    Http,
+    Database,
+}
+
+/// One production direct-I/O construction resolved through Rust imports and aliases.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DirectIoCall {
+    pub line: usize,
+    pub api: DirectIoApi,
+    pub function: String,
+}
+
+#[derive(Default)]
+struct ImportAliases {
+    paths: HashMap<String, Vec<String>>,
+    type_aliases: Vec<(String, Vec<String>)>,
+}
+
+impl ImportAliases {
+    fn add_use(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.add_use(&path.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                if name.ident == "self" {
+                    if let Some(local) = prefix.last() {
+                        self.paths.insert(local.clone(), prefix.clone());
+                    }
+                } else {
+                    let mut full = prefix.clone();
+                    full.push(name.ident.to_string());
+                    self.paths.insert(name.ident.to_string(), full);
+                }
+            }
+            syn::UseTree::Rename(rename) => {
+                let mut full = prefix.clone();
+                if rename.ident != "self" {
+                    full.push(rename.ident.to_string());
+                }
+                self.paths.insert(rename.rename.to_string(), full);
+            }
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    self.add_use(tree, prefix);
+                }
+            }
+            syn::UseTree::Glob(_) => {
+                let leaves: &[&str] = match prefix
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    ["std" | "tokio", "fs"] => &[
+                        "read",
+                        "read_to_string",
+                        "write",
+                        "copy",
+                        "rename",
+                        "remove_file",
+                        "remove_dir_all",
+                        "create_dir",
+                        "create_dir_all",
+                        "canonicalize",
+                        "metadata",
+                        "symlink_metadata",
+                        "read_dir",
+                        "File",
+                        "OpenOptions",
+                    ],
+                    ["std" | "tokio", "process"] => &["Command"],
+                    ["std", "net"] => &["TcpStream", "TcpListener", "UdpSocket"],
+                    ["tokio", "net"] => &[
+                        "TcpStream",
+                        "TcpListener",
+                        "UdpSocket",
+                        "UnixStream",
+                        "UnixListener",
+                    ],
+                    ["std", "os", "unix", "net"] => &["UnixStream", "UnixListener"],
+                    ["reqwest"] => &["Client", "get"],
+                    ["rusqlite"] => &["Connection"],
+                    _ => &[],
+                };
+                for leaf in leaves {
+                    let mut full = prefix.clone();
+                    full.push((*leaf).to_string());
+                    self.paths.insert((*leaf).to_string(), full);
+                }
+            }
+        }
+    }
+
+    fn resolve(&self, segments: &[String]) -> Vec<String> {
+        let mut resolved = segments.to_vec();
+        for _ in 0..8 {
+            let Some(first) = resolved.first().cloned() else {
+                break;
+            };
+            let Some(prefix) = self.paths.get(&first) else {
+                break;
+            };
+            let mut next = prefix.clone();
+            next.extend(resolved.into_iter().skip(1));
+            resolved = next;
+        }
+        resolved
+    }
+
+    fn resolve_type_aliases(&mut self) {
+        loop {
+            let mut changed = false;
+            for (alias, path) in &self.type_aliases {
+                if self.paths.contains_key(alias) {
+                    continue;
+                }
+                let resolved = self.resolve(path);
+                if resolved != *path {
+                    self.paths.insert(alias.clone(), resolved);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+fn classify_direct_io(segments: &[String]) -> Option<DirectIoApi> {
+    let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
+    if matches!(parts.as_slice(), ["std" | "tokio", "fs", ..]) {
+        return Some(DirectIoApi::Filesystem);
+    }
+    if matches!(
+        parts.as_slice(),
+        ["std" | "tokio", "process", "Command", ..]
+    ) {
+        return Some(DirectIoApi::Process);
+    }
+    if matches!(
+        parts.as_slice(),
+        ["std", "net", "TcpStream", "connect", ..]
+            | ["tokio", "net", "TcpStream", "connect", ..]
+            | ["std", "net", "TcpListener", "bind", ..]
+            | ["tokio", "net", "TcpListener", "bind", ..]
+            | ["std", "net", "UdpSocket", "bind" | "connect", ..]
+            | ["tokio", "net", "UdpSocket", "bind" | "connect", ..]
+            | ["std", "os", "unix", "net", "UnixStream", "connect", ..]
+            | ["tokio", "net", "UnixStream", "connect", ..]
+            | ["std", "os", "unix", "net", "UnixListener", "bind", ..]
+            | ["tokio", "net", "UnixListener", "bind", ..]
+    ) {
+        return Some(DirectIoApi::Socket);
+    }
+    if matches!(
+        parts.as_slice(),
+        ["reqwest", "Client", "new" | "builder", ..]
+            | ["reqwest", "blocking", "Client", "new" | "builder", ..]
+    ) || matches!(
+        parts.as_slice(),
+        ["reqwest", "get", ..] | ["reqwest", "blocking", "get", ..]
+    ) {
+        return Some(DirectIoApi::Http);
+    }
+    if matches!(parts.as_slice(), ["rusqlite", "Connection", method, ..] if method.starts_with("open"))
+        || matches!(parts.as_slice(), ["sqlx", _, method, ..] if method.starts_with("connect"))
+    {
+        return Some(DirectIoApi::Database);
+    }
+    None
+}
+
+struct DirectIoAliasCollector<'a>(&'a mut ImportAliases);
+
+impl<'ast> Visit<'ast> for DirectIoAliasCollector<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if !has_cfg_test(&item.attrs) {
+            self.0.add_use(&item.tree, &mut Vec::new());
+        }
+    }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        if let syn::Type::Path(path) = item.ty.as_ref() {
+            self.0.type_aliases.push((
+                item.ident.to_string(),
+                path.path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+            ));
+        }
+        syn::visit::visit_item_type(self, item);
+    }
+}
+
+struct DirectIoVisitor<'a> {
+    aliases: &'a ImportAliases,
+    /// Lexical bindings for local values. `None` records a non-path binding that shadows an import
+    /// or outer alias; `Some(path)` is a callable path already resolved at the declaration site.
+    local_bindings: Vec<HashMap<String, Option<Vec<String>>>>,
+    functions: Vec<String>,
+    hits: BTreeSet<DirectIoCall>,
+}
+
+impl DirectIoVisitor<'_> {
+    fn resolve(&self, segments: &[String]) -> Vec<String> {
+        let Some(first) = segments.first() else {
+            return Vec::new();
+        };
+        for scope in self.local_bindings.iter().rev() {
+            if let Some(binding) = scope.get(first) {
+                let Some(prefix) = binding else {
+                    return segments.to_vec();
+                };
+                let mut resolved = prefix.clone();
+                resolved.extend(segments.iter().skip(1).cloned());
+                return resolved;
+            }
+        }
+        self.aliases.resolve(segments)
+    }
+
+    fn record_call(&mut self, call: &syn::ExprCall) {
+        let Some(path) = transparent_expr_path(&call.func) else {
+            return;
+        };
+        let segments = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>();
+        let resolved = self.resolve(&segments);
+        if let Some(api) = classify_direct_io(&resolved) {
+            self.hits.insert(DirectIoCall {
+                line: start_line(path.span()),
+                api,
+                function: self
+                    .functions
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "<module>".into()),
+            });
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for DirectIoVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.local_bindings.push(HashMap::new());
+        syn::visit::visit_block(self, block);
+        self.local_bindings.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        // The initializer executes before this binding exists. Visit it first so a direct I/O call
+        // there is still recorded and an outer binding with the same name remains visible to it.
+        if let Some(init) = &local.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+
+        let Some(ident) = simple_binding_ident(&local.pat) else {
+            return;
+        };
+        let binding = local
+            .init
+            .as_ref()
+            .and_then(|init| transparent_expr_path(&init.expr))
+            .map(|path| {
+                let segments = path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                self.resolve(&segments)
+            });
+        if let Some(scope) = self.local_bindings.last_mut() {
+            // Recording non-path bindings is important: they shadow identically named imported or
+            // outer I/O aliases and prevent the conservative gate from inventing a false call.
+            scope.insert(ident, binding);
+        }
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        self.record_call(call);
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+/// Resolve direct filesystem, process, socket, HTTP-client, and database opens from parsed Rust.
+/// Imports, renamed imports, module aliases, type aliases, local callable aliases, and multiline
+/// calls are followed; test-only items, comments, and strings are excluded structurally by `syn`.
+pub fn raw_direct_io_calls(src: &str) -> syn::Result<Vec<DirectIoCall>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = ImportAliases::default();
+    DirectIoAliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_type_aliases();
+    let mut visitor = DirectIoVisitor {
+        aliases: &aliases,
+        local_bindings: Vec::new(),
+        functions: Vec::new(),
+        hits: BTreeSet::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.hits.into_iter().collect())
 }
 
 /// One raw filesystem call in a function that names project-controlled metadata.
@@ -636,6 +1052,36 @@ mod tests {
     use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+
+    // One exhaustively reviewed classification for first-party operation implementation packs in
+    // the production agent catalog. The direct-I/O script delegates to these tests and carries no
+    // second, narrower crate list.
+    const MODEL_FACING_OPERATION_CRATES: &[&str] = &[
+        "flux-tools",
+        "flux-web",
+        "flux-capabilities",
+        "flux-eval",
+        "flux-cognition",
+        "flux-flow",
+        "flux-orchestrate",
+        "flux-app",
+    ];
+    const EXTERNAL_CFG_TEST_MODULES: &[&str] = &["crates/flux-flow/src/voice/tests.rs"];
+
+    fn direct_io_allow_reason(source: &str, line: usize) -> Option<String> {
+        let lines = source.lines().collect::<Vec<_>>();
+        let mut cursor = line.saturating_sub(1);
+        while cursor > 0 {
+            cursor -= 1;
+            let trimmed = lines.get(cursor)?.trim();
+            let comment = trimmed.strip_prefix("//")?.trim();
+            if let Some(reason) = comment.strip_prefix("flux-allow-direct-io:") {
+                let reason = reason.trim();
+                return (!reason.is_empty()).then(|| reason.to_string());
+            }
+        }
+        None
+    }
 
     /// Collect production Rust sources from both Cargo workspaces. Keeping this traversal shared
     /// makes it impossible for one architecture gate to quietly forget the separately-built
@@ -1076,6 +1522,181 @@ fn spawn() {
         let after =
             "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn prod() {\n    std::process::Command::new(\"y\");\n}\n";
         assert_eq!(raw_process_command_lines(after), vec![6]);
+    }
+
+    #[test]
+    fn direct_io_scanner_resolves_imports_aliases_and_all_io_families() {
+        let fixture = r#"
+use std::fs as disk;
+use std::process::Command as Process;
+use std::net::TcpStream as Tcp;
+use std::net::TcpListener as Listener;
+use reqwest::Client as Http;
+use reqwest::blocking::Client as BlockingHttp;
+use rusqlite::Connection as Db;
+type Database = Db;
+fn opens() {
+    disk::read_to_string("file");
+    Process::new("program");
+    Tcp::connect("127.0.0.1:1");
+    Listener::bind("127.0.0.1:1");
+    Http::builder();
+    BlockingHttp::new();
+    Database::open("db");
+}
+#[cfg(test)]
+fn fixture_only() { std::fs::write("ignored", "x"); }
+"#;
+        let hits = raw_direct_io_calls(fixture).unwrap();
+        assert_eq!(hits.len(), 7, "{hits:?}");
+        assert_eq!(
+            hits.iter().map(|hit| hit.api).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                DirectIoApi::Filesystem,
+                DirectIoApi::Process,
+                DirectIoApi::Socket,
+                DirectIoApi::Http,
+                DirectIoApi::Database,
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_io_scanner_resolves_local_callable_aliases_for_all_io_families() {
+        let fixture = r#"
+fn opens() {
+    let initial_read = std::fs::read_to_string;
+    let read = initial_read;
+    let process = std::process::Command::new;
+    let connect = std::net::TcpStream::connect;
+    let http = reqwest::Client::builder;
+    let database = rusqlite::Connection::open;
+    read("file");
+    process("program");
+    connect("127.0.0.1:1");
+    http();
+    database("db");
+}
+"#;
+        let hits = raw_direct_io_calls(fixture).unwrap();
+        assert_eq!(hits.len(), 5, "{hits:?}");
+        assert_eq!(
+            hits.iter().map(|hit| hit.api).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                DirectIoApi::Filesystem,
+                DirectIoApi::Process,
+                DirectIoApi::Socket,
+                DirectIoApi::Http,
+                DirectIoApi::Database,
+            ])
+        );
+        let process_hits = raw_process_commands(fixture).unwrap();
+        assert_eq!(process_hits.len(), 1, "{process_hits:?}");
+        assert_eq!(process_hits[0].api, ProcessApi::Std);
+
+        let shadowed = r#"
+use std::fs::read;
+fn harmless(_: &str) {}
+fn no_open() {
+    let read = harmless;
+    read("not-io");
+}
+"#;
+        assert!(raw_direct_io_calls(shadowed).unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_io_allowance_requires_a_real_reason_immediately_above_the_call() {
+        let valid = "fn f() {\n  // flux-allow-direct-io: reviewed host store\n  std::fs::read(\"x\");\n}\n";
+        let hit = raw_direct_io_calls(valid).unwrap().pop().unwrap();
+        assert_eq!(
+            direct_io_allow_reason(valid, hit.line).as_deref(),
+            Some("reviewed host store")
+        );
+
+        let empty = "fn f() {\n  // flux-allow-direct-io:\n  std::fs::read(\"x\");\n}\n";
+        let hit = raw_direct_io_calls(empty).unwrap().pop().unwrap();
+        assert!(direct_io_allow_reason(empty, hit.line).is_none());
+    }
+
+    #[test]
+    fn direct_io_scanner_resolves_known_io_glob_imports() {
+        let fixture = r#"
+use std::fs::*;
+use reqwest::*;
+fn opens() {
+    read_to_string("file");
+    Client::builder();
+}
+"#;
+        let hits = raw_direct_io_calls(fixture).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].api, DirectIoApi::Filesystem);
+        assert_eq!(hits[1].api, DirectIoApi::Http);
+    }
+
+    /// The production model-facing packs have one syntax-aware no-direct-I/O gate. Reviewed host
+    /// stores and broker implementations stay visible through a reason directly above the call;
+    /// every allowance is call-local, so a second call fails independently.
+    #[test]
+    fn no_unreviewed_direct_io_in_model_facing_operation_crates() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let mut violations = Vec::new();
+        let mut scanned = 0usize;
+
+        for crate_name in MODEL_FACING_OPERATION_CRATES {
+            let src_dir = repo_root.join("crates").join(crate_name).join("src");
+            assert!(
+                src_dir.is_dir(),
+                "classified operation crate missing: {}",
+                src_dir.display()
+            );
+            let mut files = Vec::new();
+            collect_rs(&src_dir, &mut files);
+            assert!(
+                !files.is_empty(),
+                "classified operation crate has no Rust sources: {crate_name}"
+            );
+            for file in files {
+                scanned += 1;
+                let relative_path = file
+                    .strip_prefix(repo_root)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if EXTERNAL_CFG_TEST_MODULES.contains(&relative_path.as_str()) {
+                    let parent = std::fs::read_to_string(file.parent().unwrap().join("mod.rs"))
+                        .expect("external test module parent");
+                    assert!(
+                        parent.contains("#[cfg(test)]\nmod tests;"),
+                        "{relative_path} is classified test-only but its cfg(test) parent declaration drifted"
+                    );
+                    continue;
+                }
+                let source = std::fs::read_to_string(&file).unwrap();
+                for hit in raw_direct_io_calls(&source).unwrap_or_else(|error| {
+                    panic!("parse {} for direct-I/O gate: {error}", file.display())
+                }) {
+                    if direct_io_allow_reason(&source, hit.line).is_none() {
+                        violations.push(format!(
+                            "{relative_path}:{}: {:?} open in {} has no reasoned flux-allow-direct-io annotation",
+                            hit.line, hit.api, hit.function
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            scanned > 50,
+            "model-facing classification scanned only {scanned} files"
+        );
+        assert!(
+            violations.is_empty(),
+            "direct I/O outside flux-system in model-facing operation crates:\n  {}",
+            violations.join("\n  ")
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@ impl Drop for TempDir {
 struct Run {
     stdout: String,
     stderr: String,
+    success: bool,
 }
 
 /// Run `flux <args>` in an isolated HOME + CWD with no usable sandbox backend. `sandbox` is the
@@ -102,6 +103,7 @@ fn run_flux_with_env(
     Run {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        success: out.status.success(),
     }
 }
 
@@ -147,12 +149,11 @@ fn sandbox_on_without_a_backend_discloses_the_unconfined_posture_on_stderr() {
     );
 }
 
-/// Silent when confinement actually holds or was never requested — a warning that fires when
-/// nothing is wrong trains operators to ignore it. Covers the shipped default (`FLUX_SANDBOX`
-/// unset → `off`) and the nested case (a truthy `FLUX_SANDBOXED`, i.e. `Backend::AlreadyConfined`,
-/// where an outer flux sandbox already confines this whole process tree).
+/// Silent when confinement was never requested. A truthy `FLUX_SANDBOXED` still suppresses the
+/// unconfined disclosure because it asserts an outer boundary, but accepting that ambient assertion
+/// must itself be prominent and auditable.
 #[test]
-fn no_disclosure_when_the_sandbox_is_off_or_confinement_is_inherited() {
+fn no_unconfined_disclosure_when_sandbox_is_off_or_outer_confinement_is_asserted() {
     let default_run = run_flux("c217-default", None, false, &["sessions"]);
     assert!(
         !discloses_unconfined(&default_run.stderr) && !discloses_unconfined(&default_run.stdout),
@@ -166,15 +167,13 @@ fn no_disclosure_when_the_sandbox_is_off_or_confinement_is_inherited() {
         "a nested run IS confined by the outer flux sandbox — no unconfined disclosure is due.\nstderr:\n{}",
         nested.stderr
     );
-    // Non-vacuity for the nested arm: prove this run really did take the `AlreadyConfined` branch
-    // rather than, say, failing before `apply_sandbox_env` ever ran. The pre-existing dim note is
-    // that branch's observable marker, so asserting it also pins the branch the disclosure change
-    // deliberately left alone.
+    // The marker is ambient state and cannot be verified by the nested process. Accepting it must
+    // therefore be a prominent, source-attributed trust event rather than a silent escape.
     assert!(
-        nested
-            .stderr
-            .contains("already confined by the outer flux run"),
-        "expected the nested run to reach the AlreadyConfined branch.\nstderr:\n{}",
+        nested.stderr.contains("FLUX_SANDBOXED=1")
+            && nested.stderr.contains("OUTER-CONFINEMENT")
+            && nested.stderr.contains("cannot verify"),
+        "outer-confinement assertion was not audited prominently.\nstderr:\n{}",
         nested.stderr
     );
 }
@@ -205,14 +204,7 @@ fn the_disclosure_does_not_pollute_stream_json_stdout() {
         "c217-stream-json",
         Some("on"),
         false,
-        &[
-            "run",
-            "--stream-json",
-            "--yes",
-            "-m",
-            "mock",
-            "write a quick note",
-        ],
+        &["run", "--stream-json", "-m", "mock", "write a quick note"],
     );
 
     assert!(
@@ -237,6 +229,113 @@ fn the_disclosure_does_not_pollute_stream_json_stdout() {
         run.stdout,
         run.stderr
     );
+}
+
+/// C-262: an auto-approved turn and a serving surface inherit `require` before provider/tool work.
+/// With both backends forced unavailable, startup fails rather than silently running unconfined.
+#[test]
+fn unattended_and_serving_surfaces_fail_closed_before_work() {
+    for (tag, args) in [
+        (
+            "c262-run",
+            &["run", "--yes", "-m", "mock", "should never start"][..],
+        ),
+        (
+            "c262-serve",
+            &["app", "run", "--serve", "--yes", "-m", "mock"][..],
+        ),
+        (
+            "c262-preset",
+            &[
+                "preset",
+                "map_each",
+                "item=item",
+                "source=[\"README.md\"]",
+                "op=read",
+                "collect=results",
+                "--run",
+                "--yes",
+            ][..],
+        ),
+        (
+            "c265-review",
+            &["review", "--files", "README.md", "-m", "mock"][..],
+        ),
+    ] {
+        let run = run_flux(tag, None, false, args);
+        assert!(!run.success, "{tag} unexpectedly started\n{}", run.stdout);
+        assert!(
+            run.stderr.contains("unattended sandbox profile refused")
+                && run.stderr.contains("container/VM"),
+            "{tag} needs an actionable fail-closed error\nstderr:\n{}",
+            run.stderr
+        );
+        assert!(
+            !run.stdout.contains("should never start"),
+            "provider/tool work reached stdout before preflight: {}",
+            run.stdout
+        );
+    }
+}
+
+/// `FLUX_SANDBOXED=1` is accepted for real nested runs, but it is also forgeable ambient state.
+/// The unattended profile may proceed only with a prominent audit line recording that trust choice.
+#[test]
+fn unattended_outer_confinement_assertion_is_prominently_audited() {
+    let run = run_flux(
+        "c262-outer-marker",
+        None,
+        true,
+        &["run", "--yes", "-m", "mock", "hello"],
+    );
+    assert!(
+        run.success,
+        "outer-confined nested run should proceed: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("warning:")
+            && run.stderr.contains("FLUX_SANDBOXED=1")
+            && run.stderr.contains("OUTER-CONFINEMENT")
+            && run.stderr.contains("cannot verify"),
+        "outer-confinement trust was not recorded prominently:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("UNCONFINED"),
+        "the assertion is audited, but must not falsely claim the outer boundary is absent:\n{}",
+        run.stderr
+    );
+}
+
+/// The escape is exact and noisy: an operator may deliberately accept an outer isolation boundary,
+/// but the process must state the unconfined posture and the source that selected it.
+#[test]
+fn unattended_unconfined_escape_is_explicit_and_prominent() {
+    for (tag, sandbox, args, expected_source) in [
+        (
+            "c262-escape-flag",
+            None,
+            &["--no-sandbox", "run", "--yes", "-m", "mock", "hello"][..],
+            "--no-sandbox",
+        ),
+        (
+            "c262-escape-env",
+            Some("off"),
+            &["run", "--yes", "-m", "mock", "hello"][..],
+            "FLUX_SANDBOX=off",
+        ),
+    ] {
+        let run = run_flux(tag, sandbox, false, args);
+        assert!(run.success, "explicit escape should run: {}", run.stderr);
+        assert!(
+            run.stderr.contains("profile BYPASSED")
+                && run.stderr.contains(expected_source)
+                && run.stderr.contains("UNCONFINED"),
+            "escape posture was not recorded prominently:\n{}",
+            run.stderr
+        );
+    }
 }
 
 /// The other machine-readable surface: a `--json` subcommand emits ONE JSON document on stdout, and
@@ -271,21 +370,20 @@ fn the_disclosure_does_not_pollute_json_stdout() {
     );
 }
 
-/// Acceptance: **once per process, not once per spawn.** The tests above run subcommands that spawn
-/// nothing, so they cannot tell the two apart. This one drives a mock turn that actually executes
-/// the `bash` op — a real child process built through `System::build_command`, i.e. through
-/// `Sandbox::wrap_argv`, the exact seam where a naive implementation would warn. Exactly one
-/// disclosure must survive that.
+/// C-262 compatibility: an auto-approved spawn cannot exercise C-217's soft `on` posture anymore —
+/// it correctly upgrades to `require`. Drive the explicit unconfined escape instead and prove its
+/// startup audit is one line per process, not one line per spawned child.
 #[test]
-fn the_disclosure_is_emitted_once_per_process_not_once_per_spawn() {
+fn the_unattended_escape_is_recorded_once_per_process_not_once_per_spawn() {
     let run = run_flux_with_env(
         "c217-spawn",
-        Some("on"),
+        None,
         false,
         // `bash` is opt-in (off-by-default `shell` group), so it must be enabled explicitly.
         &[("FLUX_ENABLE_BASH", "1"), ("FLUX_MOCK_BASH", "echo hello")],
         &[
             "run",
+            "--no-sandbox",
             "--stream-json",
             "--yes",
             "-m",
@@ -308,9 +406,9 @@ fn the_disclosure_is_emitted_once_per_process_not_once_per_spawn() {
         run.stderr
     );
     assert_eq!(
-        run.stderr.matches("UNCONFINED").count(),
+        run.stderr.matches("profile BYPASSED").count(),
         1,
-        "a spawning run must still disclose exactly once.\nstderr:\n{}",
+        "a spawning escape must be recorded exactly once.\nstderr:\n{}",
         run.stderr
     );
 }

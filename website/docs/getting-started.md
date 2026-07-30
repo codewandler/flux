@@ -11,17 +11,26 @@ offline smoke test first so you can verify the runtime without provider credenti
 
 ## Install
 
-**Prebuilt binary** — installs `flux` into `~/.cargo/bin` (Linux & macOS on x86_64 + aarch64; Windows on x86_64):
+**Prebuilt binary** — choose a version and target from the
+[release page](https://github.com/codewandler/flux/releases), then verify that the archive was
+produced by that tag's official release workflow before extracting it:
 
 ```bash
-# Linux / macOS
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh | sh
+release=vX.Y.Z
+archive=flux-cli-<target>.tar.xz
+gh release download "$release" --repo codewandler/flux --pattern "$archive"
+source_digest="$(gh api "repos/codewandler/flux/commits/$release" --jq .sha)"
+gh attestation verify "$archive" --repo codewandler/flux \
+  --signer-workflow codewandler/flux/.github/workflows/release.yml \
+  --source-ref "refs/tags/$release" --source-digest "$source_digest" \
+  --deny-self-hosted-runners
+tar -xJf "$archive"
 ```
 
-```powershell
-# Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.ps1 | iex"
-```
+The `.zip` archive is the equivalent verified path on Windows. Convenience installer scripts remain
+attached to each release, but inspect/download them separately if you choose that path; executing a
+`latest` installer directly from the network trusts the release origin without binding it to a
+specific tag and workflow.
 
 **From source** — requires Rust 1.85+ (`rustup update stable`):
 

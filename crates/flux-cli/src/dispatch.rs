@@ -1,5 +1,33 @@
 use super::*;
 
+/// Why this invocation must use the fail-closed unattended sandbox profile. Interactive REPL/TUI
+/// use is deliberately absent: those surfaces retain the operator-visible `off`/`on`/`require`
+/// contract, while auto-approved or serving work has no human approval boundary to fall back on.
+fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
+    match cli.command.as_ref()? {
+        Commands::Run { agent, .. } if agent.yes => Some("auto-approved `flux run --yes`"),
+        Commands::Fork { agent, .. } if agent.yes => Some("auto-approved `flux fork --yes`"),
+        Commands::Record { agent, .. } if agent.yes => Some("auto-approved `flux record --yes`"),
+        Commands::Flow {
+            action: FlowAction::Run { yes: true, .. },
+        } => Some("auto-approved `flux flow run --yes`"),
+        Commands::App {
+            action: AppAction::Run { serve: Some(_), .. },
+        } => Some("HTTP/A2A serving surface"),
+        Commands::App {
+            action: AppAction::Run { agent, .. },
+        } if agent.yes => Some("auto-approved `flux app run --yes`"),
+        Commands::Preset { args }
+            if args.iter().any(|arg| arg == "--run")
+                && args.iter().any(|arg| arg == "--yes" || arg == "-y") =>
+        {
+            Some("auto-approved `flux preset --run --yes`")
+        }
+        Commands::Review { .. } => Some("auto-approved `flux review` strict-review flow"),
+        _ => None,
+    }
+}
+
 /// Export the C-21 filesystem-access policy to `FLUX_ADD_DIRS` / `FLUX_ALLOW_ALL` from the CLI flags +
 /// `[workspace]` config, so `Workspace::from_env` (used at every production construction site) picks it
 /// up. Sources are **additive**: `--add-dir` flags, `[workspace] add_dirs`, and any pre-set `FLUX_ADD_DIRS`
@@ -84,9 +112,11 @@ pub(super) fn apply_workspace_access_env(cli: &Cli, cfg: &flux_config::Config) {
 /// a pre-set `FLUX_SANDBOX` contributes `Require`/`On` for those values (anything unrecognized —
 /// empty string, a typo like `requird` — contributes NOTHING and, if non-empty, earns a warning,
 /// rather than dropping to `Off`); config contributes `Require` when `[sandbox] require`, else `On`
-/// when `[sandbox] enabled`. The one exception is the explicit kill switch — `--no-sandbox`, or a
+/// when `[sandbox] enabled`. Auto-approved noninteractive and serving surfaces contribute
+/// `Require` automatically. The one exception is the explicit kill switch — `--no-sandbox`, or a
 /// pre-set `FLUX_SANDBOX=off` — which forces `Off` outright, mirroring `FLUX_OP_CACHE=off`. There is
-/// no `--require-sandbox` flag; `require` comes only from config or `FLUX_SANDBOX=require`.
+/// no `--require-sandbox` flag; outside the unattended profile, `require` comes only from config or
+/// `FLUX_SANDBOX=require`.
 ///
 /// When the resolved mode isn't `off`, this also runs the startup preflight: `require` + no usable
 /// backend is a hard startup error (fail-closed, mirroring `Sandbox::ensure_available`'s per-spawn
@@ -95,8 +125,9 @@ pub(super) fn apply_workspace_access_env(cli: &Cli, cfg: &flux_config::Config) {
 /// (running unconfined) and the reason, in the same style as this function's `--allow-all-paths`
 /// warning above. The line is composed and latched once-per-process at L2 by
 /// `Sandbox::take_posture_disclosure`. A *nested* run (already confined by an outer flux sandbox →
-/// `Backend::AlreadyConfined`) gets neither: it satisfies `require` and is genuinely confined, so
-/// only a dim informational note fires.
+/// `Backend::AlreadyConfined`) satisfies `require`, but the marker is only an assertion from the
+/// parent environment, not independently verifiable here. It therefore emits a prominent audit
+/// warning naming that trust decision instead of silently becoming a second escape hatch.
 pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<()> {
     use flux_system::sandbox::SandboxMode;
 
@@ -114,6 +145,7 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
 
     let preset = std::env::var("FLUX_SANDBOX").ok();
     let preset_lc = preset.as_deref().map(str::to_ascii_lowercase);
+    let unattended = unattended_sandbox_surface(cli);
     // The explicit kill switch still wins outright (mirrors `FLUX_OP_CACHE=off`): `--no-sandbox`, or
     // a pre-set `FLUX_SANDBOX=off`, forces `Off` regardless of any confinement request.
     let explicit_off = cli.no_sandbox || preset_lc.as_deref() == Some("off");
@@ -121,7 +153,13 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
     let mode = if explicit_off {
         SandboxMode::Off
     } else {
-        let mut mode = SandboxMode::Off;
+        // C-262: unattended/auto-approved execution starts at Require. Every other source may
+        // tighten that posture but cannot silently soften it.
+        let mut mode = if unattended.is_some() {
+            SandboxMode::Require
+        } else {
+            SandboxMode::Off
+        };
         // `--sandbox` asks for (at least) `On`.
         if cli.sandbox {
             mode = stricter(mode, SandboxMode::On);
@@ -162,15 +200,47 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
         },
     );
 
-    // Network: a pre-set env wins over config; an explicit narrowing to closed is only ever
-    // exported when it actually narrows (mirrors FLUX_ADD_DIRS/FLUX_ALLOW_ALL's "only set what
-    // changes" style) — the default stays open with nothing exported.
-    let network = std::env::var("FLUX_SANDBOX_NET")
-        .ok()
+    if let Some(surface) = unattended.filter(|_| explicit_off) {
+        let source = if cli.no_sandbox {
+            "--no-sandbox"
+        } else {
+            "FLUX_SANDBOX=off"
+        };
+        eprintln!(
+            "{} unattended sandbox profile BYPASSED by {source}: {surface} is running UNCONFINED. \
+             Sandbox network controls cannot apply; provide equivalent isolation in an outer \
+             container/VM and retain this startup line in operator audit logs.",
+            style::red("warning:")
+        );
+    }
+
+    // Network: unattended confinement defaults CLOSED. An exact truthy env or explicit
+    // `[sandbox] network = true` may open it; unknown env values narrow to closed, never widen.
+    // Interactive/local operation retains the pre-C-262 unrestricted default.
+    let network_env = std::env::var("FLUX_SANDBOX_NET").ok();
+    let network = network_env
+        .as_deref()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or_else(|| cfg.sandbox_network().unwrap_or(true));
-    if !network {
+        .unwrap_or_else(|| {
+            cfg.sandbox_network()
+                .unwrap_or_else(|| unattended.is_none())
+        });
+    if unattended.is_some() {
+        std::env::set_var("FLUX_SANDBOX_NET", if network { "1" } else { "0" });
+    } else if !network {
         std::env::set_var("FLUX_SANDBOX_NET", "0");
+    }
+    if let Some(surface) = unattended.filter(|_| network && !explicit_off) {
+        let source = if network_env.is_some() {
+            "FLUX_SANDBOX_NET"
+        } else {
+            "[sandbox] network = true"
+        };
+        eprintln!(
+            "{} unattended sandbox network opened explicitly by {source} for {surface}; spawned \
+             processes are confined but may reach the network.",
+            style::red("warning:")
+        );
     }
 
     // Writable extras: additive like FLUX_ADD_DIRS, absolutized against cwd.
@@ -204,9 +274,18 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
     }
 
     let sandbox = resolved_sandbox();
-    sandbox
-        .ensure_available()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    sandbox.ensure_available().map_err(|e| {
+        if let Some(surface) = unattended {
+            anyhow::anyhow!(
+                "unattended sandbox profile refused to start {surface}: {e}. Install a supported \
+                 sandbox backend, or run flux inside an outer container/VM that provides equivalent \
+                 filesystem and network isolation. To accept unconfined operation explicitly, use \
+                 --no-sandbox (recorded as a prominent startup warning)."
+            )
+        } else {
+            anyhow::anyhow!("{e}")
+        }
+    })?;
     if !sandbox.is_active() {
         // C-217: the resolved-posture disclosure. The line itself is composed at L2, next to the
         // facts that determine it (`Sandbox::posture_disclosure`), and latched there to once per
@@ -224,13 +303,14 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
         if let Some(disclosure) = sandbox.take_posture_disclosure() {
             eprintln!("{} {disclosure}", style::red("warning:"));
         } else if sandbox.confined_by_parent() {
-            // A nested flux run: an outer sandbox already confines this whole process tree, so this
-            // process adds no wrapper of its own — that satisfies `require` and is NOT an
-            // "unavailable" state, so the warning above (reason() == None here) rightly stays
-            // silent. A one-line dim note just makes the inherited confinement legible.
+            // A nested flux run normally inherits this from a wrapper flux created. The marker is
+            // still ambient process state, though, and this process cannot independently verify the
+            // claimed container/VM boundary. Make accepting it a prominent, auditable trust event.
             eprintln!(
-                "{}",
-                style::dim("sandbox: already confined by the outer flux run (nested).")
+                "{} sandbox: trusting FLUX_SANDBOXED=1 as an explicit OUTER-CONFINEMENT assertion. \
+                 This process cannot verify the parent container/VM boundary; retain this startup \
+                 line in operator audit logs.",
+                style::red("warning:")
             );
         }
     }
@@ -384,8 +464,15 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 agent,
                 stream_json,
                 stream_json_input,
+                entry,
+                inputs,
+                args,
                 prompt,
             }) => {
+                if let Some(entry) = entry {
+                    let target = named_entry_target(&prompt, &entry)?;
+                    return run_flow_entry(target, &entry, inputs, args, &agent).await;
+                }
                 // C-160: the machine-output modes are Run-only and don't compose with the
                 // multi-agent-program path — `flux app run` already has its own JSON-shaped
                 // surfaces (`--serve`); a single line protocol over one adaptive turn doesn't map

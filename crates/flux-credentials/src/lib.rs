@@ -560,7 +560,20 @@ fn truncate_body(body: &str) -> String {
 /// `/oauth/token` (plugin-oauth, D-81). `params` is the grant body (e.g. `grant_type=refresh_token`,
 /// `authorization_code`, `password`, or `client_credentials` + the matching credentials).
 pub async fn oauth_token_grant(token_url: &str, params: &[(&str, &str)]) -> Result<OAuthToken> {
-    let resp = reqwest::Client::new()
+    oauth_token_grant_with_client(&reqwest::Client::new(), token_url, params).await
+}
+
+/// Run a generic OAuth token grant over a caller-supplied transport.
+///
+/// Plugin hosts use this seam to pass a redirect-disabled client whose DNS mapping is pinned to
+/// addresses already admitted by their egress guard. Other callers can keep using
+/// [`oauth_token_grant`].
+pub async fn oauth_token_grant_with_client(
+    client: &reqwest::Client,
+    token_url: &str,
+    params: &[(&str, &str)],
+) -> Result<OAuthToken> {
+    let resp = client
         .post(token_url)
         .form(params)
         .send()
@@ -603,6 +616,45 @@ pub async fn resolve_stored_bearer(
     token_url: &str,
     client_id: &str,
 ) -> Result<Option<String>> {
+    resolve_stored_bearer_with_client_factory(store, key, token_url, client_id, || {
+        Ok(reqwest::Client::new())
+    })
+    .await
+}
+
+/// [`resolve_stored_bearer`] with an explicit transport for a potential refresh grant.
+///
+/// The transport is unused for a fresh token. Callers that authorize network egress can therefore
+/// bind refresh connections to the exact DNS addresses their guard vetted instead of allowing this
+/// crate to construct a client that resolves the token hostname again.
+pub async fn resolve_stored_bearer_with_client(
+    store: &dyn CredentialStore,
+    key: &str,
+    token_url: &str,
+    client_id: &str,
+    client: &reqwest::Client,
+) -> Result<Option<String>> {
+    resolve_stored_bearer_with_client_factory(store, key, token_url, client_id, || {
+        Ok(client.clone())
+    })
+    .await
+}
+
+/// [`resolve_stored_bearer`] with a lazily constructed transport for a refresh grant.
+///
+/// The factory is called only when a stored token is stale and has a refresh token. This lets an
+/// egress-aware caller fail closed on an empty DNS pin for actual network work without making an
+/// absent or still-fresh stored credential depend on DNS availability.
+pub async fn resolve_stored_bearer_with_client_factory<F>(
+    store: &dyn CredentialStore,
+    key: &str,
+    token_url: &str,
+    client_id: &str,
+    client_factory: F,
+) -> Result<Option<String>>
+where
+    F: FnOnce() -> Result<reqwest::Client>,
+{
     let Some(mut tok) = store.load(key).await else {
         return Ok(None);
     };
@@ -612,7 +664,9 @@ pub async fn resolve_stored_bearer(
         .unwrap_or(false);
     if stale {
         if let Some(refresh) = tok.refresh.clone() {
-            let refreshed = oauth_token_grant(
+            let client = client_factory()?;
+            let refreshed = oauth_token_grant_with_client(
+                &client,
                 token_url,
                 &[
                     ("grant_type", "refresh_token"),

@@ -18,7 +18,6 @@
               "adapter": "multi",
               "trials": 3,
               "model": "anthropic/claude-sonnet-4-6",
-              "flux_bin": "target/x86_64-unknown-linux-musl/release/flux",
               "members": [
                 {
                   "adapter": "terminal-bench",
@@ -26,10 +25,7 @@
                     "chess-best-move",
                     "fibonacci-server"
                   ],
-                  "dataset": "terminal-bench-core==0.1.1",
-                  "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
-                  "agent_timeout_secs": 180,
-                  "rebuild": true
+                  "agent_timeout_secs": 180
                 },
                 {
                   "adapter": "synthetic"
@@ -212,7 +208,6 @@
                       "adapter": "multi",
                       "trials": 3,
                       "model": "anthropic/claude-sonnet-4-6",
-                      "flux_bin": "target/x86_64-unknown-linux-musl/release/flux",
                       "members": [
                         {
                           "adapter": "terminal-bench",
@@ -220,10 +215,7 @@
                             "chess-best-move",
                             "fibonacci-server"
                           ],
-                          "dataset": "terminal-bench-core==0.1.1",
-                          "flux_binary": "target/x86_64-unknown-linux-musl/release/flux",
-                          "agent_timeout_secs": 180,
-                          "rebuild": true
+                          "agent_timeout_secs": 180
                         },
                         {
                           "adapter": "synthetic"

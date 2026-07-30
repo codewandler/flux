@@ -2,7 +2,7 @@
 id: C-226
 title: "A failed turn is indistinguishable from a successful one to every machine consumer"
 pillar: Core
-status: ready
+status: done
 priority: 17
 epic: unattended-run-integrity
 design: docs/designs/unattended-run-integrity.md
@@ -52,28 +52,28 @@ EXIT=0
 Nothing on stderr. A consumer that trusts `type == "turn_end"` records this as a completed turn.
 
 ## Acceptance
-- [ ] A stage failure in `detect_intent` / `explore` propagates as a **typed outcome** rather than
+- [x] A stage failure in `detect_intent` / `explore` propagates as a **typed outcome** rather than
       being laundered into `Ok`. The `"kind": "error"` payload at
       `crates/flux-flow/src/loop_host.rs:563-586` is the existing signal — carry it, don't recompute
       it. Keep the apologetic answer text: the *human* surface must not regress into a raw stack.
-- [ ] `turn_end` carries a machine-readable outcome (e.g. `"outcome": "ok" | "error"`, with the
+- [x] `turn_end` carries a machine-readable outcome (e.g. `"outcome": "ok" | "error"`, with the
       error detail alongside). **`usage: null` + `cost_usd: null` is not an acceptable substitute** —
       it is a coincidence of the failure path, not a contract, and a consumer keying on it will
       silently misclassify the first failure that happens to have partial usage.
-- [ ] The NDJSON `error` line fires for a provider/flow-level turn failure, so the documented
+- [x] The NDJSON `error` line fires for a provider/flow-level turn failure, so the documented
       vocabulary matches observable behaviour. If `error` stays reserved for `run_turn`'s `Err(_)`,
       say so in the design doc and make `turn_end.outcome` the sole contract — but the two must not
       disagree.
-- [ ] **`flux run` exits non-zero when the turn failed.** This is the signal every subprocess driver
+- [x] **`flux run` exits non-zero when the turn failed.** This is the signal every subprocess driver
       reaches for first, and today it is actively misleading.
-- [ ] **Failing-first test**: drive a turn whose model stage errors (the bogus-credential path above,
+- [x] **Failing-first test**: drive a turn whose model stage errors (the bogus-credential path above,
       or a stub provider that returns `Err`) and assert (a) non-zero exit and (b) a typed error
       outcome on the NDJSON stream. Both assertions fail today — the run exits 0 and the stream shows
       a clean `turn_end`.
-- [ ] Protocol version handling is decided explicitly: `v: 1` is documented as unstable and the tag
+- [x] Protocol version handling is decided explicitly: `v: 1` is documented as unstable and the tag
       set as open/additive, so adding a field is in-contract — state in the design doc whether this
       lands under `v: 1` or bumps it.
-- [ ] Standard gate green in both workspaces.
+- [x] Standard gate green in both workspaces.
 
 ## Progress
 - 2026-07-29 — found while driving `flux run` headlessly as a sub-agent implementor from a
@@ -81,6 +81,16 @@ Nothing on stderr. A consumer that trusts `type == "turn_end"` records this as a
   then an upstream rate-limit) and **every one returned exit 0 with nothing committed**; the
   coordinator only detected the failures by diffing the git branch afterwards. The 401 reproducer
   above was then constructed to pin the same behaviour deterministically.
+- 2026-07-30 — the adaptive host now carries its existing tagged stage-failure value through normal
+  turn finalization, preserving the authored human answer and valid provider history while returning
+  `Err` and recording the durable turn outcome as `error`. NDJSON v1 additively gains
+  `turn_end.outcome` plus optional `error`; a failure emits a dedicated `error` record followed by a
+  final, agreeing `turn_end`, and the CLI exits non-zero. A deterministic mock-provider failure test
+  covers the real binary, while the engine regression repeats a failed turn and validates session
+  shape after each attempt. Verification: `cargo test -p codewandler-flux-flow` (227 passed),
+  `cargo test -p flux-cli` (249 unit tests plus all integration suites passed),
+  `cargo clippy -p codewandler-flux-flow -p flux-cli --all-targets -- -D warnings`,
+  `cargo test -p flux-codegate` (17 passed), and `cargo fmt --all -- --check`.
 
 ## Notes
 - Seams: `crates/flux-flow/src/loop_host.rs:563-586` (`detect_intent`, `explore` — the swallow);

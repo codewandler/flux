@@ -1820,6 +1820,13 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(s));
         }
 
+        // Deterministic provider-failure hook for black-box CLI tests. Unlike a canned response,
+        // this exercises the real adaptive loop's stage-error path and its terminal machine
+        // outcome without requiring credentials or network access.
+        if let Ok(message) = std::env::var("FLUX_MOCK_ERROR") {
+            return Err(flux_core::Error::Provider(message));
+        }
+
         // Test hook for direct model-backed cognition ops (not the adaptive outer loop): return a canned
         // text completion. L-79 uses this to exercise `ai.extract` input mapping through the real
         // binary without provider credentials or a network stub.
@@ -1916,6 +1923,42 @@ impl Provider for MockCliProvider {
                     }),
                     Chunk::Done {
                         stop_reason: Some(StopReason::ToolUse),
+                    },
+                ];
+                return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            }
+
+            // A gather-safe operation (for example `read`) executes immediately instead of being
+            // captured into an action batch. Once its successful result is in the native ledger,
+            // finish the offline turn; repeatedly proposing the same gather call only used to look
+            // successful because stage-budget exhaustion was laundered into prose before C-226.
+            let gathered = req
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            is_error: false,
+                            ..
+                        } if tool_use_id == "action1"
+                    )
+                });
+            if gathered {
+                let chunks = vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "Finished.".into(),
+                    }),
+                    Chunk::Usage(Usage {
+                        input_tokens: 180,
+                        output_tokens: 12,
+                        cache_read_input_tokens: 1_240,
+                        ..Default::default()
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
                     },
                 ];
                 return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));

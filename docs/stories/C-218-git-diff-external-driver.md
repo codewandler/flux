@@ -2,7 +2,7 @@
 id: C-218
 title: "`git_diff` honours external diff drivers, so its I1 exemption claims more than it can hold"
 pillar: Core
-status: ready
+status: done
 priority: 8
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -27,23 +27,37 @@ that program instead of diffing internally**. The op's argv never changes; what 
 Close the gap by passing `--no-ext-diff`, and make the exemption's justification true again.
 
 ## Acceptance
-- [ ] `GitDiffTool`'s argv passes `--no-ext-diff` (`crates/flux-tools/src/lib.rs`, the
+- [x] `GitDiffTool`'s argv passes `--no-ext-diff --no-textconv` (`crates/flux-tools/src/lib.rs`, the
       `vec!["git", "diff"]` construction). **Failing-first test**: in a fixture repo configured with
       `diff.external` pointing at a marker program, assert `git_diff` does *not* execute it — the
       test fails today because it does.
-- [ ] Audit the sibling `git_*` ops for the same class of config-directed execution and state the
+- [x] Whole-file and hunk diff paths pass `--no-textconv`; a matching `.gitattributes` textconv
+      driver fixture proves the low-risk operation cannot execute it.
+- [x] Audit the sibling `git_*` ops for the same class of config-directed execution and state the
       result in the story, rather than assuming. `git status`/`git log` do not run diff drivers on
       their default argv, but `git log` gains one under `-p`/`--ext-diff`, so state explicitly
       whether any caller-reachable flag can get there.
-- [ ] The `EXEMPT` entry's `reason` for `git_diff` is updated to say *why* the argv is now genuinely
+- [x] The `EXEMPT` entry's `reason` for `git_diff` is updated to say *why* the argv is now genuinely
       behaviour-fixing — the reason string is read by `the_allowlist_is_well_formed` and is the only
       place the justification lives.
-- [ ] Standard gate green in both workspaces.
+- [x] Standard gate green in both workspaces.
 
 ## Progress
 - 2026-07-29 — found while reviewing C-92, by comparing its new `git_hunks` op against the shipped
   `git_*` family. The new op passes `--no-ext-diff`; the existing `git_diff` does not. The
   discrepancy is what surfaced it.
+- 2026-07-30 — failing-first Unix fixture configured `diff.external` to a marker program and proved
+  the low-risk op executed it. `GitDiffTool` now always passes `--no-ext-diff`; the same fixture
+  proves the external program stays untouched, and the I1 exemption names the behaviour-fixing flag.
+- 2026-07-30 — sibling audit: `git_status` exposes no caller flags and runs only `git status
+  --short`; `git_log` exposes only a numeric limit and runs `git log -N --oneline`, so neither can
+  enable patch/external-diff behaviour. `git log` would become suspect if `-p` or `--ext-diff` were
+  ever made caller-reachable.
+- 2026-07-30 — full `codewandler-flux-tools` and `codewandler-flux-spec` tests plus scoped clippy
+  with `-D warnings` are green.
+- 2026-07-30 — closure review covered Git's separate text-conversion seam: whole-file and hunk diff
+  argv now pass `--no-textconv`, and a repository fixture proves a matching textconv driver cannot
+  execute through the low-risk op.
 
 ## Notes
 - **Scope the severity honestly, in both directions.** This is *not* remote code execution from

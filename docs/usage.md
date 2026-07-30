@@ -158,6 +158,9 @@ flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR 
 flux tui                         # dense ratatui chat UI (queue, session replay, approval sheet)
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
+flux run workflows.flux --entry triage --arg queue=new
+                                 # select one named top-level flow from a multi-flow module and exit;
+                                 # --inputs JSON and repeatable --arg use the strict flow input contract
 flux a2a <url> [prompt…]         # connect to a remote A2A agent and chat like a local one (the client
                                  #   side of `app run --serve`): with a prompt or piped stdin it runs
                                  #   one turn and exits, otherwise it opens a REPL. --token <t> for a
@@ -242,7 +245,8 @@ flux plugin install <name>       # the plugin CLI — verified install from the 
 flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mock / terminal-bench / multi);
                                  #   --watch streams the agent live, --report out.md writes a categorized report
 flux review --files a.rs b.rs    # run the embedded strict-review protocol over the files and print a
-                                 #   ReviewReport (self-contained, read-only — posts nowhere, stdout only);
+                                 #   ReviewReport (immutable built-in toolless roles; project role files
+                                 #   cannot replace them; fail-closed unattended sandbox; stdout only);
                                  #   --format md|json, --fail-on info|low|medium|high|critical (exit 1
                                  #   at/above that severity), -m <spec> reviewer model, --max-tokens N
 flux loop show                   # print the built-in adaptive loop. `flux loop eject` writes it to

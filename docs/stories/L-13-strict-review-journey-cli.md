@@ -67,12 +67,12 @@ through the identical `Executor::dispatch` envelope.
   (`Info|Low|Medium|High|Critical`, `>=` comparison; an unrecognized severity string fails safe as
   `Critical` so it can never silently slip under a threshold); `run_review` calls
   `std::process::exit(1)` only at the top level.
-- **Self-contained:** `load_roles` already falls back to the built-in `DEFAULT_ROLES`/checked-in
-  `.flux/agents/review-*.md` pattern; a project's own role files still override. The flow text ships in
-  the binary via `include_str!`, so `flux review` works in any repo.
-- **Security:** unchanged from L-11/L-12 — reviewer roles keep `tools: []`; `strict_review`'s core stays
-  read-only (git_status/git_diff/read_many + bounded `task` fan-out + `review.aggregate`); the CLI only
-  ever prints to stdout, no write/network/publishing effect was added.
+- **Self-contained:** the checked-in reviewer roles and flow text ship in the binary, so both product
+  surfaces work in any repo. C-265 subsequently made those embedded definitions immutable: project
+  roles with the same names remain available to ordinary agents but cannot replace this protocol.
+- **Security:** reviewer roles keep `tools: []`; `strict_review`'s core stays read-only
+  (git_status/git_diff/read_many + bounded `task` fan-out + `review.aggregate`); the CLI only prints
+  to stdout, and C-265 subjects the internally auto-approved command to unattended confinement.
 - **Tests:** `crates/flux-app/tests/strict_review_journey.rs` (the headline acceptance test — added RED
   when `flux_app::App` had no sub-agent wiring and `flux_app::review` didn't exist, GREEN after; asserts
   `App::deliver("review", …)`'s journey result equals `FlowClient::run_flow`'s direct result, byte for

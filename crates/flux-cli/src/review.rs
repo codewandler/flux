@@ -74,17 +74,24 @@ pub(super) async fn run_eval_cmd(
     Ok(())
 }
 
-/// Build the `SubAgents` bundle for the strict-review protocol's reviewer fan-out: the same
-/// `load_roles` + `SubAgents::new` construction `build_agent` uses for the top-level agent, shared by
-/// both `flux review` ([`run_review`]) and `flux app run strict-review` (the built-in-program branch
-/// of [`run_app`]) so the two call sites can't drift.
+/// The immutable role registry for the built-in strict-review protocol.
+///
+/// These names are part of an embedded security protocol, not extension points: consulting project
+/// or user-global role discovery here would let an untrusted checkout replace a toolless reviewer
+/// with a write-capable autonomous agent. Ordinary agents continue to use [`load_roles`].
+pub(super) fn strict_review_roles() -> RoleRegistry {
+    RoleRegistry::from_roles(flux_app::review::builtin_review_roles())
+}
+
+/// Build the `SubAgents` bundle for the strict-review protocol's reviewer fan-out, shared by both
+/// `flux review` ([`run_review`]) and `flux app run strict-review` (the built-in-program branch of
+/// [`run_app`]) so the two call sites cannot drift or regain project-controlled reviewer roles.
 pub(super) fn build_review_sub_agents(
-    cwd: &std::path::Path,
     model_spec: &str,
     model: impl Into<String>,
     max_tokens: u32,
 ) -> Result<SubAgents> {
-    let roles = load_roles(cwd)?;
+    let roles = strict_review_roles();
     let mut child_base = ToolRegistry::new();
     flux_tools::try_register_builtins(&mut child_base)?;
     let factory: ProviderFactory = {
@@ -103,10 +110,9 @@ pub(super) fn build_review_sub_agents(
 /// identical source the `review_code` app journey wraps as a composite op) through
 /// `flux_sdk::FlowClient::run_flow` — the deterministic `parse` → `analyze` → `execute_with` path, no
 /// model round-trip for the flow itself (only the reviewer sub-agents call a model). Self-contained:
-/// [`load_roles`] already falls back to built-in role definitions when a project's own
-/// `.flux/agents/review-*.md` is absent, and the flow text ships in the binary — so this works in any
-/// repo. Read-only: `strict_review`'s reviewer roles all declare `tools: []`, and this command never
-/// writes anywhere but stdout.
+/// The immutable reviewer roles and flow text ship in the binary, so this works in any repo without
+/// trusting that repo's `.flux/agents/review-*.md`. Read-only: `strict_review`'s reviewer roles all
+/// declare `tools: []`, and this command never writes anywhere but stdout.
 pub(super) async fn run_review(
     flags: &ReviewFlags,
     files: Vec<String>,
@@ -127,10 +133,11 @@ pub(super) async fn run_review(
 
     // Wire roles + sub-agents exactly like `build_agent`: `strict_review`'s bounded 3-role reviewer
     // fan-out (via `task`) delegates through the identical envelope the top-level agent uses.
-    let sub_agents = build_review_sub_agents(&cwd, &model_spec, model.clone(), flags.max_tokens)?;
+    let sub_agents = build_review_sub_agents(&model_spec, model.clone(), flags.max_tokens)?;
 
     // `strict_review`'s core is read-only by construction (git_status/git_diff/read_many + `task`
-    // against `tools: []` reviewer roles — see the design's security considerations); auto-approving
+    // against immutable embedded `tools: []` reviewer roles — see the design's security
+    // considerations); auto-approving
     // this specific, fixed flow's own ops is not the same authority `--yes` grants an arbitrary
     // prompt-compiled plan, so `review` doesn't offer `--yes` at all (see [`ReviewFlags`]).
     let mut client = flux_sdk::FlowClient::builder()

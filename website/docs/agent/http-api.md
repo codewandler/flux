@@ -201,6 +201,7 @@ come from per provider.
 | `401` | Authentication required or failed for the configured mode. |
 | `404` | Unknown session, or an unknown `agent_id` on the multi-agent mount. |
 | `408` | The request exceeded the response-production timeout. |
+| `429` | The caller exceeded request rate or live work, or completed provider usage tripped a call/spend circuit breaker. `Retry-After` and `X-Flux-Limit` identify when and which dimension may be retried. |
 | `413` | The request body exceeded the body cap. |
 | `500` | The turn failed. |
 
@@ -212,7 +213,39 @@ the daemon is never accidentally left unlimited).
 The timeout bounds how long a handler may take to **produce** a response, not how long a response
 body may stream. That distinction is what lets `POST /sessions/{id}/messages` be bounded — it holds
 the connection for a whole turn — while `GET /sessions/{id}/stream` returns its SSE response
-promptly and then streams for the life of the turn without being severed.
+promptly and then streams for the life of the turn without being severed. When a buffered REST,
+webhook, or blocking A2A request reaches its deadline, Flux cancels the owning turn and waits for
+durable turn and child-work finalization before returning `408`; a timeout cannot detach live work.
+
+Streaming bodies have their own lifecycle bound: REST SSE uses a 256-event channel. A consumer
+that disconnects or stops draining cancels the request-owned turn; the producer finalizes a valid
+cancelled session instead of continuing approved effects or buffering token events without limit.
+
+Request admission is keyed by authenticated principal in principal mode, by the configured shared
+realm in shared-secret mode, and by one loopback-development bucket in open mode. It covers every
+authenticated protected route, including session and usage reads; `/health` and discovery cards
+remain exempt. A request is charged once at that boundary. The same key's separate live-work cap
+covers REST turns, fresh-session webhooks, blocking/background A2A work, and long-lived SSE.
+
+Provider call and priced-spend thresholds are **retrospective completed-usage circuit breakers**,
+not exact prepaid caps. Flux charges each durable call fact after its exact owning turn/producer
+finishes, including calls that reported zero tokens, then rejects new work once the threshold is
+observed. Turns already admitted can finish and overshoot the threshold;
+`max_inflight_per_principal` bounds how many can do so concurrently. Exact turn attribution keeps
+overlapping requests for one session assigned to the right principal even when they finish or drop
+in reverse order. The in-process principal/realm buckets are cardinality-bounded and stale buckets
+are swept.
+
+These controls are **per replica**. A multi-replica deployment must also enforce aggregate request,
+concurrency, and spend policy at an authenticated reverse proxy or shared control plane, using the
+same principal/tenant claim. Do not rely on client IP as the tenancy key behind a proxy. Limit
+rejections emit a secret-free `flux_server_limit_rejections_total` log signal and never include a
+bearer or shared-secret value.
+
+In principal mode bearer introspection necessarily runs **before** the in-process request limiter:
+the verified principal selects the bucket. Protect the listener and introspection dependency with
+reverse-proxy/identity-provider arrival limits as well; Flux's per-principal limiter cannot shield
+that pre-admission authentication call from raw request floods.
 
 ## Tenancy
 

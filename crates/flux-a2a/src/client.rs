@@ -5,6 +5,7 @@
 //! agents that answer `message/send` with a still-running task. SSE is decoded with
 //! `eventsource-stream` (the same crate the provider transports use).
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use eventsource_stream::Eventsource;
@@ -49,12 +50,52 @@ pub struct A2aClient {
     rpc_url: Url,
     token: Option<String>,
     headers: Vec<(String, String)>,
+    /// A pinned client is origin-locked: card adoption and explicit RPC overrides may change only
+    /// the path, never escape to a hostname that was not part of the vetted address binding.
+    origin_locked: bool,
 }
 
 impl A2aClient {
     /// Build a client from a base URL or a full RPC URL. A bare origin (`http://host:port`) targets
     /// `<origin>/a2a`; a URL with a path (`…/a2a`) is used verbatim as the RPC endpoint.
     pub fn new(input: &str) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| A2aError::Http(format!("building A2A client: {e}")))?;
+        Self::with_http(input, http, false)
+    }
+
+    /// Build an origin-locked client that connects only to `pinned` socket addresses.
+    ///
+    /// The caller must obtain this set from its egress authorization boundary (fleet uses
+    /// `flux_system::net::guard_url_scoped_pinned`). Empty sets fail closed. Redirects are disabled,
+    /// and later agent-card or explicit RPC endpoint adoption cannot switch origins, so every
+    /// request made by this client remains bound to the addresses that were vetted here.
+    pub fn new_pinned(input: &str, pinned: &[SocketAddr]) -> Result<Self> {
+        if pinned.is_empty() {
+            return Err(A2aError::Http(
+                "refusing to build an unpinned A2A client: the egress guard vetted no addresses"
+                    .to_string(),
+            ));
+        }
+        let parsed = Url::parse(input).map_err(|e| A2aError::Url(format!("{input}: {e}")))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| A2aError::Url(format!("{input}: url has no host")))?;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            // A guarded/pinned transport must connect to the vetted addresses directly. Ambient
+            // proxy variables would route the request to an unvetted peer and move DNS resolution
+            // behind that peer, defeating the authorization decision.
+            .no_proxy()
+            .resolve_to_addrs(host, pinned)
+            .build()
+            .map_err(|e| A2aError::Http(format!("building pinned A2A client: {e}")))?;
+        Self::with_http(input, http, true)
+    }
+
+    fn with_http(input: &str, http: reqwest::Client, origin_locked: bool) -> Result<Self> {
         let parsed = Url::parse(input).map_err(|e| A2aError::Url(format!("{input}: {e}")))?;
         let mut base = parsed.clone();
         base.set_path("/");
@@ -67,11 +108,12 @@ impl A2aClient {
             parsed
         };
         Ok(A2aClient {
-            http: reqwest::Client::new(),
+            http,
             base,
             rpc_url,
             token: None,
             headers: Vec::new(),
+            origin_locked,
         })
     }
 
@@ -89,7 +131,13 @@ impl A2aClient {
 
     /// Override the JSON-RPC endpoint (e.g. from a fetched [`AgentCard`]).
     pub fn with_rpc_url(mut self, url: &str) -> Result<Self> {
-        self.rpc_url = Url::parse(url).map_err(|e| A2aError::Url(format!("{url}: {e}")))?;
+        let parsed = Url::parse(url).map_err(|e| A2aError::Url(format!("{url}: {e}")))?;
+        if self.origin_locked && !same_origin(&self.base, &parsed) {
+            return Err(A2aError::Url(format!(
+                "{url}: a pinned A2A client cannot change origin"
+            )));
+        }
+        self.rpc_url = parsed;
         Ok(self)
     }
 
@@ -113,12 +161,23 @@ impl A2aClient {
     /// the agent over a non-loopback host — a common container/reverse-proxy footgun. In that case
     /// keep the host we connected to and borrow only the card's path.
     fn adopt_endpoint(&self, advertised: Url) -> Url {
+        if self.origin_locked && !same_origin(&self.base, &advertised) {
+            return self.endpoint_path_on_base(&advertised);
+        }
         if is_loopback_host(advertised.host_str()) && !is_loopback_host(self.base.host_str()) {
-            if let Ok(joined) = self.base.join(advertised.path()) {
-                return joined;
-            }
+            return self.endpoint_path_on_base(&advertised);
         }
         advertised
+    }
+
+    /// Retain only an advertised endpoint's path/query on the connected origin. Mutating the URL
+    /// components directly is deliberate: `Url::join("//attacker")` treats that path as a new
+    /// authority, which would defeat the origin lock it was meant to preserve.
+    fn endpoint_path_on_base(&self, advertised: &Url) -> Url {
+        let mut endpoint = self.base.clone();
+        endpoint.set_path(advertised.path());
+        endpoint.set_query(advertised.query());
+        endpoint
     }
 
     /// Fetch the agent card, trying the newer `agent-card.json` path then the older `agent.json`.
@@ -309,6 +368,14 @@ fn is_loopback_host(host: Option<&str>) -> bool {
     )
 }
 
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str()
+            .zip(b.host_str())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +411,155 @@ mod tests {
         let c = A2aClient::new("http://127.0.0.1:8787").unwrap();
         let adopted = c.adopt_endpoint(Url::parse("http://127.0.0.1:8787/a2a").unwrap());
         assert_eq!(adopted.as_str(), "http://127.0.0.1:8787/a2a");
+    }
+
+    #[test]
+    fn pinned_clients_fail_closed_and_cannot_change_origin() {
+        assert!(A2aClient::new_pinned("https://worker.example", &[]).is_err());
+        let client = A2aClient::new_pinned(
+            "https://worker.example",
+            &["93.184.216.34:443".parse().unwrap()],
+        )
+        .unwrap();
+        assert!(client.with_rpc_url("https://attacker.example/a2a").is_err());
+
+        let client = A2aClient::new_pinned(
+            "https://worker.example",
+            &["93.184.216.34:443".parse().unwrap()],
+        )
+        .unwrap();
+        let adopted = client
+            .adopt_endpoint(Url::parse("https://attacker.example//other-host/a2a?x=1").unwrap());
+        assert_eq!(adopted.host_str(), Some("worker.example"));
+        assert_eq!(adopted.path(), "//other-host/a2a");
+        assert_eq!(adopted.query(), Some("x=1"));
+    }
+
+    /// C-256: reqwest must never follow an A2A redirect behind the fleet guard. The source is
+    /// reached through a fake hostname pinned to loopback; the redirect target must receive zero
+    /// connections even though it is otherwise reachable.
+    #[tokio::test]
+    async fn pinned_client_never_follows_automatic_redirects() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let reached = Arc::new(AtomicBool::new(false));
+        let reached_task = reached.clone();
+        let target_task = tokio::spawn(async move {
+            if tokio::time::timeout(Duration::from_millis(250), target.accept())
+                .await
+                .is_ok()
+            {
+                reached_task.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = source.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/a2a\r\nContent-Length: 0\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = A2aClient::new_pinned(
+            &format!("http://worker.test:{}/a2a", source_addr.port()),
+            &[source_addr],
+        )
+        .unwrap();
+        let err = client
+            .get_task("t_1")
+            .await
+            .expect_err("a redirect response is not an authorized A2A response");
+        assert!(err.to_string().contains("HTTP 302"), "{err}");
+        target_task.await.unwrap();
+        assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    /// C-256 closure: address pinning is meaningless if reqwest may route the request through an
+    /// ambient proxy. Run the network assertion in an isolated test process so changing proxy
+    /// variables cannot race sibling tests.
+    #[tokio::test]
+    async fn pinned_client_ignores_ambient_proxy() {
+        const CHILD: &str = "FLUX_A2A_PROXY_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "client::tests::pinned_client_ignores_ambient_proxy",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated proxy regression failed");
+            return;
+        }
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_once(listener: tokio::net::TcpListener, reached: Arc<AtomicBool>) {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            let Ok(Ok((mut socket, _))) = accepted else {
+                return;
+            };
+            reached.store(true, Ordering::SeqCst);
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        }
+
+        let pinned = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pinned_addr = pinned.local_addr().unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let pinned_reached = Arc::new(AtomicBool::new(false));
+        let proxy_reached = Arc::new(AtomicBool::new(false));
+        let pinned_task = tokio::spawn(serve_once(pinned, pinned_reached.clone()));
+        let proxy_task = tokio::spawn(serve_once(proxy, proxy_reached.clone()));
+
+        let proxy_url = format!("http://{proxy_addr}");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            std::env::set_var(key, &proxy_url);
+        }
+        std::env::set_var("NO_PROXY", "");
+        std::env::set_var("no_proxy", "");
+
+        let client = A2aClient::new_pinned(
+            &format!("http://worker.test:{}/a2a", pinned_addr.port()),
+            &[pinned_addr],
+        )
+        .unwrap();
+        client
+            .http
+            .get(client.rpc_url.clone())
+            .send()
+            .await
+            .unwrap();
+
+        pinned_task.await.unwrap();
+        proxy_task.await.unwrap();
+        assert!(pinned_reached.load(Ordering::SeqCst));
+        assert!(!proxy_reached.load(Ordering::SeqCst));
     }
 
     /// A one-shot loopback JSON-RPC stub: accepts one connection, captures the full request

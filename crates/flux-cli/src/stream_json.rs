@@ -84,6 +84,10 @@ pub(super) enum ProtocolLine {
     TurnEnd {
         v: u32,
         session: String,
+        /// `ok` or `error`. v1 is additive/open, so this C-226 field lands without a version bump.
+        outcome: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
         answer: String,
         usage: Option<Usage>,
         cost_usd: Option<f64>,
@@ -129,6 +133,9 @@ pub(super) struct StreamJsonSink {
     /// Stashed by `tool_timing`, consumed by the immediately following `tool_result` — mirrors
     /// `CliSink::pending_timing`.
     pending_timing: Option<flux_core::OperationTiming>,
+    /// `AgentSink::turn_end` arrives before `run_turn` returns its machine outcome. Hold its usage
+    /// until the caller can emit one self-consistent final `turn_end` plus (on failure) `error`.
+    pending_usage: Option<Option<Usage>>,
 }
 
 impl StreamJsonSink {
@@ -140,6 +147,7 @@ impl StreamJsonSink {
             pricing: None,
             answer: String::new(),
             pending_timing: None,
+            pending_usage: None,
         }
     }
 
@@ -168,13 +176,38 @@ impl StreamJsonSink {
         });
     }
 
-    /// The caller emits this when `run_turn`/`run_turn_cancellable` returns `Err` — the one
-    /// termination path `AgentSink` itself has no hook for (see the design doc).
-    pub(super) fn turn_error(&self, message: &str) {
-        self.write(ProtocolLine::Error {
+    /// Emit the final machine outcome after `run_turn` has returned. On failure, the dedicated
+    /// `error` line and `turn_end.outcome/error` derive from the same returned error, so the two
+    /// protocol signals cannot disagree.
+    pub(super) fn finish_turn(&mut self, error: Option<&str>) {
+        let error = error.map(str::to_string);
+        if let Some(message) = &error {
+            self.write(ProtocolLine::Error {
+                v: SCHEMA_VERSION,
+                session: self.session.clone(),
+                message: message.clone(),
+            });
+        }
+        // Lifecycle/setup failures can return before `AgentSink::turn_end`; retain the existing
+        // error-only shape rather than inventing a turn boundary with no upstream source.
+        let Some(usage) = self.pending_usage.take() else {
+            return;
+        };
+        let cost_usd = usage.as_ref().and_then(|u| {
+            let spec = self.model_spec.as_deref()?;
+            let table = self.pricing.as_ref()?;
+            table.cost(u, spec).map(|m| m.usd)
+        });
+        let outcome = if error.is_some() { "error" } else { "ok" };
+        let answer = std::mem::take(&mut self.answer);
+        self.write(ProtocolLine::TurnEnd {
             v: SCHEMA_VERSION,
             session: self.session.clone(),
-            message: message.to_string(),
+            outcome,
+            error,
+            answer,
+            usage,
+            cost_usd,
         });
     }
 }
@@ -255,19 +288,7 @@ impl AgentSink for StreamJsonSink {
     }
 
     fn turn_end(&mut self, usage: Option<Usage>) {
-        let cost_usd = usage.as_ref().and_then(|u| {
-            let spec = self.model_spec.as_deref()?;
-            let table = self.pricing.as_ref()?;
-            table.cost(u, spec).map(|m| m.usd)
-        });
-        let answer = std::mem::take(&mut self.answer);
-        self.write(ProtocolLine::TurnEnd {
-            v: SCHEMA_VERSION,
-            session: self.session.clone(),
-            answer,
-            usage,
-            cost_usd,
-        });
+        self.pending_usage = Some(usage);
     }
 }
 
@@ -287,9 +308,8 @@ pub(super) async fn run_stream_json(flags: AgentFlags, prompt: Vec<String>) -> R
     // Persist "always allow" choices made during the turn even when the turn itself failed —
     // mirrors `run_agentic`.
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
-    if let Err(e) = &outcome {
-        sink.turn_error(&e.to_string());
-    }
+    let error = outcome.as_ref().err().map(ToString::to_string);
+    sink.finish_turn(error.as_deref());
     outcome.context("agent turn")?;
     Ok(())
 }
@@ -415,10 +435,13 @@ pub(super) async fn run_stream_json_conversation(
         turn_in_flight.store(true, Ordering::Release);
         let outcome = agent.run_turn(&session_id, &input, &mut sink).await;
         turn_in_flight.store(false, Ordering::Release);
-        if let Err(e) = &outcome {
-            sink.turn_error(&e.to_string());
+        let error = outcome.as_ref().err().map(ToString::to_string);
+        sink.finish_turn(error.as_deref());
+        if let Err(error) = outcome {
+            persist_new_rules(&initial_rules, &agent.executor.allow_rules());
+            reader.abort();
+            return Err(error).context("agent turn");
         }
-        outcome.context("agent turn")?;
     }
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
     reader.abort();
@@ -478,6 +501,8 @@ mod tests {
         let line = ProtocolLine::TurnEnd {
             v: SCHEMA_VERSION,
             session: "s1".into(),
+            outcome: "ok",
+            error: None,
             answer: "done".into(),
             usage: None,
             cost_usd: None,

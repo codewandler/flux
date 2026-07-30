@@ -24,9 +24,11 @@ use flux_spec::{Effect, Risk};
 pub const STRICT_REVIEW_FLOW_SRC: &str = include_str!("../../../examples/strict_review.flux");
 
 /// The three built-in reviewer roles the flow's `task` fan-out targets, embedded from the SAME
-/// committed `.flux/agents/review-*.md` files a project can override (L-14). Without these in the
-/// binary, `flux review` failed "unknown role: review-security" in every repo but this one — the
-/// "self-contained, works in any repo" claim depends on the roles shipping alongside the flow.
+/// committed `.flux/agents/review-*.md` files (L-14). Built-in strict-review callers use these
+/// immutable definitions; project roles with the same names are ordinary agent roles and cannot
+/// replace this protocol. Without these in the binary, `flux review` failed "unknown role:
+/// review-security" in every repo but this one — the "self-contained, works in any repo" claim
+/// depends on the roles shipping alongside the flow.
 pub const REVIEW_ROLE_SOURCES: &[(&str, &str)] = &[
     (
         "review-security",
@@ -43,7 +45,7 @@ pub const REVIEW_ROLE_SOURCES: &[(&str, &str)] = &[
 ];
 
 /// The parsed built-in reviewer [`Role`](flux_agent::Role)s. Callers seed these into their role
-/// registry only when absent, so a project's own `.flux/agents/review-*.md` still wins.
+/// registry.
 pub fn builtin_review_roles() -> Vec<flux_agent::Role> {
     REVIEW_ROLE_SOURCES
         .iter()
@@ -160,7 +162,7 @@ mod tests {
     fn builtin_review_roles_ship_the_three_reviewers_toolless() {
         // L-14: `flux review` must work in ANY repo — the three reviewer roles the flow's `task`
         // fan-out targets ship in the binary. Each is the committed `.flux/agents/review-*.md`
-        // (project files still override), declaring `tools: []` (read-nothing reviewers).
+        // declaring `tools: []` (read-nothing reviewers).
         let roles = builtin_review_roles();
         let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(

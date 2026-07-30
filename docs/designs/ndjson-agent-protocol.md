@@ -61,6 +61,11 @@ but nothing about field *shapes* within a known `v` is promised stable yet. The 
 wants to make a compatibility promise bumps `v` and freezes the shape it ships; until then, treat
 `--stream-json` as a preview surface (documented as such on the website page).
 
+C-226 therefore adds `turn_end.outcome` and its optional `error` detail under `v: 1`, without a
+version bump. This is an additive field-shape change on the explicitly unstable preview schema;
+consumers should use `outcome` as the terminal machine contract and continue tolerating fields they
+do not recognize.
+
 ## Line vocabulary
 
 One `\n`-terminated JSON object per line on stdout, flushed after every line (so `| jq` sees it
@@ -75,7 +80,7 @@ until a buffer fills). Every variant is internally tagged on `type` and carries 
 | `tool_result` | `AgentSink::tool_result` + the immediately preceding `AgentSink::tool_timing` | `session`, `name`, `is_error`, `content`, `view`, `duration_us` |
 | `approval` | `Observation{kind: "approval.requested" \| "approval.approved" \| "approval.denied"}` (`loop_host.rs`'s `approve_batch`, forwarded live via `SharedSink` — confirmed the batch-approval path, not just recorded to the durable evidence log) | `session`, `phase` (`requested`/`approved`/`denied`), `data` (the observation's own payload — `scope`/`batch_id`/`actions`/`risk`/`wait_us`; no dedicated `tool` field, since the batch-level approval this fires from has no single-tool subject — a batch can hold several) |
 | `steered` | `Observation{kind: "turn.steering"}` | `session`, `messages` |
-| `turn_end` | `AgentSink::turn_end` | `session`, `answer`, `usage`, `cost_usd` |
+| `turn_end` | `AgentSink::turn_end` plus the terminal `run_turn` result | `session`, `outcome` (`ok`/`error`), optional `error`, `answer`, `usage`, `cost_usd` |
 | `error` | `run_turn`'s `Err(_)` | `session`, `message` |
 
 No line type here invents a fact: each row's Source column is a real, already-existing call site.
@@ -83,16 +88,18 @@ Adding a new line type in the future means adding a match arm over an existing `
 `Observation` source, never a new field the engine doesn't already produce — this is the acceptance
 item "a new event type cannot be added to the protocol without existing upstream" made concrete.
 
-A note on `error`'s narrowness: a **model/flow-level** failure inside a turn (the adaptive loop
-couldn't complete, a compaction failed, …) is NOT a distinct signal on `AgentSink` today — the engine
-(`FlowEngine::turn_terminal`, `crates/flux-flow/src/engine.rs`) converts it into an ordinary,
-apologetic answer text ("I couldn't complete the turn — …") and still calls the normal
-`text_delta`/`turn_end` pair; there is no sink-visible `outcome: "error"` flag to key on, and
-inventing one by pattern-matching the answer text would violate the "projection, not
-reinterpretation" rule. So that case surfaces in v1 as an ordinary `turn_end` (its `answer` explains
-the failure in prose) — only a failure that aborts `run_turn` itself *before* it reaches that
-conversion (session/lifecycle setup, e.g.) produces the dedicated `error` line. Checked and ruled
-out as a v1 source: a `flow.halt` observation kind exists in the human/TUI renderers
+A note on terminal errors: a **model/flow-level** failure inside a turn is retained by the engine as
+the same typed failure that the adaptive loop already classified; it is not inferred by matching
+apologetic answer prose. `FlowEngine` still finalizes the turn normally — emitting the human answer,
+closing any tool-use/result pair, recording a durable error outcome, and calling
+`AgentSink::turn_end` — then returns `Err`. The stream sink combines that result with the stashed
+`turn_end` usage: on failure it emits a dedicated `error` line followed by a final `turn_end` with
+`outcome: "error"` and the same error detail. On success it emits only `turn_end` with
+`outcome: "ok"`. Because both error signals come from the same `run_turn` result, they cannot
+disagree, and `turn_end` remains the final line for consumers that use it as a turn boundary.
+
+Checked and ruled out as a separate v1 source: a `flow.halt` observation kind exists in the
+human/TUI renderers
 (`rendering.rs`, `flux-tui`) purely defensively — nothing in `flux-flow`/`flux-runtime` production
 code emits one today, so it is not listed as a source (would be inventing a call site that doesn't
 exist); the arm can be added here for free the day something does emit it.

@@ -1733,6 +1733,88 @@ mod tests {
     }
 
     #[test]
+    fn generated_pack_archives_are_total_and_write_only_after_complete_extraction() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut value = self.0;
+                value ^= value >> 12;
+                value ^= value << 25;
+                value ^= value >> 27;
+                self.0 = value;
+                value.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+        }
+
+        let cases = std::env::var("FLUX_ADVERSARIAL_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64usize)
+            .clamp(1, 512);
+        let unix_exe = "flux-plugin-corpus";
+        let windows_exe = "flux-plugin-corpus.exe";
+        let contents = b"committed-secret-free-pack-corpus";
+        let archives = [
+            (false, unix_exe, tar_xz_fixture(unix_exe, contents)),
+            (true, windows_exe, zip_fixture(windows_exe, contents)),
+        ];
+
+        let root = std::env::temp_dir().join(format!(
+            "flux-plugin-pack-adversarial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A temporary known-bad fixture proves the extraction oracle itself is live: corrupt bytes
+        // must fail without creating the destination directory.
+        let known_bad_dest = root.join("known-bad");
+        assert!(unpack_single_binary(&[1, 2, 3], false, unix_exe, &known_bad_dest).is_err());
+        assert!(!known_bad_dest.exists());
+
+        let mut rng = Rng(0xC264_A2C4_1E00_0001);
+        for case in 0..cases {
+            let (windows, exe, seed) = &archives[case % archives.len()];
+            let mut candidate = seed.clone();
+            let recipe = if case % 3 == 0 {
+                let cut = rng.next() as usize % candidate.len();
+                candidate.truncate(cut);
+                format!("truncate:{cut}")
+            } else {
+                let junk_len = 1 + rng.next() as usize % 8;
+                candidate.extend((0..junk_len).map(|_| rng.next() as u8));
+                format!("append:{junk_len}")
+            };
+
+            let dest = root.join(format!("case-{case}"));
+            let outcome =
+                std::panic::catch_unwind(|| unpack_single_binary(&candidate, *windows, exe, &dest));
+            let result = outcome.unwrap_or_else(|_| {
+                panic!(
+                    "pack decoder panicked; reproduce with case={case}, format={}, recipe={recipe}",
+                    if *windows { "zip" } else { "tar.xz" }
+                )
+            });
+            match result {
+                Ok(bytes) => {
+                    // Appended bytes may leave a valid archive. A successful decode must remain
+                    // bounded and materialize exactly the returned single entry.
+                    assert!(
+                        bytes.len() <= 4096,
+                        "case {case}: extraction exceeded corpus bound"
+                    );
+                    assert_eq!(std::fs::read(dest.join(exe)).unwrap(), bytes, "case {case}");
+                    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1, "case {case}");
+                }
+                Err(_) => assert!(
+                    !dest.exists(),
+                    "case {case}: failed extraction left filesystem output ({recipe})"
+                ),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn resolve_release_tag_picks_highest_semver_from_plugins_v_tags() {
         struct StaticTags(Vec<&'static str>);
         #[async_trait::async_trait]

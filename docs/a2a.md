@@ -78,6 +78,25 @@ program's sole declared agent; multi-agent programs should declare an `a2a` chan
 A non-loopback bind requires authentication — a shared secret (`FLUX_SERVER_TOKEN`) or per-request
 principal auth (`[server] introspect_url`). See **Security notes** for all three modes.
 
+Daemon requests are additionally bounded per authenticated principal (or per shared auth realm):
+all authenticated protected-route requests, live REST/webhook/A2A turns, completed provider calls,
+and completed priced provider spend. Configure these under
+`[server]` with `requests_per_minute`, `max_inflight_per_principal`,
+`provider_calls_per_day`, and `provider_spend_usd_per_day`; corresponding `FLUX_SERVER_*`
+environment variables override them. Provider call/spend thresholds are retrospective circuit
+breakers: usage is charged from durable call events when a turn finishes, new work is rejected once
+the threshold is observed, and already-admitted work may overshoot within the live-turn bound. A
+rejected work request returns HTTP `429` before an A2A or webhook session is minted.
+
+Limit state is local to one daemon. Multi-replica deployments need the same aggregate policy at an
+authenticating reverse proxy or shared control plane, keyed from the verified principal/tenant
+claim rather than client IP. The existing A2A per-realm live-task cap remains an inner,
+protocol-specific bound.
+
+Principal authentication/introspection runs before the in-process request limiter because the
+verified principal selects the bucket. The authenticating reverse proxy or identity provider must
+also rate-limit raw arrivals; the per-principal daemon limit cannot protect that pre-admission call.
+
 On startup flux prints:
 
 ```

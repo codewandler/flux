@@ -348,8 +348,8 @@ acceptance mapping.
   name, no file needed) runs it.
 - **CLI:** `flux review --files <path>… [--format md|json] [--fail-on <severity>]`
   (`crates/flux-cli/src/main.rs`) wires roles + sub-agents via a shared `build_review_sub_agents`
-  helper (exactly like `build_agent`'s construction — `load_roles` + `SubAgents::new` — and shared with
-  the `flux app run strict-review` branch so the two call sites can't drift), then runs
+  helper (an immutable registry made only from the embedded reviewer roles + `SubAgents::new`, shared
+  with the `flux app run strict-review` branch so the two call sites can't drift), then runs
   `STRICT_REVIEW_FLOW_SRC` through `flux_sdk::FlowClient::run_flow` (`parse` → `analyze` →
   `execute_with`, deterministic, no model round-trip for the flow itself — only the reviewer
   sub-agents call a model). Markdown (default, a readable findings + gaps summary) or raw
@@ -359,13 +359,14 @@ acceptance mapping.
   `Critical` for this gate (fail-safe — it can never silently slip under a threshold), the opposite
   convention from `flux_tools::cognition`'s ranking (which sorts an unknown severity as the *lowest*
   tier, safe for stable ordering but wrong for a security gate).
-- **Self-contained:** `load_roles`'s existing `DEFAULT_ROLES` fallback pattern already covers the
-  built-in review roles (a project's own `.flux/agents/review-*.md` still overrides), and the flow text
-  ships in the binary via `include_str!` — so `flux review` and `flux app run strict-review` work in
-  any repo, not just this one.
-- **Security:** unchanged from L-11/L-12 — reviewer roles keep `tools: []`; the strict-review core
-  stays read-only; the CLI only ever prints to stdout (no write/network/report-publishing effect was
-  added).
+- **Self-contained:** the built-in reviewer roles and flow text ship in the binary via
+  `include_str!`, so `flux review` and `flux app run strict-review` work in any repo. Project and
+  user-global roles with the same names do not replace this embedded security protocol.
+- **Security:** reviewer roles keep `tools: []`; the strict-review core stays read-only; the CLI only
+  ever prints to stdout (no write/network/report-publishing effect was added). Because the fixed flow
+  is internally auto-approved, direct `flux review` also inherits the fail-closed unattended sandbox
+  profile. Project-specific checks must use a future explicit, read-only extension contract (C-161),
+  never role-name shadowing.
 - Tests: `crates/flux-app/tests/strict_review_journey.rs` (the headline test — `App::deliver("review",
   …)`'s journey result equals `FlowClient::run_flow`'s direct result, byte for byte, against the same
   mock reviewer fixture; added RED before the sub-agent wiring existed, GREEN after), `flux-app/src/

@@ -155,9 +155,9 @@ pub struct SystemHostCaps {
     /// `process.run`/`process.spawn` execute in the context's *active* root — a worktree transition
     /// is observed by the next op. [`FixedSystem`] for non-transitioning surfaces.
     system: Arc<dyn SystemSource>,
-    /// Redirect-disabled client for `http.do`. Redirects are handled manually so every target is
-    /// re-checked against both the shared SSRF guard and this plugin's manifest host scope.
-    http: reqwest::Client,
+    /// Resolver used by the egress guard. The exact answer is consumed by the HTTP/TCP connection,
+    /// not discarded before a second connect-time lookup.
+    host_resolver: Arc<dyn flux_system::net::HostResolver>,
     private_net_grants: Vec<String>,
     grants: PluginCapabilities,
     auth: Vec<AuthMethod>,
@@ -231,10 +231,7 @@ impl SystemHostCaps {
     pub fn from_source(system: Arc<dyn SystemSource>) -> Self {
         Self {
             system,
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("the plugin HTTP client uses only static options"),
+            host_resolver: Arc::new(flux_system::net::SystemHostResolver),
             private_net_grants: Vec::new(),
             grants: PluginCapabilities::default(),
             auth: Vec::new(),
@@ -261,6 +258,15 @@ impl SystemHostCaps {
         } else {
             Vec::new()
         };
+        self
+    }
+
+    /// Inject the DNS resolver used for both authorization and the pinned connection.
+    ///
+    /// Production uses the system resolver. Tests use this seam to model a hostname whose first
+    /// answer is admissible and whose hypothetical connect-time answer would be private.
+    pub fn with_host_resolver(mut self, resolver: Arc<dyn flux_system::net::HostResolver>) -> Self {
+        self.host_resolver = resolver;
         self
     }
 
@@ -335,9 +341,9 @@ impl SystemHostCaps {
 
     /// Fire the egress-audit hook (if installed) when `host` is a private/internal address — i.e. the
     /// scoped grant just admitted a request the bare SSRF guard would have refused.
-    fn audit_admit(&self, host: &str) {
+    fn audit_admit(&self, host: &str, pinned: &[std::net::SocketAddr]) {
         if let Some(audit) = &self.audit {
-            if flux_system::net::host_resolves_private(host) {
+            if flux_system::net::destination_is_private(host, pinned) {
                 audit.record_private_admit(&self.caller, host, &self.grant_source);
             }
         }
@@ -366,18 +372,40 @@ impl SystemHostCaps {
                 base.trim_end_matches('/'),
                 oauth.token_path.trim_start_matches('/')
             );
-            let url = guard_http_url(&token_url, &self.private_net_allow())?;
+            // Validate the declared endpoint's syntax and manifest host grant before consulting
+            // the credential store. DNS is deliberately later: absent/fresh tokens perform no
+            // network IO, so they must not depend on resolver availability.
+            let url = url::Url::parse(&token_url)
+                .map_err(|error| format!("oauth token endpoint is invalid: {error}"))?;
             self.ensure_http_host_allowed(&url)?;
             let key = format!("plugin:{}:{}", self.caller, purpose);
             // Use the injected store (D-83) or fall back to the default file backend.
             let file_store = flux_credentials::FileCredentialStore;
             let store: &dyn flux_credentials::CredentialStore =
                 self.cred_store.as_deref().unwrap_or(&file_store);
-            match flux_credentials::resolve_stored_bearer(
+            match flux_credentials::resolve_stored_bearer_with_client_factory(
                 store,
                 &key,
                 url.as_str(),
                 &oauth.client_id,
+                || {
+                    // The credential helper invokes this factory only for a stale stored token
+                    // carrying refresh material. Resolve, guard, pin, and audit at that moment so
+                    // authorization and connect consume the same DNS answer without making the
+                    // offline absent/fresh paths resolve at all.
+                    let (guarded_url, pinned) = guard_http_url_pinned(
+                        &token_url,
+                        &self.private_net_allow(),
+                        self.host_resolver.as_ref(),
+                    )
+                    .map_err(flux_core::Error::Http)?;
+                    let client = pinned_http_client(&guarded_url, &pinned, "oauth refresh")
+                        .map_err(flux_core::Error::Http)?;
+                    if let Some(host) = guarded_url.host_str() {
+                        self.audit_admit(host, &pinned);
+                    }
+                    Ok(client)
+                },
             )
             .await
             {
@@ -663,8 +691,15 @@ impl SystemHostCaps {
         let mut url = initial_url;
         let mut redirects = 0usize;
         loop {
-            let mut request = self
-                .http
+            let (guarded_url, pinned) = guard_http_url_pinned(
+                url.as_str(),
+                &self.private_net_allow(),
+                self.host_resolver.as_ref(),
+            )?;
+            self.ensure_http_host_allowed(&guarded_url)?;
+            let client = pinned_http_client(&guarded_url, &pinned, "http.do")?;
+            url = guarded_url;
+            let mut request = client
                 .request(method.clone(), url.clone())
                 .headers(headers.clone());
             if let Some(bytes) = &body {
@@ -672,7 +707,7 @@ impl SystemHostCaps {
             }
             let response = request.send().await.map_err(|e| format!("http.do: {e}"))?;
             if let Some(host) = url.host_str() {
-                self.audit_admit(host);
+                self.audit_admit(host, &pinned);
             }
 
             if !follows_redirects || !is_followed_http_redirect(response.status()) {
@@ -692,8 +727,7 @@ impl SystemHostCaps {
             let joined = url
                 .join(location)
                 .map_err(|e| format!("http.do: invalid redirect Location: {e}"))?;
-            let mut next = guard_http_url(joined.as_str(), &self.private_net_allow())?;
-            self.ensure_http_host_allowed(&next)?;
+            let mut next = joined;
             if url.scheme() == "https" && next.scheme() == "http" {
                 return Err(format!(
                     "http.do: refusing HTTPS-to-HTTP redirect to {next}"
@@ -1337,19 +1371,53 @@ impl HostCapabilities for SystemHostCaps {
                         other => return Err(format!("conn.dial: unknown kind `{other}`")),
                     }
                 };
+                // A Unix grant names a filesystem location, so it can only be enforced against the
+                // socket's *physical* identity. Rejecting `.`/`..` and confining `*` to one segment
+                // still leaves `alias.sock` — a dot-free, single-segment, perfectly granted spelling
+                // — free to be a symlink the kernel then follows to a listener outside the grant.
+                // Both sides are reduced, never just the target: a grant and a target that name one
+                // socket through different symlinked spellings (`/tmp` vs macOS `/private/tmp`) must
+                // still match. Resolving here also makes the checked path the dialed path, so the
+                // link cannot be repointed between the two.
+                let unix_path = match &target {
+                    flux_system::net::DialTarget::Unix { path } => Some(path.clone()),
+                    flux_system::net::DialTarget::Tcp { .. } => None,
+                };
+                let (target, grants) = if let Some(path) = unix_path {
+                    let sys = self.system();
+                    let physical = sys.host_path_identity(&path).map_err(|e| {
+                        format!("conn.dial: cannot resolve unix path `{path}`: {e}")
+                    })?;
+                    let grants = self
+                        .grants
+                        .conn
+                        .iter()
+                        .map(|g| physical_unix_grant(&sys, g))
+                        .collect::<Vec<_>>();
+                    (
+                        flux_system::net::DialTarget::Unix { path: physical },
+                        std::borrow::Cow::Owned(grants),
+                    )
+                } else {
+                    (target, std::borrow::Cow::Borrowed(&self.grants.conn))
+                };
                 let tstr = conn_target_str(&target);
-                if !conn_granted(&self.grants.conn, &tstr) {
+                if !conn_granted(&grants[..], &tstr) {
                     return Err(format!(
                         "conn.dial: target `{tstr}` not in this plugin's granted conn capabilities"
                     ));
                 }
-                let stream = flux_system::net::dial_scoped(&target, &self.private_net_allow())
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let (stream, pinned) = flux_system::net::dial_scoped_pinned_with_resolver(
+                    &target,
+                    &self.private_net_allow(),
+                    self.host_resolver.as_ref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
                 // The dial was admitted. A TCP target that resolves private was let through by the
                 // scoped grant (Unix sockets aren't IP egress) — audit it.
                 if let flux_system::net::DialTarget::Tcp { host, .. } = &target {
-                    self.audit_admit(host);
+                    self.audit_admit(host, &pinned);
                 }
                 let id = self
                     .next_conn
@@ -1495,19 +1563,77 @@ fn conn_target_str(t: &flux_system::net::DialTarget) -> String {
 }
 
 /// Whether a plugin's `conn` grant list permits `target`. Entries match exactly or with a single `*`
-/// wildcard segment (e.g. `tcp:*:5432`, `tcp:db.internal:*`, `unix:/var/run/*.sock`).
+/// wildcard segment (e.g. `tcp:*:5432`, `tcp:db.internal:*`, `unix:/var/run/*.sock`). Unix targets
+/// containing `.`/`..` components are refused before matching so the kernel cannot resolve a
+/// granted spelling to a socket outside that grant.
 fn conn_granted(grants: &[String], target: &str) -> bool {
+    if target
+        .strip_prefix("unix:")
+        .is_some_and(unix_path_has_dot_components)
+    {
+        return false;
+    }
     grants.iter().any(|g| conn_glob(g, target))
+}
+
+/// Reduce a `unix:` conn grant to physical form so it can be matched against a physically-reduced
+/// target. Only the literal directory prefix *before* any wildcard is resolved — the wildcard and
+/// the segment holding it are pattern text, not a path, so they are carried through untouched. A
+/// non-unix grant, a relative one, or one whose prefix cannot be resolved passes through verbatim:
+/// failing to reduce a grant must never silently widen it, and an unreduced grant simply fails to
+/// match a reduced target.
+fn physical_unix_grant(sys: &flux_system::System, grant: &str) -> String {
+    let Some(pattern) = grant.strip_prefix("unix:") else {
+        return grant.to_string();
+    };
+    let head = match pattern.split_once('*') {
+        Some((literal, _)) => literal,
+        None => pattern,
+    };
+    // Everything up to the last separator is a real directory; the remainder stays as written.
+    let Some(cut) = head.rfind('/') else {
+        return grant.to_string();
+    };
+    let dir = &pattern[..cut];
+    if dir.is_empty() {
+        return grant.to_string();
+    }
+    match sys.host_path_identity(dir) {
+        Ok(physical) => format!("unix:{physical}{}", &pattern[cut..]),
+        Err(_) => grant.to_string(),
+    }
 }
 
 /// Match a pattern with at most one `*` wildcard against a string.
 fn conn_glob(pat: &str, s: &str) -> bool {
+    if let (Some(pattern), Some(target)) = (pat.strip_prefix("unix:"), s.strip_prefix("unix:")) {
+        if unix_path_has_dot_components(pattern) || pat.matches('*').count() > 1 {
+            return false;
+        }
+        return match pattern.split_once('*') {
+            Some((pre, suf)) => {
+                if target.len() < pre.len() + suf.len()
+                    || !target.starts_with(pre)
+                    || !target.ends_with(suf)
+                {
+                    return false;
+                }
+                let wildcard = &target[pre.len()..target.len() - suf.len()];
+                !wildcard.contains('/')
+            }
+            None => pattern == target,
+        };
+    }
     match pat.split_once('*') {
         Some((pre, suf)) => {
             s.len() >= pre.len() + suf.len() && s.starts_with(pre) && s.ends_with(suf)
         }
         None => pat == s,
     }
+}
+
+fn unix_path_has_dot_components(path: &str) -> bool {
+    path.split('/').any(|part| matches!(part, "." | ".."))
 }
 
 /// Truncate a `String` to at most `max` bytes without splitting a UTF-8 codepoint (`String::truncate`
@@ -1631,6 +1757,41 @@ async fn read_http_body_capped(
 /// coverage), the same SSRF policy the agent's own `web.fetch` uses.
 fn guard_http_url(raw: &str, allow: &PrivateNetAllow) -> std::result::Result<url::Url, String> {
     flux_system::net::guard_url_scoped(raw, allow).map_err(|e| e.to_string())
+}
+
+fn guard_http_url_pinned(
+    raw: &str,
+    allow: &PrivateNetAllow,
+    resolver: &dyn flux_system::net::HostResolver,
+) -> std::result::Result<(url::Url, Vec<std::net::SocketAddr>), String> {
+    flux_system::net::guard_url_scoped_pinned_with_resolver(raw, allow, resolver)
+        .map_err(|e| e.to_string())
+}
+
+/// Build a redirect-disabled client for exactly one authorized HTTP hop. The host mapping is
+/// replaced with the guard's vetted socket set, closing the gap between DNS authorization and the
+/// connection. An empty answer is a failed authorization, not permission to resolve again.
+fn pinned_http_client(
+    url: &url::Url,
+    pinned: &[std::net::SocketAddr],
+    op: &str,
+) -> std::result::Result<reqwest::Client, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("{op}: guarded URL has no host"))?;
+    if pinned.is_empty() {
+        return Err(format!(
+            "{op}: refusing to connect to {host} — DNS returned no vetted addresses"
+        ));
+    }
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        // Never allow ambient proxy configuration to replace the guard-vetted connection peer or
+        // perform the hostname resolution behind the authorization boundary.
+        .no_proxy()
+        .resolve_to_addrs(host, pinned)
+        .build()
+        .map_err(|e| format!("{op}: building pinned HTTP client failed: {e}"))
 }
 
 /// Compose an absolute request URL from a resolved base and an optional plugin-supplied `path`.
@@ -1769,6 +1930,40 @@ mod tests {
     // non-test host path reaches them only through `handshake::terminate_handshake`.
     use super::pg;
     use super::*;
+
+    struct SequenceResolver {
+        answers: Vec<std::net::IpAddr>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SequenceResolver {
+        fn new(answers: &[&str]) -> Self {
+            Self {
+                answers: answers
+                    .iter()
+                    .map(|answer| answer.parse().unwrap())
+                    .collect(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl flux_system::net::HostResolver for SequenceResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .answers
+                .get(call)
+                .or_else(|| self.answers.last())
+                .copied()
+                .into_iter()
+                .collect())
+        }
+    }
 
     #[test]
     fn remove_descriptor_deletes_file_and_reports_missing_as_false() {
@@ -2781,8 +2976,10 @@ mod tests {
 
     /// D-81: an OAuth2-backed purpose resolves a fresh bearer from the credential store (keyed by
     /// `plugin:<name>:<purpose>`); with no stored token it falls back to the declared env secret. The
-    /// token endpoint is built from the DECLARED endpoint and still passes the SSRF + host allow-list
-    /// guards. (The store→refresh mechanics themselves are covered in flux-credentials.)
+    /// token endpoint is built from the DECLARED endpoint and still passes the manifest host check
+    /// before credential lookup. DNS guard/pinning is lazy: absent/fresh tokens stay offline, while
+    /// stale refresh still fails closed. (The store→refresh mechanics themselves are covered in
+    /// flux-credentials.)
     #[tokio::test]
     async fn oauth2_purpose_resolves_stored_bearer_else_env_fallback() {
         use flux_system::{System, Workspace};
@@ -2821,7 +3018,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let caps = SystemHostCaps::new(sys).with_manifest(&manifest);
+        let resolver = Arc::new(SequenceResolver::new(&[]));
+        let caps = SystemHostCaps::new(sys)
+            .with_manifest(&manifest)
+            .with_host_resolver(resolver.clone());
 
         // No stored token → env fallback.
         let got = caps
@@ -2829,6 +3029,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got["value"], "env-fallback-tok");
+        assert_eq!(
+            resolver.calls(),
+            0,
+            "an absent stored token must not resolve the refresh endpoint"
+        );
 
         // A stored token (no expiry → never auto-refreshes) is returned as the bearer, over env.
         flux_credentials::save_token(
@@ -2846,9 +3051,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got["value"], "stored-bearer");
+        assert_eq!(
+            resolver.calls(),
+            0,
+            "a fresh stored token must not resolve the refresh endpoint"
+        );
 
         std::env::remove_var("HOME");
         std::env::remove_var("FLUX_TEST_OAUTH_ENV");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-257: OAuth refresh uses the same pinned transport as plugin HTTP instead of constructing a
+    /// fresh client from the token URL. The fake hostname can reach the loopback token stub only
+    /// through the guard's pin, and the resolver's metadata answer is never requested.
+    #[tokio::test]
+    async fn oauth_refresh_consumes_the_guard_vetted_address() {
+        use async_trait::async_trait;
+        use flux_system::{System, Workspace};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct RefreshStore(std::sync::Mutex<flux_credentials::OAuthToken>);
+        #[async_trait]
+        impl flux_credentials::CredentialStore for RefreshStore {
+            async fn load(&self, _key: &str) -> Option<flux_credentials::OAuthToken> {
+                Some(self.0.lock().unwrap().clone())
+            }
+
+            async fn save(
+                &self,
+                _key: &str,
+                token: &flux_credentials::OAuthToken,
+            ) -> flux_core::Result<()> {
+                *self.0.lock().unwrap() = token.clone();
+                Ok(())
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"access_token":"fresh-pinned","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("flux-oauth-pin-c257-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let resolver = Arc::new(SequenceResolver::new(&["127.0.0.1", "169.254.169.254"]));
+        let store = Arc::new(RefreshStore(std::sync::Mutex::new(
+            flux_credentials::OAuthToken {
+                access: "stale".into(),
+                refresh: Some("refresh-secret".into()),
+                expires_at_ms: Some(0),
+                account_id: None,
+            },
+        )));
+        let manifest = PluginManifest {
+            name: "oauth-pin".into(),
+            auth: vec![AuthMethod::oauth2(
+                "api",
+                OAuth2Spec {
+                    endpoint: "api".into(),
+                    token_path: "/oauth/token".into(),
+                    client_id: "cid".into(),
+                    grants: vec![OAuthGrant::RefreshToken],
+                    ..Default::default()
+                },
+            )],
+            endpoints: vec![EndpointSpec {
+                name: "api".into(),
+                default: Some(format!("http://oauth-pin.test:{port}")),
+                http_hosts: vec!["oauth-pin.test".into()],
+                ..Default::default()
+            }],
+            capabilities: PluginCapabilities {
+                http: true,
+                http_hosts: vec!["oauth-pin.test".into()],
+                private_hosts: vec!["oauth-pin.test".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys)
+            .with_manifest(&manifest)
+            .with_host_resolver(resolver.clone())
+            .with_private_net_grants(vec!["oauth-pin.test".into()])
+            .with_credential_store(store);
+
+        let bearer = caps
+            .handle("secret", &json!({"purpose": "api"}))
+            .await
+            .unwrap();
+        assert_eq!(bearer["value"], "fresh-pinned");
+        server.await.unwrap();
+        assert_eq!(resolver.calls(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3568,6 +3872,142 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn unix_conn_wildcards_are_single_segment_and_traversal_safe() {
+        let grants = vec!["unix:/tmp/plugin/*.sock".to_string()];
+        assert!(conn_granted(&grants, "unix:/tmp/plugin/db.sock"));
+        assert!(!conn_granted(&grants, "unix:/tmp/plugin/nested/db.sock"));
+        assert!(!conn_granted(
+            &grants,
+            "unix:/tmp/plugin/../../var/run/docker.sock"
+        ));
+        assert!(!conn_granted(&grants, "unix:/tmp/plugin/./db.sock"));
+
+        let exact = vec!["unix:/tmp/plugin/../docker.sock".to_string()];
+        assert!(!conn_granted(&exact, "unix:/tmp/plugin/../docker.sock"));
+    }
+
+    /// C-257 closure: a path wildcard is not a directory capability when the final socket name can
+    /// be a symlink. The host must deny the alias before the kernel follows it to an ungranted
+    /// listener outside the nominally granted directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_conn_grant_does_not_follow_symlink_outside_granted_directory() {
+        use flux_system::{System, Workspace};
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "flux-conn-unix-symlink-c257-{}",
+            std::process::id()
+        ));
+        let granted = dir.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let outside_socket = dir.join("outside.sock");
+        let listener = tokio::net::UnixListener::bind(&outside_socket).unwrap();
+        let alias = granted.join("alias.sock");
+        symlink(&outside_socket, &alias).unwrap();
+
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            conn: vec![format!("unix:{}/*.sock", granted.display())],
+            ..Default::default()
+        });
+        let result = caps
+            .handle(
+                "conn.dial",
+                &json!({"kind": "unix", "path": alias.to_string_lossy()}),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a Unix grant wildcard must not authorize a symlink to an outside socket"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "the ungranted outside listener must never receive a connection"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-257 closure, the other half: enforcing physical identity must deny only what actually
+    /// escapes. A symlink resolving to a socket *inside* the granted directory is still granted —
+    /// otherwise the fix would be a blanket ban on symlinked sockets rather than a containment
+    /// boundary, and would break the ordinary `/run/service/current.sock` indirection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_conn_grant_allows_symlink_that_resolves_inside_granted_directory() {
+        use flux_system::{System, Workspace};
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "flux-conn-unix-symlink-inside-c257-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let granted = dir.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let real_socket = granted.join("real.sock");
+        let _listener = tokio::net::UnixListener::bind(&real_socket).unwrap();
+        let alias = granted.join("alias.sock");
+        symlink(&real_socket, &alias).unwrap();
+
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            conn: vec![format!("unix:{}/*.sock", granted.display())],
+            ..Default::default()
+        });
+        let result = caps
+            .handle(
+                "conn.dial",
+                &json!({"kind": "unix", "path": alias.to_string_lossy()}),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a symlink resolving inside the granted directory must stay authorized, got: {result:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-257: `conn.dial` must connect directly to the address returned by its authorization
+    /// lookup. A fake hostname has no system DNS entry; reaching the listener proves the pin was
+    /// consumed, and the single resolver call proves connect did not ask for the metadata answer.
+    #[tokio::test]
+    async fn conn_dial_consumes_the_vetted_address_without_rebinding() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-conn-pin-c257-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let resolver = Arc::new(SequenceResolver::new(&["127.0.0.1", "169.254.169.254"]));
+        let caps = SystemHostCaps::new(sys)
+            .with_host_resolver(resolver.clone())
+            .with_private_net_grants(vec!["plugin-db.test".into()])
+            .with_grants(PluginCapabilities {
+                conn: vec![format!("tcp:plugin-db.test:{port}")],
+                private_hosts: vec!["plugin-db.test".into()],
+                ..Default::default()
+            });
+
+        let opened = caps
+            .handle(
+                "conn.dial",
+                &json!({"kind": "tcp", "host": "plugin-db.test", "port": port}),
+            )
+            .await
+            .unwrap();
+        assert!(opened["conn_id"].is_u64());
+        accepted.await.unwrap();
+        assert_eq!(resolver.calls(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn conn_read_timeout_returns_timed_out_without_closing() {
         // D-45: a `conn.read` with `timeout_ms` that elapses before data arrives returns
@@ -3972,6 +4412,142 @@ mod tests {
             err.contains("private/loopback"),
             "shared guard denial: {err}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-257: every HTTP hop is pinned to the answer that its guard call vetted. The resolver's
+    /// third answer models a connect-time rebind to metadata; two-hop success plus exactly two
+    /// resolver calls proves neither connection performs a hidden lookup.
+    #[tokio::test]
+    async fn http_do_pins_the_initial_request_and_each_redirect_hop() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!(
+            "flux-http-pinned-redirect-c257-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let port = spawn_same_origin_redirect().await;
+        let resolver = Arc::new(SequenceResolver::new(&[
+            "127.0.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+        ]));
+        let caps = SystemHostCaps::new(sys)
+            .with_host_resolver(resolver.clone())
+            .with_private_net_grants(vec!["plugin-http.test".into()])
+            .with_grants(PluginCapabilities {
+                http: true,
+                http_hosts: vec!["plugin-http.test".into()],
+                private_hosts: vec!["plugin-http.test".into()],
+                ..Default::default()
+            });
+
+        let result = caps
+            .handle(
+                "http.do",
+                &json!({"url": format!("http://plugin-http.test:{port}/start")}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["body"], "final");
+        assert_eq!(
+            resolver.calls(),
+            2,
+            "one authorization lookup per hop; no connect-time re-resolution"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-257 closure: reqwest's ambient proxy support must not replace the address admitted by the
+    /// guard. Run in an isolated child process because proxy variables are process-global.
+    #[tokio::test]
+    async fn pinned_http_client_ignores_ambient_proxy() {
+        const CHILD: &str = "FLUX_PLUGIN_PROXY_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::tests::pinned_http_client_ignores_ambient_proxy",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated proxy regression failed");
+            return;
+        }
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_once(listener: tokio::net::TcpListener, reached: Arc<AtomicBool>) {
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    .await;
+            let Ok(Ok((mut socket, _))) = accepted else {
+                return;
+            };
+            reached.store(true, Ordering::SeqCst);
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        }
+
+        let pinned = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pinned_addr = pinned.local_addr().unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let pinned_reached = Arc::new(AtomicBool::new(false));
+        let proxy_reached = Arc::new(AtomicBool::new(false));
+        let pinned_task = tokio::spawn(serve_once(pinned, pinned_reached.clone()));
+        let proxy_task = tokio::spawn(serve_once(proxy, proxy_reached.clone()));
+
+        let proxy_url = format!("http://{proxy_addr}");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            std::env::set_var(key, &proxy_url);
+        }
+        std::env::set_var("NO_PROXY", "");
+        std::env::set_var("no_proxy", "");
+
+        let url = url::Url::parse(&format!("http://plugin.test:{}/", pinned_addr.port())).unwrap();
+        let client = pinned_http_client(&url, &[pinned_addr], "http.do").unwrap();
+        client.get(url).send().await.unwrap();
+
+        pinned_task.await.unwrap();
+        proxy_task.await.unwrap();
+        assert!(pinned_reached.load(Ordering::SeqCst));
+        assert!(!proxy_reached.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn http_do_fails_closed_when_dns_vets_no_address() {
+        use flux_system::{System, Workspace};
+        let dir =
+            std::env::temp_dir().join(format!("flux-http-empty-pin-c257-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let caps = SystemHostCaps::new(sys)
+            .with_host_resolver(Arc::new(SequenceResolver::new(&[])))
+            .with_grants(PluginCapabilities {
+                http: true,
+                http_hosts: vec!["empty.test".into()],
+                ..Default::default()
+            });
+        let err = caps
+            .handle("http.do", &json!({"url": "https://empty.test/path"}))
+            .await
+            .expect_err("an empty guard answer must not reach connect-time DNS");
+        assert!(err.contains("no vetted addresses"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

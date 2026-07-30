@@ -40,8 +40,9 @@
 //!
 //! A census like this rots the moment someone adds a pack to `build_agent_with` and not here.
 //! [`every_registration_seam_in_the_cli_assembly_is_classified`] is the guard against that: it
-//! reads `execution.rs` and fails on any registration call it has not been told about, which forces
-//! a new pack to be either added to the census or explicitly excluded with a reason.
+//! recursively parses every production Rust module below `flux-cli/src` and fails on any
+//! registration call it has not been told about. A new pack must therefore be added to the census
+//! or explicitly excluded with a reason, regardless of which CLI module wires it in.
 //!
 //! # Posture
 //!
@@ -50,10 +51,12 @@
 //! `Risk::Medium`) is recorded in `docs/designs/security-assurance.md`. Read that before changing
 //! any declaration this gate covers.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use flux_runtime::ToolRegistry;
-use flux_spec::metadata_violations;
+use flux_spec::{metadata_violations, Risk};
+use syn::visit::Visit;
 
 /// The audit source label `build_agent_with` registers `TaskTool` under. Shared with the census so
 /// the drift guard's `COVERED_SOURCES` entry and the registration it approves cannot drift apart:
@@ -183,6 +186,166 @@ fn production_catalog() -> ToolRegistry {
     registry
 }
 
+const RISK_REFERENCE_EXCLUDED: &[(&str, &str)] = &[(
+    "web.search",
+    "the first-party websearch plugin is installed from the separately released plugin pack and \
+     is not part of the native CLI catalog until a signed plugin descriptor is loaded",
+)];
+
+#[derive(Debug, Default)]
+struct RiskReferenceCheck {
+    checked: usize,
+    excluded: Vec<String>,
+    errors: Vec<String>,
+}
+
+fn check_published_risk_column(reference: &str, registry: &ToolRegistry) -> RiskReferenceCheck {
+    let mut result = RiskReferenceCheck::default();
+    let mut risk_column = None;
+    let mut seen = BTreeSet::new();
+    for line in reference.lines() {
+        let cells = markdown_table_cells(line);
+        if !line.trim_start().starts_with('|') {
+            risk_column = None;
+            continue;
+        }
+        if let Some(index) = cells.iter().position(|cell| cell == "risk") {
+            risk_column = Some(index);
+            continue;
+        }
+        let Some(index) = risk_column else { continue };
+        let Some(op) = cells
+            .get(1)
+            .and_then(|cell| cell.strip_prefix('`'))
+            .and_then(|cell| cell.strip_suffix('`'))
+        else {
+            continue;
+        };
+        if !seen.insert(op.to_string()) {
+            result
+                .errors
+                .push(format!("the risk table documents `{op}` more than once"));
+            continue;
+        }
+        let Some(documented) = cells.get(index).map(String::as_str) else {
+            result
+                .errors
+                .push(format!("`{op}` has no value in the published risk column"));
+            continue;
+        };
+        let Some(tool) = registry.get(op) else {
+            if let Some((_, reason)) = RISK_REFERENCE_EXCLUDED
+                .iter()
+                .find(|(excluded, _)| *excluded == op)
+            {
+                result.excluded.push(format!("{op}: {reason}"));
+            } else {
+                result.errors.push(format!(
+                    "`{op}` is published in the risk table but cannot be resolved in the production catalog"
+                ));
+            }
+            continue;
+        };
+        let declared = match tool.spec().risk {
+            Risk::Low => "Low",
+            Risk::Medium => "Medium",
+            Risk::High => "High",
+            Risk::Destructive => "Destructive",
+        };
+        result.checked += 1;
+        if documented != declared {
+            result.errors.push(format!(
+                "`{op}` is declared `{declared}` but the reference documents it as `{documented}`"
+            ));
+        }
+    }
+    result
+}
+
+fn markdown_table_cells(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            cell.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+            cell.push(ch);
+        } else if ch == '|' {
+            cells.push(cell.trim().to_string());
+            cell.clear();
+        } else {
+            cell.push(ch);
+        }
+    }
+    cells.push(cell.trim().to_string());
+    cells
+}
+
+/// C-233: the Risk column operators read is checked against the same widest production census as
+/// metadata coherence. No unresolved row is silently skipped; the separately shipped plugin alias
+/// is the sole reasoned exception, and the count floor makes an empty/changed table fail closed.
+#[test]
+fn the_published_risk_column_matches_the_production_catalog() {
+    let registry = production_catalog();
+    let reference = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../flux-flow/docs/ops-reference.md"),
+    )
+    .expect("the ops reference is readable");
+    let result = check_published_risk_column(&reference, &registry);
+    assert!(
+        result.checked > 60,
+        "only {} published Risk rows resolved in the production catalog — the table parser or \
+         census probably stopped early; exclusions: {:?}",
+        result.checked,
+        result.excluded
+    );
+    assert_eq!(
+        result.excluded.len(),
+        RISK_REFERENCE_EXCLUDED.len(),
+        "a reasoned risk-table exclusion disappeared or was not exercised: {:?}",
+        result.excluded
+    );
+    assert!(
+        result.errors.is_empty(),
+        "crates/flux-flow/docs/ops-reference.md has drifted from the production catalog:\n  {}",
+        result.errors.join("\n  ")
+    );
+}
+
+#[test]
+fn a_non_builtin_published_risk_drift_is_caught() {
+    let registry = production_catalog();
+    let reference = "| op | signature | risk | description |\n\
+                     |---|---|---|---|\n\
+                     | `browser.close` | `session` | Low | deliberately wrong fixture |";
+    let result = check_published_risk_column(reference, &registry);
+    assert_eq!(result.checked, 1);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|error| error.contains("`browser.close` is declared `Medium`")),
+        "a non-built-in risk drift passed silently: {result:?}"
+    );
+}
+
+#[test]
+fn an_unresolved_published_risk_row_fails_with_its_name() {
+    let registry = production_catalog();
+    let reference = "| op | risk |\n|---|---|\n| `future.unregistered` | Low |";
+    let result = check_published_risk_column(reference, &registry);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|error| error.contains("`future.unregistered`")),
+        "an unresolved row was silently skipped: {result:?}"
+    );
+}
+
 /// Every `metadata_violations` sentence raised by every op in `registry`, sorted for a stable
 /// failure message.
 fn violations_in(registry: &ToolRegistry) -> Vec<String> {
@@ -295,195 +458,429 @@ fn the_sub_agent_base_registry_is_a_coherent_subset_of_the_catalog() {
     }
 }
 
-/// Drift guard. A census assembled by hand goes stale the moment a pack is added to
-/// `build_agent_with` and not here, and it goes stale *silently* — the gate keeps passing while
-/// covering less. So the registration seams are enumerated from the source of `execution.rs` and
-/// each must be classified: one the census drives, or one deliberately out of scope.
-///
-/// Two things are classified, because the function name alone is not enough. Most packs arrive
-/// through a name of their own (`try_register_web`, `try_register_eval_ops`, …), but `TaskTool` and
-/// every plugin op arrive through the *same* generic `try_register_from`, so a new
-/// `registry.try_register_from("new pack", …)` would inherit an already-approved name and escape.
-/// The **source label** — `try_register_from`'s first argument, the string the registry records for
-/// audit — is therefore classified too, and a new label fails this test until someone says which it
-/// is.
-///
-/// # What this does *not* catch
-///
-/// Stated plainly, because a guard that overstates itself is worse than one with a documented
-/// limit:
-///
-/// * Only `execution.rs` is scanned. A pack registered into the agent's catalog from another
-///   `flux-cli` module would not be seen. (`app_cmd.rs`'s `assemble_integrations` reaches the
-///   catalog only through the `source` label classified below, so it is covered today — but that is
-///   a fact about the current call graph, not something this test enforces.)
-/// * A new registration that *reuses* an already-classified source label. Labels are an audit
-///   facility, not a uniqueness key, and nothing forces a new pack to introduce its own.
-///
-/// Neither hole is silent in the way the original gap was: both require someone to route a new pack
-/// through existing machinery rather than to simply add a call.
-#[test]
-fn every_registration_seam_in_the_cli_assembly_is_classified() {
-    /// Seams the census drives, directly or through `register_tool_packs`.
-    const COVERED: &[&str] = &[
-        "try_register_builtins",
-        "try_register_dev_builtins",
-        "try_register_eval_ops",
-        "try_register_reflect",
-        "try_register_flows",
-        "try_register_render",
-        "try_register_datasource_ops",
-        // A `board:<backend>` datasource declaration (A-131). `build_datasources` names it in
-        // `execution.rs`; the loop that calls it lives in `app_cmd.rs`, and the census drives the
-        // same registrar so the generated board ops are walked by the gate above.
-        "try_register_work_board",
-        "try_register_fleet",
-        "try_register_web",
-        "try_register_model_stage",
-        // The generic registry methods, whose *callers* are classified by source label below.
-        // `try_register` is the pack-owned shorthand (`ConsultTool`, `WakeupTool`), both reached
-        // through `register_tool_packs`; it takes no label.
-        "try_register_from",
-        "try_register_all_from",
-        "try_register",
-    ];
-    /// Seams deliberately outside this gate, with the reason.
-    const EXCLUDED: &[(&str, &str)] = &[(
-        "try_register_op",
-        "flux-sdk's embedder seam: ops authored outside this repo, with no compile-time list to \
-         walk. Third-party metadata is checked where it crosses the trust boundary — the plugin \
-         loader's `op_coherence_warnings` — not at a registration call.",
-    )];
-    // Source labels the census registers under itself, in the quoted form they take in source
-    // text. Built at runtime rather than as a `const` so the `TaskTool` entry is *derived from*
-    // the constant the census registers with: change the label in `execution.rs` alone and the
-    // guard reports an unclassified label rather than approving a name that no longer appears.
-    let covered_sources: [String; 3] = [
-        // `CognitionPack::try_register_from`, driven via `register_tool_packs`.
+/// Registration methods whose production call sites are represented by [`production_catalog`].
+const COVERED_REGISTRATION_SEAMS: &[&str] = &[
+    "try_register_builtins",
+    "try_register_dev_builtins",
+    "try_register_eval_ops",
+    "try_register_reflect",
+    "try_register_flows",
+    "try_register_render",
+    "try_register_datasource_ops",
+    "try_register_work_board",
+    "try_register_fleet",
+    "try_register_web",
+    "try_register_model_stage",
+    "try_register_from",
+    "try_register_all_from",
+    "try_register",
+];
+
+/// Registration methods that cannot be represented by a repository-owned static census.
+const EXCLUDED_REGISTRATION_SEAMS: &[(&str, &str)] = &[(
+    "try_register_op",
+    "flux-sdk's embedder seam accepts operations authored outside this repository; plugin metadata \
+     is checked when it crosses the trust boundary by flux-plugin's op_coherence_warnings",
+)];
+
+/// Dynamic source expressions that cannot name a repository-owned static pack.
+const EXCLUDED_REGISTRATION_SOURCES: &[(&str, &str)] = &[(
+    "source",
+    "assemble_integrations uses a runtime source for endpoint and subprocess-plugin operations; \
+     endpoint operations are represented directly and plugin metadata is checked at load",
+)];
+
+#[derive(Debug, PartialEq, Eq)]
+struct RegistrationCall {
+    module: String,
+    seam: String,
+    source: Option<String>,
+}
+
+fn covered_registration_sources() -> [String; 5] {
+    [
         "\"flux-cli cognition pack\"".to_string(),
         format!("{TASK_OP_SOURCE:?}"),
-        // `try_register_fleet`, also driven via `register_tool_packs`.
         format!("{FLEET_OP_SOURCE:?}"),
-    ];
-    /// Source labels deliberately outside the census, with the reason.
-    const EXCLUDED_SOURCES: &[(&str, &str)] = &[(
-        "source",
-        "the `assemble_integrations` loop, whose label is a runtime value covering two populations: \
-         the endpoint ops, which the census registers directly under `cli endpoint integration`, \
-         and subprocess plugin ops, whose metadata is authored outside this repo and checked at \
-         load by `flux_plugin`'s `op_coherence_warnings` — there is no compile-time list of them to \
-         walk here.",
-    )];
+        "ConsultTool".to_string(),
+        "WakeupTool".to_string(),
+    ]
+}
 
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execution.rs"),
-    )
-    .expect("execution.rs is readable");
-    // Only the production body. `execution.rs` carries several inline `#[cfg(test)] mod` blocks,
-    // and those register probe tools that are deliberately not part of any catalog — a `Risk::Low`
-    // write is registered on purpose to prove the approval gate still holds. Blocks are skipped by
-    // brace column, which holds because every top-level item in this repo is rustfmt-formatted.
-    let production: String = source
-        .lines()
-        .scan(false, |in_test_module, line| {
-            if *in_test_module {
-                *in_test_module = line != "}";
-                return Some("");
-            }
-            if line.trim() == "#[cfg(test)]" {
-                *in_test_module = true;
-                return Some("");
-            }
-            Some(line)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let syn::Meta::List(meta) = &attr.meta else {
+            return false;
+        };
+        meta.path.is_ident("cfg") && meta.tokens.to_string() == "test"
+    })
+}
 
-    let mut seen: Vec<&str> = Vec::new();
-    let mut labels: Vec<&str> = Vec::new();
-    let mut rest = production.as_str();
-    while let Some(at) = rest.find("try_register") {
-        let tail = &rest[at..];
-        let end = tail
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(tail.len());
-        let ident = &tail[..end];
-        if !seen.contains(&ident) {
-            seen.push(ident);
+fn registration_source(expr: &syn::Expr) -> String {
+    match expr {
+        syn::Expr::Lit(expr) => match &expr.lit {
+            syn::Lit::Str(value) => format!("{:?}", value.value()),
+            _ => "<non-string literal>".to_string(),
+        },
+        syn::Expr::Path(expr) => expr.path.segments.last().map_or_else(
+            || "<empty path>".to_string(),
+            |segment| segment.ident.to_string(),
+        ),
+        syn::Expr::Reference(expr) => registration_source(&expr.expr),
+        syn::Expr::Paren(expr) => registration_source(&expr.expr),
+        syn::Expr::Group(expr) => registration_source(&expr.expr),
+        syn::Expr::MethodCall(expr) if expr.method == "clone" && expr.args.is_empty() => {
+            registration_source(&expr.receiver)
         }
-        // For the label-bearing methods, capture the first argument — the audit source label.
-        if matches!(ident, "try_register_from" | "try_register_all_from") {
-            if let Some(label) = first_argument(&tail[end..]) {
-                if !labels.contains(&label) {
-                    labels.push(label);
+        syn::Expr::MethodCall(expr) => registration_source(&expr.receiver),
+        syn::Expr::Call(expr) => match expr.func.as_ref() {
+            syn::Expr::Path(function) => function
+                .path
+                .segments
+                .iter()
+                .rev()
+                .find(|segment| segment.ident != "new")
+                .map_or_else(
+                    || "<empty constructor>".to_string(),
+                    |segment| segment.ident.to_string(),
+                ),
+            _ => "<complex constructor>".to_string(),
+        },
+        _ => "<complex expression>".to_string(),
+    }
+}
+
+struct RegistrationVisitor<'a> {
+    module: &'a str,
+    calls: Vec<RegistrationCall>,
+}
+
+impl RegistrationVisitor<'_> {
+    fn record<'ast>(
+        &mut self,
+        seam: &syn::Ident,
+        arguments: impl Iterator<Item = &'ast syn::Expr>,
+    ) {
+        let seam = seam.to_string();
+        if !seam.starts_with("try_register") {
+            return;
+        }
+        let source = matches!(
+            seam.as_str(),
+            "try_register" | "try_register_from" | "try_register_all_from"
+        )
+        .then(|| {
+            arguments
+                .into_iter()
+                .next()
+                .map_or_else(|| "<missing argument>".to_string(), registration_source)
+        });
+        self.calls.push(RegistrationCall {
+            module: self.module.to_string(),
+            seam,
+            source,
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for RegistrationVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(function) = call.func.as_ref() {
+            if let Some(seam) = function.path.segments.last().map(|segment| &segment.ident) {
+                self.record(seam, call.args.iter());
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "try_register" {
+            let receiver = registration_source(&call.receiver);
+            let source = if receiver == "registry" {
+                call.args
+                    .first()
+                    .map_or_else(|| "<missing argument>".to_string(), registration_source)
+            } else {
+                receiver
+            };
+            self.calls.push(RegistrationCall {
+                module: self.module.to_string(),
+                seam: call.method.to_string(),
+                source: Some(source),
+            });
+        } else {
+            self.record(&call.method, call.args.iter());
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn registration_calls_in_source(
+    module: &str,
+    source: &str,
+) -> Result<Vec<RegistrationCall>, String> {
+    let syntax =
+        syn::parse_file(source).map_err(|error| format!("cannot parse {module}: {error}"))?;
+    let mut visitor = RegistrationVisitor {
+        module,
+        calls: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    Ok(visitor.calls)
+}
+
+fn rust_sources_below(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    fn walk(
+        directory: &std::path::Path,
+        sources: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot read an entry below {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, sources)?;
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut sources = Vec::new();
+    walk(root, &mut sources)?;
+    sources.sort();
+    Ok(sources)
+}
+
+fn external_module_candidates(parent: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let directory = parent.parent().expect("a Rust source has a parent");
+    let mut candidates = vec![
+        directory.join(format!("{name}.rs")),
+        directory.join(name).join("mod.rs"),
+    ];
+    if parent.file_name().is_some_and(|name| name != "mod.rs") {
+        if let Some(stem) = parent.file_stem() {
+            candidates.push(directory.join(stem).join(format!("{name}.rs")));
+            candidates.push(directory.join(stem).join(name).join("mod.rs"));
+        }
+    }
+    candidates
+}
+
+fn test_only_external_modules(
+    sources: &[std::path::PathBuf],
+) -> Result<BTreeSet<std::path::PathBuf>, String> {
+    let mut excluded = BTreeSet::new();
+    for source_path in sources {
+        let source = std::fs::read_to_string(source_path)
+            .map_err(|error| format!("cannot read {}: {error}", source_path.display()))?;
+        let syntax = syn::parse_file(&source)
+            .map_err(|error| format!("cannot parse {}: {error}", source_path.display()))?;
+        for item in syntax.items {
+            let syn::Item::Mod(module) = item else {
+                continue;
+            };
+            if module.content.is_some() || !has_cfg_test(&module.attrs) {
+                continue;
+            }
+            for candidate in external_module_candidates(source_path, &module.ident.to_string()) {
+                if candidate.is_file() {
+                    excluded.insert(candidate);
                 }
             }
         }
-        rest = &tail[end..];
     }
+    Ok(excluded)
+}
+
+fn cli_registration_calls() -> Result<(usize, Vec<RegistrationCall>), String> {
+    let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let sources = rust_sources_below(&source_root)?;
+    let test_only = test_only_external_modules(&sources)?;
+    let mut calls = Vec::new();
+    let mut scanned = 0usize;
+
+    for path in sources {
+        if test_only.contains(&path) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let module = path
+            .strip_prefix(&source_root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        calls.extend(registration_calls_in_source(&module, &source)?);
+        scanned += 1;
+    }
+    Ok((scanned, calls))
+}
+
+fn registration_classification_errors(calls: &[RegistrationCall]) -> Vec<String> {
+    let covered_sources = covered_registration_sources();
+    let mut errors = BTreeSet::new();
+
+    for call in calls {
+        if !COVERED_REGISTRATION_SEAMS.contains(&call.seam.as_str())
+            && !EXCLUDED_REGISTRATION_SEAMS
+                .iter()
+                .any(|(seam, _)| *seam == call.seam)
+        {
+            errors.insert(format!(
+                "{}: unclassified registration seam `{}`",
+                call.module, call.seam
+            ));
+        }
+        let Some(source) = &call.source else {
+            continue;
+        };
+        if !covered_sources.contains(source)
+            && !EXCLUDED_REGISTRATION_SOURCES
+                .iter()
+                .any(|(name, _)| *name == source)
+        {
+            errors.insert(format!(
+                "{}: unclassified source label {} at seam `{}`",
+                call.module, source, call.seam
+            ));
+        }
+    }
+    errors.into_iter().collect()
+}
+
+/// Drift guard over the recursively discovered production Rust modules below `flux-cli/src`.
+///
+/// Parsing the modules as Rust syntax makes comments, string contents, and `#[cfg(test)]` modules
+/// inert. Both registration method names and source labels are classified because the generic
+/// `try_register_from` methods otherwise allow a new pack to inherit an already-approved seam.
+///
+/// The remaining limit is deliberate and narrow: a new pack can reuse an already-classified source
+/// label. Registry labels are audit descriptions rather than unique pack identities, so preventing
+/// reuse requires a separate identity contract rather than a stronger source scan.
+#[test]
+fn every_registration_seam_in_the_cli_assembly_is_classified() {
+    let (scanned, calls) = cli_registration_calls().expect("the CLI source tree parses");
+    let seams: BTreeSet<_> = calls.iter().map(|call| call.seam.as_str()).collect();
+    let sources: BTreeSet<_> = calls
+        .iter()
+        .filter_map(|call| call.source.as_deref())
+        .collect();
 
     assert!(
-        seen.len() >= 8 && labels.len() >= 3,
-        "only {} seam(s) and {} source label(s) found in execution.rs — the scan probably stopped \
-         matching, and this test would pass vacuously: {seen:?} / {labels:?}",
-        seen.len(),
-        labels.len()
+        scanned >= 20 && calls.len() >= 20 && seams.len() >= 8 && sources.len() >= 4,
+        "registration census looks vacuous: scanned={scanned}, calls={}, seams={seams:?}, \
+         sources={sources:?}",
+        calls.len()
     );
-    let unclassified: Vec<&&str> = seen
-        .iter()
-        .filter(|ident| {
-            !COVERED.contains(*ident) && !EXCLUDED.iter().any(|(name, _)| name == *ident)
-        })
-        .collect();
     assert!(
-        unclassified.is_empty(),
-        "unclassified registration seam(s) in flux-cli's assembly: {unclassified:?}. Add each to \
-         the census in `production_catalog` (and to COVERED), or to EXCLUDED with the reason it is \
-         out of scope. A pack that registers ops the coherence gate never walks is exactly the gap \
-         C-208 closed."
+        EXCLUDED_REGISTRATION_SEAMS
+            .iter()
+            .all(|(_, reason)| !reason.trim().is_empty())
+            && EXCLUDED_REGISTRATION_SOURCES
+                .iter()
+                .all(|(_, reason)| !reason.trim().is_empty()),
+        "every registration exclusion needs an auditable reason"
     );
-    let unclassified: Vec<&&str> = labels
-        .iter()
-        .filter(|label| {
-            !covered_sources.iter().any(|covered| covered == *label)
-                && !EXCLUDED_SOURCES.iter().any(|(name, _)| name == *label)
-        })
-        .collect();
+
+    let errors = registration_classification_errors(&calls);
     assert!(
-        unclassified.is_empty(),
-        "unclassified registration source label(s) in flux-cli's assembly: {unclassified:?}. These \
-         arrive through the generic `try_register_from`, so the method name alone approves nothing \
-         — add each to the census (and to COVERED_SOURCES), or to EXCLUDED_SOURCES with its reason."
+        errors.is_empty(),
+        "unclassified CLI registration calls:\n{}",
+        errors.join("\n")
     );
 }
 
-/// The first argument of a call, given the text starting at its `(`. Returns `None` if the text
-/// does not open a call. Tracks nesting and string literals so a label containing a comma, or an
-/// argument that is itself a call, does not truncate the result.
-fn first_argument(text: &str) -> Option<&str> {
-    let open = text.find('(')?;
-    let body = &text[open + 1..];
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, ch) in body.char_indices() {
-        if in_string {
-            match ch {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
+#[test]
+fn registration_scan_ignores_comments_strings_and_test_only_calls() {
+    let calls = registration_calls_in_source(
+        "fixture.rs",
+        r##"
+        fn production(registry: &mut Registry, tool: Tool) {
+            // registry.try_register_from("comment pack", tool)?;
+            let _text = r#"registry.try_register_from("string pack", tool)"#;
+            registry.try_register_from("flux-cli cognition pack", tool);
+        }
+
+        #[cfg(test)]
+        mod tests {
+            fn probe(registry: &mut Registry, tool: Tool) {
+                registry.try_register_from("test pack", tool);
             }
-            continue;
         }
-        match ch {
-            '"' => in_string = true,
-            '(' | '[' | '{' => depth += 1,
-            ')' if depth == 0 => return Some(body[..index].trim()),
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => return Some(body[..index].trim()),
-            _ => {}
+        "##,
+    )
+    .expect("fixture parses");
+
+    assert_eq!(
+        calls,
+        vec![RegistrationCall {
+            module: "fixture.rs".to_string(),
+            seam: "try_register_from".to_string(),
+            source: Some("\"flux-cli cognition pack\"".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn a_fresh_app_command_source_label_is_rejected() {
+    let calls = registration_calls_in_source(
+        "app_cmd.rs",
+        r#"
+        fn assemble(registry: &mut Registry, tool: Tool) {
+            registry.try_register_from("fresh app pack", tool);
         }
-    }
-    None
+        "#,
+    )
+    .expect("fixture parses");
+    let errors = registration_classification_errors(&calls);
+
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0].contains("app_cmd.rs")
+            && errors[0].contains("fresh app pack")
+            && errors[0].contains("try_register_from"),
+        "unexpected classification error: {errors:?}"
+    );
+}
+
+#[test]
+fn a_fresh_direct_registration_identity_is_rejected() {
+    let calls = registration_calls_in_source(
+        "execution.rs",
+        r#"
+        fn assemble(registry: &mut Registry) {
+            registry.try_register(FreshTool::new());
+        }
+        "#,
+    )
+    .expect("fixture parses");
+    let errors = registration_classification_errors(&calls);
+
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0].contains("execution.rs")
+            && errors[0].contains("FreshTool")
+            && errors[0].contains("try_register"),
+        "unexpected classification error: {errors:?}"
+    );
 }

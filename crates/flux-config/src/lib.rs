@@ -766,6 +766,18 @@ pub struct ServerConfig {
     /// session's last activity, not its creation — see [`Config::a2a_session_ttl_secs`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2a_session_ttl_secs: Option<u64>,
+    /// Work requests admitted per authenticated principal/realm each minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<u32>,
+    /// Concurrent live turns admitted per authenticated principal/realm across HTTP surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_per_principal: Option<usize>,
+    /// Provider calls admitted per authenticated principal/realm per 24-hour process window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_calls_per_day: Option<u64>,
+    /// Priced provider spend admitted per authenticated principal/realm per 24-hour process window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_spend_usd_per_day: Option<f64>,
     /// RFC 7662 token-introspection endpoint (D-69). Setting this switches `--serve` into
     /// per-request principal auth: every request's bearer is resolved to a principal, sessions
     /// are realm-scoped, and `external_url` becomes required.
@@ -1208,6 +1220,22 @@ fn merge(user: Config, project: Config) -> Config {
                 .server
                 .a2a_session_ttl_secs
                 .or(user.server.a2a_session_ttl_secs),
+            requests_per_minute: project
+                .server
+                .requests_per_minute
+                .or(user.server.requests_per_minute),
+            max_inflight_per_principal: project
+                .server
+                .max_inflight_per_principal
+                .or(user.server.max_inflight_per_principal),
+            provider_calls_per_day: project
+                .server
+                .provider_calls_per_day
+                .or(user.server.provider_calls_per_day),
+            provider_spend_usd_per_day: project
+                .server
+                .provider_spend_usd_per_day
+                .or(user.server.provider_spend_usd_per_day),
             introspect_url: project.server.introspect_url.or(user.server.introspect_url),
             introspect_client_id: project
                 .server
@@ -2110,6 +2138,33 @@ gitlab = ["gitlab.internal"]
         let cfg = load(&project).unwrap();
         assert_eq!(cfg.server.a2a_session_ttl_secs, Some(0));
         assert_eq!(cfg.a2a_session_ttl_secs(), 0, "0 = never prune");
+
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn daemon_resource_budgets_merge_project_over_user() {
+        let project = temp_dir();
+        let home = temp_dir();
+        let _home = crate::HOME_LOCK.lock().unwrap();
+        std::env::set_var("HOME", &home);
+        std::fs::write(
+            home.join(".flux").join("config.toml"),
+            "[server]\nrequests_per_minute = 10\nmax_inflight_per_principal = 2\n\
+             provider_calls_per_day = 100\nprovider_spend_usd_per_day = 5.0\n",
+        )
+        .unwrap();
+        write_project(
+            &project,
+            "[server]\nrequests_per_minute = 20\nprovider_spend_usd_per_day = 1.5\n",
+        );
+
+        let cfg = load(&project).unwrap();
+        assert_eq!(cfg.server.requests_per_minute, Some(20));
+        assert_eq!(cfg.server.max_inflight_per_principal, Some(2));
+        assert_eq!(cfg.server.provider_calls_per_day, Some(100));
+        assert_eq!(cfg.server.provider_spend_usd_per_day, Some(1.5));
 
         std::fs::remove_dir_all(&project).ok();
         std::fs::remove_dir_all(&home).ok();

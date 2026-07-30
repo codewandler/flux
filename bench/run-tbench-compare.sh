@@ -5,8 +5,8 @@
 # builds: `baseline` (pre-cutover main, default b528772 = parent of the multi-pass
 # cutover commit e3ba495) and `post` (the current tree). The current tree's binary is
 # the DRIVER for both legs (it runs `flux flow run` on a generated eval_run flow);
-# what differs per leg is only the `flux_binary` installed into the task containers —
-# each leg's own musl build, prebuilt here with `rebuild: false`, so the baseline leg
+# what differs per leg is only the trusted-host `FLUX_EVAL_BINARY` installed into the task
+# containers — each leg's own prebuilt musl build, so the baseline leg
 # really measures the pre-cutover loop.
 #
 # Strict comparison rules (the story's): same tasks, same trials, same model, both
@@ -89,11 +89,11 @@ mkdir -p "$out"
 git rev-parse HEAD >"$out/post-head.txt"
 git rev-parse "$baseline_ref^{commit}" >"$out/baseline-commit.txt"
 
-# --- one generated eval_run flow per leg (rebuild:false — the leg's musl build is final) --
+# --- one path-free eval_run flow per leg (each leg's prebuilt musl path is host env only) ----------
 for leg in baseline post; do
-  python3 - "$out/eval-$leg.flux" "${musl[$leg]}" "$tasks" "$trials" "$dataset" "$model" "$agent_timeout" <<'EOF'
+  python3 - "$out/eval-$leg.flux" "$tasks" "$trials" "$model" "$agent_timeout" <<'EOF'
 import json, sys
-path, flux_binary, tasks, trials, dataset, model, timeout = sys.argv[1:8]
+path, tasks, trials, model, timeout = sys.argv[1:6]
 flow = {
     "name": "tbench_compare",
     "params": [],
@@ -112,11 +112,8 @@ flow = {
                             "adapter": "terminal-bench",
                             "tasks": tasks.split(","),
                             "trials": int(trials),
-                            "dataset": dataset,
                             "model": model,
-                            "flux_binary": flux_binary,
                             "agent_timeout_secs": int(timeout),
-                            "rebuild": False,
                         },
                     }
                 ],
@@ -135,7 +132,10 @@ for leg in baseline post; do
   echo "→ [$leg] eval_run: ${#task_arr[@]} task(s) × $trials trial(s)"
   home="$out/home-$leg"
   mkdir -p "$home"
-  HOME="$home" "$driver" flow run "$out/eval-$leg.flux" --yes \
+  HOME="$home" \
+  FLUX_EVAL_BINARY="${musl[$leg]}" \
+  FLUX_TERMINAL_BENCH_DATASET="$dataset" \
+    "$driver" flow run "$out/eval-$leg.flux" --yes \
     | tee "$out/$leg-report.txt"
   # eval_run also writes structured artifacts under $HOME/.flux/eval — keep them.
   [ -d "$home/.flux/eval" ] && cp -r "$home/.flux/eval" "$out/$leg-eval-artifacts"

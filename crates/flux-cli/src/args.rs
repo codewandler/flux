@@ -58,12 +58,16 @@ pub(super) struct Cli {
     /// backend is available (unsupported platform, or the wrapper is missing/blocked) this degrades
     /// to a one-line warning and runs unconfined — unless `[sandbox] require` (or
     /// `FLUX_SANDBOX=require`) is set, which fails closed at startup. `--no-sandbox` is the kill
-    /// switch. See docs/designs/process-sandboxing.md.
+    /// switch. Auto-approved noninteractive and serving surfaces instead default to fail-closed
+    /// `require` with sandbox network denied; `--no-sandbox` is their explicit, prominently warned
+    /// outer-container/VM escape. See docs/designs/process-sandboxing.md.
     #[arg(long = "sandbox", global = true, conflicts_with = "no_sandbox")]
     pub(super) sandbox: bool,
 
     /// Force OS-level sandboxing OFF for this invocation — the kill switch, overriding `--sandbox`,
-    /// a pre-set `FLUX_SANDBOX`, and `[sandbox]` config.
+    /// a pre-set `FLUX_SANDBOX`, and `[sandbox]` config. On an unattended/serving surface this is an
+    /// explicit escape that prints a prominent UNCONFINED startup posture; provide equivalent
+    /// filesystem and network isolation in an outer container or VM.
     #[arg(long = "no-sandbox", global = true, conflicts_with = "sandbox")]
     pub(super) no_sandbox: bool,
 }
@@ -204,7 +208,8 @@ pub(super) struct AgentFlags {
 /// Review runs the embedded strict-review flow through `flux_sdk::FlowClient`, so the turn flags
 /// (`--continue`/`--resume`, `--turn-budget`, `--skill-dir`, `--dev`, `-v`, `--yes`, …) have no
 /// effect on that path; offering them would accept-and-ignore, so they are rejected at parse time
-/// instead. (Review always auto-approves its own fixed, read-only flow — see `run_review`.)
+/// instead. (Review always auto-approves its own fixed, read-only flow under the unattended sandbox
+/// profile — see `run_review`.)
 #[derive(clap::Args, Debug)]
 pub(super) struct ReviewFlags {
     /// Fully-qualified `provider/model` spec the reviewer sub-agents run (same forms as `flux run -m`).
@@ -268,6 +273,21 @@ pub(super) enum Commands {
         /// since this reader and the interactive approval prompt would otherwise both read stdin.
         #[arg(long = "stream-json-input")]
         stream_json_input: bool,
+        /// Select and run one named top-level flow from a `.flux` program. This is the authored,
+        /// deterministic flow path (the model is used only by explicit AI operations in the flow),
+        /// while `flux run <app.flux>` without this flag retains the multi-agent app behavior.
+        #[arg(
+            long,
+            value_name = "FLOW",
+            conflicts_with_all = ["stream_json", "stream_json_input"]
+        )]
+        entry: Option<String>,
+        /// JSON object supplying the selected flow's declared parameters.
+        #[arg(long, value_name = "JSON", requires = "entry")]
+        inputs: Option<String>,
+        /// Supply one selected-flow parameter as `NAME=VALUE` (repeatable; last value wins).
+        #[arg(long = "arg", value_name = "NAME=VALUE", requires = "entry")]
+        args: Vec<String>,
         /// The prompt words, or a path to an `<app.flux>` multi-agent program. Agent flags
         /// (`-m`, `--yes`, …) may appear before or after. With `--stream-json-input`, the prompt is
         /// optional — the first turn's input can come from stdin's first line instead.
@@ -381,9 +401,9 @@ pub(super) enum Commands {
     },
     /// Run the strict-review protocol over `--files` and print a `ReviewReport` (flux L-13; design
     /// `docs/designs/strict-review-flows.md`). Self-contained: the reviewer roles and the
-    /// `strict_review` flow are embedded in the binary, so this works in any repo — a project's own
-    /// `.flux/agents/review-*.md` still overrides the built-in role definitions. Read-only: this never
-    /// posts anywhere, it only prints to stdout.
+    /// `strict_review` flow are embedded immutably in the binary, so this works in any repo without
+    /// trusting project role definitions. Read-only: this never posts anywhere, it only prints to
+    /// stdout.
     Review {
         #[command(flatten)]
         flags: ReviewFlags,

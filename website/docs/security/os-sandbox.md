@@ -49,7 +49,8 @@ Policy semantics are the same wherever a backend is active:
   `[sandbox] writable` extras. Missing configured paths are created as directories before launch and use a
   required bind; a writable `/` is rejected unless filesystem confinement was explicitly lifted.
 - **Network**: on or off for the whole process, via a network namespace (Linux) or a Seatbelt
-  `(deny network*)` clause (macOS). Default is unrestricted (open); narrowing is opt-in.
+  `(deny network*)` clause (macOS). Interactive/local operation defaults open; unattended/serving
+  operation defaults closed and requires an explicit setting to open it.
 - `--allow-all-paths` lifts filesystem confinement from the sandbox too (with a warning); network
   policy still applies on top of it. On Linux the root bind is ordered before the protected
   `/dev`, `/proc`, and `/run` mounts, so those mounts remain in force.
@@ -58,12 +59,23 @@ Policy semantics are the same wherever a backend is active:
 
 ## Turning it on
 
-Off by default. Enable it with a flag, a config table, or the environment; when more than one
-source has an opinion the **strictest posture wins** (`require` beats `on` beats off), so
-`--sandbox` on top of `[sandbox] require = true` stays `require`. The lone exception is the kill
-switch — `--no-sandbox` or `FLUX_SANDBOX=off` — which forces sandboxing off outright. An
-unrecognized or empty `FLUX_SANDBOX` value never downgrades a configured posture, and a config file
-that fails to parse is a hard startup error rather than silently dropping a configured `require`.
+Interactive/local operation is off by default. Auto-approved noninteractive operation (`--yes` on
+`run`, `fork`, `record`, `flow run`, `preset --run`, or `app run`) and every HTTP/A2A serving surface
+automatically use `require` with sandbox network closed. They refuse startup when no backend is
+usable. Enable the interactive profile with a flag, a config table, or the environment; when more
+than one source has an opinion the **strictest posture wins** (`require` beats `on` beats off), so
+`--sandbox` on top of `[sandbox] require = true` stays `require`. Only `--no-sandbox` or exact
+`FLUX_SANDBOX=off` can force sandboxing off outright. On an unattended surface that escape emits a
+prominent, source-attributed `UNCONFINED` warning and should be used only when an outer container/VM
+supplies equivalent filesystem and network isolation. An unrecognized or empty `FLUX_SANDBOX` value
+never downgrades a configured posture, and a config file that fails to parse is a hard startup error
+rather than silently dropping a configured `require`.
+
+A truthy inherited `FLUX_SANDBOXED` marker asserts that a parent flux sandbox or equivalent outer
+container/VM already confines the process tree. Nested flux accepts that assertion instead of trying
+to nest another backend, but it cannot independently verify the boundary. Every acceptance therefore
+emits a prominent `OUTER-CONFINEMENT` warning naming `FLUX_SANDBOXED=1`; manually setting the marker
+is an explicit, audited trust decision, never a silent way to satisfy `require`.
 
 ```bash
 flux --sandbox run "…"       # turn on for this invocation
@@ -75,7 +87,7 @@ flux --no-sandbox run "…"    # force off — the kill switch, wins over env an
 [sandbox]
 enabled = true      # turn on OS sandboxing for spawned processes
 require = false     # fail closed instead of warn-and-continue when no backend is usable (implies enabled)
-network = true       # omit for the unrestricted default; false closes the sandbox's network namespace/profile
+network = true       # interactive default is open; unattended default is closed unless explicitly true
 writable = ["../shared-output"]   # extra writable paths beyond the workspace root and toolchain caches
 ```
 
@@ -83,11 +95,11 @@ writable = ["../shared-output"]   # extra writable paths beyond the workspace ro
 |---|---|---|---|
 | `[sandbox] enabled` | `--sandbox` / `--no-sandbox` | `FLUX_SANDBOX=on\|off\|require` | Turn sandboxing on for spawned processes. |
 | `[sandbox] require` | — | `FLUX_SANDBOX=require` | Fail closed (refuse to spawn) instead of warning when no backend is usable. |
-| `[sandbox] network` | — | `FLUX_SANDBOX_NET` (truthy = open) | Whether sandboxed processes may reach the network. Unset/absent means open. |
+| `[sandbox] network` | — | `FLUX_SANDBOX_NET` (truthy = open) | Whether sandboxed processes may reach the network. Unset means open for interactive/local operation and closed for unattended/serving operation. |
 | `[sandbox] writable` | — | `FLUX_SANDBOX_WRITABLE` (`:`-separated) | Extra writable paths, beyond the workspace/named/Git roots/tmp/toolchain caches. Missing paths are created as directories; `/` is rejected. |
 | — | — | `FLUX_BWRAP_BIN` | Override which `bwrap` binary is used (Linux). Always resolved to an absolute path. |
 | — | — | `FLUX_SANDBOX_EXEC_BIN` | Override which `sandbox-exec` binary is used (macOS). Always resolved to an absolute path. |
-| — | — | `FLUX_SANDBOXED` | Set by flux itself on a genuinely-sandboxed child; a nested flux invocation sees this and skips re-wrapping (the outer namespaces already confine it). Not meant to be set by hand. |
+| — | — | `FLUX_SANDBOXED` | Set by flux on a genuinely-sandboxed child. A nested invocation skips re-wrapping but prominently audits that it is trusting this ambient outer-confinement assertion because it cannot verify the parent boundary itself. |
 
 `FLUX_SANDBOX`/`FLUX_SANDBOX_NET`/`FLUX_SANDBOX_WRITABLE` are exported by the CLI so a child flux
 invocation (`app run`, an eval child host, `plugin call`) inherits the parent's posture without
@@ -103,6 +115,12 @@ user's, never loosen it — `enabled`/`require` are OR'd, `network` is strictest
 | `off` (default) | No confinement attempted; no backend probe runs at all. | Same — the common case pays nothing. |
 | `on` | Confined. | **Auto-degrades**: one styled startup warning naming the reason, then runs unconfined for the rest of the session. |
 | `require` | Confined. | **Fails closed**: a hard startup error, and a per-spawn backstop if something slips past startup — flux refuses any confinement-required spawn rather than degrade it. The explicit trusted host/browser exemptions below remain exempt by design. |
+
+The unattended profile selects the `require` row automatically and gives missing/unsupported
+platforms (including Windows, where Flux has no native backend) an actionable container/VM error.
+It never claims confinement on an unsupported host. `--no-sandbox`/exact `FLUX_SANDBOX=off` is the
+audited unconfined escape; `FLUX_SANDBOXED=1` is the separately audited assertion that an outer
+boundary already exists. Unknown environment values are ignored and cannot select either posture.
 
 "Degraded" is not hypothetical: it is the expected state inside default-seccomp Docker, Debian ≤11
 without the userns sysctl flipped, and Ubuntu 23.10+'s AppArmor userns restriction — all of which
@@ -127,18 +145,14 @@ Browser confinement instead stays as it was before this epic: an env-cleared spa
 interception (the SSRF guard applied to everything the browser fetches). Sandboxing the browser
 process itself is a candidate follow-up, not solved here.
 
-One other spawn is deliberately exempt: the **terminal-bench eval harness**. Its host-side
-`cargo build` and `tb` runner drive Docker directly, and the sandbox's mandatory `/run` masking
-would hide `/run/docker.sock` and break them — and the eval's task *container* is already the
-isolation boundary. Those spawns run unsandboxed on purpose (marked as such in the code); the agent
-being evaluated is confined by the container, not by this sandbox.
-
-The **local eval child flux host** is also launched outside its child sandbox. That process must
-call Anthropic, OpenAI, OpenRouter, or Ollama itself, so putting it in a `network = false` namespace
-would prevent the provider request. The harness passes the resolved sandbox variables into the
-host instead: provider traffic stays outside the child namespace, while the host's shell and plugin
-descendants are confined at their own guarded spawn boundary. This exemption does not expose a
-model-selected executable; it applies only to the harness-selected flux host binary.
+The **terminal-bench rebuild step** remains a trusted-host exemption: it runs a fixed `cargo build`
+only when the operator enables `FLUX_TERMINAL_BENCH_REBUILD`, and may need the host toolchain and
+network. Model-facing eval input cannot enable it or select its dataset, `tb` executable, Python
+import path, or flux child. The terminal-bench runner and the local eval child, however, now use the
+ordinary sandboxed process path. A `require` deployment
+therefore fails closed if its posture cannot expose what a benchmark needs (for example Docker or
+provider egress); it does not silently turn confinement off. The executable under evaluation is
+selected only through trusted host configuration, never through the model-facing operation input.
 
 ## What v1 does not defend against
 

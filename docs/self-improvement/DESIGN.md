@@ -205,16 +205,17 @@ on hard tasks is not guaranteed — a correct revert is a successful run of the 
 
 ### Terminal-bench environment & integration
 
-- **Install:** terminal-bench's `tb` CLI (via `uv`/`pip`); dataset pinned to
-  `terminal-bench-core==0.1.1` in the flow.
+- **Install:** terminal-bench's `tb` CLI (via `uv`/`pip`); the runner pins the trusted-host dataset
+  to `terminal-bench-core==0.1.1` with `FLUX_TERMINAL_BENCH_DATASET`.
 - **flux as a custom agent:** `tb run --agent-import-path flux_agent:FluxAgent`. The shim
   `crates/flux-eval/terminal_bench/flux_agent.py` (imported via `PYTHONPATH`) copies the static flux binary
   into each task container in `perform_task`; `crates/flux-eval/terminal_bench/flux-setup.sh` then verifies it
   (`flux --version`, emitting `INSTALL_FAIL_STATUS` on failure, which tb treats as an install failure).
 - **The binary:** the portable build is the static musl one,
   `target/x86_64-unknown-linux-musl/release/flux` (`cargo build --release --target
-  x86_64-unknown-linux-musl`). The adapter's `prepare()` **rebuilds it from candidate source** before
-  the candidate eval when `rebuild: true`, so the eval measures the worker's edits — not a stale binary.
+  x86_64-unknown-linux-musl`). `FLUX_EVAL_BINARY` selects that host-owned child, and the adapter's
+  `prepare()` **rebuilds it from candidate source** before the candidate eval only when trusted-host
+  `FLUX_TERMINAL_BENCH_REBUILD=1`, so model input cannot select a program or unsandboxed build.
 - **Results:** tb writes `<output>/<run-id>/results.json`; the adapter reads `is_resolved` plus the
   per-subtest `parser_results` for partial credit, and decodes the tail of `sessions/agent.cast` as the
   transcript fed back to the reviewer.

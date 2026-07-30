@@ -33,9 +33,10 @@ use crate::util::{arg, json_result, str_field};
 pub struct EvalRunTool;
 
 /// Arguments for the `eval_run` op. `adapter` selects the suite; the remaining keys are read by
-/// `run_eval` and the adapters it builds. Note: this op accepts adapter-specific keys not enumerated
-/// here (e.g. terminal-bench's `flux_binary`/`dataset`/…, `multi`'s `members`), so it is intentionally
-/// an open object (no `deny_unknown_fields`).
+/// `run_eval` and the adapters it builds. Note: this op accepts safe adapter-specific keys not
+/// enumerated here (e.g. terminal-bench's time limits and `multi`'s `members`), so it is intentionally
+/// an open object (no `deny_unknown_fields`). Executable, import, dataset, and rebuild selectors are
+/// rejected by terminal-bench and come only from trusted host configuration.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct EvalRunInput {
     /// mock | synthetic | terminal-bench | multi (swebench-lite lands later)
@@ -53,10 +54,6 @@ struct EvalRunInput {
     #[serde(default)]
     #[allow(dead_code)]
     model: Option<String>,
-    /// path to the flux binary under test (default: current binary)
-    #[serde(default)]
-    #[allow(dead_code)]
-    flux_bin: Option<String>,
 }
 
 #[async_trait]
@@ -89,7 +86,9 @@ impl Tool for EvalRunTool {
 
 /// Run a benchmark suite and return its JSON report — shared by the `eval_run` op and the `flux eval`
 /// CLI so both drive the exact same adapters + scoring. `params` mirrors the op's input schema
-/// (`adapter`, `tasks`, `limit`, `model`, `flux_bin`, `trials`, plus adapter-specific keys).
+/// (`adapter`, `tasks`, `limit`, `model`, `trials`, plus adapter-specific keys). The executable is
+/// deliberately absent: it is selected by the trusted host through `FLUX_EVAL_BINARY`, never by a
+/// tool argument.
 pub async fn run_eval(params: Value) -> Result<Value> {
     let adapter_name = str_field(&params, "adapter").unwrap_or("mock").to_string();
     let ids: Vec<String> = params
@@ -128,23 +127,7 @@ pub async fn run_eval(params: Value) -> Result<Value> {
         build_adapter(&adapter_name, &params)?
     };
 
-    // Resolve the binary under test. A relative `flux_bin` (e.g. "target/debug/flux", the *rebuilt*
-    // binary inside the improve loop) is made absolute against the current dir, since the eval child
-    // runs with its cwd set to a task tempdir. Default: the running binary.
-    let flux_bin: PathBuf = match str_field(&params, "flux_bin") {
-        Some(p) => {
-            let pb = PathBuf::from(p);
-            if pb.is_absolute() {
-                pb
-            } else {
-                std::env::current_dir()
-                    .map_err(|e| Error::Other(format!("eval_run: current dir: {e}")))?
-                    .join(pb)
-            }
-        }
-        None => std::env::current_exe()
-            .map_err(|e| Error::Other(format!("eval_run: locate flux binary: {e}")))?,
-    };
+    let flux_bin = resolve_eval_binary(&params, |key| std::env::var(key).ok())?;
 
     let watch = params
         .get("watch")
@@ -230,6 +213,32 @@ pub async fn run_eval(params: Value) -> Result<Value> {
         report["members"] = member_scores(&cases, adapter.as_ref());
     }
     Ok(report)
+}
+
+/// Resolve the binary under test from trusted host configuration. `FLUX_EVAL_BINARY` is read from
+/// the already-running host process and is not writable through `eval_run`; a relative path is
+/// pinned to the host's current workspace before the child moves into its isolated task directory.
+fn resolve_eval_binary(
+    params: &Value,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf> {
+    if params.get("flux_bin").is_some() {
+        return Err(Error::Other(
+            "eval_run: `flux_bin` is not a tool input; configure FLUX_EVAL_BINARY on the trusted host"
+                .into(),
+        ));
+    }
+    if let Some(path) = get_env("FLUX_EVAL_BINARY").filter(|path| !path.trim().is_empty()) {
+        let path = PathBuf::from(path);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .map_err(|e| Error::Other(format!("eval_run: current dir: {e}")))
+        };
+    }
+    std::env::current_exe().map_err(|e| Error::Other(format!("eval_run: locate flux binary: {e}")))
 }
 
 /// Construct a leaf benchmark adapter by name from its params — shared by `run_eval` and the `multi`
@@ -908,6 +917,35 @@ mod tests {
         assert_eq!(ScoreCompareMultiTool.spec().name, "score_compare_multi");
         assert_eq!(EvalReportMdTool.spec().name, "eval_report_md");
         assert_eq!(GradeTool.spec().name, "grade");
+    }
+
+    #[test]
+    fn eval_run_schema_does_not_offer_an_executable_path() {
+        let schema = EvalRunTool.spec().input_schema;
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("eval_run schema properties");
+        assert!(
+            !properties.contains_key("flux_bin"),
+            "model input must not select eval argv[0]"
+        );
+    }
+
+    #[test]
+    fn eval_binary_selector_rejects_model_supplied_paths() {
+        let supplied = json!({"adapter": "mock", "flux_bin": "/tmp/attacker"});
+        let error = resolve_eval_binary(&supplied, |_| None).unwrap_err();
+        assert!(error.to_string().contains("flux_bin"), "{error}");
+    }
+
+    #[test]
+    fn eval_binary_selector_accepts_only_the_trusted_host_setting() {
+        let selected = resolve_eval_binary(&json!({"adapter": "mock"}), |key| {
+            (key == "FLUX_EVAL_BINARY").then(|| "/trusted/flux".to_string())
+        })
+        .unwrap();
+        assert_eq!(selected, PathBuf::from("/trusted/flux"));
     }
 
     /// The combined-eval keep-gate must reject a candidate that lifts the overall mean while

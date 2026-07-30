@@ -1217,6 +1217,19 @@ mod tests {
         request.tools.iter().any(|tool| tool.name == name)
     }
 
+    fn request_has_intent_family(request: &Request, family: &str) -> bool {
+        request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "declare_intent")
+            .and_then(|tool| {
+                tool.input_schema
+                    .pointer("/properties/capability_families/items/enum")
+            })
+            .and_then(Value::as_array)
+            .is_some_and(|families| families.iter().any(|value| value.as_str() == Some(family)))
+    }
+
     fn intent_chunks(intent: &str, families: &[&str]) -> Vec<Chunk> {
         vec![
             Chunk::Block(ContentBlock::ToolUse {
@@ -1521,8 +1534,8 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await
-            .unwrap()
-            .text;
+            .unwrap_err()
+            .to_string();
         assert!(
             stopped.contains("adaptive `intent` model-call cap exhausted"),
             "{stopped}"
@@ -1555,8 +1568,8 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await
-            .unwrap()
-            .text;
+            .unwrap_err()
+            .to_string();
         assert!(stopped.contains("model-call budget exhausted"), "{stopped}");
         assert!(stopped.contains("1/1"), "{stopped}");
         assert_eq!(requests.lock().unwrap().len(), 1);
@@ -3282,13 +3295,20 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // Zero-usage attempts are intentionally durable too: the daemon's provider-call circuit
+        // breaker must count calls even when a provider omits token usage. Isolate the billed child
+        // fact rather than asserting those honest zero-usage facts do not exist.
+        let billed: Vec<_> = call_usages
+            .iter()
+            .filter(|(_, usage)| usage.input_tokens > 0 || usage.output_tokens > 0)
+            .collect();
         assert_eq!(
-            call_usages.len(),
+            billed.len(),
             1,
-            "one CallUsage for the sub-agent's call (the parent's own planner billed nothing): {call_usages:?}"
+            "one billed CallUsage belongs to the sub-agent: {call_usages:?}"
         );
-        assert_eq!(call_usages[0].0, "mock");
-        assert_eq!(call_usages[0].1.input_tokens, 1000);
+        assert_eq!(billed[0].0, "mock");
+        assert_eq!(billed[0].1.input_tokens, 1000);
     }
 
     #[tokio::test]
@@ -4124,8 +4144,9 @@ mod tests {
             }
             async fn stream(&self, req: Request) -> Result<ChunkStream> {
                 let is_delegator = req.system_text().unwrap_or_default().contains("DELEGATE");
+                let can_delegate = request_has_tool(&req, "task");
                 if request_has_tool(&req, "declare_intent") {
-                    let families = if is_delegator {
+                    let families = if is_delegator && request_has_intent_family(&req, "process") {
                         vec!["process"]
                     } else {
                         vec!["core"]
@@ -4139,7 +4160,11 @@ mod tests {
                 let n = self
                     .calls
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let chunks = if n == 0 {
+                let chunks = if is_delegator && !can_delegate {
+                    // At the configured depth ceiling `task` is deliberately absent from the
+                    // request. Keep the fixture provider honest and do not call an unsurfaced op.
+                    prose_chunks("done")
+                } else if n == 0 {
                     if is_delegator {
                         native_call(
                             "task-1",

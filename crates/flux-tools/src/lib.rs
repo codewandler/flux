@@ -2346,7 +2346,14 @@ impl Tool for GitDiffTool {
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: GitDiffInput = parse_params(params, "git_diff")?;
         let staged = args.staged.unwrap_or(false);
-        let mut argv = vec!["git".to_string(), "diff".to_string()];
+        // Fix behaviour as well as argv: without `--no-ext-diff`, repository/global Git config can
+        // redirect this low-risk read operation into an arbitrary external program (C-218).
+        let mut argv = vec![
+            "git".to_string(),
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-textconv".to_string(),
+        ];
         if staged {
             argv.push("--staged".to_string());
         }
@@ -3177,6 +3184,7 @@ fn hunk_diff_argv(path: &str, context: u32) -> Vec<String> {
         "--no-pager",
         "diff",
         "--no-ext-diff",
+        "--no-textconv",
         "--no-color",
         "--src-prefix=a/",
         "--dst-prefix=b/",
@@ -5619,6 +5627,119 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feature");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-218: `git diff` must not honour repository/global external diff configuration. The op is
+    /// low-risk because its fixed argv is expected to fix its behaviour as well as its executable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_diff_never_executes_an_external_diff_driver() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, c) = git_ctx();
+        WriteTool
+            .execute(&c, json!({"path": "tracked.txt", "content": "before\n"}))
+            .await
+            .unwrap();
+        GitStageTool
+            .execute(&c, json!({"paths": ["tracked.txt"]}))
+            .await
+            .unwrap();
+        GitCommitTool
+            .execute(&c, json!({"message": "baseline"}))
+            .await
+            .unwrap();
+        WriteTool
+            .execute(&c, json!({"path": "tracked.txt", "content": "after\n"}))
+            .await
+            .unwrap();
+
+        let marker = dir.join("external-driver-ran");
+        let driver = dir.join("external-diff-driver.sh");
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch -- {}\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&driver).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&driver, permissions).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["config", "diff.external", driver.to_str().unwrap()])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let result = GitDiffTool.execute(&c, json!({})).await.unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            !marker.exists(),
+            "git_diff executed configured diff.external at {}",
+            driver.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-218 closure: `--no-ext-diff` does not disable a default-enabled textconv driver. Pin that
+    /// second Git execution seam off explicitly as well.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_diff_never_executes_a_textconv_driver() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, c) = git_ctx();
+        WriteTool
+            .execute(&c, json!({"path": "tracked.txt", "content": "before\n"}))
+            .await
+            .unwrap();
+        WriteTool
+            .execute(
+                &c,
+                json!({"path": ".gitattributes", "content": "tracked.txt diff=marker\n"}),
+            )
+            .await
+            .unwrap();
+        GitStageTool
+            .execute(&c, json!({"paths": ["tracked.txt", ".gitattributes"]}))
+            .await
+            .unwrap();
+        GitCommitTool
+            .execute(&c, json!({"message": "baseline"}))
+            .await
+            .unwrap();
+        WriteTool
+            .execute(&c, json!({"path": "tracked.txt", "content": "after\n"}))
+            .await
+            .unwrap();
+
+        let marker = dir.join("textconv-driver-ran");
+        let driver = dir.join("textconv-driver.sh");
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch -- {}\ncat -- \"$1\"\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&driver).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&driver, permissions).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["config", "diff.marker.textconv", driver.to_str().unwrap()])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let result = GitDiffTool.execute(&c, json!({})).await.unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(!marker.exists(), "git_diff executed configured textconv");
+        assert!(
+            hunk_diff_argv("tracked.txt", 3)
+                .iter()
+                .any(|argument| argument == "--no-textconv"),
+            "hunk diff argv must close the same textconv seam"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

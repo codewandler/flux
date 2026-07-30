@@ -23,6 +23,65 @@ use crate::spec::{Criterion, SeedFile, Setup, TaskSpec};
 
 use crate::util::unique_temp_dir;
 
+const PROVIDER_CREDENTIAL_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "FLUX_SECRET",
+];
+
+/// Copy only the environment material needed by the selected provider. OAuth-backed and local
+/// providers receive no raw credential environment; their own configured credential source is
+/// responsible for authentication.
+pub(crate) fn provider_credential_env(
+    model: &str,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let provider = model
+        .split_once('/')
+        .map(|(provider, _)| provider)
+        .unwrap_or_else(|| match model {
+            "mock" => "mock",
+            "ollama" => "ollama",
+            _ => "anthropic",
+        });
+    let keys: &[&str] = match provider {
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "openai" => &["OPENAI_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "aws" => &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+        ],
+        _ => &[],
+    };
+    keys.iter()
+        .filter_map(|key| get_env(key).map(|value| ((*key).to_string(), value)))
+        .collect()
+}
+
+fn extend_task_env(
+    env: &mut Vec<(String, String)>,
+    task_env: &std::collections::BTreeMap<String, String>,
+) {
+    env.extend(
+        task_env
+            .iter()
+            // Task fixtures cannot smuggle a second provider credential or flux's host secret into
+            // the child. Authentication material comes solely from the selected-provider allow-list.
+            .filter(|(key, _)| !PROVIDER_CREDENTIAL_ENV.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+}
+
 fn io_err(e: std::io::Error) -> Error {
     Error::Other(e.to_string())
 }
@@ -39,20 +98,30 @@ fn write_seed(workdir: &Path, f: &SeedFile) -> Result<()> {
     safe_rel(&f.path)?;
     let dest = workdir.join(&f.path);
     if let Some(parent) = dest.parent() {
+        // flux-allow-direct-io: trusted benchmark fixture materialization into the freshly generated
+        // eval temp root after safe_rel rejects absolute paths and parent traversal.
         std::fs::create_dir_all(parent).map_err(io_err)?;
     }
+    // flux-allow-direct-io: trusted benchmark fixture materialization confined by safe_rel to the
+    // freshly generated eval temp root; the agent never supplies seed paths or contents.
     std::fs::write(&dest, &f.content).map_err(io_err)
 }
 
 fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
+    // flux-allow-direct-io: host-authored benchmark setup copies a trusted fixture tree into the
+    // unpredictable eval temp root before the model starts; this is harness provisioning.
     for entry in std::fs::read_dir(from).map_err(io_err)? {
         let entry = entry.map_err(io_err)?;
         let src = entry.path();
         let dest = to.join(entry.file_name());
         if src.is_dir() {
+            // flux-allow-direct-io: recursive destination remains below the harness-owned eval temp
+            // root and is derived only from host-authored fixture entries.
             std::fs::create_dir_all(&dest).map_err(io_err)?;
             copy_dir_recursive(&src, &dest)?;
         } else {
+            // flux-allow-direct-io: host-authored fixture copy into the harness-owned eval temp root;
+            // neither endpoint is selected by the evaluated model.
             std::fs::copy(&src, &dest).map_err(io_err)?;
         }
     }
@@ -162,10 +231,9 @@ const SANDBOX_CHILD_ENV_KEYS: &[&str] = &[
     "FLUX_SANDBOX_EXEC_BIN",
 ];
 
-/// Forward the already-resolved sandbox posture into the child flux *host*. The host itself is
-/// launched exempt so provider HTTP remains available when `network = false`; these variables make
-/// its own `System::from_env` construction confine shell/plugin descendants at the real spawn choke
-/// point. `FLUX_SANDBOXED` is intentionally absent because the exempt host was not wrapped.
+/// Forward the already-resolved sandbox posture into the child flux host. The child is launched
+/// through the ordinary sandboxed `System` path; `build_command` adds `FLUX_SANDBOXED=1` only when
+/// the wrapper is genuinely active, so it is intentionally absent from this explicit env list.
 fn sandbox_child_env_from(mut read: impl FnMut(&str) -> Option<String>) -> Vec<(String, String)> {
     SANDBOX_CHILD_ENV_KEYS
         .iter()
@@ -257,17 +325,19 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     let workdir = unique_temp_dir("flux-eval-task").map_err(io_err)?;
     materialize(&spec.setup, &workdir)?;
     let home = workdir.join(".home");
+    // flux-allow-direct-io: private HOME is harness infrastructure below the unpredictable eval
+    // temp root and must exist before the sandboxed child flux process is launched.
     std::fs::create_dir_all(&home).map_err(io_err)?;
 
     let model = spec
         .model
         .clone()
         .unwrap_or_else(|| ctx.default_model.to_string());
+    let provider_env = provider_credential_env(&model, |key| std::env::var(key).ok());
 
     // Attach the environment's sandbox posture without pulling in FLUX_ADD_DIRS/FLUX_ALLOW_ALL,
-    // which would defeat the isolated eval workspace. The child *host* is launched through the
-    // explicit exemption below so network=false does not block its provider request; the resolved
-    // posture is forwarded into that host so only its shell/plugin descendants are confined.
+    // which would defeat the isolated eval workspace. The eval child uses the ordinary sandboxed
+    // process path, so `require` and sandbox-network policy apply honestly to the whole child.
     let sys = System::new(
         Workspace::new(&workdir)
             .map_err(|e| Error::Other(format!("eval workspace {}: {e}", workdir.display())))?,
@@ -287,25 +357,10 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     ];
     let mut env: Vec<(String, String)> =
         vec![("HOME".to_string(), home.to_string_lossy().to_string())];
-    // Forward provider credentials to the eval child. flux-system scrubs the env and we isolate HOME,
-    // so without this the child can't authenticate any real model. The child IS flux running a task —
-    // the harness trusts itself; the child's own bash/process tools still scrub their subprocess env,
-    // and the child's output is captured by the harness (never shown to a model).
-    for key in [
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "FLUX_SECRET",
-    ] {
-        if let Ok(val) = std::env::var(key) {
-            env.push((key.to_string(), val));
-        }
-    }
+    env.extend(provider_env);
     // Rust toolchain (so the child's own `cargo`/`rustup` tools work under the isolated HOME).
     env.extend(toolchain_env());
-    for (k, v) in &spec.env {
-        env.push((k.clone(), v.clone()));
-    }
+    extend_task_env(&mut env, &spec.env);
     // Add security posture last: benchmark-controlled `spec.env` must not be able to downgrade the
     // parent CLI's resolved sandbox mode or redirect its backend after the harness decided it.
     env.extend(sandbox_child_env());
@@ -316,10 +371,10 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
 
     let run = if ctx.watch {
         eprintln!("\n── {} ──", spec.id);
-        sys.run_with_env_streamed_exempt(&argv, &env, Duration::from_secs(spec.timeout_secs))
+        sys.run_with_env_streamed(&argv, &env, Duration::from_secs(spec.timeout_secs))
             .await
     } else {
-        sys.run_with_env_exempt(&argv, &env, Duration::from_secs(spec.timeout_secs))
+        sys.run_with_env(&argv, &env, Duration::from_secs(spec.timeout_secs))
             .await
     };
     let wall_ms = started.elapsed().as_millis() as u64;
@@ -417,6 +472,52 @@ mod tests {
             !env.iter().any(|(key, _)| key == "FLUX_SANDBOXED"),
             "the network-capable host itself was deliberately not wrapped"
         );
+    }
+
+    #[test]
+    fn eval_child_receives_only_the_selected_provider_credential() {
+        let values = std::collections::HashMap::from([
+            ("ANTHROPIC_API_KEY", "anthropic-sentinel"),
+            ("OPENAI_API_KEY", "openai-sentinel"),
+            ("OPENROUTER_API_KEY", "openrouter-sentinel"),
+            ("FLUX_SECRET", "flux-sentinel"),
+        ]);
+        let env = provider_credential_env("openai/gpt-5", |key| {
+            values.get(key).map(ToString::to_string)
+        });
+        assert_eq!(
+            env,
+            vec![("OPENAI_API_KEY".to_string(), "openai-sentinel".to_string())]
+        );
+        assert!(!env.iter().any(|(key, _)| key == "FLUX_SECRET"));
+    }
+
+    #[test]
+    fn bare_anthropic_alias_receives_only_anthropic_key() {
+        let env = provider_credential_env("sonnet", |key| Some(format!("{key}-value")));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn task_fixture_cannot_reintroduce_host_or_unrelated_provider_secrets() {
+        let task_env = std::collections::BTreeMap::from([
+            ("SAFE_FIXTURE".to_string(), "yes".to_string()),
+            ("OPENAI_API_KEY".to_string(), "unrelated".to_string()),
+            ("FLUX_SECRET".to_string(), "host-secret".to_string()),
+        ]);
+        let mut env = Vec::new();
+        extend_task_env(&mut env, &task_env);
+        assert_eq!(env, vec![("SAFE_FIXTURE".to_string(), "yes".to_string())]);
+    }
+
+    #[test]
+    fn model_reachable_eval_runner_has_no_sandbox_exemption() {
+        let source = include_str!("runner.rs");
+        let captured = ["run_with_env", "_exempt("].concat();
+        let streamed = ["run_with_env_streamed", "_exempt("].concat();
+        assert!(!source.contains(&captured));
+        assert!(!source.contains(&streamed));
     }
 
     #[test]

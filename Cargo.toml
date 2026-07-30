@@ -77,7 +77,7 @@ flux-flow = { package = "codewandler-flux-flow", version = "0.37.0", path = "cra
 flux-eval = { path = "crates/flux-eval" }
 flux-plugin = { package = "codewandler-flux-plugin", version = "0.37.0", path = "crates/flux-plugin", default-features = false, features = ["host", "hooks", "pack"] }
 # The plugin wire contract. Versioned on its own line (1.x) — see crates/flux-plugin-protocol.
-flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.0.0", path = "crates/flux-plugin-protocol" }
+flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.1.0", path = "crates/flux-plugin-protocol" }
 flux-auth = { path = "crates/flux-auth" }
 flux-evidence = { package = "codewandler-flux-evidence", version = "1", path = "crates/flux-evidence" }
 flux-datasource = { package = "codewandler-flux-datasource", version = "1", path = "crates/flux-datasource" }

@@ -174,6 +174,8 @@ impl FlowStore {
     /// Open (creating if needed) a store at `path`, with WAL enabled. Run-trace events are forwarded
     /// to the shared `events` log.
     pub fn open(path: impl AsRef<Path>, events: Arc<EventStore>) -> Result<Self> {
+        // flux-allow-direct-io: FlowStore is the owner of this host-selected SQLite state backend;
+        // operation implementations receive the store, never a model-supplied database path.
         let conn = Connection::open(path).map_err(map_sql)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
@@ -188,6 +190,7 @@ impl FlowStore {
     /// An in-memory store sharing a given event log — so the engine's run trace, message log, and turn
     /// telemetry all land in one place even in tests.
     pub fn in_memory_with_events(events: Arc<EventStore>) -> Result<Self> {
+        // flux-allow-direct-io: in-memory FlowStore backend owns no filesystem or external resource.
         Self::init(Connection::open_in_memory().map_err(map_sql)?, events)
     }
 

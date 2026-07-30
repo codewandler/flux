@@ -16,6 +16,10 @@ use flux_spec::{Effect, FlowEffect, Idempotency, Risk, StagingDisposition};
 /// `serde` defaults on every field make additive changes compatible without a bump.
 pub const PROTOCOL: &str = "flux.plugin.v1";
 
+/// Maximum encoded size of one newline-delimited plugin frame. The host bounds its read to this
+/// value before calling [`decode_ndjson_frame`], so an unterminated line cannot grow without bound.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 /// Check a frame's protocol marker against the one this build speaks.
 ///
 /// The host applies this to every frame a plugin sends. Without it an incompatible plugin surfaces
@@ -30,6 +34,29 @@ pub fn check_protocol(marker: &str) -> std::result::Result<(), String> {
          upgrade whichever side is older (`flux plugin install` for the plugin pack, \
          or a newer flux for the host)"
     ))
+}
+
+/// Decode one complete newline-delimited plugin frame and enforce the protocol marker.
+///
+/// Keeping this pure wire seam in the protocol crate lets deterministic adversarial and Miri lanes
+/// exercise the exact decoder used by the async host without constructing a subprocess. The caller
+/// still owns bounded reading; this function independently rejects oversized or unterminated input
+/// so another host cannot accidentally create a weaker framing path.
+pub fn decode_ndjson_frame(line: &[u8]) -> std::result::Result<Frame, String> {
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(format!(
+            "plugin frame exceeded the size limit of {MAX_FRAME_BYTES} bytes"
+        ));
+    }
+    if line.last() != Some(&b'\n') {
+        return Err("plugin frame is not newline terminated".into());
+    }
+    let line = std::str::from_utf8(line)
+        .map_err(|error| format!("plugin frame not valid UTF-8: {error}"))?;
+    let frame: Frame = serde_json::from_str(line.trim())
+        .map_err(|error| format!("plugin frame is not valid JSON: {error}"))?;
+    check_protocol(&frame.protocol)?;
+    Ok(frame)
 }
 
 /// Whether a frame is a request (host→plugin) or a response (plugin→host).
@@ -540,7 +567,8 @@ pub struct PluginCapabilities {
     #[serde(default)]
     pub private_hosts: Vec<String>,
     /// Allowed `conn.dial` targets (`tcp:host:port` / `unix:/path`; a single `*` wildcards one
-    /// segment, e.g. `tcp:*:5432`). Empty = the `conn.*` capability is denied.
+    /// segment, e.g. `tcp:*:5432`). Unix paths containing `.` or `..` components are always denied.
+    /// Empty = the `conn.*` capability is denied.
     #[serde(default)]
     pub conn: Vec<String>,
     /// Whether the `blob.*` capability (content-addressed scratch store) is permitted.

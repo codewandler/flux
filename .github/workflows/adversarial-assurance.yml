@@ -1,0 +1,161 @@
+name: adversarial-assurance
+
+# C-264: independent-input assurance complements the author-written workspace gate. Pull requests
+# get bounded deterministic smoke and Rust CodeQL. The weekly lane expands the corpus and runs Miri
+# over compatible pure seams; network/process/compression integrations remain in the deterministic
+# corpus because Miri cannot execute their OS/Tokio/FFI paths honestly.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  codeql-rust:
+    name: CodeQL · Rust security-extended
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+
+      - name: Initialize pinned CodeQL for Rust
+        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        with:
+          languages: rust
+          build-mode: manual
+          queries: security-extended
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Build the analyzed workspace
+        run: cargo build --workspace --locked --offline
+
+      - name: Analyze Rust
+        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        with:
+          category: /language:rust
+
+  corpus-smoke:
+    name: deterministic adversarial corpus · PR smoke
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Prove selectors cannot become vacuous
+        run: ./scripts/run-adversarial-assurance.sh --self-test
+
+      - name: Run bounded corpus offline
+        run: timeout 10m ./scripts/run-adversarial-assurance.sh --smoke
+
+      - name: Preserve secret-free reproduction logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adversarial-corpus-smoke-${{ github.run_id }}
+          path: target/adversarial-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  corpus-deep:
+    name: deterministic adversarial corpus · scheduled deep
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Prove selectors cannot become vacuous
+        run: ./scripts/run-adversarial-assurance.sh --self-test
+
+      - name: Run expanded corpus offline
+        run: timeout 20m ./scripts/run-adversarial-assurance.sh --deep
+
+      - name: Preserve secret-free reproduction logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adversarial-corpus-deep-${{ github.run_id }}
+          path: target/adversarial-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  miri:
+    name: Miri · pure parser and protocol seams
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Machine-checked by run-adversarial-assurance.sh; unlike the prose below this inventory
+      # cannot survive as a comment-only decoy if a coverage decision changes.
+      FLUX_MIRI_UNSUPPORTED: provider-streams,url-dialing,pack-extraction
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install pinned nightly with Miri
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly-2026-07-15
+          components: miri
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Run compatible high-risk pure seams
+        run: |
+          mkdir -p target/adversarial-artifacts
+          ./scripts/run-adversarial-assurance.sh --miri-preflight
+          cargo miri setup
+          timeout 12m cargo miri test --locked --offline \
+            -p codewandler-flux-plugin-protocol --test adversarial_frames \
+            2>&1 | tee target/adversarial-artifacts/miri-plugin-ndjson.log
+          timeout 8m cargo miri test --locked --offline \
+            -p codewandler-flux-lang --lib lexer::tests:: \
+            2>&1 | tee target/adversarial-artifacts/miri-flux-lang-lexer.log
+
+      # Explicitly unsupported under Miri: provider streams (Tokio/HTTP), URL dialing (DNS/socket),
+      # and pack extraction (filesystem plus compression implementations). Their pure admission and
+      # framing surfaces run in the corpus jobs above; this is not a silent matrix skip.
+      - name: Preserve Miri reproduction logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adversarial-miri-${{ github.run_id }}
+          path: target/adversarial-artifacts/
+          if-no-files-found: error
+          retention-days: 30

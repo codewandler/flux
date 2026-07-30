@@ -538,7 +538,7 @@ pub(super) async fn run_app(
     // out to reviewer sub-agents via `task` — the same `build_review_sub_agents` helper `flux review`
     // uses, so the two surfaces delegate through the identical envelope, never a re-derived one.
     let sub_agents = is_builtin_strict_review
-        .then(|| build_review_sub_agents(&cwd, &spec, model.clone(), flags.max_tokens))
+        .then(|| build_review_sub_agents(&spec, model.clone(), flags.max_tokens))
         .transpose()?;
     let mut integration_registry = ToolRegistry::new();
     for (source, tool) in extra_tools {

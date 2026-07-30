@@ -4,9 +4,9 @@
 //! Beyond rejecting non-HTTP schemes and raw private/loopback IP literals, this **resolves the
 //! host to IP addresses** and blocks the request if any resolved address is private, loopback,
 //! link-local, unique-local, CGNAT, or an IPv4-mapped form of those — so a hostname pointing at
-//! `169.254.169.254` (cloud metadata) or `[::ffff:10.0.0.1]` can't slip through. DNS rebinding
-//! (a different answer at connect time) is still possible; this is defense-in-depth, not a
-//! complete TOCTOU fix.
+//! `169.254.169.254` (cloud metadata) or `[::ffff:10.0.0.1]` can't slip through. Callers that
+//! consume a pinned guard/dial result bind the connection to the vetted addresses; callers that
+//! use only a URL-returning compatibility API do not receive that DNS-rebinding guarantee.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
@@ -292,13 +292,52 @@ impl DialStream {
 
 /// Dial a socket target, applying the SSRF egress policy to TCP unless `allow` covers the host.
 pub async fn dial_scoped(target: &DialTarget, allow: &PrivateNetAllow) -> Result<DialStream> {
+    dial_scoped_pinned(target, allow)
+        .await
+        .map(|(stream, _)| stream)
+}
+
+/// Guard and dial a socket target, returning the exact addresses that were vetted and attempted.
+///
+/// TCP hostnames are resolved exactly once. The resulting addresses are policy-checked and then
+/// passed directly to [`tokio::net::TcpStream::connect`], so a hostname cannot answer publicly to
+/// the guard and rebind to a private address when the connection is opened. An empty or failed DNS
+/// answer is refused rather than re-resolved by the connect path. Unix sockets have no DNS address
+/// set and return an empty vector.
+pub async fn dial_scoped_pinned(
+    target: &DialTarget,
+    allow: &PrivateNetAllow,
+) -> Result<(DialStream, Vec<SocketAddr>)> {
+    dial_scoped_pinned_with_resolver(target, allow, &SystemHostResolver).await
+}
+
+/// [`dial_scoped_pinned`] with an injectable resolver for deterministic rebinding tests.
+pub async fn dial_scoped_pinned_with_resolver(
+    target: &DialTarget,
+    allow: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+) -> Result<(DialStream, Vec<SocketAddr>)> {
     match target {
         DialTarget::Tcp { host, port } => {
-            guard_target_host(host, *port, allow)?;
-            let s = tokio::net::TcpStream::connect((host.as_str(), *port))
-                .await
-                .map_err(|e| Error::Other(format!("tcp dial {host}:{port}: {e}")))?;
-            Ok(DialStream::Tcp(s))
+            let pinned = guard_target_host_pinned(host, *port, allow, resolver)?;
+            if pinned.is_empty() {
+                return Err(Error::Other(format!(
+                    "refusing to dial {host}:{port} — DNS returned no vetted addresses"
+                )));
+            }
+            let mut last_error = None;
+            for address in pinned.iter().copied() {
+                match tokio::net::TcpStream::connect(address).await {
+                    Ok(stream) => return Ok((DialStream::Tcp(stream), pinned)),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(Error::Other(format!(
+                "tcp dial {host}:{port}: {}",
+                last_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "no vetted address was connectable".to_string())
+            )))
         }
         DialTarget::Unix { path } => {
             #[cfg(unix)]
@@ -306,7 +345,7 @@ pub async fn dial_scoped(target: &DialTarget, allow: &PrivateNetAllow) -> Result
                 let s = tokio::net::UnixStream::connect(path)
                     .await
                     .map_err(|e| Error::Other(format!("unix dial {path}: {e}")))?;
-                Ok(DialStream::Unix(s))
+                Ok((DialStream::Unix(s), Vec::new()))
             }
             #[cfg(not(unix))]
             {
@@ -324,11 +363,15 @@ pub async fn dial(target: &DialTarget, allow_private: bool) -> Result<DialStream
     dial_scoped(target, &PrivateNetAllow::from_legacy_bool(allow_private)).await
 }
 
-/// Guard a `host:port` for a socket dial with the same policy as [`guard_url`]: internal hostnames and
-/// private/loopback/link-local IPs are blocked unless `allow` covers this host.
-fn guard_target_host(host: &str, port: u16, allow: &PrivateNetAllow) -> Result<()> {
+fn guard_target_host_pinned(
+    host: &str,
+    port: u16,
+    allow: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return block_if(ip, host, allow);
+        block_if(ip, host, allow)?;
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let lower = host.to_ascii_lowercase();
     if is_internal_hostname(&lower) && !allow.allows_host(host) {
@@ -336,12 +379,24 @@ fn guard_target_host(host: &str, port: u16, allow: &PrivateNetAllow) -> Result<(
             "refusing to dial internal host {host}"
         )));
     }
-    if let Ok(addrs) = (host, port).to_socket_addrs() {
-        for sa in addrs {
-            block_if(sa.ip(), host, allow)?;
-        }
+    let addresses = resolver
+        .resolve(host, port)
+        .map_err(|e| Error::Other(format!("resolving {host}:{port}: {e}")))?;
+    let mut pinned = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        block_if(address, host, allow)?;
+        pinned.push(SocketAddr::new(address, port));
     }
-    Ok(())
+    Ok(pinned)
+}
+
+/// Whether a guarded destination names or resolves to a private address.
+///
+/// Callers that audit an admitted private-network grant should use the same vetted address set
+/// that was connected, rather than resolving the hostname a second time for classification.
+pub fn destination_is_private(host: &str, pinned: &[SocketAddr]) -> bool {
+    is_internal_hostname(&host.to_ascii_lowercase())
+        || pinned.iter().any(|address| is_blocked_ip(address.ip()))
 }
 
 fn is_internal_hostname(lower: &str) -> bool {
@@ -565,5 +620,63 @@ mod tests {
         let got = s.read(64).await.unwrap();
         assert_eq!(&got, b"ping");
         s.shutdown().await.ok();
+    }
+
+    struct RebindingResolver {
+        calls: std::sync::atomic::AtomicUsize,
+        first: IpAddr,
+        later: IpAddr,
+    }
+
+    impl HostResolver for RebindingResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![if call == 0 { self.first } else { self.later }])
+        }
+    }
+
+    /// C-257: the raw TCP path must consume the address authorized by the guard. Before the fix it
+    /// called `TcpStream::connect((host, port))`, which performed a second DNS lookup and could take
+    /// `later`. The fixed path calls the resolver once and connects directly to `first`.
+    #[tokio::test]
+    async fn pinned_dial_never_re_resolves_after_authorization() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resolver = RebindingResolver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            first: "127.0.0.1".parse().unwrap(),
+            later: "169.254.169.254".parse().unwrap(),
+        };
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let target = DialTarget::Tcp {
+            host: "rebind.test".to_string(),
+            port,
+        };
+        let allow = PrivateNetAllow::from_hosts(["rebind.test".to_string()]);
+
+        let (_stream, pinned) = dial_scoped_pinned_with_resolver(&target, &allow, &resolver)
+            .await
+            .expect("the vetted loopback address is connected directly");
+        assert_eq!(pinned, vec![SocketAddr::from(([127, 0, 0, 1], port))]);
+        assert_eq!(
+            resolver.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the connect path must not ask DNS for the attacker's second answer"
+        );
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_dial_fails_closed_on_an_empty_dns_answer() {
+        let target = DialTarget::Tcp {
+            host: "empty.test".to_string(),
+            port: 443,
+        };
+        let resolver = FixedResolver(Vec::new());
+        let err = dial_scoped_pinned_with_resolver(&target, &PrivateNetAllow::None, &resolver)
+            .await
+            .err()
+            .expect("an empty vetted set cannot fall back to connect-time DNS");
+        assert!(err.to_string().contains("no vetted addresses"), "{err}");
     }
 }

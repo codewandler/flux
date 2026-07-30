@@ -174,7 +174,7 @@ what you must declare to get it.
 | `config` | `config` (declared names) | Resolve a declared **non-secret** value; a secret-classified key is refused. |
 | `http.do` | `http` + `http_hosts` (+ SSRF guard) | Method, headers and body, with auth injected host-side per the declared scheme. |
 | `process.run` / `spawn` / `read` / `kill` | `process` (argv-**prefix** allow-list) | Run or hold a subprocess with captured, capped output. |
-| `conn.dial` / `read` / `write` / `close` | `conn` (`tcp:host:port`, `unix:/path`) | A raw byte stream for non-HTTP wire protocols. |
+| `conn.dial` / `read` / `write` / `close` | `conn` (`tcp:host:port`, `unix:/path`; `*` matches one segment and Unix `.`/`..` paths are denied) | A raw byte stream for non-HTTP wire protocols. |
 | `conn.authenticate` | `conn` + a declared auth purpose or endpoint credential ref | The **host** speaks the in-band handshake and hands back a post-auth connection. |
 | `credential` | `credential: true` | Materialize a credential *reference* into its value — the audited exception. |
 | `endpoint.discover` | `discover: true` | Ask the host which endpoints exist for a product. |
