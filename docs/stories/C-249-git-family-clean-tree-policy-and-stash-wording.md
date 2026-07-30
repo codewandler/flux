@@ -2,7 +2,7 @@
 id: C-249
 title: "The git family's clean-tree preconditions are per-op accidents, and \"commit or stash them first\" is unactionable for untracked files"
 pillar: Core
-status: in-progress
+status: done
 priority: 8
 areas: [flux-tools]
 note: "surfaced by C-238's review: git_worktree_leave and git_revert each grew their own clean-tree guard for the same reason, git_merge had none, and three ops share advice that a plain `git stash` cannot carry out"

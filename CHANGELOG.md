@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The git family's clean-tree precondition is policy now, not per-op taste (C-249).** Every guarded git
+  op that runs a blanket restore declares its precondition through one shared helper, and the refusal
+  separates tracked from untracked files — because "commit or stash them first" is unactionable advice
+  for a file that was never tracked. Two refusals are genuinely new and strictly stricter: `git_revert`
+  refuses a revert or cherry-pick already in flight (the hazard C-238 fixed for `git_merge`), and
+  `git_worktree_leave` proves the original checkout is not mid-merge before its always-aborted trial
+  merge. Nothing was weakened — the change only adds refusals.
+  The durable half is the guard. It selects ops by **what they invoke**, not by name, on two rules: a
+  blanket restore must route through the shared helper, and `git status --porcelain` may appear only
+  inside it. The second rule exists because the first is self-erasing — once an op is converted its raw
+  signal moves into the helper — and it is the rule that catches a git-shaped op wearing a
+  non-`git_*` name. `fleet.isolate` was exactly that: it had been hand-copying an older revision of
+  `git_revert`'s refusal wording, so the family would otherwise have shipped two different dirty-tree
+  messages.
+
 ### Added
 
 - **Flux now compiles to WebAssembly, and the module agrees with the native engine (C-271).** A
