@@ -34,7 +34,9 @@ flux-tools.workspace = true
 # re-exported by `flux_sdk::datasource` so embedders need no transitive dependency imports.
 flux-capabilities.workspace = true
 flux-datasource.workspace = true
-flux-events.workspace = true
+# The embedded SQLite backend is asked for explicitly: the workspace entry turns default
+# features off so flux-flow can shed the driver (C-274) — see the root Cargo.toml.
+flux-events = { workspace = true, features = ["sqlite"] }
 flux-agent.workspace = true
 # Flux-Lang lifecycle surface: the L0 language (artifact prelude), the L3 engine (compile/analyze/
 # execute), and the L3 model-op pack wired into the assembled registry.

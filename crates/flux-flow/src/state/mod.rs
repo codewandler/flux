@@ -13,16 +13,25 @@
 //!
 //! **Storage is a port** (C-270). [`FlowStore`] holds an `Arc<dyn FlowStateBackend>` and owns
 //! everything above it: serialization, the projection policy, the timestamps, and the run-event
-//! forwarding. [`SqliteState`] is the native backend and the default for every existing constructor,
+//! forwarding. `SqliteState` is the native backend and the default for every existing constructor,
 //! so nothing about native behaviour changed; [`MemoryState`] is a driver-free implementation of the
 //! same port, and [`FlowStore::with_backend`] is how an embedder supplies its own. The engine
 //! therefore no longer reaches a database directly — see [`port`] for why "no such row" had to become
 //! the port's own outcome rather than a driver error.
+//!
+//! C-274 finished the job the port left open: the driver itself is now a **feature** (`sqlite`, on by
+//! default), so `--no-default-features` builds this crate with [`MemoryState`] as the only backend
+//! and no C library anywhere in the graph. C-270 deliberately did not do this alone, because
+//! `rusqlite` also reached here through `flux-events` (`Arc<EventStore>` is in [`FlowStore`]'s public
+//! signature) — dropping one of two paths bought nothing. Both are gated now.
 
 mod memory;
 pub mod port;
+#[cfg(feature = "sqlite")]
 mod sqlite;
 
+// Only the SQLite-backed constructor takes a filesystem path — see `FlowStore::open`.
+#[cfg(feature = "sqlite")]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +42,7 @@ use crate::ast::{Node, NodeId, RunEvent, SymbolName, Value, ValueId, Visibility}
 
 pub use memory::MemoryState;
 pub use port::{FlowStateBackend, Lookup, StoredSymbol, Suspension, SymbolBinding};
+#[cfg(feature = "sqlite")]
 pub use sqlite::SqliteState;
 
 /// Wall-clock milliseconds, read once per write and handed to the backend. The single clock
@@ -181,6 +191,11 @@ pub struct FlowStore {
 impl FlowStore {
     /// Open (creating if needed) a SQLite store at `path`, with WAL enabled. Run-trace events are
     /// forwarded to the shared `events` log.
+    ///
+    /// Needs the `sqlite` feature (on by default): this constructor promises durable state at a path,
+    /// which the driver-free backend cannot deliver — quietly substituting a store that forgets
+    /// everything would be worse than not compiling (C-274).
+    #[cfg(feature = "sqlite")]
     pub fn open(path: impl AsRef<Path>, events: Arc<EventStore>) -> Result<Self> {
         Ok(Self::with_backend(
             Arc::new(SqliteState::open(path)?),
@@ -188,19 +203,23 @@ impl FlowStore {
         ))
     }
 
-    /// An in-memory **SQLite** store (for tests), with its own throwaway event log. Note this still
-    /// links `rusqlite`; [`MemoryState`] is the driver-free backend.
+    /// An in-memory store (for tests), with its own throwaway event log — in-memory **SQLite** with
+    /// the `sqlite` feature on (the default, and unchanged behaviour), [`MemoryState`] when it is off.
+    /// Present in every feature combination on purpose: this is how most of the engine's tests and
+    /// several consumers build a throwaway store, and none of them cares which implementation forgets
+    /// the data.
     pub fn in_memory() -> Result<Self> {
         Self::in_memory_with_events(Arc::new(EventStore::in_memory()?))
     }
 
-    /// An in-memory SQLite store sharing a given event log — so the engine's run trace, message log,
-    /// and turn telemetry all land in one place even in tests.
+    /// [`in_memory`](Self::in_memory) sharing a given event log — so the engine's run trace, message
+    /// log, and turn telemetry all land in one place even in tests.
     pub fn in_memory_with_events(events: Arc<EventStore>) -> Result<Self> {
-        Ok(Self::with_backend(
-            Arc::new(SqliteState::in_memory()?),
-            events,
-        ))
+        #[cfg(feature = "sqlite")]
+        let backend: Arc<dyn FlowStateBackend> = Arc::new(SqliteState::in_memory()?);
+        #[cfg(not(feature = "sqlite"))]
+        let backend: Arc<dyn FlowStateBackend> = Arc::new(MemoryState::default());
+        Ok(Self::with_backend(backend, events))
     }
 
     /// Build a store over an arbitrary [`FlowStateBackend`] — the seam a non-native substrate uses
@@ -938,6 +957,9 @@ mod tests {
         );
     }
 
+    // `FlowStore::in_memory` resolves to the SQLite backend only while the feature is on (C-274) —
+    // gated so the name cannot quietly start describing `MemoryState`, which its twin below covers.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn the_sqlite_backend_conforms_to_the_state_port() {
         assert_state_port_conformance(&FlowStore::in_memory().unwrap());
@@ -976,7 +998,14 @@ mod tests {
             backend.get_value(&vid).unwrap(),
             Lookup::Found("\"x\"".to_string())
         );
-        // The SQLite backend answers the same way — absence is the port's, not the driver's.
+    }
+
+    /// The driver half of the same claim: the SQLite backend reports absence through the port's own
+    /// outcome too, never a `rusqlite` error. Its own test since C-274 made the driver optional —
+    /// the port's semantics must hold with or without it.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_sqlite_backend_reports_absence_through_the_port_too() {
         let sqlite = SqliteState::in_memory().unwrap();
         assert_eq!(
             sqlite.get_value(&ValueId("v_1".into())).unwrap(),

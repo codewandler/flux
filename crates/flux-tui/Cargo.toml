@@ -16,7 +16,9 @@ flux-spec.workspace = true
 # approval request so it can name what a plan will touch.
 flux-policy.workspace = true
 flux-evidence.workspace = true
-flux-events.workspace = true
+# The embedded SQLite backend is asked for explicitly: the workspace entry turns default
+# features off so flux-flow can shed the driver (C-274) — see the root Cargo.toml.
+flux-events = { workspace = true, features = ["sqlite"] }
 ratatui.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
 anyhow.workspace = true

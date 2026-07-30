@@ -10,6 +10,16 @@ description = "Flux-Lang: compile an instruction into a typed, deterministic exe
 [lib]
 name = "flux_flow"
 
+[features]
+default = ["sqlite"]
+# The SQLite-backed engine state store — ON by default, so nothing about the native build changes
+# (C-274). Off, the engine's persistence is `MemoryState` (C-270's driver-free `FlowStateBackend`)
+# over the driver-free event store, and the crate links no C library: the prerequisite for a
+# `wasm32-unknown-unknown` build. `flux-events` is taken with `default-features = false` and its
+# backend re-enabled from here, because otherwise the driver still reaches this crate by that second
+# path — `Arc<EventStore>` is in `FlowStore`'s public signature, so flux-flow cannot drop flux-events.
+sqlite = ["dep:rusqlite", "flux-events/sqlite"]
+
 [dependencies]
 flux-lang.workspace = true
 flux-core.workspace = true
@@ -17,6 +27,9 @@ flux-spec.workspace = true
 flux-runtime.workspace = true
 flux-system.workspace = true
 flux-provider.workspace = true
+# Deliberately WITHOUT `features = ["sqlite"]` (the root Cargo.toml turns flux-events' default
+# features off for every member): the store's backend is re-enabled by this crate's own default-on
+# `sqlite` feature instead, so `--no-default-features` sheds the driver on BOTH paths at once.
 flux-events.workspace = true
 flux-evidence.workspace = true
 flux-secret.workspace = true
@@ -26,7 +39,9 @@ serde.workspace = true
 serde_json.workspace = true
 jsonschema.workspace = true
 async-trait.workspace = true
-rusqlite.workspace = true
+# The engine state store's SQLite driver. Optional: gated behind `sqlite` (on by default) — it links
+# a C library, so shedding it is what makes a `wasm32` build of the engine possible (C-274).
+rusqlite = { workspace = true, optional = true }
 sha2.workspace = true
 futures.workspace = true
 tokio.workspace = true
