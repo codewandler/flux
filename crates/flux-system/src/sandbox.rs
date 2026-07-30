@@ -909,6 +909,58 @@ pub(crate) fn sandbox_marker(
         .then_some(("FLUX_SANDBOXED", "1"))
 }
 
+/// The environment variables that carry a sandbox **posture** down the process tree — everything
+/// [`SandboxSettings::from_env`] and the backend discovery helpers ([`discover_bwrap`],
+/// [`discover_seatbelt`]) read back on the other side. None of them is a secret: three are an
+/// enum, a boolean and a `:`-separated path list the operator already chose, and two are paths to
+/// the *confining wrapper binary* itself.
+const POSTURE_ENV: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOX_NET",
+    "FLUX_SANDBOX_WRITABLE",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+];
+
+/// C-276: the posture keys this process hands to a child, alongside the `FLUX_SANDBOXED` marker
+/// [`sandbox_marker`] injects. Split out from `apply_safe_env` so the decision is unit-testable
+/// without a live backend.
+///
+/// The defect this closes was an **asymmetry**: `SAFE_ENV` carried `FLUX_SANDBOXED` — the marker
+/// whose whole job is to assert *"you are already confined"* — and none of [`POSTURE_ENV`]. A
+/// spawned `flux` therefore resolved its posture from an environment containing no posture, got
+/// `off` (the opt-in default), and so declined to confine its own descendants while the operator
+/// had demanded `require`. Forwarding a claim of confinement without the means to enforce it is
+/// strictly worse than forwarding nothing, so the posture now travels with the marker.
+///
+/// It travels as a **floor, never a ceiling**: an `Off` sandbox forwards nothing at all rather
+/// than forwarding `FLUX_SANDBOX=off`. That distinction is load-bearing, because on the reading
+/// side `off` is not "no opinion" — it is `flux-cli`'s explicit kill switch, which beats a child's
+/// own `[sandbox] require` config *and* C-262's unattended fail-closed profile. Handing it down
+/// would have turned this fix into a new bypass channel. Withholding it leaves a child free to
+/// resolve its own (possibly stricter) posture, which is exactly today's behaviour — so the change
+/// can only ever tighten a child, never loosen one.
+///
+/// Why each is safe to put on the allow-list, against the deny-by-default rule that flux never
+/// forwards a host credential to a child:
+/// - `FLUX_SANDBOX` / `FLUX_SANDBOX_NET`: an `off|on|require` enum and a truthy flag. Not values,
+///   controls — and forwarding them only ever raises the child's floor (see above).
+/// - `FLUX_SANDBOX_WRITABLE`: a `:`-separated list of paths the operator already opened for
+///   writing in *this* process. Same category as `PATH`/`HOME`/`KUBECONFIG` — a filename is not a
+///   credential — and it widens nothing, because it only names paths inside a confinement the
+///   child would not otherwise apply at all.
+/// - `FLUX_BWRAP_BIN` / `FLUX_SANDBOX_EXEC_BIN`: the path to the *confining wrapper* the operator
+///   pinned. Forwarding these is strictly safer than dropping them: a child that cannot see the
+///   pinned wrapper falls back to a `PATH` lookup, and `PATH` is already forwarded — so dropping
+///   them hands backend selection to the weaker of the two channels.
+pub(crate) fn posture_env(sandbox: &Sandbox) -> &'static [&'static str] {
+    if sandbox.settings().mode == SandboxMode::Off {
+        &[]
+    } else {
+        POSTURE_ENV
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Backend argv builders (D-131 bubblewrap, D-132 Seatbelt)
 // ---------------------------------------------------------------------------
@@ -1691,6 +1743,59 @@ mod tests {
             sandbox_marker(Confinement::Sandboxed, &active),
             Some(("FLUX_SANDBOXED", "1"))
         );
+    }
+
+    // -- posture_env (C-276: the marker never travels alone) ------------------------------------
+
+    /// A sandbox with a posture hands the whole posture on. The set is asserted exhaustively, not
+    /// by membership: a variable added to [`SandboxSettings::from_env`] or to backend discovery and
+    /// forgotten here recreates precisely this story's defect — a child that is told it is confined
+    /// without being told with what.
+    #[test]
+    fn a_posture_travels_whole_so_a_child_can_enforce_what_the_marker_claims() {
+        let confining = Sandbox {
+            settings: SandboxSettings {
+                mode: SandboxMode::Require,
+                network: false,
+                extra_writable: Vec::new(),
+            },
+            backend: Backend::Bubblewrap {
+                bwrap: PathBuf::from("/usr/bin/bwrap"),
+            },
+        };
+        assert_eq!(
+            posture_env(&confining),
+            &[
+                "FLUX_SANDBOX",
+                "FLUX_SANDBOX_NET",
+                "FLUX_SANDBOX_WRITABLE",
+                "FLUX_BWRAP_BIN",
+                "FLUX_SANDBOX_EXEC_BIN",
+            ]
+        );
+
+        // It is the *posture*, not an active backend, that decides: an `On` run whose backend went
+        // missing still hands its request down, so a child with a working backend can honor it.
+        let unbacked = Sandbox {
+            settings: SandboxSettings {
+                mode: SandboxMode::On,
+                network: true,
+                extra_writable: Vec::new(),
+            },
+            backend: Backend::Unsupported {
+                reason: "bwrap not found".to_string(),
+            },
+        };
+        assert_eq!(posture_env(&unbacked), posture_env(&confining));
+    }
+
+    /// The floor-never-ceiling rule: an `Off` sandbox forwards NOTHING rather than forwarding
+    /// `FLUX_SANDBOX=off`. On the reading side `off` is not "no opinion" — it is `flux-cli`'s kill
+    /// switch, which beats a child's own `[sandbox] require` and C-262's unattended fail-closed
+    /// profile. Handing it down would make this fix a new bypass channel.
+    #[test]
+    fn an_off_sandbox_forwards_no_posture_so_a_parent_can_never_downgrade_a_child() {
+        assert!(posture_env(&Sandbox::disabled()).is_empty());
     }
 
     // -- SpawnPolicy::for_workspace --------------------------------------------------------------
