@@ -465,10 +465,17 @@ impl FromRef<ServerState> for Arc<ResourceGovernor> {
 
 /// Bind `addr` and serve until shutdown, authenticating per `auth` (see [`ServerAuth`] for the
 /// three modes). [`ServerAuth::Open`] requires a loopback bind.
+///
+/// The readiness line is rendered by [`flux_core::readiness::serving_announcement`] rather than
+/// spelled here: `flux-orchestrate`'s `fleet.start` matches it to decide a fleet worker is live,
+/// and being three layers below this crate it cannot import it to check the wording agrees (C-277).
 pub async fn serve(addr: &str, agent: FlowEngine, auth: ServerAuth) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
-    eprintln!("flux server listening on http://{addr}");
+    eprintln!(
+        "{}",
+        flux_core::readiness::serving_announcement(&addr.to_string())
+    );
     eprintln!("  A2A agent card:  http://{addr}/.well-known/agent-card.json");
     eprintln!("  A2A endpoint:    http://{addr}/a2a  (message/send, message/stream)");
     serve_on(listener, agent, auth).await
@@ -1570,6 +1577,32 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use axum::routing::get;
     use tower::ServiceExt; // for `oneshot`
+
+    /// C-277: `serve`'s readiness line is a cross-crate contract, not an `eprintln!`.
+    ///
+    /// `flux-orchestrate` (L3) decides a fleet worker is live by matching this crate's (L6) stderr.
+    /// The layering rule means no test can reach across that pair, so a rewording here used to fail
+    /// silently and remotely: `fleet.start` degrades to its 60-second readiness timeout and reports
+    /// a worker that never announced itself — indistinguishable, at the call site, from a slow or
+    /// hung worker. Both sides now render and match through
+    /// [`flux_core::readiness`], and this test is what stops this one from drifting back to a local
+    /// literal.
+    #[test]
+    fn the_serving_announcement_is_rendered_through_the_shared_contract() {
+        let source = include_str!("lib.rs");
+        // Split so this assertion's own text is not the match it is looking for.
+        let literal = ["listening on ", "http://"].concat();
+        assert!(
+            !source.contains(&literal),
+            "flux-server spells the readiness announcement itself. flux-orchestrate's \
+             `fleet.start` matches that wording to decide a worker is live and cannot import this \
+             crate to check — render it with `flux_core::readiness::serving_announcement` instead."
+        );
+        assert!(
+            source.contains("readiness::serving_announcement("),
+            "`serve` must render its readiness line through the shared contract"
+        );
+    }
 
     struct PrincipalTestAuthenticator;
 
