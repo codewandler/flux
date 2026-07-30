@@ -15,6 +15,63 @@ use flux_system::{System, Workspace};
 const PROJECT_CONFIG: &str = ".flux/config.toml";
 const PROJECT_GROUPS: &str = ".flux/groups.toml";
 
+/// The environment user-global discovery reads: just `HOME`, the root under which the well-known
+/// `~/.flux`, `~/.agents` and `~/.claude` trees live.
+///
+/// Held as a value rather than read from `std::env` at each site, mirroring `flux-capabilities`'
+/// `HarnessEnv` (C-213). The reason is the same: process-global env is shared across parallel test
+/// threads, so a test that repoints `HOME` races every other test in the binary, and from Rust 2024
+/// on the mutation is `unsafe` besides. C-297: it also lets a discovery test pin an empty home
+/// instead of walking the operator's real one, whose contents a concurrent agent session mutates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiscoveryEnv {
+    home: Option<PathBuf>,
+}
+
+impl DiscoveryEnv {
+    /// Snapshot `HOME` from the process environment — what every production surface uses.
+    pub fn from_process() -> Self {
+        Self {
+            home: std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        }
+    }
+
+    /// An environment with no home at all, so discovery consults project roots only.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Pin the home directory, for tests and for surfaces that resolve it themselves.
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home = Some(home.into());
+        self
+    }
+
+    /// The user-global skill roots, in precedence order. Empty when there is no home.
+    fn skill_roots(&self) -> Vec<PathBuf> {
+        self.home
+            .iter()
+            .flat_map(|home| {
+                [
+                    home.join(".flux/skills"),
+                    home.join(".agents/skills"),
+                    home.join(".claude/skills"),
+                ]
+            })
+            .collect()
+    }
+
+    /// The user-global command roots, in precedence order. Empty when there is no home.
+    fn command_roots(&self) -> Vec<PathBuf> {
+        self.home
+            .iter()
+            .flat_map(|home| [home.join(".flux/commands"), home.join(".claude/commands")])
+            .collect()
+    }
+}
+
 /// Build the deliberately non-widened system used for automatic repository metadata.
 pub fn project_system(cwd: &Path) -> Result<System> {
     Ok(System::new(Workspace::new(cwd)?))
@@ -340,11 +397,25 @@ pub fn discover_skills(cwd: &Path, extra: &[PathBuf]) -> Result<Vec<flux_skill::
 
 /// Provenance-aware skill discovery used when layered config and explicit CLI paths are combined.
 ///
-/// D-192: the five well-known directories below (project `.flux/skills`, project `.claude/skills`,
-/// then user-global `~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`, in that precedence
-/// order) are the **single** definition of flux's default skill-directory set — `flux-skill` no
-/// longer carries a duplicate of this list; it owns parsing only.
+/// D-192: five well-known directories (project `.flux/skills`, project `.claude/skills`, then
+/// user-global `~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`, in that precedence order)
+/// are the **single** definition of flux's default skill-directory set — `flux-skill` no longer
+/// carries a duplicate of this list; it owns parsing only. The project pair is spelled in
+/// [`discover_skills_in`]; the user-global three in [`DiscoveryEnv::skill_roots`] (C-297).
 pub fn discover_skills_from(cwd: &Path, extra: &[SkillRoot]) -> Result<SkillDiscovery> {
+    discover_skills_in(cwd, extra, &DiscoveryEnv::from_process())
+}
+
+/// [`discover_skills_from`] against an explicit [`DiscoveryEnv`] rather than the process's own.
+///
+/// This is the single site that knows the user-global half of the default root set; the
+/// process-reading wrappers above differ from it only in where `HOME` comes from. A test pins an
+/// empty or fixture home here instead of mutating process env — see [`DiscoveryEnv`].
+pub fn discover_skills_in(
+    cwd: &Path,
+    extra: &[SkillRoot],
+    env: &DiscoveryEnv,
+) -> Result<SkillDiscovery> {
     let project = project_system(cwd)?;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -370,15 +441,9 @@ pub fn discover_skills_from(cwd: &Path, extra: &[SkillRoot]) -> Result<SkillDisc
         extend_skills(&mut out, &mut seen, files, &mut warnings);
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for dir in [
-            home.join(".flux/skills"),
-            home.join(".agents/skills"),
-            home.join(".claude/skills"),
-        ] {
-            let files = trusted_skill_files(&dir)?;
-            extend_skills(&mut out, &mut seen, files, &mut warnings);
-        }
+    for dir in env.skill_roots() {
+        let files = trusted_skill_files(&dir)?;
+        extend_skills(&mut out, &mut seen, files, &mut warnings);
     }
 
     out.sort_by(|left, right| left.name.cmp(&right.name));
@@ -512,6 +577,12 @@ fn trusted_command_files(dir: &Path) -> Result<Vec<(PathBuf, String)>> {
 /// four roots. Dispatch-time built-in shadowing is the caller's decision (built-ins live in the
 /// REPL/TUI surfaces, not here).
 pub fn discover_commands(cwd: &Path) -> Result<CommandDiscovery> {
+    discover_commands_in(cwd, &DiscoveryEnv::from_process())
+}
+
+/// [`discover_commands`] against an explicit [`DiscoveryEnv`] rather than the process's own — the
+/// command-side twin of [`discover_skills_in`], and for the same reason (C-297).
+pub fn discover_commands_in(cwd: &Path, env: &DiscoveryEnv) -> Result<CommandDiscovery> {
     let project = project_system(cwd)?;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -522,11 +593,9 @@ pub fn discover_commands(cwd: &Path) -> Result<CommandDiscovery> {
         extend_commands(&mut out, &mut seen, files, &mut warnings);
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for dir in [home.join(".flux/commands"), home.join(".claude/commands")] {
-            let files = trusted_command_files(&dir)?;
-            extend_commands(&mut out, &mut seen, files, &mut warnings);
-        }
+    for dir in env.command_roots() {
+        let files = trusted_command_files(&dir)?;
+        extend_commands(&mut out, &mut seen, files, &mut warnings);
     }
 
     out.sort_by(|left, right| left.name.cmp(&right.name));
@@ -574,6 +643,17 @@ pub fn expand_command_arguments(body: &str, raw_args: &str) -> String {
 /// env is shared across parallel test threads (mirrors `flux_config`'s `HOME_LOCK`).
 #[cfg(test)]
 pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes tests that assert on `tracing` output against tests that emit the *same* callsite.
+///
+/// `tracing` caches a callsite's `Interest` process-globally, so a thread that reaches
+/// `extend_skills`' duplicate-skill `warn!` while another thread is between installing its
+/// `with_default` subscriber and emitting builds the cache against the wrong dispatcher, and the
+/// recording subscriber captures nothing. C-297: `HOME_LOCK` used to serialize these two by
+/// accident; now that discovery tests pin a [`DiscoveryEnv`] instead of `HOME`, the coupling is
+/// named for what it actually protects. Assertions on the returned `warnings` need no lock.
+#[cfg(test)]
+static TRACING_CALLSITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serializes tests that set `FLUX_MANAGED_CONFIG` (C-165) — same rationale as `HOME_LOCK`.
 #[cfg(test)]
@@ -646,7 +726,7 @@ mod tests {
         std::fs::remove_file(root.join(".flux/config.toml")).unwrap();
 
         symlink(outside.join("secret"), root.join(".flux/skills/escaped.md")).unwrap();
-        let error = discover_skills(&root, &[]).unwrap_err();
+        let error = discover_skills_in(&root, &[], &DiscoveryEnv::empty()).unwrap_err();
         assert!(error.to_string().contains("outside"), "{error}");
 
         std::fs::remove_dir_all(root).ok();
@@ -667,7 +747,7 @@ mod tests {
         std::fs::write(outside.join("SKILL.md"), "---\nname: escaped\n---\nOUTSIDE").unwrap();
 
         symlink(&outside, root.join(".claude/skills/ns/escaped")).unwrap();
-        let error = discover_skills(&root, &[]).unwrap_err();
+        let error = discover_skills_in(&root, &[], &DiscoveryEnv::empty()).unwrap_err();
         assert!(error.to_string().contains("outside"), "{error}");
 
         std::fs::remove_dir_all(root).ok();
@@ -677,9 +757,8 @@ mod tests {
     #[test]
     fn a_skill_directory_with_references_is_not_double_discovered() {
         // A skill's own `references/` subdirectory (with its own `.md` files) must not surface as
-        // a second skill — the parent already claimed the subtree by containing SKILL.md. Repoint
-        // HOME to an empty dir so the host's real `~/.claude/skills` (if any) can't leak in.
-        let _home_guard = HOME_LOCK.lock().unwrap();
+        // a second skill — the parent already claimed the subtree by containing SKILL.md. Pin an
+        // empty home so the host's real `~/.claude/skills` (if any) can't leak in.
         let root = temp_dir("refs-root");
         let home = temp_dir("refs-home");
         std::fs::create_dir_all(root.join(".claude/skills/foo/references")).unwrap();
@@ -694,9 +773,9 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("HOME", &home);
-        let skills = discover_skills(&root, &[]).unwrap();
-        std::env::remove_var("HOME");
+        let skills = discover_skills_in(&root, &[], &DiscoveryEnv::empty().with_home(&home))
+            .unwrap()
+            .skills;
 
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -712,9 +791,8 @@ mod tests {
     #[test]
     fn namespaced_duplicate_skill_names_dedup_first_wins_and_warn() {
         // Two namespaced trees defining the same skill name (`a/foo` vs `b/foo`): first-wins
-        // precedence keeps the earlier one and the loser is loud (a warning), not silent. Repoint
-        // HOME to an empty dir so the host's real user-global skills can't collide with `foo`.
-        let _home_guard = HOME_LOCK.lock().unwrap();
+        // precedence keeps the earlier one and the loser is loud (a warning), not silent. Pin an
+        // empty home so the host's real user-global skills can't collide with `foo`.
         let root = temp_dir("dup-root");
         let home = temp_dir("dup-home");
         std::fs::create_dir_all(root.join(".claude/skills/a/foo")).unwrap();
@@ -734,10 +812,12 @@ mod tests {
         let subscriber = RecordingSubscriber {
             messages: messages.clone(),
         };
-        std::env::set_var("HOME", &home);
-        let skills =
-            tracing::subscriber::with_default(subscriber, || discover_skills(&root, &[]).unwrap());
-        std::env::remove_var("HOME");
+        let env = DiscoveryEnv::empty().with_home(&home);
+        let _callsite_guard = TRACING_CALLSITE_LOCK.lock().unwrap();
+        let discovery = tracing::subscriber::with_default(subscriber, || {
+            discover_skills_in(&root, &[], &env).unwrap()
+        });
+        let skills = &discovery.skills;
 
         let foo: Vec<_> = skills.iter().filter(|s| s.name == "foo").collect();
         assert_eq!(
@@ -746,10 +826,19 @@ mod tests {
             "namespaced duplicate must dedup to a single entry"
         );
         assert_eq!(foo[0].body, "from a", "first-discovered definition wins");
+        // The structured channel is the one callers read, and it needs no global state to observe.
+        assert!(
+            discovery
+                .warnings
+                .iter()
+                .any(|w| w.contains("duplicate skill `foo`")),
+            "expected a returned warning about the shadowed duplicate, got: {:?}",
+            discovery.warnings
+        );
         let captured = messages.lock().unwrap();
         assert!(
             captured.iter().any(|m| m.contains("duplicate skill")),
-            "expected a warning about the shadowed duplicate, got: {captured:?}"
+            "expected a traced warning about the shadowed duplicate, got: {captured:?}"
         );
 
         std::fs::remove_dir_all(root).ok();
@@ -761,7 +850,6 @@ mod tests {
     /// still succeeds (non-fatal).
     #[test]
     fn discovery_lints_an_invalid_skill_name_but_still_loads_it() {
-        let _home_guard = HOME_LOCK.lock().unwrap();
         let root = temp_dir("lint-name-root");
         let home = temp_dir("lint-name-home");
         std::fs::create_dir_all(root.join(".flux/skills")).unwrap();
@@ -771,10 +859,8 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("HOME", &home);
-        let discovery =
-            discover_skills_from(&root, &[]).expect("discovery succeeds despite a lint issue");
-        std::env::remove_var("HOME");
+        let discovery = discover_skills_in(&root, &[], &DiscoveryEnv::empty().with_home(&home))
+            .expect("discovery succeeds despite a lint issue");
 
         assert!(
             discovery.skills.iter().any(|s| s.name == "Bad--Name"),
@@ -797,7 +883,6 @@ mod tests {
     /// `warnings`, not silently — the field the CLI's `load_skills` will print at load time.
     #[test]
     fn discovery_warns_on_unsupported_frontmatter_field() {
-        let _home_guard = HOME_LOCK.lock().unwrap();
         let root = temp_dir("lint-field-root");
         let home = temp_dir("lint-field-home");
         std::fs::create_dir_all(root.join(".flux/skills")).unwrap();
@@ -807,9 +892,8 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("HOME", &home);
-        let discovery = discover_skills_from(&root, &[]).unwrap();
-        std::env::remove_var("HOME");
+        let discovery =
+            discover_skills_in(&root, &[], &DiscoveryEnv::empty().with_home(&home)).unwrap();
 
         assert!(
             discovery
@@ -828,7 +912,6 @@ mod tests {
     /// entry surfaces as a discovery warning instead of silently vanishing.
     #[test]
     fn discovery_translates_allowed_tools_and_warns_on_unmappable() {
-        let _home_guard = HOME_LOCK.lock().unwrap();
         let root = temp_dir("lint-tools-root");
         let home = temp_dir("lint-tools-home");
         std::fs::create_dir_all(root.join(".flux/skills")).unwrap();
@@ -838,9 +921,8 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("HOME", &home);
-        let discovery = discover_skills_from(&root, &[]).unwrap();
-        std::env::remove_var("HOME");
+        let discovery =
+            discover_skills_in(&root, &[], &DiscoveryEnv::empty().with_home(&home)).unwrap();
 
         let skill = discovery
             .skills
@@ -872,7 +954,10 @@ mod tests {
     /// [`discover_commands_across_four_dirs_with_precedence_and_dedup`] for skills.
     #[test]
     fn discover_skills_across_five_dirs_with_precedence_and_dedup() {
-        let _home_guard = HOME_LOCK.lock().unwrap();
+        // Deliberately builds duplicate names, so it emits the same `warn!` callsite that
+        // `namespaced_duplicate_skill_names_dedup_first_wins_and_warn` records — see
+        // [`TRACING_CALLSITE_LOCK`].
+        let _callsite_guard = TRACING_CALLSITE_LOCK.lock().unwrap();
         let root = temp_dir("skill-prec-root");
         let home = temp_dir("skill-prec-home");
 
@@ -923,9 +1008,8 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("HOME", &home);
-        let discovery = discover_skills_from(&root, &[]).unwrap();
-        std::env::remove_var("HOME");
+        let discovery =
+            discover_skills_in(&root, &[], &DiscoveryEnv::empty().with_home(&home)).unwrap();
 
         let shared = discovery
             .skills
@@ -971,7 +1055,14 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills(&root, &[]).unwrap();
+        // C-297: pin an empty home. Reading the process's own would walk the operator's real
+        // `~/.flux|.agents|.claude/skills`, whose contents a concurrent agent session mutates —
+        // and a `read_dir` entry that is gone by the time it is `stat`ed surfaces here as a bare
+        // `Io(NotFound)` with no path, which reads as an infrastructure failure rather than a
+        // flake. A unit test may not read the operator's home.
+        let skills = discover_skills_in(&root, &[], &DiscoveryEnv::empty())
+            .unwrap()
+            .skills;
         assert!(
             skills.iter().any(|s| s.name == "beta"),
             "directory skill with no frontmatter name should take the directory name: {:?}",
@@ -1027,7 +1118,7 @@ mod tests {
         let config = load_config(&root).unwrap();
         let roots = configured_skill_roots(&config);
         assert!(matches!(roots.as_slice(), [SkillRoot::Project(path)] if path == &outside));
-        assert!(discover_skills_from(&root, &roots).is_err());
+        assert!(discover_skills_in(&root, &roots, &DiscoveryEnv::empty()).is_err());
 
         std::fs::remove_dir_all(root).ok();
         std::fs::remove_dir_all(outside).ok();
@@ -1038,13 +1129,12 @@ mod tests {
         let root = temp_dir("missing");
         assert!(load_config(&root).is_ok());
         assert!(load_groups(&root).unwrap().is_empty());
-        assert!(discover_skills(&root, &[]).is_ok());
+        assert!(discover_skills_in(&root, &[], &DiscoveryEnv::empty()).is_ok());
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn discover_commands_across_four_dirs_with_precedence_and_dedup() {
-        let _home_guard = HOME_LOCK.lock().unwrap();
         let root = temp_dir("cmd-root");
         let home = temp_dir("cmd-home");
 
@@ -1086,9 +1176,8 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("HOME", &home);
-        let discovery = discover_commands(&root).unwrap();
-        std::env::remove_var("HOME");
+        let discovery =
+            discover_commands_in(&root, &DiscoveryEnv::empty().with_home(&home)).unwrap();
 
         let shared = discovery
             .commands
@@ -1135,7 +1224,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = discover_commands(&root).unwrap_err();
+        let error = discover_commands_in(&root, &DiscoveryEnv::empty()).unwrap_err();
         assert!(error.to_string().contains("outside"), "{error}");
 
         std::fs::remove_dir_all(root).ok();
@@ -1152,7 +1241,9 @@ mod tests {
         )
         .unwrap();
 
-        let discovery = discover_commands(&root).unwrap();
+        // C-297: an empty home, so the operator's real `~/.flux|.claude/commands` can neither add
+        // a command ahead of `review` nor contribute a warning to the count asserted below.
+        let discovery = discover_commands_in(&root, &DiscoveryEnv::empty()).unwrap();
         let cmd = discovery.commands.first().unwrap();
         assert_eq!(cmd.name, "review");
         assert_eq!(cmd.description, "Review a PR");
@@ -1185,7 +1276,7 @@ mod tests {
         )
         .unwrap();
 
-        let discovery = discover_commands(&root).unwrap();
+        let discovery = discover_commands_in(&root, &DiscoveryEnv::empty()).unwrap();
         let human = discovery
             .commands
             .iter()
