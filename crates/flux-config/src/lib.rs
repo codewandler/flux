@@ -826,6 +826,34 @@ pub struct Limits {
     /// `FLUX_TURN_TOKEN_BUDGET` and the `--turn-budget` flag (flag > env > config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_token_budget: Option<u64>,
+    /// C-290: how many tool calls may be executing simultaneously in one in-process runtime.
+    /// Absent means no ceiling. Unlike `[server] max_inflight_per_principal` this is not
+    /// per-principal and not server-side — it binds inside the safety envelope, so it applies to an
+    /// embedded runtime too. `0` is read as `1`.
+    ///
+    /// This whole group is consumed by an embedding host through
+    /// `flux_runtime::ResourceLimits::from_config`, which it hands to
+    /// `ClientBuilder::resource_limits`. The `flux` binary does **not** apply it yet — that wiring
+    /// is a separate change in `flux-cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_tool_calls: Option<usize>,
+    /// C-290: how long a tool call waits for a concurrency slot before it is refused with an
+    /// actionable message. Absent means the runtime default (30s). Meaningful only alongside
+    /// `max_concurrent_tool_calls`.
+    ///
+    /// **No sentinel means "wait forever", and the 30s default binds when this is absent — but this
+    /// value is not clamped.** It is milliseconds handed to `Duration::from_millis`, so `u64::MAX`
+    /// is a ~584,942,417-year wait that `tokio::time::timeout` will honor rather than cap. An
+    /// operator who writes an absurd number here has chosen a hang; that is deliberate and visible,
+    /// and nothing overrides it. See `flux_runtime::DEFAULT_TOOL_CALL_QUEUE_TIMEOUT` for why no
+    /// maximum is imposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_queue_timeout_ms: Option<u64>,
+    /// C-290: how many bytes of tool results the runtime may retain in its deterministic op cache.
+    /// Absent means no byte ceiling (the entry-count bound still applies). Eviction is
+    /// correctness-neutral — a miss re-runs the op — so this never truncates a visible result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retained_result_bytes: Option<usize>,
 }
 
 impl Limits {
@@ -1212,6 +1240,18 @@ fn merge(user: Config, project: Config) -> Config {
                 .limits
                 .turn_token_budget
                 .or(user.limits.turn_token_budget),
+            max_concurrent_tool_calls: project
+                .limits
+                .max_concurrent_tool_calls
+                .or(user.limits.max_concurrent_tool_calls),
+            tool_call_queue_timeout_ms: project
+                .limits
+                .tool_call_queue_timeout_ms
+                .or(user.limits.tool_call_queue_timeout_ms),
+            max_retained_result_bytes: project
+                .limits
+                .max_retained_result_bytes
+                .or(user.limits.max_retained_result_bytes),
         },
         server: ServerConfig {
             // Same scalar rule throughout: a project value (including an explicit 0/false)
@@ -1642,6 +1682,48 @@ mod tests {
     fn unknown_top_level_config_key_is_rejected() {
         let err = toml::from_str::<Config>("future_knob = true").unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// C-290: a file-configured host reaches the runtime resource ceilings through `[limits]`,
+    /// alongside the token budget that was already there.
+    #[test]
+    fn runtime_resource_ceilings_parse_from_the_limits_table() {
+        let config = toml::from_str::<Config>(
+            r#"
+[limits]
+turn_token_budget = 100000
+max_concurrent_tool_calls = 4
+tool_call_queue_timeout_ms = 2500
+max_retained_result_bytes = 1048576
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.limits.turn_token_budget, Some(100_000));
+        assert_eq!(config.limits.max_concurrent_tool_calls, Some(4));
+        assert_eq!(config.limits.tool_call_queue_timeout_ms, Some(2500));
+        assert_eq!(config.limits.max_retained_result_bytes, Some(1_048_576));
+    }
+
+    /// The new ceilings follow the same scalar merge rule as `turn_token_budget`: a project value
+    /// overrides the user's, and a value the project left unset survives from the user layer.
+    #[test]
+    fn runtime_resource_ceilings_merge_as_scalars() {
+        let mut user = Config::default();
+        user.limits.max_concurrent_tool_calls = Some(2);
+        user.limits.max_retained_result_bytes = Some(1024);
+        user.limits.tool_call_queue_timeout_ms = Some(9_000);
+
+        let mut project = Config::default();
+        project.limits.max_concurrent_tool_calls = Some(8);
+
+        let merged = merge(user, project);
+        assert_eq!(merged.limits.max_concurrent_tool_calls, Some(8));
+        assert_eq!(
+            merged.limits.max_retained_result_bytes,
+            Some(1024),
+            "project left it unset, so the user's value survives"
+        );
+        assert_eq!(merged.limits.tool_call_queue_timeout_ms, Some(9_000));
     }
 
     #[test]

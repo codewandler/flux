@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use flux_runtime::{AllowApprover, Approver, DenyApprover, ExecutionAuthorization};
+use flux_runtime::{AllowApprover, Approver, DenyApprover, ExecutionAuthorization, ResourceLimits};
 use flux_secret::Redactor;
 use flux_system::sandbox::{Sandbox, SandboxSettings};
 
@@ -18,6 +18,9 @@ pub(crate) struct Envelope {
     pub(crate) sandbox: Option<Sandbox>,
     pub(crate) authorization: ExecutionAuthorization,
     pub(crate) redactor: Redactor,
+    /// C-290: the host's ceilings on what the runtime *uses* — simultaneously executing tool calls
+    /// and retained result bytes. Unbounded by default.
+    pub(crate) resource_limits: ResourceLimits,
 }
 
 impl Envelope {
@@ -31,6 +34,7 @@ impl Envelope {
             sandbox: None,
             authorization: ExecutionAuthorization::local(),
             redactor: Redactor::new(),
+            resource_limits: ResourceLimits::new(),
         }
     }
 
