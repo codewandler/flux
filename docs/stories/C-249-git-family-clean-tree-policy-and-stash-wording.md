@@ -73,6 +73,25 @@ shared by `git_revert`, `git_snapshot` and `git_worktree_enter`.
     before its always-aborted trial merge. Both are new refusals, no relaxations.
   - Preflight git failures inside the shared helper return a recoverable `ToolResult::error` instead
     of `?`-propagating a plan-halting raw error (the C-241 review shape).
+- 2026-07-30 — merged `main` (27 commits) into `impl/C-249` and brought **`fleet.isolate`** (C-241,
+  landed after the fork) under the policy. It aborts nothing, so no abort-based rule selects it, and
+  it is named `Fleet*`, so no name-based rule selects it — but it ran its own `git status
+  --porcelain` and refused with a hand-copied variant of `git_revert`'s pre-C-249 wording (its
+  comment says so: *"Same wording care as `git_revert`"*). Excluding it would have left the family
+  with two dirty-tree messages on day one, which is the drift this story exists to end. It now
+  declares `FLEET_ISOLATE_TREE` — `in_flight: &[]`, `CleanTree::Required` for its own reason (it
+  checks out HEAD for a worker, so uncommitted work would be missing from that copy). Membership is
+  therefore **not** the same as being abort-capable, and the policy doc now says so.
+- 2026-07-30 — the selector no longer depends on the `Git` name prefix, which was the part that
+  would rot again. Sections are bounded by the file's own banner separators and selected purely on
+  what an op's body invokes. Two rules now, because one is not enough:
+  `abort_capable_ops_route_through_the_shared_tree_precondition` (blanket restore ⇒ must call the
+  helper; the selected set is pinned by sentinels so a rotted selector cannot pass vacuously), and
+  `no_op_hand_rolls_its_own_clean_tree_check` (`git status --porcelain` may appear only inside the
+  shared `tree_status` helper). The second is the one that would have caught `fleet.isolate` the day
+  it landed: name-agnostic, abort-agnostic, and — unlike the first — it does not erase itself as ops
+  are converted. Verified against main's unmodified source: it names `lib.rs:4118`, `fleet.isolate`'s
+  own probe.
 
 ## Notes
 - Useful negative result from the same review, worth not re-deriving: an attempt to build a

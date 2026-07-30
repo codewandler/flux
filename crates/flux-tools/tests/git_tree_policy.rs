@@ -186,19 +186,21 @@ fn abort_capable_ops_route_through_the_shared_tree_precondition() {
 #[test]
 fn no_op_hand_rolls_its_own_clean_tree_check() {
     let src = production_source();
-    let shared = src
-        .find(SHARED_STATUS_READER)
-        .unwrap_or_else(|| panic!("the shared `{SHARED_STATUS_READER}` helper is gone"));
-    // The helper's own body is the one legitimate probe; bound it by its closing brace.
-    let shared_end = src[shared..]
-        .find("\n}\n")
-        .map(|i| shared + i)
-        .unwrap_or(src.len());
+    // The shared helper's own body is the one legitimate probe. If the helper is gone, nothing is
+    // exempt and every probe is hand-rolled — which is the honest reading, and keeps this test
+    // reporting the offending lines rather than the helper's absence.
+    let exempt = src.find(SHARED_STATUS_READER).map(|start| {
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        start..end
+    });
 
     let strays: Vec<String> = src
         .match_indices(CLEANLINESS_PROBE)
         .map(|(i, _)| i)
-        .filter(|&i| !(shared..shared_end).contains(&i))
+        .filter(|i| exempt.as_ref().is_none_or(|r| !r.contains(i)))
         .map(|i| format!("{FAMILY_SRC}:{}", src[..i].lines().count()))
         .collect();
 
