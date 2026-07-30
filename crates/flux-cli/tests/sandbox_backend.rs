@@ -224,7 +224,10 @@ fn a_confined_child_inherits_the_posture_and_not_only_the_marker() {
             ("FLUX_ENABLE_BASH", "1"),
             (
                 "FLUX_MOCK_BASH",
-                "echo posture=[$FLUX_SANDBOX] marker=[$FLUX_SANDBOXED] net=[$FLUX_SANDBOX_NET]",
+                // Exactly one wrapper variable is ever set (bwrap on Linux, sandbox-exec on
+                // macOS), so concatenating them reads whichever this host resolved.
+                "echo posture=[$FLUX_SANDBOX] marker=[$FLUX_SANDBOXED] \
+                 net=[$FLUX_SANDBOX_NET] wrapper=[$FLUX_BWRAP_BIN$FLUX_SANDBOX_EXEC_BIN]",
             ),
         ],
         &[
@@ -260,6 +263,21 @@ fn a_confined_child_inherits_the_posture_and_not_only_the_marker() {
     assert!(
         reported.contains("net=[0]"),
         "the resolved network posture did not reach the child.\ntool_result: {reported}"
+    );
+    // The wrapper path is the sharpest evidence that these values come from the RESOLVED sandbox
+    // rather than from the ambient environment: nothing set `FLUX_BWRAP_BIN` on this run, so an
+    // env-echoing forwarder has nothing to echo. What the child sees is the absolute binary
+    // discovery found and the preflight probe verified — the one actually wrapping it.
+    let wrapper = reported
+        .split("wrapper=[")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or_else(|| panic!("no wrapper field in the tool_result: {reported}"));
+    assert!(
+        wrapper.starts_with('/'),
+        "the child inherited no resolved wrapper path (got {wrapper:?}), so it would rediscover \
+         one through `PATH` instead of using the binary this process verified.\n\
+         tool_result: {reported}"
     );
 }
 

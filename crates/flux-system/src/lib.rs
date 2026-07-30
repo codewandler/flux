@@ -2105,10 +2105,18 @@ impl System {
             // no more than the `~/.kube/config` it already reads through the forwarded `HOME`.
             "KUBECONFIG",
         ];
-        for key in SAFE_ENV.iter().chain(sandbox::posture_env(sandbox)) {
+        for key in SAFE_ENV {
             if let Ok(val) = std::env::var(key) {
                 cmd.env(key, val);
             }
+        }
+        // C-276: the sandbox posture, rendered from `sandbox` — deliberately NOT read back out of
+        // `std::env` like the allow-list above. A pinned `Sandbox` and the ambient environment can
+        // legitimately disagree (`System::with_sandbox` exists for exactly that), and taking the
+        // decision from one and the value from the other is how a pinned posture ends up shipping
+        // the ambient kill switch. See `sandbox::posture_env`.
+        for (key, value) in sandbox::posture_env(sandbox) {
+            cmd.env(key, value);
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -3300,16 +3308,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The keys `sandbox::posture_env` may emit, collected out of a spawned `env` dump — so these
+    /// tests assert on the *whole* forwarded posture rather than on the entries they remembered to
+    /// look for.
+    fn forwarded_posture(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .filter(|line| {
+                line.starts_with("FLUX_SANDBOX=")
+                    || line.starts_with("FLUX_SANDBOX_NET=")
+                    || line.starts_with("FLUX_SANDBOX_WRITABLE=")
+                    || line.starts_with("FLUX_BWRAP_BIN=")
+                    || line.starts_with("FLUX_SANDBOX_EXEC_BIN=")
+            })
+            .collect()
+    }
+
+    /// Resolve a `Sandbox` for `settings` with both wrapper paths pinned at nonexistent binaries,
+    /// then wipe every posture variable the resolution read. What comes back is a sandbox whose
+    /// posture exists ONLY in the struct — the shape `System::with_sandbox` is built to produce,
+    /// and the shape that catches a forwarder consulting `std::env` instead of the sandbox it was
+    /// handed. Hermetic on any host: the backend never resolves, so nothing is ever wrapped.
+    fn pin_posture_then_clear_the_env(settings: SandboxSettings) -> Sandbox {
+        std::env::set_var("FLUX_BWRAP_BIN", "/nonexistent/bwrap");
+        std::env::set_var("FLUX_SANDBOX_EXEC_BIN", "/nonexistent/sandbox-exec");
+        let sandbox = Sandbox::resolve(settings);
+        assert!(!sandbox.is_active(), "the pinned backend must not exist");
+        for key in [
+            "FLUX_SANDBOX",
+            "FLUX_SANDBOX_NET",
+            "FLUX_SANDBOX_WRITABLE",
+            "FLUX_BWRAP_BIN",
+            "FLUX_SANDBOX_EXEC_BIN",
+        ] {
+            std::env::remove_var(key);
+        }
+        sandbox
+    }
+
     /// C-276: the marker above never travels alone. A process with a posture forwards it through
     /// the same env-clear, so a child `flux` resolves the confinement the operator asked for
     /// instead of reading an environment with no posture in it and defaulting to `off`.
     ///
-    /// Hermetic on purpose — the backend is pinned at a nonexistent path, so the sandbox is
-    /// `On`-but-unavailable and nothing is wrapped. That is the weaker case: it proves the posture
-    /// travels because this process *has* one, not because a wrapper happened to be present. The
-    /// end-to-end proof over a real backend lives in `flux-cli`'s `sandbox_backend.rs`.
+    /// The posture here is **pinned while the ambient environment is silent** — the `with_sandbox`
+    /// case, and the one that pins down where the values come from. A forwarder that decided from
+    /// the resolved sandbox but read its values back out of `std::env` would forward nothing at all
+    /// here, making this story's Goal a silent no-op for every embedder. The end-to-end proof over
+    /// a real backend lives in `flux-cli`'s `sandbox_backend.rs`.
     #[tokio::test]
-    async fn the_sandbox_posture_survives_env_clear_so_the_marker_never_travels_alone() {
+    async fn a_pinned_posture_reaches_a_child_when_the_ambient_env_is_silent() {
         let (dir, sys) = temp_workspace();
         // Same shared lock as the marker test above; restores every key on drop.
         let _env = sandbox::EnvGuard::new(&[
@@ -3319,32 +3366,73 @@ mod tests {
             "FLUX_BWRAP_BIN",
             "FLUX_SANDBOX_EXEC_BIN",
         ]);
-        std::env::set_var("FLUX_SANDBOX", "on");
-        std::env::set_var("FLUX_SANDBOX_NET", "0");
-        std::env::set_var("FLUX_SANDBOX_WRITABLE", "/flux-c276-writable");
-        std::env::set_var("FLUX_BWRAP_BIN", "/nonexistent/bwrap");
-        let sys = sys.with_sandbox(Sandbox::resolve(SandboxSettings::from_env()));
-        assert!(
-            !sys.sandbox.is_active(),
-            "the pinned backend must not exist"
+        let sys = sys.with_sandbox(pin_posture_then_clear_the_env(SandboxSettings {
+            mode: sandbox::SandboxMode::Require,
+            network: false,
+            extra_writable: vec![PathBuf::from("/flux-c276-writable")],
+        }));
+
+        // `Require` with no backend refuses a confined spawn (the fail-closed backstop), so this
+        // goes through the exempt seam — the local-eval child host's path, which is exactly a
+        // caller that must receive the posture for its own descendants.
+        let out = sys
+            .run_with_env_exempt(&["env".to_string()], &[], Duration::from_secs(10))
+            .await
+            .unwrap();
+        // Exhaustive: the whole posture, and nothing beyond it. In particular no wrapper path —
+        // this process never established one, so it has none to hand on.
+        assert_eq!(
+            forwarded_posture(&out.stdout),
+            vec![
+                "FLUX_SANDBOX=require",
+                "FLUX_SANDBOX_NET=0",
+                "FLUX_SANDBOX_WRITABLE=/flux-c276-writable",
+            ],
+            "full child env:\n{}",
+            out.stdout
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same divergence pointed the other way, and the sharper half: the sandbox is pinned `On`
+    /// while the ambient environment says `off`. `System::with_sandbox` exists so an embedder can
+    /// pin a posture *independent of ambient env* (`flux-sdk`'s `SystemBuilder` documents exactly
+    /// that), so the two sources legitimately disagree — and a forwarder that takes the decision
+    /// from one and the values from the other hands the child `FLUX_SANDBOX=off`, the kill switch,
+    /// leaving it LESS confined than forwarding nothing would have.
+    #[tokio::test]
+    async fn a_pinned_posture_beats_a_contradicting_ambient_env_instead_of_shipping_it() {
+        let (dir, sys) = temp_workspace();
+        let _env = sandbox::EnvGuard::new(&[
+            "FLUX_SANDBOX",
+            "FLUX_SANDBOX_NET",
+            "FLUX_SANDBOX_WRITABLE",
+            "FLUX_BWRAP_BIN",
+            "FLUX_SANDBOX_EXEC_BIN",
+        ]);
+        let sys = sys.with_sandbox(pin_posture_then_clear_the_env(SandboxSettings {
+            mode: sandbox::SandboxMode::On,
+            network: false,
+            extra_writable: Vec::new(),
+        }));
+        // The ambient env now contradicts the pin, the way an embedder's host environment can.
+        std::env::set_var("FLUX_SANDBOX", "off");
+        std::env::set_var("FLUX_SANDBOX_NET", "1");
 
         let out = sys
             .run(&["env".to_string()], Duration::from_secs(10))
             .await
             .unwrap();
-        for expected in [
-            "FLUX_SANDBOX=on",
-            "FLUX_SANDBOX_NET=0",
-            "FLUX_SANDBOX_WRITABLE=/flux-c276-writable",
-            "FLUX_BWRAP_BIN=/nonexistent/bwrap",
-        ] {
-            assert!(
-                out.stdout.contains(expected),
-                "{expected} did not survive the env-clear: {}",
-                out.stdout
-            );
-        }
+        assert_eq!(
+            forwarded_posture(&out.stdout),
+            vec!["FLUX_SANDBOX=on", "FLUX_SANDBOX_NET=0"],
+            "the pinned posture must reach the child and the ambient env must not: forwarding \
+             `off` would leave the child LESS confined than forwarding nothing, because on the \
+             reading side `off` short-circuits ahead of the child's own `[sandbox] require` and \
+             C-262's unattended profile — and an ambient `FLUX_SANDBOX_NET=1` would re-open a \
+             network this process closed.\nfull child env:\n{}",
+            out.stdout
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3352,21 +3440,27 @@ mod tests {
     /// forwards NOTHING — not even `FLUX_SANDBOX=off` — because on the reading side `off` is
     /// `flux-cli`'s explicit kill switch, which beats a child's own `[sandbox] require` and C-262's
     /// unattended fail-closed profile. Forwarding it would have made this fix a bypass channel.
+    ///
+    /// The ambient environment says `require` here rather than `off`, so the test can pass for only
+    /// one reason. A forwarder that shipped the environment would leak `require`; one that shipped
+    /// the settings unconditionally would leak `off`. Only the carve-out is silent.
     #[tokio::test]
     async fn an_off_sandbox_forwards_no_posture_so_a_child_keeps_its_own() {
         let (dir, sys) = temp_workspace();
-        let _env = sandbox::EnvGuard::new(&["FLUX_SANDBOX", "FLUX_SANDBOX_NET"]);
-        std::env::set_var("FLUX_SANDBOX", "off");
+        let _env =
+            sandbox::EnvGuard::new(&["FLUX_SANDBOX", "FLUX_SANDBOX_NET", "FLUX_SANDBOX_WRITABLE"]);
+        std::env::set_var("FLUX_SANDBOX", "require");
         std::env::set_var("FLUX_SANDBOX_NET", "0");
+        std::env::set_var("FLUX_SANDBOX_WRITABLE", "/flux-c276-writable");
         // `temp_workspace` builds `System::new`, whose sandbox is `Sandbox::disabled()` (mode Off).
         let out = sys
             .run(&["env".to_string()], Duration::from_secs(10))
             .await
             .unwrap();
         assert!(
-            !out.stdout.contains("FLUX_SANDBOX="),
-            "an Off sandbox handed its kill switch to a child, which could downgrade a child that \
-             would otherwise confine itself: {}",
+            forwarded_posture(&out.stdout).is_empty(),
+            "an Off sandbox forwarded a posture it does not hold: {:?}\nfull child env:\n{}",
+            forwarded_posture(&out.stdout),
             out.stdout
         );
         std::fs::remove_dir_all(&dir).ok();

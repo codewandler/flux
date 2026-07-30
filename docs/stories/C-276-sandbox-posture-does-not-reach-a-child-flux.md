@@ -41,25 +41,49 @@ marker not travel alone.
 ## Progress
 
 - **The posture now travels with the marker**, as a **floor and never a ceiling**.
-  `sandbox::posture_env` (`crates/flux-system/src/sandbox.rs`) returns the five posture variables
-  when this process's resolved mode is not `Off`, and `apply_safe_env` chains them onto `SAFE_ENV`.
-  Each key's safety against the deny-by-default env rule is argued in that function's doc.
+  `sandbox::posture_env` (`crates/flux-system/src/sandbox.rs`) renders the posture when this
+  process's resolved mode is not `Off`, and `apply_safe_env` applies it after `SAFE_ENV`. Each
+  key's safety against the deny-by-default env rule is argued in that function's doc.
+- **Every value is rendered from the resolved `Sandbox`, never read back out of `std::env`.**
+  The first attempt at this story gated on `sandbox.settings().mode` but sourced the values from
+  `std::env::var`, and independent review caught it: `System::with_sandbox` exists so an embedder
+  can pin a posture *independent of ambient env* (`flux-sdk/src/lib.rs:653-657`), so the two sources
+  legitimately disagree. A pinned `On` sandbox under an ambient `FLUX_SANDBOX=off` passed the gate
+  and then shipped the child the **kill switch** — strictly less confined than forwarding nothing.
+  Mirrored, a pinned `Require` with a silent env forwarded nothing, making the Goal a no-op for that
+  whole consumer class. One source, or the guarantee is fiction. The wrapper path now forwarded is
+  the absolute binary discovery resolved *and the preflight probe verified*, not an echo of
+  `FLUX_BWRAP_BIN`; a sandbox with no backend of its own forwards no wrapper path at all.
 - **An `Off` sandbox forwards nothing**, deliberately — not even `FLUX_SANDBOX=off`. On the reading
   side `off` is not "no opinion": it is `flux-cli`'s explicit kill switch, which beats a child's own
   `[sandbox] require` *and* C-262's unattended fail-closed profile. Forwarding it would have turned
   this fix into a new bypass channel. Withholding it leaves today's behaviour intact (a child
   resolves its own posture), so the change can only tighten a child, never loosen one.
+- **An open network forwards nothing either** — the same rule, applied to `FLUX_SANDBOX_NET`, which
+  review raised as a MINOR. A truthy value beats both `[sandbox] network` and C-262's
+  unattended-closed default (`dispatch.rs:220-227`), so forwarding "open" would be a ceiling. The
+  variable is emitted only to say *closed*, mirroring `flux-cli`'s own exporter, which writes it
+  when narrowing and otherwise leaves it alone. Rendering from settings would otherwise have
+  introduced this: `SandboxSettings`' network default is `true`.
 - The marker's own rule is untouched: `sandbox_marker` still stamps `FLUX_SANDBOXED=1` only for a
   genuinely wrapped spawn, and is still applied *after* caller overrides so no call site can forge
   it. The posture is applied *with* the allow-list, before caller overrides, because it is an
   inherited default a trusted call site may legitimately override (the local-eval child host does).
 - Proof, in C-266's with-backend lane (`FLUX_TEST_SANDBOX_BACKEND=1`):
   `a_confined_child_inherits_the_posture_and_not_only_the_marker` (the asymmetry: at the base the
-  child reported `posture=[] marker=[1] net=[]`) and `a_child_flux_resolves_the_parents_require_posture`
+  child reported `posture=[] marker=[1] net=[] wrapper=[]`, and the `wrapper` field is the sharpest
+  evidence the values come from the resolved sandbox — nothing set `FLUX_BWRAP_BIN` on that run, so
+  an env-echoing forwarder has nothing to echo) and `a_child_flux_resolves_the_parents_require_posture`
   (a real child `flux` now emits the C-217 OUTER-CONFINEMENT audit line; at the base it was silent,
-  which is what a resolved `off` looks like). Hermetic regression guards for both halves of the rule
-  live in `flux-system` (`the_sandbox_posture_survives_env_clear_so_the_marker_never_travels_alone`,
-  `an_off_sandbox_forwards_no_posture_so_a_child_keeps_its_own`, plus two `posture_env` unit tests).
+  which is what a resolved `off` looks like).
+- The **pinned** cases — the ones review found missing — are named tests in `flux-system`:
+  `a_pinned_posture_reaches_a_child_when_the_ambient_env_is_silent` and
+  `a_pinned_posture_beats_a_contradicting_ambient_env_instead_of_shipping_it`. Both were confirmed
+  to fail against an ambient-reading forwarder before being kept (the second reproduces review's
+  finding verbatim: `FLUX_SANDBOX=off` in the child env). `an_off_sandbox_forwards_no_posture_so_a_child_keeps_its_own`
+  now sets the ambient env to `require`, not `off`, so it can pass for only one reason — review
+  noted the old version was satisfied by two causes at once. Four `posture_env` unit tests cover the
+  rendering, the backend variants, the `Off` carve-out and the open-network carve-out.
 - **Owed elsewhere (not in this diff's write set).** Two hand-forwarders are now redundant for every
   non-`off` posture, and both carry doc comments this change falsifies:
   - `crates/flux-eval/src/runner.rs` — `SANDBOX_CHILD_ENV_KEYS` + `sandbox_child_env`.
