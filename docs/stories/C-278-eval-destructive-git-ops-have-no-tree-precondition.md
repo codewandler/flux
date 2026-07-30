@@ -2,7 +2,7 @@
 id: C-278
 title: "`flux-eval`'s two most destructive git ops carry no tree precondition at all"
 pillar: Core
-status: ready
+status: in-progress
 priority: 6
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -27,22 +27,60 @@ make it enforced rather than assumed.
 
 ## Acceptance
 
-- [ ] A failing-first test demonstrates the hazard concretely: an untracked file present before the op,
+- [x] A failing-first test demonstrates the hazard concretely: an untracked file present before the op,
       gone after it, with no refusal and no warning. That is the behaviour to argue about — it may turn
       out to be correct for a self-improvement loop, but it should be a decision with a test behind it.
-- [ ] Each op gets a stated precondition, or a stated and reasoned exemption. "Top-level-loop-only by
+- [x] Each op gets a stated precondition, or a stated and reasoned exemption. "Top-level-loop-only by
       design" is a legitimate answer — but it must be **written down and enforced**, not inferred from
       where the op happens to be called today. If the exemption rests on the caller, say what stops a
       future caller from being different.
-- [ ] Whatever is decided, C-249's `crates/flux-tools/tests/git_tree_policy.rs` module doc is updated so
+- [x] Whatever is decided, C-249's `crates/flux-tools/tests/git_tree_policy.rs` module doc is updated so
       its exclusion of these two points at this story's outcome instead of at "out of scope".
-- [ ] If a precondition is added, its refusal follows C-249's reconciled wording — tracked and untracked
+- [x] If a precondition is added, its refusal follows C-249's reconciled wording — tracked and untracked
       separated, with advice that is actionable for both.
-- [ ] Full gate green, including `FLUX_BWRAP_BIN=/nonexistent/bwrap`.
+- [x] Full gate green, including `FLUX_BWRAP_BIN=/nonexistent/bwrap`.
 
 ## Progress
 
-- (not started)
+The two ops got **different** answers, because they are not the same kind of operation. Both are
+stated in `crates/flux-eval/src/git.rs`'s module doc ("What licenses these ops to destroy
+uncommitted work") and enforced by tests, not inferred from today's call sites.
+
+**`git_reset` — precondition added: a verified snapshot.** The story's sharp question was whether
+the loop's invariant ("everything in this tree was produced by the step I am undoing") can be
+*checked* rather than trusted. It can, and it now is. The invariant splits into two independently
+checkable halves, both in `licence_to_restore`:
+
+1. `git_snapshot` already refuses a dirty tree and only then emits `clean: true` — so that field is
+   a **proof-carrying token**: the tree held nothing but committed work at `head`, therefore
+   everything differing from `head` now was produced after the snapshot. A payload without it is a
+   caller *asserting* the invariant rather than having established it.
+2. `clean: true` is a fact about the tree at *that* commit and says nothing about the tree we stand
+   in unless `head` is an ancestor of `HEAD` (`git merge-base --is-ancestor`, reflexive so equality
+   passes). Without this, a snapshot taken on a divergent line would be honoured and would rewind
+   onto a history no snapshot accounts for.
+
+This is a genuine check, not a reflex: it refuses the calls that were never licensed while leaving
+the one the loop makes untouched. Both `examples/improve-tbench.flux` and
+`examples/improve-synthetic.flux` satisfy it on every reject path (`snapshot = git_snapshot()` then
+`git_reset(snapshot)`, HEAD at or ahead of the snapshot), so the self-improvement loop still
+discards candidates exactly as before. The refusal reuses C-249's tracked/untracked split. A
+licensed reset now also reports what it consumed in `discarded`, which answers the "no warning"
+half of the hazard: an untracked file `clean -fd` removed is otherwise invisible forever.
+
+**`guard_protected` — reasoned exemption, enforced.** It is *not* a blanket restore, despite
+matching C-249's `-fd` selector. Both argv it builds end in `--` followed by an explicit pathspec
+list it computed itself and filtered through `is_protected`, so its blast radius is bounded **by
+construction**, not by its caller — which is why "what stops a future caller being different" has
+no bite here: nothing about the caller can widen it. A clean-tree precondition would also be
+incoherent, since the op exists to run *after* the worker has deliberately dirtied the tree. The
+bound is now pinned by `guard_protected_touches_nothing_outside_the_protected_paths`, which
+specifically holds **untracked non-protected** files — the case an unscoped `clean -fd` would
+delete and which the pre-existing tampering test never covered.
+
+Docs updated: C-249's `git_tree_policy.rs` module doc now points at this outcome and states both
+answers; `crates/flux-flow/docs/ops-reference.md` and `website/docs/language/ops.md` carry the
+precondition and the exemption.
 
 ## Notes
 

@@ -413,12 +413,18 @@ every member benchmark's pass rate and check rate to be at least the baseline's.
 | `gate_check` | `[build, test, clippy, fmt, timeout_secs]` | Run the dev gate (build/test/clippy/fmt) and return `"true"` or `"false"`; each step is individually toggleable |
 | `guard_protected` | `snapshot` | Restore grader/suite/loop/CI paths to the round snapshot after the worker runs |
 | `git_snapshot` | | Capture `HEAD` for later revert; errors if the working tree is dirty |
-| `git_reset` | `snapshot` | **Destructive** — hard-reset the working tree to a snapshot, discarding the round's changes |
+| `git_reset` | `snapshot` | **Destructive** — hard-reset the working tree to a snapshot, discarding the round's changes; refuses a snapshot it cannot verify |
 | `git_tag` | `name[, message]` | Tag the current commit (`name` is a prefix — the short `HEAD` sha is appended; annotated when `message` is given) |
 
 `guard_protected` is the anti-cheat step: it restores the grader, the suite, the loop, and the CI
 config after each worker run, so a round cannot raise its own score by editing what measures it.
-`git_reset` carries the `Destructive` risk tier and is approval-gated accordingly.
+`git_reset` carries the `Destructive` risk tier and is approval-gated accordingly. It is a *blanket*
+restore — `reset --hard` plus an unscoped `git clean -fd`, which deletes untracked files outright —
+so it runs only against a snapshot that proves it accounts for the whole tree: the snapshot must
+carry `clean: true` (set by `git_snapshot`, and only after it found the tree clean) and its `head`
+must be an ancestor of the current `HEAD`. Anything else is refused with the working tree listed and
+left untouched. `guard_protected` needs no such check: every path it restores or removes is an
+explicit pathspec filtered through the protected set, so it cannot reach outside it.
 
 ## Cutting a release
 

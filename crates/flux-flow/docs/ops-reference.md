@@ -313,7 +313,7 @@ a gain on one benchmark must not be allowed to mask a loss on another.
 | `gate_check` | `[build, test, clippy, fmt, timeout_secs]` | Medium | Run the dev gate (`cargo build`/`test`/`clippy`/`fmt --check`) → `"true"` (all green) or `"false"`; each step is individually toggleable and `timeout_secs` bounds each one |
 | `git_snapshot` | | Low | Capture `HEAD` as a round snapshot; **errors if the working tree is dirty**, so a round can always be undone |
 | `guard_protected` | `snapshot` | Medium | Restore the grader/suite/loop/CI paths to the round snapshot after the worker runs → `{tampered, restored}` |
-| `git_reset` | `snapshot` | Destructive | Hard-reset the working tree to a `git_snapshot`, discarding the round's changes |
+| `git_reset` | `snapshot` | Destructive | Hard-reset the working tree to a `git_snapshot`, discarding the round's changes → `{reset_to, discarded}`; **refuses a snapshot it cannot verify** |
 | `git_tag` | `name[, message]` | Medium | Tag the current commit (`name` is a prefix — the short `HEAD` sha is appended for uniqueness; annotated when `message` is given) |
 
 `guard_protected` is the anti-cheat step, and it is the reason a round is measurable at all: the worker
@@ -324,6 +324,19 @@ the snapshot *before* the candidate is scored. Tampering is reported rather than
 accordingly. Note the name: the **builtin** `git_revert` appends an inverse commit and never touches
 the working tree, while this op discards it. They are different operations with different blast
 radii — C-238 renamed this one out of the collision.
+
+Because `git_reset` is a *blanket* restore — `reset --hard` plus an unscoped `git clean -fd`, which
+deletes untracked files outright — it will only run against a snapshot that proves it accounts for
+the whole tree (C-278). Two things must hold, and both are checked at every call rather than assumed
+from the call site: the snapshot must carry `clean: true` (only `git_snapshot` sets it, and only
+after finding the tree clean), and its `head` must be an ancestor of the current `HEAD`. A
+hand-written `{"head": "…"}` literal, or a snapshot taken on a divergent line, is refused with the
+working tree listed and untouched. What a licensed reset did destroy comes back in `discarded`.
+
+`guard_protected` needs no such precondition and states the exemption instead: its `checkout` and
+`clean` argv always end in `--` and an explicit pathspec list filtered through the `PROTECTED` set,
+so it cannot reach a path outside it however dirty the tree is. Requiring a clean tree would also be
+incoherent — the op runs *after* the worker has deliberately dirtied one.
 
 ## Release ops (`examples/release.flux`)
 

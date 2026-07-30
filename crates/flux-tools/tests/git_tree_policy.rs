@@ -17,10 +17,21 @@
 //! whole file one question that no naming convention can dodge.
 //!
 //! Scope: `crates/flux-tools/src/lib.rs`. The `flux-eval` loop ops (`git_reset`,
-//! `guard_protected`) are the most destructive git ops in the repo and carry no precondition at
-//! all, but they are a separate top-level-only family with their own contract and cannot reach
-//! this crate's helper (`flux-eval` depends on `flux-tools` only as a dev-dependency) — a named,
-//! reasoned exclusion, filed as its own story rather than skipped by silence.
+//! `guard_protected`) are a separate top-level-only family and cannot reach this crate's helper
+//! (`flux-eval` depends on `flux-tools` only as a dev-dependency), so this scan does not cover
+//! them. That exclusion is no longer an open question: **C-278 settled it**, and the two ops now
+//! state and enforce their own preconditions in `crates/flux-eval/src/git.rs` — see that module's
+//! "What licenses these ops to destroy uncommitted work". The answers differ from each other,
+//! which is why they were never a good fit for this file's one rule:
+//!
+//! - `git_reset` IS a blanket restore (`reset --hard` + an unscoped `clean -fd`). Its precondition
+//!   is a *verified snapshot*: `git_snapshot`'s `clean: true` proof-token plus an
+//!   `--is-ancestor` check, which together establish "everything in this tree was produced by the
+//!   step I am undoing" instead of trusting the call site for it.
+//! - `guard_protected` is NOT a blanket restore, despite matching [`BLANKET_RESTORES`] on `-fd`:
+//!   its `clean`/`checkout` argv end in `--` and an explicit pathspec list filtered through
+//!   `is_protected`, so its blast radius is bounded by construction. It holds a stated, tested
+//!   exemption rather than a precondition.
 
 use std::path::PathBuf;
 
