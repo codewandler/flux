@@ -26,16 +26,26 @@
 //!   the `--is-ancestor` half interrogates the repository and cannot be talked out of its answer,
 //!   while the `clean: true` half only reads the payload and a caller can simply write it. See
 //!   [`licence_to_restore`] for which guarantee comes from which, and what neither covers.
-//! - **`guard_protected` — reasoned exemption: its blast radius is bounded by construction.** It is
-//!   not a blanket restore. Both argv it builds are explicit pathspec lists it computed itself and
-//!   filtered through [`is_protected`], so it cannot touch a path outside `PROTECTED` however dirty
-//!   the tree is or whoever calls it. A clean-tree precondition would buy nothing and would break
-//!   the op's entire purpose, which is to run *after* the worker has deliberately dirtied the tree.
-//!   The exemption is about **which paths** it may touch, and that much no caller can widen — it
-//!   rests only on the pathspec filtering staying in place, which
-//!   `guard_protected_touches_nothing_outside_the_protected_paths` is what holds. It says nothing
-//!   about **which commit** those paths are restored *to*: `snap["head"]` is unvalidated here, and
-//!   for the anti-cheat op that is a live question rather than a settled one. Filed as C-281.
+//! - **`guard_protected` — two separate axes, and it took a different answer on each.** Read them
+//!   apart; C-281 exists because the first was once read as covering the second.
+//!
+//!   1. **Which paths it may touch — reasoned exemption, still standing.** It is not a blanket
+//!      restore. Both argv it builds are explicit pathspec lists it computed itself and filtered
+//!      through [`is_protected`], so it cannot touch a path outside `PROTECTED` however dirty the
+//!      tree is or whoever calls it. On *this* axis a clean-tree precondition would buy nothing and
+//!      would break the op's entire purpose, which is to run *after* the worker has deliberately
+//!      dirtied the tree. No caller can widen the bound; it rests only on the pathspec filtering
+//!      staying in place, which `guard_protected_touches_nothing_outside_the_protected_paths`
+//!      holds.
+//!   2. **Which commit those paths are restored *to* — precondition, added by C-281.** The
+//!      exemption above says nothing here, and until C-281 `snap["head"]` was unvalidated: a valid
+//!      but *divergent* commit restored the grader, the suite and the loop flows from an unrelated
+//!      line of history, silently and with no refusal. A bogus sha already failed safe, but only
+//!      incidentally (`git diff --name-only` cannot resolve it). This is the anti-cheat op, so a
+//!      wrong restore is the measurement going wrong rather than a wrong file. It now shares
+//!      `git_reset`'s ancestry check — [`off_this_checkouts_line`], and **only** that half of
+//!      [`licence_to_restore`]; the `clean: true` half stays out for the reason in (1), which is
+//!      stated again at the call site because that is where someone will be tempted to add it.
 
 use std::time::Duration;
 
@@ -321,29 +331,59 @@ async fn licence_to_restore(ctx: &ToolContext, op: &str, snap: &Value) -> Result
         ))));
     }
 
-    match git_exit(ctx, &["merge-base", "--is-ancestor", head, "HEAD"]).await? {
-        (0, _) => {}
-        (1, _) => {
-            let status = git(ctx, &["status", "--porcelain"]).await?;
-            return Ok(Licence::Refused(ToolResult::error(format!(
-                "{op}: refusing — snapshot {} is not an ancestor of this checkout's HEAD, so it was \
-                 not taken on the line this round advanced. Restoring to it would rewind onto a \
-                 divergent history and discard commits and working-tree state no snapshot accounts \
-                 for. The working tree currently holds:{}",
-                short(head),
-                status_breakdown(&status)
-            ))));
-        }
-        (_, err) => {
-            return Ok(Licence::Refused(ToolResult::error(format!(
-                "{op}: could not run `git merge-base --is-ancestor {} HEAD` to check its \
-                 preconditions ({err}); refusing to start — nothing was changed",
-                short(head)
-            ))))
-        }
+    if let Some(refusal) = off_this_checkouts_line(
+        ctx,
+        op,
+        head,
+        "restoring to it would rewind onto a divergent history and discard commits and \
+         working-tree state no snapshot accounts for",
+    )
+    .await?
+    {
+        return Ok(Licence::Refused(refusal));
     }
 
     Ok(Licence::Granted(head.to_string()))
+}
+
+/// The unforgeable half on its own: is `head` on this checkout's line of history? `Some(refusal)`
+/// if it is not, or if git could not be asked; `None` when it is.
+///
+/// **This is shared, not copied, and that is the requirement rather than a nicety.** Both restoring
+/// ops need this exact question answered, including the three-way exit handling that is the easy
+/// part to get subtly wrong (`0` yes, `1` no, *anything else* "could not tell" — which must also
+/// refuse, since a check that could not run has established nothing). C-241 shipped a hand-copied
+/// variant of a sibling's refusal that then drifted from its original; C-249 made that a standing
+/// rule. So `git_reset` reaches this through [`licence_to_restore`] and `guard_protected` calls it
+/// directly, and neither owns a second copy.
+///
+/// `because` names the consequence for the calling op, the way [`dirty_tree_refusal`] takes one:
+/// what a wrong restore costs genuinely differs between the two, while the structure, the sha
+/// rendering and the [`status_breakdown`] tail — the parts C-249 reconciled — cannot.
+async fn off_this_checkouts_line(
+    ctx: &ToolContext,
+    op: &str,
+    head: &str,
+    because: &str,
+) -> Result<Option<ToolResult>> {
+    match git_exit(ctx, &["merge-base", "--is-ancestor", head, "HEAD"]).await? {
+        (0, _) => Ok(None),
+        (1, _) => {
+            let status = git(ctx, &["status", "--porcelain"]).await?;
+            Ok(Some(ToolResult::error(format!(
+                "{op}: refusing — snapshot {} is not an ancestor of this checkout's HEAD, so it was \
+                 not taken on the line this round advanced, and {because}. The working tree \
+                 currently holds:{}",
+                short(head),
+                status_breakdown(&status)
+            ))))
+        }
+        (_, err) => Ok(Some(ToolResult::error(format!(
+            "{op}: could not run `git merge-base --is-ancestor {} HEAD` to check its \
+             preconditions ({err}); refusing to start — nothing was changed",
+            short(head)
+        )))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,13 +481,20 @@ impl Tool for GitResetTool {
 /// (they CAN write anywhere non-destructively), so this top-level op — which the worker doesn't control
 /// — is the real enforcement. Returns `{tampered, restored:[…]}`.
 ///
-/// **Stated exemption from a tree precondition (C-278).** This op runs `clean -fd`, but never
-/// blanket: both argv it builds end in `--` followed by an explicit pathspec list it computed
-/// itself and filtered through [`is_protected`]. Its blast radius is bounded by construction rather
-/// than by its caller, so a dirty tree is not a hazard here — and requiring a clean one would be
-/// incoherent, since the op exists precisely to run *after* the worker has dirtied the tree. The
-/// bound is enforced by `guard_protected_touches_nothing_outside_the_protected_paths`, which holds
-/// untracked non-protected files specifically: those are what an unscoped `clean -fd` would delete.
+/// **Stated exemption from a tree precondition (C-278) — on the blast-radius axis only.** This op
+/// runs `clean -fd`, but never blanket: both argv it builds end in `--` followed by an explicit
+/// pathspec list it computed itself and filtered through [`is_protected`]. Its blast radius is
+/// bounded by construction rather than by its caller, so a dirty tree is not a hazard here — and
+/// requiring a clean one would be incoherent, since the op exists precisely to run *after* the
+/// worker has dirtied the tree. The bound is enforced by
+/// `guard_protected_touches_nothing_outside_the_protected_paths`, which holds untracked
+/// non-protected files specifically: those are what an unscoped `clean -fd` would delete.
+///
+/// **What that exemption does not cover, and C-281 does: the commit restored *from*.** Bounding
+/// which paths are touched says nothing about what they are set to, and `snap["head"]` used to go
+/// unchecked. The snapshot must now be placeable on this checkout's line of history
+/// ([`off_this_checkouts_line`]) — and that half only; see the call site for why `clean: true`
+/// must not join it.
 pub struct GuardProtectedTool;
 
 /// Arguments for the `guard_protected` op.
@@ -483,6 +530,31 @@ impl Tool for GuardProtectedTool {
             .get("head")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Other("guard_protected: snapshot has no `head`".to_string()))?;
+
+        // C-281: the restore has to come from somewhere this checkout has actually been. Exactly
+        // ONE half of `git_reset`'s licence applies here, and the asymmetry is load-bearing:
+        //
+        // - ancestry (this call) — yes. It is the unforgeable half, and it is what stops the
+        //   anti-cheat baseline being taken from an unrelated line of history.
+        // - `clean: true` — NO. Never add it. This op exists to run *after* the worker has
+        //   deliberately dirtied the tree; demanding a clean one refuses every real round and
+        //   breaks the self-improvement loop. `guard_protected_restores_grader_and_loop_tampering`
+        //   and `guard_protected_touches_nothing_outside_the_protected_paths` both pass a payload
+        //   with no `clean` field on a dirty tree, so that mistake goes red rather than shipping.
+        //
+        // Hence [`off_this_checkouts_line`] directly rather than [`licence_to_restore`].
+        if let Some(refusal) = off_this_checkouts_line(
+            ctx,
+            "guard_protected",
+            head,
+            "restoring the protected paths from it would reset the grader, the suite and the loop \
+             flows to an unrelated state — and since this op is what decides whether the round \
+             cheated, that is the measurement going wrong rather than a file",
+        )
+        .await?
+        {
+            return Ok(refusal);
+        }
 
         // Detect protected-path changes: tracked diffs (exist in `head` → restore via checkout) vs
         // untracked additions (not in `head` → remove). Only touch paths that actually changed, so a
@@ -821,6 +893,107 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-281: the anti-cheat op restored the protected paths from a snapshot whose provenance it
+    /// never checked. `guard_protected` reads `snap["head"]` and checks out the protected paths
+    /// from it — so a `head` on an unrelated line of history silently resets the grader, the
+    /// suite and the loop flows to a state nobody chose. This is the op that decides whether a
+    /// round cheated: a wrong restore here is not a wrong file, it is the measurement itself.
+    ///
+    /// The two acts are the whole point of the test. A **bogus** sha was already safe before this
+    /// story, but for an unrelated reason — `git diff --name-only` cannot resolve it and the op
+    /// stops — so a test built on one demonstrates nothing about the defect. A **valid but
+    /// divergent** commit resolves perfectly well, and before C-281 it was honoured in silence.
+    #[tokio::test]
+    async fn guard_protected_refuses_a_snapshot_taken_off_this_checkouts_line() {
+        let dir = crate::util::unique_temp_dir("flux-guard-divergent").unwrap();
+        std::fs::create_dir_all(dir.join("crates/flux-eval/src")).unwrap();
+        let grader = dir.join("crates/flux-eval/src/score.rs");
+        std::fs::write(&grader, "pub const PASS_MARK: u8 = 50;\n").unwrap();
+        sh(&dir, &["git", "init", "-q"]);
+        sh(&dir, &["git", "config", "user.email", "a@b.c"]);
+        sh(&dir, &["git", "config", "user.name", "t"]);
+        sh(&dir, &["git", "add", "-A"]);
+        sh(&dir, &["git", "commit", "-qm", "init"]);
+
+        let ctx = ToolContext::new(std::sync::Arc::new(System::new(
+            Workspace::new(&dir).unwrap(),
+        )));
+
+        // A real, resolvable commit in this repository, made on a line this checkout never
+        // advanced along — and carrying a *different* grader.
+        sh(&dir, &["git", "checkout", "-q", "-b", "other"]);
+        std::fs::write(&grader, "pub const PASS_MARK: u8 = 0;\n").unwrap();
+        sh(&dir, &["git", "add", "-A"]);
+        sh(&dir, &["git", "commit", "-qm", "an unrelated line"]);
+        let divergent = git(&ctx, &["rev-parse", "HEAD"]).await.unwrap();
+        sh(&dir, &["git", "checkout", "-q", "-"]);
+        let base = git(&ctx, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_ne!(divergent, base);
+
+        // The worker has had its way with the tree. That is the *normal* state on entry to this
+        // op, and the reason the `clean: true` half of the licence must never be demanded here.
+        std::fs::write(&grader, "pub const PASS_MARK: u8 = 99;\n").unwrap();
+
+        // Act 1 — a bogus sha, the already-safe case. The shape of its failure is not the point
+        // (git cannot resolve the object, so the op halts rather than refuses); what matters is
+        // that it stops for a reason that has nothing to do with provenance, which is exactly why
+        // it proves nothing about act 2.
+        let bogus = "0".repeat(40);
+        let stopped = match GuardProtectedTool
+            .execute(
+                &ctx,
+                json!({ "snapshot": json!({ "head": bogus }).to_string() }),
+            )
+            .await
+        {
+            Err(_) => true,
+            Ok(r) => r.is_error,
+        };
+        assert!(stopped, "a sha git cannot resolve stops the op");
+        assert!(
+            std::fs::read_to_string(&grader).unwrap().contains("99"),
+            "and restores nothing"
+        );
+
+        // Act 2 — valid, resolvable, and off this checkout's line. This is the hazard.
+        let r = GuardProtectedTool
+            .execute(
+                &ctx,
+                json!({ "snapshot": json!({ "head": divergent }).to_string() }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.is_error,
+            "a snapshot off this checkout's line must be refused: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&grader).unwrap(),
+            "pub const PASS_MARK: u8 = 99;\n",
+            "the refusal restores nothing — before C-281 the grader came back as the divergent \
+             line's PASS_MARK of 0, silently and with no refusal"
+        );
+        assert_eq!(
+            git(&ctx, &["rev-parse", "HEAD"]).await.unwrap(),
+            base,
+            "and HEAD stays where it was"
+        );
+        // C-249's reconciled wording, reached through the shared `status_breakdown` so this op's
+        // refusal cannot drift from its two siblings'.
+        assert!(
+            r.content.contains("Tracked changes (1)") && r.content.contains("score.rs"),
+            "{}",
+            r.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-281's other half, and the one a well-meaning reader is most likely to break: only the
+    /// **ancestry** half of the licence applies to this op. This test and
+    /// `guard_protected_touches_nothing_outside_the_protected_paths` both hand it a payload with
+    /// no `clean` field on a deliberately dirty tree and expect a restore — so "completing" the
+    /// check by demanding `clean: true` here turns them red rather than shipping.
     #[tokio::test]
     async fn guard_protected_restores_grader_and_loop_tampering() {
         let dir = crate::util::unique_temp_dir("flux-guard-test").unwrap();

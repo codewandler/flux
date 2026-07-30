@@ -312,7 +312,7 @@ a gain on one benchmark must not be allowed to mask a loss on another.
 | `change_implement` | `tasks[, limit]` | Medium | Implement each derived task by spawning a `worker` sub-agent → a per-task summary. `limit` caps the round (`0` = all) |
 | `gate_check` | `[build, test, clippy, fmt, timeout_secs]` | Medium | Run the dev gate (`cargo build`/`test`/`clippy`/`fmt --check`) → `"true"` (all green) or `"false"`; each step is individually toggleable and `timeout_secs` bounds each one |
 | `git_snapshot` | | Low | Capture `HEAD` as a round snapshot; **errors if the working tree is dirty**, so a round can always be undone |
-| `guard_protected` | `snapshot` | Medium | Restore the grader/suite/loop/CI paths to the round snapshot after the worker runs → `{tampered, restored}` |
+| `guard_protected` | `snapshot` | Medium | Restore the grader/suite/loop/CI paths to the round snapshot after the worker runs → `{tampered, restored}`; **refuses a snapshot it cannot place on this checkout's line** |
 | `git_reset` | `snapshot` | Destructive | Hard-reset the working tree to a `git_snapshot`, discarding the round's changes → `{reset_to, discarded}`; **refuses a snapshot it cannot verify** |
 | `git_tag` | `name[, message]` | Medium | Tag the current commit (`name` is a prefix — the short `HEAD` sha is appended for uniqueness; annotated when `message` is given) |
 
@@ -339,10 +339,15 @@ earlier round is still honoured and the commits since are rewound. What a licens
 comes back in `discarded` — though that is built from `git status --porcelain`, so it reports
 working-tree losses only, never rewound commits.
 
-`guard_protected` needs no such precondition and states the exemption instead: its `checkout` and
-`clean` argv always end in `--` and an explicit pathspec list filtered through the `PROTECTED` set,
-so it cannot reach a path outside it however dirty the tree is. Requiring a clean tree would also be
-incoherent — the op runs *after* the worker has deliberately dirtied one.
+`guard_protected` answers the two halves separately. On *which paths* it may touch it needs no
+precondition and states an exemption instead: its `checkout` and `clean` argv always end in `--` and
+an explicit pathspec list filtered through the `PROTECTED` set, so it cannot reach a path outside it
+however dirty the tree is. Requiring a clean tree would also be incoherent — the op runs *after* the
+worker has deliberately dirtied one, so `clean: true` is deliberately **not** demanded here. On
+*which commit those paths are restored from* it takes the same ancestry check as `git_reset`, added
+by C-281: a `head` that is not an ancestor of the current `HEAD` is refused with the working tree
+listed and nothing touched. A bogus sha always failed safe by accident; a valid but divergent one
+used to reset the anti-cheat baseline to an unrelated line of history without a word.
 
 ## Release ops (`examples/release.flux`)
 
