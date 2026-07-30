@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+- **Flux's built-in operations and language nodes now have one machine-readable catalogue.** Run
+  `flux catalog core --format json` to export the current foundational tool contracts, language-node
+  schemas, and stable specification links without running a tool or contacting the network. The
+  export distinguishes things you can call from language structure and future protocol support:
+  HTTP is available, while DNS, TCP, UDP, and ICMP are clearly marked planned and non-callable.
+
 - **A coordinating workflow can now start its own workers, so it can work several tasks at once.**
   Previously one worker served one task at a time, which capped a coordinated run at a single item
   regardless of how much work was waiting. A workflow can now start a worker for a task, check whether it

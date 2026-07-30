@@ -188,6 +188,8 @@ flux flow run <name|file>        # run a saved flow by filename stem/declared na
                                  #                        (values rehydrated), and execute from the first changed
                                  #                        statement; `last` needs the flow to declare a name
                                  #                        (`flow <name> -> …`) to find its session unambiguously
+flux catalog core --format json # export versioned core operations, language nodes, capabilities,
+                                 #   and their schemas; deterministic, offline, and no operation runs
 flux render <file.flux>          # render a .flux file as a syntax-highlighted image (One Dark):
                                  #   --view source (default) | tree; -o out.svg writes SVG, -o
                                  #   out.png rasterizes PNG (embedded font); both workspace-

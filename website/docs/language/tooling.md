@@ -68,6 +68,23 @@ flux run --loop .flux/agent-loop.flux "use the edited loop"
 `eject` copies the built-in adaptive preset for study or editing. The file is not an implicit
 override; select it explicitly through `--loop`, `[agent] loop`, an `AgentSpec`, role, or app agent.
 
+## `flux catalog core`
+
+```bash
+flux catalog core --format json > core-v1.json
+```
+
+This offline command exports Flux's foundational catalogue for documentation and explorer tooling.
+It projects 29 real registered operations—including `http.request` and the pure data transforms—and
+all Flux-Lang node kinds without invoking an operation or touching the network. Each entry carries a
+versioned `https://flux.codewandler.org/v1/core/...json` identity, and the bundle includes the JSON
+Schemas that validate the catalogue, individual entries, and anchored Flux AST nodes.
+
+Operations are callable tool contracts. Language nodes such as `return` describe program structure
+and are not operations. There is deliberately no `noop` operation. HTTP is available; DNS, TCP, UDP,
+and ICMP are published as planned, non-callable capability records until their guarded runtime
+contracts land.
+
 ## The `fluxlang` developer workbench
 
 The standalone binary works on the pure language without assembling the agent stack:

@@ -34,6 +34,7 @@ and [Safety & approvals](./safety.md).
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
 | `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
 | `flux flow run <name\|file>` | execute a saved flow by name or an existing Flux-Lang file (files win) |
+| `flux catalog core --format json` | export the deterministic, versioned catalogue of foundational operations, language nodes, capabilities, and their JSON Schemas |
 | `flux render <file.flux>` | render a `.flux` file as a syntax-highlighted image (`--view source\|tree`; `-o out.svg` writes SVG, `-o out.png` rasterizes PNG with the embedded font; stdout is SVG) |
 | `flux review --files …` | run the immutable embedded read-only multi-reviewer protocol under the fail-closed unattended sandbox; Markdown or JSON output |
 | `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |

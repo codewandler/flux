@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Flux can export its foundational catalogue as deterministic, versioned JSON (C-283).** `flux
+  catalog core --format json` projects 29 real registered operations and all 43 Flux-Lang node kinds,
+  with generated catalogue/entry/AST JSON Schemas and canonical
+  `https://flux.codewandler.org/v1/core/...json` identities. It records HTTP as available and
+  DNS/TCP/UDP/ICMP as planned and non-callable; it does not fabricate runtime operations for those
+  protocols. `return` remains a language node and `noop` remains absent. The command is offline and
+  deterministic, so downstream explorers can vendor its bytes without linking to Flux internals.
+
 ### Fixed
 
 - **The two destructive git ops the self-improvement loop relies on now state and enforce a

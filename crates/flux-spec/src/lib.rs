@@ -70,7 +70,7 @@ pub fn tool_output_schema<T: schemars::JsonSchema + 'static>() -> serde_json::Va
 }
 
 /// A side effect a tool may have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
     Read,
@@ -231,7 +231,9 @@ impl FlowEffect {
 }
 
 /// Coarse risk classification, driving approval thresholds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Risk {
     Low,
@@ -241,7 +243,7 @@ pub enum Risk {
 }
 
 /// Whether repeating the operation is safe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Idempotency {
     Idempotent,
@@ -267,7 +269,7 @@ pub enum StagingDisposition {
 }
 
 /// A host capability the tool needs access to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessKind {
     Auth,
@@ -283,7 +285,7 @@ pub enum AccessKind {
 }
 
 /// The inert specification of a tool/operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,

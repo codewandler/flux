@@ -556,6 +556,11 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: PolicyAction,
     },
+    /// Export versioned, machine-readable specifications for Flux's built-in catalogue.
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
     /// Render or install generated Claude-format Flux skills.
     Skill {
         /// Which section to render/install: cli | lang | plugin | ops. Omit for the root skill.
@@ -603,6 +608,23 @@ pub(super) enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `flux catalog …`
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum CatalogAction {
+    /// Print the curated foundational operation, language-node, and capability catalogue.
+    Core {
+        /// Output encoding. JSON is the stable versioned interchange format.
+        #[arg(long, value_enum, default_value_t = CatalogFormat::Json)]
+        format: CatalogFormat,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default)]
+pub(super) enum CatalogFormat {
+    #[default]
+    Json,
 }
 
 impl Commands {
