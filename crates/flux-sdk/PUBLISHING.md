@@ -217,6 +217,12 @@ reaching it:
 scripts/check-release-tags.sh
 ```
 
+Run mid-cut it prints a yellow `NOTE ... still being published` for the tag whose Release workflow has
+not finished yet, and still passes (C-252) — that line is the audit telling you it deferred on
+evidence, not a warning you need to act on. The same tag turns into a red `FAIL` naming the run's
+conclusion as soon as that workflow finishes without publishing a Release, so a dead cut is never
+silently forgiven.
+
 - **Irreversible.** A published `name@version` can never be reused — only yanked.
 - If a mid-sequence publish fails, fix and re-run — already-published crates are skipped.
 
