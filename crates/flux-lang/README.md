@@ -124,12 +124,19 @@ Inspect the language without the engine (built with `--features cli`):
 cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- skill    # the language skill (markdown)
 cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- schema   # the AST JSON Schema
 echo '<json-ast>' | cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- render   # AST → tree
+cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- compile flow.flux             # source → JSON AST
+cargo run -p codewandler-flux-lang --features cli --bin fluxlang -- rail flow.flux                # source → Railflux
 ```
+
+`rail` projects canonical Flux source as **Railflux** — a 7-bit ASCII dataflow diagram of the same
+AST ([`docs/railflux.md`](docs/railflux.md)). It is output-only: malformed source reports exactly the
+diagnostics `compile` reports, and there is no Railflux reader.
 
 ## Docs
 
 - [`docs/reference.md`](docs/reference.md) — every node kind, fields, semantics (node table generated).
 - [`docs/syntax.md`](docs/syntax.md) — the writable text-syntax spec.
+- [`docs/railflux.md`](docs/railflux.md) — the Railflux ASCII dataflow projection (output spec).
 - [`docs/PRD.md`](docs/PRD.md) — design rationale, scope, and roadmap (the two display modes + parser).
 - [`docs/STATUS.md`](docs/STATUS.md) — PRD conformance matrix (what's built vs. planned, with evidence).
 - [`../../docs/designs/flux-lang-evolution.md`](../../docs/designs/flux-lang-evolution.md) — forward design: the agent-cognition AST (`ctx`/`need` + artifact ontology), language/syntax, **candidate control-flow primitives**, and SDK.

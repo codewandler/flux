@@ -6,7 +6,48 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The git family's clean-tree precondition is policy now, not per-op taste (C-249).** Every guarded git
+  op that runs a blanket restore declares its precondition through one shared helper, and the refusal
+  separates tracked from untracked files — because "commit or stash them first" is unactionable advice
+  for a file that was never tracked. Two refusals are genuinely new and strictly stricter: `git_revert`
+  refuses a revert or cherry-pick already in flight (the hazard C-238 fixed for `git_merge`), and
+  `git_worktree_leave` proves the original checkout is not mid-merge before its always-aborted trial
+  merge. Nothing was weakened — the change only adds refusals.
+  The durable half is the guard. It selects ops by **what they invoke**, not by name, on two rules: a
+  blanket restore must route through the shared helper, and `git status --porcelain` may appear only
+  inside it. The second rule exists because the first is self-erasing — once an op is converted its raw
+  signal moves into the helper — and it is the rule that catches a git-shaped op wearing a
+  non-`git_*` name. `fleet.isolate` was exactly that: it had been hand-copying an older revision of
+  `git_revert`'s refusal wording, so the family would otherwise have shipped two different dirty-tree
+  messages.
+
 ### Added
+
+- **Flux now compiles to WebAssembly, and the module agrees with the native engine (C-271).** A
+  `wasm32-unknown-unknown` build of the portable core, produced by `scripts/build-portable-wasm.sh`, plus
+  a parity test that runs the **same** `.flux` through both substrates. Both halves include one
+  evaluation file, so the only difference between the runs is the target triple, and the comparison is
+  the whole run transcript rather than a return value — parity is against the native engine, not a
+  golden, so the two cannot drift together.
+  **The epic's dependency graph was attached to the wrong noun, and this story proved it.** It needed
+  none of its three stated prerequisites: the design treated `flux-lang` and "the evaluation core —
+  control flow, retry, parallel, budgets" as two things to port together, but they are one thing, and
+  retry/parallel/budgets all live in `flux-lang`'s own runtime. That crate was already portable — zero
+  source changes, one target-gated dependency. What C-269/C-270/C-274 unblock is the *second* crossing,
+  `flux-flow`'s engine, which remains blocked.
+  ⚠ Scope, stated rather than implied: the language core crosses for the **model-free** fragment. A
+  program using `throttle`, `debounce`, a time-bounded `loop`, `timeout` or `await` hits a clock panic or
+  the poll budget. `rustup target add wasm32-unknown-unknown` is a manual prerequisite, and the parity
+  test skips silently without the artifact — so `cargo test --workspace` is green on a machine lacking
+  the target, and the build script is the load-bearing run until CI wires it.
+
+- **`fluxlang rail` renders a program as a 7-bit ASCII dataflow diagram (L-95).** The first projection of
+  the notation workbench: one AST, several readable surfaces. A pure projection — no AST, parser, runtime
+  or loader change and no registered op — with a golden table pinning all 43 `Node` variants byte-for-byte,
+  cross-checked against the schema's own node-kind table so a new variant cannot be added without the
+  table noticing.
 
 - **`fleet.start` — flux can start a flux worker, so a wave can be larger than one (C-243).** A new
   `AgentRuntime` port with `ProcessRuntime`/`ExternalRuntime`, plus `fleet.start`, `fleet.worker_status`

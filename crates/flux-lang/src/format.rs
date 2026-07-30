@@ -494,7 +494,7 @@ fn is_ident_key(k: &str) -> bool {
 
 /// Render an object-template key: a bareword when identifier-safe, else a JSON-quoted string. The
 /// parser accepts both forms and recovers the same key string, so the choice is lossless.
-fn fmt_obj_key(k: &str) -> String {
+pub(crate) fn fmt_obj_key(k: &str) -> String {
     if is_ident_key(k) {
         k.to_string()
     } else {
@@ -504,7 +504,7 @@ fn fmt_obj_key(k: &str) -> String {
 
 /// Render a spellable symbol without a sigil. Contextual keywords retain `$` as an explicit escape,
 /// so the canonical surface stays unambiguous while ordinary locals shed their repeated marker.
-fn fmt_symbol(symbol: &SymbolName) -> String {
+pub(crate) fn fmt_symbol(symbol: &SymbolName) -> String {
     if is_bare_symbol_name(&symbol.0) {
         symbol.0.clone()
     } else {
@@ -574,7 +574,7 @@ fn fmt_legacy_call_args(args: &[Node], multiline: bool) -> Option<String> {
 
 /// Convert the AST's jq-compatible dotted path (`.items.0.name`) to readable field/index syntax
 /// (`.items[0].name`). Unsupported jq syntax falls back to the JSON node escape.
-fn fmt_field_path(path: &str) -> Option<String> {
+pub(crate) fn fmt_field_path(path: &str) -> Option<String> {
     let segments = path.strip_prefix('.')?.split('.').collect::<Vec<_>>();
     if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
         return None;
@@ -595,7 +595,7 @@ fn fmt_field_path(path: &str) -> Option<String> {
     Some(rendered)
 }
 
-fn fmt_duration(ms: u64) -> String {
+pub(crate) fn fmt_duration(ms: u64) -> String {
     if ms != 0 && ms.is_multiple_of(60_000) {
         format!("{}m", ms / 60_000)
     } else if ms != 0 && ms.is_multiple_of(1_000) {

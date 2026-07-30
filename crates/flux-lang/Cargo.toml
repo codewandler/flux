@@ -32,10 +32,26 @@ text-size.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 sha2.workspace = true
-tokio.workspace = true
 futures.workspace = true
 # CLI-only; gated behind the `cli` feature so library consumers don't pull clap.
 clap = { workspace = true, optional = true }
+
+# `tokio`, split by target family (C-271). Native keeps the workspace's `full` feature set
+# unchanged. `wasm32-unknown-unknown` has no sockets, so tokio's `net` feature pulls `mio`, which
+# refuses to compile there ("This wasm target is unsupported by mio"). The interpreter only ever
+# uses `tokio::task::yield_now` and `tokio::time::{sleep, timeout}`, so the portable build takes the
+# subset tokio actually supports on wasm — `sync`, `macros`, `rt`, `time` — and nothing else.
+# See docs/designs/portable-wasm-runtime.md § "Open questions" for the reasoning.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "macros",
+    "rt",
+    "time",
+] }
 
 [features]
 # Builds the `fluxlang` binary (skill/schema/render). Off by default for lib consumers.
@@ -45,3 +61,20 @@ cli = ["dep:clap"]
 name = "fluxlang"
 path = "src/bin/fluxlang.rs"
 required-features = ["cli"]
+
+# The portable core as a WebAssembly module (C-271). Declared explicitly rather than auto-discovered
+# so it can carry `crate-type = ["cdylib"]` — the shape `wasm32-unknown-unknown` needs — without the
+# library itself becoming a cdylib. `examples/portable/` holds no `main.rs`, so cargo does not
+# auto-discover the directory and `core.rs` stays a plain `#[path]`-included module shared with
+# `tests/wasm_parity.rs`. Build: scripts/build-portable-wasm.sh
+[[example]]
+name = "flux_portable"
+path = "examples/portable/wasm_abi.rs"
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+# The Wasm embedder the C-271 parity test runs the portable module in. `wasmi` is a pure-Rust
+# interpreter with no native toolchain and no C dependency, so the parity proof runs under plain
+# `cargo test` on any host rather than depending on a `wasmtime` binary being installed. Test-only:
+# it is not in the library's dependency graph.
+wasmi = { version = "1.1.0", default-features = false, features = ["std"] }

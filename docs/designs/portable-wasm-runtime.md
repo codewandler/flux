@@ -160,22 +160,86 @@ These are genuinely open and should be settled by their stories, not here:
   stay host-side. Is a host-mediated inference import in scope, or is v1 deliberately **model-free**
   — deterministic authored flows only? Model-free is a much smaller and much more defensible first
   target, and most of the customer-submitted-code use case does not need inference.
-- **Which Wasm flavour.** `wasm32-unknown-unknown` with hand-written imports, `wasm32-wasip2` with
-  the Component Model and WIT-described interfaces, or both. The Component Model gives a typed,
-  versioned ABI for free and is the strategically right answer if the toolchain is ready; a hand-rolled
-  ABI is faster to prove.
-- **`tokio` in the portable core.** Both `flux-lang` and the engine depend on it. Its wasm support is
-  partial (`sync`/`macros` yes; net/fs no), so the portable core may need a runtime-agnostic executor
-  or careful feature gating. Unresolved.
-- **The clock.** `now_ms()` in the engine's state facade calls `SystemTime::now`, which does not exist
-  on `wasm32-unknown-unknown`. C-270 deliberately left it in the facade as the single seam an
-  embedder-supplied clock replaces, but it is a real C-271 item that this section previously missed.
+- ~~**Which Wasm flavour.**~~ **Settled by C-271: `wasm32-unknown-unknown` with a hand-written ABI.**
+  See [§ Settled: the Wasm flavour](#settled-the-wasm-flavour) below.
+- ~~**`tokio` in the portable core.**~~ **Settled by C-271: feature-gate it, and use no async runtime
+  at all.** See [§ Settled: what replaces `tokio`](#settled-what-replaces-tokio) below.
+- **The clock.** `now_ms()` in the engine's state facade calls `SystemTime::now`. C-270 deliberately
+  left it in the facade as the single seam an embedder-supplied clock replaces.
+  **Still open, and C-271 did not close it** — but it measured two things that change its shape:
+  - It is **not a compile blocker.** `std` compiles `SystemTime::now`/`Instant::now` for
+    `wasm32-unknown-unknown`; they panic only when *called*. So a clock seam is a **runtime**
+    correctness problem, not a build one, and it will not announce itself by failing a build.
+  - The language core has its own instances, independent of the engine's facade —
+    `flux_lang::runtime::now_millis` (throttle) and the `Instant::now` deadline in the
+    time-bounded `loop`. A portable clock has to cover those too, or `throttle`/`loop`/`debounce`
+    panic inside the module. C-271's model-free fragment never reaches them, which is exactly why
+    its green parity test says nothing about this question.
 - **Determinism as a product feature.** A Wasm module plus a recorded set of import responses is a
   perfectly reproducible run — which is very close to what the Time Machine (C-43) and the Agent Lab
   cassette already do. Whether to unify them is worth asking, but not in v1.
 - **Trust in the AST path.** If the embedder parses and the module evaluates, the parser is host-side
   and untrusted input is the AST; if the module parses, the parser is inside. The latter is a smaller
   host attack surface and is probably right, but it means shipping the parser in the module.
+  *(C-271 built the module the second way — the ABI takes `.flux` **text** and the module parses it —
+  but only as the shape that was simplest to prove, not as a decision. The question stays open.)*
+
+## Settled: the Wasm flavour
+
+**`wasm32-unknown-unknown` with a hand-written ABI. Not WASI, not the Component Model — and the
+reason is a security argument, not a toolchain one.**
+
+WASI is a *capability set*: `wasm32-wasip1`/`wasip2` exist to give a module a filesystem, a clock,
+an environment, sockets and stdio. The whole premise of this epic is that a submitted program starts
+with **none** of those and receives only narrow, already-decided operations (§ "The load-bearing
+invariant"). Choosing a WASI target means starting from a preopened world and then arguing about
+which parts of it to withhold — the fail-open direction. `wasm32-unknown-unknown` starts from
+nothing, so every authority the module has is one we typed out by hand and can see in the module's
+import section.
+
+That is not rhetoric: the C-271 module's import section is **empty**, and
+`the_portable_module_declares_no_imports` in `crates/flux-lang/tests/wasm_parity.rs` asserts it. A
+model-free flow genuinely needs no clock and no syscall, so "no ambient authority" is structural
+here rather than a policy we enforce. When C-272 adds the first guarded imports, each one becomes a
+visible line in that section and the same test is the review surface.
+
+The Component Model's real advantages — a typed, versioned, WIT-described ABI — are advantages we
+want *for the host-import boundary* (C-272), and they are additive later: a component can be built
+over the same portable core once that boundary has a settled shape worth describing in WIT. Adopting
+it now would mean designing the interface and adopting `wasm-tools`/`cargo-component` before we know
+what the interface is. The hand-written ABI is three functions
+(`flux_alloc` / `flux_dealloc` / `flux_eval`) and cost nothing to throw away.
+
+**Revisit when** the host-import set stabilizes (after C-272/C-273), or when an embedder we care
+about speaks components natively.
+
+## Settled: what replaces `tokio`
+
+**Nothing. The portable core runs the interpreter's future on a bounded poll loop with a no-op
+waker, and `tokio` is reduced to a compile-time dependency.**
+
+Two separate problems hid behind this question:
+
+1. **Compiling.** The workspace pins `tokio` with `features = ["full"]`, and `net` pulls `mio`, which
+   refuses outright: *"This wasm target is unsupported by mio. If using Tokio, disable the net
+   feature."* This was the **only** thing stopping `flux-lang` from building for `wasm32` — the fix
+   is a target-gated dependency in `crates/flux-lang/Cargo.toml` giving the wasm build
+   `["sync", "macros", "rt", "time"]` and leaving the native build byte-identical. No source change,
+   no `cfg` in the interpreter.
+2. **Running.** The interpreter is `async`, but on its pure path it is a single non-concurrent future
+   whose only suspension point is `tokio::task::yield_now`, which re-wakes immediately. So it needs
+   no reactor at all: `block_on` in `crates/flux-lang/examples/portable/core.rs` is ~20 lines of
+   `Future::poll` with a no-op waker and a poll budget. No threads, no timer wheel, no
+   `Instant::now`, no `SystemTime::now` — each of which is either absent or panicking on
+   `wasm32-unknown-unknown`.
+
+The poll budget is the honest part. A program that needs a *timer* (`loop every_ms`, `timeout`,
+`throttle`, `debounce`) or an `await` stays `Pending` forever under this executor, and the budget
+turns that hang into the error *"the portable core has no reactor: this program needs a host import
+to make progress"*. That is the right failure: **a clock is a host import** (§ "The load-bearing
+invariant" — "not `now()` unbounded but a host-supplied clock"), and the portable core must not
+invent one. Wiring the clock is C-272's business; C-273's wall-clock deadline replaces the poll
+budget with a real one.
 
 ## Non-goals
 

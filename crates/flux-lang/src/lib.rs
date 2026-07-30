@@ -47,6 +47,9 @@ pub mod parse;
 pub mod parser;
 pub mod prelude;
 pub mod program;
+/// Railflux — the 7-bit ASCII dataflow projection. Private: its entry points are re-exported from
+/// [`render`], which is the one public home for AST projections.
+mod rail;
 pub mod render;
 pub mod runtime;
 pub mod schema;
