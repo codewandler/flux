@@ -20,25 +20,48 @@ reads it), and fix C-235: a string-returning cognition op must yield the string,
 encoding.
 
 ## Acceptance
-- [ ] `each $item in board.query({...})` binds `id`/`runner`/`task_id` and a `match` on `state`
+- [x] `each $item in board.query({...})` binds `id`/`runner`/`task_id` and a `match` on `state`
       works end to end. **Failing-first test**:
       `crates/flux-sdk/tests/board_iteration.rs::a_program_iterates_the_board_and_matches_on_state`
       — impossible today (`board.query` is not registered).
-- [ ] `board.query` carries an `output_schema` and returns structured rows, not prose.
-- [ ] "ready and unblocked" is expressible via a `depends_on` filter that treats an item as blocked
+- [x] `board.query` carries an `output_schema` and returns structured rows, not prose.
+- [x] "ready and unblocked" is expressible via a `depends_on` filter that treats an item as blocked
       until every dependency is `done` (an absent dependency is not `done`). Pinned for every
       backend in the shared contract suite.
-- [ ] `board.comments` reads back what `board.comment` wrote, for both backends — via a new
+- [x] `board.comments` reads back what `board.comment` wrote, for both backends — via a new
       `WorkBoard::comments` port method (a deliberate breaking change to
       `codewandler-flux-capabilities`: no default body, both backends implement it, the contract
       suite pins the property).
-- [ ] A string-returning cognition op yields the raw string; a chained journey (extract a URL, feed
+- [x] A string-returning cognition op yields the raw string; a chained journey (extract a URL, feed
       it to `fleet.status`, which parses a URL) succeeds — the exact shape that failed the 0.36.0
       smoke test (C-235).
-- [ ] Standard gate green in both workspaces.
+- [x] Standard gate green in both workspaces.
 
 ## Progress
 - 2026-07-30 — filed as fleet-loop F1; implementation on `impl/C-236`.
+- 2026-07-30 — **complete on `impl/C-236`.** The first implementor died mid-flight leaving 1039
+  uncommitted lines with zero commits; those were preserved as a WIP commit, then assessed. The
+  inherited state was tests-only plus a corrupted source region: `item_row` had been emitted 15
+  times and `query_output_schema` 3 times (a generation loop), no `Query`/`Comments` spec arms
+  existed, neither backend implemented `comments` or the `depends_on` filter, and **the C-235 fix
+  itself was never written** — only its expectations had been flipped. All of that is now done:
+  - `flux-datasource`: `DependencyMatch` + `DEPENDS_ON_FILTER` beside `validate_transition`, so one
+    definition of "unblocked" serves both backends.
+  - `flux-capabilities`: `query` (typed rows + `output_schema` + the `depends_on` filter) and
+    `comments` (`output_schema`); `WorkBoard::comments` with **no default body**; `depends_on`
+    reserved in `validate_board_contract` exactly like `state`; `page_schema` shared by `list`/`query`
+    so only `query` advertises `depends_on`.
+  - `MemoryBoard` + `MarkdownBoard`: both implement `comments` and the `depends_on` filter;
+    `MemoryBoard`'s inherent `comments` (which returned `Vec` and swallowed an absent id) is gone,
+    superseded by the trait method that errors. Markdown read-back is the exact inverse of
+    `comment`'s render — top-level `- ` bullets, in file order — via a new `read_document`.
+  - `flux-tools`: `selected_content` applies the workspace's string convention to the four
+    *selecting* ops (`regex_extract` single, `first`, `last`, `coalesce`). C-235 discharged.
+  - Gate green in full; `examples/bitcoin-price.flux` becomes correct without a source change,
+    confirming the story's "no compensating consumer" finding.
+  - ⚠ `scripts/check-crate-versions.sh` FAILs on `codewandler-flux-datasource` (content changed,
+    still `1.1.0`). Versions are fenced — the coordinator owns that bump. `WorkBoard::comments`
+    is a breaking change to the published `codewandler-flux-capabilities` crate.
 
 ## Notes
 - **C-235 verdict (with evidence): the bug is in the ops, not the engine.** The interpreter binds op

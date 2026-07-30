@@ -742,341 +742,6 @@ fn render_full(item: &Item) -> String {
 
 /// One item as a typed `query` row (C-236).
 ///
-/// Unlike the prose renderers, every field is always present — an absent optional is `null`,
-/// never a missing key, so `$item.runner` under Flux-Lang's strict field access reads `null`
-/// instead of erroring on an undispatched item.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is always present — absent optionals serialize as `null` rather than missing keys,
-/// so a Program's `$item.runner` read never errors on an undispatched item (the strict-by-default
-/// field access would call a missing key a typo). This deliberately does not reuse [`Item`]'s own
-/// `Serialize`, whose `skip_serializing_if` drops exactly the fields a sweep reads.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// The `output_schema` `query` declares: an array of [`item_row`] rows.
-fn query_output_schema() -> Value {
-    json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "title": {"type": "string"},
-                "state": {
-                    "type": "string",
-                    "enum": State::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-                },
-                "assignee": {"type": ["string", "null"]},
-                "runner": {"type": ["string", "null"]},
-                "task_id": {"type": ["string", "null"]},
-                "depends_on": {"type": "array", "items": {"type": "string"}},
-                "repo": {"type": ["string", "null"]},
-                "attempts": {"type": "integer", "minimum": 0}
-            },
-            "required": [
-                "id", "title", "state", "assignee", "runner", "task_id", "depends_on", "repo",
-                "attempts"
-            ]
-        }
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Deliberately NOT [`Item`]'s own `Serialize`: that skips absent optionals, and a missing key is
-/// a loud error under the language's strict `$item.field` access. A row carries **every** field,
-/// with absent optionals as `null`, so a sweep can read `$item.runner` on an undispatched item and
-/// get `null` rather than an error.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is always present — absent optionals serialize as `null`, never as missing keys —
-/// because the language's strict field access (`$item.runner`) errors on a missing key, and a
-/// sweep over rows where only some are dispatched must not die on the undispatched ones.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is always present — absent optionals are `null`, never missing keys, because the
-/// native `$item.field` sugar is strict about absent keys and a sweep over items where only some
-/// are dispatched must not error on the rest. `state` renders in its wire spelling, so
-/// `match $item.state` compares against `"claimed"` & co. exactly as `transition` accepts them.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// The `output_schema` `query` advertises: an array of [`item_row`] rows.
-fn query_output_schema() -> Value {
-    json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "title": {"type": "string"},
-                "state": {
-                    "type": "string",
-                    "enum": State::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-                },
-                "assignee": {"type": ["string", "null"]},
-                "runner": {"type": ["string", "null"]},
-                "task_id": {"type": ["string", "null"]},
-                "depends_on": {"type": "array", "items": {"type": "string"}},
-                "repo": {"type": ["string", "null"]},
-                "attempts": {"type": "integer", "minimum": 0}
-            },
-            "required": [
-                "id", "title", "state", "assignee", "runner", "task_id", "depends_on", "repo",
-                "attempts"
-            ],
-            "additionalProperties": false
-        }
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is always present — an absent optional is `null`, never a missing key — because
-/// `$item.runner` is strict jq access: a missing key is a loud error, and a sweep over items where
-/// only some are dispatched must not error on the rest. `evidence` stays out of the row: the nine
-/// fields here are what wave selection and reconciliation read.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is present in every row — absent optionals are `null` rather than missing keys,
-/// because the language's strict field access (`$item.runner`) errors on a missing key but reads
-/// a present `null` fine. `evidence` stays out: the sweep's identity fields are the nine a
-/// coordinator reasons over, and `Reference`'s tagged shape is what `get` renders for humans.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is always present — absent optionals serialize as `null` rather than being skipped
-/// (which [`Item`]'s own serde does), because the strict `$item.field` access a Program uses errors
-/// on a *missing* key but reads a present `null` fine. `evidence` stays off the row: the query
-/// surface is the sweep's working set, and references are already reachable through `get`.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One [`Item`] as a typed `query` row (C-236).
-///
-/// Every field is always present — absent optionals are `null`, never missing keys, because the
-/// native `$item.field` sugar is strict: a missing key is a loud error, and a sweep over items
-/// where only some are dispatched must be able to read `runner`/`task_id` on all of them. `state`
-/// renders in its wire spelling so a `match` arm compares against `"claimed"`, and `depends_on` is
-/// the raw id list a wave selector reasons over.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is present on every row — absent optionals are explicit `null`, never a missing
-/// key, because `$item.runner` on a missing key is a *loud* strict-jq error in Flux-Lang and a
-/// sweep over half-dispatched items must not die on the undispatched ones. The field set is the
-/// coordinator's reasoning vocabulary: identity (`id`), the machine (`state`, `attempts`), the run
-/// registry (`assignee`, `runner`, `task_id`), and wave selection (`depends_on`, `repo`).
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Deliberately NOT [`Item`]'s own `Serialize`: that skips absent optionals, and a missing key
-/// makes `$item.runner` a loud strict-access error on exactly the undispatched items a sweep is
-/// looking for. Every row carries every field; absent optionals are `null`.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Every field is present on every row — absent optionals are `null`, never missing keys — because
-/// `$item.runner` on a missing key is a loud error in strict jq access, and a sweep over a board
-/// where only some items are dispatched must not die on the first undispatched row. `state` is the
-/// wire spelling, so a `match` arm compares it against `"claimed"` and friends directly.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Deliberately NOT [`Item`]'s own serde form: that skips absent optionals, and a missing key is a
-/// loud error under `$item.field` access. A row carries every field — absent optionals are `null`
-/// — so a sweep can read `$item.runner` on an undispatched item and get `null`, not a crash.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
-/// Deliberately *not* [`Item`]'s own serde form: that skips absent optionals, and a missing key
-/// makes `$item.runner` a loud error under the runtime's strict field access. Every row carries
-/// every field — absent optionals are `null` — so a Program can bind any of them without a
-/// presence check.
-fn item_row(item: &Item) -> Value {
-    json!({
-        "id": item.id,
-        "title": item.title,
-        "state": item.state.as_str(),
-        "assignee": item.assignee,
-        "runner": item.runner,
-        "task_id": item.task_id,
-        "depends_on": item.depends_on,
-        "repo": item.repo,
-        "attempts": item.attempts,
-    })
-}
-
-/// One item as a typed `query` row (C-236).
-///
 /// Deliberately not [`Item`]'s own serde: that skips absent fields, and a missing key is a *loud
 /// error* under the runtime's strict `$item.field` access. A coordinator iterating a mixed board
 /// cannot have `$item.runner` blow up on the undispatched rows, so every row carries every field —
@@ -1137,7 +802,7 @@ fn spec_for(op: &str, projection: &BoardProjection) -> ToolSpec {
     let (description, schema) = match kind {
         OpKind::List => (
             format!("List one page of items from the `{domain}` work board."),
-            list_schema(projection),
+            page_schema(projection, &projection.filters),
         ),
         OpKind::Get => (
             format!("Fetch one full item from the `{domain}` work board."),
@@ -1223,9 +888,40 @@ fn spec_for(op: &str, projection: &BoardProjection) -> ToolSpec {
                 &["id", "runner", "task_id"],
             ),
         ),
+        OpKind::Query => (
+            format!(
+                "Query one page of `{domain}` items as typed JSON rows — the machine-readable \
+                 sibling of `{domain}.list`, for `each`/`match` rather than for reading. Every row \
+                 carries every field; absent optionals are `null`. The `depends_on` filter makes \
+                 \"ready and unblocked\" one call: `satisfied` keeps only items whose every \
+                 dependency is `done`."
+            ),
+            page_schema(projection, &projection.query_filters),
+        ),
+        OpKind::Comments => (
+            format!(
+                "Read back the notes left on one `{domain}` item, oldest first — the read half of \
+                 `{domain}.comment`."
+            ),
+            object(
+                json!({"id": {"type": "string", "description": "Stable item id"}}),
+                &["id"],
+            ),
+        ),
     };
 
     let spec = ToolSpec::read_only(name, description, schema);
+    // The two structured reads are the only board ops a Program consumes as data rather than as
+    // prose, so they are the only ones that can honestly advertise an `output_schema` (C-236).
+    let spec = match kind {
+        OpKind::Query => spec.with_output_schema(query_output_schema()),
+        OpKind::Comments => spec.with_output_schema(json!({
+            "type": "array",
+            "description": "The item's notes, oldest first.",
+            "items": {"type": "string"}
+        })),
+        _ => spec,
+    };
     let mut spec = if kind.writes() {
         // C-191's coherence invariants: a `Write` may keep neither the `Risk::Low` tier nor the
         // `Idempotent` claim. Two are genuinely safe to repeat under a stated condition, which is
@@ -1272,10 +968,15 @@ fn object(properties: Value, required: &[&str]) -> Value {
     })
 }
 
-fn list_schema(projection: &BoardProjection) -> Value {
+/// The paging + filter input schema shared by `list` and `query`.
+///
+/// The two differ in exactly one thing — the filter vocabulary they accept (`query` additionally
+/// takes the reserved `depends_on`, C-236) — so the caller passes the set rather than the schema
+/// being derived twice.
+fn page_schema(projection: &BoardProjection, declared: &[FilterKey]) -> Value {
     let mut properties = Map::new();
     let mut required_filters = Vec::new();
-    for filter in &projection.filters {
+    for filter in declared {
         properties.insert(filter.name.clone(), filter_schema(filter));
         if filter.required {
             required_filters.push(Value::String(filter.name.clone()));
@@ -1355,9 +1056,12 @@ pub fn validate_board_contract(
                 "work board `{domain}` has an invalid blank/whitespace filter name"
             )));
         }
-        if name == STATE_FILTER {
+        // Both reserved names belong to the host: `state` on every read, `depends_on` on `query`
+        // (C-236). A backend that redeclared either would be silently shadowed on one surface and
+        // authoritative on the other, so it is refused outright.
+        if name == STATE_FILTER || name == DEPENDS_ON_FILTER {
             return Err(Error::Other(format!(
-                "work board `{domain}` redeclares the reserved `{STATE_FILTER}` filter"
+                "work board `{domain}` redeclares the reserved `{name}` filter"
             )));
         }
         if !names.insert(name) {
@@ -1424,6 +1128,23 @@ mod tests {
         assert!(error.contains("reserved `state` filter"), "{error}");
     }
 
+    /// C-236: `depends_on` is the host's too. It rides `query` only, but reserving it on the whole
+    /// contract is what keeps a backend from being authoritative on `list` and shadowed on `query`.
+    #[test]
+    fn a_backend_may_not_shadow_the_reserved_depends_on_filter() {
+        let mut declared = schema();
+        declared.filters.push(FilterKey {
+            name: DEPENDS_ON_FILTER.into(),
+            ty: FilterType::String,
+            required: false,
+            description: None,
+        });
+        let error = validate_board_contract("board", &declared, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved `depends_on` filter"), "{error}");
+    }
+
     #[test]
     fn page_bounds_and_domains_are_checked_once_at_registration() {
         let mut bad = schema();
@@ -1474,6 +1195,7 @@ mod tests {
         let projection = BoardProjection {
             domain: "board".into(),
             filters: declared_filters(&schema()),
+            query_filters: declared_filters(&schema()),
             schema: schema(),
             access: Vec::new(),
             backend: Arc::new(crate::datasource::MemoryBoard::new()),

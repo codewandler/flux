@@ -134,6 +134,12 @@ registry.
 The model-backed ops carry a `Network` effect and require provider access (an LLM call is network
 egress); the pure ops carry no effect and never pause for approval.
 
+**Ops that *select* an existing value return a bare string unquoted** (C-236, fixing C-235):
+`regex_extract` (single match), `first`, `last` and `coalesce` bind the string itself, so
+`regex_extract` of a URL feeds straight into an op that parses one. Anything structured (object,
+array, number, bool, `null`) is still its compact JSON encoding, which the runtime's string-leaf
+re-parse rule reads back — so `split`, `keys`, and `regex_extract` with `all: true` are unchanged.
+
 ## Second opinion (group `consult`)
 
 `consult` (A-96) is deliberately separate from the cognition pack above: it does not reuse the
@@ -191,17 +197,29 @@ is no workspace signal that could gate them honestly. `.flux/groups.toml` can st
 the group. A worker behind `flux serve`'s required bearer token is not yet reachable — the token is
 operator configuration that does not exist yet.
 
-## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch`)
+## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch` / `.query` / `.comments`)
 
 A `WorkBoard` (A-113) is the write-capable sibling of a live datasource: a typed item state machine
 behind a swappable backend. A program binds one with a `board:<backend>` datasource declaration
-(A-131) and the host generates seven operations under the declaration's name — so `datasource board`
-yields `board.list` … `board.record_dispatch`. Five of them write, and each reports a concrete
+(A-131) and the host generates nine operations under the declaration's name — so `datasource board`
+yields `board.list` … `board.comments`. Five of them write, and each reports a concrete
 `<domain>/item/<id>` permission subject (`<domain>/item/new` for `create`); `transition` validates
 the edge before writing, so an illegal edge errors and performs no write. `record_dispatch` (A-130)
 binds an item to the worker running it — the `runner` address and the worker-minted `task_id` — which
 is what makes the board a run registry rather than only a task list; it writes those two fields and
 nothing else, so `transition` stays the single entry point into the state machine.
+
+`list` renders prose for a human and pages with a cursor. **`query` (C-236) is its machine-readable
+sibling**: one page as a bare JSON array of typed rows under a real `output_schema`, so
+`each $item in board.query({…})` binds `id`/`state`/`runner`/`task_id`/`depends_on`/`repo` directly and
+`match $item.state` compares against the same wire spellings `transition` accepts. Every row carries
+every field — an absent optional is `null`, never a missing key — so a sweep over a half-dispatched
+board does not error on `$item.runner`. `query` additionally takes the reserved **`depends_on`**
+filter (`satisfied` / `unsatisfied`), which makes "ready and unblocked" one call: an item is
+unblocked exactly when every id in its `depends_on` is `done`; no dependencies is trivially
+unblocked, and an absent dependency never resolves. `list`'s filter vocabulary is unchanged.
+`comments` (C-236) is the read half of `comment` — the item's notes as a JSON array, oldest first.
+
 Backends: `board:markdown` (durable, file-per-item) and `board:memory` (in-process). See
 [`fleet-coordinator.md`](../../../docs/designs/fleet-coordinator.md).
 

@@ -142,8 +142,8 @@ async fn worker_stub(respond: impl Fn(&str) -> Value + Send + Sync + 'static) ->
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let payload = json!({ "jsonrpc": "2.0", "id": 1, "result": respond(&method) })
-                .to_string();
+            let payload =
+                json!({ "jsonrpc": "2.0", "id": 1, "result": respond(&method) }).to_string();
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{payload}",
@@ -181,7 +181,12 @@ async fn a_program_iterates_the_board_and_matches_on_state() {
         .unwrap();
     board.claim(&ctx, &dispatched.id, "worker-1").await.unwrap();
     board
-        .record_dispatch(&ctx, &dispatched.id, "https://worker-1.internal:8787", "t_1")
+        .record_dispatch(
+            &ctx,
+            &dispatched.id,
+            "https://worker-1.internal:8787",
+            "t_1",
+        )
         .await
         .unwrap();
     board
@@ -296,8 +301,14 @@ async fn a_program_reads_comments_back_off_the_board() {
         )
         .await
         .unwrap();
-    board.comment(&ctx, &item.id, "worker started").await.unwrap();
-    board.comment(&ctx, &item.id, "gate is green").await.unwrap();
+    board
+        .comment(&ctx, &item.id, "worker started")
+        .await
+        .unwrap();
+    board
+        .comment(&ctx, &item.id, "gate is green")
+        .await
+        .unwrap();
 
     let client = client_with_board(&root, board);
     let out = run(

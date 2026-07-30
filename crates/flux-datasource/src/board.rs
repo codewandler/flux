@@ -361,7 +361,10 @@ mod tests {
             attempts: 0,
             evidence: Vec::new(),
         };
-        let states = |done: &[&str]| move |id: &str| done.contains(&id).then_some(State::Done);
+        /// A `state_of` resolver where exactly `done` is `done` and everything else is absent.
+        fn states<'a>(done: &'a [&'a str]) -> impl Fn(&str) -> Option<State> + 'a {
+            move |id: &str| done.contains(&id).then_some(State::Done)
+        }
 
         for spelling in ["satisfied", "unsatisfied"] {
             assert_eq!(

@@ -144,6 +144,26 @@ fn arr_or_empty(params: &Value, key: &str, tool: &str) -> Result<Vec<Value>> {
     }
 }
 
+/// Render a **selected** value as result content (C-235).
+///
+/// The ops that *select* an existing value — `regex_extract` (single match), `first`, `last`,
+/// `coalesce` — must hand back a bare string unquoted, because the interpreter binds op output
+/// verbatim (`Value::String(result.content)`) and never re-parses a bare string leaf. A JSON-encoded
+/// `"http://…"` therefore reached the next op's argument parser with its quotes attached, which is
+/// how "extract a URL, then dial it" failed with `relative URL without a base`.
+///
+/// Anything structured (object, array, number, bool, null) stays its compact JSON encoding — the
+/// runtime's string-leaf re-parse rule reads those back. This is the workspace convention already
+/// spelled out in `flux_runtime`'s `value_to_content`, applied to the ops that had drifted from it.
+/// Ops that *construct* a value (`pick`, `omit`, `split`, `keys`, …) are unaffected: they were never
+/// returning a bare string.
+fn selected_content(value: &Value) -> Result<String> {
+    Ok(match value {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(other)?,
+    })
+}
+
 /// Truthiness for the `gaps` field-coverage heuristic: null/false/empty are falsy.
 fn is_truthy(v: &Value) -> bool {
     match v {
@@ -507,7 +527,7 @@ impl Tool for FirstTool {
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let items = arr_param(&params, "items", "first")?;
         let v = items.into_iter().next().unwrap_or(Value::Null);
-        Ok(ToolResult::ok(serde_json::to_string(&v)?))
+        Ok(ToolResult::ok(selected_content(&v)?))
     }
 }
 
@@ -533,7 +553,7 @@ impl Tool for LastTool {
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let items = arr_param(&params, "items", "last")?;
         let v = items.into_iter().next_back().unwrap_or(Value::Null);
-        Ok(ToolResult::ok(serde_json::to_string(&v)?))
+        Ok(ToolResult::ok(selected_content(&v)?))
     }
 }
 
@@ -1172,9 +1192,11 @@ impl Tool for RegexExtractTool {
             match regex.captures(&s) {
                 None => Ok(ToolResult::ok("null".to_string())),
                 Some(caps) => {
+                    // The extracted text is handed back raw, not JSON-encoded (C-235) — see
+                    // `selected_content`. `all: true` above stays an encoded array.
                     if group > 0 {
                         match caps.get(group) {
-                            Some(m) => Ok(ToolResult::ok(serde_json::to_string(m.as_str())?)),
+                            Some(m) => Ok(ToolResult::ok(m.as_str().to_string())),
                             None => Err(Error::Other(format!(
                                 "regex_extract: no capture group {group} in pattern"
                             ))),
@@ -1182,7 +1204,7 @@ impl Tool for RegexExtractTool {
                     } else {
                         // group 0 always available
                         match caps.get(0) {
-                            Some(m) => Ok(ToolResult::ok(serde_json::to_string(m.as_str())?)),
+                            Some(m) => Ok(ToolResult::ok(m.as_str().to_string())),
                             None => Ok(ToolResult::ok("null".to_string())),
                         }
                     }
@@ -1399,7 +1421,7 @@ impl Tool for CoalesceTool {
             .into_iter()
             .find(|v| !is_empty_for_coalesce(v))
             .unwrap_or(default);
-        Ok(ToolResult::ok(serde_json::to_string(&chosen)?))
+        Ok(ToolResult::ok(selected_content(&chosen)?))
     }
 }
 

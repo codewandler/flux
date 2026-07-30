@@ -517,11 +517,21 @@ async fn query_filters_ready_and_unblocked_in_one_call() {
 
     // The child is ready but blocked; only the parent is ready and unblocked.
     assert_eq!(
-        query_titles(&query, &ctx, json!({"state": "ready", "depends_on": "satisfied"})).await,
+        query_titles(
+            &query,
+            &ctx,
+            json!({"state": "ready", "depends_on": "satisfied"})
+        )
+        .await,
         vec!["parent".to_string()]
     );
     assert_eq!(
-        query_titles(&query, &ctx, json!({"state": "ready", "depends_on": "unsatisfied"})).await,
+        query_titles(
+            &query,
+            &ctx,
+            json!({"state": "ready", "depends_on": "unsatisfied"})
+        )
+        .await,
         vec!["child".to_string()]
     );
 

@@ -337,10 +337,7 @@ async fn the_depends_on_filter_treats_an_item_as_blocked_until_every_dependency_
         depends_on: &str,
     ) -> Vec<String> {
         let mut filters = Filters::new();
-        filters.insert(
-            "depends_on",
-            FilterValue::String(depends_on.to_string()),
-        );
+        filters.insert("depends_on", FilterValue::String(depends_on.to_string()));
         board
             .list(
                 ctx,
@@ -400,12 +397,19 @@ async fn the_depends_on_filter_treats_an_item_as_blocked_until_every_dependency_
         board,
         ctx,
         &parent_a.id,
-        &[State::Claimed, State::InProgress, State::Review, State::Done],
+        &[
+            State::Claimed,
+            State::InProgress,
+            State::Review,
+            State::Done,
+        ],
         0,
     )
     .await;
     assert!(
-        !listed_ids(board, ctx, "satisfied").await.contains(&child.id),
+        !listed_ids(board, ctx, "satisfied")
+            .await
+            .contains(&child.id),
         "a half-satisfied dependency set is still blocked"
     );
 
@@ -414,7 +418,12 @@ async fn the_depends_on_filter_treats_an_item_as_blocked_until_every_dependency_
         board,
         ctx,
         &parent_b.id,
-        &[State::Claimed, State::InProgress, State::Review, State::Done],
+        &[
+            State::Claimed,
+            State::InProgress,
+            State::Review,
+            State::Done,
+        ],
         0,
     )
     .await;
