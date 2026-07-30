@@ -92,7 +92,15 @@ jobs:
     # bubblewrap is not the same as having it work — a kernel that refuses unprivileged user
     # namespaces (Ubuntu 23.10+'s AppArmor restriction, default-seccomp Docker) resolves
     # `Unsupported`, which would quietly turn this lane into a second copy of `check`: green, and
-    # proving nothing. If that ever happens, this job says so loudly instead.
+    # proving nothing.
+    #
+    # C-280: that is not hypothetical, and it did not take long. This lane's FIRST real run
+    # (30564156249, 2026-07-30) failed exactly that way — `ubuntu-latest` is now Ubuntu 24.04, which
+    # ships `kernel.apparmor_restrict_unprivileged_userns=1`. `bubblewrap` installed, `bwrap
+    # --version` succeeded, and the kernel still refused the namespace, so `doctor` reported the
+    # backend `WARN` and both assertions failed. The guard did its job; the runner needed work to
+    # host this lane at all. That is what the "permit unprivileged user namespaces" step below is
+    # for, and why it exists at all is worth knowing before anyone deletes it.
     #
     # Note what is NOT duplicated from `check`: clippy and fmt are posture-independent, so this lane
     # runs only the parts whose behavior a backend can change.
@@ -122,6 +130,49 @@ jobs:
           sudo apt-get install -y bubblewrap
           bwrap --version
 
+      # C-280. Three fixes were on the table and they are not equivalent:
+      #
+      #   * pin the job to `ubuntu-22.04` — no such restriction, but an announced retirement, so it
+      #     buys time rather than fixing anything. Worse, it would make this the one lane running on
+      #     an older image than every other job, so "flux confines correctly" would stop being a
+      #     statement about the platform CI actually tests on.
+      #   * run the lane in a container that provides the namespace itself — the heaviest option, and
+      #     the one with a vacuity hazard: GitHub container jobs run as root, and root can create a
+      #     user namespace even under this AppArmor restriction. The lane would go green for a reason
+      #     that has nothing to do with the posture flux runs in, which is precisely the failure mode
+      #     C-266 built this lane to prevent.
+      #   * clear the sysctl on the job's own throwaway VM — chosen. It is one line, it keeps the lane
+      #     on the same image as every other job, and it is honest about what it does.
+      #
+      # What it costs: the lane proves flux confines on a host *reconfigured to permit* unprivileged
+      # userns, not on a stock ubuntu-latest. That is the right subject — the code under test is
+      # flux's confinement path, not Ubuntu's kernel policy — and the other posture is not lost: a
+      # host that refuses userns resolves to no backend, which the `check` job above asserts
+      # hermetically. Between them both real postures still have a lane.
+      #
+      # Deliberately best-effort, and deliberately NOT the gate. If the knob ever disappears (a future
+      # image drops AppArmor, or Ubuntu retires the restriction) `sysctl -w` fails on a host that
+      # confines perfectly well, and failing here would red `main` for no defect. Whether confinement
+      # is REAL stays where C-266 put it: `a_promised_backend_is_real_and_functional` fails the job on
+      # a `WARN` backend. This step only clears a known obstacle in front of that assertion — it must
+      # never become the thing that decides the lane passed.
+      - name: Permit unprivileged user namespaces (Ubuntu 24.04's AppArmor restriction)
+        run: |
+          echo "before: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>&1 || true)"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
+            || echo "::notice::could not clear the AppArmor userns restriction; if this runner can still confine the lane passes anyway, and if it cannot the sandbox-backend assertion below says so"
+          echo "after:  $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>&1 || true)"
+
+      # Fail fast and attributably. This is a strict SUBSET of the flag set flux's own preflight probe
+      # uses (`--unshare-pid`/`--unshare-ipc`/`--unshare-uts`/… — see `bwrap_probe_argv` in
+      # `crates/flux-system/src/sandbox.rs`), so it cannot fail where flux would have succeeded. If it
+      # fails, the runner genuinely cannot confine and the next ten minutes of building would only
+      # arrive at the same conclusion with the blame pointed at the diff under test instead of at the
+      # image. It does not replace the assertion below — a subset probe passing proves less than
+      # `doctor` does.
+      - name: The runner can actually create a user namespace
+        run: bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true
+
       - name: Build
         run: cargo build --workspace
 
@@ -137,6 +188,74 @@ jobs:
       # never check before, and the site the 0.38.0 cut found last.
       - name: Live smoke gate — CLI shape guard, confined (hermetic, no credentials)
         run: FLUX_SANDBOX=require FLUX_BIN="$PWD/target/debug/flux" ./scripts/smoke-live.sh --shapes
+
+  portable-wasm:
+    name: the portable core still compiles to wasm32 and matches the native engine
+    runs-on: ubuntu-latest
+    # C-279. C-271 landed a real proof — the portable core built for `wasm32-unknown-unknown`, run
+    # inside a Wasm engine, asserted byte-identical to the native engine on the same `.flux` source —
+    # and then nothing ran it. `crates/flux-lang/tests/wasm_parity.rs` skips (loudly to stdout, but it
+    # PASSES) when the module is absent, and the module is absent on every machine without the wasm32
+    # target installed, which is every runner. So `cargo test --workspace` was green and the proof was
+    # decorative. Measured, at 80bb31fa: with a deliberate off-by-one in `flux_eval`'s packed return,
+    # `cargo test --workspace` exited 0 while this lane's command failed 2 of 4 parity tests.
+    #
+    # `FLUX_PORTABLE_WASM_REQUIRED=1` is what makes the lane incapable of passing vacuously: it turns
+    # "the module is not built" from a skip into a failure. `scripts/build-portable-wasm.sh` already
+    # sets it on the `cargo test` it runs; declaring it here as well states the requirement in the
+    # workflow itself, so it survives someone simplifying the script and cannot be lost silently.
+    #
+    # WHERE THIS RUNS: every push and every pull request, with NO `paths:` filter. That is deliberate
+    # and it is the expensive-looking half of this story, so the reasoning is written down:
+    #
+    #   * The regression class is feature unification, not file locality. C-271's actual blocker was
+    #     tokio's `net` feature pulling `mio`, which refuses to compile on wasm32. Cargo unifies
+    #     features across the workspace, so ANY crate adding a feature to a shared dependency can
+    #     break the wasm build. A filter on `crates/flux-lang/**` would skip precisely the PR that
+    #     did it.
+    #   * A correct filter would have to enumerate flux-lang's transitive closure plus the root
+    #     manifest and the lockfile — a second, hand-maintained copy of the dependency graph with
+    #     nothing checking it. It rots silently, and its failure mode is "the lane did not run on the
+    #     PR that broke the thing" — the exact defect class this story exists to close, and the
+    #     fourth instance of it this cycle after C-248, C-259 and C-264.
+    #   * The cost does not buy enough to justify that risk. This job is parallel and is nowhere near
+    #     the critical path: `check` builds, tests, clippies and smoke-tests the whole workspace,
+    #     while this builds one crate's dependency closure twice (wasm32 release + host debug test)
+    #     and runs four tests. Its marginal effect on CI wall-clock is ~0; it costs runner-minutes on
+    #     a job far smaller than `check`. Locally the wasm half is ~15s wall / ~71s CPU from a clean
+    #     wasm target dir with a warm registry.
+    #   * The repo has already made this trade once and written it down: `website.yml` refuses a
+    #     `paths:` filter on main because "a stale public page that contradicts the tree costs more"
+    #     than the couple of minutes it saves. Same trade, same answer.
+    env:
+      FLUX_PORTABLE_WASM_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain (with the wasm32 target)
+        # Pinned for the same reason as the `check` job — see its comment. `targets:` is what retires
+        # `rustup target add wasm32-unknown-unknown` as a manual prerequisite: the build script
+        # refuses to run (exit 2) rather than falling back to a host build, so a target this action
+        # failed to install fails the lane instead of quietly proving nothing.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # No `cargo fetch --locked` step here, unlike `check` and `sandbox-backend`: theirs exists for
+      # flux-codegate's layering lint, which resolves `cargo metadata --locked --offline` over the
+      # full lockfile closure. This lane never runs that lint, so the fetch would be cost with no
+      # corresponding failure to prevent.
+
+      # Builds the `wasm32-unknown-unknown` cdylib and then runs the parity assertion against the
+      # artifact it just produced. The script is the single recorded command (C-271 acceptance), so
+      # the lane deliberately calls it rather than re-spelling its steps — a lane that drifted from
+      # the command developers run by hand would be gating something nobody else executes.
+      - name: Build the portable core for wasm32 and assert parity with the native engine
+        run: ./scripts/build-portable-wasm.sh
 
   plugins:
     name: plugins workspace · build · test · clippy · fmt
