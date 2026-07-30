@@ -2,7 +2,7 @@
 id: C-290
 title: "A runtime has no memory ceiling and no general concurrency limit"
 pillar: Core
-status: in-progress
+status: done
 priority: 4
 areas: [flux-config, flux-runtime, flux-sdk]
 note: "surveyed while designing the flux-connectors interop: context_budget/max_iterations/max_tokens/max_calls exist, but nothing bounds memory and the only concurrency control is server-side max_inflight_per_principal — so an embedding host cannot bound a runtime it constructs"
