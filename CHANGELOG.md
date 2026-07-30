@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-07-30
+
 ### Fixed
 
 - **The in-repo operation reference was unguarded against omission (C-248).** `ops-reference.md` had a
