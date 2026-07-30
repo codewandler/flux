@@ -26,6 +26,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- Starting two flux processes at the same time against a brand-new event store no longer risks one of
+  them failing. Previously, if nothing had created the store yet — a fresh machine, a fresh CI job, or
+  a server and a command starting together — the two could collide while setting it up and one would
+  error out. They now take turns.
+
 - Pulling a value out of text and feeding it straight into another step now works. Extracting a
   single match (or taking the first, last, or first-non-empty value) used to hand back the text
   wrapped in quote characters, so the next step received something like `"1.2.3"` instead of `1.2.3`

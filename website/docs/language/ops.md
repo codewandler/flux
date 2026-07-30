@@ -92,6 +92,22 @@ bounded by that plugin's manifest and its Tavily credential is injected host-sid
 | `git_worktree_enter` | | high | Move this agent context into an isolated temporary git worktree (requires a clean `main`; creates a generated `flux/worktree/*` branch) |
 | `git_worktree_leave` | | high | Merge the worktree's committed work back into `main` (`--no-ff`, guarded by an aborted trial merge), remove the worktree and branch, restore the original root |
 
+None of these ops rewrites history. `git_revert` undoes a commit by adding a new one on top, so the
+commit it reverts stays in the log and nothing already pushed is invalidated.
+
+:::caution `git_revert` changed meaning — the old one is now `git_reset`
+
+`git_revert` used to name the [improvement loop](#improvement-loop)'s snapshot op, which hard-resets
+the working tree and **discards** uncommitted changes. That op is now called **`git_reset`**, and
+`git_revert` is the true revert described above. There is no alias: a flow that calls
+`git_revert($snapshot)` must be changed to `git_reset($snapshot)`.
+
+The rename matters because the call still looks valid. `git_revert($snapshot)` now asks git to append
+the inverse of that commit instead of resetting to it — a different outcome, and one that errors on a
+dirty tree rather than clearing it. If you have a flow that restored a snapshot, rename the call.
+
+:::
+
 ## Cognition ops
 
 The cognition pack splits into **pure** data-shaping ops — deterministic, no IO, never pause
@@ -132,6 +148,13 @@ Pure:
 | `regex_extract` | `s, pattern[, group, all]` | Extract text matching pattern; returns first match or null, or all matches with `all: true` |
 | `cite` | `claims` | A markdown citation list, one line per claim |
 
+**Ops that select an existing string hand back the string itself.** `regex_extract` (single match),
+`first`, `last` and `coalesce` bind the bare text, with no surrounding quote characters — so an
+extracted URL can be passed straight to an op that fetches one. Anything they select that is *not* a
+string (an object, an array, a number, a boolean, `null`) comes back as JSON, which the runtime reads
+back as structured data. Ops that build a new value are unaffected: `split` and `keys` still return
+arrays, and `regex_extract` with `all: true` still returns an array of matches.
+
 **Examples:**
 
 ```flux
@@ -162,7 +185,7 @@ when $has_error
 // Extract SemVer from a version string
 $version = regex_extract({
   s: "flux-cli v1.2.3", pattern: r"v(\d+\.\d+\.\d+)", group: 1
-})  // returns "1.2.3"
+})  // $version is the 5-character string 1.2.3 — no quote characters around it
 
 // Extract all email addresses from text
 $emails = regex_extract({
@@ -237,6 +260,13 @@ behind `flux serve`'s bearer token is not reachable yet.
 
 `fleet.status` is never served from the operation cache — observing the change since the last poll is
 the point of a status call.
+
+**Work board operations are not in this catalog**, because they do not exist until a program asks for
+them. A `datasource` with a `board:` kind generates nine operations named after *that declaration*, so
+a board declared as `board` yields `board.list` … `board.comments` while one declared as `queue`
+yields `queue.list` … `queue.comments`. Nothing is callable without the declaration. They are
+documented with the declaration that creates them, in
+[Work boards and the fleet](../agent/fleet.md).
 
 ## Endpoints
 

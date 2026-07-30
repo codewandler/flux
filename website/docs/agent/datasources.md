@@ -206,8 +206,9 @@ datasource board
 ```
 
 The declaration's **name** becomes the operation prefix, so this one generates `board.list`,
-`board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`, and
-`board.record_dispatch`. Board kinds live in their own `board:` namespace on purpose: `markdown`
+`board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
+`board.record_dispatch`, `board.query`, and `board.comments`. Board kinds live in their own
+`board:` namespace on purpose: `markdown`
 already means *a directory of docs to index*, so a board that happens to be backed by markdown files
 needs a name that cannot be confused with it. A knowledge kind is never promoted to a board, a board
 kind is never ingested as knowledge, and a `board:` kind naming a backend that does not exist is an
@@ -226,6 +227,12 @@ its own.
 
 `board:memory` cannot outlive the process that created it, so a Program relying on crash recovery
 wants `board:markdown`.
+
+Two of the four reads are for a program rather than for a person: `board.query` returns a page as
+typed JSON rows (every field present, absent optionals as `null`) so a flow can `each` over items and
+`match` on their state, and it accepts a `depends_on` filter that keeps only items whose dependencies
+are all `done`. `board.comments` returns one item's notes as an array. `board.list` and `board.get`
+render prose for reading. See [Work boards and the fleet](./fleet.md#reading-the-board-as-data).
 
 The five mutating operations are gated like any other write: each reports a concrete
 `<name>/item/<id>` approval subject—`<name>/item/new` for `create`, since no id exists yet—so a grant

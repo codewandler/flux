@@ -58,6 +58,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Two flux processes cold-booting one fresh `events.db` raced the schema migration (C-230).** One
+  of them died with `event store: duplicate column name: account`. SQLite has no
+  `ADD COLUMN IF NOT EXISTS`, so `migrate_stream_context`'s `PRAGMA table_info` → `ALTER TABLE ADD
+  COLUMN` is an unavoidable check-then-act, and concurrent cold booters raced it. **Once the database
+  exists every probe finds its column and the race is invisible** — which is exactly why nothing
+  caught it: every multi-process fixture in the tree, C-125's included, creates the database in the
+  orchestrator before spawning children, so the children always find a migrated schema. Real
+  exposure: an `app run --serve` alongside a CLI turn, a fleet of sub-agents on a fresh machine, or CI
+  matrix jobs sharing a `HOME`.
+  The whole bootstrap now runs inside one `BEGIN IMMEDIATE` transaction — the SQLite analogue of
+  D-76's Postgres `flux:ddl` advisory lock. **Chosen rather than copied**, which the story demanded:
+  SQLite's write lock already has D-76's two decisive properties — it is *transaction-scoped*
+  (released by commit, rollback, or the OS when a process dies, so no stale lock can wedge a later
+  boot) and *database-enforced* rather than by convention. A `flock`/`O_EXCL` sentinel has neither: it
+  degrades to a no-op on some NFS clients, and a `SIGKILL`ed process leaves a file nobody can safely
+  distinguish from a slow live peer. And because SQLite DDL *is* transactional, the transaction is the
+  whole mechanism — unlike Postgres, whose non-atomic `IF NOT EXISTS` forced D-76 to add a separate
+  lock object.
+  **A second, independent cold-boot race was found and fixed with it, which the story had not
+  anticipated:** `PRAGMA journal_mode = WAL` is the one statement `busy_timeout`'s busy handler does
+  **not** cover — converting a brand-new `delete`-mode file to WAL needs a brief EXCLUSIVE lock and
+  SQLite returns `SQLITE_BUSY` for it *immediately* instead of invoking the handler. Measured rather
+  than assumed: with the handler installed first, a storm of 8 cold boots still failed 1–7 of 8 from
+  exactly that pragma. `set_wal_mode` now retries until the pragma reports `wal` and **never silently
+  settles for a lesser journal mode**, since running on a rollback journal would forfeit C-25's
+  cross-process writer coordination and C-126's checkpoint hygiene. The busy handler is also now
+  installed *before* the first contendable statement rather than after the `journal_mode` pragma.
+
 - **String-returning selection ops returned their JSON encoding, so their output could not feed
   another op (C-235).** `regex_extract` (single match), `first`, `last` and `coalesce` returned
   `"1.2.3"` *with the quote characters*, which is why the 0.36.0 fleet smoke test re-derived `runner`
