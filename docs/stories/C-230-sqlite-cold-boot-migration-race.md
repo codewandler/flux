@@ -2,7 +2,7 @@
 id: C-230
 title: "Two flux processes cold-booting one fresh events.db race the schema migration"
 pillar: Core
-status: ready
+status: in-progress
 priority: 20
 design:
 note: "found by accident during A-107: four processes cold-booting the SAME brand-new events.db died with `duplicate column name: account` — D-76 fixed exactly this for Postgres with a `flux:ddl` advisory lock; SQLite has no equivalent, and every existing multi-process test creates the DB first, so nothing covers it"
