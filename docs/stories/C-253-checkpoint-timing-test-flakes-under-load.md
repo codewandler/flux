@@ -2,7 +2,7 @@
 id: C-253
 title: "A wall-clock assertion in the checkpoint test fails under concurrent build load, so a busy machine reds the gate on no defect"
 pillar: Core
-status: in-progress
+status: done
 priority: 12
 areas: [flux-events]
 note: "918ms observed against its threshold while four sibling builds ran; 5/5 pass in isolation at 0.22-0.36s — the assertion measures the machine, not the code"
