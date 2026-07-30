@@ -2,8 +2,7 @@
 id: C-238
 title: "The git op family cannot create a branch, merge it, or revert a merge — the serial-integration half of the fleet loop has no verbs"
 pillar: Core
-status: in-progress
-priority:
+status: done
 epic: fleet-loop
 design:
 note: "Milestone 2 / F3 of the fleet-loop plan: git_branch + git_merge + git_revert all land here. The name collision is resolved by renaming the eval pack's `git_revert` (which does `git reset --hard`) to `git_reset` — a BREAKING op-catalog change, clean cutover with no alias"

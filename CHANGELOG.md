@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The git family can finally branch, merge and revert (C-238).** Milestone 2 / F3 of the **fleet
+  loop** epic: a Program could stage, commit, diff, and enter or leave a worktree, but not create a
+  branch, merge it, or undo a merge — so the serial, gated, revert-on-red half of the loop could not
+  be written at all. `git_branch`, `git_merge` (`--no-ff`, `Risk::High`) and `git_revert` (`-m 1` for
+  a merge commit) now sit beside the existing ops, argv-only through `flux_system` with concrete
+  `permission_subjects`. **`git_revert` appends an inverse commit and can never reset or rewrite
+  history**, which is the property the integration loop depends on; the test pins `HEAD~1 == <merge
+  sha>` after the revert, an assertion a reset could not satisfy, and the conflict test performs a
+  *second* successful revert to prove `.git/sequencer` was cleared rather than merely checking
+  `REVERT_HEAD`.
+  The review round that preceded this is worth recording, because it caught a defect that could
+  **destroy a user's work**: `git_merge` inferred a pre-existing `MERGE_HEAD` as "this call
+  conflicted" and ran an unconditional `git merge --abort`, discarding a merge the user may have
+  hand-resolved but not yet committed. `git merge` refuses to start while `MERGE_HEAD` exists, so the
+  inference was simply wrong. It now refuses up front — and that guard is also what *licenses* the
+  abort further down, since reaching that path proves the `MERGE_HEAD` is this call's own. Two
+  messages that lied were fixed with it: "restored to its pre-merge state" when the merge never
+  started, and "conflicts in 0 file(s)" printed beside a list saying there were none (count and list
+  now derive from one source, in both `git_merge` and `git_revert`).
+
 - **A board the model can actually reason over — `board.query`, `board.comments` (C-236).** First
   story (F1) of the **fleet loop** epic, and its lynchpin: board ops returned human prose with no
   `output_schema`, and `render_compact` exposed only `title`/`state`/`attempts`/`assignee` — dropping
@@ -22,6 +42,19 @@ All notable changes to this project are documented in this file. The format is b
   wrote, added to `WorkBoard` **with no default body** so a backend cannot silently omit it.
   `depends_on` is also now reserved in `validate_board_contract` alongside `state`, so a backend
   redeclaring it cannot be authoritative on `list` while being shadowed on `query`.
+
+### Changed
+
+- **BREAKING — the eval pack's `git_revert` is now `git_reset` (C-238).** That op runs
+  `git reset --hard <snapshot>` plus `git clean -fd`, so its old name misdescribed it, and two public
+  ops cannot share a name — `execution.rs` registers the builtin and eval packs into one registry
+  where a duplicate name is a hard startup error. Renaming it frees `git_revert` for the true revert
+  semantics above. **Clean cutover: no alias, no deprecation shim.** Every in-repo call site moved
+  (`examples/improve-{multi,synthetic,tbench}.flux`, the website op and improvement pages,
+  `docs/self-improvement/DESIGN.md`, the language syntax doc and the markdown corpus), but an authored
+  flow outside this repo calling `git_revert($snapshot)` must become `git_reset($snapshot)`. If missed
+  it fails safely rather than destructively: the new `git_revert` requires a clean tree and rejects a
+  snapshot string rather than resetting anything.
 
 ### Fixed
 

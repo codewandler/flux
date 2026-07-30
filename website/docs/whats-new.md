@@ -14,6 +14,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- Flows can now create a branch, merge it, and undo a merge. Together with the existing stage, commit
+  and diff steps, a flow can integrate work end to end: branch, merge with a real merge commit, and —
+  if something turns out to be wrong — undo that merge. Undoing always *adds* a commit that reverses
+  the change; it never rewrites or discards history, so the record of what happened stays intact.
+
 - Work boards can now be read as structured data, not just as text. A flow can loop over board items
   and branch on their state, filter to the items that are ready *and* not blocked by unfinished
   dependencies in a single call, and read back the notes it left on an item. This is what lets a flow
@@ -27,6 +32,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   and typically failed on it.
 
 ### Action needed
+
+- **If a flow of yours calls `git_revert`, rename that call to `git_reset`.** The step that discarded
+  your changes and returned the checkout to a snapshot was named `git_revert`, which described the
+  wrong thing — it resets. It is now called `git_reset`, and the name `git_revert` belongs to a new
+  step that undoes a commit by adding a reversing commit instead. There is no alias, so the old name
+  will not be recognised. If you miss one it fails safely rather than destructively: the new
+  `git_revert` refuses a snapshot argument instead of resetting anything.
 
 - If you have a flow that worked around the quoting above — for example by stripping quote characters
   from an extracted value before using it — remove that workaround, or it will now strip real
