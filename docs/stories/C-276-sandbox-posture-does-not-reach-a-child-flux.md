@@ -58,7 +58,12 @@ marker not travel alone.
   side `off` is not "no opinion": it is `flux-cli`'s explicit kill switch, which beats a child's own
   `[sandbox] require` *and* C-262's unattended fail-closed profile. Forwarding it would have turned
   this fix into a new bypass channel. Withholding it leaves today's behaviour intact (a child
-  resolves its own posture), so the change can only tighten a child, never loosen one.
+  resolves its own posture), so for `FLUX_SANDBOX` — and, per the bullet below, `FLUX_SANDBOX_NET` —
+  `posture_env` can only tighten a child, never loosen one. **Scope that claim precisely**, in both
+  directions: `FLUX_SANDBOX_WRITABLE` is a *union* rather than a narrowing (`dispatch.rs:256-270`
+  unions the forwarded list with the child's own `[sandbox] writable` and de-dupes), bounded by the
+  parent's envelope but not strictly tightening; and the guarantee belongs to `posture_env`, not to
+  the whole spawn path, since a caller's explicit `env` overrides land after it and win.
 - **An open network forwards nothing either** — the same rule, applied to `FLUX_SANDBOX_NET`, which
   review raised as a MINOR. A truthy value beats both `[sandbox] network` and C-262's
   unattended-closed default (`dispatch.rs:220-227`), so forwarding "open" would be a ceiling. The
@@ -84,14 +89,19 @@ marker not travel alone.
   now sets the ambient env to `require`, not `off`, so it can pass for only one reason — review
   noted the old version was satisfied by two causes at once. Four `posture_env` unit tests cover the
   rendering, the backend variants, the `Off` carve-out and the open-network carve-out.
-- **Owed elsewhere (not in this diff's write set).** Two hand-forwarders are now redundant for every
-  non-`off` posture, and both carry doc comments this change falsifies:
-  - `crates/flux-eval/src/runner.rs` — `SANDBOX_CHILD_ENV_KEYS` + `sandbox_child_env`.
-  - `crates/flux-orchestrate/src/worker.rs:109-124,311` — `SANDBOX_POSTURE_ENV` + `worker_env`, whose
-    doc still asserts "None of `FLUX_SANDBOX*` is in `build_command`'s `SAFE_ENV`" (`worker.rs:1579`).
-  Neither conflicts: both push the same values as explicit overrides, which are applied last and
-  win. Both do still forward `FLUX_SANDBOX=off`, which `SAFE_ENV` deliberately will not — so
-  removing them is a *behaviour* decision about the kill switch, not a pure cleanup. File it.
+- **Owed elsewhere — deliberately NOT fixed here; pre-existing on `main` and behaviour-identical
+  before and after this diff.** Two hand-forwarders read the *ambient env* and push `FLUX_SANDBOX`
+  (including `off`) into the **caller-override** slot, which `apply_safe_env` applies after
+  `posture_env` — so they can override the floor this story establishes. That is why the guarantee
+  above is scoped to `posture_env` rather than to the spawn path:
+  - `crates/flux-eval/src/runner.rs:244-246,366` — `SANDBOX_CHILD_ENV_KEYS` + `sandbox_child_env`.
+  - `crates/flux-orchestrate/src/worker.rs:309-315` — `SANDBOX_POSTURE_ENV` + `worker_env`; its doc
+    at `worker.rs:1579` also still asserts "None of `FLUX_SANDBOX*` is in `build_command`'s
+    `SAFE_ENV`", which this change falsifies.
+  Neither *conflicts* today: both push the same values, and they win only by landing last. The
+  decision owed is whether a call site should be able to hand a child the kill switch at all — a
+  behaviour question about the override slot, not a cleanup. The coordinator is filing it as its
+  own story.
 
 ## Notes
 

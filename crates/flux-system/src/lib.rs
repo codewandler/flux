@@ -2147,11 +2147,13 @@ impl System {
     /// shapes. [`sandbox::sandbox_marker`] stamps `FLUX_SANDBOXED=1` only when the spawn was
     /// *genuinely* wrapped — a claim of confinement must never outrun the thing it claims — and it
     /// is applied last, after the caller's overrides, so no call site can forge or clear it.
-    /// [`sandbox::posture_env`] extends the allow-list with the posture that decides whether
-    /// confinement happens at all, so a child `flux` enforces what this process enforces (C-276);
-    /// it is applied with the allow-list, *before* the caller's overrides, because a posture is an
-    /// inherited default a trusted call site may legitimately override (the local-eval child host
-    /// does).
+    /// [`sandbox::posture_env`] adds the posture that decides whether confinement happens at all,
+    /// so a child `flux` inherits the confinement this process resolved rather than reading `off`
+    /// out of an environment with no posture in it (C-276). It is applied *before* the caller's
+    /// overrides, because a posture is an inherited default a trusted call site may legitimately
+    /// override (the local-eval child host does) — which is also why the floor guarantee documented
+    /// on `posture_env` is a property of that function and not of this whole path: whatever a call
+    /// site puts in `env` lands after it and wins.
     fn build_command(
         &self,
         argv: &[String],

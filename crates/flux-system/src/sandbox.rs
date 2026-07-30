@@ -951,17 +951,24 @@ fn mode_env_value(mode: SandboxMode) -> &'static str {
 ///   which writes the variable when narrowing and otherwise leaves it alone.
 ///
 /// Withholding in both cases leaves the child free to resolve its own (possibly stricter) posture,
-/// which is exactly the pre-C-276 behaviour — so this can only ever tighten a child, never loosen
-/// one.
+/// which is exactly the pre-C-276 behaviour. So for those two keys — and **only** those two — what
+/// this function returns can never loosen a child; read the `FLUX_SANDBOX_WRITABLE` bullet below
+/// for the one that is a union rather than a narrowing. The guarantee is a property of *this
+/// function*, not of the whole spawn path: `apply_safe_env` applies a caller's explicit `env`
+/// overrides after this, and a call site is free to push anything it likes into that slot.
 ///
 /// Why each key is safe to add to the allow-list, against the deny-by-default rule that flux never
 /// forwards a host credential to a child:
 /// - `FLUX_SANDBOX` / `FLUX_SANDBOX_NET`: an `off|on|require` enum and a flag. Controls, not
 ///   values, and per the floor rule they can only tighten.
 /// - `FLUX_SANDBOX_WRITABLE`: the extra writable set **this process resolved**, which is also the
-///   set it just bound into the child's own wrapper via [`SpawnPolicy::for_workspace`]. Handing it
-///   on keeps a grandchild's confinement inside the envelope the child is already running under,
-///   rather than widening anything. Same category as the already-forwarded `PATH`/`HOME`/
+///   set it just bound into the child's own wrapper via [`SpawnPolicy::for_workspace`]. This one is
+///   *not* a strict narrowing, and saying so matters: `flux-cli`'s reader **unions** the forwarded
+///   list with the child's own `[sandbox] writable` and de-dupes it, so a child that would have
+///   confined its descendants to its own roots now also grants the parent's. That is bounded, not
+///   an escape — every path in it is already writable in the envelope the child itself is running
+///   under, in both the wrapped and the `Exempt` case, so a grandchild cannot reach outside what
+///   the parent already permitted. Same category as the already-forwarded `PATH`/`HOME`/
 ///   `KUBECONFIG` — a filename is not a credential.
 /// - `FLUX_BWRAP_BIN` / `FLUX_SANDBOX_EXEC_BIN`: the **absolute path discovery resolved and the
 ///   preflight probe verified** — the wrapper this process actually runs, not whatever the
