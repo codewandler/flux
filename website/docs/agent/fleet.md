@@ -30,8 +30,8 @@ datasource board
 ```
 
 The declaration's **name becomes the operation prefix**, so the example above generates
-`board.list`, `board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment` and
-`board.record_dispatch`.
+`board.list`, `board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
+`board.record_dispatch`, `board.query` and `board.comments`.
 
 `board:` is its own namespace on purpose. `markdown` already means *a directory of documents to index
 as knowledge*, so a board that happens to be stored as markdown files needs a name that cannot be
@@ -75,6 +75,50 @@ coordinators to work one board.
 
 The `failed` → `ready` retry edge increments the item's attempt count. No other edge touches it, so
 "how many times has this been tried" stays trustworthy.
+
+An item can also declare what it waits on. `board.create` takes `depends_on` — the ids of items that
+must reach `done` first — and `board.get` shows them. Dependencies do not block a `transition` on
+their own; they are a fact about the item that the reads below let you filter on, so the policy stays
+in your flow rather than being hidden in the state machine.
+
+## Reading the board as data
+
+`board.list` renders a page of items as prose for a person to read. **`board.query` is its
+machine-readable sibling**: the same page as typed JSON rows, so a flow can loop over items and
+branch on their fields instead of parsing text.
+
+```flux
+$ready = board.query({ filters: { state: "ready", depends_on: "satisfied" } })
+
+each $item in $ready
+  $run = fleet.dispatch({ worker: $worker, task: $item.title, item: $item.id })
+```
+
+Filters go inside a `filters` object, and paging (`page`, `limit`) stays at the top level — the same
+shape `board.list` takes. An `each` source has to be a pure value, so bind the query to a variable
+first rather than calling it in the `in` position.
+
+Each row carries `id`, `title`, `state`, `assignee`, `runner`, `task_id`, `depends_on`, `repo` and
+`attempts`.
+**Every row carries every field** — an optional that is not set comes back as `null` rather than
+being absent — so a sweep over a half-dispatched board can read `$item.runner` on every item without
+erroring on the ones nobody has picked up. The `state` values are the same spellings
+`board.transition` accepts, so `match $item.state` and a later transition cannot disagree about what
+a state is called.
+
+`board.query` takes the same paging and filters as `board.list`, plus one more that only it accepts:
+
+| `depends_on` value | Keeps |
+|---|---|
+| `"satisfied"` | items whose every dependency is `done` — including items with no dependencies |
+| `"unsatisfied"` | items still waiting on at least one dependency |
+
+That is what makes **"ready and unblocked" a single call** rather than a list followed by a lookup
+per dependency. An item with no dependencies is unblocked; an id that names no item on the board
+never resolves, so it never counts as satisfied.
+
+`board.comments` is the read half of `board.comment` — one item's notes as a JSON array, oldest
+first. A flow that leaves a note on an item can therefore read back what previous attempts recorded.
 
 ## Handing work to a worker
 
@@ -135,9 +179,19 @@ new process holding nothing but the board can find every run that was in flight,
 that owns it. There is no second store and no state file to reconcile: restart, re-read the board,
 carry on.
 
-Concretely: `board.list` with a `state` filter finds the in-flight items, `board.get` returns an
-item's `runner` and `task_id`, and `fleet.status` against those values resumes supervision of a run
-the current process never started.
+Concretely: a `state` filter finds the in-flight items, each one carries its `runner` and `task_id`,
+and `fleet.status` against those values resumes supervision of a run the current process never
+started. A recovering *program* wants `board.query` for this — the rows already carry `runner` and
+`task_id`, so the sweep needs no follow-up call per item:
+
+```flux
+$in_flight = board.query({ filters: { state: "in_progress" } })
+
+each $item in $in_flight
+  $state = fleet.status({ worker: $item.runner, task_id: $item.task_id })
+```
+
+`board.list` plus `board.get` is the equivalent for a person reading the board by hand.
 
 Recording a dispatch **replaces** rather than appends, so a retried item never keeps a stale handle
 that would send you after a run that no longer exists. It also writes only those two fields — it is
