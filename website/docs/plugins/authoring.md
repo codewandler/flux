@@ -46,8 +46,10 @@ capability model.
 ## The manifest
 
 The manifest *is* the security surface. It is built once with `PluginBuilder` and handed to the host
-on the first protocol frame. Here is the whole of the `websearch` plugin's declaration — a small,
-complete, real one:
+on the first protocol frame. Here is the shape of the `websearch` plugin's declaration, trimmed to one
+operation so the security blocks stay legible — the real plugin declares a second op
+(`websearch.provider.list`) and projects `websearch.search` under the public name `web.search` with
+`exposed_as`:
 
 ```rust
 use host_kit::*;
@@ -173,7 +175,7 @@ what you must declare to get it.
 | `secret` | `secrets` (env-key allow-list) | Resolve a secret **by purpose**, never by a key chosen at runtime. |
 | `config` | `config` (declared names) | Resolve a declared **non-secret** value; a secret-classified key is refused. |
 | `http.do` | `http` + `http_hosts` (+ SSRF guard) | Method, headers and body, with auth injected host-side per the declared scheme. |
-| `process.run` / `spawn` / `read` / `kill` | `process` (argv-**prefix** allow-list) | Run or hold a subprocess with captured, capped output. |
+| `process.run` / `spawn` / `read` / `status` / `kill` | `process` (argv-**prefix** allow-list) | Run or hold a subprocess with captured, capped output; `status` polls a held one for liveness. |
 | `conn.dial` / `read` / `write` / `close` | `conn` (`tcp:host:port`, `unix:/path`; `*` matches one segment and Unix `.`/`..` paths are denied) | A raw byte stream for non-HTTP wire protocols. |
 | `conn.authenticate` | `conn` + a declared auth purpose or endpoint credential ref | The **host** speaks the in-band handshake and hands back a post-auth connection. |
 | `credential` | `credential: true` | Materialize a credential *reference* into its value — the audited exception. |

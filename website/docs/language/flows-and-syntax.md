@@ -86,18 +86,21 @@ $x = read("a.txt")   # an inline comment
 
 ## Symbols
 
-All runtime values live in named symbols, referenced as `$name` (lowercase, underscores
-allowed). The `$` sigil is mandatory on every reference — it is the unambiguous signal that
-something is a runtime value, not a keyword or op name.
+All runtime values live in named symbols (lowercase, underscores allowed). A symbol is written bare:
 
 ```flux
-$result = read("some/file.txt")   # bind: $result now holds the file contents
-return $result                    # reference
+flow read-notes
+  result = read("some/file.txt")   # bind: result now holds the file contents
+  return result                    # reference
 ```
 
+The `$` sigil is an accepted **escape**, not a requirement. Write `$name` when the name collides with
+a contextual keyword, or when you prefer the older spelling — most examples on this site still use it
+and parse identically. The formatter emits the bare form for every name that can be spelled bare, so
+that is the canonical surface.
+
 Symbols are immutable once bound on a single execution path; rebinding stores a new value.
-Parameters are declared without `$` in the header but referenced with `$` in the body — the
-same convention as declaring `fn f(x)` and writing `x + 1` in mainstream languages.
+Parameters are declared without a sigil in the header and referenced the same way in the body.
 
 ## Literals
 
@@ -112,9 +115,11 @@ same convention as declaring `fn f(x)` and writing `x + 1` in mainstream languag
 
 A `"…"` string is single-line — embed newlines with `\n` escapes, or use the
 [`"""…"""` form](#multi-line-strings) below, which is the better choice for anything long. Object
-and array literals are valid inside call arguments **on one line** — the parser is line-based, so a
-statement is a single line. Inside a call argument list, `{` always starts an object, never a block;
-blocks are only introduced by flow-control keywords on their own line.
+and array literals are valid inside call arguments. Layout **inside** a delimiter — an argument list,
+object, or array — is whitespace, so those may span lines and may carry a trailing comma; it is the
+statement grammar *outside* delimiters that is line-based. Inside a call argument list, `{` always
+starts an object, never a block; blocks are only introduced by flow-control keywords on their own
+line.
 
 An object or array whose leaves include symbols or expressions is a **value template** rather
 than a literal — see [Pure data](./pure-data.md).
@@ -150,9 +155,10 @@ Diff:
   return $notes
 ```
 
-This is the one construct allowed to span physical lines — the terminator is found by scanning for
-the next `"""`, not by tracking indentation, so it sidesteps the line-based statement grammar used
-everywhere else. It works in **every** position a `"…"` string does: a bind value, a call argument,
+Its terminator is found by scanning for the next `"""` rather than by tracking indentation, so a
+`"""` block spans physical lines without any enclosing delimiter — unlike an argument list or object,
+which spans lines only because it is already inside one. It works in **every** position a `"…"` string
+does: a bind value, a call argument,
 a `lit` nested in an object or array, a value-template leaf, and the natively spelled string fields
 (`fmt`'s template, `assert`'s message, `ctx`'s purpose, `route`'s case label).
 
@@ -162,12 +168,14 @@ of the value, not of the spelling used to write it.
 Prefer this form for anything long: prompts, embedded JSON, diffs, file contents. Removing escaping
 as a failure mode is the point of the feature.
 
-:::note Two things a `"""` block cannot contain
+:::note Three things a `"""` block cannot contain
 Because the terminator is "the next literal `\"\"\"`", the content cannot itself contain `"""`, and
 cannot **end** with a `"` (that quote would merge with the closing delimiter into an ambiguous run).
-Both are rare in real payloads. `fluxlang format` detects them and falls back to the escaped
-single-line spelling automatically, so round-tripping is never unsafe — a small set of inputs simply
-don't get the nicer spelling.
+It also cannot contain a carriage return: `\r\n` is normalized to `\n` inside triple-quoted content,
+so a `\r` would be silently lost on the way back through the parser. All three are rare in real
+payloads. The formatter detects them and falls back to the escaped single-line spelling
+automatically, so round-tripping is never unsafe — a small set of inputs simply don't get the nicer
+spelling.
 :::
 
 ## Calls
@@ -184,17 +192,22 @@ the symbol table but still appears in the run trace.
 
 ### Named arguments
 
-Multi-parameter operations take **a single object argument** whose keys name the parameters.
-An operation with exactly one required parameter accepts a bare value as sugar:
+A multi-parameter operation takes **named arguments** — one object of parameter names, written either
+brace-free or braced. Both spellings lower to the same single object argument; the brace-free one is
+what the formatter emits, so it is canonical:
 
 ```flux
-$hits = grep({pattern: "ERROR", glob: "*.log", max_results: 50})
-$page = read({path: "large.txt", limit: 100, offset: 200})
-$src  = read("README.md")            # sole-required-param sugar
+flow named-arguments
+  hits = grep(pattern: "ERROR", glob: "*.log", max_results: 50)
+  page = read({path: "large.txt", limit: 100, offset: 200})
+  src = read("README.md")
+  return src
 ```
 
-Passing two or more bare positional arguments is rejected by the analyzer. There is exactly
-one convention for multi-parameter calls, and it is the object form.
+Where a name and the symbol holding its value are identical, write the name once — `grep(pattern,
+glob)` is a **pun** for `grep(pattern: pattern, glob: glob)`. An operation with exactly one required
+parameter accepts a bare value as sugar (`read("README.md")` above). Passing two or more bare
+positional arguments is rejected by the analyzer: there is no positional convention.
 
 ## Binds
 

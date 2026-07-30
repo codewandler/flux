@@ -107,7 +107,8 @@ A literal JSON value. String literals support `{symbol}` interpolation at evalua
 
 ### `var`
 
-A reference to a bound symbol, resolved to its stored value. Text form: `$name`.
+A reference to a bound symbol, resolved to its stored value. Text form: `name` — bare. `$name` is the
+retained escape spelling, required only when the name collides with a contextual keyword.
 
 ```json
 {"kind": "var", "name": "draft"}
@@ -141,8 +142,9 @@ A reference to an external object, resolved before execution begins. Text form:
 ### `call`
 
 Invoke a registered operation. Arguments are named: a multi-param op takes a single object
-argument; a sole-required-param op accepts one bare value. Text form: `op(args)` or
-`do op args`.
+argument; a sole-required-param op accepts one bare value. Text form: `op(name: value, …)` — the
+canonical brace-free spelling for named inputs — or the equivalent `op({name: value})`, or `do op
+args`.
 
 ```json
 {"kind": "call", "op": "write", "args": [
@@ -434,7 +436,7 @@ Retry a body on transient failure. Text form:
 |---|---|---|---|
 | `max` | u32 | yes | maximum attempts including the first |
 | `backoff` | string | no | `"none"` (default) / `"linear"` / `"exponential"` |
-| `delay_ms` | u64 | no | base delay in ms |
+| `delay_ms` | u64 | no | base delay in ms; **defaults to 500** when omitted, so a bare `retry 3` waits half a second between attempts |
 | `body` | Node[] | no | body to retry |
 | `bind` | string | no | symbol for the successful result |
 

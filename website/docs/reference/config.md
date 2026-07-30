@@ -186,7 +186,9 @@ are refused by default.
 - `[private_net.endpoints]` is keyed by `"<plugin>:<endpoint-name>"` and merges with the owning
   plugin's grant.
 
-The former `[private_net] web_fetch = …` key is no longer read; migrate it to `web`.
+The former `[private_net] web_fetch = …` key is gone, and `[private_net]` rejects unknown keys — an
+old config still carrying it fails to load with `unknown field \`web_fetch\`` rather than starting
+with the grant quietly dropped. Migrate it to `web`.
 
 For a one-off invocation, global `--allow-private-net` temporarily opens native web to every private
 range and supplies the operator side of plugin grants:
