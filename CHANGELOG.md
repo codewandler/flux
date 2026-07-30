@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Delegated work is now visible while it runs, instead of only when it finishes (C-246).**
+  `SpawnActivitySink` shipped in A-79 and **nothing ever installed it**, so a running fleet produced no
+  observable activity at all. The CLI sink now carries a `⚇ fleet · …` status line built from a new
+  projection (`flux-tui`'s `fleet` module), showing per-worker role, last-activity age, and whether a
+  worker is working or hung — which is the operational point, since "still going" and "wedged" were
+  previously indistinguishable.
+  **Scoped to local children, deliberately.** The surfaced workers are `task` spawns via `LocalSpawner`;
+  a worker's tool activity is not observable over A2A, so remote `fleet.dispatch` workers still emit
+  nothing and full-fleet visibility waits on C-243. The story was filed on exactly that basis — the
+  install seam and the redaction work were scoped to local children first.
+  Two properties are load-bearing rather than incidental. The install is on the **production** path — a
+  real arm in `CliSink::observation` with no `cfg(test)` and no feature gate, exercised by a smoke test
+  that drives the real binary; a test-only install would have satisfied the story and left the fleet just
+  as invisible. And redaction is **structural**: the projection never reads `ToolCall.input` or
+  `Observation.observation` at all, so there is no second redaction seam to re-earn, pinned by an
+  eight-shape secret corpus test with a non-vacuity assertion.
+  Known limitation, recorded rather than papered over: the age refresh is driven by worker emissions, so
+  if the *whole* wave hangs the line freezes at its last age. A single hung worker among working peers is
+  what item 3 covers, and that case does work.
+
 - **The work board can move an item off a dead worker and record what a run produced (C-240).** Two new
   ops on the generated board surface, taking it from nine to eleven and its writes from five to seven:
   `reassign` moves an item to a new assignee, where a `claim` by a non-holder conflicts and had left no

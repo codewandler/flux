@@ -17,6 +17,13 @@
 
 ### New
 
+- **You can see what delegated helpers are doing while they work.** When flux hands work to helper
+  agents, a status line now shows each one's role, how long since it last did anything, and whether it
+  is working or stuck. Previously a delegated run was silent until it finished, so a wedged helper
+  looked exactly like a busy one. Their inputs and outputs are never shown, only that activity
+  happened — so a helper handling secrets cannot leak them onto your screen. This currently covers
+  helpers running on your own machine; remote workers stay silent for now.
+
 - **Work boards can now hand an item to a different worker, and record what a run produced.** If the
   worker holding a task dies, you can reassign the task to someone else — previously nothing could move
   it, because only the current holder was allowed to claim it. And a finished piece of work can now
