@@ -889,11 +889,27 @@ pub enum Confinement {
     /// Wrapped when the sandbox is active: `run`/`run_with_env`, `run_with_env_streamed`,
     /// `spawn_background`, `spawn_interactive`.
     Sandboxed,
-    /// Never wrapped. Used only at explicit trusted-host seams: `spawn_debug_pipe` (Chrome's own
-    /// content sandbox needs a nested user namespace), the local-eval child flux host (it needs
-    /// provider network access and receives the posture for its own descendants), and the backend
-    /// preflight (which is testing the wrapper itself). Every exemption remains argv-only,
-    /// env-cleared, workspace-pinned, and guarded for cleanup.
+    /// Never wrapped. The **complete** inventory of seams that pass this, one bullet each:
+    ///
+    /// - `spawn_debug_pipe` — Chrome runs its own content sandbox, which needs a nested user
+    ///   namespace; forcing `--no-sandbox` on it to fit inside bwrap is a net security loss (D-130).
+    /// - `run_guarded_probe` — the backend preflight, which *is* the wrapper being tested.
+    /// - `run_with_env_exempt` — trusted host steps that must keep network access. Its one product
+    ///   caller is the plugin pack's `git`/`cargo` source builder in `flux-cli`.
+    /// - `run_with_env_streamed_exempt` — the streamed counterpart, **retained with no product
+    ///   caller at all**. It is public API of a published crate, so it is recorded here as unused
+    ///   rather than quietly deleted; a caller that appears must justify itself against this list.
+    ///
+    /// Those bullets are not prose. `the_exempt_doc_names_exactly_the_seams_that_exist` resolves the
+    /// functions that actually pass `Confinement::Exempt` and asserts this list matches them in both
+    /// directions, because a comment must not be the only thing asserting a call site exists — an
+    /// earlier revision of this doc claimed a local-eval child flux host was exempted "because it
+    /// needs provider network access", no such seam was ever built, and the claim was later cited as
+    /// precedent for a change nobody should have made (C-277). `flux-eval` in fact spawns its child
+    /// `Sandboxed` and pins that from its own side with
+    /// `model_reachable_eval_runner_has_no_sandbox_exemption`.
+    ///
+    /// Every exemption remains argv-only, env-cleared, workspace-pinned, and guarded for cleanup.
     Exempt,
 }
 
@@ -1474,6 +1490,101 @@ mod tests {
         let dir = fixture_dir("sandbox-test");
         let ws = Workspace::new(&dir).unwrap();
         (dir, ws)
+    }
+
+    // -- the exempt-seam inventory (C-277) -------------------------------------------------------
+
+    /// Every function in the *production* half of `source` that passes [`Confinement::Exempt`],
+    /// keyed by the enclosing `fn` name.
+    ///
+    /// Deliberately a source scan rather than a hand-kept list: the defect C-277 closes is a doc
+    /// that named a seam nobody had built, so the check has to derive the seams from the code that
+    /// actually spawns. The trailing `mod tests` is cut first — a test may name
+    /// `Confinement::Exempt` freely (this module does) without becoming a product spawn seam.
+    fn exempt_seams(source: &str) -> std::collections::BTreeSet<String> {
+        // Split so this scanner never matches its own source when pointed at `sandbox.rs`.
+        let needle = ["Confinement", "::Exempt"].concat();
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("a trailing `#[cfg(test)] mod tests` block")
+            .0;
+        let mut seams = std::collections::BTreeSet::new();
+        let mut enclosing = String::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if let Some(name) = declared_fn_name(trimmed) {
+                enclosing = name;
+            }
+            // Doc and line comments describe seams; they are not seams.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if line.contains(&needle) {
+                seams.insert(enclosing.clone());
+            }
+        }
+        seams
+    }
+
+    /// The name declared by a `fn` item line, ignoring any `pub`/`pub(crate)`/`async` prefix.
+    fn declared_fn_name(trimmed: &str) -> Option<String> {
+        let rest = trimmed
+            .strip_prefix("pub(crate) ")
+            .or_else(|| trimmed.strip_prefix("pub(super) "))
+            .or_else(|| trimmed.strip_prefix("pub "))
+            .unwrap_or(trimmed);
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("fn ")?;
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The seams the [`Confinement::Exempt`] doc comment claims, read from its bullet **leads** —
+    /// each seam is one `- \`name\` — why` item.
+    ///
+    /// Only the lead is read, so the surrounding prose stays free to backtick whatever it needs to
+    /// explain itself without silently registering a seam.
+    fn seams_named_by_the_exempt_doc(source: &str) -> std::collections::BTreeSet<String> {
+        let variant = source
+            .split_once("\n    Exempt,\n")
+            .expect("the `Exempt` variant declaration")
+            .0;
+        variant
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix("/// - `")?;
+                let (name, _) = rest.split_once('`')?;
+                Some(name.to_string())
+            })
+            .collect()
+    }
+
+    /// C-277, part 1: a comment must not be the only thing asserting a call site exists.
+    ///
+    /// The `Exempt` doc previously named "the local-eval child flux host" as a seam. There was no
+    /// such seam — `flux-eval` spawns its child `Sandboxed` and pins that with
+    /// `model_reachable_eval_runner_has_no_sandbox_exemption` — and the stale claim was later cited
+    /// as precedent for a change nobody should have made. So the doc's inventory is now checked
+    /// against the spawn sites themselves, in both directions: it may not omit a real seam, and it
+    /// may not invent one.
+    #[test]
+    fn the_exempt_doc_names_exactly_the_seams_that_exist() {
+        let mut actual = exempt_seams(include_str!("lib.rs"));
+        actual.extend(exempt_seams(include_str!("sandbox.rs")));
+        let documented = seams_named_by_the_exempt_doc(include_str!("sandbox.rs"));
+        assert_eq!(
+            documented,
+            actual,
+            "the `Confinement::Exempt` doc comment and the functions that actually pass it have \
+             drifted.\n  documented but nonexistent: {:?}\n  exists but undocumented: {:?}",
+            documented.difference(&actual).collect::<Vec<_>>(),
+            actual.difference(&documented).collect::<Vec<_>>(),
+        );
     }
 
     /// **The one way these tests may build a policy** (C-209, second leg).

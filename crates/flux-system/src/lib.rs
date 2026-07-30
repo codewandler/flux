@@ -1907,10 +1907,13 @@ impl System {
     }
 
     /// Launch a trusted host process outside this `System`'s child sandbox while retaining every
-    /// other guarded-process invariant. This narrowly supports hosts such as the local-eval child
-    /// `flux`: the host must keep network access for provider requests, while the sandbox posture is
-    /// passed into it so its own shell/plugin descendants are confined at their spawn choke point.
-    /// Model-selected executables must use [`Self::run_with_env`], never this exemption.
+    /// other guarded-process invariant — argv-only, env-cleared, workspace-pinned, output-capped.
+    ///
+    /// Its one product caller is the plugin pack's source builder in `flux-cli`
+    /// (`SystemSourceBuilder`), whose `git clone`/`fetch` and `cargo` build steps must reach the
+    /// network and the registry. Model-selected executables must use [`Self::run_with_env`], never
+    /// this exemption. See [`sandbox::Confinement::Exempt`] for the checked inventory of every seam
+    /// that skips wrapping, and why that inventory is checked rather than merely written down.
     pub async fn run_with_env_exempt(
         &self,
         argv: &[String],
@@ -2260,7 +2263,13 @@ impl System {
     }
 
     /// Streamed counterpart to [`Self::run_with_env_exempt`], for a trusted host whose terminal
-    /// output is intentionally inherited (local eval `--watch`).
+    /// output is intentionally inherited.
+    ///
+    /// **No product caller** — it is retained as public API of a published crate rather than
+    /// deleted, and recorded as unused in [`sandbox::Confinement::Exempt`]'s inventory so the fact
+    /// is stated where a reader looks for it (C-277). An earlier revision cited local eval
+    /// `--watch`; `flux-eval` streams through the *sandboxed* [`Self::run_with_env_streamed`] and
+    /// asserts it does.
     pub async fn run_with_env_streamed_exempt(
         &self,
         argv: &[String],
@@ -3430,8 +3439,8 @@ mod tests {
 
     /// The same inherited confinement over the **exempt** seam. `Confinement::Exempt` says "this
     /// spawn is not wrapped by *us*"; it says nothing about whether an outer boundary already holds,
-    /// and the trusted-host children behind it (the local-eval child `flux`, `spawn_debug_pipe`) sit
-    /// inside that boundary exactly as a wrapped spawn would.
+    /// and the trusted-host children behind it (the plugin pack's `git`/`cargo` steps,
+    /// `spawn_debug_pipe`) sit inside that boundary exactly as a wrapped spawn would.
     ///
     /// Without such a boundary the exempt seam forges nothing either — that child is precisely the
     /// one that must confine its OWN descendants.

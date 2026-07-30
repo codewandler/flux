@@ -7,6 +7,11 @@
 # and a real OS process without booting a full `flux`, resolving a provider, or binding a port a CI
 # box may not let us bind twice.
 #
+# The announcement below is a copy of `flux_core::readiness::serving_announcement` — a shell script
+# cannot import it. `the_stand_in_worker_announces_exactly_what_the_real_server_announces` checks the
+# copy against the original on every run, because a fixture that agrees only with the matcher and not
+# with the server would keep this whole suite green while every real worker timed out (C-277).
+#
 # Why this is a committed fixture rather than a file the test writes: writing an executable and then
 # exec'ing it races with `fork` on other test threads. A forked child inherits the still-open write
 # fd, and `execve` answers ETXTBSY ("Text file busy") for as long as any writer exists — so the suite

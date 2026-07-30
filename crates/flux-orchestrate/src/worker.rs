@@ -26,10 +26,12 @@
 //!   port; the child's own `bind` is the availability test, and an "address already in use" exit
 //!   moves on to the next candidate. That is both simpler and more honest than a probe-then-hope
 //!   race.
-//! * **Readiness is the worker's own word.** `flux-server` prints `flux server listening on
-//!   http://<addr>` to stderr once bound, and [`System::spawn_background`] pipes stderr into a capped
-//!   drained buffer. So `start` waits for that line — no readiness probe, hence no egress, hence
-//!   these ops declare no network access at all.
+//! * **Readiness is the worker's own word.** `flux-server` prints its serving announcement to stderr
+//!   once bound, and [`System::spawn_background`] pipes stderr into a capped drained buffer. So
+//!   `start` waits for that line — no readiness probe, hence no egress, hence these ops declare no
+//!   network access at all. The wording is not repeated here: `flux-server` is L6 and this crate is
+//!   L3, so the pair would be unpinnable from either side. Both go through
+//!   [`flux_core::readiness`], which is L0 and therefore legal for both (C-277).
 //!
 //! ## [`ExternalRuntime`] — a worker somebody else runs
 //!
@@ -71,10 +73,6 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Cadence of the readiness poll. Fast enough that a test does not pay for the budget above.
 const READY_POLL: Duration = Duration::from_millis(25);
-
-/// The line `flux_server::serve` prints to stderr once it has bound — the worker's own statement
-/// that it is serving, and the only readiness signal available without making a request.
-const LISTENING_MARKER: &str = "listening on http://";
 
 /// How much of a worker's own output is kept as the `detail` a status poll reports. Enough for a
 /// startup failure to explain itself, bounded so a chatty worker cannot grow this map without limit
@@ -387,7 +385,7 @@ impl ProcessRuntime {
             let (out, err) = child.read_output();
             push_capped(&mut log, &out);
             push_capped(&mut log, &err);
-            if log.contains(LISTENING_MARKER) {
+            if flux_core::readiness::announces_serving(&log) {
                 return Readiness::Serving(log);
             }
             let status = child.status();
@@ -611,7 +609,7 @@ impl AgentRuntime for ProcessRuntime {
         let (out, err) = worker.child.read_output();
         push_capped(&mut worker.log, &out);
         push_capped(&mut worker.log, &err);
-        if worker.log.contains(LISTENING_MARKER) {
+        if flux_core::readiness::announces_serving(&worker.log) {
             worker.announced = true;
         }
         let live = worker.child.status();
@@ -1102,6 +1100,47 @@ mod tests {
     /// It speaks the real worker argv and announces itself exactly as `flux_server::serve` does, so
     /// the lifecycle is proven against a **real guarded spawn** and a real OS process without booting
     /// a full `flux`.
+    /// C-277: readiness is matched through the shared contract, not a literal copied from a crate
+    /// this one may not depend on.
+    ///
+    /// `flux-server` is L6 and this crate is L3, so the pair was unpinnable from either side: a
+    /// rewording of the server's line does not fail loudly here, it degrades `fleet.start` to its
+    /// full 60-second readiness timeout and then reports a worker that never announced itself —
+    /// which reads as a slow or hung worker rather than the broken contract it is.
+    #[test]
+    fn readiness_is_matched_through_the_shared_contract() {
+        let source = include_str!("worker.rs");
+        // Split so this assertion's own text is not the match it is looking for.
+        let literal = ["listening on ", "http://"].concat();
+        assert!(
+            !source.contains(&literal),
+            "this crate spells `flux-server`'s readiness wording itself, and the layering rule \
+             means no test can check the two agree — match it with \
+             `flux_core::readiness::announces_serving` instead."
+        );
+    }
+
+    /// C-277: the stand-in worker is the third copy of the wording, and the dangerous one.
+    ///
+    /// Every `ProcessRuntime` lifecycle test below proves itself against this fixture rather than a
+    /// real `flux`. If the server's announcement were reworded and the fixture were not, the fixture
+    /// would still agree with the matcher and the whole suite would stay green while `fleet.start`
+    /// timed out against every real worker — a guard tested against its own assumptions. Pinning the
+    /// fixture to the shared contract is what turns a rewording into a failing test: change
+    /// `flux_core::readiness::SERVING_MARKER` and this fails until the fixture is moved with it.
+    #[test]
+    fn the_stand_in_worker_announces_exactly_what_the_real_server_announces() {
+        let fixture = std::fs::read_to_string(stand_in_worker()).unwrap();
+        // The fixture interpolates the address it parsed out of its own argv.
+        let expected = flux_core::readiness::serving_announcement("$addr");
+        assert!(
+            fixture.contains(&expected),
+            "the stand-in worker no longer announces what `flux_server::serve` announces \
+             ({expected:?}); every lifecycle test below would keep passing against a contract no \
+             real worker honours"
+        );
+    }
+
     fn stand_in_worker() -> PathBuf {
         let path = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1375,7 +1414,7 @@ mod tests {
         assert_eq!(status.state, WorkerState::Dead);
         assert_eq!(status.exit_code, Some(17), "{status:?}");
         assert!(
-            status.detail.contains("listening on http://"),
+            flux_core::readiness::announces_serving(&status.detail),
             "the worker's own output must survive the drain: {status:?}"
         );
         // Repeated polls must keep agreeing — `try_wait` reports a code once, so a runtime that did
