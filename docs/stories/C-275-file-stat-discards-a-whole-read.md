@@ -2,7 +2,7 @@
 id: C-275
 title: "`file_stat` reads the whole target a second time and throws it away"
 pillar: Core
-status: in-progress
+status: done
 priority: 8
 epic: security-assurance
 design: docs/designs/security-assurance.md

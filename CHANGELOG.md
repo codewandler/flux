@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **`file_stat` no longer reads the whole file twice, and no longer claims a mode it never returns
+  (C-275).** The op awaited a second guarded read of the target and threw the bytes away, paying a full
+  read of an arbitrarily large file for no output — a surprising cost for something a caller reasonably
+  expects to be metadata-only. Confinement was never at risk; only the cost was.
+  The op now says nothing about mode, consistently. An honest mode needs a guarded accessor on `System`
+  that does not exist, and `std::fs::metadata` on a caller's raw path string would escape the jail —
+  which is precisely why the original author declined it. The `file_stat` tool description had been
+  advertising "octal mode" to the model, so that went too: a promise the op could not keep was the real
+  defect, worse than an absent field, because it tells the reader the case is handled.
+  This closes the last open finding of the 2026-07-29 envelope-integrity review — the only one of its
+  four never addressed, and it survived by never being filed rather than by anyone deciding to defer it.
+
 - **The git family's clean-tree precondition is policy now, not per-op taste (C-249).** Every guarded git
   op that runs a blanket restore declares its precondition through one shared helper, and the refusal
   separates tracked from untracked files — because "commit or stash them first" is unactionable advice
