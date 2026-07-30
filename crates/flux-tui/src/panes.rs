@@ -589,17 +589,86 @@ mod tests {
         buf.content.iter().map(|c| c.symbol()).collect()
     }
 
-    /// The glyph vocabulary this surface draws its **own** chrome from: the borders of every
-    /// bordered block (the approval sheet, a pane, the transcript's C-149 rail), the bars and the
-    /// `▍` reason cursor, the agent mark and the `▸`/`●` selection marks, and the sheet's own
-    /// `⚠`/`↑↓` affordances. Nothing a payload writes may land in this alphabet — that is what
-    /// makes the counterfeit unbuildable rather than merely discouraged.
+    /// **The adversarial corpus: glyphs someone builds harness chrome out of, and what each one
+    /// imitates.**
+    ///
+    /// This list is deliberately **not** derived from [`trust::is_reserved`], and it is deliberately
+    /// **not** a second copy of its ranges. It was grown by probing the shipped rule for
+    /// pass-throughs, because that is the only way a test can see a gap the implementation has: a
+    /// mirrored range list shares the implementation's blind spot *exactly*, so a counterfeit built
+    /// out of a block the rule forgot scores zero forged cells and the test reports success. That is
+    /// the "guard tested against its own assumptions" failure, and an earlier revision of this file
+    /// shipped it — the first four groups below all passed through a rule that reserved only box
+    /// drawing, block elements and geometric shapes.
+    ///
+    /// Add to this list whenever a new lookalike turns up. Never rewrite it as a range check.
+    const CHROME_LOOKALIKES: &[(&str, &str)] = &[
+        // Box-drawing variants — the reason the rule has to be range-shaped and not a list of the
+        // six glyphs the sheet happens to use.
+        ("┏", "heavy top-left"),
+        ("┓", "heavy top-right"),
+        ("┗", "heavy bottom-left"),
+        ("┛", "heavy bottom-right"),
+        ("━", "heavy horizontal"),
+        ("┃", "heavy vertical"),
+        ("╔", "double top-left"),
+        ("╗", "double top-right"),
+        ("═", "double horizontal"),
+        ("║", "double vertical"),
+        ("╭", "rounded top-left"),
+        ("╯", "rounded bottom-right"),
+        // Misc technical: Unicode's own names for these are box and scan lines, and the bracket
+        // pieces tile into a frame edge. One block BELOW the reserved box-drawing range.
+        ("\u{23b8}", "left vertical box line"),
+        ("\u{23b9}", "right vertical box line"),
+        ("\u{23ba}", "horizontal scan line 1"),
+        ("\u{23bb}", "horizontal scan line 3"),
+        ("\u{23bc}", "horizontal scan line 7"),
+        ("\u{23bd}", "horizontal scan line 9"),
+        ("\u{239c}", "left parenthesis extension"),
+        ("\u{239f}", "right parenthesis extension"),
+        // Braille tiles densely enough to stand in for the bars — and the spinner IS Braille.
+        ("\u{28ff}", "full 8-dot cell, as a block fill"),
+        ("\u{2847}", "left-column dots, as a vertical rule"),
+        ("\u{283f}", "bottom dots, as a horizontal rule"),
+        // Fullwidth and halfwidth rule forms.
+        ("\u{ffe8}", "halfwidth forms light vertical"),
+        ("\u{ff5c}", "fullwidth vertical line"),
+        ("\u{ffe3}", "fullwidth macron, as an overline rule"),
+        ("\u{fe31}", "presentation form vertical em dash"),
+        ("\u{fe33}", "presentation form vertical low line"),
+        // Legacy computing: sextants and half-blocks exist for terminal graphics.
+        ("\u{1fb70}", "vertical one-eighth block"),
+        ("\u{1fb00}", "sextant"),
+        // Long rules that are punctuation rather than drawing.
+        ("\u{2015}", "horizontal bar"),
+        ("\u{2e3a}", "two-em dash"),
+        // Fills, arrows and attention marks.
+        ("\u{2b1b}", "large black square"),
+        ("\u{2b06}", "upwards black arrow"),
+        ("\u{21d1}", "upwards double arrow"),
+        ("\u{26a1}", "high voltage, as a warning mark"),
+        ("\u{2757}", "heavy exclamation, as a warning mark"),
+        ("\u{1f53a}", "red triangle up, as a risk badge"),
+        ("\u{1f7e5}", "red square, as a risk badge"),
+        ("\u{1f536}", "orange diamond, as a risk badge"),
+        ("\u{2666}", "black diamond suit, imitating the agent mark"),
+    ];
+
+    /// What a *user* reads as harness chrome: the blocks whose glyphs draw frames, rules and fills,
+    /// plus every glyph in [`CHROME_LOOKALIKES`].
+    ///
+    /// The ranges here are the narrow, obvious ones; the corpus is what gives this predicate reach
+    /// beyond them, and it is the half that is independent of the implementation.
     fn is_chrome_glyph(ch: char) -> bool {
         matches!(ch,
             '\u{2500}'..='\u{257F}'      // box drawing
             | '\u{2580}'..='\u{259F}'    // block elements
             | '\u{25A0}'..='\u{25FF}'    // geometric shapes
             | '⚠' | '↑' | '↓')
+            || CHROME_LOOKALIKES
+                .iter()
+                .any(|(glyph, _)| glyph.chars().any(|c| c == ch))
     }
 
     /// Where the chrome alphabet appears on a frame, as `(x, y, glyph)` — a position-aware
@@ -623,13 +692,20 @@ mod tests {
     /// would keep passing. Two more primitives a payload would reach for ride along: an ANSI
     /// sequence, and the surface's own agent mark.
     ///
-    /// Three things are asserted, in every slot, with the real sheet pending:
+    /// A second counterfeit rides along, and it is the one that catches a *gap in the rule* rather
+    /// than a gap in its enforcement: the same frame rebuilt from [`CHROME_LOOKALIKES`], the corpus
+    /// grown by probing rather than copied from [`trust::is_reserved`]'s ranges. Against the rule as
+    /// first shipped — box drawing, block elements, geometric shapes — that payload rendered a
+    /// complete frame and scored **zero** forged cells.
+    ///
+    /// Four things are asserted, in every slot, with the real sheet pending:
     ///
     /// 1. **The payload paints no chrome.** Every cell on screen holding a chrome glyph is one the
     ///    *surface* chose — identical, cell for cell, to the same frame whose pane holds plain
     ///    letters of the same shape.
-    /// 2. **Nothing is interpreted.** No control byte reaches a cell.
-    /// 3. **The sheet is untouched.** Its rows are byte-identical, styles included, to the same
+    /// 2. **No lookalike survives.** Not one glyph of the corpus reaches a cell.
+    /// 3. **Nothing is interpreted.** No control byte reaches a cell.
+    /// 4. **The sheet is untouched.** Its rows are byte-identical, styles included, to the same
     ///    sheet drawn with no pane open at all — a pane draws first, the sheet `Clear`s and draws
     ///    over it, always.
     #[test]
@@ -648,6 +724,17 @@ mod tests {
             .collect();
         counterfeit.push("\u{1b}[7m approve bash? \u{1b}[0m".into());
         counterfeit.push(format!("{AGENT_MARK} agent"));
+        // The corpus, packed a few glyphs to a row so that every one of them clears the surface's
+        // row cap and is actually drawn — an elided lookalike would pass this test for free.
+        let lookalikes: Vec<String> = CHROME_LOOKALIKES
+            .chunks(6)
+            .map(|chunk| chunk.iter().map(|(glyph, _)| *glyph).collect())
+            .collect();
+        assert!(
+            lookalikes.len() <= MAX_PANE_ROWS as usize,
+            "the corpus must fit the surface's row cap to be provably drawn: {} rows",
+            lookalikes.len()
+        );
         let title = counterfeit[0].clone();
         // The benign twin: the same shape and the same char counts, drawn from an alphabet with no
         // chrome in it. Any chrome cell present in one frame and not the other came from a payload.
@@ -677,6 +764,29 @@ mod tests {
                     .any(|c| c.symbol().chars().any(char::is_control)),
                 "{slot:?}: a control byte reached a cell",
             );
+
+            // The gap-catching pass: the corpus, rendered as a pane, in this slot.
+            let probe = trust_frame(Some((slot, lookalikes.join(" "), lookalikes.clone())), true);
+            let probe_text = screen_text(&probe);
+            let leaked: Vec<&str> = CHROME_LOOKALIKES
+                .iter()
+                .filter(|(glyph, _)| probe_text.contains(glyph))
+                .map(|(_, what)| *what)
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "{slot:?}: {} lookalike(s) reached a cell — a payload can still draw chrome \
+                 this rule does not reserve: {:?}",
+                leaked.len(),
+                leaked
+            );
+            for y in &sheet {
+                assert_eq!(
+                    row_cells(&probe, *y),
+                    row_cells(&real, *y),
+                    "{slot:?}: the lookalike pane reached sheet row {y}\n{probe_text}"
+                );
+            }
             for y in &sheet {
                 assert_eq!(
                     row_cells(&bad, *y),
@@ -709,10 +819,28 @@ mod tests {
             .collect();
         let title = "W".repeat(300);
 
+        // Below the suppression threshold the sheet-row comparison is vacuous — no pane is drawn, so
+        // of course the sheet is unchanged. Assert the stronger thing that actually holds there: the
+        // WHOLE frame is identical, which is C-221's narrow-width posture still holding with a
+        // pending approval on screen.
+        for slot in ALL_SLOTS {
+            let narrow = PANE_MIN_TRANSCRIPT_WIDTH - 1;
+            assert_eq!(
+                trust_frame_at(
+                    narrow,
+                    24,
+                    Theme::default(),
+                    Some((slot, title.clone(), greedy.clone())),
+                    true
+                ),
+                trust_frame_at(narrow, 24, Theme::default(), None, true),
+                "{slot:?}: at {narrow} columns a pane must not change the frame at all"
+            );
+        }
+
         for (width, height) in [
-            (PANE_MIN_TRANSCRIPT_WIDTH - 1, 24), // panes suppressed entirely
-            (PANE_MIN_TRANSCRIPT_WIDTH, 24),     // exactly one side column fits
-            (80, PANE_MIN_HEIGHT),               // the shortest frame that carries a pane
+            (PANE_MIN_TRANSCRIPT_WIDTH, 24), // exactly one side column fits
+            (80, PANE_MIN_HEIGHT),           // the shortest frame that carries a pane
             (80, 24),
             (100, 40),
             (132, 30),

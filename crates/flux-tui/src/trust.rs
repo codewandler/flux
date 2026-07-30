@@ -22,22 +22,42 @@
 //!   private to this module, and its one constructor sanitizes. A payload string therefore cannot
 //!   reach a terminal cell without passing through [`sanitize`] — `panes.rs` is a sibling module
 //!   and cannot build one any other way.
-//! - **[`sanitize`] drops what is interpreted and neutralizes what is chrome.** Escape sequences,
-//!   control bytes and invisible/bidi format characters are removed outright (the C-113/C-114
-//!   approval-modal lesson, one surface over); the glyph alphabet this surface draws its own
-//!   chrome from ([`is_reserved`]) is replaced one-for-one by a space, so a counterfeit frame is
-//!   not merely discouraged but unbuildable.
+//! - **[`sanitize`] drops what is interpreted and neutralizes what draws.** Escape sequences are
+//!   consumed whole and control characters dropped, so a payload is text and only text (the
+//!   C-113/C-114 approval-modal lesson, one surface over); the glyph blocks that exist in order to
+//!   draw ([`is_reserved`]) are replaced one-for-one by a space.
 //! - **The mark and the border come from the [`Theme`], through [`agent_block`] /
 //!   [`agent_overlay_header`].** The mark is a glyph *plus a modifier*, never a tint, so it
 //!   survives `Theme::MONO` (`theme.rs:120`), where every colour role resolves to `Color::Reset` —
 //!   the same reasoning C-149 used for the transcript gutter rail and C-154 for the approval risk
 //!   tiers.
 //!
-//! What this module does **not** claim: it does not filter glyphs the *surface* generates from a
-//! payload's values — `plan::render_nodes`' `├─` connectors and the `█░` progress bar are drawn by
-//! the surface, from the theme, at widths the surface chose. The one derived case that is filtered
-//! is Markdown, because its renderer turns payload text into spans the payload chose the shape of;
-//! [`sanitize_lines`] runs over its output for that reason.
+//! # What is guaranteed, and what is only made harder
+//!
+//! Being precise here matters more than sounding strong, because C-163's host-UI prompts are told
+//! to inherit this invariant rather than write a parallel one — so an overclaim here propagates.
+//!
+//! **Guaranteed.** A payload cannot style anything (C-220's type, plus no escape sequence survives
+//! [`sanitize`]); it cannot produce a glyph from the drawing blocks, so it cannot render a
+//! *pixel-accurate* copy of this surface's own chrome; every cell it does paint lies inside a
+//! region whose border ring, mark and title style are drawn by the surface from the theme, after
+//! the payload and from data the payload cannot reach; and the approval sheet draws last over its
+//! own `Clear`ed rect, so a pane cannot change one cell of it. Each of those is asserted, in every
+//! slot, by `panes::tests`.
+//!
+//! **Not guaranteed: that nothing a payload writes can *resemble* a frame.** ASCII `|`, `-`, `+`
+//! and `_` approximate a box and cannot be taken away from text without gutting it. [`is_reserved`]
+//! therefore raises the cost and removes the accurate imitation; it is not the thing standing
+//! between the user and a phish. **That thing is the mark** — surface-drawn, one per pane,
+//! unforgeable because its glyph is itself reserved, and legible under `MONO` because it carries
+//! modifiers rather than colour. A user who has learnt ` ◆ agent ` is not misled by an ASCII-art
+//! box drawn underneath it.
+//!
+//! **Out of scope by design.** Glyphs the *surface* generates from a payload's values are not
+//! filtered: `plan::render_nodes`' `├─` connectors and the `█░` progress bar are drawn from the
+//! theme at widths the surface chose. The one derived case that *is* filtered is Markdown, because
+//! its renderer turns payload text into spans the payload chose the shape of; [`sanitize_lines`]
+//! runs over its output for that reason.
 //!
 //! [C-163]: ../../../docs/stories/C-163-plugin-commands-and-host-ui.md
 
@@ -155,35 +175,93 @@ impl AgentPane {
 /// U+001B. Matched before [`char::is_control`] so the *sequence* it introduces goes with it.
 const ESC: char = '\u{1b}';
 
-/// The glyph alphabet this surface draws its own chrome from. A payload glyph that lands in it is
-/// replaced by a space, which is what makes a counterfeit frame unbuildable rather than unlikely:
+/// Glyphs reserved to the surface: a payload character that lands here is replaced by a space.
 ///
-/// - **box drawing** — every bordered block on this surface (the approval sheet, a pane, a plan
-///   card) and the transcript's C-149 turn-boundary rail;
-/// - **block elements** — the `/usage` and progress bars, and the `▍` deny-reason cursor;
-/// - **geometric shapes** — the agent mark itself, the slash menu's `▸`, the session picker's `●`;
-/// - `⚠`, `↑`, `↓` — the approval sheet's destructive disclosure and its scroll affordance.
+/// **The rule has to be range-shaped, not an enumeration.** Reserving only the glyphs the sheet
+/// actually draws — `┌┐└┘─│` — is defeated in one keystroke by `┏┓┗┛━┃`, then by `╔╗╚╝═║`, then by
+/// `╭╮╰╯`. Any list of code points loses to variant selection, so the unit of reservation is the
+/// *block*, and the criterion is "the glyphs in it exist in order to draw" rather than "the surface
+/// happens to use them today". A block reserved this way also lets the surface's own chrome grow
+/// inside it without this list having to be remembered.
 ///
-/// Ranges rather than an enumeration on purpose: the surface's chrome is allowed to grow inside
-/// them without this list having to be remembered.
+/// The drawing blocks, and what each one protects:
+///
+/// - **misc technical** (`U+2300`) — horizontal and vertical *scan lines* (`U+23B8`–`U+23BD`, whose
+///   Unicode names are literally box and scan lines) and the bracket-extension pieces
+///   (`U+239B`–`U+23AD`) that tile into a frame edge;
+/// - **box drawing** (`U+2500`) — every bordered block on this surface (the approval sheet, a pane,
+///   a plan card) and the transcript's C-149 turn-boundary rail;
+/// - **block elements** (`U+2580`) — the `/usage` and progress bars, and [`CURSOR`], the
+///   deny-reason caret;
+/// - **geometric shapes** (`U+25A0`) — the agent mark itself, the slash menu's `▸`, the session
+///   picker's `●`;
+/// - **braille** (`U+2800`) — not exotic: [`SPINNER`] *is* Braille, so this is the block a payload
+///   would imitate the running indicator from, and its 8-dot patterns tile densely enough to stand
+///   in for `█`/`░`;
+/// - **misc symbols and arrows** (`U+2B00`), **arrows** (`U+2190`), **geometric shapes extended**
+///   (`U+1F780`) and the geometric run of the pictographs block (`U+1F532`–`U+1F53D`) — the fill
+///   and arrow lookalikes (`⬛`, `⬆`, `⇑`, `🟥`, `🔺`);
+/// - **legacy computing** (`U+1FB00`) — sextants, half-blocks and the terminal-graphics tiles that
+///   exist for exactly this purpose;
+/// - **CJK compatibility forms** (`U+FE30`) and the **fullwidth/halfwidth symbol tail**
+///   (`U+FFE0`–`U+FFEE`, plus `U+FF5C`) — vertical and overline rule forms (`︱`, `﹉`, `￨`, `｜`).
+///
+/// Then a short list of named rules and attention marks that live in blocks too broad to reserve
+/// whole (`U+2015` and the em-dash rules; `⚠` and its lookalikes). **This part is
+/// enumeration-shaped and therefore best-effort**, and it is allowed to be: neutralizing `⚡` buys
+/// little when a payload can always write the word "WARNING". What it must not do is let a payload
+/// draw a *frame*, which is the part above.
+///
+/// See the module docs for what this rule does and does not buy — ASCII `| - + _` can always
+/// approximate a box, so the load-bearing guarantee is the unforgeable mark, not this alphabet.
 pub(crate) fn is_reserved(ch: char) -> bool {
     matches!(ch,
-        '\u{2500}'..='\u{257F}'      // box drawing
-        | '\u{2580}'..='\u{259F}'    // block elements
-        | '\u{25A0}'..='\u{25FF}'    // geometric shapes
-        | '⚠' | '↑' | '↓')
+        // Blocks whose glyphs exist in order to draw.
+        '\u{2300}'..='\u{23ff}'        // misc technical: scan lines, bracket pieces
+        | '\u{2500}'..='\u{257f}'      // box drawing
+        | '\u{2580}'..='\u{259f}'      // block elements
+        | '\u{25a0}'..='\u{25ff}'      // geometric shapes
+        | '\u{2800}'..='\u{28ff}'      // braille — the spinner's own block
+        | '\u{2190}'..='\u{21ff}'      // arrows
+        | '\u{2b00}'..='\u{2bff}'      // misc symbols and arrows
+        | '\u{fe30}'..='\u{fe4f}'      // CJK compatibility forms: vertical/overline rules
+        | '\u{ffe0}'..='\u{ffee}'      // halfwidth/fullwidth symbol tail
+        | '\u{ff5c}'                   // fullwidth vertical line
+        | '\u{1f532}'..='\u{1f53d}'    // pictographs: the geometric run
+        | '\u{1f780}'..='\u{1f7ff}'    // geometric shapes extended
+        | '\u{1fb00}'..='\u{1fbff}'    // legacy computing: sextants, half-blocks
+        // Named rules and attention marks whose own blocks are too broad to reserve whole.
+        | '\u{2015}' | '\u{2e3a}' | '\u{2e3b}'          // horizontal bar, two/three-em dash
+        | '\u{2660}'..='\u{2667}'                       // card suits: `♦` imitates the mark
+        | '⚠' | '⚡' | '‼' | '⁉' | '❗' | '❕' | '❌' | '⛔')
 }
 
 /// Characters that occupy no column but change how the columns around them are read — the display
-/// spoof that survives every width check because it has no width. Dropped outright.
+/// spoof that survives every width check because it has no width. Dropped.
+///
+/// This is **enumerated, not categorical**: `std` exposes no Unicode-category test, so this is the
+/// `Cf` format characters plus the zero-width fillers and line/paragraph separators, listed by
+/// range. Treat it as defence in depth rather than as a closed set — the reordering spoof that
+/// actually matters (`RLO`/`LRO`/`RLE`/`LRE`/`PDF`, `U+202A`–`U+202E`) is covered, and because the
+/// surface budgets every row by *display width* a leftover zero-width character cannot shift a
+/// column or escape a pane's rect. It would only ever be cosmetic noise inside one.
 fn is_invisible(ch: char) -> bool {
     matches!(ch,
-        '\u{00ad}'                   // soft hyphen
-        | '\u{200b}'..='\u{200f}'    // zero-width space/joiners, LRM/RLM
-        | '\u{202a}'..='\u{202e}'    // bidi embedding and override
-        | '\u{2060}'..='\u{2064}'    // word joiner, invisible operators
-        | '\u{2066}'..='\u{2069}'    // bidi isolates
-        | '\u{feff}') // BOM / zero-width no-break space
+        '\u{00ad}'                     // soft hyphen
+        | '\u{061c}'                   // arabic letter mark
+        | '\u{070f}'                   // syriac abbreviation mark
+        | '\u{1160}'                   // hangul jungseong filler
+        | '\u{180b}'..='\u{180f}'      // mongolian variation selectors and vowel separator
+        | '\u{200b}'..='\u{200f}'      // zero-width space/joiners, LRM/RLM
+        | '\u{2028}' | '\u{2029}'      // line and paragraph separators
+        | '\u{202a}'..='\u{202e}'      // bidi embedding and override
+        | '\u{2060}'..='\u{206f}'      // word joiner, invisible operators, bidi isolates, deprecated
+        | '\u{3164}'                   // hangul filler
+        | '\u{feff}'                   // BOM / zero-width no-break space
+        | '\u{ffa0}'                   // halfwidth hangul filler
+        | '\u{fff9}'..='\u{fffb}'      // interlinear annotation
+        | '\u{1d173}'..='\u{1d17a}'    // musical formatting
+        | '\u{e0000}'..='\u{e007f}') // tags
 }
 
 /// Make one payload string safe to place in a terminal cell: **text, never interpreted**.
@@ -380,23 +458,43 @@ mod tests {
         assert_eq!(sanitize("⚠ ↑↓ █░ ▍ ▸ ●"), " ".repeat(13));
     }
 
-    /// The reserved set is checked against the surface's **actual** chrome, not against a copy of
-    /// itself: every glyph the harness draws its own chrome from must be in it, or a payload could
-    /// forge that piece of chrome. (`guards tested against their own assumptions` is a recurring
-    /// bug class in this tree; this is the cross-check that avoids it.)
+    /// The reserved set is checked against the surface's **actual** chrome, so a payload can never
+    /// forge a piece of chrome this surface really draws.
+    ///
+    /// Every glyph the crate holds in a *named constant* is read from that constant — the mark, the
+    /// C-149 transcript rail, the deny-reason caret, the spinner frames, the in-flight badge — so
+    /// those entries cannot drift from what is rendered. The remainder are inline literals at their
+    /// call sites, cited here, and are the reason this test is only half the cross-check: a range
+    /// this list forgets is invisible to it. The other half — an adversarial corpus that is *not*
+    /// derived from [`is_reserved`] — lives in
+    /// `panes::tests::an_agent_pane_cannot_imitate_the_approval_sheet`, so widening the rule and
+    /// widening its test are not the same edit. (*Guards tested against their own assumptions* is a
+    /// recurring bug class in this tree, and it is what a mirrored range list reproduces.)
     #[test]
     fn every_glyph_the_surface_draws_chrome_with_is_reserved() {
-        // The mark, the transcript rail (C-149), the bar glyphs the `/usage` and progress panes
-        // draw, the deny-reason cursor, the slash-menu and session-picker selection marks, the
-        // sheet's destructive disclosure and its scroll hint, and ratatui's own default borders.
-        for glyph in [
-            AGENT_MARK, GUTTER, "█", "░", "▍", "▸", "●", "⚠", "↑", "↓", "┌", "┐", "└", "┘", "─",
-            "│", "├", "┤",
-        ] {
-            for ch in glyph.chars().filter(|c| !c.is_whitespace()) {
+        let mut from_constants: Vec<&str> = vec![AGENT_MARK, GUTTER, CURSOR, RUNNING_BADGE];
+        from_constants.extend(SPINNER);
+        let literals = [
+            "▸", // rendering.rs: the slash and `@` menus' selection marker
+            "●", // rendering.rs: the session picker's current-session mark
+            "█", // rendering.rs / panes.rs: the `/usage` and progress bars, filled
+            "░", // rendering.rs / panes.rs: the same bars, empty
+            "⚠", // rendering.rs: the sheet's destructive disclosure
+            "↑", // rendering.rs: the sheet's subject-scroll hint
+            "↓", // rendering.rs: the same
+            "├─", "└─", "│  ", // plan.rs: the tree connectors and their indent guide
+            "┌", "┐", "└", "┘", "─", "│", // ratatui's own `Block::bordered` glyph set
+        ];
+        // Only the drawing part of each constant: `RUNNING_BADGE` is a glyph plus a word, and a
+        // letter is not chrome.
+        for glyph in from_constants.into_iter().chain(literals) {
+            for ch in glyph
+                .chars()
+                .filter(|c| !c.is_whitespace() && !c.is_alphanumeric())
+            {
                 assert!(
                     is_reserved(ch),
-                    "{ch:?} ({glyph:?}) is drawable by a payload"
+                    "{ch:?} (in {glyph:?}) is chrome this surface draws, and a payload can draw it"
                 );
             }
         }

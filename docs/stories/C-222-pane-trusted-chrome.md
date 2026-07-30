@@ -60,12 +60,25 @@ and the adversarial test that proves them.
   1. `PaneStore` holds `trust::AgentPane`, whose inner `PaneSpec` is private to `trust` and whose
      only constructor sanitizes. `panes.rs` is a *sibling* module, so it cannot assemble one from a
      raw spec — an unsanitized payload cannot be rendered because it cannot be stored.
-  2. `sanitize` drops escape sequences (whole, per the ECMA-48 grammar), control bytes and
-     invisible/bidi format characters, and replaces the glyph alphabet the surface draws its own
-     chrome from (`is_reserved`: box drawing, block elements, geometric shapes, `⚠ ↑ ↓`) with a
-     space, one for one. A counterfeit frame is therefore unbuildable, not merely discouraged.
+  2. `sanitize` drops escape sequences (whole, per the ECMA-48 grammar) and control characters, and
+     replaces every glyph from the blocks that exist in order to draw (`is_reserved`) with a space,
+     one for one.
   3. The mark and border come from the `Theme` via `agent_block` / `agent_overlay_header`. The mark
      is ` ◆ agent ` under `REVERSED | BOLD` — a glyph, a word and two modifiers, no tint.
+- **What is guaranteed, stated precisely** (`trust.rs` has the same section, because C-163 is told to
+  inherit this invariant and an overclaim here would propagate): a payload cannot style anything,
+  cannot produce a glyph from the drawing blocks — so no *pixel-accurate* copy of harness chrome —
+  paints only inside a region whose border ring and mark the surface draws afterwards from the
+  theme, and cannot change one cell of the approval sheet. **Not** guaranteed: that nothing a
+  payload writes can *resemble* a frame; ASCII `| - + _` always can, and cannot be taken away from
+  text. `is_reserved` raises the cost and kills the accurate imitation; the thing actually standing
+  between the user and a phish is the mark.
+- The rule is **range-shaped, not an enumeration**, because reserving the six glyphs the sheet
+  happens to use (`┌┐└┘─│`) is defeated by `┏┓┗┛━┃`, then `╔╗╚╝═║`, then `╭╮╰╯`. Reserved: misc
+  technical (scan lines, bracket pieces), box drawing, block elements, geometric shapes, braille
+  (the spinner's own block), arrows, misc symbols and arrows, CJK compatibility forms, the
+  fullwidth/halfwidth symbol tail, geometric shapes extended, legacy computing, plus a short,
+  explicitly best-effort list of named rules and attention marks.
 - `render_overlay_panel`'s `header` became a `Line<'static>` so the `overlay` slot — which shares
   its chrome with the host's own overlays — can carry the mark's modifiers. Host callers pass the
   same styled row they passed before, so their frames are unchanged.
@@ -77,6 +90,15 @@ and the adversarial test that proves them.
   which is the actual threat this story names.
 - Base proof: at `37b0a3c6` the same test reported *53 cells of chrome the surface did not draw* —
   a full counterfeit frame plus a forged `◆` mark and the sheet's `⚠`.
+- **Review round 2 (blocking finding, fixed).** The first revision's ranges stopped one Unicode block
+  short, and its adversarial test could not see it: `panes.rs`'s `is_chrome_glyph` re-stated the same
+  three ranges as `trust::is_reserved`, so the test's blind spot *was* the implementation's. A
+  counterfeit sheet rebuilt from U+23B8–23BD scan lines, Braille, legacy-computing sextants and
+  fullwidth rules rendered in full and scored **zero forged cells**. Both halves are now fixed: the
+  rule is widened, and the test is driven by `CHROME_LOOKALIKES` — a corpus grown by *probing* the
+  rule, not derived from its ranges — so widening the rule and widening its test are no longer the
+  same edit. Verified by re-narrowing `is_reserved` to the shipped-first three ranges: the test then
+  reports *29 lookalike(s) reached a cell*, naming each one and what it imitates.
 
 ## Notes
 - This is the story a reviewer should read first, and the one where a review verdict matters more
