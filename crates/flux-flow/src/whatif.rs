@@ -368,6 +368,12 @@ pub struct RerunSelection {
     exec_keys: Vec<String>,
 }
 
+// No `is_empty`: a resolved selection holds at least one execution by construction, because
+// `resolve` refuses an empty one outright rather than returning it. A published `is_empty` that
+// ignored its receiver and always answered `false` would read as a test an external caller could
+// rely on, so the invariant is stated here instead of hidden inside a method that pretends to check
+// it.
+#[allow(clippy::len_without_is_empty)]
 impl RerunSelection {
     /// Resolve `src`'s recorded plan executions, optionally narrowed to one 1-based `turn`, refusing
     /// loudly if there is nothing to rerun. Reads `src` only — never `dst`, which need not exist yet.
@@ -409,12 +415,6 @@ impl RerunSelection {
     /// is a refusal, not a value).
     pub fn len(&self) -> usize {
         self.exec_keys.len()
-    }
-
-    /// Always `false`: [`Self::resolve`] refuses an empty selection outright. Present because clippy
-    /// requires it alongside [`Self::len`], and honest about why it is a constant.
-    pub fn is_empty(&self) -> bool {
-        false
     }
 }
 

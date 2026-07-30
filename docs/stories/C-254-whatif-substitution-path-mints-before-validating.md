@@ -85,6 +85,26 @@ All three are pre-existing at `a0ad8219` and none is a regression from C-247.
     `RerunSelection` is new public API on that crate. That is a **breaking change to a published
     crate** — left as a version decision for integration, not taken here. In-tree callers are the SDK
     and this module's own tests; there are no others.
+- 2026-07-30 — **post-review fixes**, after the story passed independent review.
+  - Dropped `RerunSelection::is_empty`, which returned the constant `false`, in favour of
+    `#[allow(clippy::len_without_is_empty)]` on the impl. It existed only to satisfy the lint that
+    pairs with `len`, but on a published crate a receiver-ignoring `is_empty` reads to an external
+    caller as a test they can rely on. A resolved selection is non-empty *by construction* — `resolve`
+    refuses an empty one rather than returning it — so that invariant is now stated where the type is
+    defined instead of hidden inside a method pretending to check it.
+  - ⚠ **The breaking change is invisible to CI, and this note is the only thing standing between it
+    and a patch release.** `rerun_pinned`'s parameter list lost `src: &str` and `turn: Option<usize>`
+    and gained `selection: &RerunSelection` (`crates/flux-flow/src/whatif.rs:435-443`). Removing
+    parameters from a `pub async fn` breaks every out-of-tree caller at compile time — this is
+    **breaking, not additive**, and under the project's 0.y rule (the minor position is the breaking
+    signal) it obliges a **MINOR** at the next cut.
+    `scripts/check-crate-versions.sh` reports PASS and always will: by its own design it compares
+    *version strings* for crates that set their own version, and deliberately **skips crates that
+    inherit `version.workspace = true`** — `cut-release.sh` sweeps those, so "changed but not bumped"
+    is their normal state on main and flagging it would be noise. `codewandler-flux-flow` is one of
+    those inheriting crates, so it is out of the script's scope entirely; and the script has no notion
+    of API *shape* in any case, only of version movement. Nothing mechanical in the gate can catch
+    this. Whoever cuts the next release must read the bump off this note, not off a green CI run.
 
 ## Notes
 - Read C-211's and C-247's diffs first; this is the same move applied to the last three sites.
