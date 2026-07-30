@@ -63,6 +63,72 @@ fn begin_write(conn: &Connection, warn_after: Duration) -> Result<rusqlite::Tran
     Ok(tx)
 }
 
+/// C-230: how long [`set_wal_mode`] keeps trying to see the database in WAL mode. Matched to the
+/// `busy_timeout` in [`SqliteEvents::open`], because it plays the same role for the one statement
+/// that timeout cannot reach.
+const WAL_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// C-230: how long [`set_wal_mode`] pauses between attempts. A conversion takes microseconds, so
+/// this only bounds how eagerly a cold-booting peer re-checks; the wait is measured in single-digit
+/// milliseconds in practice.
+const WAL_SETUP_RETRY_DELAY: Duration = Duration::from_millis(1);
+
+/// Whether a rusqlite error is SQLite reporting lock contention rather than a real fault.
+fn is_busy(e: &rusqlite::Error) -> bool {
+    // `SQLITE_BUSY` ("database is locked") is what a contended lock reports; `SQLITE_LOCKED`
+    // ("database table is locked") is its within-connection sibling, treated the same way here.
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ErrorCode::DatabaseBusy
+                || err.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
+/// Put the database into WAL mode, tolerating peer processes doing the same thing at the same time.
+///
+/// C-230: `PRAGMA journal_mode = WAL` is the one statement the `busy_timeout` busy handler does
+/// **not** cover. Converting a brand-new `delete`-mode file to WAL needs a brief EXCLUSIVE lock, and
+/// SQLite returns `SQLITE_BUSY` for it *immediately* instead of invoking the handler (measured, not
+/// assumed: with the handler installed first, a storm of 8 cold boots still failed 1–7 of 8 with
+/// `event store: database is locked` raised from exactly this pragma). So N processes cold-booting
+/// one fresh `events.db` all attempt the conversion and all but the winner die — a second cold-boot
+/// race, independent of the migration race [`SqliteEvents::init`] serialises, and reachable even
+/// with a perfectly serialised migration.
+///
+/// A `SQLITE_BUSY` here is benign and self-resolving: it means a peer is converting the *same file*
+/// to the *same mode*, so the wait is all that was missing. Since the pragma reports the mode
+/// actually in force and is a plain no-op once the database is already in WAL, retrying until it
+/// answers `wal` needs no notion of who did the conversion.
+///
+/// This never silently settles for a lesser mode: if the database is still not in WAL after
+/// [`WAL_SETUP_TIMEOUT`], the error propagates. Running on a rollback journal would forfeit C-25's
+/// cross-process writer coordination and C-126's checkpoint hygiene, which is a correctness loss,
+/// not a slow path.
+fn set_wal_mode(conn: &Connection) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let blocked = match conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| {
+            r.get::<_, String>(0)
+        }) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+            // Not converted yet. SQLite reports the contended conversion as `SQLITE_BUSY`; a
+            // non-`wal` answer with no error would mean the same thing, so both wait.
+            Ok(mode) => format!("journal_mode is still {mode}"),
+            Err(e) if is_busy(&e) => e.to_string(),
+            Err(e) => return Err(map_sql(e)),
+        };
+        if start.elapsed() >= WAL_SETUP_TIMEOUT {
+            return Err(map_sql(format!(
+                "could not switch the event store to WAL mode within {}s ({blocked}); another \
+                 process may be holding the database exclusively",
+                WAL_SETUP_TIMEOUT.as_secs()
+            )));
+        }
+        std::thread::sleep(WAL_SETUP_RETRY_DELAY);
+    }
+}
+
 /// The `streams` columns a [`SessionSummary`] reads, in `row_to_summary` order. Shared by
 /// `list` and `list_for_account` so the two never drift.
 const SUMMARY_COLS: &str =
@@ -303,16 +369,20 @@ impl SqliteEvents {
     fn open_with_threshold(path: impl AsRef<Path>, threshold: Duration) -> Result<Self> {
         let path = path.as_ref();
         let conn = Connection::open(path).map_err(map_sql)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sql)?;
         // C-25: coordinate cross-process writers on the shared `~/.flux/events.db`. WAL permits a
         // single writer at a time; without a busy handler a second process (a `flux app run --serve`
         // daemon + a CLI turn on the same file) gets `SQLITE_BUSY` immediately and the write is lost
         // — the conversation write `?`-propagates and aborts the turn. A ~5s busy_timeout makes a contended
         // writer WAIT for the lock instead of failing; the in-process `Mutex` still serializes one
         // process's own writers, so this only ever matters across processes.
+        //
+        // C-230: install the handler BEFORE the first statement that can contend, not after the
+        // `journal_mode` pragma as it once was — every statement from here on can want a lock another
+        // process holds. The WAL conversion itself is the one exception the handler does *not* cover;
+        // [`set_wal_mode`] explains why and supplies the wait.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(map_sql)?;
+        set_wal_mode(&conn)?;
         // NORMAL is the recommended durability level under WAL: durable against application crashes
         // (only a power loss can drop the last few committed transactions) while avoiding an fsync
         // per commit — so single-process throughput does not regress.
@@ -340,12 +410,40 @@ impl SqliteEvents {
         )
     }
 
+    /// Create-or-migrate the schema, then wrap the connection into a store.
+    ///
+    /// C-230: the **entire** bootstrap runs inside one `BEGIN IMMEDIATE` transaction — the SQLite
+    /// analogue of D-76's Postgres `flux:ddl` advisory lock. Without it, N processes cold-booting the
+    /// same brand-new file race [`migrate_stream_context`]'s `PRAGMA table_info` → `ALTER TABLE ADD
+    /// COLUMN` (SQLite has no `ADD COLUMN IF NOT EXISTS`, so that pair is an unavoidable
+    /// check-then-act) and the loser dies with `duplicate column name: account`. Once the database
+    /// exists every probe finds its column and the race is invisible, which is why only a *cold* boot
+    /// exposes it (test: `tests/cold_boot_migration.rs`).
+    ///
+    /// Why a transaction rather than a lock file: SQLite's write lock is the primitive that already
+    /// has D-76's two decisive properties — it is **transaction-scoped** (released by commit,
+    /// rollback, or the OS when a process dies, so there is no stale lock to wedge a later boot) and
+    /// it is **enforced by the database**, not by a convention every caller has to honour. A
+    /// `flock`/`O_EXCL` sentinel beside the file has neither: it degrades to a no-op on some NFS
+    /// clients, and a `SIGKILL`ed process leaves a file that blocks every future boot with no safe
+    /// way to distinguish "stale" from "a slow live peer". And DDL in SQLite *is* transactional, so
+    /// unlike Postgres — whose non-atomic `IF NOT EXISTS` forced D-76 to add a lock *object* — here
+    /// the transaction is the whole mechanism. The in-process `conn` [`Mutex`] is no help: it cannot
+    /// span processes, and does not even exist yet at this point.
+    ///
+    /// The lock is taken on **every** open, not just a cold one, matching D-76's choice to keep
+    /// `PgEvents::connect`'s bootstrap eager-but-locked: the batch is a handful of no-op statements
+    /// on an already-migrated file, so it holds the write lock for well under a millisecond, and one
+    /// unconditional path cannot skew from a "detect whether migration is needed" fast path.
     fn init(
         conn: Connection,
         contention_warn_threshold: Duration,
         checkpoint_conn: Option<Connection>,
     ) -> Result<Self> {
-        conn.execute_batch(
+        // `BEGIN IMMEDIATE` (not a deferred transaction) is what lets the `busy_timeout` set in
+        // `open_with_threshold` actually wait a peer's bootstrap out — see [`begin_write`].
+        let tx = begin_write(&conn, contention_warn_threshold)?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                  global_seq     INTEGER PRIMARY KEY AUTOINCREMENT,
                  stream         TEXT    NOT NULL,
@@ -372,7 +470,8 @@ impl SqliteEvents {
              );",
         )
         .map_err(map_sql)?;
-        migrate_stream_context(&conn)?;
+        migrate_stream_context(&tx)?;
+        tx.commit().map_err(map_sql)?;
         Ok(Self {
             conn: Mutex::new(conn),
             contention_warn_threshold,
