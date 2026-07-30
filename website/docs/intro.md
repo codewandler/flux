@@ -25,10 +25,12 @@ runtime decides what is allowed and performs the work.
 - **Agent**: the local coding agent — CLI/TUI, an embeddable Rust SDK, an HTTP/[A2A](./agent/a2a.md)
   server, and [multi-agent programs](./agent/programs.md).
 - **Flux-Lang**: the plan language and reference interpreter.
-- **[Improvement loop](./agent/improvement.md)**: the eval and self-improvement harness used to
-  measure flux against benchmarks. Unlike the other two, this pillar is **de-prioritized and on
-  hold** — the harness runs and its evidence is trustworthy, but a repeatable grader-confirmed gain
-  is unproven. Treat it as a measurement tool, not a shipped capability.
+- **[Improvement loop](./agent/improvement.md)**: the self-improvement harness that lets flux edit
+  its own harness under a keep-or-revert gate. Unlike the other two, this pillar is
+  **de-prioritized and on hold** — the harness runs and its evidence is trustworthy, but a
+  repeatable grader-confirmed gain is unproven. Treat it as a measurement tool, not a shipped
+  capability. Benchmarking a harness build against another is a separate tool,
+  [flux-bench](https://github.com/codewandler/flux-bench).
 
 ## Public docs vs project docs
 
@@ -55,7 +57,8 @@ They are useful when contributing, but they are more detailed and more volatile 
 - What flux is allowed to do: read [Safety & approvals](./agent/safety.md).
 - Interested in the language: read [Flux-Lang overview](./language/overview.md).
 - Embedding flux: read the [SDK overview](./sdk/overview.md).
-- Measuring and improving behavior: read [Evaluation and improvement](./agent/improvement.md).
+- Measuring and improving behavior: read [Evaluation and improvement](./agent/improvement.md), which
+  points at [flux-bench](https://github.com/codewandler/flux-bench) for benchmarking a harness.
 - Replay, fork, and diff past runs: read [Time Machine](./agent/time-machine.md).
 - Something not working: check [Troubleshooting](./troubleshooting.md).
 
