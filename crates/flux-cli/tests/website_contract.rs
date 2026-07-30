@@ -78,6 +78,14 @@ fn wakeup_events_for_contract() -> Arc<flux_events::EventStore> {
     Arc::new(flux_events::EventStore::open(dir.join("events.db")).expect("open contract store"))
 }
 
+/// A worker runtime for a name-only catalog check. `ExternalRuntime` over an empty table cannot
+/// start anything, which is the point: this contract reads `Tool::spec`, it never executes an op.
+fn fleet_runtime_for_contract() -> Arc<dyn flux_runtime::AgentRuntime> {
+    Arc::new(flux_orchestrate::ExternalRuntime::new(
+        std::collections::HashMap::new(),
+    ))
+}
+
 /// A provider that records the cognition prompt and returns one deterministic answer. The tutorial
 /// flow is authored, so this provider is called exactly once by `ai.reason`.
 struct PromptCapture {
@@ -379,6 +387,20 @@ fn operations_reference_covers_the_registered_public_catalog() {
             Arc::new(flux_orchestrate::FleetCancelTool::new(
                 flux_system::net::PrivateNetAllow::None,
                 None,
+            )),
+            // C-243's worker-lifecycle half, added for exactly the reason recorded above: they are
+            // in the production catalog via the same `try_register_fleet`, so leaving them out here
+            // would let them go undocumented while this contract stayed green — the third instance
+            // of that failure mode. The runtime is the `ExternalRuntime` (no process is started);
+            // only the registered names and specs matter to this check.
+            Arc::new(flux_orchestrate::FleetStartTool::new(
+                fleet_runtime_for_contract(),
+            )),
+            Arc::new(flux_orchestrate::FleetWorkerStatusTool::new(
+                fleet_runtime_for_contract(),
+            )),
+            Arc::new(flux_orchestrate::FleetStopTool::new(
+                fleet_runtime_for_contract(),
             )),
         ]
         .into_iter()

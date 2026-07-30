@@ -1089,12 +1089,24 @@ fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
     }
 }
 
-/// Outbound A2A dispatch (A-116): `fleet.dispatch` / `fleet.status` / `fleet.cancel` — hand a task
-/// to a remote flux worker without waiting, poll it, stop it.
+/// The whole fleet surface, in one place: worker **lifecycle** (C-243) plus outbound A2A **dispatch**
+/// (A-116).
 ///
-/// A-116 landed the ops; nothing constructed them, so a Program could not call one. This is the one
-/// construction site, shared by the agent assembly below and the `flux app run` path, so the two
-/// surfaces cannot offer different fleet catalogs — and a fourth fleet op is added here alone.
+/// A-116 landed the dispatch ops; nothing constructed them, so a Program could not call one. This is
+/// the one construction site, shared by the agent assembly below and the `flux app run` path, so the
+/// two surfaces cannot offer different fleet catalogs — and a further fleet op is added here alone.
+///
+/// C-243 adds `fleet.start` / `fleet.worker_status` / `fleet.stop` over a [`ProcessRuntime`], because
+/// the dispatch half could only talk to a worker that somehow already existed: `flux` never spawned
+/// `flux`, and `FlowEngine`'s turn gate serves one concurrent turn per worker, so a wave was a wave of
+/// one. `ProcessRuntime` is constructed here rather than passed in for the same reason the dispatch
+/// ops are — one site, one catalog — and it owns the live child handles, so its lifetime is the
+/// process's and a coordinator exit kills every worker it started (`kill_on_drop`).
+///
+/// `ExternalRuntime` is deliberately **not** wired: naming already-running workers is operator
+/// configuration that does not exist yet, and inventing a config key for it here would add public
+/// surface this story does not own. The port has both implementations; only the spawning one is
+/// reachable from the CLI today.
 ///
 /// The worker bearer token is `None`: a token for an authenticated worker is operator configuration
 /// that does not exist yet, and inventing an env var for it here would add public surface this
@@ -1104,6 +1116,17 @@ pub(super) fn try_register_fleet(
     registry: &mut ToolRegistry,
     ledger: Option<Arc<dyn flux_runtime::DispatchLedger>>,
 ) -> Result<()> {
+    let runtime: Arc<dyn flux_runtime::AgentRuntime> =
+        Arc::new(flux_orchestrate::ProcessRuntime::new()?);
+    let lifecycle: Vec<Arc<dyn flux_runtime::Tool>> = vec![
+        Arc::new(flux_orchestrate::FleetStartTool::new(runtime.clone())),
+        Arc::new(flux_orchestrate::FleetWorkerStatusTool::new(
+            runtime.clone(),
+        )),
+        Arc::new(flux_orchestrate::FleetStopTool::new(runtime)),
+    ];
+    registry.try_register_all_from("flux-cli fleet lifecycle", lifecycle)?;
+
     let private_net = fleet_private_net();
     let dispatch = flux_orchestrate::FleetDispatchTool::new(private_net.clone(), None);
     // With a ledger, `fleet.dispatch` records `runner` + `task_id` onto the board item it was given,
@@ -2444,6 +2467,43 @@ mod fleet_and_board_wiring {
             fleet_private_net(),
             flux_system::net::PrivateNetAllow::None,
             "the fleet ops must not be registered with a standing private-network grant"
+        );
+    }
+
+    /// C-243 failing-first: **nothing starts a worker**. A-116 wired the dispatch half of the fleet
+    /// — hand a task to a worker that is somehow already running — but the fleet had no verb that
+    /// *makes* a worker exist, so a "wave" was a wave of one (`FlowEngine`'s `turn_gate` gives one
+    /// worker one concurrent turn). The worker-lifecycle ops must be registered at the same single
+    /// construction site as the dispatch ops, so the two halves cannot drift into different
+    /// catalogs, and each must name a **worker** rather than a network origin as its subject: these
+    /// ops spawn and signal a local OS process, they perform no egress at all.
+    #[test]
+    fn the_fleet_worker_lifecycle_ops_are_registered_and_named_by_worker() {
+        let mut registry = ToolRegistry::new();
+        try_register_fleet(&mut registry, None).expect("the fleet ops register");
+
+        for op in ["fleet.start", "fleet.worker_status", "fleet.stop"] {
+            let tool = registry
+                .get(op)
+                .unwrap_or_else(|| panic!("`{op}` is not registered — nothing can start a worker"));
+            let spec = tool.spec();
+            assert!(
+                spec.access.contains(&flux_spec::AccessKind::Process),
+                "`{op}` spawns/signals an OS process, so it must declare Process access: {:?}",
+                spec.access
+            );
+            assert!(
+                !spec.access.contains(&flux_spec::AccessKind::Network),
+                "`{op}` performs no egress, so it must not demand network access: {:?}",
+                spec.access
+            );
+        }
+
+        let start = registry.get("fleet.start").expect("fleet.start");
+        assert_eq!(
+            start.permission_subjects(&serde_json::json!({ "item": "C-243" })),
+            vec!["fleet-worker:C-243".to_string()],
+            "a start must be grantable per worker, never blanket"
         );
     }
 
