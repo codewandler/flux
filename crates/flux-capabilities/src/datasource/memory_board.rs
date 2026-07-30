@@ -9,8 +9,10 @@
 //!
 //! * `transition` calls [`validate_transition`] **before** touching the entry, so a refused edge
 //!   cannot leave a partial write behind — the check is not "then roll back", it is "never start".
-//! * [`Item::attempts`] moves on exactly the edges [`is_retry`] names, and no others.
-//! * `claim` is idempotent for the current holder and a conflict for anyone else.
+//! * [`Item::attempts`] moves, and the run identity (`runner`/`task_id`) is dropped, on exactly the
+//!   edges [`is_retry`] names and no others — while `assignee` survives all of them.
+//! * `claim` is idempotent for the current holder and a conflict for anyone else; `reassign` is the
+//!   deliberate exception that moves an item off a holder that is gone.
 
 use std::sync::Mutex;
 
@@ -20,7 +22,7 @@ use flux_datasource::board::{
     is_retry, validate_transition, BoardSchema, DependencyMatch, Item, ItemDraft, State,
     DEPENDS_ON_FILTER,
 };
-use flux_datasource::live::{FilterValue, Filters, Page, PageRequest};
+use flux_datasource::live::{FilterValue, Filters, Page, PageRequest, Reference};
 use flux_runtime::ToolContext;
 
 use super::board::WorkBoard;
@@ -198,6 +200,11 @@ impl WorkBoard for MemoryBoard {
         item.state = to;
         if is_retry(from, to) {
             item.attempts += 1;
+            // The run that was executing this item is over, so the item must not still name it — a
+            // sweep reading a stale `task_id` chases a process that no longer exists (C-240).
+            // `assignee` is deliberately untouched: the holder outlives one run.
+            item.runner = None;
+            item.task_id = None;
         }
         Ok(item.clone())
     }
@@ -245,6 +252,37 @@ impl WorkBoard for MemoryBoard {
         // state machine has exactly one entry point and this is not it.
         item.runner = Some(runner.to_string());
         item.task_id = Some(task_id.to_string());
+        Ok(item.clone())
+    }
+
+    async fn reassign(&self, _ctx: &ToolContext, id: &str, assignee: &str) -> Result<Item> {
+        let mut entries = self.locked();
+        let index = Self::index_of(&entries, id)?;
+        let item = &mut entries[index].item;
+        // Forcible by design: `claim` protects two live workers from each other, and this is the
+        // case where the holder is dead. The old holder's run goes with it, for the same reason a
+        // retry drops it.
+        item.assignee = Some(assignee.to_string());
+        item.runner = None;
+        item.task_id = None;
+        Ok(item.clone())
+    }
+
+    async fn record_evidence(
+        &self,
+        _ctx: &ToolContext,
+        id: &str,
+        reference: Reference,
+    ) -> Result<Item> {
+        let mut entries = self.locked();
+        let index = Self::index_of(&entries, id)?;
+        let item = &mut entries[index].item;
+        // Appending, not replacing — an item legitimately carries a commit *and* the review that
+        // accepted it. A reference already present is dropped: a rework records the same commit
+        // again, and a duplicate carries no information.
+        if !item.evidence.contains(&reference) {
+            item.evidence.push(reference);
+        }
         Ok(item.clone())
     }
 
@@ -328,8 +366,11 @@ mod tests {
         assert_eq!(claimed.state, State::Claimed);
     }
 
+    /// Every active state may divert to `blocked`, and coming back out of it requeues the work at a
+    /// cost: `blocked → ready` re-opens work already attempted, so it spends an attempt exactly as
+    /// `failed → ready` does (C-240). Diverting *into* `blocked` is free.
     #[tokio::test]
-    async fn an_item_may_block_from_any_active_state_and_requeues_unassigned() {
+    async fn an_item_may_block_from_any_active_state_and_requeueing_spends_an_attempt() {
         let board = MemoryBoard::new();
         let ctx = ctx();
         for spine in [
@@ -342,16 +383,20 @@ mod tests {
             for to in spine {
                 board.transition(&ctx, &item.id, to).await.unwrap();
             }
-            board
+            let blocked = board
                 .transition(&ctx, &item.id, State::Blocked)
                 .await
                 .expect("every active state may block");
+            assert_eq!(blocked.attempts, 0, "diverting into blocked is free");
             let requeued = board
                 .transition(&ctx, &item.id, State::Ready)
                 .await
                 .expect("an unblocked item returns to the queue");
             assert_eq!(requeued.state, State::Ready);
-            assert_eq!(requeued.attempts, 0, "blocking is not a retry");
+            assert_eq!(
+                requeued.attempts, 1,
+                "requeueing out of blocked re-opens attempted work, so it spends an attempt"
+            );
         }
     }
 

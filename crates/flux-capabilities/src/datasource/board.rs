@@ -1,4 +1,5 @@
-//! The write-capable [`WorkBoard`] port and its nine generated operations (A-113, A-130, C-236).
+//! The write-capable [`WorkBoard`] port and its eleven generated operations (A-113, A-130, C-236,
+//! C-240).
 //!
 //! This is the sibling of [`super::live::LiveDatasource`], and deliberately the same shape: a
 //! backend declares a schema plus its external authority, the contract is snapshotted and validated
@@ -6,7 +7,7 @@
 //! subjects, a per-domain [`ToolGroup`] and an ambient signal, installed atomically on a clone.
 //! Everything a reader already knows about `try_register_live_datasource` transfers.
 //!
-//! What is new is that five of the nine operations **write**. That changes two things and nothing
+//! What is new is that seven of the eleven operations **write**. That changes two things and nothing
 //! else:
 //!
 //! * **Permission subjects stay concrete.** `board.transition` on `PROJ-42` reports
@@ -107,12 +108,15 @@ fn depends_on_filter() -> FilterKey {
 /// generated operations cannot enforce for you:
 ///
 /// * an illegal edge errors and performs **no write** — the item is byte-identical afterwards;
-/// * the `Failed → Ready` retry edge increments [`Item::attempts`], and no other edge touches it;
+/// * a retry edge increments [`Item::attempts`], and no other edge touches it;
+/// * a retry edge clears `runner`/`task_id` and leaves `assignee` alone (C-240);
 /// * `claim` is idempotent for the same assignee and conflicts for a different one;
 /// * the reserved `depends_on` filter treats an item as blocked until **every** dependency is
 ///   `done` — an absent dependency never resolves (C-236);
 /// * `comments` reads back what `comment` wrote, oldest first (C-236);
-/// * a recorded dispatch is **durable** — `runner` and `task_id` survive a fresh read.
+/// * a recorded dispatch is **durable** — `runner` and `task_id` survive a fresh read;
+/// * `reassign` moves the holder so the new one can `claim` where it would have conflicted, and
+///   `record_evidence` appends a durable [`Reference`] (C-240).
 #[async_trait]
 pub trait WorkBoard: Send + Sync {
     /// Model-facing filter contract and page bounds.
@@ -140,12 +144,60 @@ pub trait WorkBoard: Send + Sync {
     /// Move an item along a legal edge.
     ///
     /// Implementations **must** call [`validate_transition`] against the item's current state
-    /// before writing anything, and must increment [`Item::attempts`] exactly when
-    /// [`flux_datasource::board::is_retry`] says the edge is a retry.
+    /// before writing anything, and on exactly the edges
+    /// [`is_retry`](flux_datasource::board::is_retry) names they must both increment
+    /// [`Item::attempts`] and clear [`Item::runner`] / [`Item::task_id`] — never
+    /// [`Item::assignee`]. That predicate is the single copy of both rules; a backend that
+    /// re-derives either is what C-240 fixed.
     async fn transition(&self, ctx: &ToolContext, id: &str, to: State) -> Result<Item>;
 
     /// Take ownership of an item. Idempotent for the current holder; a conflict for anyone else.
     async fn claim(&self, ctx: &ToolContext, id: &str, assignee: &str) -> Result<Item>;
+
+    /// Hand an item to a different worker (C-240).
+    ///
+    /// [`claim`](WorkBoard::claim) conflicts for anyone but the current holder, which is right for
+    /// two live workers racing and wrong for the case the sweep actually meets: the holder is dead
+    /// and the work has to move. `reassign` is therefore a deliberately **forcible** takeover — it
+    /// does not consult the current holder. Its gate is authority, not state: like every other
+    /// mutation it reports a concrete `<domain>/item/<id>` subject, so an operator grants the power
+    /// to move *this* item and nothing else.
+    ///
+    /// Two obligations:
+    ///
+    /// * **The dead run goes with the old holder.** Setting `assignee` also clears
+    ///   [`Item::runner`] and [`Item::task_id`], for the reason
+    ///   [`is_retry`](flux_datasource::board::is_retry) gives: a record naming the previous
+    ///   worker's run would have the coordinator report progress on a process that is gone.
+    /// * **Not a state change.** No edge, no `attempts`.
+    ///   [`transition`](WorkBoard::transition) stays the single entry point into the state machine.
+    ///
+    /// Idempotent for the assignee named: reassigning to the same worker rewrites the same fields.
+    async fn reassign(&self, ctx: &ToolContext, id: &str, assignee: &str) -> Result<Item>;
+
+    /// Append a weak locator for an artifact produced against `id` (C-240).
+    ///
+    /// [`Item::evidence`] round-tripped through the backends from the start but nothing could write
+    /// it — the same defect A-130 fixed for `runner`/`task_id`. It is the diff-handoff channel: a
+    /// worker records the commit it produced (`commit/<sha>`) and the review that accepted it (a
+    /// URL), and a coordinator reads them back off the item.
+    ///
+    /// Three obligations, all pinned by the contract suite:
+    ///
+    /// * **Durable and appending.** A subsequent [`get`](WorkBoard::get) by an unrelated reader sees
+    ///   every reference recorded so far, oldest first. Unlike
+    ///   [`record_dispatch`](WorkBoard::record_dispatch) this is a log, not a slot: an item
+    ///   legitimately carries a commit *and* a PR.
+    /// * **A repeat of the same reference is a no-op.** A reworked item records the same commit
+    ///   again; a duplicate entry carries no information, so an already-present reference is
+    ///   dropped rather than appended. That is what makes the operation safe to replay.
+    /// * **Not a state change.** No edge, no `attempts`, no assignee.
+    async fn record_evidence(
+        &self,
+        ctx: &ToolContext,
+        id: &str,
+        reference: Reference,
+    ) -> Result<Item>;
 
     /// Record that `id` was dispatched to a worker: bind it to the worker's address (`runner`) and
     /// the worker-minted handle (`task_id`). This is the write that makes the board a **run
@@ -192,18 +244,19 @@ pub trait WorkBoard: Send + Sync {
 /// [`ambient_signal`](Self::ambient_signal) whenever the configured backend is present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkBoardSurface {
-    /// Per-domain group containing exactly the nine generated operations.
+    /// Per-domain group containing exactly the eleven generated operations.
     pub group: ToolGroup,
     /// Ambient project signal emitted because this board is configured.
     pub ambient_signal: String,
 }
 
-/// The nine operation suffixes a board generates, in catalog order.
+/// The eleven operation suffixes a board generates, in catalog order.
 ///
 /// The first seven are A-113/A-130's. `query` (C-236) is the machine-readable sibling of `list` —
 /// typed rows under an `output_schema` instead of prose — and `comments` the read half of
-/// `comment`.
-const OPERATIONS: [&str; 9] = [
+/// `comment`. `reassign` and `record_evidence` are C-240's: moving an item off a dead worker, and
+/// writing the one [`Item`] field nothing could write.
+const OPERATIONS: [&str; 11] = [
     "list",
     "get",
     "create",
@@ -213,10 +266,13 @@ const OPERATIONS: [&str; 9] = [
     "record_dispatch",
     "query",
     "comments",
+    "reassign",
+    "record_evidence",
 ];
 
 /// Build the uniform `<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment`
-/// / `.record_dispatch` / `.query` / `.comments` operations for one board backend.
+/// / `.record_dispatch` / `.query` / `.comments` / `.reassign` / `.record_evidence` operations for
+/// one board backend.
 ///
 /// The backend contract is snapshotted and validated once, so the filters, page bounds and external
 /// authority advertised at registration are the same vocabulary used to route calls — a backend
@@ -249,10 +305,10 @@ pub fn work_board_tools(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Vec
         .collect())
 }
 
-/// Atomically install exactly the nine operations for one board domain.
+/// Atomically install exactly the eleven operations for one board domain.
 ///
-/// All nine share an auditable source label. [`ToolRegistry::try_register_all_from`] assembles on a
-/// clone, so a collision or an invalid declaration leaves the caller's registry unchanged — there
+/// All eleven share an auditable source label. [`ToolRegistry::try_register_all_from`] assembles on
+/// a clone, so a collision or an invalid declaration leaves the caller's registry unchanged — there
 /// is no state in which a board is half-registered and three of its writes are reachable.
 pub fn try_register_work_board(
     registry: &mut ToolRegistry,
@@ -359,7 +415,7 @@ impl BoardProjection {
 // Operations
 // ---------------------------------------------------------------------------
 
-/// Which of the nine an instance is. One `impl Tool` covers all of them because they differ only
+/// Which of the eleven an instance is. One `impl Tool` covers all of them because they differ only
 /// in their input contract and their one backend call — the subject, authority and spec derivation
 /// are shared, which is the whole point of generating them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +429,8 @@ enum OpKind {
     RecordDispatch,
     Query,
     Comments,
+    Reassign,
+    RecordEvidence,
 }
 
 impl OpKind {
@@ -387,12 +445,15 @@ impl OpKind {
             "record_dispatch" => Self::RecordDispatch,
             "query" => Self::Query,
             "comments" => Self::Comments,
+            "reassign" => Self::Reassign,
+            "record_evidence" => Self::RecordEvidence,
             other => unreachable!("undeclared board operation `{other}`"),
         }
     }
 
-    /// Whether this operation mutates the board. The five that do carry `Effect::Write`, a
-    /// `datasource_write` requirement, and a non-`Low` risk tier.
+    /// Whether this operation mutates the board. The seven that do carry `Effect::Write`, a
+    /// `datasource_write` requirement, and a non-`Low` risk tier. Stated as the complement of the
+    /// reads so a newly declared operation is a write until someone says otherwise.
     fn writes(&self) -> bool {
         !matches!(self, Self::List | Self::Get | Self::Query | Self::Comments)
     }
@@ -539,6 +600,20 @@ impl Tool for BoardOp {
                 let comments = backend.comments(ctx, id).await?;
                 ToolResult::ok(serde_json::to_string(&comments)?)
             }
+            OpKind::Reassign => {
+                let input: ClaimInput = parse(op, params)?;
+                let id = require(op, "id", &input.id)?;
+                let assignee = require(op, "assignee", &input.assignee)?;
+                ToolResult::ok(render_full(&backend.reassign(ctx, id, assignee).await?))
+            }
+            OpKind::RecordEvidence => {
+                let input: RecordEvidenceInput = parse(op, params)?;
+                let id = require(op, "id", &input.id)?;
+                let reference = parse_reference(op, &input)?;
+                ToolResult::ok(render_full(
+                    &backend.record_evidence(ctx, id, reference).await?,
+                ))
+            }
         })
     }
 }
@@ -621,6 +696,53 @@ struct RecordDispatchInput {
     runner: String,
     #[serde(default)]
     task_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordEvidenceInput {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    entity: String,
+    #[serde(default)]
+    entity_id: String,
+}
+
+/// Resolve one `record_evidence` call's flat input into the [`Reference`] it names.
+///
+/// [`Reference`] is a two-variant sum, and a JSON `oneOf` is a shape models reliably get wrong. So
+/// the operation takes the two spellings side by side and requires **exactly one**: either `url`, or
+/// `entity` + `entity_id` together. Ambiguity is an error rather than a preference for one side —
+/// silently picking would let a caller believe it recorded a URL while the board stored an entity.
+///
+/// The two spellings are the two [`render_full`] prints, so what a reader sees on `get`
+/// (`evidence: commit/<sha>`, `evidence: https://…`) is what this accepts back.
+fn parse_reference(operation: &str, input: &RecordEvidenceInput) -> Result<Reference> {
+    let url = input.url.trim();
+    let entity = input.entity.trim();
+    let entity_id = input.entity_id.trim();
+
+    match (url.is_empty(), entity.is_empty(), entity_id.is_empty()) {
+        (false, true, true) => Ok(Reference::Url {
+            url: url.to_string(),
+        }),
+        (true, false, false) => Ok(Reference::Entity {
+            entity: entity.to_string(),
+            id: entity_id.to_string(),
+        }),
+        (true, true, true) => Err(Error::Other(format!(
+            "{operation}: name the artifact as either `url` or `entity` + `entity_id`; neither was given"
+        ))),
+        (true, _, _) => Err(Error::Other(format!(
+            "{operation}: an `entity` reference needs both `entity` and `entity_id`"
+        ))),
+        (false, _, _) => Err(Error::Other(format!(
+            "{operation}: `url` and `entity`/`entity_id` are mutually exclusive; name exactly one artifact"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +1030,52 @@ fn spec_for(op: &str, projection: &BoardProjection) -> ToolSpec {
                 &["id"],
             ),
         ),
+        OpKind::Reassign => (
+            format!(
+                "Hand a `{domain}` item to a different worker, for when the current holder is gone \
+                 — unlike `{domain}.claim` this does not conflict with the existing assignee. Also \
+                 clears the recorded runner and task id, because the previous worker's run is dead; \
+                 does not move the item's state."
+            ),
+            object(
+                json!({
+                    "id": {"type": "string", "description": "Stable item id"},
+                    "assignee": {
+                        "type": "string",
+                        "description": "Worker the item is handed to; replaces the current holder"
+                    }
+                }),
+                &["id", "assignee"],
+            ),
+        ),
+        OpKind::RecordEvidence => (
+            format!(
+                "Attach a locator for an artifact produced against a `{domain}` item — a commit, a \
+                 pull request, a build. Appends to the item's evidence list; recording the same \
+                 artifact twice changes nothing. Name exactly one artifact: either `url`, or \
+                 `entity` plus `entity_id`. Does not move the item's state."
+            ),
+            object(
+                json!({
+                    "id": {"type": "string", "description": "Stable item id"},
+                    "url": {
+                        "type": "string",
+                        "description": "Navigation URL for the artifact, e.g. a pull request. \
+                                        Mutually exclusive with entity/entity_id, and never a \
+                                        credential or presigned secret"
+                    },
+                    "entity": {
+                        "type": "string",
+                        "description": "Artifact kind, e.g. `commit`. Requires entity_id"
+                    },
+                    "entity_id": {
+                        "type": "string",
+                        "description": "Stable id within that kind, e.g. the commit sha"
+                    }
+                }),
+                &["id"],
+            ),
+        ),
     };
 
     let spec = ToolSpec::read_only(name, description, schema);
@@ -924,13 +1092,17 @@ fn spec_for(op: &str, projection: &BoardProjection) -> ToolSpec {
     };
     let mut spec = if kind.writes() {
         // C-191's coherence invariants: a `Write` may keep neither the `Risk::Low` tier nor the
-        // `Idempotent` claim. Two are genuinely safe to repeat under a stated condition, which is
-        // exactly what `Conditional` is for: `claim` for its current holder, and `record_dispatch`
-        // for the same `(runner, task_id)` — replaying it rewrites the same two fields with the
-        // same values. Neither may be `Idempotent`, which would license the op cache to skip the
-        // call entirely and silently drop the write.
+        // `Idempotent` claim. Four are genuinely safe to repeat under a stated condition, which is
+        // exactly what `Conditional` is for: `claim` for its current holder, `record_dispatch` for
+        // the same `(runner, task_id)`, `reassign` for the same assignee — each replays into the
+        // same fields with the same values — and `record_evidence` for a reference the item already
+        // carries, which it drops rather than duplicating. None may be `Idempotent`, which would
+        // license the op cache to skip the call entirely and silently drop the write.
         let mut spec = spec.with_risk(Risk::Medium);
-        spec.idempotency = if matches!(kind, OpKind::Claim | OpKind::RecordDispatch) {
+        spec.idempotency = if matches!(
+            kind,
+            OpKind::Claim | OpKind::RecordDispatch | OpKind::Reassign | OpKind::RecordEvidence
+        ) {
             Idempotency::Conditional
         } else {
             Idempotency::NonIdempotent
@@ -1188,6 +1360,57 @@ mod tests {
             .contains("duplicate authority"));
     }
 
+    /// C-240: `record_evidence` takes the two [`Reference`] spellings side by side and accepts
+    /// **exactly one**. Ambiguity is refused rather than resolved — a caller must never believe it
+    /// recorded a URL while the board stored an entity.
+    #[test]
+    fn record_evidence_accepts_exactly_one_reference_spelling() {
+        fn input(url: &str, entity: &str, entity_id: &str) -> RecordEvidenceInput {
+            RecordEvidenceInput {
+                id: "item-1".into(),
+                url: url.into(),
+                entity: entity.into(),
+                entity_id: entity_id.into(),
+            }
+        }
+        assert_eq!(
+            parse_reference("board.record_evidence", &input("https://x.test/pr/1", "", "")).unwrap(),
+            Reference::Url {
+                url: "https://x.test/pr/1".into()
+            }
+        );
+        assert_eq!(
+            parse_reference(
+                "board.record_evidence",
+                &input("", " commit ", " deadbeef ")
+            )
+            .unwrap(),
+            Reference::Entity {
+                entity: "commit".into(),
+                id: "deadbeef".into()
+            },
+            "each half is trimmed, exactly as `require` trims the id"
+        );
+
+        for (case, expected) in [
+            (input("", "", ""), "neither was given"),
+            (input("   ", "  ", " "), "neither was given"),
+            (input("", "commit", ""), "needs both `entity` and `entity_id`"),
+            (input("", "", "deadbeef"), "needs both `entity` and `entity_id`"),
+            (
+                input("https://x.test", "commit", "deadbeef"),
+                "mutually exclusive",
+            ),
+            (input("https://x.test", "commit", ""), "mutually exclusive"),
+        ] {
+            let error = parse_reference("board.record_evidence", &case)
+                .expect_err("an ambiguous or empty reference is refused")
+                .to_string();
+            assert!(error.contains("board.record_evidence"), "{error}");
+            assert!(error.contains(expected), "expected `{expected}` in {error}");
+        }
+    }
+
     /// The one rule the whole story turns on, checked at the lowest level: no mutating operation
     /// can be talked into a wildcard or empty subject by its parameters.
     #[test]
@@ -1215,6 +1438,9 @@ mod tests {
             OpKind::Transition,
             OpKind::Claim,
             OpKind::Comment,
+            OpKind::RecordDispatch,
+            OpKind::Reassign,
+            OpKind::RecordEvidence,
         ] {
             for params in &hostile {
                 let subject = projection.subject(kind, params);

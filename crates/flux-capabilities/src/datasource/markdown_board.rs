@@ -61,7 +61,7 @@ use flux_datasource::board::{
     is_retry, validate_transition, BoardSchema, DependencyMatch, Item, ItemDraft, State,
     DEPENDS_ON_FILTER,
 };
-use flux_datasource::live::{FilterValue, Filters, Page, PageRequest};
+use flux_datasource::live::{FilterValue, Filters, Page, PageRequest, Reference};
 use flux_runtime::ToolContext;
 use flux_system::{System, Workspace};
 
@@ -498,6 +498,11 @@ impl WorkBoard for MarkdownBoard {
             item.state = to;
             if is_retry(from, to) {
                 item.attempts += 1;
+                // The run that was executing this item is over, so the item must not still name it
+                // — a sweep reading a stale `task_id` chases a process that no longer exists
+                // (C-240). `assignee` is deliberately untouched: the holder outlives one run.
+                item.runner = None;
+                item.task_id = None;
             }
             Ok(())
         })
@@ -548,6 +553,39 @@ impl WorkBoard for MarkdownBoard {
         .await
     }
 
+    async fn reassign(&self, _ctx: &ToolContext, id: &str, assignee: &str) -> Result<Item> {
+        self.edit_item(id, |item, _body| {
+            // Forcible by design: `claim` protects two live workers from each other, and this is the
+            // case where the holder is dead. The old holder's run goes with it, for the same reason
+            // a retry drops it. Nothing else moves — `transition` owns the state machine.
+            item.assignee = Some(assignee.to_string());
+            item.runner = None;
+            item.task_id = None;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_evidence(
+        &self,
+        _ctx: &ToolContext,
+        id: &str,
+        reference: Reference,
+    ) -> Result<Item> {
+        self.edit_item(id, |item, _body| {
+            // Appending, not replacing — an item legitimately carries a commit *and* the review that
+            // accepted it. A reference already present is dropped: a rework records the same commit
+            // again, and a duplicate carries no information. The append rides the same
+            // compare-and-set as every other write, so two workers recording at once cannot lose one
+            // another's reference.
+            if !item.evidence.contains(&reference) {
+                item.evidence.push(reference);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn comment(&self, _ctx: &ToolContext, id: &str, text: &str) -> Result<()> {
         let note = format!("- {}\n", one_line(text));
         self.edit_item(id, |_item, body| {
@@ -576,8 +614,6 @@ impl WorkBoard for MarkdownBoard {
 
 #[cfg(test)]
 mod tests {
-    use flux_datasource::live::Reference;
-
     use super::*;
 
     fn item() -> Item {

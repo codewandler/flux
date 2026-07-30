@@ -1,8 +1,8 @@
-//! The nine generated `<domain>.*` board operations (A-113, A-130, C-236).
+//! The eleven generated `<domain>.*` board operations (A-113, A-130, C-236, C-240).
 //!
 //! Mirrors `live_datasource_operations.rs` — the board port follows `try_register_live_datasource`
 //! exactly for op generation, atomic registration on a clone, and the evidence surface. What is new
-//! here, and what carries the review weight, is the **mutating** half: five ops declaring
+//! here, and what carries the review weight, is the **mutating** half: seven ops declaring
 //! `Effect::Write` whose `permission_subjects` must stay concrete.
 
 use std::collections::HashSet;
@@ -10,20 +10,23 @@ use std::sync::Arc;
 
 use codewandler_flux_capabilities::{try_register_work_board, MemoryBoard, WorkBoard};
 use flux_datasource::board::{ItemDraft, State};
+use flux_datasource::live::Reference;
 use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL};
 use flux_runtime::{tool_fn, AuthorityRequirement, ToolContext, ToolRegistry};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_system::{System, Workspace};
 use serde_json::{json, Value};
 
-/// The five ops that write. Every assertion about gating below is driven off this list, so adding a
+/// The seven ops that write. Every assertion about gating below is driven off this list, so adding a
 /// mutating op without deciding its subject shape makes the tests fail rather than pass silently.
-const MUTATING: [&str; 5] = [
+const MUTATING: [&str; 7] = [
     "board.create",
     "board.transition",
     "board.claim",
     "board.comment",
     "board.record_dispatch",
+    "board.reassign",
+    "board.record_evidence",
 ];
 
 fn ctx() -> ToolContext {
@@ -58,12 +61,14 @@ fn mutating_params(op: &str, id: &str) -> Value {
         "board.record_dispatch" => {
             json!({"id": id, "runner": "https://worker-1.internal:8787", "task_id": "t_1"})
         }
+        "board.reassign" => json!({"id": id, "assignee": "worker-b"}),
+        "board.record_evidence" => json!({"id": id, "entity": "commit", "entity_id": "deadbeef"}),
         other => panic!("unclassified mutating op {other}"),
     }
 }
 
 #[test]
-fn registration_installs_nine_source_labelled_generated_contracts() {
+fn registration_installs_eleven_source_labelled_generated_contracts() {
     let registry = registry();
     assert_eq!(
         registry.names(),
@@ -75,7 +80,9 @@ fn registration_installs_nine_source_labelled_generated_contracts() {
             "board.get",
             "board.list",
             "board.query",
+            "board.reassign",
             "board.record_dispatch",
+            "board.record_evidence",
             "board.transition",
         ]
     );
@@ -108,7 +115,7 @@ fn registration_installs_nine_source_labelled_generated_contracts() {
 }
 
 #[test]
-fn the_surface_groups_all_nine_operations_behind_the_domain_signal() {
+fn the_surface_groups_all_eleven_operations_behind_the_domain_signal() {
     let mut registry = ToolRegistry::new();
     let surface =
         try_register_work_board(&mut registry, "board", Arc::new(MemoryBoard::new())).unwrap();
@@ -129,6 +136,8 @@ fn the_surface_groups_all_nine_operations_behind_the_domain_signal() {
                 "board.record_dispatch".into(),
                 "board.query".into(),
                 "board.comments".into(),
+                "board.reassign".into(),
+                "board.record_evidence".into(),
             ],
             surface_when: vec![SignalMatch {
                 kind: KIND_SIGNAL.into(),
@@ -146,7 +155,7 @@ fn the_surface_groups_all_nine_operations_behind_the_domain_signal() {
                 &HashSet::from([surface.ambient_signal.clone()])
             )
             .len(),
-        9
+        11
     );
 }
 
@@ -600,6 +609,131 @@ async fn comments_reads_back_what_comment_wrote() {
     assert!(error.contains("no item `nope`"), "{error}");
 }
 
+/// C-240: `reassign` is the one path that moves an item off a holder that is gone, and it takes the
+/// dead holder's run with it. Driven through the generated operation, because that is the only door a
+/// Program has.
+#[tokio::test]
+async fn reassign_moves_the_holder_and_drops_the_dead_run() {
+    let mut registry = ToolRegistry::new();
+    let board = Arc::new(MemoryBoard::new());
+    try_register_work_board(&mut registry, "board", board.clone()).unwrap();
+    let ctx = ctx();
+
+    operation(&registry, "board.create")
+        .execute(&ctx, json!({"title": "handed over"}))
+        .await
+        .unwrap();
+    operation(&registry, "board.claim")
+        .execute(&ctx, json!({"id": "item-1", "assignee": "worker-a"}))
+        .await
+        .unwrap();
+    operation(&registry, "board.record_dispatch")
+        .execute(
+            &ctx,
+            json!({"id": "item-1", "runner": "https://worker-a.internal:8787", "task_id": "t_1"}),
+        )
+        .await
+        .unwrap();
+
+    // `claim` still refuses a non-holder — that behaviour is unchanged.
+    let conflict = operation(&registry, "board.claim")
+        .execute(&ctx, json!({"id": "item-1", "assignee": "worker-b"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(conflict.contains("already claimed by `worker-a`"), "{conflict}");
+
+    let moved = operation(&registry, "board.reassign")
+        .execute(&ctx, json!({"id": "item-1", "assignee": "worker-b"}))
+        .await
+        .unwrap();
+    assert!(moved.content.contains("assignee worker-b"), "{}", moved.content);
+    assert!(
+        !moved.content.contains("runner") && !moved.content.contains("task_id"),
+        "the rendered item must not still advertise the dead run: {}",
+        moved.content
+    );
+    assert!(moved.content.contains("claimed (attempts 0)"), "{}", moved.content);
+
+    // The property the story names: the claim that conflicted now succeeds.
+    operation(&registry, "board.claim")
+        .execute(&ctx, json!({"id": "item-1", "assignee": "worker-b"}))
+        .await
+        .expect("the new holder may claim what it now holds");
+
+    let stored = board.get(&ctx, "item-1").await.unwrap().unwrap();
+    assert_eq!(stored.assignee.as_deref(), Some("worker-b"));
+    assert_eq!(stored.runner, None);
+    assert_eq!(stored.task_id, None);
+}
+
+/// C-240: `record_evidence` is the write `Item::evidence` never had. Both `Reference` spellings reach
+/// the backend, `get` renders them back, and an ambiguous or empty reference is refused with the
+/// operation path.
+#[tokio::test]
+async fn record_evidence_appends_both_reference_spellings_and_refuses_an_ambiguous_one() {
+    let mut registry = ToolRegistry::new();
+    let board = Arc::new(MemoryBoard::new());
+    try_register_work_board(&mut registry, "board", board.clone()).unwrap();
+    let ctx = ctx();
+
+    operation(&registry, "board.create")
+        .execute(&ctx, json!({"title": "cites artifacts"}))
+        .await
+        .unwrap();
+
+    let recorded = operation(&registry, "board.record_evidence")
+        .execute(&ctx, json!({"id": "item-1", "entity": "commit", "entity_id": "deadbeef"}))
+        .await
+        .unwrap();
+    assert!(
+        recorded.content.contains("evidence: commit/deadbeef"),
+        "{}",
+        recorded.content
+    );
+    operation(&registry, "board.record_evidence")
+        .execute(&ctx, json!({"id": "item-1", "url": "https://example.test/pr/1"}))
+        .await
+        .unwrap();
+    // A replayed record does not double the list.
+    operation(&registry, "board.record_evidence")
+        .execute(&ctx, json!({"id": "item-1", "entity": "commit", "entity_id": "deadbeef"}))
+        .await
+        .unwrap();
+
+    let got = operation(&registry, "board.get")
+        .execute(&ctx, json!({"id": "item-1"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.content,
+        "[item item-1] cites artifacts — ready (attempts 0)\nevidence: commit/deadbeef\nevidence: https://example.test/pr/1"
+    );
+    assert_eq!(
+        board.get(&ctx, "item-1").await.unwrap().unwrap().evidence,
+        vec![
+            Reference::Entity {
+                entity: "commit".into(),
+                id: "deadbeef".into()
+            },
+            Reference::Url {
+                url: "https://example.test/pr/1".into()
+            },
+        ]
+    );
+
+    // `query` rows stay the reasoning surface: a weak-reference list is what `get` renders.
+    let rows: Vec<Value> = serde_json::from_str(
+        &operation(&registry, "board.query")
+            .execute(&ctx, json!({}))
+            .await
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    assert!(rows[0].get("evidence").is_none(), "{}", rows[0]);
+}
+
 #[tokio::test]
 async fn an_illegal_transition_errors_through_the_operation_without_writing() {
     let mut registry = ToolRegistry::new();
@@ -673,6 +807,26 @@ async fn bad_input_is_rejected_with_the_operation_path_before_backend_entry() {
             "board.list",
             json!({"filters": {"state": "elsewhere"}}),
             "board.list.filters.state: expected one of",
+        ),
+        (
+            "board.reassign",
+            json!({"id": "item-1", "assignee": " "}),
+            "board.reassign.assignee: must not be blank",
+        ),
+        (
+            "board.record_evidence",
+            json!({"id": "item-1"}),
+            "board.record_evidence: name the artifact as either `url` or `entity` + `entity_id`",
+        ),
+        (
+            "board.record_evidence",
+            json!({"id": "item-1", "entity": "commit"}),
+            "board.record_evidence: an `entity` reference needs both",
+        ),
+        (
+            "board.record_evidence",
+            json!({"id": "item-1", "url": "https://x.test", "entity": "commit", "entity_id": "d"}),
+            "board.record_evidence: `url` and `entity`/`entity_id` are mutually exclusive",
         ),
     ];
     for (op, params, expected) in cases {
