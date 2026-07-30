@@ -37,11 +37,12 @@ verification:
   outcome: >
     desk-review findings 1-4 and the classification-trust concern are CLOSED with evidence and
     production-reachable; envelope-integrity findings 1-3 are CLOSED; envelope-integrity finding 4
-    is still OPEN, verbatim, and was never filed as a story. No child marked `done` was found to
-    have an absent or structurally unreachable control.
+    was still OPEN at the time of this pass, verbatim, and had never been filed as a story — it has
+    since been filed as C-275 and CLOSED (see the finding-4 row). No child marked `done` was found
+    to have an absent or structurally unreachable control.
   material_errors: none in the baseline reviews; two stale claims found in this repo's own ledgers (see "What this pass found that the ledgers did not")
 top_findings:
-  - "OPEN — envelope-integrity finding 4 (`file_stat` reads the file twice and discards it) survives verbatim at `flux-tools/src/extra.rs:96-107`; no story was ever filed for it"
+  - "CLOSED (C-275) — envelope-integrity finding 4 (`file_stat` reads the file twice and discards it). OPEN and unfiled when this pass ran; this artifact is what caused it to be filed"
   - "The board's hand-written `## Status` claims the gate is green in both workspaces; `cargo test --workspace` is red at 588144a2 — 8 tests across 3 `codewandler-flux-lang` targets, traced to 3e2a8b89"
   - "C-186 cannot close as `done`: C-266 is a `ready` child filed the same day as this closure story"
   - "The desk review's headline finding (sandbox off by default) is only PARTIALLY closed — unattended and serving surfaces fail closed (C-262), the interactive default is still `Off` with network open"
@@ -63,9 +64,11 @@ closure from the table below instead of re-deriving it.
 The honest remainder is small but real, and it is stated up front because an unsupported tick here
 would be worse than an open finding:
 
-- **One baseline finding is still open** — envelope-integrity finding 4, LOW, dead code in
-  `file_stat`. It survives verbatim in the tree. It was never filed as a story, which is *how* it
-  survived: it fell out of the epic's scope silently rather than by decision.
+- **One baseline finding was still open when this pass ran** — envelope-integrity finding 4, LOW,
+  dead code in `file_stat`. It survived verbatim in the tree. It was never filed as a story, which
+  is *how* it survived: it fell out of the epic's scope silently rather than by decision.
+  **Since closed by C-275**, which this artifact caused to be filed — the process gap below is the
+  part worth keeping.
 - **This epic still has an open child** (C-266, `ready`) and one deliberately blocked child (C-205).
 - **Two of this repo's own ledger claims are stale**, including one that says the gate is green when
   it is not.
@@ -271,10 +274,32 @@ Called by the baseline *"the structural finding"* and *"the cheapest thing on th
 
 Two things make this row credible rather than nominal. First, `direct_io_allowance_requires_a_real_reason_immediately_above_the_call` — an allowance needs a stated reason at the call site, so the escape hatch is auditable. Second, the first implementation was **review-caught as bypassable**, reworked, and re-verified against a novel bypass; a gate that survived an attack on itself is worth more than one that was merely written.
 
-### 4 — LOW · `file_stat` reads the entire file twice and discards the second read · **OPEN**
+### 4 — LOW · `file_stat` reads the entire file twice and discards the second read · **CLOSED** (C-275)
 
-**This finding is not closed. It survives verbatim in the shipped tree, and no story was ever filed
-for it.**
+> **Closure note, added after this pass.** Filed as **C-275** — the story this artifact existed to
+> provoke — and closed on branch `impl/C-275`. The second `read_file_bytes`, the `mode_str` binding
+> and the `let _ = mode_str;` line are gone from `crates/flux-tools/src/extra.rs`; `file_stat` now
+> reads the target exactly once, for `line_count`.
+>
+> **The choice made on mode: report none, and say so nowhere.** An honest mode needs a guarded
+> accessor on `System`, which does not exist; the only other route is `std::fs::metadata` on the
+> caller's raw string, which escapes the jail — precisely what the original author declined, and
+> what `scripts/check-no-direct-io.sh` refuses. So the op reports no mode, and the *spec
+> description* stopped advertising one too: it promised the model "octal mode" that no emitted
+> field ever carried. The emitted contract is unchanged at `{path, size_bytes, line_count,
+> mtime_unix}`.
+>
+> **Pinned by two tests** in `crates/flux-tools/src/extra.rs`, both red before the fix:
+> `file_stat_reads_the_target_exactly_once` (a source scan of the `FileStatTool` declaration —
+> behaviour cannot witness a discarded read, so the contract is held at the source, and the scan
+> panics rather than passing vacuously if it loses its anchor) and
+> `file_stat_reports_no_mode_anywhere_in_its_contract` (spec description, emitted JSON keys, view).
+>
+> The original analysis is kept verbatim below: it is the evidence, and **the process lesson is the
+> part that outlives the fix.**
+
+**Below, as recorded on 2026-07-30 — the finding was not closed then. It survived verbatim in the
+shipped tree, and no story had ever been filed for it.**
 
 `crates/flux-tools/src/extra.rs:96-107`, in `FileStatTool::execute`:
 

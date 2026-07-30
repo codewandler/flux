@@ -1,6 +1,6 @@
 //! Extra built-in tools: file_stat, path_exists, sqlite_query, home_dir, now, cwd, sys_info.
 //!
-//! - `file_stat`    — file metadata (size, line count, mtime, mode). Risk: Low.
+//! - `file_stat`    — file metadata (size, line count, mtime). Risk: Low.
 //! - `path_exists`  — pure filesystem probe. Risk: Low.
 //! - `sqlite_query` — read-only SQLite query; statement-type allowlist (SELECT/WITH/PRAGMA/EXPLAIN). Risk: Low.
 //! - `home_dir`     — the user's home directory. Risk: Low.
@@ -41,9 +41,9 @@ impl Tool for FileStatTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "file_stat",
-            "Return metadata for a workspace file: size in bytes, line count, last-modified \
-             timestamp (Unix seconds), and octal mode. Replaces `wc -l`, `stat`, `ls -la` for \
-             routine metadata checks.",
+            "Return metadata for a workspace file: size in bytes, line count, and last-modified \
+             timestamp (Unix seconds). Replaces `wc -l`, `stat`, `ls -la` for routine metadata \
+             checks.",
             tool_input_schema::<FileStatInput>(),
         )
         .with_access(vec![AccessKind::Filesystem])
@@ -91,20 +91,12 @@ impl Tool for FileStatTool {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Mode via std::fs::metadata on the real path (the system jail has already resolved it).
-        // We call std::fs here only for metadata — no content IO.
-        let mode_str = ctx
-            .system()
-            .read_file_bytes(path)
-            .await
-            .ok()
-            .map(|_| {
-                // We already read the file above via the guarded system; std::fs::metadata on the
-                // raw string would escape the jail, so we omit mode rather than break confinement.
-                "(mode unavailable)".to_string()
-            })
-            .unwrap_or_else(|| "(mode unavailable)".to_string());
-        let _ = mode_str; // suppress unused warning — we surface it as a note below
+        // No mode is reported, deliberately (C-275). `std::fs::metadata` on the caller's raw
+        // string would escape the jail — the reason the original author declined it — and
+        // `System` exposes no guarded mode accessor to replace it with. Reporting nothing is the
+        // honest option; the alternative is a field the op cannot fill. Do not "fix" this by
+        // re-reading the file: the earlier version awaited a second `read_file_bytes` here and
+        // discarded the bytes, paying a full read of an arbitrarily large file for no output.
 
         let content = json!({
             "path": path,
@@ -893,6 +885,110 @@ mod tests {
             r.content
         );
         let _ = std::fs::remove_file(&outside);
+    }
+
+    // -----------------------------------------------------------------------
+    // C-275: `file_stat` is metadata-only, and says nothing about mode
+    // -----------------------------------------------------------------------
+
+    /// The section banner this file uses between op declarations.
+    const SECTION_BANNER: &str =
+        "\n// ---------------------------------------------------------------------------";
+
+    /// Every guarded call that pulls a file's **whole contents** into memory. `file_stat` needs
+    /// exactly one of these (for `line_count`); a second is by definition read-and-discard.
+    const WHOLE_CONTENT_READS: &[&str] = &[
+        ".read_file_bytes(",
+        ".read_file_bytes_capped(",
+        ".read_file(",
+        ".read_file_scoped(",
+        ".read_optional_text(",
+    ];
+
+    /// This file's `file_stat` declaration: `pub struct FileStatTool` up to the next banner.
+    fn file_stat_section() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/extra.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let start = src
+            .find("\npub struct FileStatTool")
+            .expect("`pub struct FileStatTool` is gone — this scan lost its anchor, fix the scan");
+        let rest = &src[start + 1..];
+        let end = rest.find(SECTION_BANNER).unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// C-275 / envelope-integrity finding 4. `file_stat` used to await `read_file_bytes` a second
+    /// time and feed the bytes to `.map(|_| …)`, paying a full read of an arbitrarily large file
+    /// for nothing. Confinement was never at risk — the cost was. Behaviour cannot witness a
+    /// discarded read (the emitted JSON is identical either way), so the contract is pinned at the
+    /// source: **one** whole-content read in the whole declaration. Reintroduce a second guarded
+    /// read anywhere in `FileStatTool` — for a binary sniff, a mode probe, anything — and this
+    /// fails with the count. It cannot pass vacuously: losing the anchor or the op's own markers
+    /// panics rather than scanning an empty string.
+    #[test]
+    fn file_stat_reads_the_target_exactly_once() {
+        let section = file_stat_section();
+        assert!(
+            section.contains("\"file_stat\"") && section.contains("line_count"),
+            "the scanned section is not `file_stat`'s — the scan needs updating, not silencing"
+        );
+
+        let counts: Vec<(&str, usize)> = WHOLE_CONTENT_READS
+            .iter()
+            .map(|form| (*form, section.matches(form).count()))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let total: usize = counts.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            total, 1,
+            "`file_stat` must read the target exactly once (line counting); found {total}: {counts:?}"
+        );
+    }
+
+    /// C-275. The op reports **no** mode at all — the deliberate choice over reporting one, because
+    /// an honest mode needs a guarded accessor on `System` that does not exist, and the only other
+    /// route is `std::fs::metadata` on the caller's raw string, which escapes the jail (the reason
+    /// the original author declined it, and what `scripts/check-no-direct-io.sh` refuses). Silence
+    /// is then the honest contract, and it has to be silent *everywhere*: the model reads the spec
+    /// description, which used to advertise "octal mode" that no field ever carried.
+    #[tokio::test]
+    async fn file_stat_reports_no_mode_anywhere_in_its_contract() {
+        let (dir, c) = tool_ctx();
+        std::fs::write(dir.join("sample.txt"), "alpha\nbeta\n").unwrap();
+
+        let description = FileStatTool.spec().description.to_lowercase();
+        assert!(
+            !description.contains("mode"),
+            "the spec description promises the model a mode it never returns: {description}"
+        );
+
+        let r = FileStatTool
+            .execute(&c, json!({"path": "sample.txt"}))
+            .await
+            .expect("file_stat on a workspace file succeeds");
+        let parsed: Value = serde_json::from_str(&r.content).expect("content is JSON");
+        let mut keys: Vec<&str> = parsed
+            .as_object()
+            .expect("content is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["line_count", "mtime_unix", "path", "size_bytes"],
+            "file_stat's emitted contract changed"
+        );
+        assert_eq!(parsed["size_bytes"], 11);
+        assert_eq!(parsed["line_count"], 2);
+
+        let view = r.view.unwrap_or_default().to_lowercase();
+        assert!(
+            !r.content.to_lowercase().contains("mode") && !view.contains("mode"),
+            "file_stat mentions mode without reporting one: {} / {view}",
+            r.content
+        );
     }
 
     #[test]
