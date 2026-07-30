@@ -140,8 +140,7 @@ pub enum Backend {
 /// per-**process** fact, so it is stated once no matter how many [`Sandbox`]es a process resolves or
 /// clones. Process-global for the same reason [`PROBE_CACHE`] is — per-instance state would be
 /// defeated by `Sandbox: Clone`.
-static POSTURE_DISCLOSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static POSTURE_DISCLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Test-only reset of [`POSTURE_DISCLOSED`], so the once-per-process tests can each observe a fresh
 /// latch. Callers hold [`SANDBOX_ENV_LOCK`] (via [`EnvGuard`]) to keep that observation exclusive.
@@ -1528,13 +1527,34 @@ mod tests {
         };
 
         for (label, sandbox) in [
-            ("off never asked to be confined", with(SandboxMode::Off, unsupported())),
-            ("a live bubblewrap backend confines us", with(SandboxMode::On, bwrap.clone())),
-            ("a live seatbelt backend confines us", with(SandboxMode::On, seatbelt.clone())),
-            ("an outer flux sandbox already confines us", with(SandboxMode::On, Backend::AlreadyConfined)),
-            ("require + unsupported fails closed instead", with(SandboxMode::Require, unsupported())),
-            ("require + a live backend is confined", with(SandboxMode::Require, bwrap)),
-            ("require under an outer sandbox is confined", with(SandboxMode::Require, Backend::AlreadyConfined)),
+            (
+                "off never asked to be confined",
+                with(SandboxMode::Off, unsupported()),
+            ),
+            (
+                "a live bubblewrap backend confines us",
+                with(SandboxMode::On, bwrap.clone()),
+            ),
+            (
+                "a live seatbelt backend confines us",
+                with(SandboxMode::On, seatbelt.clone()),
+            ),
+            (
+                "an outer flux sandbox already confines us",
+                with(SandboxMode::On, Backend::AlreadyConfined),
+            ),
+            (
+                "require + unsupported fails closed instead",
+                with(SandboxMode::Require, unsupported()),
+            ),
+            (
+                "require + a live backend is confined",
+                with(SandboxMode::Require, bwrap),
+            ),
+            (
+                "require under an outer sandbox is confined",
+                with(SandboxMode::Require, Backend::AlreadyConfined),
+            ),
         ] {
             assert_eq!(
                 sandbox.posture_disclosure(),
