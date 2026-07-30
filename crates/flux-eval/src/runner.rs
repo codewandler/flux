@@ -68,6 +68,21 @@ pub(crate) fn provider_credential_env(
         .collect()
 }
 
+/// Append a task fixture's own `env` to the child's environment, minus the keys a fixture is not
+/// allowed to speak for.
+///
+/// Two refusals, both because this env lands in `build_command`'s **caller-override** slot, which is
+/// applied last and wins:
+/// - provider credentials, so a fixture cannot smuggle a second provider's key or flux's host
+///   secret into the child — authentication material comes solely from the selected-provider
+///   allow-list;
+/// - the sandbox posture (C-282). The harness resolves a posture and `sandbox::posture_env` forwards
+///   it *before* this slot, so a fixture naming `FLUX_SANDBOX=off` would land after it and hand the
+///   child `flux-cli`'s kill switch — which beats the child's own `[sandbox] require` and C-262's
+///   unattended fail-closed profile. A benchmark task has no business moving the harness's
+///   confinement in either direction, so the keys are dropped rather than honored. Filtered against
+///   `flux_system::sandbox::POSTURE_ENV_KEYS` so the set cannot drift from what is actually
+///   forwarded.
 fn extend_task_env(
     env: &mut Vec<(String, String)>,
     task_env: &std::collections::BTreeMap<String, String>,
@@ -75,9 +90,10 @@ fn extend_task_env(
     env.extend(
         task_env
             .iter()
-            // Task fixtures cannot smuggle a second provider credential or flux's host secret into
-            // the child. Authentication material comes solely from the selected-provider allow-list.
-            .filter(|(key, _)| !PROVIDER_CREDENTIAL_ENV.contains(&key.as_str()))
+            .filter(|(key, _)| {
+                !PROVIDER_CREDENTIAL_ENV.contains(&key.as_str())
+                    && !flux_system::sandbox::is_posture_env_key(key)
+            })
             .map(|(key, value)| (key.clone(), value.clone())),
     );
 }
@@ -223,28 +239,6 @@ pub(crate) fn toolchain_env() -> Vec<(String, String)> {
     out
 }
 
-const SANDBOX_CHILD_ENV_KEYS: &[&str] = &[
-    "FLUX_SANDBOX",
-    "FLUX_SANDBOX_NET",
-    "FLUX_SANDBOX_WRITABLE",
-    "FLUX_BWRAP_BIN",
-    "FLUX_SANDBOX_EXEC_BIN",
-];
-
-/// Forward the already-resolved sandbox posture into the child flux host. The child is launched
-/// through the ordinary sandboxed `System` path; `build_command` adds `FLUX_SANDBOXED=1` only when
-/// the wrapper is genuinely active, so it is intentionally absent from this explicit env list.
-fn sandbox_child_env_from(mut read: impl FnMut(&str) -> Option<String>) -> Vec<(String, String)> {
-    SANDBOX_CHILD_ENV_KEYS
-        .iter()
-        .filter_map(|key| read(key).map(|value| ((*key).to_string(), value)))
-        .collect()
-}
-
-fn sandbox_child_env() -> Vec<(String, String)> {
-    sandbox_child_env_from(|key| std::env::var(key).ok())
-}
-
 /// Grade a criterion in the (already-finished) workspace. Reads/exec go through `sys`. Public so the
 /// `grade` op (and any evidence-based flow) can reuse the exact same pass/fail check the eval harness
 /// uses — one grading implementation, no divergence.
@@ -360,10 +354,12 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     env.extend(provider_env);
     // Rust toolchain (so the child's own `cargo`/`rustup` tools work under the isolated HOME).
     env.extend(toolchain_env());
+    // The sandbox posture is NOT appended here. `sys` above carries the resolved `Sandbox`, and the
+    // guarded spawn renders the posture from it (`sandbox::posture_env`) — one implementation of
+    // that decision, reading the resolved sandbox rather than `std::env`, which `System::with_sandbox`
+    // exists to diverge from. `extend_task_env` drops the posture keys so `spec.env` cannot land in
+    // the caller-override slot and replace it (C-282).
     extend_task_env(&mut env, &spec.env);
-    // Add security posture last: benchmark-controlled `spec.env` must not be able to downgrade the
-    // parent CLI's resolved sandbox mode or redirect its backend after the harness decided it.
-    env.extend(sandbox_child_env());
     // In watch mode, reveal authored-loop stages and evidence events.
     if ctx.watch {
         env.push(("FLUX_SHOW_LOOP".to_string(), "1".to_string()));
@@ -452,25 +448,42 @@ mod tests {
         (dir, sys)
     }
 
+    /// C-282: a task fixture's `env` is a **caller override**, and the guarded spawn applies those
+    /// *after* `sandbox::posture_env` — so a benchmark that names `FLUX_SANDBOX=off` would land
+    /// last and hand the eval child `flux-cli`'s kill switch, which beats the child's own
+    /// `[sandbox] require` and C-262's unattended fail-closed profile.
+    ///
+    /// `run_local_task` used to defend this by re-reading the ambient posture out of `std::env` and
+    /// appending it afterwards. That is a hand-rolled copy of a decision with one correct
+    /// implementation, and — read from the environment rather than from the resolved `Sandbox` —
+    /// it disagrees with a pinned posture in exactly the way C-276's first attempt was reworked
+    /// for. A fixture has no legitimate reason to move the harness's posture in either direction,
+    /// so the keys are refused here instead.
     #[test]
-    fn eval_child_gets_resolved_sandbox_posture_but_not_a_false_confinement_marker() {
-        let values = std::collections::HashMap::from([
-            ("FLUX_SANDBOX", "require"),
-            ("FLUX_SANDBOX_NET", "0"),
-            ("FLUX_SANDBOX_WRITABLE", "/output"),
-            ("FLUX_BWRAP_BIN", "/nix/store/example/bin/bwrap"),
-            ("FLUX_SANDBOXED", "1"),
-        ]);
-        let env = sandbox_child_env_from(|key| values.get(key).map(ToString::to_string));
-        assert!(env.contains(&("FLUX_SANDBOX".to_string(), "require".to_string())));
-        assert!(env.contains(&("FLUX_SANDBOX_NET".to_string(), "0".to_string())));
-        assert!(env.contains(&(
-            "FLUX_BWRAP_BIN".to_string(),
-            "/nix/store/example/bin/bwrap".to_string()
-        )));
+    fn a_task_fixture_may_not_name_the_eval_childs_sandbox_posture() {
+        let mut env = Vec::new();
+        extend_task_env(
+            &mut env,
+            &std::collections::BTreeMap::from([
+                ("FLUX_SANDBOX".to_string(), "off".to_string()),
+                ("FLUX_SANDBOX_NET".to_string(), "1".to_string()),
+                (
+                    "FLUX_BWRAP_BIN".to_string(),
+                    "/nonexistent/other-bwrap".to_string(),
+                ),
+                ("TASK_FIXTURE".to_string(), "kept".to_string()),
+            ]),
+        );
         assert!(
-            !env.iter().any(|(key, _)| key == "FLUX_SANDBOXED"),
-            "the network-capable host itself was deliberately not wrapped"
+            !env.iter()
+                .any(|(key, _)| key.starts_with("FLUX_SANDBOX") || key == "FLUX_BWRAP_BIN"),
+            "a benchmark fixture must not be able to downgrade the posture the harness resolved: \
+             {env:?}"
+        );
+        assert!(
+            env.contains(&("TASK_FIXTURE".to_string(), "kept".to_string())),
+            "only the posture keys are dropped — a task's own env is the field's whole point: \
+             {env:?}"
         );
     }
 

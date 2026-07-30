@@ -2118,6 +2118,22 @@ impl System {
         for (key, value) in sandbox::posture_env(sandbox) {
             cmd.env(key, value);
         }
+        // The caller-override slot. Two facts about the sandbox cross into a child, and they sit on
+        // **opposite sides** of this loop on purpose:
+        //
+        // - the *posture* lands **before** it, because a posture is an inherited default a trusted
+        //   call site may legitimately override (`flux-eval`'s child host is one);
+        // - the `FLUX_SANDBOXED` *marker* lands **after** it — in `build_command`, past this
+        //   function — because it asserts confinement that genuinely happened, and no call site may
+        //   forge or clear it.
+        //
+        // So `posture_env`'s floor guarantee is a property of *that function*, not of this path:
+        // anything a call site puts in `env` wins, `FLUX_SANDBOX=off` included, which on the reading
+        // side is `flux-cli`'s kill switch rather than "no opinion". A call site assembling `env`
+        // out of material it does not control — a benchmark fixture, an embedder's startup env —
+        // must therefore refuse the posture keys itself, against `sandbox::POSTURE_ENV_KEYS` rather
+        // than a hand-copied list (C-282). Two such forwarders existed and hand-rolled the whole
+        // decision from `std::env`; both are gone.
         for (k, v) in env {
             cmd.env(k, v);
         }

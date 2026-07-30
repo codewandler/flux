@@ -919,9 +919,37 @@ fn mode_env_value(mode: SandboxMode) -> &'static str {
     }
 }
 
+/// The complete set of keys [`posture_env`] may emit — the sandbox posture rendered as an
+/// environment vocabulary.
+///
+/// Published because the **reverse** direction needs it (C-282). `System::build_command` applies a
+/// caller's `env` overrides *after* [`posture_env`], so any of these keys reaching that slot
+/// silently replaces the posture this process resolved — including with `off`, which on the reading
+/// side is `flux-cli`'s kill switch rather than "no opinion". A call site that assembles an env for
+/// a child out of material it does not itself control (a benchmark fixture, an embedder's startup
+/// env) must therefore be able to refuse a posture key, and it must refuse against *this* list
+/// rather than a hand-copied one that drifts as the posture grows.
+///
+/// `FLUX_SANDBOXED` is deliberately **absent**: that is the confinement *marker*, which is
+/// [`sandbox_marker`]'s alone to set and is applied *after* the caller's overrides precisely so no
+/// call site can forge or clear it. It needs no filtering because it cannot be pushed.
+pub const POSTURE_ENV_KEYS: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOX_NET",
+    "FLUX_SANDBOX_WRITABLE",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+];
+
+/// Whether `key` names part of the sandbox posture — see [`POSTURE_ENV_KEYS`] for why a call site
+/// building a child's environment asks.
+pub fn is_posture_env_key(key: &str) -> bool {
+    POSTURE_ENV_KEYS.contains(&key)
+}
+
 /// C-276: the posture a spawn hands to its child, alongside the `FLUX_SANDBOXED` marker
 /// [`sandbox_marker`] injects. Split out from `apply_safe_env` so the decision is unit-testable
-/// without a live backend.
+/// without a live backend. Every key it can emit is listed in [`POSTURE_ENV_KEYS`].
 ///
 /// The defect this closes was an **asymmetry**: `SAFE_ENV` carried `FLUX_SANDBOXED` — the marker
 /// whose whole job is to assert *"you are already confined"* — and none of the variables that
@@ -1919,6 +1947,58 @@ mod tests {
         assert!(
             !forwarded.iter().any(|(k, _)| *k == "FLUX_SANDBOX_NET"),
             "an open network must not be forwarded: {forwarded:?}"
+        );
+    }
+
+    /// C-282: [`POSTURE_ENV_KEYS`] is published so a downstream call site can refuse a posture key
+    /// in a caller override. That is only worth anything while it stays the **complete** set — a
+    /// key `posture_env` emits but the list omits is a hole that looks closed, and the filter built
+    /// on it would let exactly that key through into the slot that lands last and wins.
+    ///
+    /// Driven over every backend and settings shape rather than over one sandbox, so a new key
+    /// added on any branch of `posture_env` is caught here rather than downstream.
+    #[test]
+    fn every_key_posture_env_can_emit_is_named_in_the_published_list() {
+        let backends = [
+            Backend::Bubblewrap {
+                bwrap: PathBuf::from("/usr/bin/bwrap"),
+            },
+            Backend::Seatbelt {
+                sandbox_exec: PathBuf::from("/usr/bin/sandbox-exec"),
+            },
+            Backend::AlreadyConfined,
+            Backend::Unsupported {
+                reason: "none".to_string(),
+            },
+        ];
+        let mut seen: Vec<&'static str> = Vec::new();
+        for backend in backends {
+            for mode in [SandboxMode::Off, SandboxMode::On, SandboxMode::Require] {
+                for network in [true, false] {
+                    for extra in [&[][..], &["/output"][..]] {
+                        let sandbox = pinned(mode, network, extra, backend.clone());
+                        for (key, _) in posture_env(&sandbox) {
+                            assert!(
+                                is_posture_env_key(key),
+                                "`{key}` is forwarded by posture_env but missing from \
+                                 POSTURE_ENV_KEYS, so every downstream filter silently lets it \
+                                 through into the caller-override slot"
+                            );
+                            if !seen.contains(&key) {
+                                seen.push(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seen.sort_unstable();
+        let mut published = POSTURE_ENV_KEYS.to_vec();
+        published.sort_unstable();
+        assert_eq!(
+            seen, published,
+            "the list must also not be *wider* than reality: a key nothing emits is a filter that \
+             drops a variable for no reason"
         );
     }
 

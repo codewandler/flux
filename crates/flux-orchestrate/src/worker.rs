@@ -104,26 +104,6 @@ const DEFAULT_MAX_FLEET_DEPTH: u32 = 1;
 /// in, so exhausting it reports a budget rather than a port scan.
 const DEFAULT_MAX_WORKERS: usize = 16;
 
-/// Sandbox-posture variables forwarded verbatim into a worker.
-///
-/// Copied in spirit from `flux_eval`'s `SANDBOX_CHILD_ENV_KEYS`, which forwards exactly these into
-/// the eval child `flux` host, and for the same reason: none of them is in `build_command`'s
-/// `SAFE_ENV`, so without this a worker resolves its posture from an **empty** environment and
-/// silently runs `FLUX_SANDBOX=off` while the operator asked for `require`. A worker is a full
-/// `flux` that spawns processes of its own; it must confine them exactly as its parent would.
-///
-/// `FLUX_SANDBOXED` is deliberately **absent**, as it is in the eval list: that marker means "you
-/// are already inside a wrapper, do not nest", and only `build_command` may set it — it does so
-/// itself when the wrapper is genuinely active. Forwarding it by hand would let a worker skip its
-/// own confinement on the strength of a claim nobody checked.
-const SANDBOX_POSTURE_ENV: &[&str] = &[
-    "FLUX_SANDBOX",
-    "FLUX_SANDBOX_NET",
-    "FLUX_SANDBOX_WRITABLE",
-    "FLUX_BWRAP_BIN",
-    "FLUX_SANDBOX_EXEC_BIN",
-];
-
 // ── ProcessRuntime ──────────────────────────────────────────────────────────
 
 /// One live child `flux`, plus what the ops need to answer about it after the fact.
@@ -300,19 +280,35 @@ impl ProcessRuntime {
         argv
     }
 
-    /// The environment one worker is started with: the host seam's `env`, the coordinator's sandbox
-    /// posture, and the depth this worker is granted.
+    /// The environment one worker is started with: the host seam's `env` and the depth this worker
+    /// is granted.
     ///
     /// Ordering is load-bearing — `apply_safe_env` applies these last and lets later entries win — so
     /// the depth marker is appended after everything else. A `with_startup` caller therefore cannot
     /// overwrite the budget by passing `FLUX_FLEET_DEPTH` itself.
-    fn worker_env(&self, system: &System) -> Vec<(String, String)> {
-        let mut env = self.env.clone();
-        for key in SANDBOX_POSTURE_ENV {
-            if let Some(value) = system.env(key) {
-                env.push(((*key).to_string(), value));
-            }
-        }
+    ///
+    /// The coordinator's **sandbox posture is deliberately not here**. A worker is a full `flux`
+    /// that spawns processes of its own and must confine them exactly as its parent would, but that
+    /// is the guarded spawn's job: `sandbox::posture_env` renders the posture from `system`'s
+    /// resolved `Sandbox` and `apply_safe_env` applies it *before* this env (C-276). This method
+    /// used to hand-roll the same forwarding out of the **ambient environment** and push it into the
+    /// caller-override slot, which lands after — so a coordinator pinned non-`Off` under an ambient
+    /// `FLUX_SANDBOX=off` (the shape `System::with_sandbox` exists to create) handed its worker
+    /// `flux-cli`'s kill switch, strictly less confined than forwarding nothing (C-282).
+    ///
+    /// The startup env is filtered for the same reason rather than merely documented: a call site
+    /// has no legitimate reason to push a worker's posture **downward**, so the slot is closed, the
+    /// way [`DEPTH_ENV`] already is. Filtered against `sandbox::POSTURE_ENV_KEYS`, not a local copy,
+    /// so it cannot drift from what is actually forwarded. `FLUX_SANDBOXED` needs no filter: it is
+    /// applied *after* the overrides by `build_command`, so it can be neither forged nor cleared
+    /// from here.
+    fn worker_env(&self) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = self
+            .env
+            .iter()
+            .filter(|(key, _)| !flux_system::sandbox::is_posture_env_key(key))
+            .cloned()
+            .collect();
         env.push((DEPTH_ENV.to_string(), (self.depth + 1).to_string()));
         env
     }
@@ -329,7 +325,7 @@ impl ProcessRuntime {
         id: &str,
         spec: &WorkerSpec,
     ) -> Result<(String, String, ManagedChild)> {
-        let env = self.worker_env(system);
+        let env = self.worker_env();
         let mut refused = Vec::new();
         for _ in 0..PORT_SPAN {
             let port = self.next_candidate();
@@ -1151,6 +1147,55 @@ mod tests {
         dir
     }
 
+    /// Serializes the tests that mutate the process-global sandbox environment, and restores every
+    /// key it touched on drop — panic-safe, so a failed assertion cannot leak a posture into a
+    /// later test in the same process. Mirrors `flux_system::sandbox::EnvGuard`, which is
+    /// `pub(crate)` there and so cannot be reused across the crate boundary.
+    struct SandboxEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    static SANDBOX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl SandboxEnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            // A poisoned lock still serializes correctly: the guard restores what it saved, so a
+            // panicking test leaves the environment clean even though the mutex is marked.
+            let lock = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for SandboxEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// The keys `flux_system::sandbox::posture_env` may emit, collected out of a spawned `env`
+    /// dump — so a test asserts the **whole** forwarded posture rather than the one entry it
+    /// expected to move. Same shape (and, deliberately, its own copy of the key list rather than a
+    /// read of the production constant) as C-276's helper in `flux-system`.
+    fn forwarded_posture(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .filter(|line| {
+                line.starts_with("FLUX_SANDBOX=")
+                    || line.starts_with("FLUX_SANDBOX_NET=")
+                    || line.starts_with("FLUX_SANDBOX_WRITABLE=")
+                    || line.starts_with("FLUX_BWRAP_BIN=")
+                    || line.starts_with("FLUX_SANDBOX_EXEC_BIN=")
+            })
+            .collect()
+    }
+
     /// Fast startup budget + no extra env, so a failing test fails in seconds rather than a minute.
     fn runtime_for(program: PathBuf) -> ProcessRuntime {
         ProcessRuntime::with_program(program).with_startup(Duration::from_secs(10), Vec::new())
@@ -1576,34 +1621,124 @@ mod tests {
     /// so it confines its own descendants — and must NOT receive `FLUX_SANDBOXED`, which only
     /// `build_command` may set and which means "you are already wrapped, do not nest".
     ///
-    /// None of `FLUX_SANDBOX*` is in `build_command`'s `SAFE_ENV`, so without this forwarding a worker
-    /// resolves its posture from an empty environment and runs `FLUX_SANDBOX=off` while the operator
-    /// demanded `require`. Same list, same omission, same reasoning as `flux_eval`'s
-    /// `SANDBOX_CHILD_ENV_KEYS`.
+    /// Since C-276 the posture travels with the guarded spawn itself (`sandbox::posture_env`,
+    /// rendered from the coordinator's resolved `Sandbox`), so `worker_env` no longer forwards any
+    /// of it — the assertion is now that it forwards **none** of it, marker included. C-282 removed
+    /// the hand-rolled copy; the two tests below are what hold that.
     #[test]
-    fn a_worker_inherits_the_sandbox_posture_but_never_the_confined_marker() {
-        let root = test_root("posture-env");
+    fn a_worker_env_carries_no_sandbox_posture_and_never_the_confined_marker() {
         let runtime = ProcessRuntime::with_program("/nonexistent/worker");
-        // Read through the guarded accessor the runtime itself uses, so this reflects the real path.
-        let system = test_system(&root);
-        let env = runtime.worker_env(&system);
+        let env = runtime.worker_env();
 
         assert!(
             !env.iter().any(|(k, _)| k == "FLUX_SANDBOXED"),
             "FLUX_SANDBOXED is build_command's to set when the wrapper is genuinely active; \
              forwarding it would let a worker skip its own confinement: {env:?}"
         );
-        // Every posture key the host has set must be forwarded; ones it has not set must not be
-        // invented. Asserted against the live environment so the list cannot drift from reality.
-        for key in SANDBOX_POSTURE_ENV {
-            let forwarded = env.iter().any(|(k, _)| k == key);
-            assert_eq!(
-                forwarded,
-                std::env::var(key).is_ok(),
-                "`{key}` forwarding must follow whether the host actually set it: {env:?}"
-            );
-        }
+        assert!(
+            !env.iter().any(|(k, _)| k.starts_with("FLUX_SANDBOX")
+                || k == "FLUX_BWRAP_BIN"
+                || k == "FLUX_SANDBOX_EXEC_BIN"),
+            "the posture is the guarded spawn's to forward, from the resolved Sandbox — a copy \
+             here lands in the caller-override slot and replaces it: {env:?}"
+        );
+    }
+
+    /// C-282: a worker must receive the posture its coordinator **resolved**, and `worker_env` must
+    /// not be able to replace it with a different one.
+    ///
+    /// The guarded spawn already forwards the resolved posture (C-276's `sandbox::posture_env`),
+    /// but it does so *before* caller overrides — so whatever `worker_env` puts in the env slot
+    /// lands after it and wins. The forwarder removed here read the **ambient** environment, which
+    /// `System::with_sandbox` exists precisely to diverge from: a coordinator pinned `On` under an
+    /// ambient `FLUX_SANDBOX=off` handed its worker `flux-cli`'s kill switch, leaving it strictly
+    /// less confined than forwarding nothing would have.
+    ///
+    /// Asserted as a **differential** against a spawn with no caller env at all: the expectation is
+    /// the real `posture_env` output on this host rather than a second copy of its rules, so the
+    /// test cannot agree with a wrong implementation of the decision it is checking. The whole
+    /// forwarded posture is compared, not the one key expected to move.
+    #[tokio::test]
+    async fn a_worker_receives_the_coordinators_resolved_posture_not_the_ambient_one() {
+        use flux_system::sandbox::{Sandbox, SandboxMode, SandboxSettings};
+
+        let root = test_root("posture-floor");
+        let runtime = runtime_for(stand_in_worker());
+
+        let _env = SandboxEnvGuard::new(&["FLUX_SANDBOX", "FLUX_SANDBOX_NET"]);
+        // `On` rather than `Require`: `Require` without a backend refuses at `ensure_available`,
+        // which would prove something else entirely. Resolved before the ambient env is poisoned,
+        // so this is a genuinely *pinned* posture — the `with_sandbox` shape.
+        let pinned = Sandbox::resolve(SandboxSettings {
+            mode: SandboxMode::On,
+            network: true,
+            extra_writable: Vec::new(),
+        });
+        let system = System::new(Workspace::new(&root).expect("workspace")).with_sandbox(pinned);
+        // The ambient environment now contradicts the pin, the way an embedder's host env can.
+        std::env::set_var("FLUX_SANDBOX", "off");
+        std::env::set_var("FLUX_SANDBOX_NET", "0");
+
+        let floor = system
+            .run_with_env(&["env".to_string()], &[], Duration::from_secs(60))
+            .await
+            .expect("the baseline spawn");
+        let floor = forwarded_posture(&floor.stdout).join("\n");
+        assert!(
+            floor.contains("FLUX_SANDBOX=on"),
+            "the baseline must carry the pinned posture or this test proves nothing:\n{floor}"
+        );
+
+        let worker_env = runtime.worker_env();
+        let worker = system
+            .run_with_env(&["env".to_string()], &worker_env, Duration::from_secs(60))
+            .await
+            .expect("the worker-env spawn");
+        assert_eq!(
+            forwarded_posture(&worker.stdout).join("\n"),
+            floor,
+            "a worker's env must not move the posture the guarded spawn already forwarded: \
+             pushing the ambient `off` into the caller-override slot hands the worker flux-cli's \
+             kill switch, which beats its own `[sandbox] require` and C-262's unattended \
+             fail-closed profile.\nworker env: {worker_env:?}\nfull child env:\n{}",
+            worker.stdout
+        );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other half of C-282: `with_startup`'s `env` is a caller override too, and the guarded
+    /// spawn applies those *after* the posture — so an embedder passing `FLUX_SANDBOX=off` through
+    /// that seam would silently unconfine every worker it starts.
+    ///
+    /// There is no legitimate reason for a call site to push a coordinator's posture **downward**:
+    /// a worker is a full `flux` that spawns processes of its own and must confine them exactly as
+    /// its parent would. So the slot is closed rather than merely documented — the same treatment
+    /// [`DEPTH_ENV`] already gets, for the same reason.
+    #[test]
+    fn a_startup_env_may_not_push_a_sandbox_posture_at_a_worker() {
+        let runtime = ProcessRuntime::with_program("/nonexistent/worker").with_startup(
+            Duration::from_secs(1),
+            vec![
+                ("FLUX_SANDBOX".to_string(), "off".to_string()),
+                (
+                    "FLUX_BWRAP_BIN".to_string(),
+                    "/nonexistent/other-bwrap".to_string(),
+                ),
+                ("WORKER_LABEL".to_string(), "kept".to_string()),
+            ],
+        );
+        let env = runtime.worker_env();
+
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k.starts_with("FLUX_SANDBOX") || k == "FLUX_BWRAP_BIN"),
+            "a startup env must not be able to name the worker's sandbox posture: {env:?}"
+        );
+        assert!(
+            env.contains(&("WORKER_LABEL".to_string(), "kept".to_string())),
+            "only the posture keys are dropped — carrying the rest is the seam's whole point: \
+             {env:?}"
+        );
     }
 
     /// Review finding B3: a worker is spawned with `--yes`, and its own catalog contains
@@ -1633,7 +1768,7 @@ mod tests {
         // parent's — a coordinator at depth 0 grants 1, never 0.
         let coordinator = runtime_for(program);
         assert_eq!(coordinator.depth(), 0, "a test process is not a worker");
-        let env = coordinator.worker_env(&system);
+        let env = coordinator.worker_env();
         assert_eq!(
             env.iter()
                 .filter(|(k, _)| k == DEPTH_ENV)
@@ -1648,7 +1783,7 @@ mod tests {
             .with_startup(Duration::from_secs(1), vec![(DEPTH_ENV.into(), "0".into())]);
         assert_eq!(
             spoofed
-                .worker_env(&system)
+                .worker_env()
                 .iter()
                 .filter(|(k, _)| k == DEPTH_ENV)
                 .map(|(_, v)| v.as_str())

@@ -2,7 +2,7 @@
 id: C-282
 title: "Two hand-rolled sandbox-env forwarders sit downstream of the posture floor and can push `off`"
 pillar: Core
-status: ready
+status: in-progress
 priority: 4
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -35,29 +35,79 @@ is exactly the drift shape C-249 was filed for.
 
 ## Acceptance
 
-- [ ] A failing-first test demonstrates the gap concretely: a process with a resolved non-`Off`
+- [x] A failing-first test demonstrates the gap concretely: a process with a resolved non-`Off`
       posture spawns through one of these two paths under an ambient `FLUX_SANDBOX=off`, and the
       child receives `off` rather than the parent's floor. Assert the **whole** forwarded posture,
       not the one key you expect to move — C-276's tests use a `forwarded_posture` helper for exactly
       this reason and it is the shape to copy.
-- [ ] Both call sites stop hand-rolling the decision. The values must come from the same source
+- [x] Both call sites stop hand-rolling the decision. The values must come from the same source
       `posture_env` reads (the resolved `Sandbox`), not from `std::env` — **this is the identical
       defect C-276's round 1 shipped and was reworked for**: gating on the resolved posture while
       taking the value from the ambient environment. Read that story's Progress before choosing a
       shape; the trap is documented there in full.
-- [ ] If either call site has a legitimate reason to override the posture *downward*, it is stated
+- [x] If either call site has a legitimate reason to override the posture *downward*, it is stated
       and enforced rather than left implicit. "It reads ambient env because it always has" is not a
       reason. If there is no such reason, the override should not be reachable at all.
-- [ ] The ordering asymmetry is documented where it will be hit: `posture_env` is applied *before*
+- [x] The ordering asymmetry is documented where it will be hit: `posture_env` is applied *before*
       caller overrides (a posture is an inherited default a trusted call site may override) while
       the `FLUX_SANDBOXED` marker is applied *after* them (so no call site can forge or clear it).
       That difference is deliberate and is what makes this story possible; say so at the override
       slot, not only at `posture_env`.
-- [ ] Full gate green, including `FLUX_BWRAP_BIN=/nonexistent/bwrap`.
+- [x] Full gate green, including `FLUX_BWRAP_BIN=/nonexistent/bwrap`.
 
 ## Progress
 
-- (not started)
+- **Both hand-forwarders are deleted, not rewritten.** `flux-eval`'s `SANDBOX_CHILD_ENV_KEYS` /
+  `sandbox_child_env` / `sandbox_child_env_from` and `flux-orchestrate`'s `SANDBOX_POSTURE_ENV` are
+  gone. Neither call site needed a corrected copy of the decision, because there is nothing left for
+  a copy to do: both spawn through a `System` that already carries the resolved `Sandbox`, and
+  `apply_safe_env` renders the posture from it (`sandbox::posture_env`, C-276) on *every* spawn path
+  regardless of `Confinement`. The hand-forwarders were pure redundancy — right up until the resolved
+  posture and the ambient env disagreed, which is exactly what `System::with_sandbox` exists to
+  create. `worker_env` no longer takes a `&System` at all, since it has nothing left to read from it.
+- **The answer to "is there a legitimate downward override?" is no, at both sites, and the slot is
+  closed rather than documented.** Deleting the forwarders alone would have been a *regression*: both
+  sites relied on landing last to defend against an untrusted env source that lands in the same
+  caller-override slot. `runner.rs`'s own comment said so ("benchmark-controlled `spec.env` must not
+  be able to downgrade the parent CLI's resolved sandbox mode"). So the defence moved to where it
+  belongs — a refusal at the source:
+  - `extend_task_env` now drops the posture keys from a task fixture's `env`, alongside the provider
+    credentials it already dropped, and for the same reason (both land in a slot applied last).
+  - `worker_env` now drops them from `with_startup`'s `env` — the same treatment `DEPTH_ENV` already
+    gets, and stated in the same terms: a worker is a full `flux` that must confine its descendants
+    exactly as its parent would, so no call site gets to move that downward.
+- **One list, filtered against, never copied.** `flux_system::sandbox::POSTURE_ENV_KEYS` (+
+  `is_posture_env_key`) is now public, and both filters read it. A `flux-system` unit test drives
+  `posture_env` over every backend × mode × network × writable shape and asserts the emitted key set
+  equals the published list **exactly** — neither narrower (a hole that looks closed) nor wider (a
+  filter dropping a variable for no reason). Without that, publishing the list would just have
+  recreated the drift shape one level up.
+- **The ordering asymmetry is now stated at the override slot**, in `apply_safe_env` where the
+  caller's `env` is applied: posture *before* (an inherited default a trusted call site may
+  override), `FLUX_SANDBOXED` *after* (so no call site can forge or clear it), and therefore what a
+  call site must do about it. It was previously documented only on `posture_env` and `build_command`
+  — neither of which a call site is reading when it decides what to put in `env`.
+- Proof (`crates/flux-orchestrate/src/worker.rs`):
+  `a_worker_receives_the_coordinators_resolved_posture_not_the_ambient_one`. At the merge base
+  `389f1c95`, with the coordinator pinned `On` and the ambient env saying `off`, the child's own env
+  dump read `FLUX_BWRAP_BIN=/usr/bin/bwrap  FLUX_SANDBOX=off  FLUX_SANDBOX_NET=0` against a floor of
+  `FLUX_BWRAP_BIN=/usr/bin/bwrap  FLUX_SANDBOX=on` — the kill switch, delivered. Asserted as a
+  **differential** against a spawn with no caller env at all, so the expectation is the real
+  `posture_env` output on that host rather than a second copy of its rules; the whole forwarded
+  posture is compared, per C-276's `forwarded_posture` shape (which the test re-states locally rather
+  than reading `POSTURE_ENV_KEYS`, so it cannot agree with a wrong production list).
+  Two hermetic companions: `a_startup_env_may_not_push_a_sandbox_posture_at_a_worker` and
+  `flux-eval`'s `a_task_fixture_may_not_name_the_eval_childs_sandbox_posture`; both also failed at
+  the base.
+- **The note's ⚠ is answered: they are the same two sites, not a third and fourth.** C-276's
+  `SANDBOX_POSTURE_ENV` / `sandbox_child_env` pair *is* `runner.rs:244-246,366` /
+  `worker.rs:309-315`. A repo-wide grep for `FLUX_SANDBOX` outside `flux-system`/`flux-cli` finds no
+  other forwarder. `flux-codegate`'s identically-named `SANDBOX_POSTURE_ENV` is unrelated — it is
+  C-266's list of env keys whose *appearance in a test spawn's builder chain* counts as a posture
+  declaration, a lint input, not a forwarder — and was deliberately left alone.
+- The falsified doc C-276 flagged (`worker.rs:1579`, "None of `FLUX_SANDBOX*` is in
+  `build_command`'s `SAFE_ENV`") is gone with the test it annotated; the replacement asserts the
+  inverse property, that `worker_env` forwards *none* of the posture.
 
 ## Notes
 
