@@ -2124,16 +2124,25 @@ impl System {
         // - the *posture* lands **before** it, because a posture is an inherited default a trusted
         //   call site may legitimately override (`flux-eval`'s child host is one);
         // - the `FLUX_SANDBOXED` *marker* lands **after** it — in `build_command`, past this
-        //   function — because it asserts confinement that genuinely happened, and no call site may
-        //   forge or clear it.
+        //   function — because it asserts confinement that genuinely happened.
         //
         // So `posture_env`'s floor guarantee is a property of *that function*, not of this path:
         // anything a call site puts in `env` wins, `FLUX_SANDBOX=off` included, which on the reading
-        // side is `flux-cli`'s kill switch rather than "no opinion". A call site assembling `env`
-        // out of material it does not control — a benchmark fixture, an embedder's startup env —
-        // must therefore refuse the posture keys itself, against `sandbox::POSTURE_ENV_KEYS` rather
-        // than a hand-copied list (C-282). Two such forwarders existed and hand-rolled the whole
-        // decision from `std::env`; both are gone.
+        // side is `flux-cli`'s kill switch rather than "no opinion".
+        //
+        // The marker's protection is narrower than the ordering above suggests, and the difference
+        // matters here. `sandbox_marker` returns `Some` only for a `Sandboxed` spawn over an
+        // **active** sandbox, and `build_command` writes the key only on `Some` — so the marker
+        // outranks a caller exactly when the spawn is *genuinely wrapped*. For an `Exempt` spawn, or
+        // the inactive sandbox that is this project's default posture, nothing is written after this
+        // loop and a caller-supplied `FLUX_SANDBOXED=1` reaches the child verbatim, where it reads
+        // as "already confined, do not nest". That gap is pre-existing and filed separately.
+        //
+        // Either way the obligation lands in the same place: a call site assembling `env` out of
+        // material it does not control — a benchmark fixture, an embedder's startup env — must
+        // refuse these keys itself, against `sandbox::SANDBOX_ENV_KEYS` (posture *and* marker)
+        // rather than a hand-copied list (C-282). Two such forwarders existed and hand-rolled the
+        // whole decision from `std::env`; both are gone.
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -2162,7 +2171,12 @@ impl System {
     /// Two env facts about the sandbox cross into the child, and they are deliberately different
     /// shapes. [`sandbox::sandbox_marker`] stamps `FLUX_SANDBOXED=1` only when the spawn was
     /// *genuinely* wrapped — a claim of confinement must never outrun the thing it claims — and it
-    /// is applied last, after the caller's overrides, so no call site can forge or clear it.
+    /// is applied last, after the caller's overrides, so for a wrapped spawn no call site can forge
+    /// or clear it. Scope that to the wrapped case, because the `if let Some(..)` below is what
+    /// enforces it: when the marker is `None` (an `Exempt` spawn, or an inactive sandbox — the
+    /// default posture) nothing is written after the overrides, and a caller-supplied
+    /// `FLUX_SANDBOXED` survives. Pre-existing, filed separately; see `sandbox::SANDBOX_ENV_KEYS`
+    /// for what a call site owes in the meantime.
     /// [`sandbox::posture_env`] adds the posture that decides whether confinement happens at all,
     /// so a child `flux` inherits the confinement this process resolved rather than reading `off`
     /// out of an environment with no posture in it (C-276). It is applied *before* the caller's

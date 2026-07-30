@@ -76,13 +76,16 @@ pub(crate) fn provider_credential_env(
 /// - provider credentials, so a fixture cannot smuggle a second provider's key or flux's host
 ///   secret into the child — authentication material comes solely from the selected-provider
 ///   allow-list;
-/// - the sandbox posture (C-282). The harness resolves a posture and `sandbox::posture_env` forwards
-///   it *before* this slot, so a fixture naming `FLUX_SANDBOX=off` would land after it and hand the
-///   child `flux-cli`'s kill switch — which beats the child's own `[sandbox] require` and C-262's
-///   unattended fail-closed profile. A benchmark task has no business moving the harness's
-///   confinement in either direction, so the keys are dropped rather than honored. Filtered against
-///   `flux_system::sandbox::POSTURE_ENV_KEYS` so the set cannot drift from what is actually
-///   forwarded.
+/// - the sandbox posture *and the confinement marker* (C-282). The harness resolves a posture and
+///   `sandbox::posture_env` forwards it *before* this slot, so a fixture naming `FLUX_SANDBOX=off`
+///   would land after it and hand the child `flux-cli`'s kill switch — which beats the child's own
+///   `[sandbox] require` and C-262's unattended fail-closed profile. `FLUX_SANDBOXED` is refused for
+///   a sharper reason: `build_command` overwrites the marker after the overrides *only* when the
+///   spawn is genuinely wrapped, so against an inactive sandbox a fixture could claim a confinement
+///   that never happened and the child would skip wrapping itself. A benchmark task has no business
+///   moving the harness's confinement in either direction, so the keys are dropped rather than
+///   honored. Filtered against `flux_system::sandbox::SANDBOX_ENV_KEYS` so the set cannot drift from
+///   what the spawn actually forwards.
 fn extend_task_env(
     env: &mut Vec<(String, String)>,
     task_env: &std::collections::BTreeMap<String, String>,
@@ -92,7 +95,7 @@ fn extend_task_env(
             .iter()
             .filter(|(key, _)| {
                 !PROVIDER_CREDENTIAL_ENV.contains(&key.as_str())
-                    && !flux_system::sandbox::is_posture_env_key(key)
+                    && !flux_system::sandbox::is_sandbox_env_key(key)
             })
             .map(|(key, value)| (key.clone(), value.clone())),
     );
@@ -459,14 +462,22 @@ mod tests {
     /// it disagrees with a pinned posture in exactly the way C-276's first attempt was reworked
     /// for. A fixture has no legitimate reason to move the harness's posture in either direction,
     /// so the keys are refused here instead.
+    ///
+    /// `FLUX_SANDBOXED` is in the input on purpose, and refused for a sharper reason than the rest:
+    /// `build_command` overwrites the marker after the overrides *only* for a genuinely wrapped
+    /// spawn, so against an inactive sandbox — the default posture — this filter is the only thing
+    /// standing between a fixture and a child that believes it is already confined. The assertion
+    /// covers every `FLUX_SANDBOX*` spelling and the filter
+    /// (`sandbox::SANDBOX_ENV_KEYS`) covers exactly the same set, so neither over-promises.
     #[test]
-    fn a_task_fixture_may_not_name_the_eval_childs_sandbox_posture() {
+    fn a_task_fixture_may_not_name_the_eval_childs_sandbox_posture_or_forge_the_marker() {
         let mut env = Vec::new();
         extend_task_env(
             &mut env,
             &std::collections::BTreeMap::from([
                 ("FLUX_SANDBOX".to_string(), "off".to_string()),
                 ("FLUX_SANDBOX_NET".to_string(), "1".to_string()),
+                ("FLUX_SANDBOXED".to_string(), "1".to_string()),
                 (
                     "FLUX_BWRAP_BIN".to_string(),
                     "/nonexistent/other-bwrap".to_string(),
@@ -477,8 +488,8 @@ mod tests {
         assert!(
             !env.iter()
                 .any(|(key, _)| key.starts_with("FLUX_SANDBOX") || key == "FLUX_BWRAP_BIN"),
-            "a benchmark fixture must not be able to downgrade the posture the harness resolved: \
-             {env:?}"
+            "a benchmark fixture must not be able to downgrade the posture the harness resolved, \
+             nor claim a confinement that never happened: {env:?}"
         );
         assert!(
             env.contains(&("TASK_FIXTURE".to_string(), "kept".to_string())),

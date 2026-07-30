@@ -76,12 +76,40 @@ is exactly the drift shape C-249 was filed for.
   - `worker_env` now drops them from `with_startup`'s `env` — the same treatment `DEPTH_ENV` already
     gets, and stated in the same terms: a worker is a full `flux` that must confine its descendants
     exactly as its parent would, so no call site gets to move that downward.
-- **One list, filtered against, never copied.** `flux_system::sandbox::POSTURE_ENV_KEYS` (+
-  `is_posture_env_key`) is now public, and both filters read it. A `flux-system` unit test drives
-  `posture_env` over every backend × mode × network × writable shape and asserts the emitted key set
-  equals the published list **exactly** — neither narrower (a hole that looks closed) nor wider (a
-  filter dropping a variable for no reason). Without that, publishing the list would just have
-  recreated the drift shape one level up.
+- **Two lists, filtered against, never copied.** `flux_system::sandbox` now publishes
+  `POSTURE_ENV_KEYS` / `is_posture_env_key` (exactly what `posture_env` renders) and
+  `SANDBOX_ENV_KEYS` / `is_sandbox_env_key` (that list **plus `FLUX_SANDBOXED`** — what a call site
+  must refuse). Both filters read the second. Two unit tests hold them: one drives `posture_env` over
+  every backend × mode × network × writable shape and asserts the emitted key set equals
+  `POSTURE_ENV_KEYS` **exactly** — neither narrower (a hole that looks closed) nor wider (a filter
+  dropping a variable for no reason); the other asserts `SANDBOX_ENV_KEYS` is that list plus the
+  marker and nothing else, so forgetting to widen it alongside a new posture key cannot pass.
+- **Round 2, correction 1 — the diff asserted something false about the marker, and now does not.**
+  Three comments said no call site can forge or clear `FLUX_SANDBOXED`. Review disproved it against an
+  **inactive** sandbox, which is the default posture: `sandbox_marker` returns `Some` only for a
+  `Sandboxed` spawn over an *active* sandbox (`sandbox.rs:904-910`) and `build_command` writes the key
+  only on `Some` (`lib.rs:2209-2211`), so when nothing is wrapped nothing is written after the
+  caller's env and a supplied `FLUX_SANDBOXED=1` goes through verbatim. Verified in-tree before
+  rewriting. All three now state the real scope — unforgeable *when the spawn is genuinely wrapped*,
+  undefended when it is not — and name the behaviour gap as pre-existing and separately filed. This
+  mattered because the diff had made the false claim newly load-bearing: it was the stated reason for
+  omitting the marker from the published key list.
+- **Round 2, correction 2 — the two refusal tests no longer assert more than the filters guarantee.**
+  Both asserted `!key.starts_with("FLUX_SANDBOX")` (which covers `FLUX_SANDBOXED`) while the filters
+  called `is_posture_env_key` (which does not); they passed only because neither fixture input named
+  the key. **Chose to widen the filter, not narrow the assertion** — given correction 1, forging the
+  marker is *worse* than pushing `FLUX_SANDBOX=off` (it suppresses the child's own wrapping rather
+  than declining to demand it), these two call sites are exactly the ones assembling a child env from
+  untrusted material, and the blast radius is nil (no production `with_startup` caller, no in-tree
+  fixture naming it). `POSTURE_ENV_KEYS` was left alone rather than widened, because its completeness
+  test defines it as precisely what `posture_env` emits — hence the second list. Both fixture inputs
+  now name `FLUX_SANDBOXED`, and the assertions were confirmed to **fail** with the filter reverted to
+  `is_posture_env_key` (`[("FLUX_SANDBOXED", "1"), ("TASK_FIXTURE", "kept")]` /
+  `[("FLUX_SANDBOXED", "1"), ("WORKER_LABEL", "kept"), ("FLUX_FLEET_DEPTH", "1")]`), so neither is
+  vacuous.
+- **Round 2, correction 3 —** `worker.rs`'s `env` field doc no longer links the deleted
+  `SANDBOX_POSTURE_ENV` or describes the inverted behaviour; it now states both refusals a
+  `with_startup` caller is subject to.
 - **The ordering asymmetry is now stated at the override slot**, in `apply_safe_env` where the
   caller's `env` is applied: posture *before* (an inherited default a trusted call site may
   override), `FLUX_SANDBOXED` *after* (so no call site can forge or clear it), and therefore what a
