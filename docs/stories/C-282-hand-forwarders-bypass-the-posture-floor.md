@@ -2,7 +2,7 @@
 id: C-282
 title: "Two hand-rolled sandbox-env forwarders sit downstream of the posture floor and can push `off`"
 pillar: Core
-status: in-progress
+status: done
 priority: 4
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -136,6 +136,17 @@ is exactly the drift shape C-249 was filed for.
 - The falsified doc C-276 flagged (`worker.rs:1579`, "None of `FLUX_SANDBOX*` is in
   `build_command`'s `SAFE_ENV`") is gone with the test it annotated; the replacement asserts the
   inverse property, that `worker_env` forwards *none* of the posture.
+
+- **One half of the fix is unpinned, stated rather than glossed.** Deleting `sandbox_child_env()`
+  from `run_local_task` (`crates/flux-eval/src/runner.rs`) is covered by no test — the new eval test
+  pins `extend_task_env`'s filter only, so nothing would catch a re-added ambient forwarder in
+  `run_local_task` itself. Acceptance item 1 asks for a proof through *one* of the two paths and the
+  worker test satisfies it, so this is not a shortfall against the story. The implementor declined to
+  invent one and gave the reason: extracting the env assembly into a testable function would pin the
+  extracted function and not `run_local_task` appending after it — a partial guarantee that reads as a
+  total one — and a source-grep guard is the "guard tested against its own assumptions" shape this
+  repo has shipped four times. The honest test is a committed `flux_bin` stand-in fixture that dumps
+  its env, driven through `run_local_task`; that is real scope and wants its own story.
 
 ## Notes
 
