@@ -85,6 +85,47 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
 > the itemized history.
 
+### A portable Flux runtime — WebAssembly as a second execution substrate (epic) — 🔄 **PROPOSED (C-268; C-269…C-273 filed, none started)**
+
+Flux executes `.flux` on one substrate: a native process holding the OS's ambient authority, confined
+*after the fact* by an OS sandbox and by the authorization → approval → guarded-IO envelope. That is
+right for a flux the operator installed. It does not answer the case this epic exists for — **someone
+else's `.flux`, submitted to us, executed by us** — where the only honest answers today are "a container
+we manage" or "no".
+
+A Wasm module has **no ambient authority at all**: no syscalls, no filesystem, no network, no clock,
+unless the embedder hands it an import. That is the posture the plugin host constructs by policy, except
+the runtime enforces it. The secondary prize is reach — the same module runs in a browser or an edge
+worker, so running a program stops requiring installing flux.
+
+**The decision is to port the interpreter, not to write a Flux-to-Wasm code generator.** Codegen means a
+second implementation of Flux semantics — `retry`, `parallel`, budgets, approval gating — that must agree
+with the first one forever, for no user-visible gain; and it pushes decisions into generated code, when
+the point of flux is that the *runtime* decides.
+
+**The load-bearing invariant is that the guard runs OUTSIDE the sandbox.** If the host exports
+`fetch(url)` and the module is merely *expected* to guard it first, a submitted program declines to —
+it controls its own control flow. So imports are narrow, already-decided operations (host resolves the
+endpoint, applies `guard_url_scoped`, pins the vetted address, injects credentials the module never
+sees), never raw primitives. **C-272** carries that as its central test: a module that does not call a
+guard must still not escape one.
+
+Two blockers were measured rather than assumed. **[C-269](stories/C-269-system-trait-seam.md)**:
+`flux-system::System` is a concrete struct (`lib.rs:1077`), so nothing can substitute a non-syscall
+backend — wide but shallow, since the method set already dictates the trait.
+**[C-270](stories/C-270-engine-state-store-port.md)**: `flux-flow` binds `rusqlite`, which cannot build
+for `wasm32` — but only in `src/state.rs`, **1 of 17 files**, so it is an extraction. `flux-lang` is
+already **L0, no IO**, so the parser and AST are portable today.
+Then **[C-271](stories/C-271-portable-core-wasm-parity.md)** proves parity against the *native* engine on
+the same source, and **[C-273](stories/C-273-embedder-resource-limits.md)** bounds a run — because Wasm
+constrains authority and **not** resources: an unbounded loop or allocation takes the embedder down
+unless the host caps it.
+
+This is defence in depth, not a replacement for C-262's fail-closed OS sandbox on the flux we run. The
+design is deliberately published while still cheap to argue with: repo record
+[portable-wasm-runtime.md](designs/portable-wasm-runtime.md), public page
+`website/docs/direction/portable-wasm-runtime.md`.
+
 ### Adversarial review remediation (epic) — 🔄 **IN PROGRESS (C-255; C-256…C-265 all done, closure reviews pending)**
 
 Three independent adversarial passes were run against `cb3bb057` on 2026-07-30 and recorded under

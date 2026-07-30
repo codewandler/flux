@@ -113,6 +113,11 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Direction',
+      items: ['direction/portable-wasm-runtime'],
+    },
+    {
+      type: 'category',
       label: 'Security',
       items: [
         'security/overview',
