@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-30
+
 ### Added
 
 - **Named entrypoints select one flow from a multi-flow module (L-92).** `flux run <module.flux>

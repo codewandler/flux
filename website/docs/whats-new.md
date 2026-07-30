@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-30
+
 ### New
 
 - **You can now run one named workflow out of a file that defines several.** `flux run <file>
