@@ -28,24 +28,26 @@ fn overlay_window(selected: usize, total: usize, cap: usize) -> (usize, usize) {
     (start, count)
 }
 
-/// Shared chrome for the queue, session-picker, and help overlays (C-152): an accent-on-`panel_bg`
-/// header row, the caller's already-styled/windowed body rows, and an optional trailing `n/m`
-/// overflow counter — one `Clear` + `Paragraph` pane sized exactly to its content instead of three
-/// hand-rolled copies. Selection styling and row content stay with the caller; only the shape
-/// (header style, no border, exact-fit sizing) is shared.
+/// Shared chrome for the queue, session-picker, and help overlays (C-152): a header row, the
+/// caller's already-styled/windowed body rows, and an optional trailing `n/m` overflow counter —
+/// one `Clear` + `Paragraph` pane sized exactly to its content instead of three hand-rolled
+/// copies. Selection styling and row content stay with the caller; only the shape (no border,
+/// exact-fit sizing) is shared.
+///
+/// The header arrives already styled, as a `Line`, rather than as a string this helper tints: an
+/// `overlay`-slot **agent pane** goes through the same chrome as the host's own overlays (C-221),
+/// so its header has to be able to carry the trust mark's modifiers (C-222). Host callers pass
+/// `Line::styled(…, accent_style().bg(panel_bg))` and get exactly the row they got before.
 pub(super) fn render_overlay_panel(
     frame: &mut Frame,
     theme: &Theme,
-    header: impl Into<String>,
+    header: Line<'static>,
     body: Vec<Line<'static>>,
     counter: Option<(usize, usize)>,
     max_width: u16,
 ) {
     let width = frame.area().width.min(max_width);
-    let mut lines = vec![Line::styled(
-        header.into(),
-        theme.accent_style().bg(theme.panel_bg),
-    )];
+    let mut lines = vec![header];
     lines.extend(body);
     if let Some((position, total)) = counter {
         lines.push(Line::styled(
@@ -227,6 +229,12 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     // bookkeeping (C-106), not found by transcript search (C-108) — the same rule
     // `render_empty_state_card` states above, for the same reason. Every colour here comes from
     // the `Theme`; `PaneSpec` carries no style-bearing field.
+    //
+    // C-222: the draw order is half the trust invariant and it is asserted, not assumed — the
+    // sheet's rows are byte-identical with and without panes open, at every width, in every slot
+    // (`panes::tests::an_agent_pane_cannot_imitate_the_approval_sheet`). The other half is that a
+    // pane's border, mark and title come from the `Theme` and its payload can draw neither: see
+    // `crate::trust`.
     panes::render_panes(frame, state, &pane_areas, bottom_area);
 
     if !queued.is_empty() {
@@ -374,7 +382,10 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         render_overlay_panel(
             frame,
             &state.theme,
-            " queued · Enter edit · Delete remove · Alt-↑/↓ reorder · Esc close ",
+            Line::styled(
+                " queued · Enter edit · Delete remove · Alt-↑/↓ reorder · Esc close ",
+                state.theme.accent_style().bg(state.theme.panel_bg),
+            ),
             rows,
             counter,
             76,
@@ -430,7 +441,14 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             })
             .collect();
         let counter = (sessions.len() > visible).then_some((selected + 1, sessions.len()));
-        render_overlay_panel(frame, &state.theme, header, rows, counter, 76);
+        render_overlay_panel(
+            frame,
+            &state.theme,
+            Line::styled(header, state.theme.accent_style().bg(state.theme.panel_bg)),
+            rows,
+            counter,
+            76,
+        );
     }
 
     // C-140: `/usage` overlay — the turn in progress, per round, from the same per-call data
@@ -591,7 +609,14 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             }
             rows.push(Line::from(spans));
         }
-        render_overlay_panel(frame, t, " help · Esc close ", rows, None, 76);
+        render_overlay_panel(
+            frame,
+            t,
+            Line::styled(" help · Esc close ", t.accent_style().bg(t.panel_bg)),
+            rows,
+            None,
+            76,
+        );
     }
 
     if let Some(view) = &state.approval {
