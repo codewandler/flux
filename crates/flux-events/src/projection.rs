@@ -2195,10 +2195,7 @@ mod tests {
             call_usage: Usage::default(),
         };
         let texts = stmt_texts(std::slice::from_ref(&turn));
-        assert_eq!(
-            texts.get(&hash).map(|s| s.as_str()),
-            Some("flow ⏎   $x = 1")
-        );
+        assert_eq!(texts.get(&hash).map(|s| s.as_str()), Some("flow ⏎   x = 1"));
 
         // A same row and a plan-divergence row exercise every DiffLineKind.
         let diff = RunDiff {
@@ -2225,14 +2222,14 @@ mod tests {
         let lines = render_run_diff(&diff, &texts);
         assert_eq!(
             lines[0],
-            (DiffLineKind::Same, "  = flow ⏎   $x = 1".to_string())
+            (DiffLineKind::Same, "  = flow ⏎   x = 1".to_string())
         );
         assert_eq!(
             lines[1],
             (DiffLineKind::Plan, "  ~ plan diverges:".to_string())
         );
         assert_eq!(lines[2].0, DiffLineKind::Plan);
-        assert!(lines[2].1.contains("$x = 1"), "{:?}", lines[2]);
+        assert!(lines[2].1.contains("x = 1"), "{:?}", lines[2]);
         assert_eq!(lines[3].0, DiffLineKind::Plan);
         assert!(
             lines[3].1.contains("no statement"),

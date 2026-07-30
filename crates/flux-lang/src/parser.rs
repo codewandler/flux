@@ -177,7 +177,10 @@ struct Parser<'s> {
 /// L-81: the recursion-depth ceiling for the expression/type parsers. Each nested syntactic level
 /// costs a handful of `enter()` frames, so this admits tens of real nesting levels — far more than
 /// any hand-written program needs — while stopping the thousands-deep adversarial input that aborts.
-const MAX_PARSE_DEPTH: usize = 256;
+// Delimited expressions now retain a little more per-level parser state (continuation trivia and
+// optional named-argument ownership). Keep the guard comfortably below the default test-thread stack
+// while still allowing far more nesting than authored Flux needs.
+const MAX_PARSE_DEPTH: usize = 128;
 
 fn to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
     FluxLang::kind_to_raw(kind)
@@ -751,6 +754,14 @@ impl<'s> Parser<'s> {
         }
         if self.at(SyntaxKind::IDENT) {
             let kw = self.cur_text();
+            if crate::ast::is_bare_symbol_name(kw)
+                && matches!(
+                    self.nth(1),
+                    SyntaxKind::EQ | SyntaxKind::COLON | SyntaxKind::PLUS_EQ
+                )
+            {
+                return self.bind_or_expr_stmt();
+            }
             match kw {
                 "do" => return self.do_call_stmt(),
                 "when" => return self.when_stmt(),
@@ -804,7 +815,7 @@ impl<'s> Parser<'s> {
         match self.nth(1) {
             SyntaxKind::PLUS_EQ => {
                 self.start(SyntaxKind::CTX_APPEND_STMT);
-                self.bump(); // $var
+                self.bump(); // $var / bare name
                 self.bump(); // +=
                 self.expr_list_to_eol();
                 self.eat(SyntaxKind::NEWLINE);
@@ -812,13 +823,23 @@ impl<'s> Parser<'s> {
             }
             SyntaxKind::EQ | SyntaxKind::COLON => {
                 self.start(SyntaxKind::BIND_STMT);
-                self.bump(); // $var
+                self.bump(); // $var / bare name
                 if self.eat(SyntaxKind::COLON) {
                     self.type_ref();
                 }
                 self.expect(SyntaxKind::EQ, "`=` in a bind");
+                let missing_rhs = self.at_newline() || self.at_eof();
                 self.expr(0);
-                self.eat(SyntaxKind::NEWLINE);
+                if !missing_rhs {
+                    if !self.at_newline() && !self.at_eof() {
+                        self.error("unexpected trailing tokens");
+                        self.eat_to_end_of_line();
+                    } else {
+                        self.eat(SyntaxKind::NEWLINE);
+                    }
+                }
+                // With a missing RHS, `expr` owns the recovery newline. Leave the following line
+                // to the block parser so the tolerant CST retains later statements.
                 self.finish_node();
             }
             _ => self.expr_stmt(),
@@ -890,7 +911,7 @@ impl<'s> Parser<'s> {
     fn each_stmt(&mut self) {
         self.start(SyntaxKind::EACH_STMT);
         self.bump(); // each
-        self.expect(SyntaxKind::VAR, "the loop variable, e.g. `$x`");
+        self.expect_symbol("the loop variable, e.g. `x`");
         if self.at_kw("in") {
             self.bump();
         } else {
@@ -901,7 +922,7 @@ impl<'s> Parser<'s> {
             if self.at_kw("flat") {
                 self.bump();
             }
-            self.expect(SyntaxKind::VAR, "a collect variable after `->`");
+            self.expect_symbol("a collect variable after `->`");
         }
         self.eat(SyntaxKind::NEWLINE);
         self.block_if_indented(Self::block);
@@ -1004,7 +1025,7 @@ impl<'s> Parser<'s> {
             self.skip_blank_lines();
             self.start(SyntaxKind::CATCH_CLAUSE);
             self.bump();
-            if self.at(SyntaxKind::VAR) {
+            if self.at_symbol() {
                 self.bump();
             }
             self.eat(SyntaxKind::NEWLINE);
@@ -1017,7 +1038,7 @@ impl<'s> Parser<'s> {
     fn scope_stmt(&mut self) {
         self.start(SyntaxKind::SCOPE_STMT);
         self.bump(); // scope
-        if self.at(SyntaxKind::VAR) {
+        if self.at_symbol() && self.nth(1) == SyntaxKind::EQ {
             self.bump();
             self.expect(SyntaxKind::EQ, "`=` after the scope binding");
             self.expr(0);
@@ -1045,7 +1066,7 @@ impl<'s> Parser<'s> {
     fn memo_stmt(&mut self) {
         self.start(SyntaxKind::MEMO_STMT);
         self.bump(); // memo
-        self.expect(SyntaxKind::VAR, "a symbol after `memo`");
+        self.expect_symbol("a symbol after `memo`");
         if self.eat(SyntaxKind::COLON) {
             self.type_ref();
         }
@@ -1079,7 +1100,7 @@ impl<'s> Parser<'s> {
     fn await_stmt(&mut self) {
         self.start(SyntaxKind::AWAIT_STMT);
         self.bump(); // await
-        if self.at(SyntaxKind::VAR) {
+        if self.at_symbol() && matches!(self.nth(1), SyntaxKind::COLON | SyntaxKind::EQ) {
             self.bump();
             if self.eat(SyntaxKind::COLON) {
                 self.type_ref();
@@ -1235,13 +1256,22 @@ impl<'s> Parser<'s> {
     fn postfix(&mut self) {
         let cp = self.checkpoint();
         self.primary();
-        while self.at(SyntaxKind::DOT) {
-            self.bump(); // .
-                         // a field name (IDENT) or index (NUMBER)
-            if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::NUMBER) {
-                self.bump();
+        while self.at(SyntaxKind::DOT)
+            || (self.at(SyntaxKind::L_BRACK)
+                && self.nth(1) == SyntaxKind::NUMBER
+                && self.nth(2) == SyntaxKind::R_BRACK)
+        {
+            if self.eat(SyntaxKind::DOT) {
+                // a field name (IDENT) or compact dotted index (NUMBER)
+                if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::NUMBER) {
+                    self.bump();
+                } else {
+                    self.error("expected a field name or index after `.`");
+                }
             } else {
-                self.error("expected a field name or index after `.`");
+                self.bump(); // [
+                self.expect(SyntaxKind::NUMBER, "an integer index after `[` ");
+                self.expect(SyntaxKind::R_BRACK, "`]` to close the index");
             }
             self.eat(SyntaxKind::QUESTION); // optional-access marker
             self.wrap(cp, SyntaxKind::FIELD_EXPR);
@@ -1304,7 +1334,7 @@ impl<'s> Parser<'s> {
             "peek" => {
                 self.start(SyntaxKind::PEEK_EXPR);
                 self.bump();
-                self.expect(SyntaxKind::VAR, "a symbol after `peek`");
+                self.expect_symbol("a symbol after `peek`");
                 self.finish_node();
             }
             "thing" => {
@@ -1321,6 +1351,12 @@ impl<'s> Parser<'s> {
                     "parse" => SyntaxKind::PARSE_EXPR,
                     _ => SyntaxKind::CALL_EXPR,
                 };
+                if !self.call_follows() {
+                    self.start(SyntaxKind::VAR_EXPR);
+                    self.bump();
+                    self.finish_node();
+                    return;
+                }
                 let cp = self.checkpoint();
                 self.start(SyntaxKind::NAME);
                 self.bump(); // first ident
@@ -1366,18 +1402,24 @@ impl<'s> Parser<'s> {
     fn call_args(&mut self) {
         self.start(SyntaxKind::ARG_LIST);
         self.bump(); // (
-        while !self.at(SyntaxKind::R_PAREN) && !self.at_eof() && !self.at_newline() {
+        self.delimited_trivia();
+        while !self.at(SyntaxKind::R_PAREN) && !self.at_eof() {
             // named arg `name:` (e.g. `parse(v, as: "f64")`)
             if self.nth(0) == SyntaxKind::IDENT && self.nth(1) == SyntaxKind::COLON {
+                self.start(SyntaxKind::NAMED_ARG);
                 self.start(SyntaxKind::NAME);
                 self.bump();
                 self.finish_node();
                 self.bump(); // :
+                self.expr(0);
+                self.finish_node();
+            } else {
+                self.expr(0);
             }
-            self.expr(0);
             if !self.eat(SyntaxKind::COMMA) {
                 break;
             }
+            self.delimited_trivia();
         }
         self.expect(SyntaxKind::R_PAREN, "`)` to close the call");
         self.finish_node();
@@ -1392,7 +1434,8 @@ impl<'s> Parser<'s> {
         }
         self.start(SyntaxKind::OBJ_EXPR);
         self.bump(); // {
-        while !self.at(SyntaxKind::R_BRACE) && !self.at_eof() && !self.at_newline() {
+        self.delimited_trivia();
+        while !self.at(SyntaxKind::R_BRACE) && !self.at_eof() {
             self.start(SyntaxKind::OBJ_FIELD);
             if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::STRING) {
                 self.start(SyntaxKind::NAME);
@@ -1401,12 +1444,14 @@ impl<'s> Parser<'s> {
             } else {
                 self.error("expected an object key");
             }
-            self.expect(SyntaxKind::COLON, "`:` after the key");
-            self.expr(0);
+            if self.eat(SyntaxKind::COLON) {
+                self.expr(0);
+            }
             self.finish_node();
             if !self.eat(SyntaxKind::COMMA) {
                 break;
             }
+            self.delimited_trivia();
         }
         self.expect(SyntaxKind::R_BRACE, "`}` to close the object");
         self.finish_node();
@@ -1421,15 +1466,58 @@ impl<'s> Parser<'s> {
         }
         self.start(SyntaxKind::LIST_EXPR);
         self.bump(); // [
-        while !self.at(SyntaxKind::R_BRACK) && !self.at_eof() && !self.at_newline() {
+        self.delimited_trivia();
+        while !self.at(SyntaxKind::R_BRACK) && !self.at_eof() {
             self.expr(0);
             if !self.eat(SyntaxKind::COMMA) {
                 break;
             }
+            self.delimited_trivia();
         }
         self.expect(SyntaxKind::R_BRACK, "`]` to close the list");
         self.finish_node();
         self.leave();
+    }
+
+    fn at_symbol(&self) -> bool {
+        self.at(SyntaxKind::VAR)
+            || (self.at(SyntaxKind::IDENT) && crate::ast::is_bare_symbol_name(self.cur_text()))
+    }
+
+    fn expect_symbol(&mut self, what: &str) {
+        if self.at_symbol() {
+            self.bump();
+        } else {
+            self.error(format!("expected {what}"));
+        }
+    }
+
+    /// Whether the current identifier begins an op call. Dotted/hyphenated operation names are
+    /// consumed only when the complete name is followed by `(`; otherwise postfix parsing owns
+    /// the dot as ordinary value access.
+    fn call_follows(&self) -> bool {
+        let mut n = 1;
+        while matches!(self.nth(n), SyntaxKind::DOT | SyntaxKind::MINUS)
+            && self.nth(n + 1) == SyntaxKind::IDENT
+        {
+            n += 2;
+        }
+        self.nth(n) == SyntaxKind::L_PAREN
+    }
+
+    /// Trivia/layout inside delimiters is semantically whitespace, not an outer statement-block
+    /// boundary. Zero-width INDENT/DEDENT tokens are consumed without entering the CST; textual
+    /// newlines/comments/spacing remain lossless children of the delimited node.
+    fn delimited_trivia(&mut self) {
+        loop {
+            match self.raw_kind_at(self.pos) {
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::NEWLINE => {
+                    self.feed_one()
+                }
+                SyntaxKind::INDENT | SyntaxKind::DEDENT => self.pos += 1,
+                _ => break,
+            }
+        }
     }
 
     /// A JSON value for the `@json` escape: a balanced object/array/string/number/keyword.
@@ -1558,7 +1646,8 @@ mod tests {
             "[".repeat(depth),
             "]".repeat(depth)
         );
-        assert!(!parse_cst(&lists).errors.is_empty(), "deep lists bounded");
+        let list_parse = parse_cst(&lists);
+        assert!(!list_parse.errors.is_empty(), "deep lists bounded");
 
         // Nested `List<List<…>>` in a parameter type.
         let ty = format!(

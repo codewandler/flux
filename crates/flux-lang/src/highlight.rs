@@ -126,7 +126,7 @@ fn name_class(name: &SyntaxNode) -> HighlightClass {
         K::PARAM | K::FLOW_HEADER | K::BIND_STMT | K::MEMO_STMT | K::NAME => C::Type,
         // Labels: object keys and named-argument keys (`as:` in `parse(v, as: "f64")`). A bare
         // expression name in an arg list is a reference, not a label.
-        K::OBJ_FIELD => C::Punct,
+        K::OBJ_FIELD | K::NAMED_ARG => C::Punct,
         K::ARG_LIST if followed_by_colon(name) => C::Punct,
         // Op names: `do <op>`, `op(args)`, `fmt(…)`/`parse(…)`, and bare references.
         _ => C::Op,

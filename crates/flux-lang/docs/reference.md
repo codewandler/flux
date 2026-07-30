@@ -235,6 +235,11 @@ Invoke a registered operation. Arguments are **named**: a multi-param op is call
 single object argument naming each parameter; a sole-required-param op accepts a bare value
 (the ergonomic sugar). A single object argument is passed straight through as the named input.
 
+Canonical text projects that object without a wrapper: `write(path: target, content)` lowers to
+`args: [Obj { path: target, content: content }]`. Bare identifiers are exact puns. A standalone call
+uses the same `op(…)` form as a call on a bind RHS; legacy `do op …` remains accepted and is used by
+the formatter only when an operation name collides with statement syntax.
+
 ```json
 {"kind": "call", "op": "read", "args": [
   {"kind": "lit", "value": "README.md"}
@@ -1368,6 +1373,13 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
 
 ## Key invariants
 
+- **`.flux` is Flux-Lang text, never content-sniffed JSON.** JSON `DraftAst` remains a wire/API
+  representation; source files, the CLI, and the LSP share the CST parser.
+- **Both formatter projections are source.** Two-space canonical and one-space compact output parse
+  back to the exact AST; they differ only in whitespace and multiline-string spelling.
+- **Compact spelling does not change semantics.** Bare locals, named-input/object puns, bracket
+  indexes, and duration suffixes lower to the existing AST/runtime forms. `$`/`do`/millisecond
+  spellings remain compatibility escapes.
 - **Every op goes through `Executor::dispatch`** — policy, approval, and redaction are
   non-bypassable regardless of which node kind triggers the call.
 - **`return` inside `parallel` is rejected** by the analyzer. Use `bind` inside the

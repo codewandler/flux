@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Flux-Lang source is smaller and has one honest file format (L-93).** Canonical source now uses
+  bare locals, direct named inputs and puns, `op(...)` calls, bracket indexes, multiline delimiters,
+  and exact duration suffixes while retaining `$`, `do`, object wrappers, and raw milliseconds as
+  compatibility spellings. Canonical and compact output both round-trip exactly. Every root example
+  is native text and is gated through strict CST lowering, LSP parse diagnostics, CST formatting,
+  canonical/compact formatting, and JSON AST projection. CLI `.flux` loaders no longer reinterpret
+  a leading `{` as a JSON `DraftAst`; JSON remains an explicit API/wire representation.
+
 ### Fixed
 
 - **The release verifier had never met a real release (C-259 follow-up).** `verify-github-release.sh`

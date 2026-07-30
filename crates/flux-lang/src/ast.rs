@@ -75,6 +75,93 @@ pub fn is_valid_decl_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Whether a symbol can use the sigil-free text spelling without colliding with a contextual
+/// language keyword. `$name` remains the escape for these words, so every identifier-valid symbol
+/// is still writable and formatter round-trips stay total.
+pub fn is_bare_symbol_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && !is_reserved_word(name)
+}
+
+/// Contextual words that cannot be interpreted as a bare symbol in statement/expression position.
+/// Keep this centralized: the parser and formatter must make the same escape decision.
+pub fn is_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "true"
+            | "false"
+            | "null"
+            | "flow"
+            | "op"
+            | "goal"
+            | "permissions"
+            | "agent_loop"
+            | "agent"
+            | "channel"
+            | "datasource"
+            | "trigger"
+            | "journey"
+            | "do"
+            | "when"
+            | "else"
+            | "unless"
+            | "each"
+            | "in"
+            | "flat"
+            | "repeat"
+            | "until"
+            | "loop"
+            | "for"
+            | "every"
+            | "match"
+            | "route"
+            | "case"
+            | "default"
+            | "fallback"
+            | "branch"
+            | "parallel"
+            | "race"
+            | "timeout"
+            | "budget"
+            | "with_tools"
+            | "retry"
+            | "backoff"
+            | "delay"
+            | "seq"
+            | "ctx"
+            | "purpose"
+            | "include"
+            | "exclude"
+            | "return"
+            | "assert"
+            | "memo"
+            | "once"
+            | "checkpoint"
+            | "await"
+            | "confirm"
+            | "risk"
+            | "throttle"
+            | "per"
+            | "debounce"
+            | "verify"
+            | "contains"
+            | "try"
+            | "catch"
+            | "scope"
+            | "finally"
+            | "saga"
+            | "step"
+            | "undo"
+            | "pipe"
+            | "peek"
+            | "thing"
+            | "fmt"
+            | "parse"
+    )
+}
+
 string_id! {
     /// The identity of a stored immutable value.
     ValueId,

@@ -300,10 +300,8 @@ fn lower_bind(statement: &SyntaxNode, memo: bool) -> DecodeResult<Node> {
     } else {
         header.as_str()
     };
-    let rest = rest
-        .trim_start()
-        .strip_prefix('$')
-        .ok_or_else(|| error(statement, "expected a bind symbol"))?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('$').unwrap_or(rest);
     let (name, tail) = take_while(rest, is_ident_char);
     if name.is_empty() {
         return Err(error(statement, "empty bind symbol"));
@@ -386,28 +384,33 @@ fn lower_when(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_each(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let vars = header_tokens(statement)
-        .into_iter()
-        .filter(|(kind, _)| *kind == SyntaxKind::VAR)
-        .map(|(_, text)| symbol(&text))
-        .collect::<Vec<_>>();
-    let item = vars
-        .first()
-        .cloned()
-        .ok_or_else(|| error(statement, "`each` expects `$item`"))?;
     let header = semantic_line(statement);
+    let rest = rest_after_keyword(statement, "each")?;
+    let (item, tail) = parse_symbol_prefix(&rest, statement, "each item")?;
+    if keyword_rest(tail.trim_start(), "in").is_none() {
+        return Err(error(statement, "`each` expects `item in source`"));
+    }
     let has_arrow = header.contains("->");
-    let collect = has_arrow.then(|| vars.last().cloned()).flatten();
+    let (collect, flat) = if let Some((_, tail)) = header.split_once("->") {
+        let tail = tail.trim_start();
+        let (flat, tail) = if let Some(rest) = keyword_rest(tail, "flat") {
+            (true, rest)
+        } else {
+            (false, tail)
+        };
+        (
+            Some(parse_symbol_exact(tail, statement, "each collect")?),
+            flat,
+        )
+    } else {
+        (None, false)
+    };
     Ok(Node::Each {
         source: Box::new(required_expression(statement, "each source")?),
         item,
         body: lower_first_block(statement)?,
         collect,
-        flat: has_arrow
-            && header
-                .split("->")
-                .nth(1)
-                .is_some_and(|tail| tail.split_whitespace().next() == Some("flat")),
+        flat: has_arrow && flat,
     })
 }
 
@@ -512,10 +515,7 @@ fn lower_fallback(statement: &SyntaxNode) -> DecodeResult<Node> {
 fn lower_parallel(statement: &SyntaxNode, race: bool) -> DecodeResult<Node> {
     let (timeout_ms, bind) = if race {
         let rest = rest_after_keyword(statement, "race")?;
-        let (digits, tail) = take_while(rest.trim_start(), |c| c.is_ascii_digit());
-        let timeout = digits
-            .parse::<u64>()
-            .map_err(|_| error(statement, "`race` expects a timeout"))?;
+        let (timeout, tail) = take_duration(&rest, statement)?;
         (
             Some(timeout),
             parse_optional_arrow(tail, "race", statement)?,
@@ -531,15 +531,8 @@ fn lower_parallel(statement: &SyntaxNode, race: bool) -> DecodeResult<Node> {
         if arm.kind() != SyntaxKind::BRANCH_ARM {
             return Err(error(&arm, "expected a `branch $name` arm"));
         }
-        let name = header_tokens(&arm)
-            .into_iter()
-            .find(|(kind, _)| *kind == SyntaxKind::VAR)
-            .map(|(_, text)| symbol(&text))
-            .ok_or_else(|| error(&arm, "branch needs a `$name`"))?;
         let arm_rest = rest_after_keyword(&arm, "branch")?;
-        if arm_rest.trim() != format!("${}", name.0) {
-            return Err(error(&arm, "invalid branch name"));
-        }
+        let name = parse_symbol_exact(&arm_rest, &arm, "branch name")?;
         branches.push(Branch {
             name,
             body: lower_first_block(&arm)?,
@@ -560,10 +553,10 @@ fn lower_loop(statement: &SyntaxNode) -> DecodeResult<Node> {
     let rest = rest_after_keyword(statement, "loop")?;
     let rest = keyword_rest(rest.trim_start(), "for")
         .ok_or_else(|| error(statement, "`loop` expects `for <ms>`"))?;
-    let (for_ms, rest) = take_u64(rest, statement)?;
+    let (for_ms, rest) = take_duration(rest, statement)?;
     let rest = keyword_rest(rest.trim_start(), "every")
         .ok_or_else(|| error(statement, "`loop` expects `every <ms>`"))?;
-    let (every_ms, tail) = take_u64(rest, statement)?;
+    let (every_ms, tail) = take_duration(rest, statement)?;
     let bind = parse_optional_arrow(tail, "loop", statement)?;
     let (until, body) = statement
         .children()
@@ -582,7 +575,7 @@ fn lower_loop(statement: &SyntaxNode) -> DecodeResult<Node> {
 
 fn lower_timeout(statement: &SyntaxNode) -> DecodeResult<Node> {
     let rest = rest_after_keyword(statement, "timeout")?;
-    let (ms, tail) = take_u64(&rest, statement)?;
+    let (ms, tail) = take_duration(&rest, statement)?;
     Ok(Node::Timeout {
         ms,
         body: lower_first_block(statement)?,
@@ -631,7 +624,7 @@ fn lower_retry(statement: &SyntaxNode) -> DecodeResult<Node> {
     }
     let mut delay_ms = None;
     if let Some(after) = keyword_rest(tail.trim_start(), "delay") {
-        let (delay, rest) = take_u64(after, statement)?;
+        let (delay, rest) = take_duration(after, statement)?;
         delay_ms = Some(delay);
         tail = rest;
     }
@@ -677,18 +670,8 @@ fn lower_until_block(block: &SyntaxNode) -> DecodeResult<(Option<Box<Node>>, Vec
 }
 
 fn lower_ctx(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let name = header_tokens(statement)
-        .into_iter()
-        .find(|(kind, _)| *kind == SyntaxKind::VAR)
-        .map(|(_, text)| symbol(&text))
-        .ok_or_else(|| error(statement, "`ctx` expects `$name`"))?;
     let rest = rest_after_keyword(statement, "ctx")?;
-    if rest.trim() != format!("${}", name.0) {
-        return Err(error(
-            statement,
-            format!("unexpected text after `ctx $name`: `{}`", rest.trim()),
-        ));
-    }
+    let name = parse_symbol_exact(&rest, statement, "ctx name")?;
     let mut purpose = None;
     let mut include = Vec::new();
     let mut exclude = Vec::new();
@@ -729,11 +712,11 @@ fn lower_ctx(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_ctx_append(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let ctx = header_tokens(statement)
-        .into_iter()
-        .find(|(kind, _)| *kind == SyntaxKind::VAR)
-        .map(|(_, text)| symbol(&text))
-        .ok_or_else(|| error(statement, "context append expects `$name`"))?;
+    let header = semantic_line(statement);
+    let (lhs, _) = header
+        .split_once("+=")
+        .ok_or_else(|| error(statement, "context append expects `name += values`"))?;
+    let ctx = parse_symbol_exact(lhs, statement, "context append name")?;
     let mut add = Vec::new();
     for expression in expression_children(statement) {
         match lower_expression(&expression)? {
@@ -790,11 +773,17 @@ fn lower_checkpoint(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_await(statement: &SyntaxNode) -> DecodeResult<Node> {
+    let rest = rest_after_keyword(statement, "await")?;
+    let binding = if rest.trim_start().starts_with('"') {
+        None
+    } else {
+        let (lhs, _) = rest
+            .split_once('=')
+            .ok_or_else(|| error(statement, "`await` binding expects `name = source`"))?;
+        let name = lhs.split_once(':').map_or(lhs, |(name, _)| name);
+        Some(parse_symbol_exact(name, statement, "await binding")?)
+    };
     let tokens = header_tokens(statement);
-    let binding = tokens
-        .iter()
-        .find(|(kind, _)| *kind == SyntaxKind::VAR)
-        .map(|(_, text)| symbol(text));
     let as_type = statement
         .children()
         .find(|node| node.kind() == SyntaxKind::NAME)
@@ -848,7 +837,7 @@ fn lower_throttle(statement: &SyntaxNode) -> DecodeResult<Node> {
         .map_err(|_| error(statement, "`throttle` expects a numeric max"))?;
     let rest = keyword_rest(rest.trim_start(), "per")
         .ok_or_else(|| error(statement, "`throttle` expects `per <window_ms>`"))?;
-    let (window_ms, tail) = take_u64(rest, statement)?;
+    let (window_ms, tail) = take_duration(rest, statement)?;
     if !tail.trim().is_empty() {
         return Err(error(statement, "trailing text after `throttle` header"));
     }
@@ -863,7 +852,7 @@ fn lower_throttle(statement: &SyntaxNode) -> DecodeResult<Node> {
 fn lower_debounce(statement: &SyntaxNode) -> DecodeResult<Node> {
     let rest = rest_after_keyword(statement, "debounce")?;
     let (name, rest) = parse_string_prefix(rest.trim_start(), statement, "debounce")?;
-    let (wait_ms, tail) = take_u64(rest, statement)?;
+    let (wait_ms, tail) = take_duration(rest, statement)?;
     if !tail.trim().is_empty() {
         return Err(error(statement, "trailing text after `debounce` header"));
     }
@@ -909,12 +898,13 @@ fn lower_try(statement: &SyntaxNode) -> DecodeResult<Node> {
     let clause = statement
         .children()
         .find(|node| node.kind() == SyntaxKind::CATCH_CLAUSE);
-    let catch = clause.as_ref().and_then(|clause| {
-        header_tokens(clause)
-            .into_iter()
-            .find(|(kind, _)| *kind == SyntaxKind::VAR)
-            .map(|(_, text)| symbol(&text))
-    });
+    let catch = clause
+        .as_ref()
+        .map(|clause| rest_after_keyword(clause, "catch"))
+        .transpose()?
+        .filter(|rest| !rest.trim().is_empty())
+        .map(|rest| parse_symbol_exact(&rest, statement, "catch binding"))
+        .transpose()?;
     let handler = clause
         .and_then(|clause| {
             clause
@@ -932,10 +922,15 @@ fn lower_try(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_scope(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let bind = header_tokens(statement)
-        .into_iter()
-        .find(|(kind, _)| *kind == SyntaxKind::VAR)
-        .map(|(_, text)| symbol(&text));
+    let rest = rest_after_keyword(statement, "scope")?;
+    let bind = if rest.trim().is_empty() {
+        None
+    } else {
+        let (lhs, _) = rest
+            .split_once('=')
+            .ok_or_else(|| error(statement, "`scope` expects `name = acquire`"))?;
+        Some(parse_symbol_exact(lhs, statement, "scope binding")?)
+    };
     let acquire = expression_children(statement)
         .next()
         .map(|node| lower_expression(&node).map(Box::new))
@@ -1087,18 +1082,31 @@ fn lower_expression(expression: &SyntaxNode) -> DecodeResult<Node> {
                 .children()
                 .find(|node| node.kind() == ARG_LIST)
                 .ok_or_else(|| error(expression, "`parse` needs arguments"))?;
-            let values = expression_children(&args)
-                .map(|node| lower_expression(&node))
-                .collect::<DecodeResult<Vec<_>>>()?;
-            let [value, Node::Lit {
-                value: serde_json::Value::String(as_type),
-            }] = values.as_slice()
+            let entries = lower_arg_entries(&args)?;
+            let Some(ArgEntry::PositionalNode(_, value)) = entries.first() else {
+                return Err(error(
+                    expression,
+                    "`parse(…)` expects `<value>, as: \"type\"`",
+                ));
+            };
+            let Some(ArgEntry::Named(
+                as_name,
+                Node::Lit {
+                    value: serde_json::Value::String(as_type),
+                },
+            )) = entries.get(1)
             else {
                 return Err(error(
                     expression,
                     "`parse(…)` expects `<value>, as: \"type\"`",
                 ));
             };
+            if entries.len() != 2 || as_name != "as" {
+                return Err(error(
+                    expression,
+                    "`parse(…)` expects `<value>, as: \"type\"`",
+                ));
+            }
             Ok(Node::Parse {
                 value: Box::new(value.clone()),
                 as_type: as_type.clone(),
@@ -1108,7 +1116,7 @@ fn lower_expression(expression: &SyntaxNode) -> DecodeResult<Node> {
             let text = expression
                 .descendants_with_tokens()
                 .filter_map(|element| element.into_token())
-                .find(|token| token.kind() == SyntaxKind::VAR)
+                .find(|token| matches!(token.kind(), SyntaxKind::VAR | SyntaxKind::IDENT))
                 .map(|token| token.text().to_string())
                 .ok_or_else(|| error(expression, "empty symbol after `$`"))?;
             Ok(Node::Var {
@@ -1120,9 +1128,11 @@ fn lower_expression(expression: &SyntaxNode) -> DecodeResult<Node> {
         PEEK_EXPR => {
             let name = header_tokens(expression)
                 .into_iter()
-                .find(|(kind, _)| *kind == SyntaxKind::VAR)
+                .find(|(kind, text)| {
+                    matches!(kind, SyntaxKind::VAR | SyntaxKind::IDENT) && text != "peek"
+                })
                 .map(|(_, text)| symbol(&text))
-                .ok_or_else(|| error(expression, "`peek` expects `$name`"))?;
+                .ok_or_else(|| error(expression, "`peek` expects a name"))?;
             Ok(Node::Peek { name })
         }
         THING_EXPR => lower_thing(expression),
@@ -1148,8 +1158,81 @@ fn lower_expression(expression: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_arg_list(args: &SyntaxNode) -> DecodeResult<Vec<Node>> {
-    expression_children(args)
-        .map(|node| lower_expression(&node))
+    let entries = lower_arg_entries(args)?;
+    let has_named = entries
+        .iter()
+        .any(|entry| matches!(entry, ArgEntry::Named(..)));
+    let all_bare_puns = entries.len() > 1
+        && entries.iter().all(|entry| match entry {
+            ArgEntry::PositionalNode(node, Node::Var { .. }) => compact_text(node)
+                .chars()
+                .next()
+                .is_some_and(|ch| ch != '$'),
+            _ => false,
+        });
+
+    if has_named || all_bare_puns {
+        let mut fields = BTreeMap::new();
+        for entry in entries {
+            let (name, value) = match entry {
+                ArgEntry::Named(name, value) => (name, value),
+                ArgEntry::PositionalNode(node, Node::Var { name })
+                    if !compact_text(&node).starts_with('$') =>
+                {
+                    (name.0.clone(), Node::Var { name })
+                }
+                ArgEntry::PositionalNode(_, _) => {
+                    return Err(error(
+                        args,
+                        "named calls may only mix `name: value` entries with bare identifier puns",
+                    ));
+                }
+            };
+            if fields.insert(name.clone(), Box::new(value)).is_some() {
+                return Err(error(args, format!("duplicate named argument `{name}`")));
+            }
+        }
+        Ok(vec![Node::Obj { fields }])
+    } else {
+        Ok(entries
+            .into_iter()
+            .map(|entry| match entry {
+                ArgEntry::PositionalNode(_, value) => Ok(value),
+                ArgEntry::Named(name, _) => {
+                    Err(error(args, format!("unexpected named argument `{name}`")))
+                }
+            })
+            .collect::<DecodeResult<Vec<_>>>()?)
+    }
+}
+
+enum ArgEntry {
+    PositionalNode(SyntaxNode, Node),
+    Named(String, Node),
+}
+
+fn lower_arg_entries(args: &SyntaxNode) -> DecodeResult<Vec<ArgEntry>> {
+    args.children()
+        .filter_map(|node| match node.kind() {
+            SyntaxKind::NAMED_ARG => Some((true, node)),
+            kind if is_expression(kind) => Some((false, node)),
+            _ => None,
+        })
+        .map(|(named, node)| {
+            if named {
+                let name = node
+                    .children()
+                    .find(|child| child.kind() == SyntaxKind::NAME)
+                    .map(|child| compact_text(&child))
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| error(&node, "named argument needs a name"))?;
+                let value = required_expression(&node, "named argument value")?;
+                Ok(ArgEntry::Named(name, value))
+            } else {
+                let value = lower_expression(&node)?;
+                Ok(ArgEntry::PositionalNode(node, value))
+            }
+        })
         .collect()
 }
 
@@ -1169,10 +1252,19 @@ fn lower_field(expression: &SyntaxNode) -> DecodeResult<Node> {
     });
     let mut segment = String::new();
     let mut optional = false;
+    let mut bracket_index = false;
     for (kind, text) in direct_tokens {
         match kind {
             SyntaxKind::DOT => segment.push('.'),
-            SyntaxKind::IDENT | SyntaxKind::NUMBER => segment.push_str(&text),
+            SyntaxKind::IDENT => segment.push_str(&text),
+            SyntaxKind::NUMBER => {
+                if bracket_index {
+                    segment.push('.');
+                }
+                segment.push_str(&text);
+            }
+            SyntaxKind::L_BRACK => bracket_index = true,
+            SyntaxKind::R_BRACK => bracket_index = false,
             SyntaxKind::QUESTION => optional = true,
             _ => {}
         }
@@ -1266,7 +1358,7 @@ fn native_formula(text: &str) -> Option<Node> {
 }
 
 fn lower_object(expression: &SyntaxNode) -> DecodeResult<Node> {
-    let text = semantic_line(expression);
+    let text = compact_semantic_text(expression);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
         return Ok(Node::Lit { value });
     }
@@ -1285,16 +1377,20 @@ fn lower_object(expression: &SyntaxNode) -> DecodeResult<Node> {
         } else {
             raw_key
         };
-        fields.insert(
-            key,
-            Box::new(required_expression(&field, "object field value")?),
-        );
+        let value = expression_children(&field)
+            .next()
+            .map(|node| lower_expression(&node))
+            .transpose()?
+            .unwrap_or_else(|| Node::Var {
+                name: key.as_str().into(),
+            });
+        fields.insert(key, Box::new(value));
     }
     Ok(Node::Obj { fields })
 }
 
 fn lower_list(expression: &SyntaxNode) -> DecodeResult<Node> {
-    let text = semantic_line(expression);
+    let text = compact_semantic_text(expression);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
         return Ok(Node::Lit { value });
     }
@@ -1859,9 +1955,7 @@ fn parse_optional_arrow(
             )
         })?
         .trim_start();
-    let symbol_text = symbol_text
-        .strip_prefix('$')
-        .ok_or_else(|| error(at, format!("`{context}` expects `$name` after `->`")))?;
+    let symbol_text = symbol_text.strip_prefix('$').unwrap_or(symbol_text);
     let (name, rest) = take_while(symbol_text, is_ident_char);
     if name.is_empty() || !rest.trim().is_empty() {
         return Err(error(
@@ -1872,6 +1966,38 @@ fn parse_optional_arrow(
     Ok(Some(name.into()))
 }
 
+fn parse_symbol_prefix<'a>(
+    text: &'a str,
+    at: &SyntaxNode,
+    context: &str,
+) -> DecodeResult<(SymbolName, &'a str)> {
+    let text = text.trim_start();
+    let sigiled = text.starts_with('$');
+    let text = text.strip_prefix('$').unwrap_or(text);
+    let (name, rest) = take_while(text, is_ident_char);
+    if name.is_empty()
+        || (!sigiled
+            && !name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_'))
+    {
+        return Err(error(at, format!("`{context}` expects a symbol name")));
+    }
+    Ok((name.into(), rest))
+}
+
+fn parse_symbol_exact(text: &str, at: &SyntaxNode, context: &str) -> DecodeResult<SymbolName> {
+    let (name, rest) = parse_symbol_prefix(text, at, context)?;
+    if !rest.trim().is_empty() {
+        return Err(error(
+            at,
+            format!("unexpected text after `{context}`: `{}`", rest.trim()),
+        ));
+    }
+    Ok(name)
+}
+
 fn parse_symbol_list(text: &str, at: &SyntaxNode) -> DecodeResult<Vec<SymbolName>> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
@@ -1879,9 +2005,7 @@ fn parse_symbol_list(text: &str, at: &SyntaxNode) -> DecodeResult<Vec<SymbolName
     text.split(',')
         .map(|part| {
             let part = part.trim();
-            let name = part
-                .strip_prefix('$')
-                .ok_or_else(|| error(at, format!("expected `$symbol`, got: `{part}`")))?;
+            let name = part.strip_prefix('$').unwrap_or(part);
             if name.is_empty() || !name.chars().all(is_ident_char) {
                 return Err(error(at, format!("invalid symbol: `{part}`")));
             }
@@ -1890,13 +2014,29 @@ fn parse_symbol_list(text: &str, at: &SyntaxNode) -> DecodeResult<Vec<SymbolName
         .collect()
 }
 
-fn take_u64<'a>(text: &'a str, at: &SyntaxNode) -> DecodeResult<(u64, &'a str)> {
+fn take_duration<'a>(text: &'a str, at: &SyntaxNode) -> DecodeResult<(u64, &'a str)> {
     let text = text.trim_start();
-    let (digits, rest) = take_while(text, |ch| ch.is_ascii_digit());
+    let (digits, mut rest) = take_while(text, |ch| ch.is_ascii_digit() || ch == '_');
     let number = digits
+        .replace('_', "")
         .parse::<u64>()
         .map_err(|_| error(at, format!("expected a number, got: `{text}`")))?;
-    Ok((number, rest))
+    let multiplier = if let Some(tail) = rest.strip_prefix("ms") {
+        rest = tail;
+        1
+    } else if let Some(tail) = rest.strip_prefix('s') {
+        rest = tail;
+        1_000
+    } else if let Some(tail) = rest.strip_prefix('m') {
+        rest = tail;
+        60_000
+    } else {
+        1
+    };
+    let millis = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| error(at, "duration overflows milliseconds"))?;
+    Ok((millis, rest))
 }
 
 fn parse_string_token(text: &str, at: &SyntaxNode) -> DecodeResult<String> {
@@ -2183,6 +2323,34 @@ fn compact_text(node: &SyntaxNode) -> String {
         })
         .map(|token| token.text().to_string())
         .collect()
+}
+
+/// Compact expression text suitable for JSON decoding. Unlike [`compact_text`], triple-quoted
+/// strings are normalized to ordinary JSON strings so their interior newlines remain data rather
+/// than layout.
+fn compact_semantic_text(node: &SyntaxNode) -> String {
+    let mut text = String::new();
+    for token in node
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+    {
+        match token.kind() {
+            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::NEWLINE => {}
+            SyntaxKind::STRING if token.text().starts_with("\"\"\"") => {
+                let content = token
+                    .text()
+                    .strip_prefix("\"\"\"")
+                    .and_then(|rest| rest.strip_suffix("\"\"\""))
+                    .unwrap_or_default()
+                    .replace("\r\n", "\n");
+                text.push_str(
+                    &serde_json::to_string(&content).unwrap_or_else(|_| "\"\"".to_string()),
+                );
+            }
+            _ => text.push_str(token.text()),
+        }
+    }
+    text
 }
 
 fn has_direct_token(node: &SyntaxNode, kind: SyntaxKind) -> bool {

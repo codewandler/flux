@@ -122,7 +122,7 @@ review pass (findings fixed before commit).
 
 | Item | Status |
 |---|---|
-| 1. Two writable display modes (human + token-efficient) | ✅ (canonical round-trippable `format`/`parse` + the token-efficient display-only `format_compact`; the human box-tree is `render`) |
+| 1. Two writable display modes (human + token-efficient) | ✅ (both canonical `format` and one-space `format_compact` round-trip through `parse`; the human box-tree is `render`) |
 | 2. `fluxlang compile` (text → AST) | ✅ (`fluxlang compile` wired onto `parse`; `bin/fluxlang.rs`) |
 | 3. Richer `analyze` (type + effect checking → typed HIR) | ✅ |
 | 4. Op-input JSON Schema from `OpSpec` | ✅ (P0; `opspec.rs`) |

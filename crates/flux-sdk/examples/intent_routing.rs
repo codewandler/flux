@@ -1,5 +1,5 @@
 //! Intent detection → routing, authored with the Rust DSL and run through `FlowClient`. This is the
-//! DSL-native form of `crates/flux-lang/examples/call-routing.flux`: a single "model-cost" step
+//! DSL-native form of `crates/flux-lang/examples/call-routing.flux.example`: a single "model-cost" step
 //! classifies the caller's utterance into an intent, then everything else is **deterministic routing**.
 //!
 //! The model/datasource adapters are mocked — registered stub ops — so it runs with no API key.

@@ -14,7 +14,7 @@ The text syntax **is built**: `flux_lang::parse::parse(&str) -> Result<DraftAst>
 `flux_lang::format::format(&DraftAst) -> String`, with `parse(format(ast)) == ast` — native
 spellings for **every node kind**, with a single-line `@json <compact-json>` escape remaining only
 for shapes the grammar cannot express (non-identifier names (L-18), non-invertible `expr`
-formulas, bracket-path `jq`, all-literal `obj`/`list` templates); property-tested
+formulas, non-symbol-input `jq`, all-literal `obj`/`list` templates); property-tested
 (`tests/roundtrip_property.rs`).
 
 The lossless rowan CST is the **sole accepting parser**. `parse` and `parse_program` run the tolerant
@@ -26,12 +26,12 @@ strict APIs.
 Body sections below marked **aspirational** describe *target* syntax the parser does **not**
 accept today; everything unmarked is implemented.
 
-- **Native text** (markers `=` bind · `do <op> <args>` effectful call · `+=` `ctx_append`): `bind`,
-  `call` (bare `do …` or inline `op(…)`), `var` (`$x`), `lit` (JSON), `return`, `when`/`else`, `unless`,
+- **Native text** (markers `=` bind · `op(…)` call · `+=` `ctx_append`): `bind`,
+  `call`, `var` (bare `x`; legacy/reserved escape `$x`), `lit` (JSON), `return`, `when`/`else`, `unless`,
   `each`, `repeat`, `seq`, the context-pack nodes **`ctx`** / **`ctx_append`**, `@effect(tag)` bind
   annotations, and (added P6) the Tier-1 control-flow blocks **`match`**, **`route`**, **`fallback`**,
   **`loop`**, **`timeout`**, **`budget`**, the capability scope **`with_tools`**,
-  the inline **`fmt("…")`** node, and **`$var.path`** field-access sugar (lowers to a `jq` node); and
+  the inline **`fmt("…")`** node, and **`var.path[0]`** field/index-access sugar (lowers to `jq`); and
   (added P8) the value-template constructors **`obj`** (`{ k: expr }`) / **`list`** (`[ expr ]`) plus the
   **`assert`**, **`retry`**, and **`parallel`** blocks. Native operator formulas are accepted in bind
   RHS and condition positions (`when $count > 3`, `$ok = $score >= 0.8`) and lower to `expr` nodes.
@@ -44,24 +44,21 @@ accept today; everything unmarked is implemented.
   **`verify`**, **`peek`**, **`parse(…)`**, **`try`/`catch`**, **`race`**, **`scope`/`finally`**,
   **`saga`** (`step`/`undo`), **`pipe`**, and **`thing`** — every node kind now has a native form,
   each documented in its section below.
-- **`@json` escape** (pathological shapes only): a bind/memo whose symbol name is not an
+- **`@json` escape** (pathological AST shapes only): a bind/memo whose symbol name is not an
   identifier, a non-invertible `expr` formula (e.g. one using the expr function library), any `jq`
-  whose input is not a plain `$var` or whose path uses an array index (`.items[0]`), and all-literal
+  whose input is not a plain symbol, and all-literal
   `obj`/`list` templates — those round-trip through `@json`. Beware: writing `expr(…)`, `peek(…)`,
   or `jq(…)` call-style in text parses as an ordinary **op call** named `expr`/`peek`/`jq`, *not*
   the pure node — only `fmt(…)` and `parse(…)` are special-cased; the native `jq` spelling is the
-  `$var.path` sugar and the native `peek` spelling is the keyword form `peek $x`.
+  `var.path[0]` sugar and the native `peek` spelling is the keyword form `peek x`.
 - **Multi-line strings** (L-39, implemented): a `"""…"""` block — content taken **verbatim**, no
   escaping, no dedent — usable anywhere a string literal is valid (bind values, call args, `lit`
   values at any nesting depth inside an object/array, value-template leaves, and the natively
   spelled `fmt`/`assert`-message/`ctx`-purpose/`route`-case-label strings). `format` emits it
   automatically for any string containing a newline; see [§ Multi-line strings](#multi-line-strings)
   below for the full grammar.
-- **Aspirational** (described below as the *target* language, **not** yet parsed): comma-form named
-  arguments in call argument lists (`grep("ERROR", glob: "*.log")` — the shipped form is a single
-  object argument, see [§ Named arguments](#named-arguments)); comma-kwarg flow-control headers
-  (`retry 3, backoff: exponential`); multi-line *literals* inside call arguments other than a
-  `"""…"""` string (e.g. a multi-line `{…}` object — the parser is otherwise strictly line-based);
+- **Aspirational** (described below as the *target* language, **not** yet parsed): comma-kwarg
+  flow-control headers (`retry 3, backoff: exponential`);
   `@kind(…)` thing references (the implemented spelling is `thing <kind> <selector> "…"`);
   file-scope `type`/union declarations; and the `block`/`watch` spellings (the implemented keywords
   are `seq` and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`,
@@ -77,6 +74,9 @@ Flux-Lang exists at two levels:
   authored-flow persistence, replay, and host-derived execution records. It is not model output.
 - **Text format** — `.flux` files. The human-writable, version-controllable surface.
   This document specifies the text format.
+
+The `.flux` extension is text-only. CLI and editor paths do not inspect a leading `{` and reinterpret
+the file as JSON; JSON ASTs travel through typed APIs or explicitly JSON-oriented tooling.
 
 The two formats are semantically identical: every `.flux` file compiles to exactly the
 same `DraftAst` that the JSON wire format expresses. The text format adds nothing that
@@ -99,20 +99,20 @@ without modification. `parse` reads a single flow; `parse_program` reads a whole
 ```flux
 # single-flow file
 flow check-readme
-  $content = read("README.md")
-  return $content
+  content = read("README.md")
+  return content
 ```
 
 ```flux
 # multi-flow file (a module — parsed by parse_program)
 flow fetch-and-grep
-  $content = read("README.md")
-  $hits    = grep({pattern: "TODO", glob: "*.rs"})
-  return $hits
+  content = read("README.md")
+  hits = grep(pattern: "TODO", glob: "*.rs")
+  return hits
 
 flow summarise(text: String) -> String
-  $summary = task({role: "summariser", task: "Summarise:\n{text}"})
-  return $summary
+  summary = task(role: "summariser", task: "Summarise:\n{text}")
+  return summary
 ```
 
 Each flow starts with a `flow` header at column 0; blank lines and comments between flows are
@@ -351,32 +351,23 @@ escaped single-line spelling automatically, so `parse(&format(&ast)) == ast` alw
 no case where round-tripping is unsafe, only a small set of inputs that don't get the nicer
 spelling.
 
-`format_compact` (the display-only, non-round-tripping preview variant) never emits the multi-line
-spelling — it always uses the escaped single-line form, so a compact plan preview stays visually one
-line per statement.
+`format_compact` is also valid, round-tripping Flux source. It uses one-space block indentation and
+keeps newline-bearing strings in their escaped single-line form, so compact output stays one line per
+statement.
 
 ### Inline object literals
 
-Object (and array) literals are valid inside call arguments — **on one line**. The parser is
-strictly line-based: a statement is a single line, so a multi-line literal inside a call is a parse
-error. (This is about the object/array *shape* — one field per line, closing brace on its own line.
-A `"""…"""` string **value** nested inside a one-line object literal is fine and may itself contain
-real newlines; see [§ Multi-line strings](#multi-line-strings) — that block is the one exception to
-"statement = one physical line", handled at the lexer level, not the object/array grammar.)
+Object and array literals, and call argument lists, may span lines. Newlines/comments inside the
+delimiter are whitespace, and a trailing comma is accepted. Their indentation is visual only; the
+outer statement block resumes after the closing delimiter.
 
 ```flux
-$result = eval_run({adapter: "terminal-bench", tasks: ["chess-best-move"], trials: 1, agent_timeout: 180})
-```
-
-*(Aspirational)* the multi-line spelling — contents indented 2 spaces deeper, closing `)` on its
-own line — is **not implemented**:
-
-```flux
-# ASPIRATIONAL — does not parse today
-$result = eval_run({
+result = eval_run(
   adapter: "terminal-bench",
-  trials:  1
-})
+  tasks: ["chess-best-move"],
+  trials: 1,
+  agent_timeout: 180,
+)
 ```
 
 ---
@@ -393,33 +384,35 @@ git_commit("chore: bump version")
 ### Bind (result stored)
 
 ```flux
-$hits    = grep({pattern: "TODO", glob: "*.rs"})
-$content = read("README.md")
+hits = grep(pattern: "TODO", glob: "*.rs")
+content = read("README.md")
 ```
+
+Ordinary identifier symbols are bare. `$name` remains accepted for historical source and is the
+escape when a local is named like a contextual keyword (for example `$when`).
 
 ### Named arguments
 
-Named arguments are passed as **a single object argument** whose keys name the op's parameters
-(story L-09). This is the one convention for multi-parameter calls; a sole-required-param op
-accepts a bare value as sugar.
+Named arguments project the AST's **single object argument** convention directly. `key: value`
+names an input; a bare identifier puns to `key: key`. A sole-required-param op accepts a bare value.
 
 ```flux
-$hits = grep({pattern: "ERROR", glob: "*.log", max_results: 50})
-$page = read({path: "large.txt", limit: 100, offset: 200})
-$src  = read("README.md")            # sole-required-param sugar
+hits = grep(pattern: "ERROR", glob: "*.log", max_results: 50)
+page = read(path: "large.txt", limit: 100, offset: 200)
+saved = write(path, content: body)   # `path` means `path: path`
+src = read("README.md")              # sole-required-param sugar
 ```
 
-Two or more bare positional arguments is the deprecated positional form — the analyzer rejects it.
-
-*(Aspirational — not implemented)* a comma-separated `key: value` form appended after positional
-args (`grep("ERROR", glob: "*.log")`) does **not** parse; nor do comma-kwarg flow-control headers
-(`retry 3, backoff: exponential` / `race timeout: 5000`). The implemented flow-control headers use
+Two or more bare identifiers form a named-input map through punning. Legacy sigiled arguments retain
+the deprecated positional AST shape. Named entries cannot mix with arbitrary positional expressions,
+and duplicate names are a parse error. Comma-kwarg flow-control headers remain unsupported
+(`retry 3, backoff: exponential` / `race timeout: 5000`); those headers use
 **space-keyword** tokens in fixed order (see [§ Native control-flow forms
 (P6)](#native-control-flow-forms-p6)):
 
 ```flux
-retry 3 backoff exponential delay 500 -> $out
-loop for 10000 every 1000
+retry 3 backoff exponential delay 500ms -> out
+loop for 10s every 1s
 ```
 
 ### Memo (cross-turn cache)
@@ -939,12 +932,12 @@ string literals, but explicit about being pure.
 
 ### jq — JSON path extraction
 
-The native text spelling of the pure `jq` node is the **`$var.path` sugar** (below). The
+The native text spelling of the pure `jq` node is the **`var.path[0]` sugar** (below). The
 call-style `jq(".path", $raw)` parses as an ordinary op call named `jq`, **not** the pure node —
-bracket paths and non-symbol inputs are written via `@json`:
+non-symbol inputs are written via `@json`:
 
 ```flux
-$price = $raw.bitcoin.usd     # native sugar for the jq node
+price = raw.bitcoin.usd       # native sugar for the jq node
 ```
 
 ```flux
@@ -960,17 +953,18 @@ conditionals. Allowed forms:
 - `.field[0]`
 - `.field[0].nested`
 
-**Field-access sugar (P6):** when the input is a plain symbol and the path is a simple dotted field path
-(no array index), you may write `$var.path` instead of `jq(".path", $var)`:
+**Field/index-access sugar (P6/L-93):** when the input is a plain symbol, write `var.path` or
+`var.items[0]` instead of `jq(".path", var)`:
 
 ```flux
-$kind = $plan.kind          # sugar for jq(".kind", $plan)
-$txt  = $plan.message.text  # sugar for jq(".message.text", $plan)
+kind = plan.kind              # sugar for jq(".kind", plan)
+txt = plan.message.text       # nested fields
+first = response.items[0]     # numeric list index
 ```
 
 This is a *bind-value* form: the lowered `jq` node, like any computed value, is only valid as a bind
-value — not inline as a `match` subject or call argument (bind it first). Bracket paths (`.items[0]`) and
-non-symbol inputs keep the explicit `jq(…)` / `@json` form.
+value — not inline as a `match` subject or call argument (bind it first). Non-symbol inputs keep the
+`@json` form.
 
 ### parse — type coercion
 
@@ -979,8 +973,8 @@ Convert a string result (typically from `jq` or `fmt`) into a typed value. Like 
 an op call:
 
 ```flux
-$price_num = parse($raw.price, as: "f64")
-$flag = parse($raw.enabled, as: "bool")
+price_num = parse(raw.price, as: "f64")
+flag = parse(raw.enabled, as: "bool")
 ```
 
 `as` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. Coercion failures error rather
@@ -1241,18 +1235,18 @@ they are documentation and are preserved in the AST.
 
 ## Complete examples
 
-Both examples use the shipped spellings only: single-line calls, the single-object named-argument
-form, and `branch $name` parallel arms.
+Both examples use shipped compact spellings: bare locals, direct named inputs, and parenthesized
+calls.
 
 ### eval-smoke.flux
 
 ```flux
 flow eval-smoke
-  $baseline   = eval_run("mock")
-  $sessions   = eval_sessions($baseline)
-  $mined      = painpoints_collect($sessions)
-  $candidates = improvements_aggregate({mined: $mined, reviewed: []})
-  return $candidates
+  baseline = eval_run("mock")
+  sessions = eval_sessions(baseline)
+  mined = painpoints_collect(sessions)
+  candidates = improvements_aggregate(mined, reviewed: [])
+  return candidates
 ```
 
 ### improve.flux (abridged)
@@ -1307,9 +1301,11 @@ flow improve -> EvalReport
 - `format.rs` — `format(ast: &DraftAst) -> String`. Canonical emitter, always 2-space indentation,
   brace-free indentation blocks; emits `@json` for shapes without a native form. Separate from `render.rs`
   (a lossy one-way terminal display tree).
+- `format_compact(ast)` emits the same accepted grammar with one-space indentation and escaped
+  multiline strings; both projections round-trip exactly.
 
 Round-trip invariant: `parse(&format(&ast)) == ast` — native spellings for every node kind,
-with unspellable shapes (non-identifier names (L-18), non-invertible `expr`, bracket-path `jq`)
+with unspellable shapes (non-identifier names (L-18), non-invertible `expr`, non-symbol-input `jq`)
 falling back to `@json`; property-tested (`tests/roundtrip_property.rs`).
 
 `flux run <app.flux>` runs a multi-agent program through the `flux-app` host (see
@@ -1328,7 +1324,7 @@ text and emits the resulting `DraftAst` as JSON.
 | Round-trips | via `parse` + `format` | via `serde_json` |
 | Comments | yes (`#`) | no |
 | Multi-line strings | yes — verbatim `"""…"""` (L-39), auto-emitted for any newline-bearing string | escaped `\n` in JSON string (the wire format has no triple-quote form) |
-| Named args | single object argument (`op({k: v})`) | same — one object argument names the params |
+| Named args | direct labels/puns (`op(k: v, path)`) | one object argument names the params |
 | Type annotations | yes (params/returns) | yes (same `TypeRef` serde) |
 | String interpolation | `{sym}`, escape `{{` `}}` | same `{sym}` inside JSON strings |
 

@@ -12,6 +12,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **Workflow source is shorter and easier to scan.** Locals no longer need `$` on every use, named
+  operation inputs no longer need an extra object wrapper, standalone calls use the same `op(...)`
+  spelling as bound calls, list indexes use `[0]`, and durations can use `ms`, `s`, or `m`. Existing
+  source spellings remain accepted, and both normal and extra-compact formatting are valid source.
+
+### Action needed
+
+- **A `.flux` file must now contain Flux-Lang text.** Files containing only a JSON workflow AST are
+  no longer detected by their first character. Convert them to native source; JSON AST values remain
+  supported through explicit APIs and JSON tooling.
+
 ## [0.38.0] - 2026-07-30
 
 ### New

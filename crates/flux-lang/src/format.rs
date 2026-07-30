@@ -3,15 +3,16 @@
 //! emits a re-parseable surface: `parse(&format(&ast)) == ast` for every `DraftAst` whose header
 //! names are spellable (see "The flow-header exception" below — node bodies are covered totally).
 //!
-//! # Markers (design §5)
-//! - `$x = <expr>` — a **bind** (`=`).
-//! - `do <op> <arg>, …` — an **effectful call** discarding its result (`do`).
-//! - `$pack += $a, $b` — a **context append** (`+=`).
+//! # Canonical source
+//! - `x = <expr>` — a **bind** (`=`); `$x` remains the reserved-name/legacy escape.
+//! - `op(<args>)` — one call form whether the result is bound or discarded. `do` remains accepted
+//!   and is emitted only to escape a callable name that collides with statement syntax.
+//! - `pack += a, b` — a **context append** (`+=`).
 //!
 //! # Supported node kinds (native text form)
 //! `bind`, `call`, `var`, `lit`, `return`, `when`/`unless`, `each`, `repeat`, `seq`, `ctx`,
 //! `ctx_append`, `match`, `route`, `fallback`, `loop`, `timeout`, `budget`, `fmt` (inline `fmt("…")`),
-//! and `jq` field-access sugar (inline `$var.path`, simple dotted paths only). Blocks are **2-space
+//! and `jq` field/index-access sugar (inline `var.path[0]`). Blocks are **2-space
 //! indentation** delimited (no braces, no `end`).
 //!
 //! # The `@json` fallback
@@ -46,7 +47,8 @@
 //! ignores* one for forward-compatibility with hand-written headers; it is not part of the round-trip.
 
 use crate::ast::{
-    is_valid_decl_name, is_valid_op_name, DraftAst, FlowEffect, Node, SymbolName, TypeRef,
+    is_bare_symbol_name, is_reserved_word, is_valid_decl_name, is_valid_op_name, DraftAst,
+    FlowEffect, Node, SymbolName, TypeRef,
 };
 use crate::program::CompositeOpDecl;
 use flux_spec::{Effect, Idempotency, Risk};
@@ -140,15 +142,13 @@ pub fn format_composite_op(op: &CompositeOpDecl) -> String {
     out
 }
 
-/// Render a [`DraftAst`] in the **token-efficient** display variant: the same markers as [`format`]
-/// but single-space block indentation (≈half the indentation characters on nested plans). For cheap
-/// model-facing *display* of a plan. **Display-only:** [`crate::parse`] expects canonical two-space
-/// indentation, so this surface does not round-trip — use [`format`] for the writable, parseable form.
+/// Render a [`DraftAst`] in the **token-efficient** source variant: the same grammar as [`format`]
+/// but single-space block indentation (≈half the indentation characters on nested plans). This is
+/// writable Flux-Lang and satisfies the same exact parse/format round-trip contract.
 ///
 /// Never emits the multi-line `"""…"""` spelling (L-39): a newline-bearing string stays the
 /// standard escaped single-line form, so a compact plan preview stays visually one line per
-/// statement (the property this variant exists for) — it was never round-trippable, so there is no
-/// invariant to preserve by teaching it the new spelling too.
+/// statement (the property this variant exists for).
 pub fn format_compact(ast: &DraftAst) -> String {
     format_with(ast, " ", false)
 }
@@ -290,11 +290,16 @@ fn fmt_string_list(items: &[String]) -> String {
 /// string spelling (L-39) inside any `Lit`/`Fmt`/template string leaf.
 fn fmt_expr(node: &Node, multiline: bool) -> String {
     match node {
-        Node::Var { name } if name.is_identifier() => format!("${}", name.0),
+        Node::Var { name } if name.is_identifier() => fmt_symbol(name),
         Node::Lit { value } => compact_value(value, multiline),
-        Node::Call { op, args } if is_valid_op_name(op) && op != "fmt" => {
-            let a: Vec<String> = args.iter().map(|n| fmt_expr(n, multiline)).collect();
-            format!("{}({})", op, a.join(", "))
+        Node::Call { op, args }
+            if is_valid_op_name(op) && op != "fmt" && fmt_call_args(args, multiline).is_some() =>
+        {
+            format!(
+                "{}({})",
+                op,
+                fmt_call_args(args, multiline).unwrap_or_default()
+            )
         }
         // `fmt("template")` — the string-interpolation node.
         Node::Fmt { template } => {
@@ -308,13 +313,18 @@ fn fmt_expr(node: &Node, multiline: bool) -> String {
             path,
             input,
             optional,
-        } if is_field_path(path)
+        } if fmt_field_path(path).is_some()
             && matches!(input.as_ref(), Node::Var { name } if name.is_identifier()) =>
         {
             // L-53: a lenient access renders with a trailing `?` (`$var.path?`); strict is bare.
             let q = if *optional { "?" } else { "" };
             match input.as_ref() {
-                Node::Var { name } => format!("${}{}{}", name.0, path, q),
+                Node::Var { name } => format!(
+                    "{}{}{}",
+                    fmt_symbol(name),
+                    fmt_field_path(path).unwrap_or_default(),
+                    q
+                ),
                 _ => unreachable!("guard checked Var"),
             }
         }
@@ -324,7 +334,15 @@ fn fmt_expr(node: &Node, multiline: bool) -> String {
         Node::Obj { fields } if node_is_dynamic(node) => {
             let parts: Vec<String> = fields
                 .iter()
-                .map(|(k, v)| format!("{}: {}", fmt_obj_key(k), fmt_expr(v, multiline)))
+                .map(|(k, v)| {
+                    if is_bare_symbol_name(k)
+                        && matches!(v.as_ref(), Node::Var { name } if name.0 == *k)
+                    {
+                        k.clone()
+                    } else {
+                        format!("{}: {}", fmt_obj_key(k), fmt_expr(v, multiline))
+                    }
+                })
                 .collect();
             format!("{{ {} }}", parts.join(", "))
         }
@@ -349,7 +367,7 @@ fn fmt_expr(node: &Node, multiline: bool) -> String {
             result
         }
         // `peek $sym` reads a symbol's current value.
-        Node::Peek { name } if name.is_identifier() => format!("peek ${}", name.0),
+        Node::Peek { name } if name.is_identifier() => format!("peek {}", fmt_symbol(name)),
         // `parse(<value>, as: "T")` — coercion. The value goes through `parse_condition_expr` on the
         // way back, so a native-expr value is fine; only an @json-rendered value forces the escape.
         Node::Parse { value, as_type } if !fmt_expr(value, multiline).starts_with("@json ") => {
@@ -484,14 +502,107 @@ fn fmt_obj_key(k: &str) -> String {
     }
 }
 
-/// Whether a `jq` path is a simple dotted field path (`.kind`, `.a.b`) — the only shape the `$var.path`
-/// surface can spell. Excludes array indices (`[0]`) and the empty path, which use `@json`.
-fn is_field_path(path: &str) -> bool {
-    path.starts_with('.')
-        && path.len() > 1
-        && path[1..]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+/// Render a spellable symbol without a sigil. Contextual keywords retain `$` as an explicit escape,
+/// so the canonical surface stays unambiguous while ordinary locals shed their repeated marker.
+fn fmt_symbol(symbol: &SymbolName) -> String {
+    if is_bare_symbol_name(&symbol.0) {
+        symbol.0.clone()
+    } else {
+        format!("${}", symbol.0)
+    }
+}
+
+/// Render call arguments, projecting the existing single-object named-input convention directly as
+/// `name: value` entries. Returns `None` only when an object key cannot be represented as a label.
+fn fmt_call_args(args: &[Node], multiline: bool) -> Option<String> {
+    if let [Node::Obj { fields }] = args {
+        if !fields.keys().all(|key| is_ident_key(key)) {
+            return None;
+        }
+        let all_puns = fields.len() > 1
+            && fields.iter().all(|(key, value)| {
+                is_bare_symbol_name(key)
+                    && matches!(value.as_ref(), Node::Var { name } if name.0 == *key)
+            });
+        let rendered = fields
+            .iter()
+            .map(|(key, value)| {
+                if all_puns
+                    || (fields.len() > 1
+                        && is_bare_symbol_name(key)
+                        && matches!(value.as_ref(), Node::Var { name } if name.0 == *key))
+                {
+                    key.clone()
+                } else {
+                    format!("{key}: {}", fmt_expr(value, multiline))
+                }
+            })
+            .collect::<Vec<_>>();
+        return Some(rendered.join(", "));
+    }
+
+    let multiple = args.len() > 1;
+    Some(
+        args.iter()
+            .map(|arg| match arg {
+                // Two or more bare variable arguments are the named-input pun surface. Preserve an
+                // explicitly positional legacy call by retaining `$` on those otherwise-ambiguous
+                // entries.
+                Node::Var { name } if multiple && name.is_identifier() => {
+                    format!("${}", name.0)
+                }
+                _ => fmt_expr(arg, multiline),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+fn fmt_legacy_call_args(args: &[Node], multiline: bool) -> Option<String> {
+    let rendered = args
+        .iter()
+        .map(|arg| match arg {
+            Node::Var { name } if name.is_identifier() => format!("${}", name.0),
+            _ => fmt_expr(arg, multiline),
+        })
+        .collect::<Vec<_>>();
+    rendered
+        .iter()
+        .all(|arg| !arg.starts_with("@json "))
+        .then(|| rendered.join(", "))
+}
+
+/// Convert the AST's jq-compatible dotted path (`.items.0.name`) to readable field/index syntax
+/// (`.items[0].name`). Unsupported jq syntax falls back to the JSON node escape.
+fn fmt_field_path(path: &str) -> Option<String> {
+    let segments = path.strip_prefix('.')?.split('.').collect::<Vec<_>>();
+    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    let mut rendered = String::new();
+    for segment in segments {
+        if segment.chars().all(|ch| ch.is_ascii_digit()) {
+            rendered.push('[');
+            rendered.push_str(segment);
+            rendered.push(']');
+        } else if is_ident_key(segment) {
+            rendered.push('.');
+            rendered.push_str(segment);
+        } else {
+            return None;
+        }
+    }
+    Some(rendered)
+}
+
+fn fmt_duration(ms: u64) -> String {
+    if ms != 0 && ms.is_multiple_of(60_000) {
+        format!("{}m", ms / 60_000)
+    } else if ms != 0 && ms.is_multiple_of(1_000) {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 fn indent_of(level: usize, unit: &str) -> String {
@@ -505,10 +616,7 @@ fn fmt_body(body: &[Node], level: usize, indent: &str, multiline: bool, out: &mu
 }
 
 fn join_syms(syms: &[SymbolName]) -> String {
-    syms.iter()
-        .map(|s| format!("${}", s.0))
-        .collect::<Vec<_>>()
-        .join(", ")
+    syms.iter().map(fmt_symbol).collect::<Vec<_>>().join(", ")
 }
 
 /// True if `n` renders as an inline expression that `parse_expr` (not the native-expr or @json
@@ -564,8 +672,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
                 out.push_str(")\n");
             }
             out.push_str(&ind);
-            out.push('$');
-            out.push_str(&name.0);
+            out.push_str(&fmt_symbol(name));
             if let Some(t) = ty {
                 out.push_str(": ");
                 out.push_str(&t.label());
@@ -576,8 +683,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
         }
         Node::CtxAppend { ctx, add } if ctx.is_identifier() && all_idents(add) => {
             out.push_str(&ind);
-            out.push('$');
-            out.push_str(&ctx.0);
+            out.push_str(&fmt_symbol(ctx));
             out.push_str(" +=");
             if !add.is_empty() {
                 out.push(' ');
@@ -585,16 +691,28 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             }
             out.push('\n');
         }
-        // A bare `call` statement (result discarded) uses the `do` marker. (`do fmt …` is fine —
-        // only the *inline* paren form collides with the `Fmt` node.)
-        Node::Call { op, args } if is_valid_op_name(op) => {
+        // Calls use one expression form whether their result is bound or discarded.
+        Node::Call { op, args }
+            if is_valid_op_name(op)
+                && if op == "fmt" || is_reserved_word(op) {
+                    fmt_legacy_call_args(args, multiline).is_some()
+                } else {
+                    fmt_call_args(args, multiline).is_some()
+                } =>
+        {
             out.push_str(&ind);
-            out.push_str("do ");
-            out.push_str(op);
-            if !args.is_empty() {
-                out.push(' ');
-                let a: Vec<String> = args.iter().map(|n| fmt_expr(n, multiline)).collect();
-                out.push_str(&a.join(", "));
+            if op == "fmt" || is_reserved_word(op) {
+                out.push_str("do ");
+                out.push_str(op);
+                if !args.is_empty() {
+                    out.push(' ');
+                    out.push_str(&fmt_legacy_call_args(args, multiline).unwrap_or_default());
+                }
+            } else {
+                out.push_str(op);
+                out.push('(');
+                out.push_str(&fmt_call_args(args, multiline).unwrap_or_default());
+                out.push(')');
             }
             out.push('\n');
         }
@@ -606,8 +724,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
         }
         Node::Var { name } if name.is_identifier() => {
             out.push_str(&ind);
-            out.push('$');
-            out.push_str(&name.0);
+            out.push_str(&fmt_symbol(name));
             out.push('\n');
         }
         Node::Lit { value } => {
@@ -650,8 +767,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             // so this guard lets it fall through to the `@json` escape below — preserving round-trip.
             // Unspellable item/collect names fall through the same way (the F21 name guards).
             out.push_str(&ind);
-            out.push_str("each $");
-            out.push_str(&item.0);
+            out.push_str("each ");
+            out.push_str(&fmt_symbol(item));
             out.push_str(" in ");
             out.push_str(&fmt_expr(source, multiline));
             if let Some(c) = collect {
@@ -659,8 +776,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
                 if *flat {
                     out.push_str("flat ");
                 }
-                out.push('$');
-                out.push_str(&c.0);
+                out.push_str(&fmt_symbol(c));
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, multiline, out);
@@ -675,8 +791,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str("repeat ");
             out.push_str(&max.to_string());
             if let Some(c) = collect {
-                out.push_str(" -> $");
-                out.push_str(&c.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(c));
             }
             out.push('\n');
             if let Some(u) = until {
@@ -691,8 +807,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("seq");
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, multiline, out);
@@ -705,8 +821,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             budget,
         } if name.is_identifier() && all_idents(include) && all_idents(exclude) => {
             out.push_str(&ind);
-            out.push_str("ctx $");
-            out.push_str(&name.0);
+            out.push_str("ctx ");
+            out.push_str(&fmt_symbol(name));
             out.push('\n');
             let ind1 = indent_of(level + 1, indent);
             if let Some(p) = purpose {
@@ -784,8 +900,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("fallback");
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             let ind1 = indent_of(level + 1, indent);
@@ -804,12 +920,12 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
         } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("loop for ");
-            out.push_str(&for_ms.to_string());
+            out.push_str(&fmt_duration(*for_ms));
             out.push_str(" every ");
-            out.push_str(&every_ms.to_string());
+            out.push_str(&fmt_duration(*every_ms));
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             if let Some(u) = until {
@@ -823,10 +939,10 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
         Node::Timeout { ms, body, bind } if opt_ident(bind) => {
             out.push_str(&ind);
             out.push_str("timeout ");
-            out.push_str(&ms.to_string());
+            out.push_str(&fmt_duration(*ms));
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, multiline, out);
@@ -836,8 +952,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str("budget ");
             out.push_str(&limit.to_string());
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, multiline, out);
@@ -847,8 +963,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str("with_tools ");
             out.push_str(&fmt_string_list(tools));
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, multiline, out);
@@ -860,8 +976,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str("parallel\n");
             for br in branches {
                 out.push_str(&indent_of(level + 1, indent));
-                out.push_str("branch $");
-                out.push_str(&br.name.0);
+                out.push_str("branch ");
+                out.push_str(&fmt_symbol(&br.name));
                 out.push('\n');
                 fmt_body(&br.body, level + 2, indent, multiline, out);
             }
@@ -885,11 +1001,11 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             }
             if let Some(ms) = delay_ms {
                 out.push_str(" delay ");
-                out.push_str(&ms.to_string());
+                out.push_str(&fmt_duration(*ms));
             }
             if let Some(s) = bind {
-                out.push_str(" -> $");
-                out.push_str(&s.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(s));
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, multiline, out);
@@ -917,8 +1033,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("catch");
             if let Some(c) = catch {
-                out.push_str(" $");
-                out.push_str(&c.0);
+                out.push(' ');
+                out.push_str(&fmt_symbol(c));
             }
             out.push('\n');
             fmt_body(handler, level + 1, indent, multiline, out);
@@ -929,17 +1045,17 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             bind,
         } if branches.iter().all(|b| b.name.is_identifier()) && opt_ident(bind) => {
             out.push_str(&ind);
-            out.push_str(&format!("race {timeout_ms}"));
+            out.push_str(&format!("race {}", fmt_duration(*timeout_ms)));
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             let ind1 = indent_of(level + 1, indent);
             for br in branches {
                 out.push_str(&ind1);
-                out.push_str("branch $");
-                out.push_str(&br.name.0);
+                out.push_str("branch ");
+                out.push_str(&fmt_symbol(&br.name));
                 out.push('\n');
                 fmt_body(&br.body, level + 2, indent, multiline, out);
             }
@@ -958,8 +1074,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("scope");
             if let (Some(b), Some(a)) = (bind, acquire) {
-                out.push_str(" $");
-                out.push_str(&b.0);
+                out.push(' ');
+                out.push_str(&fmt_symbol(b));
                 out.push_str(" = ");
                 out.push_str(&fmt_expr(a, multiline));
             }
@@ -990,8 +1106,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("pipe");
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             fmt_body(steps, level + 1, indent, multiline, out);
@@ -1020,7 +1136,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("throttle ");
             out.push_str(&compact_str(name, multiline));
-            out.push_str(&format!(" {max} per {window_ms}\n"));
+            out.push_str(&format!(" {max} per {}\n", fmt_duration(*window_ms)));
             fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Debounce {
@@ -1031,7 +1147,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("debounce ");
             out.push_str(&compact_str(name, multiline));
-            out.push_str(&format!(" {wait_ms}\n"));
+            out.push_str(&format!(" {}\n", fmt_duration(*wait_ms)));
             fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Verify {
@@ -1063,8 +1179,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
                 out.push_str(")\n");
             }
             out.push_str(&ind);
-            out.push_str("memo $");
-            out.push_str(&name.0);
+            out.push_str("memo ");
+            out.push_str(&fmt_symbol(name));
             if let Some(t) = ty {
                 out.push_str(": ");
                 out.push_str(&t.label());
@@ -1078,8 +1194,8 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str("once ");
             out.push_str(&compact_str(label, multiline));
             if let Some(b) = bind {
-                out.push_str(" -> $");
-                out.push_str(&b.0);
+                out.push_str(" -> ");
+                out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
             fmt_body(body, level + 1, indent, multiline, out);
@@ -1104,8 +1220,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("await ");
             if let Some(b) = binding {
-                out.push('$');
-                out.push_str(&b.0);
+                out.push_str(&fmt_symbol(b));
                 if let Some(t) = as_type {
                     out.push_str(": ");
                     out.push_str(&t.label());
@@ -1141,8 +1256,8 @@ mod tests {
     use crate::ast::{Param, Selector, ThingKind, ThingRef, TypeRef};
 
     #[test]
-    fn compact_uses_single_space_indent_display_only() {
-        // A nested plan: `when $x` with a body, so indentation is exercised.
+    fn compact_uses_single_space_indent_and_round_trips() {
+        // A nested plan: `when x` with a body, so indentation is exercised.
         let ast = DraftAst {
             body: vec![Node::When {
                 cond: Box::new(Node::Var { name: "x".into() }),
@@ -1159,19 +1274,16 @@ mod tests {
         let canonical = format(&ast);
         let compact = format_compact(&ast);
         // Level-1 `when` is indented two spaces canonically, one space compactly — fewer chars.
-        assert!(
-            canonical.contains("\n  when $x\n"),
-            "canonical: {canonical}"
-        );
-        assert!(compact.contains("\n when $x\n"), "compact: {compact}");
+        assert!(canonical.contains("\n  when x\n"), "canonical: {canonical}");
+        assert!(compact.contains("\n when x\n"), "compact: {compact}");
         assert!(
             compact.len() < canonical.len(),
             "compact is shorter ({} vs {})",
             compact.len(),
             canonical.len()
         );
-        // The canonical form remains the round-trippable one (compact is display-only).
         assert_eq!(crate::parse::parse(&canonical).unwrap(), ast);
+        assert_eq!(crate::parse::parse(&compact).unwrap(), ast);
     }
 
     #[test]
@@ -1195,11 +1307,11 @@ mod tests {
         };
         let txt = format(&ast);
         assert!(txt.starts_with("flow greet(who: String) -> Reply\n"));
-        assert!(txt.contains("\n  $msg = greet_op($who)\n"), "got: {txt}");
+        assert!(txt.contains("\n  msg = greet_op(who)\n"), "got: {txt}");
     }
 
     #[test]
-    fn bare_call_uses_do_and_inline_call_uses_parens() {
+    fn discarded_and_inline_calls_share_the_paren_form() {
         let ast = DraftAst {
             body: vec![
                 Node::Call {
@@ -1223,8 +1335,8 @@ mod tests {
             ..Default::default()
         };
         let txt = format(&ast);
-        assert!(txt.contains("  do git_stage [\".\"]\n"), "got: {txt}");
-        assert!(txt.contains("  $x = read(\"f\")\n"), "got: {txt}");
+        assert!(txt.contains("  git_stage([\".\"])\n"), "got: {txt}");
+        assert!(txt.contains("  x = read(\"f\")\n"), "got: {txt}");
     }
 
     #[test]
@@ -1260,7 +1372,7 @@ mod tests {
         };
         let txt = format(&ast);
         assert!(
-            txt.contains("$x = \"\"\"first\nsecond\"\"\""),
+            txt.contains("x = \"\"\"first\nsecond\"\"\""),
             "expected the verbatim triple-quote spelling, got: {txt}"
         );
         assert!(
@@ -1336,10 +1448,9 @@ mod tests {
     }
 
     #[test]
-    fn format_compact_keeps_the_escaped_single_line_spelling_for_display() {
-        // `format_compact` is display-only (doesn't round-trip; see its doc comment) — it never
-        // emits the multi-line spelling, so a compact plan preview always stays visually single-line
-        // per statement.
+    fn format_compact_keeps_the_escaped_single_line_spelling() {
+        // Compact source never emits the multi-line spelling, so it stays visually single-line per
+        // statement while remaining parseable.
         let ast = DraftAst {
             body: vec![Node::Lit {
                 value: serde_json::json!("first\nsecond"),
@@ -1349,6 +1460,7 @@ mod tests {
         let compact = format_compact(&ast);
         assert!(!compact.contains("\"\"\""), "got: {compact}");
         assert!(compact.contains("\\n"), "got: {compact}");
+        assert_eq!(crate::parse::parse(&compact).unwrap(), ast);
     }
 
     #[test]
@@ -1434,7 +1546,7 @@ mod tests {
         );
         let txt = format(&opt);
         assert!(
-            txt.contains("$obj.a?"),
+            txt.contains("obj.a?"),
             "optional access should format with `?`: {txt}"
         );
         assert_eq!(
@@ -1447,7 +1559,7 @@ mod tests {
         let strict = crate::parse::parse("flow f\n  $x = $obj.a\n  return $x\n").unwrap();
         let txt2 = format(&strict);
         assert!(
-            txt2.contains("$obj.a") && !txt2.contains("$obj.a?"),
+            txt2.contains("obj.a") && !txt2.contains("obj.a?"),
             "strict access is bare: {txt2}"
         );
         assert_eq!(crate::parse::parse(&txt2).unwrap(), strict);

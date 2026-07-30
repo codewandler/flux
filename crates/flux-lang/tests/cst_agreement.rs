@@ -77,13 +77,18 @@ const LEGACY_FIXTURES: &[LegacyFixture] = &[
     },
 ];
 
-/// Shipped fixtures authored *after* the CST cutover (L-80). The legacy `parse_program` no longer
-/// exists, so there is no independent oracle to freeze an `ast_sha256` against — pinning one from
-/// the current parser would only assert that the parser agrees with itself. They are held to every
-/// other contract in this file (losslessness, no ERROR nodes, exact token/comment ranges, and
-/// format→parse survival of every executable AST).
+/// Shipped fixtures without a legacy text-parser hash: either authored after the CST cutover or
+/// mechanically migrated from the old JSON `DraftAst` storage spelling. They are held to every
+/// other contract in this file (losslessness, no ERROR nodes, exact token/comment ranges, and both
+/// canonical and compact format→parse survival of every executable AST).
 const POST_CUTOVER_FIXTURES: &[&str] = &[
     "examples/bitcoin-price.flux",
+    "examples/cognition-research.flux",
+    "examples/eval-smoke.flux",
+    "examples/eval-synthetic.flux",
+    "examples/improve-multi.flux",
+    "examples/improve-synthetic.flux",
+    "examples/improve-tbench.flux",
     "examples/release.flux",
     "examples/zendesk.triage.flux",
 ];
@@ -209,10 +214,25 @@ fn assert_module_ranges(src: &str, lowered: &LoweredModule, what: &str) {
 }
 
 fn assert_flow_round_trip(ast: &DraftAst, what: &str) {
-    let formatted = flux_lang::format::format(ast);
-    let reparsed = flux_lang::parse::parse(&formatted)
-        .unwrap_or_else(|error| panic!("{what}: formatted AST must parse: {error}\n{formatted}"));
-    assert_eq!(reparsed, *ast, "{what}: format→parse changed the AST");
+    for (projection, formatted) in [
+        ("canonical", flux_lang::format::format(ast)),
+        ("compact", flux_lang::format::format_compact(ast)),
+    ] {
+        let reparsed = flux_lang::parse::parse(&formatted).unwrap_or_else(|error| {
+            panic!("{what}: {projection} AST must parse: {error}\n{formatted}")
+        });
+        assert_eq!(
+            reparsed, *ast,
+            "{what}: {projection} format→parse changed the AST\n--- formatted ---\n{formatted}"
+        );
+        let cst = parse_cst(&formatted);
+        assert!(
+            cst.errors.is_empty(),
+            "{what}: {projection} output has CST errors: {:?}\n{formatted}",
+            cst.errors
+        );
+        assert_eq!(cst.syntax().text().to_string(), formatted);
+    }
 }
 
 fn assert_module_round_trips(module: &Module, what: &str) -> usize {
@@ -329,16 +349,10 @@ fn shipped_flux_corpus_agreement() {
                 .replace('\\', "/");
             scanned.push(relative.clone());
             let src = std::fs::read_to_string(&path).expect("read fixture");
-            // A few historical `.flux` fixtures intentionally store the JSON DraftAst wire shape;
-            // they never entered the text parser and are outside this CST corpus.
-            if src.trim_start().starts_with('{') {
-                continue;
-            }
-            // This design example intentionally demonstrates aspirational `type` declarations and
-            // multi-line call arguments that `docs/syntax.md` marks as unshipped syntax.
-            if path.file_name().and_then(|name| name.to_str()) == Some("call-routing.flux") {
-                continue;
-            }
+            assert!(
+                !matches!(src.trim_start().chars().next(), Some('{' | '[')),
+                "{relative}: .flux files must contain Flux-Lang text, not JSON"
+            );
             // Fixtures written after the CST cutover have no legacy `parse_program` to freeze
             // evidence from, so they carry no `ast_sha256`. They still get the losslessness,
             // ERROR-free, range and format→parse contracts below via `assert_agreement(_, None)`.
@@ -352,7 +366,7 @@ fn shipped_flux_corpus_agreement() {
     scanned.sort();
     accepted.sort();
     post_cutover.sort();
-    assert_eq!(scanned.len(), 19, "the shipped Flux fixture census changed");
+    assert_eq!(scanned.len(), 18, "the shipped Flux fixture census changed");
     assert_eq!(
         post_cutover.len(),
         POST_CUTOVER_FIXTURES.len(),
@@ -427,4 +441,67 @@ fn native_spelling_battery_agreement() {
     for (i, src) in snippets.iter().enumerate() {
         assert_agreement(src, &format!("battery[{i}]"), None);
     }
+}
+
+#[test]
+fn compact_readable_spellings_lower_to_the_existing_ast() {
+    let legacy = r#"flow route(unused: String)
+  $intent = $extract.intent?
+  $first = $items.0
+  $booking = booking_create({ slots: $slots, caller: $caller_id })
+  do notify $booking
+  timeout 60000 -> $answer
+    do fetch $url
+  return { intent: $intent, first: $first, booking: $booking, answer: $answer }
+"#;
+    let readable = r#"flow route(unused: String)
+  intent = extract.intent?
+  first = items[0]
+  booking = booking_create(
+    slots,
+    caller: caller_id,
+  )
+  notify(booking)
+  timeout 1m -> answer
+    fetch(url)
+  return { intent, first, booking, answer }
+"#;
+
+    let old = flux_lang::parse::parse(legacy).expect("legacy source parses");
+    let new = flux_lang::parse::parse(readable).expect("readable source parses");
+    assert_eq!(new, old);
+    assert!(
+        readable.len() * 100 <= legacy.len() * 92,
+        "representative readable source must save at least 8% (legacy={}, readable={})",
+        legacy.len(),
+        readable.len()
+    );
+
+    let parsed = parse_cst(readable);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    assert_eq!(parsed.syntax().text().to_string(), readable);
+}
+
+#[test]
+fn named_call_labels_are_semantic_and_duplicates_are_rejected() {
+    let ast = flux_lang::parse::parse(
+        "flow f\n  result = write(path: target, content: text)\n  return result\n",
+    )
+    .expect("named input parses");
+    let value = serde_json::to_value(ast).expect("serialize AST");
+    assert_eq!(value["body"][0]["value"]["args"][0]["kind"], "obj");
+    assert_eq!(
+        value["body"][0]["value"]["args"][0]["fields"]["path"]["name"],
+        "target"
+    );
+    assert_eq!(
+        value["body"][0]["value"]["args"][0]["fields"]["content"]["name"],
+        "text"
+    );
+
+    let duplicate = flux_lang::parse::parse("flow f\n  write(path: a, path: b)\n");
+    assert!(duplicate
+        .expect_err("duplicate named input must fail")
+        .to_string()
+        .contains("duplicate named argument `path`"));
 }

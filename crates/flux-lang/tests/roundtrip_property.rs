@@ -566,32 +566,36 @@ fn random_draft_asts_round_trip_exactly() {
     for seed in 1..=1000u64 {
         let mut rng = Rng::new(seed);
         let ast = gen_ast(&mut rng, &mut seen);
-        let text = flux_lang::format::format(&ast);
-        let back = flux_lang::parse::parse(&text).unwrap_or_else(|e| {
-            panic!(
-                "seed {seed}: parse failed: {e}\n--- text ---\n{text}\n--- ast ---\n{}",
-                serde_json::to_string_pretty(&ast).unwrap()
-            )
-        });
-        assert_eq!(
-            back,
-            ast,
-            "seed {seed}: round-trip changed the AST\n--- text ---\n{text}\n--- emitted ---\n{}\n--- reparsed ---\n{}",
-            serde_json::to_string_pretty(&ast).unwrap(),
-            serde_json::to_string_pretty(&back).unwrap()
-        );
-        // The sole accepting CST remains lossless and ERROR-free across the generated AST space.
-        let cst = flux_lang::parser::parse_cst(&text);
-        assert!(
-            cst.errors.is_empty(),
-            "seed {seed}: strict parse succeeded but the CST reported {:?}\n--- text ---\n{text}",
-            cst.errors
-        );
-        assert_eq!(
-            cst.syntax().text().to_string(),
-            text,
-            "seed {seed}: CST loss"
-        );
+        for (projection, text) in [
+            ("canonical", flux_lang::format::format(&ast)),
+            ("compact", flux_lang::format::format_compact(&ast)),
+        ] {
+            let back = flux_lang::parse::parse(&text).unwrap_or_else(|e| {
+                panic!(
+                    "seed {seed} ({projection}): parse failed: {e}\n--- text ---\n{text}\n--- ast ---\n{}",
+                    serde_json::to_string_pretty(&ast).unwrap()
+                )
+            });
+            assert_eq!(
+                back,
+                ast,
+                "seed {seed} ({projection}): round-trip changed the AST\n--- text ---\n{text}\n--- emitted ---\n{}\n--- reparsed ---\n{}",
+                serde_json::to_string_pretty(&ast).unwrap(),
+                serde_json::to_string_pretty(&back).unwrap()
+            );
+            // The sole accepting CST remains lossless and ERROR-free across generated ASTs.
+            let cst = flux_lang::parser::parse_cst(&text);
+            assert!(
+                cst.errors.is_empty(),
+                "seed {seed} ({projection}): strict parse succeeded but the CST reported {:?}\n--- text ---\n{text}",
+                cst.errors
+            );
+            assert_eq!(
+                cst.syntax().text().to_string(),
+                text,
+                "seed {seed} ({projection}): CST loss"
+            );
+        }
     }
     // The generator really exercised every node kind (guards against pool drift as kinds grow).
     let missing: Vec<_> = KINDS.iter().filter(|k| !seen.contains(**k)).collect();

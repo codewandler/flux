@@ -129,15 +129,8 @@ fn every_example_validates_against_its_form_appropriate_gate() {
         let display = format!("examples/{filename}");
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {display}: {e}"));
 
-        if serde_json::from_str::<serde_json::Value>(&src).is_ok() {
-            // Tier 1: JSON DraftAst.
-            let ast: flux_flow::ast::DraftAst = serde_json::from_str(&src)
-                .unwrap_or_else(|e| panic!("parse {display} as DraftAst: {e}"));
-            lower_or_panic(&display, &ast, &reg);
-            continue;
-        }
-
-        // Tiers 2/3: native flux-lang text.
+        // The `.flux` extension is reserved for native Flux-Lang text. JSON DraftAst values are
+        // valid API/wire values, but accepting them here would let mislabeled fixtures regress.
         let module = Module::parse_str(&src)
             .unwrap_or_else(|e| panic!("parse {display} as native flux-lang text: {e}"));
         match module {

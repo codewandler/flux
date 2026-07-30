@@ -163,8 +163,7 @@ review, then commits; `STATUS.md` rows flip as each lands.
 ### P6c — polish to truly-done — ✅ DONE (focus aliases deferred)
 - **`fluxlang compile`** (P6c.1): text → JSON AST, mirrors `Render` (`bin/fluxlang.rs`). ✅
 - **Token-efficient display** (P6c.2): `format::format_compact` — single-space block indentation,
-  **display-only** (the parser is 2-space-sensitive, so it does not round-trip; `format` stays the
-  writable form). ✅
+  now a writable, exact-round-tripping source form (L-93 generalized indentation parsing). ✅
 - **Thing resolver** (P6c.3): `OpHost::resolve_thing` + `default_resolve_thing` (`host.rs`) resolve the
   self-identifying selectors (`Id`/`Key`, `File`-by-`Path`, `Url`) deterministically; `Node::Thing` binds
   the resolved value with a `ThingResolved` trace. `Name`/`Query` error pending a host resolver override

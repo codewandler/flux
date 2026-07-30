@@ -1,4 +1,7 @@
-# call-routing.flux
+# call-routing.flux.example
+#
+# Design sketch: this intentionally includes proposed type declarations and is not executable
+# Flux-Lang. The `.example` suffix keeps it out of the shipped `.flux` parser/LSP corpus.
 # Routes an inbound caller utterance to the correct handler.
 #
 # This is the canonical example of a model-backed op (intent_extract) used as

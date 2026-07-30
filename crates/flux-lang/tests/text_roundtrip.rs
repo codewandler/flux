@@ -10,8 +10,7 @@ fn cognition_research_example_text_round_trips() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/cognition-research.flux");
     let src =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let ast: flux_lang::ast::DraftAst =
-        serde_json::from_str(&src).expect("example parses as DraftAst");
+    let ast = flux_lang::parse::parse(&src).expect("example parses as Flux-Lang source");
 
     let text = flux_lang::format::format(&ast);
     let back = flux_lang::parse::parse(&text)

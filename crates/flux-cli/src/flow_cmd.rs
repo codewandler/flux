@@ -108,16 +108,9 @@ pub(super) fn run_flow_list() -> Result<()> {
     Ok(())
 }
 
-/// Parse an existing path using the long-standing file semantics. JSON DraftAst files remain
-/// supported; a native module path must still select exactly one flow/journey.
+/// Parse an existing `.flux` path as Flux-Lang source. JSON is an AST interchange format, not an
+/// alternate meaning for the language file extension.
 pub(super) fn parse_cli_flow_source(label: &str, source: &str) -> Result<LoadedCliFlow> {
-    if source.trim_start().starts_with('{') {
-        return Ok(LoadedCliFlow {
-            ast: serde_json::from_str(source)
-                .with_context(|| format!("parse {label} as a Flux-Lang DraftAst (JSON)"))?,
-            composites: Vec::new(),
-        });
-    }
     match flux_lang::program::Module::parse_str(source)
         .map_err(|e| anyhow::anyhow!("parse {label} as Flux-Lang text: {e}"))?
     {
@@ -149,23 +142,8 @@ pub(super) fn parse_cli_flow_entry_source(
     source: &str,
     entry: &str,
 ) -> Result<LoadedCliFlow> {
-    let parsed = if source.trim_start().starts_with('{') {
-        let ast: flux_flow::ast::DraftAst = serde_json::from_str(source)
-            .with_context(|| format!("parse {label} as a Flux-Lang DraftAst (JSON)"))?;
-        if ast.name.as_deref() != Some(entry) {
-            bail!(
-                "flow entrypoint `{entry}` was not found in {label}; available flow: {}",
-                ast.name.as_deref().unwrap_or("<unnamed>")
-            );
-        }
-        return Ok(LoadedCliFlow {
-            ast,
-            composites: Vec::new(),
-        });
-    } else {
-        flux_lang::program::Module::parse_str(source)
-            .map_err(|e| anyhow::anyhow!("parse {label} as Flux-Lang text: {e}"))?
-    };
+    let parsed = flux_lang::program::Module::parse_str(source)
+        .map_err(|e| anyhow::anyhow!("parse {label} as Flux-Lang text: {e}"))?;
 
     match parsed {
         flux_lang::program::Module::Flow(ast) if ast.name.as_deref() == Some(entry) => {
@@ -1138,6 +1116,17 @@ flow triage(query: String) -> String
             message.contains("setup") && message.contains("triage"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn flux_sources_reject_json_ast_content() {
+        let json = r#"{"name":"legacy","body":[]}"#;
+        let run_error = parse_cli_flow_source("legacy.flux", json)
+            .expect_err("a .flux source must not be content-sniffed as JSON");
+        assert!(run_error.to_string().contains("Flux-Lang text"));
+        let entry_error = parse_cli_flow_entry_source("legacy.flux", json, "legacy")
+            .expect_err("named entry selection must reject JSON too");
+        assert!(entry_error.to_string().contains("Flux-Lang text"));
     }
 
     #[test]

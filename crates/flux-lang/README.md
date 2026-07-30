@@ -134,5 +134,5 @@ echo '<json-ast>' | cargo run -p codewandler-flux-lang --features cli --bin flux
 - [`docs/STATUS.md`](docs/STATUS.md) — PRD conformance matrix (what's built vs. planned, with evidence).
 - [`../../docs/designs/flux-lang-evolution.md`](../../docs/designs/flux-lang-evolution.md) — forward design: the agent-cognition AST (`ctx`/`need` + artifact ontology), language/syntax, **candidate control-flow primitives**, and SDK.
 - [`docs/evolution-impl-plan.md`](docs/evolution-impl-plan.md) — phased implementation plan for the above.
-- [`examples/call-routing.flux`](examples/call-routing.flux) — a worked text-syntax example (a model-backed intent step plus deterministic routing).
+- [`examples/call-routing.flux.example`](examples/call-routing.flux.example) — a forward-looking routing design sketch; the non-`.flux` suffix marks its proposed type declarations as non-executable.
 - [`AGENTS.md`](AGENTS.md) — contributor contract for this crate.

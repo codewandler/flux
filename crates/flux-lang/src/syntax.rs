@@ -175,6 +175,7 @@ pub enum SyntaxKind {
     UNARY_EXPR, // !a  /  -a
     PAREN_EXPR, // ( expr )
     ARG_LIST,   // (a, b, …)  or bare `a, b`
+    NAMED_ARG,  // name: expr inside a call argument list
     NAME,       // an identifier in name position (op names, keys, types)
 
     /// One `purpose`/`include`/`exclude`/`budget` sub-line inside a `ctx` block. Its ownership is

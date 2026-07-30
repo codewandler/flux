@@ -360,17 +360,12 @@ pub(super) async fn run_fork(
         )
     } else if let Some(file) = edit {
         let src = std::fs::read_to_string(&file).with_context(|| format!("read {file}"))?;
-        let ast: flux_flow::ast::DraftAst = if src.trim_start().starts_with('{') {
-            serde_json::from_str(&src)
-                .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?
-        } else {
-            match flux_lang::program::Module::parse_str(&src)
-                .map_err(|e| anyhow::anyhow!("parse {file} as Flux-Lang text: {e}"))?
-            {
-                flux_lang::program::Module::Flow(ast) => ast,
-                flux_lang::program::Module::Program(_) => {
-                    bail!("--edit needs a bare flow, not a multi-agent program")
-                }
+        let ast: flux_flow::ast::DraftAst = match flux_lang::program::Module::parse_str(&src)
+            .map_err(|e| anyhow::anyhow!("parse {file} as Flux-Lang text: {e}"))?
+        {
+            flux_lang::program::Module::Flow(ast) => ast,
+            flux_lang::program::Module::Program(_) => {
+                bail!("--edit needs a bare flow, not a multi-agent program")
             }
         };
         Some(

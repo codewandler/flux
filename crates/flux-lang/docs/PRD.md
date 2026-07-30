@@ -31,8 +31,7 @@ envelope onto those traits. The rest of this document is the original source-of-
 
 1. **Two writable display modes — ✅ done.** The round-trippable **human-readable** text syntax
    shipped (`parse.rs`/`format.rs`, `parse(format(ast)) == ast`; see [`syntax.md`](syntax.md));
-   the **token-efficient** form shipped as the display-only `format_compact` (a model fine-tuned
-   to emit it natively remains an open direction).
+   the **token-efficient** form shipped as the one-space, round-trippable `format_compact`.
 2. **`fluxlang compile` — ✅ done.** Text → AST, wired onto `parse` (`bin/fluxlang.rs`). It reads
    Flux-Lang text only; the once-planned auto-detection across input forms did not land.
 3. **Richer `analyze` — ✅ done (P4).** `analyze::lower` lowers `DraftAst` → typed `HirFlow` with

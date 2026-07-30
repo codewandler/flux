@@ -17,15 +17,15 @@
 //!
 //! # Surface (see [`crate::format`] for the full grammar)
 //! - Header: `flow [<name>][(<param>, …)][ -> <type>]`, body indented 2 (or any consistent step).
-//! - `$x = <expr>`, `$x: T = <expr>` — bind (with optional `@effect(<tag>)` on the line above).
-//! - `do <op> <arg>, …` or `<op>(<arg>, …)` — a bare call (both forms accepted; `do` is canonical).
-//! - `$pack += $a, $b` — ctx_append; `ctx $p` + indented `purpose`/`budget`/`include`/`exclude`.
-//! - `when`/`else`, `unless`, `each $x in <src> [-> [flat] $c]`, `repeat <n> [-> $c]` (`until` first
-//!   body line), `seq [-> $c]`, `return <expr>`.
+//! - `x = <expr>`, `x: T = <expr>` — bind; `$x` stays accepted as a legacy/reserved-word escape.
+//! - `<op>(<arg>, …)` — a call whether its result is used or discarded; legacy `do` is accepted.
+//! - `pack += a, b` — ctx_append; `ctx p` + indented `purpose`/`budget`/`include`/`exclude`.
+//! - `when`/`else`, `unless`, `each x in <src> [-> [flat] c]`, `repeat <n> [-> c]` (`until` first
+//!   body line), `seq [-> c]`, `return <expr>`.
 //! - `match <subj>`/`route <sel>` (`case <v>` arms + `default`), `fallback [-> $b]` (`branch` arms),
 //!   `loop for <ms> every <ms> [-> $b]` (`until` first body line), `timeout <ms> [-> $b]`,
 //!   `budget <n> [-> $b]`.
-//! - Inline `fmt("<template>")` (the `Fmt` node) and `$var.path` field-access sugar (lowers to `jq`).
+//! - Inline `fmt("<template>")` and `var.path[0]` field/index-access sugar (lowers to `jq`).
 //! - `@json <compact-json>` — the wire-format escape for any unsupported node (inline or statement).
 //! - A `goal "…"` header line is tolerated and ignored (`DraftAst` has no goal slot).
 
@@ -198,13 +198,13 @@ mod tests {
             !text.contains("@json"),
             "durability nodes should render natively:\n{text}"
         );
-        assert!(text.contains("memo $x = $y"), "{text}");
+        assert!(text.contains("memo x = y"), "{text}");
         assert!(text.contains("@effect(read)"), "{text}");
-        assert!(text.contains("memo $n: String = \"hi\""), "{text}");
-        assert!(text.contains("once \"charge\" -> $receipt"), "{text}");
+        assert!(text.contains("memo n: String = \"hi\""), "{text}");
+        assert!(text.contains("once \"charge\" -> receipt"), "{text}");
         assert!(text.contains("checkpoint \"phase-1\""), "{text}");
         assert!(
-            text.contains("await $reply = \"user_input\" when $decision_needed"),
+            text.contains("await reply = \"user_input\" when decision_needed"),
             "{text}"
         );
         assert!(text.contains("await \"webhook\""), "{text}");
@@ -262,17 +262,14 @@ mod tests {
             text.contains("confirm \"delete prod?\" risk high"),
             "{text}"
         );
-        assert!(text.contains("throttle \"api\" 5 per 1000"), "{text}");
-        assert!(text.contains("debounce \"save\" 250"), "{text}");
+        assert!(text.contains("throttle \"api\" 5 per 1s"), "{text}");
+        assert!(text.contains("debounce \"save\" 250ms"), "{text}");
         assert!(
             text.contains("verify bash(\"echo hi\") contains \"hi\": \"must greet\""),
             "{text}"
         );
-        assert!(text.contains("$v = peek $x"), "{text}");
-        assert!(
-            text.contains("$n = parse($raw.price, as: \"f64\")"),
-            "{text}"
-        );
+        assert!(text.contains("v = peek x"), "{text}");
+        assert!(text.contains("n = parse(raw.price, as: \"f64\")"), "{text}");
         assert_round_trips(&ast);
     }
 
@@ -330,16 +327,16 @@ mod tests {
             !text.contains("@json"),
             "batch-3 nodes should render natively:\n{text}"
         );
-        assert!(text.contains("catch $err"), "{text}");
-        assert!(text.contains("race 5000 -> $winner"), "{text}");
-        assert!(text.contains("branch $fast"), "{text}");
-        assert!(text.contains("scope $h = lock()"), "{text}");
+        assert!(text.contains("catch err"), "{text}");
+        assert!(text.contains("race 5s -> winner"), "{text}");
+        assert!(text.contains("branch fast"), "{text}");
+        assert!(text.contains("scope h = lock()"), "{text}");
         assert!(text.contains("finally"), "{text}");
         assert!(
             text.contains("saga") && text.contains("step") && text.contains("undo"),
             "{text}"
         );
-        assert!(text.contains("pipe -> $out"), "{text}");
+        assert!(text.contains("pipe -> out"), "{text}");
         assert_round_trips(&ast);
     }
 
@@ -369,11 +366,11 @@ mod tests {
             !text.contains("@json"),
             "thing refs should render natively:\n{text}"
         );
-        assert!(text.contains("$f = thing file path \"src/x.rs\""), "{text}");
-        assert!(text.contains("$p = thing person name \"john\""), "{text}");
-        assert!(text.contains("$u = thing url id \"https://x\""), "{text}");
+        assert!(text.contains("f = thing file path \"src/x.rs\""), "{text}");
+        assert!(text.contains("p = thing person name \"john\""), "{text}");
+        assert!(text.contains("u = thing url id \"https://x\""), "{text}");
         assert!(
-            text.contains("$c = thing custom \"widget\" key \"w-1\""),
+            text.contains("c = thing custom \"widget\" key \"w-1\""),
             "{text}"
         );
         assert_round_trips(&ast);
@@ -395,8 +392,8 @@ mod tests {
             ..Default::default()
         };
         let text = format(&ast);
-        assert!(text.contains("$b = $a"), "var alias: {text}");
-        assert!(text.contains("$n = 5"), "number lit: {text}");
+        assert!(text.contains("b = a"), "var alias: {text}");
+        assert!(text.contains("n = 5"), "number lit: {text}");
         assert!(!text.contains("@json"), "no json fallback: {text}");
         assert_round_trips(&ast);
     }
@@ -434,7 +431,7 @@ mod tests {
         };
         let text = format(&lit_ast);
         assert!(!text.contains("@json"), "Lit JSON stays native: {text}");
-        assert!(text.contains(r#"$o = {"a":1}"#), "{text}");
+        assert!(text.contains(r#"o = {"a":1}"#), "{text}");
         assert_round_trips(&lit_ast);
     }
 
@@ -468,13 +465,13 @@ mod tests {
             !text.contains("@json"),
             "dynamic template should be native: {text}"
         );
-        assert!(text.contains("$x.intent"), "field-access leaf: {text}");
+        assert!(text.contains("x.intent"), "field-access leaf: {text}");
         assert!(
             text.contains("ok: true"),
             "literal leaf rendered inline: {text}"
         );
         assert!(
-            text.contains(r#""a-b": $q"#),
+            text.contains(r#""a-b": q"#),
             "non-ident key is quoted: {text}"
         );
         assert_round_trips(&ast);
@@ -502,10 +499,10 @@ mod tests {
         };
         let text = format(&ast);
         assert!(
-            text.contains("assert $hits, \"grep returned nothing\""),
+            text.contains("assert hits, \"grep returned nothing\""),
             "{text}"
         );
-        assert!(text.contains("assert $gate\n"), "no-message form: {text}");
+        assert!(text.contains("assert gate\n"), "no-message form: {text}");
         assert!(!text.contains("@json"), "assert is native: {text}");
         assert_round_trips(&ast);
     }
@@ -524,7 +521,7 @@ mod tests {
         };
         let text = format(&full);
         assert!(
-            text.contains("retry 3 backoff exponential delay 500 -> $out"),
+            text.contains("retry 3 backoff exponential delay 500ms -> out"),
             "{text}"
         );
         assert!(!text.contains("@json"), "native: {text}");
@@ -585,8 +582,8 @@ mod tests {
         };
         let text = format(&ast);
         assert!(text.contains("parallel\n"), "{text}");
-        assert!(text.contains("branch $readme"), "{text}");
-        assert!(text.contains("branch $todos"), "{text}");
+        assert!(text.contains("branch readme"), "{text}");
+        assert!(text.contains("branch todos"), "{text}");
         assert!(!text.contains("@json"), "native: {text}");
         assert_round_trips(&ast);
 
@@ -619,8 +616,8 @@ mod tests {
             ..Default::default()
         };
         let text = format(&ast);
-        assert!(text.contains("$k = $plan.kind"), "field sugar: {text}");
-        assert!(text.contains("$d = $o.a.b"), "nested field sugar: {text}");
+        assert!(text.contains("k = plan.kind"), "field sugar: {text}");
+        assert!(text.contains("d = o.a.b"), "nested field sugar: {text}");
         assert!(!text.contains("@json"), "no json fallback: {text}");
         assert_round_trips(&ast);
     }
@@ -638,7 +635,7 @@ mod tests {
         };
         let text = format(&ast);
         assert!(
-            text.contains(r#"$msg = fmt("hi {name}")"#),
+            text.contains(r#"msg = fmt("hi {name}")"#),
             "fmt inline: {text}"
         );
         assert!(!text.contains("@json"), "{text}");
@@ -683,7 +680,7 @@ mod tests {
             ..Default::default()
         };
         let text = format(&m);
-        assert!(text.contains("match $plan.kind"), "{text}");
+        assert!(text.contains("match plan.kind"), "{text}");
         assert!(text.contains("case \"chat\""), "{text}");
         assert!(text.contains("default"), "{text}");
         assert!(!text.contains("@json"), "match native: {text}");
@@ -707,7 +704,7 @@ mod tests {
             ..Default::default()
         };
         let rt = format(&r);
-        assert!(rt.contains("route classify($x)"), "{rt}");
+        assert!(rt.contains("route classify(x)"), "{rt}");
         assert!(rt.contains("case \"bug\""), "{rt}");
         assert!(!rt.contains("@json"), "route native: {rt}");
         assert_round_trips(&r);
@@ -749,12 +746,12 @@ mod tests {
             ..Default::default()
         };
         let text = format(&ast);
-        assert!(text.contains("fallback -> $win"), "{text}");
+        assert!(text.contains("fallback -> win"), "{text}");
         assert!(text.contains("branch"), "{text}");
-        assert!(text.contains("loop for 1000 every 100 -> $ticks"), "{text}");
-        assert!(text.contains("until $done"), "{text}");
-        assert!(text.contains("timeout 5000"), "{text}");
-        assert!(text.contains("budget 10 -> $used"), "{text}");
+        assert!(text.contains("loop for 1s every 100ms -> ticks"), "{text}");
+        assert!(text.contains("until done"), "{text}");
+        assert!(text.contains("timeout 5s"), "{text}");
+        assert!(text.contains("budget 10 -> used"), "{text}");
         assert!(!text.contains("@json"), "all native: {text}");
         assert_round_trips(&ast);
     }
@@ -771,7 +768,7 @@ mod tests {
         };
         let text = format(&ast);
         assert!(
-            text.contains(r#"with_tools ["read_many","git_status"] -> $scoped"#),
+            text.contains(r#"with_tools ["read_many","git_status"] -> scoped"#),
             "{text}"
         );
         assert!(!text.contains("@json"), "with_tools native: {text}");
@@ -2227,7 +2224,7 @@ journey answer
 
         // All native expressions should be preserved with $
         assert!(formatted.contains("when $count > 5"));
-        assert!(formatted.contains("$ok = $score >= 0.8"));
+        assert!(formatted.contains("ok = $score >= 0.8"));
         assert!(formatted.contains("unless $count == 0"));
         assert!(formatted.contains("assert $score > 0.5"));
         assert!(formatted.contains("until $count == 0"));
