@@ -13,6 +13,8 @@
 //!   calls may be inside `Tool::execute` simultaneously.
 //! * **[`max_retained_result_bytes`](ResourceLimits::max_retained_result_bytes)** — how many bytes
 //!   of tool results the executor may retain in its deterministic op cache.
+//! * **[`max_evidence_payload_bytes`](ResourceLimits::max_evidence_payload_bytes)** — how many bytes
+//!   of observation payload the shared evidence log may retain (C-298).
 //!
 //! # Why there is no `max_memory_bytes`
 //!
@@ -25,12 +27,38 @@
 //! was bounded only by an entry count (512), so 512 large file reads retained an unbounded number
 //! of bytes. Evicting from it is correctness-neutral: a miss re-runs the op.
 //!
-//! The other candidates named in C-290 are deliberately **not** bounded here, because bounding them
-//! would be a silent truncation of an audit or conversational record rather than a cache eviction:
-//! the evidence log (`flux-evidence`) drives reactions, metrics and the audit trail, and the
-//! transcript is owned by the session store and already has an explicit, host-set
-//! compaction threshold (`ClientBuilder::with_compaction`) and context budget
-//! (`ClientBuilder::context_budget`).
+//! The transcript is deliberately **not** bounded here: it is owned by the session store and already
+//! has an explicit, host-set compaction threshold (`ClientBuilder::with_compaction`) and context
+//! budget (`ClientBuilder::context_budget`).
+//!
+//! # Why the evidence log is bounded by *payload* and not by *entries* (C-298)
+//!
+//! C-290 declined to bound the evidence log at all, because it drives reactions, `metrics()` and the
+//! audit trail, and dropping the oldest observations to fit a ceiling would be a silent truncation of
+//! an audit record rather than a cache eviction. That reasoning was right and still holds — three
+//! readers outside `flux-evidence` depend on the log's *shape*, not just its contents:
+//!
+//! * `flux-flow`'s durable event-store flush (C-14) slices the unflushed tail by **absolute index**
+//!   into `EvidenceLog::all()`, so compacting the front would silently stop persisting observations.
+//! * `flux-tools`' `metrics` op reports **cumulative** `by_kind` counts (`tool_call`, `tool_error`,
+//!   `turn.iteration`) — dropping entries makes a progress signal a model branches on go backwards.
+//! * `flux-flow` snapshots those same counts as per-turn `turn.iteration` / `subagent.usage`
+//!   baselines and diffs against them, so a count that can *shrink* is a correctness hazard next to
+//!   turn termination.
+//!
+//! So C-298 separates the two things the `Vec` was doing rather than adding an eviction knob. The
+//! unbounded part is the arbitrary-size `data` payload — a `tool_call`'s permission subjects, a
+//! flow's `observe(…)` argument — and that is what
+//! [`max_evidence_payload_bytes`](ResourceLimits::max_evidence_payload_bytes) bounds, by eliding the
+//! oldest payloads behind a self-describing marker. Every observation stays, in order, with its
+//! `kind` and `phase`, so all three readers above are untouched, and an elided payload is legible as
+//! elided rather than looking like one that was never there.
+//!
+//! What this does **not** do is bound the log's entry count, and no honest ceiling here could: an
+//! entry ceiling means dropping entries, which is exactly what the three readers forbid. A long-lived
+//! runtime therefore still retains a fixed-size header per observation. That residual is a fraction
+//! of what it retained before — the payload was the dominant and the only *unbounded* term — and
+//! saying so plainly is better than a knob that claims more than it delivers.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -86,6 +114,7 @@ pub struct ResourceLimits {
     max_concurrent_tool_calls: Option<usize>,
     queue_timeout: Option<Duration>,
     max_retained_result_bytes: Option<usize>,
+    max_evidence_payload_bytes: Option<usize>,
     /// Present iff a concurrency ceiling is configured. Shared across clones — that sharing is the
     /// whole point (see the type doc).
     slots: Option<Arc<Semaphore>>,
@@ -134,6 +163,21 @@ impl ResourceLimits {
         self
     }
 
+    /// Cap the bytes of observation `data` payload the shared evidence log retains (C-298).
+    ///
+    /// Unlike [`with_max_retained_result_bytes`](Self::with_max_retained_result_bytes) this is not a
+    /// cache bound and so is **not** correctness-neutral: reaching it elides the *oldest* payloads.
+    /// What makes that admissible rather than a silent truncation of an audit record is that no
+    /// observation is dropped — count, order, `kind` and `phase` are preserved, so every reader that
+    /// addresses the log by absolute index or counts it by kind is unaffected — and each elided
+    /// payload is replaced by a self-describing marker naming this knob. See
+    /// [`EvidenceLog::set_max_payload_bytes`](flux_evidence::EvidenceLog::set_max_payload_bytes) for
+    /// what is and is not bounded, and where an elided payload can still be read in full.
+    pub fn with_max_evidence_payload_bytes(mut self, bytes: usize) -> Self {
+        self.max_evidence_payload_bytes = Some(bytes);
+        self
+    }
+
     /// Build the runtime ceilings from a file-configured `[limits]` table.
     pub fn from_config(limits: &flux_config::Limits) -> Self {
         let mut resolved = Self::new();
@@ -145,6 +189,9 @@ impl ResourceLimits {
         }
         if let Some(bytes) = limits.max_retained_result_bytes {
             resolved = resolved.with_max_retained_result_bytes(bytes);
+        }
+        if let Some(bytes) = limits.max_evidence_payload_bytes {
+            resolved = resolved.with_max_evidence_payload_bytes(bytes);
         }
         resolved
     }
@@ -165,9 +212,16 @@ impl ResourceLimits {
         self.max_retained_result_bytes
     }
 
+    /// The configured evidence-payload ceiling, if any (C-298).
+    pub fn max_evidence_payload_bytes(&self) -> Option<usize> {
+        self.max_evidence_payload_bytes
+    }
+
     /// Whether any ceiling at all is configured.
     pub fn is_unbounded(&self) -> bool {
-        self.max_concurrent_tool_calls.is_none() && self.max_retained_result_bytes.is_none()
+        self.max_concurrent_tool_calls.is_none()
+            && self.max_retained_result_bytes.is_none()
+            && self.max_evidence_payload_bytes.is_none()
     }
 
     /// Take a concurrency slot for one tool execution, or refuse.
@@ -330,10 +384,21 @@ mod tests {
         assert!(limits.is_unbounded());
         assert_eq!(limits.max_concurrent_tool_calls(), None);
         assert_eq!(limits.max_retained_result_bytes(), None);
+        assert_eq!(limits.max_evidence_payload_bytes(), None);
         assert_eq!(
             limits.tool_call_queue_timeout(),
             DEFAULT_TOOL_CALL_QUEUE_TIMEOUT
         );
+    }
+
+    /// C-298's ceiling counts as a configured ceiling on its own — `is_unbounded` must not report a
+    /// runtime as unbounded just because the other two knobs are unset.
+    #[test]
+    fn an_evidence_ceiling_alone_makes_a_runtime_bounded() {
+        let limits = ResourceLimits::new().with_max_evidence_payload_bytes(64 * 1024);
+        assert!(!limits.is_unbounded());
+        assert_eq!(limits.max_evidence_payload_bytes(), Some(64 * 1024));
+        assert_eq!(limits.max_concurrent_tool_calls(), None);
     }
 
     /// A ceiling of zero would refuse everything; it is read as one instead.
@@ -351,6 +416,7 @@ mod tests {
             max_concurrent_tool_calls: Some(4),
             tool_call_queue_timeout_ms: Some(2_500),
             max_retained_result_bytes: Some(1_048_576),
+            max_evidence_payload_bytes: Some(262_144),
             ..Default::default()
         });
         assert_eq!(limits.max_concurrent_tool_calls(), Some(4));
@@ -359,6 +425,7 @@ mod tests {
             Duration::from_millis(2_500)
         );
         assert_eq!(limits.max_retained_result_bytes(), Some(1_048_576));
+        assert_eq!(limits.max_evidence_payload_bytes(), Some(262_144));
 
         let empty = ResourceLimits::from_config(&flux_config::Limits::default());
         assert!(empty.is_unbounded());

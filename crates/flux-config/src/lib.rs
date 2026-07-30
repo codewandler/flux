@@ -854,6 +854,17 @@ pub struct Limits {
     /// correctness-neutral — a miss re-runs the op — so this never truncates a visible result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retained_result_bytes: Option<usize>,
+    /// C-298: how many bytes of observation `data` payload the runtime may retain in the in-memory
+    /// evidence log. Absent means no ceiling — the log grows for the process lifetime, one payload
+    /// per dispatch.
+    ///
+    /// Unlike `max_retained_result_bytes` this is **not** a cache bound, so it is not
+    /// correctness-neutral: reaching it elides the *oldest* payloads. No observation is ever
+    /// dropped — count, order, kind and phase are preserved, and each elided payload is replaced by
+    /// a self-describing marker naming this key — but the payload itself is gone from memory.
+    /// Payloads from turns that already completed remain in full in the session event store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_evidence_payload_bytes: Option<usize>,
 }
 
 impl Limits {
@@ -1252,6 +1263,10 @@ fn merge(user: Config, project: Config) -> Config {
                 .limits
                 .max_retained_result_bytes
                 .or(user.limits.max_retained_result_bytes),
+            max_evidence_payload_bytes: project
+                .limits
+                .max_evidence_payload_bytes
+                .or(user.limits.max_evidence_payload_bytes),
         },
         server: ServerConfig {
             // Same scalar rule throughout: a project value (including an explicit 0/false)
@@ -1695,6 +1710,7 @@ turn_token_budget = 100000
 max_concurrent_tool_calls = 4
 tool_call_queue_timeout_ms = 2500
 max_retained_result_bytes = 1048576
+max_evidence_payload_bytes = 262144
 "#,
         )
         .unwrap();
@@ -1702,6 +1718,11 @@ max_retained_result_bytes = 1048576
         assert_eq!(config.limits.max_concurrent_tool_calls, Some(4));
         assert_eq!(config.limits.tool_call_queue_timeout_ms, Some(2500));
         assert_eq!(config.limits.max_retained_result_bytes, Some(1_048_576));
+        assert_eq!(
+            config.limits.max_evidence_payload_bytes,
+            Some(262_144),
+            "C-298: the evidence ceiling is configured in the same [limits] table, not a second place"
+        );
     }
 
     /// The new ceilings follow the same scalar merge rule as `turn_token_budget`: a project value
@@ -1712,12 +1733,15 @@ max_retained_result_bytes = 1048576
         user.limits.max_concurrent_tool_calls = Some(2);
         user.limits.max_retained_result_bytes = Some(1024);
         user.limits.tool_call_queue_timeout_ms = Some(9_000);
+        user.limits.max_evidence_payload_bytes = Some(4_096);
 
         let mut project = Config::default();
         project.limits.max_concurrent_tool_calls = Some(8);
+        project.limits.max_evidence_payload_bytes = Some(65_536);
 
         let merged = merge(user, project);
         assert_eq!(merged.limits.max_concurrent_tool_calls, Some(8));
+        assert_eq!(merged.limits.max_evidence_payload_bytes, Some(65_536));
         assert_eq!(
             merged.limits.max_retained_result_bytes,
             Some(1024),
