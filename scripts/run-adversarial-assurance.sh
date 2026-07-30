@@ -73,9 +73,14 @@ analyze = action_step(codeql, /\Agithub\/codeql-action\/analyze@[0-9a-f]{40}\z/,
 abort "CodeQL init/analyze are not pinned to the same revision" unless init["uses"].split("@").last == analyze["uses"].split("@").last
 init_with = init.fetch("with", {})
 abort "CodeQL lost the Rust language" unless init_with["languages"] == "rust"
-abort "CodeQL lost manual build mode" unless init_with["build-mode"] == "manual"
+# `none` is the only build mode CodeQL's Rust extractor accepts; `manual` is a FATAL config error
+# ("Rust does not support the manual build mode"), so pinning manual here guarded a lane that could
+# never run. Pin `none` and reject manual explicitly so the mistake cannot come back.
+abort "CodeQL Rust must use build-mode none (manual is a fatal config error)" unless init_with["build-mode"] == "none"
 abort "CodeQL lost security-extended queries" unless init_with["queries"] == "security-extended"
-run_step(codeql, "cargo build --workspace --locked --offline", "CodeQL workspace build")
+# build-mode none extracts from source, so there is deliberately NO workspace build step to require;
+# the dependency fetch is what the extractor needs to resolve the locked graph offline.
+run_step(codeql, "cargo fetch --locked", "CodeQL dependency fetch")
 abort "CodeQL analyze must follow initialization" unless codeql["steps"].index(analyze) > codeql["steps"].index(init)
 
 smoke = exact_job(jobs, "corpus-smoke", "${{ github.event_name != 'schedule' }}")

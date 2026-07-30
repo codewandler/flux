@@ -35,18 +35,19 @@ jobs:
         with:
           toolchain: "1.97.0"
 
+      # `build-mode: none` is the ONLY mode CodeQL's Rust extractor accepts — `manual` is a fatal
+      # config error ("Rust does not support the manual build mode"), not a slow path, so this job
+      # cannot run at all with it. `none` extracts from source, which is why no build step follows;
+      # dependencies are still fetched so the extractor can resolve the locked graph offline.
       - name: Initialize pinned CodeQL for Rust
         uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           languages: rust
-          build-mode: manual
+          build-mode: none
           queries: security-extended
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked
-
-      - name: Build the analyzed workspace
-        run: cargo build --workspace --locked --offline
 
       - name: Analyze Rust
         uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
