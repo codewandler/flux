@@ -2,7 +2,7 @@
 id: C-222
 title: The trusted-chrome invariant — an agent pane can never be mistaken for the approval sheet
 pillar: Core
-status: in-progress
+status: done
 priority: 13
 epic: agent-authored-surface
 design: docs/designs/agent-authored-surface.md
