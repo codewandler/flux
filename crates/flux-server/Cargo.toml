@@ -16,7 +16,9 @@ flux-a2a.workspace = true
 flux-auth.workspace = true
 flux-config.workspace = true
 flux-credentials.workspace = true
-flux-events.workspace = true
+# The embedded SQLite backend is asked for explicitly: the workspace entry turns default
+# features off so flux-flow can shed the driver (C-274) — see the root Cargo.toml.
+flux-events = { workspace = true, features = ["sqlite"] }
 flux-flow.workspace = true
 flux-runtime.workspace = true
 flux-system.workspace = true

@@ -68,7 +68,15 @@ flux-config = { package = "codewandler-flux-config", version = "0.39.0", path = 
 flux-system = { package = "codewandler-flux-system", version = "0.39.0", path = "crates/flux-system" }
 flux-runtime = { package = "codewandler-flux-runtime", version = "0.39.0", path = "crates/flux-runtime" }
 flux-tools = { package = "codewandler-flux-tools", version = "0.39.0", path = "crates/flux-tools" }
-flux-events = { package = "codewandler-flux-events", version = "0.39.0", path = "crates/flux-events" }
+# `default-features = false` here, and NOT because the SQLite backend is unwanted — it IS the default
+# for anyone depending on the published crate (C-274). It is off at the workspace level because a
+# member's own `default-features = false` is silently IGNORED for a workspace-inherited dependency
+# (measured on cargo 1.97: `cargo metadata` still reports `uses_default_features: true`), and
+# `flux-flow` — the portable engine core — has to be able to shed the driver. So every member that
+# needs the embedded backend asks for it: `flux-events = { workspace = true, features = ["sqlite"] }`.
+# flux-flow instead re-enables it through its OWN default-on `sqlite` feature, which is what makes
+# `cargo build -p codewandler-flux-flow --no-default-features` a rusqlite-free graph.
+flux-events = { package = "codewandler-flux-events", version = "0.39.0", path = "crates/flux-events", default-features = false }
 flux-agent = { package = "codewandler-flux-agent", version = "0.39.0", path = "crates/flux-agent" }
 flux-skill = { package = "codewandler-flux-skill", version = "0.39.0", path = "crates/flux-skill" }
 flux-orchestrate = { package = "codewandler-flux-orchestrate", version = "0.39.0", path = "crates/flux-orchestrate" }

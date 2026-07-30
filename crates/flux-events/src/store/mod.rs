@@ -11,11 +11,22 @@
 //! SQLite ([`sqlite::SqliteEvents`]); a Postgres backend plugs into the same seam behind a feature.
 //! There is deliberately **no public trait** — 23 consumer files hold `Arc<EventStore>` concretely,
 //! so the public API stays a concrete struct with a byte-identical surface across backends.
+//!
+//! C-274: the SQLite backend is a **feature** (`sqlite`, on by default), because its driver links a
+//! C library and so cannot build for `wasm32-unknown-unknown`. With it off, the driver-free
+//! [`ephemeral::EphemeralEvents`] is the backend — always compiled, held to the same conformance
+//! suite — so a portable build still has a *usable* store rather than merely a compiling one. Since
+//! `EventBackend` is crate-private on purpose, an embedder could not otherwise supply one.
 
 #[cfg(feature = "postgres")]
 mod postgres;
+#[cfg(feature = "sqlite")]
 mod sqlite;
 
+mod ephemeral;
+
+// Only the SQLite backend takes a filesystem path — see `EventStore::open`.
+#[cfg(feature = "sqlite")]
 use std::path::Path;
 
 use flux_core::{Error, Message, Result, Usage};
@@ -26,6 +37,8 @@ use crate::kind::{EventKind, NewEvent, StoredEvent};
 use crate::memory::{self, MemoryEntry, MemoryNote, MemoryScope, Receipt};
 use crate::projection;
 
+use ephemeral::EphemeralEvents;
+#[cfg(feature = "sqlite")]
 use sqlite::SqliteEvents;
 
 fn now_ms() -> i64 {
@@ -338,16 +351,20 @@ trait EventBackend: Send + Sync {
     }
 }
 
-/// The concrete storage backend behind an [`EventStore`]. The default build carries only the
-/// embedded SQLite arm; a Postgres arm plugs in behind the `postgres` feature (D-73).
-// `large_enum_variant` fires only in a `--features postgres` build, where the 264-byte `Sqlite` arm
-// sits next to an 8-byte `Postgres` one. Boxing to close that gap is the wrong trade here: this enum
-// is constructed once when the store opens and thereafter only ever touched through `&self`, so the
-// size never costs a move — while boxing would put an allocation and a pointer hop on every
-// operation of the DEFAULT backend to satisfy a lint that the default build does not even raise.
+/// The concrete storage backend behind an [`EventStore`]. The default build carries the embedded
+/// SQLite arm and the driver-free one; a Postgres arm plugs in behind the `postgres` feature (D-73).
+// `large_enum_variant` fires where the 264-byte `Sqlite` arm sits next to a much smaller one (the
+// 8-byte `Postgres` arm under `--features postgres`, and `Ephemeral` since C-274). Boxing to close
+// that gap is the wrong trade here: this enum is constructed once when the store opens and
+// thereafter only ever touched through `&self`, so the size never costs a move — while boxing would
+// put an allocation and a pointer hop on every operation of the DEFAULT backend.
 #[allow(clippy::large_enum_variant)]
 enum Backend {
+    #[cfg(feature = "sqlite")]
     Sqlite(SqliteEvents),
+    /// The driver-free, process-lifetime backend (C-274) — the only arm a `--no-default-features`
+    /// build has, and what [`EventStore::ephemeral`] always builds.
+    Ephemeral(EphemeralEvents),
     #[cfg(feature = "postgres")]
     Postgres(postgres::PgEvents),
 }
@@ -362,24 +379,51 @@ impl EventStore {
     /// Dispatch to the active backend's storage primitives.
     fn backend(&self) -> &dyn EventBackend {
         match &self.backend {
+            #[cfg(feature = "sqlite")]
             Backend::Sqlite(s) => s,
+            Backend::Ephemeral(e) => e,
             #[cfg(feature = "postgres")]
             Backend::Postgres(p) => p,
         }
     }
 
     /// Open (creating if needed) a SQLite store at `path`, with WAL enabled for concurrent reads.
+    ///
+    /// Needs the `sqlite` feature (on by default): this constructor promises a durable file, and the
+    /// driver-free backend cannot keep that promise — silently handing back a store that forgets
+    /// everything on exit would be worse than not compiling (C-274).
+    #[cfg(feature = "sqlite")]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             backend: Backend::Sqlite(SqliteEvents::open(path)?),
         })
     }
 
-    /// An in-memory SQLite store (for tests and the SDK's ephemeral sessions).
+    /// An in-memory store (for tests and the SDK's ephemeral sessions) — in-memory **SQLite** when
+    /// the `sqlite` feature is on (the default, and unchanged behaviour), the driver-free
+    /// [`EventStore::ephemeral`] backend when it is off. Present in every feature combination on
+    /// purpose: dozens of consumers construct throwaway stores with it, and none of them cares which
+    /// implementation forgets the data.
     pub fn in_memory() -> Result<Self> {
-        Ok(Self {
+        #[cfg(feature = "sqlite")]
+        return Ok(Self {
             backend: Backend::Sqlite(SqliteEvents::in_memory()?),
-        })
+        });
+        #[cfg(not(feature = "sqlite"))]
+        return Ok(Self::ephemeral());
+    }
+
+    /// A driver-free, process-lifetime store: no database driver, no file, nothing to configure —
+    /// the backend a `wasm32` build has (C-274). Available in every feature combination so an
+    /// embedder can ask for it by name instead of inferring it from the feature set.
+    ///
+    /// It is a full [`EventBackend`], held to the same conformance suite as the SQLite and Postgres
+    /// backends; what it gives up is durability, so anything that must survive the process needs the
+    /// SQLite (`open`) or Postgres (`open_postgres`) backend.
+    pub fn ephemeral() -> Self {
+        Self {
+            backend: Backend::Ephemeral(EphemeralEvents::new()),
+        }
     }
 
     /// Open a store backed by a shared Postgres (D-73), reusing an already-built [`flux_pg::PgHandle`]
@@ -3520,9 +3564,184 @@ mod tests {
         );
     }
 
+    /// The driver-free backend (C-274): every backend-agnostic conformance body again, against a
+    /// fresh [`EventStore::ephemeral`]. This is what makes the `--no-default-features` build a
+    /// portability win rather than a hollow one — the claim "feature-off still has a usable
+    /// `EventBackend`" is only worth as much as the suite behind it, so it is held to exactly the
+    /// same bodies as SQLite and Postgres, in the DEFAULT build (the backend is always compiled).
+    mod ephemeral_tests {
+        use super::*;
+
+        /// Run a conformance body against a fresh driver-free store.
+        macro_rules! ephemeral_case {
+            ($name:ident) => {
+                #[test]
+                fn $name() {
+                    super::$name(&EventStore::ephemeral());
+                }
+            };
+        }
+
+        ephemeral_case!(create_append_load_roundtrip);
+        ephemeral_case!(updated_at_advances_on_append);
+        ephemeral_case!(updated_at_advances_on_set_model);
+        ephemeral_case!(conversation_delta_folds_incrementally_like_a_full_replay);
+        ephemeral_case!(compaction_replaces_the_live_view_but_keeps_history);
+        ephemeral_case!(latest_session_tracks_newest);
+        ephemeral_case!(unknown_session_has_no_conversation_but_info_errors);
+        ephemeral_case!(list_returns_newest_first_with_counts);
+        ephemeral_case!(search_selects_matching_sessions_and_excludes_others);
+        ephemeral_case!(search_query_cannot_recover_a_redacted_secret);
+        ephemeral_case!(set_model_updates_listing);
+        ephemeral_case!(find_correlated_returns_newest_matching_tagged_stream);
+        ephemeral_case!(find_correlated_in_realm_isolates_realms);
+        ephemeral_case!(find_correlated_in_realm_never_matches_legacy_untagged_sessions);
+        ephemeral_case!(find_correlated_in_realm_returns_newest_within_the_realm);
+        ephemeral_case!(record_call_usage_is_turn_scoped_and_a_noop_on_negative_turn_id);
+        ephemeral_case!(cost_summary_wraps_the_projection_over_one_stream);
+        ephemeral_case!(cost_summary_all_aggregates_across_sessions);
+        ephemeral_case!(cost_summary_for_account_scopes_and_sums_through_the_shared_fold);
+        ephemeral_case!(prune_empty_removes_zero_message_sessions);
+        ephemeral_case!(prune_empty_excluding_preserves_active_empty_sessions);
+        ephemeral_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
+        ephemeral_case!(prune_inactive_excluding_protects_the_keep_list);
+        ephemeral_case!(prune_empty_keeps_sessions_with_durable_nonmessage_facts);
+        ephemeral_case!(projections_read_only_their_kinds_from_a_mixed_stream);
+        ephemeral_case!(roles_round_trip_through_the_conversation);
+        ephemeral_case!(append_is_transactional_and_sequences_monotonically);
+        ephemeral_case!(run_events_and_turn_telemetry_share_the_log);
+        ephemeral_case!(idempotent_append_with_a_stable_id);
+        ephemeral_case!(context_round_trips_on_stored_events_and_summaries);
+        ephemeral_case!(accounts_are_isolated_in_scoped_reads);
+        ephemeral_case!(single_tenant_session_has_empty_context);
+        ephemeral_case!(cost_summary_all_does_not_double_count_correlated_children);
+        ephemeral_case!(custom_events_append_and_read_back_scoped_by_account);
+        ephemeral_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
+        ephemeral_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
+        ephemeral_case!(wakeup_schedule_cancel_and_fire_fold_into_pending_correctly);
+        ephemeral_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
+        ephemeral_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);
+        ephemeral_case!(deleting_a_session_clears_its_pending_wakeups);
+        ephemeral_case!(memory_entries_live_on_a_scoped_stream_in_the_same_store);
+        ephemeral_case!(forgetting_a_memory_hides_it_from_the_projection_but_keeps_its_history);
+        ephemeral_case!(a_receipt_cites_the_stable_event_id_not_the_backend_rowid);
+        ephemeral_case!(a_credential_shaped_claim_is_scrubbed_before_it_reaches_the_store);
+
+        // --- driver-free specifics: the SQL guarantees this backend has to reproduce by hand ---
+
+        /// The event-export primitive across two driver-free stores: the conversation, the turn
+        /// projection and the remapped turn scoping all survive the copy. `copy_session_to` is
+        /// covered against SQLite by the standalone tests above; those construct their stores with
+        /// `EventStore::in_memory`, so without this the ephemeral backend's `copy_session_atomic`
+        /// would go unexercised in the default build.
+        #[test]
+        fn copy_session_reproduces_the_conversation_and_remaps_turn_scoping() {
+            let src = EventStore::ephemeral();
+            let sid = src.create_session("model-a").unwrap();
+            let turn = src.begin_turn(&sid, "hi", "model-a").unwrap();
+            ask(&src, &sid, "hi");
+            src.record_call_usage(&sid, turn, "model-a", Usage::default())
+                .unwrap();
+            src.end_turn(&sid, turn, "answered", 1, "hi back", None)
+                .unwrap();
+
+            let dst = EventStore::ephemeral();
+            let copied = src.copy_session_to(&sid, &dst).unwrap();
+
+            assert_eq!(
+                dst.conversation(&copied)
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.text())
+                    .collect::<Vec<_>>(),
+                src.conversation(&sid)
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.text())
+                    .collect::<Vec<_>>()
+            );
+            // The turn projection is what proves the remap: a copied `turn_id` still names a
+            // `TurnStarted` in the DESTINATION, so the fold sees one complete turn.
+            assert_eq!(
+                dst.turns(&copied).unwrap().len(),
+                src.turns(&sid).unwrap().len()
+            );
+            // …and every copied event's scoping resolves inside the destination, not the source.
+            let new_turn = dst
+                .load_by_kind(&copied, "turn_started")
+                .unwrap()
+                .first()
+                .expect("the copied session has a TurnStarted")
+                .global_seq;
+            assert!(
+                dst.load_turn(&copied, new_turn).unwrap().len() > 1,
+                "the copied turn must scope more than its own TurnStarted"
+            );
+        }
+
+        /// D-185 item 3 on the driver-free backend: where the SQL backends get all-or-nothing from a
+        /// transaction, this one has to reserve-then-commit. A copy that fails partway (an
+        /// unmappable `turn_id`) must leave NOTHING behind — no listed session, and no orphaned
+        /// events under the id it would have minted.
+        #[test]
+        fn a_failed_copy_commits_nothing() {
+            let src = EventStore::ephemeral();
+            let sid = src.create_session("model-a").unwrap();
+            src.append(
+                &sid,
+                NewEvent::new(EventKind::CallUsage {
+                    model: "model-a".into(),
+                    usage: Usage::default(),
+                })
+                .in_turn(999_999),
+            )
+            .unwrap();
+
+            let dst = EventStore::ephemeral();
+            let err = src.copy_session_to(&sid, &dst).unwrap_err();
+            assert!(
+                err.to_string().contains("999999"),
+                "expected the unmappable turn_id in the diagnostic, got: {err}"
+            );
+            assert_eq!(
+                dst.list(10).unwrap(),
+                Vec::new(),
+                "a failed copy must leave no listed session"
+            );
+            // The reservation is released, not consumed: the next real session takes the id the
+            // failed copy would have used — and finds nothing of the copy's under it.
+            let next = dst.create_session("model-b").unwrap();
+            assert_eq!(
+                dst.load_stream(&next, None)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.kind.kind_tag())
+                    .collect::<Vec<_>>(),
+                vec!["session_started"],
+                "a failed copy must leave no events under the session id it reserved"
+            );
+        }
+
+        /// SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT` never reuses a number, and this backend
+        /// mirrors that with monotonic counters rather than `max(id) + 1`: a receipt citing a stable
+        /// event id must not be able to resolve to a DIFFERENT event after a prune.
+        #[test]
+        fn session_ids_are_not_reused_after_a_prune() {
+            let store = EventStore::ephemeral();
+            let first = store.create_session("m").unwrap();
+            assert_eq!(store.prune_empty().unwrap(), 1);
+            let second = store.create_session("m").unwrap();
+            assert_ne!(
+                first, second,
+                "a pruned session's id must never be handed out again"
+            );
+        }
+    }
+
     /// The SQLite backend: every backend-agnostic conformance body against a fresh in-memory store
     /// (today's behavior — must stay green), plus the SQLite-specific tests (file reopen, cross-process
     /// busy-timeout) that have no Postgres analog.
+    #[cfg(feature = "sqlite")]
     mod sqlite_tests {
         use super::*;
 

@@ -8,6 +8,16 @@ homepage.workspace = true
 description = "flux unified append-only event store: one ordered log projected into conversations, run traces, and turn metrics (SQLite/WAL)"
 
 [features]
+default = ["sqlite"]
+# The embedded SQLite backend — ON by default, so every existing consumer builds and behaves exactly
+# as before and gains no build step (C-274). Turning it OFF is what lets the store — and therefore
+# `flux-flow`, which holds `Arc<EventStore>` in `FlowStore`'s public signature — build for a target
+# `rusqlite` cannot reach, `wasm32-unknown-unknown` above all: the driver links a C library. A
+# feature-off build keeps a usable `EventBackend` (the driver-free `EphemeralEvents`, which
+# `EventStore::in_memory` then resolves to), so it is a portable store rather than no store at all.
+# Durability is what it gives up: `EventStore::open` needs this feature, because a non-durable store
+# behind a path-taking constructor would be a lie rather than a fallback.
+sqlite = ["dep:rusqlite"]
 # Opt-in Postgres backend for the EventStore (D-73). The default build stays DB-free and
 # rusqlite-only: `flux-pg` (the sole sqlx owner) is pulled in only when this feature is on.
 postgres = ["dep:flux-pg"]
@@ -28,12 +38,15 @@ flux-lang.workspace = true
 flux-evidence.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rusqlite.workspace = true
 ulid.workspace = true
 # C-124: a visible trace when an append waits on the SQLite busy handler past a threshold. No
 # product surface is required to install a subscriber (mirrors `flux-provider`'s retry warnings) —
 # a silent contended writer stays silent by default, but any embedder that wires up `tracing` sees it.
 tracing.workspace = true
+# The embedded SQLite driver — the default backend's driver-owner. Optional: gated behind `sqlite`
+# (on by default), because it links a C library and so cannot build for `wasm32-unknown-unknown`;
+# see that feature's comment (C-274).
+rusqlite = { workspace = true, optional = true }
 # The Postgres driver-owner (sqlx + pool + sync↔async bridge). Optional: gated behind `postgres`.
 flux-pg = { workspace = true, optional = true }
 # The Redactor the `otel` exporter scrubs span/metric attributes through. Optional: gated behind
