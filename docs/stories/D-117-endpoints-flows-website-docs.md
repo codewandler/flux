@@ -43,6 +43,10 @@ configuration, Flux-Lang examples, operation catalogs, plugin summaries, and rel
       CLI command coverage, config examples, SDK examples, and complete Flux code fences.
 - [x] Public Pages deployment follows a published release; main/PR changes continue to build as
       previews without silently replacing the stable documentation.
+      **Reversed 2026-07-30** (this criterion was met as written, then the policy itself was
+      changed): the site now deploys on every push to `main`. PRs still only build. The trade this
+      accepts is the inverse of the one above — the site may document an unreleased change, rather
+      than lag the tree until the next release.
 
 ## Progress
 - 2026-07-09 filed from the datasource-discoverability grounding pass (see design doc).

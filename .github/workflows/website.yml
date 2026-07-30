@@ -1,11 +1,14 @@
 name: website
 
 on:
+  # NO `paths` filter on main, deliberately: the published site tracks `main`, so anything that can
+  # change a rendered page must redeploy. That is wider than `website/**` — the generated blocks in
+  # `website/docs/**` are synced from crate sources, and a doc edit paired with a code change would
+  # otherwise land a half-updated site. A docs build is a couple of minutes; a stale public page that
+  # contradicts the tree costs more.
   push:
     branches: [main]
-    paths:
-      - 'website/**'
-      - '.github/workflows/website.yml'
+  # Pull requests stay path-filtered and never deploy — they are build validation only.
   pull_request:
     paths:
       - 'website/**'
@@ -39,14 +42,28 @@ jobs:
       - run: npm run build
         working-directory: website
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
-        # `main` and pull requests are preview/build validation only. The public site follows the
-        # exact source tag of the latest published release; workflow_dispatch is the recovery hatch.
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        # The published site tracks `main`, not the latest release tag. This reverses the earlier
+        # policy on purpose: docs that describe an unreleased change are a smaller problem than docs
+        # that silently contradict the tree for however long the next release takes. The consequence
+        # is real and accepted — the site can document behaviour not yet in a released binary, so
+        # anything version-sensitive on a page has to say which version it needs.
+        # Pull requests still never deploy; `release` and `workflow_dispatch` remain so a tag and a
+        # manual recovery both republish.
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+          || github.event_name == 'release'
+          || github.event_name == 'workflow_dispatch'
         with:
           path: website/build
 
   deploy:
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    # Must stay in lockstep with the upload-pages-artifact condition above: if this job runs without
+    # an artifact having been uploaded, deploy-pages fails with a confusing "no artifact" error
+    # rather than skipping.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'release'
+      || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     environment:

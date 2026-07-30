@@ -35,9 +35,12 @@ runtime decides what is allowed and performs the work.
 This site is the public documentation for users and integrators. It covers stable concepts, the CLI,
 Flux-Lang, the SDK, plugins, and the security model.
 
-The deployed site follows the latest published release. Changes on `main` are built as previews but
-do not replace the stable site until a release is published. See [What's new](./whats-new.md) for the
-customer-facing history and `flux --version` for your installed version.
+The deployed site follows `main`, and redeploys on every push to it. That means these pages describe
+the current state of the source — including changes that have **not yet been released**, so a page may
+document behaviour your installed build does not have. Check
+[What's new](./whats-new.md) for the customer-facing history: entries under a version heading are
+released, and anything under `Unreleased` is on `main` only. `flux --version` tells you which build
+you are actually running.
 
 The repository also contains internal contributor docs under `docs/` and crate-level `docs/`
 directories. Those are design records, story boards, roadmap notes, and implementation references.

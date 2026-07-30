@@ -106,5 +106,10 @@ shipped in D-196…D-198); and `sdk/datasources.md` pinned `codewandler-flux-sdk
   (the pillar is ON HOLD since 2026-07-06 and the page should say so), and adding a drift guard for
   the editor-tooling mirrors (`AGENTS.md:159`) — that is a question about all four mirrors, not
   just the website's.
-- Nothing here is publicly visible until the next release: `.github/workflows/website.yml` deploys
-  on `release: published` only. That is D-117's design and is not being changed.
+- ~~Nothing here is publicly visible until the next release: `.github/workflows/website.yml` deploys
+  on `release: published` only. That is D-117's design and is not being changed.~~
+  **Superseded 2026-07-30:** the site now deploys on **every push to `main`** (plus `release` and
+  `workflow_dispatch`), and the push trigger carries no `paths` filter, so any commit that can change
+  a rendered page republishes it. D-117's release-pinned policy was reversed deliberately: a stale
+  public page that contradicts the tree costs more than a page describing an unreleased change.
+  `website/docs/intro.md` states the new policy for readers.

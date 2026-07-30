@@ -121,9 +121,13 @@ dark mode uses `#2be6a5` verbatim, where it passes comfortably.
   (`AGENTS.md:159`). Story 2 documents a token the grammar may not highlight. Fixing that is in
   scope; *guarding* it is a bigger question that belongs to the editor-tooling mirrors as a whole,
   and is deliberately not opened here.
-- **Nothing here is publicly visible until the next release.** `.github/workflows/website.yml`
-  deploys on `release: published` only; `main` and PRs build for validation. That is D-117's design
-  and stays — it just means the epic's payoff is release-gated.
+- **Superseded 2026-07-30 — this epic's payoff is no longer release-gated.**
+  `.github/workflows/website.yml` now deploys on **every push to `main`** (plus `release` and
+  `workflow_dispatch`), with no `paths` filter on the push trigger, so anything that can change a
+  rendered page republishes it. PRs still build without deploying. The original text read: *"Nothing
+  here is publicly visible until the next release … That is D-117's design and stays."* It was
+  reversed on the judgement that a public page contradicting the tree costs more than one describing
+  an unreleased change; `website/docs/intro.md` now tells readers which state they are looking at.
 - **The `read_many` conflict must be resolved, not papered over.** `docs/usage.md` and the registry
   description contradict each other; the story decides which is true before editing either.
 
