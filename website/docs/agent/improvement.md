@@ -1,27 +1,54 @@
 ---
 title: Evaluation and improvement
-description: "What flux eval measures, where its evidence lands, and the honest status of the repository self-improvement loop."
+description: "Where harness benchmarking lives (flux-bench), what `flux eval` is for now, and the honest status of the repository self-improvement loop."
 ---
 
 # Evaluation and improvement
 
-:::note Status
-The Improvement pillar is **de-prioritized and on hold** (since 2026-07-06 — a project priority
-call). Everything described on this page is real, shipped, and runnable. What is **not** proven is
-the pillar's headline claim: a repeatable, grader-confirmed gain at **trials ≥ 3**. The autonomous
-loop has been driven end-to-end and has correctly *reverted* non-improvements; it has not yet
-demonstrated a statistically clean win.
+Two different things used to share this page. They have been separated, because only one of them
+moved:
 
-Use `flux eval` as a measurement and audit harness. Do not build a plan around the loop reliably
-improving an agent for you. The dated, per-round record is
-[`docs/self-improvement/STATUS.md`](https://github.com/codewandler/flux/blob/main/docs/self-improvement/STATUS.md).
-:::
+- **Benchmarking a harness** — measuring whether one build of flux is better than another. That is
+  [flux-bench](https://github.com/codewandler/flux-bench)'s job now, in its own repository.
+- **The repository self-improvement loop** — flux editing its own harness under a keep-or-revert
+  gate. That stays here, because it edits *this* tree. It is real, shipped, runnable, and
+  [on hold](#the-repository-self-improvement-loop).
 
-## `flux eval` — run a benchmark suite
+## Benchmarking the harness: flux-bench
 
-`flux eval` runs a fixed task set against the flux binary and prints a scored summary. Each case
-runs the **real agent** in an isolated temporary workspace with its own `HOME`, so cases cannot see
-each other, your shell environment, or your session history.
+**flux-bench measures a harness — the system prompt, the built-in tools, the agent loop — rather
+than a model.** It runs the *shipped* flux binary against a curated corpus with the model held fixed
+and verified fixed, so the harness is the only variable. Two properties make its answers worth
+having: it **measures its own noise floor** by running a binary against itself, and reports any
+difference inside that floor as `INCONCLUSIVE` rather than as a win; and it grades what an agent
+**declines** to do, because a case can forbid an action and match it against the tool call's *input
+arguments* on flux's `--stream-json` wire. That turns "did not hijack the user's audio device" into
+a measurable outcome instead of a code-review note.
+
+→ **[codewandler/flux-bench](https://github.com/codewandler/flux-bench)** — the supported answer to
+"how do I measure this agent".
+
+It has no documentation site by design: its
+[`README.md`](https://github.com/codewandler/flux-bench/blob/main/README.md) and
+[`docs/`](https://github.com/codewandler/flux-bench/tree/main/docs) are the reference, and
+[`docs/from-flux-eval.md`](https://github.com/codewandler/flux-bench/blob/main/docs/from-flux-eval.md)
+carries the measurement practice that used to live on this page — how many trials a claim needs, when
+a task is unscoreable, and how to audit a score back to the run that produced it.
+
+Because flux-bench runs the binary flux *ships*, it follows flux releases and not the other way
+round. Nothing in flux depends on it.
+
+## `flux eval` — still shipped, still supported
+
+`flux eval` is unchanged: same adapters, same flags, same exit codes. It is not deprecated and
+nothing about it is going away — it simply is not the answer to "benchmark my harness" any more.
+What it is for:
+
+- **The scoring engine the [self-improvement loop](#the-repository-self-improvement-loop) drives.**
+  The loop calls the same suites through the `eval_run` op, so the CLI is how you reproduce or debug
+  a round by hand.
+- **An offline CI fixture.** `flux eval mock` needs no network and no credentials, and proves the
+  eval plumbing works.
 
 ```bash
 flux eval mock                                      # offline wiring/CI fixture
@@ -30,58 +57,27 @@ flux eval terminal-bench -m sonnet --trials 3 --report report.md
 flux eval multi --members synthetic,terminal-bench --trials 3
 ```
 
-### Adapters
+Every adapter and flag is documented by `flux eval --help`, which cannot drift from the binary; that
+help also names flux-bench. Running the command prints the same pointer **on stderr**, so a caller
+parsing the summary on stdout or diffing a `--report` file is unaffected.
 
-| Adapter | What it runs | Requirements |
-|---|---|---|
-| `mock` | Offline CI fixture that drives `-m mock`. Proves the eval plumbing, not model quality. | none |
-| `synthetic` | Short real-model coding riddles; fast enough to iterate on. | a provider key |
-| `terminal-bench` | Docker-backed terminal tasks graded by the benchmark's own graders. | `tb` on `PATH`, Docker |
-| `multi` | Several members behind one combined score, member results retained. | those of each member |
+One calibration result is worth keeping in view: `synthetic` is **saturated** for current frontier
+models — a 2026-07-02 run scored 1000/1000 twice, with two different models. It remains a useful
+regression floor and is a poor vehicle for demonstrating a gain.
 
-`synthetic` is **saturated** for current frontier models — a 2026-07-02 calibration scored 1000/1000
-twice, with two different models. That makes it a useful regression floor and a poor vehicle for
-demonstrating a gain; a claimed improvement has to come from `terminal-bench`.
+## The repository self-improvement loop
 
-### Flags
+:::note Status
+The Improvement pillar is **de-prioritized and on hold** (since 2026-07-06 — a project priority
+call). Everything in this section is real, shipped, and runnable. What is **not** proven is the
+pillar's headline claim: a repeatable, grader-confirmed gain at **trials ≥ 3**. The autonomous loop
+has been driven end-to-end and has correctly *reverted* non-improvements; it has not yet
+demonstrated a statistically clean win. Do not build a plan around the loop reliably improving an
+agent for you.
 
-| Flag | Effect |
-|---|---|
-| `-m, --model <spec>` | Model the suite's agent runs (`-m mock`, `-m openrouter/anthropic/claude-sonnet-4.6`, …). |
-| `--tasks a,b` | Restrict to these task ids. |
-| `--members a,b` | For `multi` only: the member adapters to combine. Checked at startup. |
-| `--limit N` | Cap the number of tasks (`0` = all). |
-| `--trials N` | Trials per task (default `1`). |
-| `--report <path>` | Write a categorized Markdown report (headline score, per-task table). |
-| `--watch` | Stream each task's agent activity to the terminal live. |
-
-A single trial is fine for debugging and is **not** evidence: model noise on a small suite easily
-swamps the effect you are looking for. Use `--trials 3` or more before comparing two runs, and treat
-a task whose baseline swings between trials as unscoreable rather than as a signal.
-
-## Where the evidence lands
-
-- **The report** goes wherever `--report` points. It is ordinary Markdown — commit it, diff it,
-  paste it into a review.
-- **Per-case sessions** are real flux sessions inside each case's isolated `HOME`
-  (`<workdir>/.home/.flux/events.db`). The report carries a reference to each one, which is what
-  makes a score auditable back to the run trace that produced it — the `eval_sessions` op extracts
-  those references, and `sessions_digest` / `painpoints_collect` read them.
-- **Improvement rounds** append one record per keep/revert decision to
-  `.flux/eval/improve-log.jsonl` under the running `HOME`, and tag kept rounds in git.
-
-Because a case's session is an ordinary session, every read-back surface applies to it: replay it,
-diff two runs, or price it. See [Time Machine](./time-machine.md) and [Usage & cost](./cost.md).
-
-## Strict review
-
-`flux review --files …` is a separate, read-only quality protocol and is **not** part of the hold.
-Built-in reviewer roles inspect the named files and `review.aggregate` produces stable Markdown
-(`--format md`, the default) or the raw `ReviewReport` (`--format json`). `--fail-on high` exits
-non-zero when any finding meets that severity, which makes it usable as a CI gate. The reviewer
-roles and the `strict_review` flow are embedded in the binary, so it works in any repository.
-
-## The repository improvement loop
+The dated, per-round record is
+[`docs/self-improvement/STATUS.md`](https://github.com/codewandler/flux/blob/main/docs/self-improvement/STATUS.md).
+:::
 
 The loop is authored as a Flux-Lang flow, not as Rust: baseline eval → review the failures → derive
 a candidate harness fix → a `worker` sub-agent implements it → restore the protected paths → run the
@@ -111,10 +107,26 @@ never touched, and the script prints the exact commands to audit, review, or dis
 expensive (musl rebuilds, Docker tasks, sub-agent runs), and a kept gain is not guaranteed: the loop
 reverting is the expected outcome, not a failure of the script.
 
-### Why it lives in this repository
+### Where a round's evidence lands
+
+- **The report** goes wherever `--report` points. It is ordinary Markdown — commit it, diff it,
+  paste it into a review.
+- **Per-case sessions** are real flux sessions inside each case's isolated `HOME`
+  (`<workdir>/.home/.flux/events.db`). The report carries a reference to each one, which is what
+  makes a score auditable back to the run trace that produced it — the `eval_sessions` op extracts
+  those references, and `sessions_digest` / `painpoints_collect` read them.
+- **Improvement rounds** append one record per keep/revert decision to
+  `.flux/eval/improve-log.jsonl` under the running `HOME`, and tag kept rounds in git.
+
+Because a case's session is an ordinary session, every read-back surface applies to it: replay it,
+diff two runs, or price it. See [Time Machine](./time-machine.md) and [Usage & cost](./cost.md).
+
+### Why the loop lives in this repository
 
 The loop edits flux's own harness, so it is reviewed like any other product change rather than
-hidden behind a service. Two properties do the load-bearing work:
+hidden behind a service. Moving it to flux-bench would be the wrong direction *and* would break the
+property flux-bench is built around: an instrument must not be writable by the thing it measures.
+Two properties do the load-bearing work here:
 
 - **The agent never grades itself.** Scores come from the benchmark's own graders, and
   `score_compare_multi` additionally requires that no member benchmark regressed — a single combined
@@ -127,8 +139,17 @@ hidden behind a service. Two properties do the load-bearing work:
 Those make a *reported* gain trustworthy. They do not make a gain happen — which is exactly the gap
 the status note above describes.
 
+## Strict review
+
+`flux review --files …` is a separate, read-only quality protocol and is **not** part of the hold.
+Built-in reviewer roles inspect the named files and `review.aggregate` produces stable Markdown
+(`--format md`, the default) or the raw `ReviewReport` (`--format json`). `--fail-on high` exits
+non-zero when any finding meets that severity, which makes it usable as a CI gate. The reviewer
+roles and the `strict_review` flow are embedded in the binary, so it works in any repository.
+
 ## Related docs
 
+- [flux-bench](https://github.com/codewandler/flux-bench) — the supported harness benchmark.
 - [Operations → Improvement loop](../language/ops.md#improvement-loop) — every eval, mining, and round-guard op with its arguments.
 - [Time Machine](./time-machine.md) — replay, fork, and diff an individual eval session.
 - [Usage & cost](./cost.md) — price a run alongside its score.

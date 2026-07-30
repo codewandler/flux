@@ -339,7 +339,7 @@ pub(super) enum Commands {
     },
     /// Run a benchmark suite against flux and print a summary.
     #[command(
-        after_help = "ADAPTERS:\n  synthetic       real-model coding riddles (fast, no Docker)\n  mock            offline CI fixture (drives -m mock)\n  terminal-bench  the real Docker benchmark\n  multi           several behind one combined score (with --members)\n\nEXAMPLES:\n  flux eval synthetic -m openrouter/anthropic/claude-sonnet-4.6 --watch --report r.md\n  flux eval multi --members synthetic,terminal-bench"
+        after_help = "ADAPTERS:\n  synthetic       real-model coding riddles (fast, no Docker)\n  mock            offline CI fixture (drives -m mock)\n  terminal-bench  the real Docker benchmark\n  multi           several behind one combined score (with --members)\n\nEXAMPLES:\n  flux eval synthetic -m openrouter/anthropic/claude-sonnet-4.6 --watch --report r.md\n  flux eval multi --members synthetic,terminal-bench\n\nBENCHMARKING THE HARNESS:\n  The supported harness benchmark is flux-bench — https://github.com/codewandler/flux-bench\n  It runs the SHIPPED flux binary against a curated corpus with the model held fixed and\n  verified fixed, measures its own noise floor, and grades what an agent declines to do.\n  `flux eval` is unchanged and stays supported: it is the in-repo scoring engine the\n  self-improvement loop drives, and an offline CI fixture."
     )]
     Eval {
         /// Which suite to run.
