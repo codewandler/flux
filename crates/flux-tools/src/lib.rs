@@ -2454,8 +2454,9 @@ impl Tool for GitMergeTool {
                           `no_ff: true` always creates a merge commit even when a fast-forward \
                           is possible — the integration loop's audit trail. A conflict is a \
                           recoverable error naming the conflicting files: the merge is aborted \
-                          and the tree restored to its pre-merge state (never left half-merged, \
-                          never auto-resolved)."
+                          and the tree restored (never left half-merged, never auto-resolved). \
+                          If a merge is ALREADY in progress this op refuses and aborts nothing, \
+                          since that merge's resolution may be uncommitted work."
                 .into(),
             input_schema: tool_input_schema::<GitMergeInput>(),
             output_schema: None,
@@ -2516,6 +2517,30 @@ impl Tool for GitMergeTool {
             )));
         }
         let system = ctx.system();
+
+        // A merge already in flight is NOT this call's to touch. `git merge` refuses to start
+        // while `MERGE_HEAD` exists, so without this guard the failure path below reads that
+        // PRE-EXISTING `MERGE_HEAD` as "this call conflicted" and runs `git merge --abort` —
+        // discarding a half-finished merge the user may have hand-resolved but not yet committed.
+        // That is the invariant in AGENTS.md ("never reset, discard"), so refuse up front.
+        //
+        // The guard is also what licenses the abort further down: reaching that path PROVES no
+        // merge was in progress when this call began, so the `MERGE_HEAD` seen there is one this
+        // call created and aborting it destroys nothing it did not create. Same discipline as
+        // `git_worktree_leave`, which refuses to merge into a dirty original checkout so its
+        // always-abort trial merge cannot eat someone else's work.
+        let (merge_in_flight, merge_head) =
+            run_git(&system, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
+        if merge_in_flight {
+            let (_, status) = run_git(&system, &["status", "--porcelain"]).await?;
+            return Ok(ToolResult::error(format!(
+                "git_merge: a merge is already in progress (MERGE_HEAD {merge_head}) — refusing \
+                 to start a merge of `{branch}`, and refusing to abort the one in flight because \
+                 its resolution may be uncommitted work. Conclude it (`git commit`) or abandon it \
+                 (`git merge --abort`) by hand, then retry. Working tree:\n{status}"
+            )));
+        }
+
         let mut argv = vec!["merge".to_string()];
         if args.no_ff.unwrap_or(false) {
             argv.push("--no-ff".to_string());
@@ -2534,8 +2559,9 @@ impl Tool for GitMergeTool {
                 out
             }));
         }
-        // A failed merge with MERGE_HEAD present stopped on a conflict: name the unmerged paths,
-        // abort, and hand back a recoverable error — the tree is never left half-merged silently.
+        // A failed merge with MERGE_HEAD present stopped on a conflict — and because the guard
+        // above proved none was in flight beforehand, this MERGE_HEAD is ours. Name the unmerged
+        // paths, abort, and hand back a recoverable error: never left half-merged silently.
         let (in_progress, _) =
             run_git(&system, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
         if in_progress {
@@ -2549,15 +2575,18 @@ impl Tool for GitMergeTool {
                      merge: {out}\nabort: {abort_out}"
                 )));
             }
-            let files = if unmerged.is_empty() {
-                "(git reported no unmerged paths)".to_string()
+            // Report the count and the list from one source, so the message can never read
+            // "conflicts in 0 file(s)" next to a list saying there were none.
+            let paths: Vec<&str> = unmerged.lines().filter(|l| !l.is_empty()).collect();
+            let detail = if paths.is_empty() {
+                "git reported no unmerged paths".to_string()
             } else {
-                unmerged
+                format!("Conflicting files ({}):\n{}", paths.len(), paths.join("\n"))
             };
             return Ok(ToolResult::error(format!(
                 "git_merge: the merge of `{branch}` conflicted; the merge was aborted and the \
-                 tree restored to its pre-merge state. Resolve the conflict on the source branch \
-                 and retry. Conflicting files:\n{files}"
+                 tree restored to the state this call found it in. Resolve the conflict on the \
+                 source branch and retry. {detail}"
             )));
         }
         Ok(ToolResult::error(format!("git merge failed: {out}")))
@@ -2791,9 +2820,12 @@ impl Tool for GitRevertTool {
         }
         let system = ctx.system();
 
-        // `git revert` refuses a dirty tree itself, but only after the fact and with a hint aimed
-        // at a human. Check first so the caller gets one recoverable error naming the offending
-        // paths — and so the conflict abort below has an unambiguous state to restore to.
+        // Require a clean tree — DELIBERATELY stricter than git. `git revert` only refuses a dirty
+        // index, or unstaged changes to the paths it would touch; verified otherwise: an unstaged
+        // edit to an unrelated file, or an untracked file, and git reverts and commits happily.
+        // That is too permissive here, because the conflict abort below is a blanket
+        // `git revert --abort` — it needs a state it can restore without guessing which of the
+        // caller's own edits were in the tree first.
         let (ok, status) = run_git(&system, &["status", "--porcelain"]).await?;
         if !ok {
             return Ok(ToolResult::error(format!(
@@ -2801,9 +2833,13 @@ impl Tool for GitRevertTool {
             )));
         }
         if !status.is_empty() {
+            // Do not say "commit or stash" alone: `status --porcelain` also reports untracked
+            // (`??`) entries, which a plain `git stash` leaves exactly where they are — an agent
+            // that followed that advice would retry and fail identically.
             return Ok(ToolResult::error(format!(
-                "git_revert: the checkout has uncommitted changes; commit or stash them \
-                 first:\n{status}"
+                "git_revert: a revert must start from a clean tree, and this checkout is not \
+                 clean. Commit or stash the tracked changes; move, remove, or `git stash -u` any \
+                 untracked (`??`) entries, which a plain `git stash` will NOT clear:\n{status}"
             )));
         }
 
@@ -2845,15 +2881,17 @@ impl Tool for GitRevertTool {
                  `git revert --abort` manually. Conflicting files:\n{conflicts}"
             )));
         }
-        let count = conflicts.lines().filter(|l| !l.is_empty()).count();
-        let files = if conflicts.is_empty() {
-            "(git reported no unmerged paths)".to_string()
+        // Count and list from one source, so the message can never read "conflicts in 0 file(s)"
+        // alongside a list stating there were none.
+        let paths: Vec<&str> = conflicts.lines().filter(|l| !l.is_empty()).collect();
+        let detail = if paths.is_empty() {
+            "git reported no unmerged paths".to_string()
         } else {
-            conflicts
+            format!("Conflicting files ({}):\n{}", paths.len(), paths.join("\n"))
         };
         Ok(ToolResult::error(format!(
-            "git_revert: reverting `{commit}` conflicts in {count} file(s); the revert was \
-             aborted and the tree is clean. Reconcile and retry. Conflicting files:\n{files}"
+            "git_revert: reverting `{commit}` conflicted; the revert was aborted and the tree is \
+             clean. Reconcile and retry. {detail}"
         )))
     }
 }
