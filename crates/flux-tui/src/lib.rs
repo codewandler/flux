@@ -1041,6 +1041,8 @@ impl ChatState {
             active_action_id: None,
             ctrl_c_armed_at: None,
             panes: PaneStore::default(),
+            fleet: crate::fleet::FleetProjection::new(),
+            fleet_rows: Vec::new(),
         }
     }
 
@@ -1052,6 +1054,51 @@ impl ChatState {
     /// by the command.
     pub fn apply_pane_command(&mut self, command: flux_runtime::PaneCommand) {
         self.panes.apply(command);
+    }
+
+    /// Every pane currently open, each labelled with who owns it (C-224).
+    ///
+    /// This is the surface-side query `PaneCommand` deliberately has no `list` variant for — that
+    /// channel is send-only. C-223 wires the `pane.list` op to this so the model can see that the
+    /// fleet pane is already up, **and that it is host-owned**, rather than opening a second one it
+    /// would then be unable to keep in sync.
+    pub fn open_panes(&self) -> Vec<panes::PaneListing> {
+        self.panes.listing()
+    }
+
+    /// Fold one live sub-agent activity event (C-224) and re-resolve the fleet pane against `now`.
+    ///
+    /// Only the structural half of A-79's contract is read, by [`crate::fleet`]: the child's tool
+    /// input and observation data are never touched, so no worker secret can reach this surface
+    /// through a field it does not read.
+    pub(crate) fn record_spawn_activity(
+        &mut self,
+        activity: &flux_runtime::SpawnActivity,
+        now: Instant,
+    ) {
+        self.fleet.apply(activity, now);
+        self.refresh_fleet(now);
+    }
+
+    /// Re-resolve the fleet against `now`, raising the host pane while workers are tracked and
+    /// retiring it once none are.
+    ///
+    /// Called on every fleet event **and** on every frame of a running turn, because both lifetime
+    /// rules that matter are time-based rather than event-driven: a quiet worker becomes `stalled`
+    /// and a finished worker retires with no further event arriving. The loop's 62 ms tick only
+    /// runs while a turn is active (`state.running()`), so once a turn ends the pane can outlive
+    /// its retention until the next input event wakes the loop — cosmetic, and cheaper than giving
+    /// every idle session a wakeup timer it otherwise does not need.
+    pub(crate) fn refresh_fleet(&mut self, now: Instant) {
+        // Retirement is time-driven: a fleet whose last worker finished sends no further event, so
+        // the retention clock has to be advanced here or the pane would never come down.
+        self.fleet.prune(now);
+        self.fleet_rows = self.fleet.rows(now);
+        if self.fleet_rows.is_empty() {
+            self.panes.retire_fleet();
+        } else {
+            self.panes.raise_fleet();
+        }
     }
 
     /// Track a `loop.phase` observation (design Part 1 / A-15, mirrors the CLI's
@@ -2688,6 +2735,11 @@ impl ChatState {
         // C-221: panes are session-scoped, so projecting a different session (`/resume`) drops them
         // rather than attributing one session's panes to another.
         self.panes.clear();
+        // C-224: and so is the fleet — its workers are *this* session's children. Dropping the
+        // projection with the panes keeps the host pane from coming back on the next refresh
+        // carrying the previous session's workers.
+        self.fleet = crate::fleet::FleetProjection::new();
+        self.fleet_rows.clear();
         for usage in &turn_usage {
             self.tokens_out += usage.output_tokens;
             self.tokens_reasoning += usage.reasoning_tokens;
@@ -3146,6 +3198,9 @@ async fn event_loop(
                     approval_queue.push_back((request, reply));
                     show_next_approval(state, &mut pending_reply, &mut approval_queue);
                 }
+                UiEvent::SpawnActivity(activity) => {
+                    state.record_spawn_activity(&activity, Instant::now())
+                }
                 UiEvent::Steered(messages) => {
                     // The engine consumed these from the shared queue (the strip empties by
                     // itself); leave a transcript record that the running turn was steered.
@@ -3189,6 +3244,12 @@ async fn event_loop(
 
         if exit_after_finish && !state.running() {
             break;
+        }
+
+        // C-224: re-resolve the fleet before drawing, so worker ages, the stalled threshold and the
+        // running indicator advance with the frame rather than only when a child reports.
+        if !state.fleet.is_empty() {
+            state.refresh_fleet(Instant::now());
         }
 
         terminal.draw(|f| render(f, state))?;

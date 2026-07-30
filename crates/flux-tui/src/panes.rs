@@ -22,6 +22,27 @@
 //! [`crate::trust`] (C-222), which is also why this store holds [`AgentPane`]s rather than raw
 //! specs: an unsanitized payload cannot be rendered because it cannot be stored. This module
 //! guarantees the ordering that invariant rests on: panes draw before the approval sheet, always.
+//!
+//! # Two owners, one store (C-224)
+//!
+//! A pane is either agent-authored or host-owned ([`Pane`]), and the difference is visible: only the
+//! agent's carries the ` ◆ agent ` mark. The host's own pane — the sub-agent fleet view — is
+//! ordinary harness chrome, and marking it would make the mark a lie in the one place a user checks
+//! it. In the other direction the discriminator is structural, which is what makes it worth
+//! anything: an agent pane cannot suppress its mark, and a payload cannot draw one, because
+//! [`trust::AGENT_MARK`] is itself a reserved glyph.
+//!
+//! **The fleet pane is why `PaneData` is not the whole vocabulary, and deliberately still is not
+//! widened.** C-224 asked whether `kind: rows` can express a fleet honestly, and it cannot: the
+//! operational question is "is that worker working or hung?", and answering it needs a *live running
+//! indicator* and a *tint on the stalled row*. A payload can have neither by construction — every
+//! `rows` cell renders in one `panel_style()` (C-220 gives the model no style field, on purpose),
+//! and the spinner is Braille, which C-222 reserves precisely so a payload cannot fake a running
+//! indicator. The answer is **not** a new [`PaneData`] variant: the fleet's content is
+//! surface-derived from A-79's typed stream, never model-authored, so it does not belong in the
+//! model-facing payload type at all. [`Pane::Fleet`] carries *no data* and reads
+//! [`ChatState::fleet_rows`] at render time instead. `PaneData` therefore reaches C-223 exactly as
+//! C-220 fixed it, and the host keeps the one thing the model must not have: a region it can style.
 
 use super::*;
 
@@ -65,6 +86,86 @@ const MAX_BOTTOM_ROWS: u16 = 8;
 /// Rows of a pane that are chrome rather than content: the top and bottom border.
 const PANE_CHROME_ROWS: u16 = 2;
 
+/// The reserved id of the host's sub-agent fleet pane (C-224).
+///
+/// Reserved rather than merely taken: [`PaneStore::apply`] refuses **every** command naming it, so
+/// the model can neither replace, repaint nor close the pane, and cannot shadow it by claiming the
+/// id before any child is live.
+pub(crate) const FLEET_PANE_ID: &str = "host:fleet";
+
+/// The fleet pane's heading. Surface-authored, like the rest of its chrome.
+const FLEET_PANE_TITLE: &str = "sub-agents";
+
+/// Where the fleet pane sits. A side column, because the fleet is an aside to the conversation and
+/// the bottom strip's rows are the ones the composer competes for.
+const FLEET_PANE_SLOT: PaneSlot = PaneSlot::Right;
+
+/// Workers listed in the fleet pane before the rest are summarized in one line. Two rows each, so
+/// this is [`MAX_PANE_ROWS`] halved — the surface's cap, applied in the unit the body is built in.
+const MAX_FLEET_WORKERS: usize = (MAX_PANE_ROWS / 2) as usize;
+
+/// One pane in the store, together with **who owns it** — the distinction the model cannot cross.
+///
+/// C-221 had one kind of pane and could hold a bare [`AgentPane`]. C-224 adds a region the *host*
+/// owns, and the two must not be confusable: the agent's carries C-222's ` ◆ agent ` mark and the
+/// host's must not, or the mark stops being evidence of anything.
+#[derive(Debug)]
+pub(crate) enum Pane {
+    /// Agent-authored: a sanitized payload, drawn inside the C-222 trust chrome.
+    Agent(AgentPane),
+    /// The host's sub-agent fleet pane (C-224).
+    ///
+    /// **This variant deliberately carries no data at all.** Its body is read from
+    /// [`ChatState::fleet_rows`] at render time, which is what lets the surface draw a live running
+    /// indicator and a stalled/failed tint — see the module docs on why `rows` cannot. Having no
+    /// field is also the whole trust argument for it: there is nothing here for a model-supplied
+    /// character to inhabit, which is stronger than sanitizing a field would be.
+    Fleet,
+}
+
+impl Pane {
+    /// The id this pane is addressed by.
+    fn id(&self) -> &str {
+        match self {
+            Pane::Agent(pane) => &pane.spec().id,
+            Pane::Fleet => FLEET_PANE_ID,
+        }
+    }
+
+    /// The slot this pane occupies. The fleet pane's is surface-chosen, not proposed.
+    fn slot(&self) -> PaneSlot {
+        match self {
+            Pane::Agent(pane) => pane.spec().slot,
+            Pane::Fleet => FLEET_PANE_SLOT,
+        }
+    }
+
+    fn is_fleet(&self) -> bool {
+        matches!(self, Pane::Fleet)
+    }
+}
+
+/// One open pane as the surface reports it to a `pane.list` query (C-224).
+///
+/// `host_owned` is the field that keeps the model from duplicating the fleet pane: it can see the
+/// pane is up and that the commands it has are not what put it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneListing {
+    pub id: String,
+    pub title: String,
+    /// Whether the surface opened this pane itself. A host-owned pane ignores every `pane.*`
+    /// command addressed at it.
+    pub host_owned: bool,
+}
+
+/// The id a command addresses, whichever command it is.
+fn addressed_id(command: &PaneCommand) -> &str {
+    match command {
+        PaneCommand::Open(spec) => &spec.id,
+        PaneCommand::Update { id, .. } | PaneCommand::Close { id } => id,
+    }
+}
+
 /// Host-pushed panes, addressed by id and rendered in the order they were opened.
 ///
 /// A `Vec` rather than a map on purpose: ids address a pane, but *render order must be
@@ -77,7 +178,7 @@ const PANE_CHROME_ROWS: u16 = 2;
 /// having been filtered.
 #[derive(Debug, Default)]
 pub(crate) struct PaneStore {
-    open: Vec<AgentPane>,
+    open: Vec<Pane>,
 }
 
 impl PaneStore {
@@ -88,7 +189,15 @@ impl PaneStore {
     /// An `update` whose payload is a different [`PaneKind`](flux_runtime::PaneKind) than the open
     /// pane re-derives the kind from the data instead of rejecting it — the two can then never
     /// disagree, which is the same invariant `PaneSpec::new` enforces at the contract end.
+    ///
+    /// **Nothing that arrives here can touch a host-owned pane** (C-224). The check is on the
+    /// command's id and happens before anything else, so `open`, `update` and `close` are refused
+    /// alike — including an `open` sent before the fleet pane exists, which would otherwise let the
+    /// model squat the reserved id and have the host adopt its payload.
     pub(crate) fn apply(&mut self, command: PaneCommand) {
+        if addressed_id(&command) == FLEET_PANE_ID {
+            return;
+        }
         match command {
             PaneCommand::Open(spec) => {
                 // `project` is rejected at the reporter (C-220) and has no store here; a spec that
@@ -96,28 +205,39 @@ impl PaneStore {
                 if spec.lifetime == PaneLifetime::Project {
                     return;
                 }
-                match self.open.iter().position(|p| p.spec().id == spec.id) {
-                    Some(at) => self.open[at] = AgentPane::sanitized(spec),
-                    None if self.open.len() < MAX_PANES => {
-                        self.open.push(AgentPane::sanitized(spec))
+                match self.open.iter().position(|p| p.id() == spec.id) {
+                    Some(at) => self.open[at] = Pane::Agent(AgentPane::sanitized(spec)),
+                    // The cap counts *agent* panes only: the host's own pane is not admitted
+                    // through this path and must not consume the model's budget either, or opening
+                    // MAX_PANES panes would be a way to suppress the surface's fleet view.
+                    None if self.agent_len() < MAX_PANES => {
+                        self.open.push(Pane::Agent(AgentPane::sanitized(spec)))
                     }
                     None => {}
                 }
             }
             PaneCommand::Update { id, data } => {
-                if let Some(pane) = self.open.iter_mut().find(|p| p.spec().id == id) {
+                if let Some(Pane::Agent(pane)) =
+                    self.open.iter_mut().find(|p| p.id() == id && !p.is_fleet())
+                {
                     pane.update(data);
                 }
             }
-            PaneCommand::Close { id } => self.open.retain(|p| p.spec().id != id),
+            PaneCommand::Close { id } => self.open.retain(|p| p.is_fleet() || p.id() != id),
         }
     }
 
     /// Drop the [`PaneLifetime::Turn`] panes. Called at every turn-termination path the surface
     /// owns, so a turn-scoped pane cannot outlive the turn that opened it.
+    ///
+    /// The fleet pane is not turn-scoped and survives: its lifetime is the fleet's own, so a wave
+    /// that finished as the turn ended stays readable for its retention window rather than
+    /// vanishing at the exact moment the user wants to see how it ended.
     pub(crate) fn end_turn(&mut self) {
-        self.open
-            .retain(|p| p.spec().lifetime != PaneLifetime::Turn);
+        self.open.retain(|p| match p {
+            Pane::Fleet => true,
+            Pane::Agent(pane) => pane.spec().lifetime != PaneLifetime::Turn,
+        });
     }
 
     /// Drop every pane. Used when the surface projects a different session (`/resume`): panes are
@@ -126,9 +246,45 @@ impl PaneStore {
         self.open.clear();
     }
 
+    /// Raise the host's fleet pane, if it is not already up (C-224).
+    pub(crate) fn raise_fleet(&mut self) {
+        if !self.has_fleet() {
+            self.open.push(Pane::Fleet);
+        }
+    }
+
+    /// Retire the host's fleet pane. Driven by the projection emptying, not by the turn ending.
+    pub(crate) fn retire_fleet(&mut self) {
+        self.open.retain(|p| !p.is_fleet());
+    }
+
+    pub(crate) fn has_fleet(&self) -> bool {
+        self.open.iter().any(Pane::is_fleet)
+    }
+
+    /// Agent-authored panes only — what [`MAX_PANES`] bounds.
+    fn agent_len(&self) -> usize {
+        self.open.iter().filter(|p| !p.is_fleet()).count()
+    }
+
+    /// Every open pane, labelled with who owns it — the surface-side answer to `pane.list` (C-223).
+    pub(crate) fn listing(&self) -> Vec<PaneListing> {
+        self.open
+            .iter()
+            .map(|pane| PaneListing {
+                id: pane.id().to_string(),
+                title: match pane {
+                    Pane::Agent(agent) => agent.spec().title.clone(),
+                    Pane::Fleet => FLEET_PANE_TITLE.to_string(),
+                },
+                host_owned: pane.is_fleet(),
+            })
+            .collect()
+    }
+
     /// The panes asking for `slot`, oldest first.
-    fn in_slot(&self, slot: PaneSlot) -> Vec<&AgentPane> {
-        self.open.iter().filter(|p| p.spec().slot == slot).collect()
+    fn in_slot(&self, slot: PaneSlot) -> Vec<&Pane> {
+        self.open.iter().filter(|p| p.slot() == slot).collect()
     }
 
     /// Whether anything is open at all — the cheap check that keeps a pane-less session on exactly
@@ -144,7 +300,7 @@ impl PaneStore {
 
     #[cfg(test)]
     pub(crate) fn ids(&self) -> Vec<&str> {
-        self.open.iter().map(|p| p.spec().id.as_str()).collect()
+        self.open.iter().map(Pane::id).collect()
     }
 }
 
@@ -184,7 +340,7 @@ pub(crate) fn bottom_rows(state: &ChatState, frame: Rect) -> u16 {
     // their sum — a second bottom pane costs width, never more of the transcript's height.
     let want = panes
         .iter()
-        .map(|p| PANE_CHROME_ROWS + body_rows(p).min(MAX_PANE_ROWS))
+        .map(|p| PANE_CHROME_ROWS + body_rows(state, p).min(MAX_PANE_ROWS))
         .max()
         .unwrap_or(0);
     want.min(MAX_BOTTOM_ROWS).min(frame.height / 3)
@@ -274,19 +430,21 @@ pub(crate) fn render_overlay_pane(frame: &mut Frame, state: &ChatState) {
         return;
     }
     let panes = state.panes.in_slot(PaneSlot::Overlay);
-    let Some(pane) = panes.last() else {
+    // Always an agent pane: the host's fleet pane is pinned to `FLEET_PANE_SLOT` and never asks for
+    // the overlay slot, so this destructure is what keeps the header below unambiguously the mark.
+    let Some(pane @ Pane::Agent(agent)) = panes.last().copied() else {
         return;
     };
     let t = &state.theme;
     let width = frame.area().width.min(OVERLAY_PANE_WIDTH);
-    let mut body = body_lines(pane, t, width);
+    let mut body = body_lines(state, pane, t, width);
     let total = body.len();
     let shown = total.min(MAX_PANE_ROWS as usize);
     body.truncate(shown);
     rendering::render_overlay_panel(
         frame,
         t,
-        trust::agent_overlay_header(t, &pane.spec().title, width),
+        trust::agent_overlay_header(t, &agent.spec().title, width),
         body,
         (total > shown).then_some((shown, total)),
         width,
@@ -294,8 +452,13 @@ pub(crate) fn render_overlay_pane(frame: &mut Frame, state: &ChatState) {
 }
 
 /// Body rows a pane's payload wants, before the surface's cap applies.
-fn body_rows(pane: &AgentPane) -> u16 {
-    let count = match &pane.spec().data {
+fn body_rows(state: &ChatState, pane: &Pane) -> u16 {
+    let agent = match pane {
+        Pane::Agent(agent) => agent,
+        // Built in the same unit the body is, so the two cannot disagree about the fleet's height.
+        Pane::Fleet => return fleet_rows_wanted(state) as u16,
+    };
+    let count = match &agent.spec().data {
         PaneData::Rows { header, rows } => usize::from(!header.is_empty()) + rows.len(),
         PaneData::Kv { pairs } => pairs.len(),
         PaneData::Log { lines } => lines.len(),
@@ -321,7 +484,7 @@ fn tree_rows(nodes: &[flux_runtime::PaneNode], depth: usize) -> usize {
 
 /// Stack a slot's panes vertically inside its column, giving each an equal share and dropping the
 /// ones that no longer clear the minimum pane height.
-fn render_column(frame: &mut Frame, state: &ChatState, panes: &[&AgentPane], area: Rect) {
+fn render_column(frame: &mut Frame, state: &ChatState, panes: &[&Pane], area: Rect) {
     let fit = (area.height / (PANE_CHROME_ROWS + 1)).min(panes.len() as u16);
     if fit == 0 {
         return;
@@ -334,7 +497,7 @@ fn render_column(frame: &mut Frame, state: &ChatState, panes: &[&AgentPane], are
 }
 
 /// Lay a slot's panes side by side across a strip, giving each an equal share.
-fn render_row(frame: &mut Frame, state: &ChatState, panes: &[&AgentPane], area: Rect) {
+fn render_row(frame: &mut Frame, state: &ChatState, panes: &[&Pane], area: Rect) {
     let fit = (area.width / MIN_PANE_WIDTH).min(panes.len() as u16);
     if fit == 0 {
         return;
@@ -346,20 +509,35 @@ fn render_row(frame: &mut Frame, state: &ChatState, panes: &[&AgentPane], area: 
     }
 }
 
-/// One pane: the surface's trust chrome ([`trust::agent_block`] — themed border, agent mark, the
-/// pane's own title as text), and a body truncated to the rect with an explicit elision marker
-/// when the cap bites.
-fn render_pane(frame: &mut Frame, state: &ChatState, pane: &AgentPane, area: Rect) {
+/// One pane: its chrome, and a body truncated to the rect with an explicit elision marker when the
+/// cap bites.
+///
+/// **Which chrome depends on who owns it, and that is load-bearing.** An agent pane gets
+/// [`trust::agent_block`] — themed border plus C-222's ` ◆ agent ` mark. The host's fleet pane gets
+/// an ordinary bordered block with a plain title and **no mark**, because the mark is the user's
+/// evidence that a region was authored by the model: putting it on harness chrome would be a false
+/// claim and would teach the user that ` ◆ agent ` means nothing in particular. The discriminator
+/// stays structural in the other direction too — an agent pane cannot drop its mark, and a payload
+/// cannot draw one, since [`trust::AGENT_MARK`] is itself a reserved glyph.
+fn render_pane(frame: &mut Frame, state: &ChatState, pane: &Pane, area: Rect) {
     if area.width < MIN_PANE_WIDTH || area.height < PANE_CHROME_ROWS + 1 {
         return;
     }
     let t = &state.theme;
-    let block = trust::agent_block(t, &pane.spec().title, area.width);
+    let block = match pane {
+        Pane::Agent(agent) => trust::agent_block(t, &agent.spec().title, area.width),
+        Pane::Fleet => Block::bordered()
+            .border_style(t.muted_style())
+            .title(Span::styled(
+                format!(" {FLEET_PANE_TITLE} "),
+                t.muted_style(),
+            )),
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let budget = inner.height.min(MAX_PANE_ROWS);
-    let mut lines = body_lines(pane, t, inner.width);
+    let mut lines = body_lines(state, pane, t, inner.width);
     let total = lines.len();
     if total > budget as usize {
         let keep = budget.saturating_sub(1) as usize;
@@ -382,9 +560,13 @@ fn render_pane(frame: &mut Frame, state: &ChatState, pane: &AgentPane, area: Rec
 /// and nothing else. `markdown` gets a second pass through [`trust::sanitize_lines`] because it is
 /// the one kind whose *renderer* turns payload text into glyphs (a thematic break, a table) —
 /// everywhere else the glyphs are the surface's own.
-fn body_lines(pane: &AgentPane, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+fn body_lines(state: &ChatState, pane: &Pane, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let cols = width as usize;
-    match &pane.spec().data {
+    let agent = match pane {
+        Pane::Agent(agent) => agent,
+        Pane::Fleet => return fleet_lines(state, theme, cols),
+    };
+    match &agent.spec().data {
         PaneData::Rows { header, rows } => {
             let widths = column_widths(header, rows, cols);
             let mut out = Vec::new();
@@ -452,6 +634,125 @@ fn body_lines(pane: &AgentPane, theme: &Theme, width: u16) -> Vec<Line<'static>>
             trust::sanitize_lines(crate::markdown::render(text, width).lines)
         }
     }
+}
+
+/// Workers the fleet pane lists, and whether a summary line is owed for the rest.
+fn fleet_shown(state: &ChatState) -> (&[crate::fleet::WorkerRow], usize) {
+    let rows = state.fleet_rows.as_slice();
+    let shown = rows.len().min(MAX_FLEET_WORKERS);
+    (&rows[..shown], rows.len() - shown)
+}
+
+/// Rows the fleet pane's body wants: two per listed worker, plus a line for any remainder.
+fn fleet_rows_wanted(state: &ChatState) -> usize {
+    let (shown, rest) = fleet_shown(state);
+    shown.len() * 2 + usize::from(rest > 0 || state.fleet.dropped() > 0)
+}
+
+/// The fleet pane's body: two rows per live worker, drawn from typed [`crate::fleet::WorkerRow`]s.
+///
+/// ```text
+/// ⠹ implementor         1m2s
+///   running · read        3s
+/// ```
+///
+/// The first row identifies the worker and how long it has been going; the second says what it is
+/// doing and how long since it last said anything — the hung-versus-working signal, which is the
+/// operational question a fleet surface exists to answer.
+///
+/// **Everything here is surface-drawn from typed values**, which is the whole reason this is a host
+/// pane rather than a `rows` payload:
+///
+/// - the leading glyph is a live [`crate::SPINNER`] frame for a worker that is working, so "this
+///   worker is running" is shown rather than asserted in text. A payload could never carry it:
+///   `SPINNER` is Braille and Braille is reserved (C-222) precisely so a payload cannot fake it.
+/// - a stalled worker is `warn`-styled and a failed one `err`-styled. A `rows` payload renders every
+///   cell in one `panel_style()`, so it can state a worker is stuck but cannot *show* it.
+/// - the status word comes from [`crate::fleet::WorkerStatus::label`] — the closed set A-79's design
+///   requires a customer surface to derive fixed or allowlisted labels from. Only the operation
+///   *name* is interpolated, already sanitized and length-bounded by `crate::fleet`. The child's
+///   tool input and observation data are never read, here or anywhere on this path.
+fn fleet_lines(state: &ChatState, theme: &Theme, cols: usize) -> Vec<Line<'static>> {
+    use crate::fleet::WorkerStatus;
+
+    let (shown, rest) = fleet_shown(state);
+    let mut out = Vec::with_capacity(shown.len() * 2 + 1);
+    for row in shown {
+        // The mark, the tint and the frame are all chosen here from the typed status — never from
+        // anything a worker or the model wrote.
+        let (mark, style) = match (&row.status, row.stalled) {
+            // A quiet worker is the one an operator has to notice, so it loses its animation: a
+            // frozen mark plus a warn tint, rather than a spinner that suggests progress.
+            (_, true) => ("◌", theme.warn_style()),
+            (WorkerStatus::Finished { is_error: true }, _) => ("●", theme.err_style()),
+            (WorkerStatus::Finished { is_error: false }, _) => ("●", theme.ok_style()),
+            (WorkerStatus::Idle, _) => ("◌", theme.muted_style()),
+            // Starting / Planning / Running: working, so it animates off its own age.
+            (_, false) => (
+                SPINNER[(row.elapsed.as_millis() / 80) as usize % SPINNER.len()],
+                theme.accent_style(),
+            ),
+        };
+
+        // Line 1: mark, role, and total age flushed right.
+        let age = fmt_elapsed(row.elapsed);
+        let role_cols = cols.saturating_sub(2 + age.len() + 1);
+        out.push(Line::from(vec![
+            Span::styled(format!("{mark} "), style),
+            Span::styled(
+                format!("{:<role_cols$}", truncate(&row.role, role_cols)),
+                if row.stalled {
+                    theme.warn_style()
+                } else {
+                    theme.panel_style()
+                },
+            ),
+            Span::styled(format!(" {age}"), theme.muted_style()),
+        ]));
+
+        // Line 2: the closed-set status label, the op name when there is one, and how long the
+        // worker has been quiet. `stalled` is carried as a **word** and not only as the warn tint,
+        // for the reason C-149/C-154 give: under `Theme::MONO` every colour role is `Color::Reset`,
+        // so a tint-only signal is no signal at all — and this is the signal an operator is here for.
+        let mut activity = String::new();
+        // `stalled` leads, so that when the line is truncated the op name is what gets dropped and
+        // not the signal: `stalled · running…` is useful, `running · read sta…` is the defect.
+        if row.stalled {
+            activity.push_str("stalled · ");
+        }
+        activity.push_str(row.status.label());
+        if let Some(op) = row.status.op() {
+            activity.push_str(" · ");
+            activity.push_str(op);
+        }
+        // Labelled, because line 1 already right-flushes an age and two bare numbers in a column
+        // cannot be told apart.
+        let idle = format!("quiet {}", fmt_elapsed(row.idle));
+        let activity_cols = cols.saturating_sub(2 + idle.len() + 1);
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{:<activity_cols$}", truncate(&activity, activity_cols)),
+                style,
+            ),
+            Span::styled(format!(" {idle}"), theme.muted_style()),
+        ]));
+    }
+
+    // Refusals and overflow are reported rather than hidden — a fleet surface that silently shows
+    // a subset is worse than one that says it is showing a subset.
+    let untracked = state.fleet.dropped();
+    if rest > 0 || untracked > 0 {
+        let mut note = String::new();
+        if rest > 0 {
+            note.push_str(&format!(" … {rest} more"));
+        }
+        if untracked > 0 {
+            note.push_str(&format!(" · {untracked} untracked"));
+        }
+        out.push(Line::styled(truncate(&note, cols), theme.muted_style()));
+    }
+    out
 }
 
 /// Per-column display widths for a `rows` payload, bounded so a single wide cell cannot decide the
@@ -1106,6 +1407,8 @@ mod tests {
     #[test]
     fn markdown_and_tree_render_through_machinery_the_tui_already_owns() {
         let theme = Theme::default();
+        // Only the agent-pane bodies are under test here; the fleet body reads `state` instead.
+        let state = ChatState::new("mock".into());
         let flat = |lines: &[Line<'static>]| -> String {
             lines
                 .iter()
@@ -1122,7 +1425,7 @@ mod tests {
                 text: "# Title\n\nsome **bold** prose\n".into(),
             },
         ));
-        let md_lines = body_lines(&md, &theme, 30);
+        let md_lines = body_lines(&state, &Pane::Agent(md), &theme, 30);
         assert!(flat(&md_lines).contains("Title"));
         assert!(
             md_lines.iter().any(|l| l.spans.len() > 1),
@@ -1150,7 +1453,7 @@ mod tests {
                 }],
             },
         ));
-        let tree_text = flat(&body_lines(&tree, &theme, 30));
+        let tree_text = flat(&body_lines(&state, &Pane::Agent(tree), &theme, 30));
         assert!(
             tree_text.contains("root") && tree_text.contains("second"),
             "{tree_text}"
@@ -1183,5 +1486,559 @@ mod tests {
             plan::render_nodes(&roots, &Theme::default(), 40).len(),
             plan::MAX_TREE_DEPTH
         );
+    }
+
+    // ---- C-224: the host-owned sub-agent fleet pane -------------------------------------------
+
+    /// One `subagent.activity` event as it actually reaches this surface: through the engine's
+    /// turn-owned `AgentSinkSpawnActivitySink`, which forwards it into the parent [`AgentSink`] as
+    /// an observation. Built here the same way, so the test exercises the real decode path rather
+    /// than a hand-made `UiEvent`.
+    fn child_event(
+        spawn_id: u64,
+        role: &str,
+        event: flux_runtime::SpawnActivityEvent,
+    ) -> flux_runtime::SpawnActivity {
+        flux_runtime::SpawnActivity {
+            spawn_id,
+            role: role.into(),
+            // Deliberately the SAME session id for both children: a fresh storeless event store
+            // hands every child `s_1`. That is exactly why the surface must not pair on it.
+            child_session_id: "s_1".into(),
+            parent_session: Some("s_parent".into()),
+            depth: 1,
+            event,
+        }
+    }
+
+    /// Feed one child event down the real path — `ChannelSink::observation` → the `UiEvent`
+    /// channel — and fold whatever comes back into `state`, exactly as the event loop does.
+    fn feed(
+        state: &mut ChatState,
+        activity: &flux_runtime::SpawnActivity,
+        now: std::time::Instant,
+    ) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::controller::UiEvent>();
+        let mut sink = crate::controller::ChannelSink { tx, action_id: 1 };
+        <crate::controller::ChannelSink as AgentSink>::observation(
+            &mut sink,
+            &activity.to_observation(),
+        );
+        let event = rx
+            .try_recv()
+            .expect("the surface decoded `subagent.activity`");
+        let inner = match event {
+            crate::controller::UiEvent::Tagged { event, .. } => *event,
+            other => other,
+        };
+        match inner {
+            crate::controller::UiEvent::SpawnActivity(activity) => {
+                state.record_spawn_activity(&activity, now)
+            }
+            _ => panic!("`subagent.activity` decoded to some other event"),
+        }
+    }
+
+    /// The story's named failing-first test.
+    ///
+    /// Two concurrent children of the **same role**, running the **same op**, sharing the **same
+    /// child session id** — the shape A-79's correlation exists to disambiguate. The surface must
+    /// pair each child's events to its own row: when one resolves its call, the *other* child must
+    /// still be shown running. Pairing on role, on op or on `child_session_id` all produce a
+    /// visibly wrong pane here, which is the point.
+    #[test]
+    fn two_children_of_one_role_pair_to_their_own_rows() {
+        use flux_runtime::SpawnActivityEvent;
+
+        let mut state = ChatState::new("mock".into());
+        let t0 = std::time::Instant::now();
+
+        // Both children open a call. Same role, same op name, same session id.
+        feed(
+            &mut state,
+            &child_event(
+                1,
+                "implementor",
+                SpawnActivityEvent::ToolCall {
+                    call_id: 1,
+                    name: "read".into(),
+                    input: serde_json::json!({ "path": "/etc/passwd" }),
+                },
+            ),
+            t0,
+        );
+        feed(
+            &mut state,
+            &child_event(
+                2,
+                "implementor",
+                SpawnActivityEvent::ToolCall {
+                    call_id: 1,
+                    name: "read".into(),
+                    input: serde_json::json!({ "path": "/etc/passwd" }),
+                },
+            ),
+            t0,
+        );
+        // Only child 1 resolves. Its `call_id` is 1 — the same number child 2 is still waiting on.
+        feed(
+            &mut state,
+            &child_event(
+                1,
+                "implementor",
+                SpawnActivityEvent::ToolResult {
+                    call_id: 1,
+                    name: "read".into(),
+                    is_error: false,
+                },
+            ),
+            t0,
+        );
+
+        // The pane is open, and it is the host's — not something the model asked for.
+        assert!(
+            state.panes.has_fleet(),
+            "live children must raise the host fleet pane"
+        );
+        let listing = state.open_panes();
+        assert_eq!(listing.len(), 1, "one pane: {listing:?}");
+        assert!(
+            listing[0].host_owned,
+            "the fleet pane reports as host-owned so the model does not duplicate it: {listing:?}"
+        );
+
+        // Two rows, correlated by spawn id, with the right status on each.
+        let rows = &state.fleet_rows;
+        assert_eq!(rows.len(), 2, "one row per child: {rows:?}");
+        let first = rows.iter().find(|r| r.spawn_id == 1).expect("child 1");
+        let second = rows.iter().find(|r| r.spawn_id == 2).expect("child 2");
+        assert_eq!(
+            first.status,
+            crate::fleet::WorkerStatus::Idle,
+            "child 1 resolved its read"
+        );
+        assert_eq!(
+            second.status,
+            crate::fleet::WorkerStatus::Running { op: "read".into() },
+            "child 2's read must NOT be closed by child 1's identically-numbered result"
+        );
+
+        // And the frame says so: two `implementor` rows, one running and one idle.
+        let mut terminal = Terminal::new(TestBackend::new(TRUST_W, TRUST_H)).unwrap();
+        terminal.draw(|f| crate::render(f, &state)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(
+            screen.matches("implementor").count(),
+            2,
+            "both children are on the surface:\n{screen}"
+        );
+        assert!(
+            screen.contains("running"),
+            "the still-working child is shown running:\n{screen}"
+        );
+        assert!(
+            screen.contains("idle"),
+            "the finished-its-call child is shown idle:\n{screen}"
+        );
+    }
+
+    /// One live worker, as the shortest way to get the pane up.
+    fn with_one_worker(state: &mut ChatState, now: std::time::Instant) {
+        feed(
+            state,
+            &child_event(
+                7,
+                "worker",
+                flux_runtime::SpawnActivityEvent::ToolCall {
+                    call_id: 1,
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                },
+            ),
+            now,
+        );
+    }
+
+    /// The pane is the **host's**: every `pane.*` command naming it is refused, so the model can
+    /// neither repaint it into something else nor take it down. The `open` case matters most and is
+    /// the least obvious — it is checked both while the pane is up (no adoption) and before it
+    /// exists (no squatting the reserved id and having the host inherit the payload).
+    #[test]
+    fn the_model_can_neither_close_repaint_nor_shadow_the_host_fleet_pane() {
+        let mut state = ChatState::new("mock".into());
+        let t0 = std::time::Instant::now();
+
+        // Before any child: the model claims the reserved id. Refused outright.
+        state.apply_pane_command(PaneCommand::Open(PaneSpec::new(
+            FLEET_PANE_ID,
+            "not the fleet",
+            PaneSlot::Right,
+            PaneLifetime::Session,
+            PaneData::Log {
+                lines: vec!["squatted".into()],
+            },
+        )));
+        assert!(state.panes.is_empty(), "the reserved id cannot be claimed");
+
+        with_one_worker(&mut state, t0);
+        assert!(state.panes.has_fleet());
+
+        // Now the pane is up: update and close are refused too.
+        state.apply_pane_command(PaneCommand::Update {
+            id: FLEET_PANE_ID.into(),
+            data: PaneData::Log {
+                lines: vec!["repainted".into()],
+            },
+        });
+        state.apply_pane_command(PaneCommand::Close {
+            id: FLEET_PANE_ID.into(),
+        });
+        assert!(
+            state.panes.has_fleet(),
+            "the model cannot close a host-owned pane"
+        );
+        assert_eq!(state.panes.len(), 1, "and did not add one either");
+
+        let mut terminal = Terminal::new(TestBackend::new(TRUST_W, TRUST_H)).unwrap();
+        terminal.draw(|f| crate::render(f, &state)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !screen.contains("repainted") && !screen.contains("squatted"),
+            "no model payload reached the host pane:\n{screen}"
+        );
+        assert!(
+            screen.contains("worker"),
+            "the real fleet body did:\n{screen}"
+        );
+    }
+
+    /// The host pane is not spendable from the model's budget. `MAX_PANES` exists so a runaway
+    /// caller cannot push a pane the user is reading off the screen; if it also capped the surface's
+    /// own regions, opening the full quota would be a way to suppress the fleet view.
+    #[test]
+    fn a_model_at_its_pane_quota_cannot_suppress_the_fleet_pane() {
+        let mut state = ChatState::new("mock".into());
+        for i in 0..MAX_PANES {
+            state.apply_pane_command(log_pane(
+                &format!("agent{i}"),
+                PaneSlot::Left,
+                PaneLifetime::Session,
+            ));
+        }
+        assert_eq!(state.panes.len(), MAX_PANES);
+
+        with_one_worker(&mut state, std::time::Instant::now());
+        assert!(
+            state.panes.has_fleet(),
+            "the fleet pane came up over a full model quota: {:?}",
+            state.panes.ids()
+        );
+        // And the model's own budget is unchanged — it still gets exactly MAX_PANES, no more.
+        state.apply_pane_command(log_pane(
+            "one-too-many",
+            PaneSlot::Left,
+            PaneLifetime::Session,
+        ));
+        assert!(
+            !state.panes.ids().contains(&"one-too-many"),
+            "the host pane must not have widened the model's quota: {:?}",
+            state.panes.ids()
+        );
+    }
+
+    /// **The host pane must not wear the agent mark.** C-222 makes ` ◆ agent ` unforgeable so a user
+    /// can trust it as evidence that a region was authored by the model; putting it on harness
+    /// chrome would make it evidence of nothing. The check runs both ways so the two cannot converge.
+    #[test]
+    fn the_host_fleet_pane_carries_no_agent_mark_and_an_agent_pane_still_does() {
+        let render_screen = |state: &ChatState| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(TRUST_W, TRUST_H)).unwrap();
+            terminal.draw(|f| crate::render(f, state)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let mut fleet_only = ChatState::new("mock".into());
+        with_one_worker(&mut fleet_only, std::time::Instant::now());
+        let screen = render_screen(&fleet_only);
+        assert!(
+            screen.contains("sub-agents"),
+            "the host pane is drawn:\n{screen}"
+        );
+        assert!(
+            !screen.contains(AGENT_MARK),
+            "host chrome must not claim to be agent-authored:\n{screen}"
+        );
+
+        let mut with_agent = ChatState::new("mock".into());
+        with_agent.apply_pane_command(log_pane("a", PaneSlot::Left, PaneLifetime::Session));
+        assert!(
+            render_screen(&with_agent).contains(AGENT_MARK),
+            "an agent pane still carries the mark"
+        );
+    }
+
+    /// A-79's contract has an internal half a customer surface must default-deny: the child's tool
+    /// input and its observation data. This is the same corpus `crate::fleet` uses, fed through the
+    /// **whole surface path** and asserted against the rendered frame — the projection proving it
+    /// never reads those fields is one thing, the terminal never showing them is the claim a user
+    /// cares about. Child prose and thinking need no case here: A-79 gives them no variant to
+    /// travel in, and this story adds no other route.
+    #[test]
+    fn no_worker_secret_reaches_the_rendered_fleet_pane() {
+        const CORPUS: &[&str] = &[
+            "sk-ant-api03-REALLOOKINGKEYMATERIAL",
+            "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "postgres://fleet:hunter2@db.internal:5432/prod",
+            "hunter2",
+        ];
+        let mut state = ChatState::new("mock".into());
+        let t0 = std::time::Instant::now();
+        for (index, secret) in CORPUS.iter().enumerate() {
+            // Values, nested values, array members and JSON *keys* — as if the emitter-side
+            // redactor seam had failed open.
+            let mut input = serde_json::json!({
+                "url": format!("https://api.example.com?token={secret}"),
+                "headers": { "Authorization": format!("Bearer {secret}") },
+                "argv": ["curl", secret],
+            });
+            input[secret.to_string()] = serde_json::json!("a secret used as a JSON key");
+            feed(
+                &mut state,
+                &child_event(
+                    1,
+                    "worker",
+                    flux_runtime::SpawnActivityEvent::ToolCall {
+                        call_id: index as u64 + 1,
+                        name: "http_request".into(),
+                        input,
+                    },
+                ),
+                t0,
+            );
+            feed(
+                &mut state,
+                &child_event(
+                    1,
+                    "worker",
+                    flux_runtime::SpawnActivityEvent::Observation {
+                        observation: flux_evidence::Observation::new(
+                            "plugin.audit",
+                            flux_evidence::Phase::ToolFollowup,
+                            serde_json::json!({ "credential": secret }),
+                        ),
+                    },
+                ),
+                t0,
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(TRUST_W, TRUST_H)).unwrap();
+        terminal.draw(|f| crate::render(f, &state)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for secret in CORPUS {
+            assert!(
+                !screen.contains(secret),
+                "`{secret}` reached the terminal:\n{screen}"
+            );
+        }
+        // Not a vacuous pass: the allowlisted structural fields did arrive. The op name is asserted
+        // on the projection rather than the screen because a 34-column pane truncates it — the
+        // point is that it crossed at all, while nothing from `input`/`observation.data` did.
+        assert!(
+            screen.contains("worker") && screen.contains("running"),
+            "the pane rendered its permitted fields:\n{screen}"
+        );
+        assert_eq!(
+            state.fleet_rows[0].status.op(),
+            Some("http_request"),
+            "the operation NAME is permitted; only its input is not"
+        );
+    }
+
+    /// The pane is bounded like any other and suppressed with them. Narrow or short frames drop
+    /// every slot together (C-221's posture), and a fleet larger than the surface's cap is
+    /// truncated by the surface with the remainder counted, never grown to fit.
+    #[test]
+    fn the_fleet_pane_is_bounded_and_suppressed_with_every_other_slot() {
+        let mut state = ChatState::new("mock".into());
+        let t0 = std::time::Instant::now();
+        for spawn_id in 0..(MAX_FLEET_WORKERS as u64 + 5) {
+            feed(
+                &mut state,
+                &child_event(
+                    spawn_id,
+                    &format!("role{spawn_id}"),
+                    flux_runtime::SpawnActivityEvent::Planning { active: true },
+                ),
+                t0,
+            );
+        }
+
+        // The body is capped in workers, and says how many it is not showing.
+        let lines = fleet_lines(&state, &Theme::default(), 34);
+        assert_eq!(
+            lines.len(),
+            MAX_FLEET_WORKERS * 2 + 1,
+            "two rows per listed worker plus the remainder line"
+        );
+        assert_eq!(body_rows(&state, &Pane::Fleet) as usize, lines.len());
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(flat.contains("5 more"), "the remainder is counted: {flat}");
+
+        // Wide frame: drawn. Narrow and short frames: nothing, exactly as with no panes at all.
+        let screen = |w: u16, h: u16| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| crate::render(f, &state)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+        assert!(screen(TRUST_W, TRUST_H).contains("sub-agents"));
+        assert!(
+            !screen(PANE_MIN_TRANSCRIPT_WIDTH - 1, TRUST_H).contains("sub-agents"),
+            "suppressed below the width floor"
+        );
+        assert!(
+            !screen(TRUST_W, PANE_MIN_HEIGHT - 1).contains("sub-agents"),
+            "suppressed below the height floor"
+        );
+    }
+
+    /// The pane's lifetime is the **fleet's**, not the turn's and not the model's: it survives the
+    /// turn that spawned the children (so a wave's outcome stays readable through its retention
+    /// window), retires once the projection empties, and goes away with the session.
+    #[test]
+    fn the_fleet_pane_retires_on_its_own_lifetime_rules() {
+        let mut state = ChatState::new("mock".into());
+        let t0 = std::time::Instant::now();
+        // A turn-lifetime agent pane alongside, to show end_turn discriminates rather than skipping.
+        state.apply_pane_command(log_pane("turnly", PaneSlot::Left, PaneLifetime::Turn));
+        feed(
+            &mut state,
+            &child_event(
+                1,
+                "worker",
+                flux_runtime::SpawnActivityEvent::Finished {
+                    usage: None,
+                    is_error: false,
+                },
+            ),
+            t0,
+        );
+
+        state.panes.end_turn();
+        assert!(
+            state.panes.has_fleet(),
+            "the fleet pane is not turn-scoped: {:?}",
+            state.panes.ids()
+        );
+        assert!(
+            !state.panes.ids().contains(&"turnly"),
+            "a turn-lifetime agent pane still goes"
+        );
+
+        // Still inside the finished worker's retention: shown, so the wave's outcome is readable.
+        state.refresh_fleet(t0 + Duration::from_secs(5));
+        assert!(state.panes.has_fleet());
+
+        // Past it: the projection empties and the pane retires with it.
+        state.refresh_fleet(t0 + Duration::from_secs(600));
+        assert!(
+            !state.panes.has_fleet(),
+            "an empty fleet retires its pane: {:?}",
+            state.panes.ids()
+        );
+        assert!(state.fleet_rows.is_empty());
+    }
+
+    /// `pane.list` (C-223) reports the fleet pane labelled host-owned, so the model does not open a
+    /// second fleet pane it would then be unable to keep in sync.
+    #[test]
+    fn pane_list_labels_the_fleet_pane_host_owned_and_agent_panes_not() {
+        let mut state = ChatState::new("mock".into());
+        state.apply_pane_command(log_pane("mine", PaneSlot::Left, PaneLifetime::Session));
+        with_one_worker(&mut state, std::time::Instant::now());
+
+        let listing = state.open_panes();
+        let agent = listing.iter().find(|p| p.id == "mine").expect("agent pane");
+        let host = listing
+            .iter()
+            .find(|p| p.id == FLEET_PANE_ID)
+            .expect("host pane");
+        assert!(!agent.host_owned, "the model's own pane is not host-owned");
+        assert!(host.host_owned, "the fleet pane is: {listing:?}");
+        assert_eq!(host.title, FLEET_PANE_TITLE);
+    }
+
+    /// A stalled worker stays legible at the narrowest pane the surface will draw, and under
+    /// `Theme::MONO` where the warn tint does not exist.
+    ///
+    /// Both halves were real defects found by eye: the activity line originally ended with
+    /// `stalled`, so a worker with a long op name rendered `running · read sta…` — truncating away
+    /// the one word an operator is scanning for, in the one theme that has nothing else to show it.
+    #[test]
+    fn a_stalled_worker_says_so_at_the_narrowest_width_and_under_mono() {
+        let mut state = ChatState::new("mock".into());
+        let t0 = std::time::Instant::now();
+        feed(
+            &mut state,
+            &child_event(
+                1,
+                "implementor",
+                flux_runtime::SpawnActivityEvent::ToolCall {
+                    call_id: 1,
+                    name: "a_very_long_operation_name".into(),
+                    input: serde_json::json!({}),
+                },
+            ),
+            t0,
+        );
+        state.refresh_fleet(t0 + crate::fleet::DEFAULT_STALL_AFTER + Duration::from_secs(1));
+        assert!(state.fleet_rows[0].stalled, "the worker is stalled");
+
+        for theme in [Theme::MONO, Theme::default()] {
+            // MIN_PANE_WIDTH is the narrowest column that gets drawn at all, minus its two borders.
+            let lines = fleet_lines(&state, &theme, (MIN_PANE_WIDTH - 2) as usize);
+            let flat: String = lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect();
+            assert!(
+                flat.contains("stalled"),
+                "the stalled word must survive truncation, not the op name: {flat:?}"
+            );
+        }
     }
 }
