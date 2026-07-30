@@ -192,6 +192,14 @@ const RISK_REFERENCE_EXCLUDED: &[(&str, &str)] = &[(
      is not part of the native CLI catalog until a signed plugin descriptor is loaded",
 )];
 
+/// The in-repo reference, read once, from the one path both directions of the coherence check use.
+fn in_repo_reference() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../flux-flow/docs/ops-reference.md"),
+    )
+    .expect("the ops reference is readable")
+}
+
 #[derive(Debug, Default)]
 struct RiskReferenceCheck {
     checked: usize,
@@ -284,16 +292,136 @@ fn markdown_table_cells(line: &str) -> Vec<String> {
     cells
 }
 
+/// Operations that cannot be a literal row in the in-repo reference, and why. Matched as a name
+/// prefix so one entry covers a whole generated family.
+///
+/// This list is *only* for ops whose production name does not exist until a program or an operator
+/// chooses it. "Niche", "evidence-gated", or "the other reference has it" are not reasons — C-248
+/// exists because the whole eval family was absent for exactly those excuses.
+const REFERENCE_COVERAGE_EXCLUDED: &[(&str, &str)] = &[
+    (
+        "census_board.",
+        "a work board's eleven operations are generated under the *program's* datasource name \
+         (A-131), so no literal name is the production one; the reference documents the shape as \
+         `<domain>.list` / `.get` / … instead",
+    ),
+    (
+        "census_stage",
+        "a config-authored model stage is named by the operator under `[agent.stages.<name>]`, so \
+         the reference documents the seam rather than any one name",
+    ),
+];
+
+#[derive(Debug, Default)]
+struct ReferenceCoverage {
+    documented: usize,
+    exercised_exclusions: BTreeSet<&'static str>,
+    missing: Vec<String>,
+}
+
+/// Every op the production catalog registers must appear as a row in one of the reference's op
+/// tables — a *row*, not a passing prose mention, so it arrives with a signature and a description
+/// and (where the table carries a Risk column) lands inside
+/// [`check_published_risk_column`]'s reach too.
+fn check_reference_coverage(reference: &str, registry: &ToolRegistry) -> ReferenceCoverage {
+    let mut documented = BTreeSet::new();
+    for line in reference.lines() {
+        if !line.trim_start().starts_with('|') {
+            continue;
+        }
+        if let Some(op) = markdown_table_cells(line)
+            .get(1)
+            .and_then(|cell| cell.strip_prefix('`'))
+            .and_then(|cell| cell.strip_suffix('`'))
+        {
+            documented.insert(op.to_string());
+        }
+    }
+
+    let mut result = ReferenceCoverage::default();
+    for name in registry.names() {
+        if let Some((prefix, _)) = REFERENCE_COVERAGE_EXCLUDED
+            .iter()
+            .find(|(prefix, _)| name.starts_with(prefix))
+        {
+            result.exercised_exclusions.insert(prefix);
+        } else if documented.contains(&name) {
+            result.documented += 1;
+        } else {
+            result.missing.push(name);
+        }
+    }
+    result
+}
+
+/// C-248, the other direction of the same coherence: [`check_published_risk_column`] walks the
+/// *reference* and holds every row to the catalog, so a documented op that drifts or disappears
+/// reddens the gate — but an op that was never written down at all is invisible to it. That is how
+/// `crates/flux-flow/docs/ops-reference.md` came to document **none** of the eval / self-improvement
+/// family (`eval_run`, `gate_check`, `git_snapshot`, `git_tag`, `git_reset`, `guard_protected`, …)
+/// while the gate stayed green, and why C-238's `git_revert` → `git_reset` rename had exactly one
+/// guarded reference to update instead of two.
+///
+/// Shape (a) of the story: the in-repo reference covers the eval family too, pinned the way
+/// `website/docs/language/ops.md` is pinned by
+/// `operations_reference_covers_the_registered_public_catalog`. Shape (b) — scoping the file to the
+/// builtin catalog — was rejected: these ops reach the same `Executor::dispatch` in a running
+/// `flux` (they are in this very census, which is why the metadata gate above already covers them),
+/// so an agent reading the in-repo catalog and finding nothing is reading a reference that is
+/// wrong, not one that is narrow.
+#[test]
+fn the_in_repo_reference_covers_the_whole_production_catalog() {
+    let registry = production_catalog();
+    let result = check_reference_coverage(&in_repo_reference(), &registry);
+    assert!(
+        result.documented > 140,
+        "only {} catalog ops resolved to a reference row — the table parser or the census probably \
+         stopped early",
+        result.documented
+    );
+    assert_eq!(
+        result.exercised_exclusions.len(),
+        REFERENCE_COVERAGE_EXCLUDED.len(),
+        "a reasoned coverage exclusion was not exercised: {:?}",
+        result.exercised_exclusions
+    );
+    assert!(
+        result.missing.is_empty(),
+        "crates/flux-flow/docs/ops-reference.md documents no row for {} production op(s): {:?}",
+        result.missing.len(),
+        result.missing
+    );
+}
+
+/// The guard on the guard: an op present in the catalog and absent from the reference must be named,
+/// and a prose mention must not satisfy it. Without this, the check above could quietly degrade into
+/// a substring search that any nearby backtick satisfies — the failure mode that let the eval family
+/// hide behind a *paragraph* naming it while no row existed.
+#[test]
+fn an_undocumented_catalog_op_is_reported_and_prose_does_not_count() {
+    let registry = production_catalog();
+    let reference = "| op | signature | risk | description |\n\
+                     |---|---|---|---|\n\
+                     | `bash` | `command` | High | Run a shell command |\n\
+                     \n\
+                     The eval family (`gate_check`, `git_snapshot`) is documented elsewhere.\n";
+    let result = check_reference_coverage(reference, &registry);
+    assert_eq!(result.documented, 1, "{result:?}");
+    for op in ["gate_check", "git_snapshot", "eval_run"] {
+        assert!(
+            result.missing.iter().any(|missing| missing == op),
+            "`{op}` was not reported as missing: {result:?}"
+        );
+    }
+}
+
 /// C-233: the Risk column operators read is checked against the same widest production census as
 /// metadata coherence. No unresolved row is silently skipped; the separately shipped plugin alias
 /// is the sole reasoned exception, and the count floor makes an empty/changed table fail closed.
 #[test]
 fn the_published_risk_column_matches_the_production_catalog() {
     let registry = production_catalog();
-    let reference = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../flux-flow/docs/ops-reference.md"),
-    )
-    .expect("the ops reference is readable");
+    let reference = in_repo_reference();
     let result = check_published_risk_column(&reference, &registry);
     assert!(
         result.checked > 60,
