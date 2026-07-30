@@ -1,0 +1,145 @@
+# The Flux-Lang release cut (C-251, `examples/release.flux`) — flux cutting its own release.
+#
+# ⚠ DELIBERATELY `workflow_dispatch` ONLY, AND DELIBERATELY DRY BY DEFAULT.
+#
+# The story this implements describes merging `main` → `release` as the whole release action. That
+# automatic `push: release` trigger is **not wired here on purpose**. An unattended agent with commit
+# and tag authority in a release pipeline is the highest-risk shape in this repo, crates.io is
+# yank-only, and a wrong publish is permanent across 30 crate names. So the trigger flip is a separate,
+# deliberate change, to be made only once this workflow has run green by hand a few times. Until then
+# a release is still cut by a human running `scripts/cut-release.sh`, exactly as
+# `crates/flux-sdk/PUBLISHING.md` documents.
+#
+# WHAT THIS WORKFLOW CANNOT DO, structurally:
+#   * It cannot push. `permissions: contents: read` — there is no write token in the job, so even
+#     `apply: true` cannot move a ref on the remote. The commit and annotated tag `apply: true` creates
+#     live and die inside the ephemeral runner.
+#   * It cannot publish. Publication is `release.yml` + `crates-io.yml`, both triggered by a **tag
+#     push**, which this workflow cannot perform.
+#   * The program it runs cannot reach source. `examples/release.flux` calls no `bash`, no `proc.run`,
+#     no `write`/`edit`; its only writing op addresses exactly the three release changelogs and its
+#     only process-capable ops have fixed argv for `scripts/check-crate-versions.sh` and
+#     `scripts/cut-release.sh`. Pinned by `crates/flux-eval/tests/release_authority.rs`.
+#
+# So `apply: false` (the default) is a real, reviewable preview against the real repo: it derives the
+# version, has the scribe draft both changelogs, and posts the rendered sections plus the diff it would
+# apply to the job summary — writing nothing. `apply: true` is a full REHEARSAL: it runs the real
+# `scripts/cut-release.sh`, including its gate, and proves the cut succeeds — then throws the result
+# away with the runner. Neither mode releases anything.
+#
+# Secrets: OPENROUTER_API_KEY — a cheap model is enough for prose curation and a smoke turn. Absent,
+# the smoke leg and the flow are SKIPPED with a notice rather than failing: a missing credential is
+# not a broken release pipeline.
+
+name: release-flow
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Cut for real in this runner (still cannot push or publish). false = preview only."
+        required: true
+        type: boolean
+        default: false
+      model:
+        description: "Model for the release-scribe sub-agent."
+        required: false
+        type: string
+        default: "openrouter/anthropic/claude-haiku-4.5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-flow
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: "smoke · scribe · ${{ inputs.apply && 'cut (rehearsal)' || 'preview' }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # `release_plan` runs `git describe --tags` and `check-crate-versions.sh` compares against
+          # the previous `v*` tag — both need the full history, not a shallow clone.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - run: cargo fetch --locked
+
+      # The release binary is what both the smoke test and the flow run under, so build it once.
+      - name: Build the flux binary
+        run: cargo build --release --bin flux
+
+      - name: Does a model credential exist?
+        id: creds
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENROUTER_API_KEY is not set — the live smoke leg and the release flow will be skipped."
+          fi
+
+      # A live provider turn against a cheap model. Its failure blocks the cut by ordering: a broken
+      # provider path is exactly the class the offline gate cannot see. Legs whose own credential is
+      # absent (ollama, claude, codex) skip themselves — see the script header.
+      - name: Live smoke against a cheap model
+        if: steps.creds.outputs.have_key == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          FLUX_SMOKE_MODEL: ${{ inputs.model }}
+          FLUX_BIN: ${{ github.workspace }}/target/release/flux
+        run: ./scripts/smoke-live.sh
+
+      # The program derives the version, drafts both changelogs, inserts the prose, and — with
+      # `apply: true` — runs the real transactional cut. `--yes` is required because there is no
+      # approval UI in CI; it is not what bounds this run's authority (the op set is, see the header).
+      - name: Run examples/release.flux
+        if: steps.creds.outputs.have_key == 'true'
+        id: flow
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -o pipefail
+          # An identity is needed only so `apply: true` can reach `cut-release.sh`'s `git commit`.
+          git config user.name "flux release flow"
+          git config user.email "release@codewandler.invalid"
+          ./target/release/flux flow run examples/release.flux \
+            --arg apply=${{ inputs.apply }} \
+            -m '${{ inputs.model }}' \
+            --yes 2>&1 | tee release-flow.out
+
+      # The prose is the part a human must actually read before a release goes out, so it goes on the
+      # run's summary page rather than only into the log.
+      - name: Post the release notes to the run summary
+        if: always() && steps.creds.outputs.have_key == 'true'
+        run: |
+          {
+            echo "## Release flow — ${{ inputs.apply && 'cut (rehearsal)' || 'preview' }}"
+            echo
+            echo "Model: \`${{ inputs.model }}\`"
+            echo
+            echo '```'
+            cat release-flow.out 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Says out loud that nothing was released, so a green run is never mistaken for one.
+      - name: What actually happened
+        if: success()
+        run: |
+          if [ "${{ inputs.apply }}" = "true" ]; then
+            echo "::notice::Rehearsal only. A commit and an annotated tag were created IN THIS RUNNER and are now gone — this job has no write token and cannot push. To release for real, follow crates/flux-sdk/PUBLISHING.md."
+          else
+            echo "::notice::Preview only. Nothing was written, committed, or tagged."
+          fi

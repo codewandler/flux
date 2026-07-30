@@ -19,6 +19,8 @@
 //! - [`runner`] — run one local task (materialize workspace → run flux → grade criterion).
 //! - [`painpoint`] — deterministic pain-point mining over a session's message log.
 //! - [`ops`] — the Flux-Lang `Tool` wrappers the improve flows call.
+//! - [`release`] — the host half of `examples/release.flux` (C-251): version derivation, the
+//!   protocol-line guard, deterministic changelog insertion, and the fixed-argv cut.
 
 pub mod adapter;
 pub mod adapters;
@@ -28,6 +30,7 @@ pub mod git;
 pub mod metrics;
 pub mod ops;
 pub mod painpoint;
+pub mod release;
 pub mod report;
 pub mod runner;
 pub mod score;
@@ -75,6 +78,14 @@ pub fn try_register_eval_ops(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(git::GitTagTool),
             Arc::new(git::GitResetTool),
             Arc::new(git::GuardProtectedTool),
+            // The release pack (C-251). Same family as the improve flows — top-level-only,
+            // repo-mutating orchestration ops — and deliberately narrow: fixed argv for the two
+            // named scripts and a three-file write scope, so `examples/release.flux` never needs
+            // general process or write authority.
+            Arc::new(release::ReleasePlanTool),
+            Arc::new(release::ReleaseVerifyVersionsTool),
+            Arc::new(release::ChangelogInsertTool),
+            Arc::new(release::ReleaseCutTool),
         ],
     )
 }

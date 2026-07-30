@@ -3,14 +3,24 @@
 # `.flux/` is local scaffolding (session state, seeded self-improvement roles, …) and stays
 # gitignored — EXCEPT a few checked-in artifacts that ship with the repo (they are part of
 # examples/tests, not local scaffolding): the strict-review reviewer roles (L-10), the
-# multi-perspective scout roles (L-37), and the flux-flow engine skill, whose generated node-kind
-# table is guarded by a test. A directory-level `.flux/` pattern would block re-inclusion entirely,
-# so exclude by content instead.
+# multi-perspective scout roles (L-37), the release-scribe role and the narrow release policy
+# document (C-251), and the flux-flow engine skill, whose generated node-kind table is guarded by a
+# test. A directory-level `.flux/` pattern would block re-inclusion entirely, so exclude by content
+# instead — a negation on a file under an excluded *directory* never applies, which is why each
+# checked-in family re-includes its directory first.
 .flux/*
 !.flux/agents/
 .flux/agents/*
 !.flux/agents/review-*.md
 !.flux/agents/*-scout.md
+!.flux/agents/release-scribe.md
+# C-251: the release flow's sub-agent role is an artifact the tests read and `examples/release.flux`
+# resolves by name (`crates/flux-eval/tests/release_authority.rs`), plus the narrow write/exec policy
+# that same test verifies as a document. Untracked, both made the feature work only in the worktree
+# that authored it.
+!.flux/policies/
+.flux/policies/*
+!.flux/policies/release.toml
 !.flux/skills/
 .flux/skills/*
 !.flux/skills/flux-flow/
