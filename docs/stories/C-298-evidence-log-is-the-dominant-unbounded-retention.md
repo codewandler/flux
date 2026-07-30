@@ -2,7 +2,7 @@
 id: C-298
 title: "The evidence log is the largest unbounded structure in a long-lived runtime, and it has no trim API at all"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 areas: [flux-evidence, flux-runtime]
 note: "named by C-290's review as the uncomfortable half: C-290 bounded the op cache honestly, but the DOMINANT leak was outside its areas and is now the only one left unaddressed"
@@ -67,7 +67,7 @@ per dispatch, plus several per gated call.
       `elided_payload_bytes` / `Executor::retained_evidence_payload_bytes`; and
       `EvidenceLog::compaction_notice` / `Executor::evidence_compaction_notice`, which names the knob
       and says where the full payloads still are — C-290's `ConcurrencyRefusal::message` bar.
-- [ ] Full gate green.
+- [x] Full gate green — the plugins lockfile was synced by the coordinator at integration.
       → Everything green **except** `flux-codegate`'s `plugin_builds_exclude_host_only_crates`, which
       needs `plugins/Cargo.lock` synced to `codewandler-flux-evidence 1.1.0`. That file is a
       coordinator-owned lockfile; see **Progress**.
