@@ -20,9 +20,8 @@
 use std::sync::Arc;
 
 use flux_core::{PricingTable, Result};
-use flux_events::{DiffRow, EventContext, ModelCost, RunDiff, SessionLog, ValidHistory};
-use flux_flow::cassette::{CassetteScope, FrozenTape, RecordScope, ReplayTape};
-use flux_flow::engine::FlowEngine;
+use flux_events::{DiffRow, ModelCost, RunDiff, SessionLog};
+use flux_flow::cassette::{CassetteScope, RecordScope};
 use flux_flow::host::OpOutcome;
 use flux_flow::AgentSink;
 
@@ -243,63 +242,207 @@ fn node_to_cell_index(trace: &[flux_lang::ast::RunEvent], node: u32) -> Option<u
     None
 }
 
-/// Mint the throwaway counterfactual session on `variant`, correlated back to the source session
-/// `src` and labelled with the targeted turn.
+/// C-254: the one door to a counterfactual session id.
 ///
-/// A function rather than an inline statement so both of [`WhatIf::run`]'s paths can call it at the
-/// point they have established they can actually finish (C-247): the mint is the first trace a
-/// what-if leaves, so no refusal may follow it.
-fn mint_counterfactual(variant: &FlowEngine, src: &str, label: &str) -> Result<String> {
-    variant.events.create_session_with_context(
-        &variant.model,
-        &EventContext {
-            correlation_id: Some(src.to_string()),
-            agent_id: Some(format!("what_if:{src}@{label}")),
-            ..Default::default()
-        },
-    )
-}
+/// [`WhatIf::run`] has two paths and each mints exactly one throwaway session. That mint is the first
+/// trace a what-if leaves, and `WhatIf` exists to answer "what would happen" **without** it
+/// happening — so a refusal that fires after the mint has already broken the feature's single
+/// promise, and broken it *silently*: nothing downstream distinguishes a minted-then-refused run from
+/// a run that never minted at all. C-211 and C-247 closed four such sites by moving statements above
+/// the mint. That fix is correct the day it lands and evaporates the moment someone reorders the
+/// function, so this module makes the ordering a property of the **types** instead.
+///
+/// The shape: each path's entire refusal surface is discharged by its `resolve` constructor, which
+/// reads only the SOURCE session; `mint` is a method on the resolved value; and the
+/// `create_session_with_context` call itself is private to this module. Reaching a `dst` therefore
+/// requires holding a fully-resolved path first — a `Cleared*` value cannot be forged from the parent
+/// module, its fields being private to this one — and hoisting the mint back above a validation
+/// simply does not compile, because the mint's receiver is what that validation produces.
+///
+/// The one thing types cannot forbid is `run` calling `variant.events.create_session_with_context`
+/// directly and bypassing the gate. That would be a conspicuous new statement in review, and the
+/// three C-254 tests in `tests/whatif.rs` fail the moment it appears — they assert the *absence of a
+/// trace* (session count unchanged across a refusal), not merely that an error came back.
+mod mint_gate {
+    use flux_core::Result;
+    use flux_events::{EventContext, EventStore, ValidHistory};
+    use flux_flow::cassette::{FrozenTape, OffTape, RecordScope, ReplayTape};
+    use flux_flow::engine::FlowEngine;
+    use flux_flow::host::OpOutcome;
+    use flux_flow::whatif::RerunSelection;
 
-/// Build the [`FrozenTape`] a `WhatIf::run()` pins: `src`'s recorded trace, every `.substitute`/
-/// `.substitute_at` applied, off-tape mode `off_tape` — `Live` needs `bridge` (a [`RecordScope`]
-/// pointed at the destination session).
-///
-/// D-182/D-184: errors, naming the node, if a `.substitute_at(node, _)` target maps to no recorded
-/// dispatch at all (`node_to_cell_index` → `None` — a typo'd node id, a node with no statement, or a
-/// statement that made no dispatch). This used to be a silent no-op: the substitution was simply
-/// dropped, and the caller had no way to tell "targeted node, no change" apart from "node doesn't
-/// exist" — both looked like an honest identical run. Handed over from D-184 (same file, filed there
-/// as a concurrent-ownership conflict; fixed here in the D-182 pass).
-fn build_frozen(
-    trace: &[flux_lang::ast::RunEvent],
-    substitute_ops: &[(String, serde_json::Value)],
-    substitute_nodes: &[(u32, serde_json::Value)],
-    off_tape: OffTape,
-    bridge: Option<RecordScope>,
-    reauthorize: bool,
-) -> Result<FrozenTape> {
-    let tape = ReplayTape::from_trace(trace);
-    let mut frozen = match off_tape {
-        OffTape::Halt => FrozenTape::hermetic(tape),
-        OffTape::Live => FrozenTape::live_bridge(
-            tape,
-            bridge.expect("OffTape::Live always supplies a bridge"),
-        ),
-    };
-    frozen = frozen.with_reauthorize(reauthorize);
-    for (op, value) in substitute_ops {
-        frozen = frozen.substitute_op(op.clone(), substitution_outcome(value));
+    use super::{node_to_cell_index, substitution_outcome};
+
+    /// Every `.substitute`/`.substitute_at` resolved against the source trace — the fallible half of
+    /// building the pinned [`FrozenTape`], split out so it happens before anything is minted.
+    ///
+    /// D-182/D-184's refusal lives here: a `.substitute_at(node, _)` whose target maps to no recorded
+    /// dispatch at all (`node_to_cell_index` → `None` — a typo'd node id, a node with no statement,
+    /// or a statement that made no dispatch) errors naming the node. It used to be a silent no-op:
+    /// the substitution was simply dropped, and the caller could not tell "targeted node, no change"
+    /// apart from "node doesn't exist" — both looked like an honest identical run. Once it did error,
+    /// it errored *after* the mint on **both** of `run`'s paths, which is the pair of sites C-254
+    /// closes.
+    pub(super) struct ResolvedSubstitutions {
+        ops: Vec<(String, OpOutcome)>,
+        cells: Vec<(usize, OpOutcome)>,
     }
-    for (node, value) in substitute_nodes {
-        let index = node_to_cell_index(trace, *node).ok_or_else(|| {
-            flux_core::Error::Other(format!(
-                "substitute_at({node}, _) targets a node with no recorded dispatch — it has no \
-                 statement, or that statement never called an op, so there is no cell to substitute"
-            ))
-        })?;
-        frozen = frozen.substitute_cell(index, substitution_outcome(value));
+
+    impl ResolvedSubstitutions {
+        fn resolve(
+            trace: &[flux_lang::ast::RunEvent],
+            substitute_ops: &[(String, serde_json::Value)],
+            substitute_nodes: &[(u32, serde_json::Value)],
+        ) -> Result<Self> {
+            let ops = substitute_ops
+                .iter()
+                .map(|(op, value)| (op.clone(), substitution_outcome(value)))
+                .collect();
+            let mut cells = Vec::with_capacity(substitute_nodes.len());
+            for (node, value) in substitute_nodes {
+                let index = node_to_cell_index(trace, *node).ok_or_else(|| {
+                    flux_core::Error::Other(format!(
+                        "substitute_at({node}, _) targets a node with no recorded dispatch — it has \
+                         no statement, or that statement never called an op, so there is no cell to \
+                         substitute"
+                    ))
+                })?;
+                cells.push((index, substitution_outcome(value)));
+            }
+            Ok(Self { ops, cells })
+        }
+
+        /// The [`FrozenTape`] a `WhatIf::run()` pins: the source's recorded `trace`, every resolved
+        /// substitution applied, off-tape mode `off_tape`.
+        ///
+        /// **Infallible by construction** — every index was resolved by [`Self::resolve`], so nothing
+        /// is left here that can say "no". That is the whole reason tape construction is split from
+        /// resolution at all: `OffTape::Live` needs `bridge`, a [`RecordScope`] pointed at the
+        /// destination session, which cannot exist until `dst` does. Resolution therefore runs before
+        /// the mint and construction after it, with no refusal on the far side.
+        pub(super) fn freeze(
+            self,
+            trace: &[flux_lang::ast::RunEvent],
+            off_tape: OffTape,
+            bridge: Option<RecordScope>,
+            reauthorize: bool,
+        ) -> FrozenTape {
+            let tape = ReplayTape::from_trace(trace);
+            let mut frozen = match off_tape {
+                OffTape::Halt => FrozenTape::hermetic(tape),
+                OffTape::Live => FrozenTape::live_bridge(
+                    tape,
+                    bridge.expect("OffTape::Live always supplies a bridge"),
+                ),
+            };
+            frozen = frozen.with_reauthorize(reauthorize);
+            for (op, outcome) in self.ops {
+                frozen = frozen.substitute_op(op, outcome);
+            }
+            for (index, outcome) in self.cells {
+                frozen = frozen.substitute_cell(index, outcome);
+            }
+            frozen
+        }
     }
-    Ok(frozen)
+
+    /// Mint the throwaway counterfactual session on `variant`, correlated back to the source session
+    /// `src` and labelled with the targeted turn.
+    ///
+    /// Private to this module: the only way to a `dst` is a `Cleared*` value's `mint`, and the only
+    /// way to one of those is its fallible `resolve`.
+    fn mint(variant: &FlowEngine, src: &str, label: &str) -> Result<String> {
+        variant.events.create_session_with_context(
+            &variant.model,
+            &EventContext {
+                correlation_id: Some(src.to_string()),
+                agent_id: Some(format!("what_if:{src}@{label}")),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The pure-substitution (`!replan`) path, every refusal discharged: the `.substitute_at`
+    /// targets, and [`rerun_pinned`](flux_flow::whatif::rerun_pinned)'s own execution selection — the
+    /// refusal that lives one crate down and so could not possibly fire before the mint until
+    /// `flux-flow` grew a seam for it. Both read only the source session.
+    pub(super) struct ClearedSubstitution {
+        subs: ResolvedSubstitutions,
+        selection: RerunSelection,
+    }
+
+    impl ClearedSubstitution {
+        pub(super) fn resolve(
+            events: &EventStore,
+            src: &str,
+            turn: Option<usize>,
+            trace: &[flux_lang::ast::RunEvent],
+            substitute_ops: &[(String, serde_json::Value)],
+            substitute_nodes: &[(u32, serde_json::Value)],
+        ) -> Result<Self> {
+            let subs = ResolvedSubstitutions::resolve(trace, substitute_ops, substitute_nodes)?;
+            let selection = RerunSelection::resolve(events, src, turn)
+                .map_err(|e| flux_core::Error::Other(e.to_string()))?;
+            Ok(Self { subs, selection })
+        }
+
+        pub(super) fn mint(&self, variant: &FlowEngine, src: &str, label: &str) -> Result<String> {
+            mint(variant, src, label)
+        }
+
+        pub(super) fn into_parts(self) -> (ResolvedSubstitutions, RerunSelection) {
+            (self.subs, self.selection)
+        }
+    }
+
+    /// The re-plan path, every refusal discharged: the source history's provider-validity and the
+    /// target turn's existence (both C-247's), plus the `.substitute_at` targets — C-254's third
+    /// site, which C-247 left below its mint because its Acceptance enumerated the other two. All
+    /// three read only the source session.
+    pub(super) struct ClearedReplan {
+        subs: ResolvedSubstitutions,
+        history: ValidHistory,
+        target_turn: usize,
+        user_input: String,
+    }
+
+    impl ClearedReplan {
+        pub(super) fn resolve(
+            events: &EventStore,
+            src: &str,
+            turn: Option<usize>,
+            trace: &[flux_lang::ast::RunEvent],
+            substitute_ops: &[(String, serde_json::Value)],
+            substitute_nodes: &[(u32, serde_json::Value)],
+        ) -> Result<Self> {
+            let subs = ResolvedSubstitutions::resolve(trace, substitute_ops, substitute_nodes)?;
+            let history = ValidHistory::new(events.conversation(src)?)?;
+            let turns = events.turns(src)?;
+            let target_turn = turn.unwrap_or(turns.len().max(1));
+            let user_input = turns
+                .get(target_turn.saturating_sub(1))
+                .map(|t| t.user_input.clone())
+                .ok_or_else(|| {
+                    flux_core::Error::Other(format!(
+                        "session {src} has no turn {target_turn} to re-plan"
+                    ))
+                })?;
+            Ok(Self {
+                subs,
+                history,
+                target_turn,
+                user_input,
+            })
+        }
+
+        pub(super) fn mint(&self, variant: &FlowEngine, src: &str, label: &str) -> Result<String> {
+            mint(variant, src, label)
+        }
+
+        pub(super) fn into_parts(self) -> (ResolvedSubstitutions, ValidHistory, usize, String) {
+            (self.subs, self.history, self.target_turn, self.user_input)
+        }
+    }
 }
 
 impl Session {
@@ -459,26 +602,33 @@ impl WhatIf {
         let mut sink = NullSink;
 
         if !replan {
-            let dst = mint_counterfactual(&variant, &src, &label)?;
-            let bridge = matches!(self.off_tape, OffTape::Live)
-                .then(|| RecordScope::new(variant.events.clone(), dst.clone()));
-            let frozen = build_frozen(
+            // C-254: everything that can REFUSE this path is discharged here, before anything is
+            // minted — the `.substitute_at` targets, and `rerun_pinned`'s own execution selection.
+            // Both read only the source session. The ordering is structural rather than incidental:
+            // `dst` is reachable only through `cleared.mint`, so no reordering of the statements
+            // below can put the mint back in front of a refusal.
+            let cleared = mint_gate::ClearedSubstitution::resolve(
+                &events,
+                &src,
+                self.turn,
                 &trace,
                 &self.substitute_ops,
                 &self.substitute_nodes,
-                self.off_tape,
-                bridge,
-                self.permissions.is_some(),
             )?;
+            let dst = cleared.mint(&variant, &src, &label)?;
+            let (subs, selection) = cleared.into_parts();
+
+            let bridge = matches!(self.off_tape, OffTape::Live)
+                .then(|| RecordScope::new(variant.events.clone(), dst.clone()));
+            let frozen = subs.freeze(&trace, self.off_tape, bridge, self.permissions.is_some());
             let scope = Arc::new(CassetteScope::Frozen(frozen));
 
             flux_flow::whatif::rerun_pinned(
                 &variant.events,
                 &variant.flow,
                 &variant.executor,
-                &src,
+                &selection,
                 &dst,
-                self.turn,
                 scope.clone(),
                 &mut sink,
             )
@@ -502,34 +652,33 @@ impl WhatIf {
         }
 
         // Re-plan path. Everything that can REFUSE the re-plan is resolved first, before anything is
-        // minted (C-247, the same move C-211 made at the fork sites): both refusals below used to
-        // fire after `dst` existed, so a refused re-plan left an orphan session behind — an artifact
-        // that did not exist before the refusal paths did. Holding "a failed operation leaves no
-        // trace" is cheaper than re-deriving it from a pruning rule on every read of this path, and
-        // the turn refusal did not even have that fallback: it fired after the rewrite below, so its
-        // orphan carried a full copy of the parent's conversation and `prune_empty` never saw an
-        // empty stream to collect. Both resolutions only read the source session.
+        // minted (C-247, the same move C-211 made at the fork sites; C-254 for the third refusal):
+        // all three used to fire after `dst` existed, so a refused re-plan left an orphan session
+        // behind — an artifact that did not exist before the refusal paths did. Holding "a failed
+        // operation leaves no trace" is cheaper than re-deriving it from a pruning rule on every read
+        // of this path, and the turn refusal did not even have that fallback: it fired after the
+        // rewrite below, so its orphan carried a full copy of the parent's conversation and
+        // `prune_empty` never saw an empty stream to collect. All three resolutions read only the
+        // source session.
         //
-        // The pure-substitution path above deliberately checks neither: it can never reach a
-        // provider, so it has no stake in the source being a valid *provider* history, and
-        // `rerun_pinned` selects its own turn out of the run trace.
-        let history = ValidHistory::new(events.conversation(&src)?)?;
-        let turns = events.turns(&src)?;
-        let target_turn = self.turn.unwrap_or(turns.len().max(1));
-        let user_input = turns
-            .get(target_turn.saturating_sub(1))
-            .map(|t| t.user_input.clone())
-            .ok_or_else(|| {
-                flux_core::Error::Other(format!(
-                    "session {src} has no turn {target_turn} to re-plan"
-                ))
-            })?;
+        // The pure-substitution path above deliberately checks neither history nor turn: it can never
+        // reach a provider, so it has no stake in the source being a valid *provider* history, and
+        // `RerunSelection` resolves its turn out of the run trace instead.
+        let cleared = mint_gate::ClearedReplan::resolve(
+            &events,
+            &src,
+            self.turn,
+            &trace,
+            &self.substitute_ops,
+            &self.substitute_nodes,
+        )?;
 
         // Now mint: copy the conversation so the re-planned turn sees the same history, rebuild every
         // earlier turn hermetically, then drive exactly one LIVE turn under the pinned scope. The
         // copy is one checked rewrite (A-102) — the variant's live turn goes to a real provider, so a
         // source history that is not a valid provider history must fail above, not there.
-        let dst = mint_counterfactual(&variant, &src, &label)?;
+        let dst = cleared.mint(&variant, &src, &label)?;
+        let (subs, history, target_turn, user_input) = cleared.into_parts();
         SessionLog::open(&variant.events, &dst)?.rewrite(history)?;
 
         flux_flow::whatif::replay_turns_prefix(
@@ -545,14 +694,12 @@ impl WhatIf {
         .map_err(|e| flux_core::Error::Other(e.to_string()))?;
 
         let bridge = RecordScope::new(variant.events.clone(), dst.clone());
-        let frozen = build_frozen(
+        let frozen = subs.freeze(
             &trace,
-            &self.substitute_ops,
-            &self.substitute_nodes,
             self.off_tape,
             Some(bridge),
             self.permissions.is_some(),
-        )?;
+        );
         let scope = Arc::new(CassetteScope::Frozen(frozen));
 
         // D-182: `run_turn_pinned` here re-plans exactly one LIVE turn under `scope` — every
