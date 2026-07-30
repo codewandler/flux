@@ -305,13 +305,13 @@ impl ProcessRuntime {
     /// way [`DEPTH_ENV`] already is. Filtered against `sandbox::SANDBOX_ENV_KEYS`, not a local copy,
     /// so it cannot drift from what the spawn actually forwards.
     ///
-    /// That list covers `FLUX_SANDBOXED` as well as the posture, and it has to. The marker is only
-    /// out of a caller's reach when the spawn is *genuinely wrapped* — `build_command` writes it
-    /// after the overrides only when `sandbox_marker` returns `Some`, which needs an **active**
-    /// sandbox. A coordinator whose sandbox is inactive (the default posture) would otherwise let a
-    /// startup env hand its worker `FLUX_SANDBOXED=1`, which a child `flux` reads as "already
-    /// confined, do not nest" — a worse outcome than `FLUX_SANDBOX=off`, since it suppresses the
-    /// worker's own wrapping rather than merely declining to demand it.
+    /// That list covers `FLUX_SANDBOXED` as well as the posture. Since C-289 the marker is out of a
+    /// caller's reach at the spawn itself — `build_command` renders it after the overrides in both
+    /// directions, stamping it only when something genuinely confines the worker and removing it
+    /// otherwise — so this filter is no longer what stands between a startup env and a worker that
+    /// believes it is already confined. It stays because a `with_startup` caller naming the marker is
+    /// describing a worker environment it cannot produce, and dropping it here keeps the two honest
+    /// rather than letting the value vanish a layer down.
     fn worker_env(&self) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = self
             .env
@@ -1634,7 +1634,8 @@ mod tests {
     /// Since C-276 the posture travels with the guarded spawn itself (`sandbox::posture_env`,
     /// rendered from the coordinator's resolved `Sandbox`), so `worker_env` no longer forwards any
     /// of it — the assertion is now that it forwards **none** of it, marker included. C-282 removed
-    /// the hand-rolled copy; the two tests below are what hold that.
+    /// the hand-rolled copy; C-289 made "only `build_command` may set it" true of every spawn rather
+    /// than only a wrapped one. The two tests below are what hold that.
     #[test]
     fn a_worker_env_carries_no_sandbox_posture_and_never_the_confined_marker() {
         let runtime = ProcessRuntime::with_program("/nonexistent/worker");
@@ -1642,8 +1643,8 @@ mod tests {
 
         assert!(
             !env.iter().any(|(k, _)| k == "FLUX_SANDBOXED"),
-            "FLUX_SANDBOXED is build_command's to set when the wrapper is genuinely active; \
-             forwarding it would let a worker skip its own confinement: {env:?}"
+            "FLUX_SANDBOXED is build_command's to decide, from what actually confines the worker; \
+             forwarding it would describe a worker environment this seam cannot produce: {env:?}"
         );
         assert!(
             !env.iter().any(|(k, _)| k.starts_with("FLUX_SANDBOX")
@@ -1725,11 +1726,13 @@ mod tests {
     /// its parent would. So the slot is closed rather than merely documented — the same treatment
     /// [`DEPTH_ENV`] already gets, for the same reason.
     ///
-    /// `FLUX_SANDBOXED` is in the input on purpose. A caller can only be stopped from forging the
-    /// marker here, in this filter: `build_command` overwrites it after the overrides *only* for a
-    /// genuinely wrapped spawn, so a coordinator with an inactive sandbox — the default posture —
-    /// defends nothing. The assertion below covers every `FLUX_SANDBOX*` spelling, and the filter
-    /// (`sandbox::SANDBOX_ENV_KEYS`) covers exactly the same set, so neither over-promises.
+    /// `FLUX_SANDBOXED` is in the input on purpose. When this test was written it was the only place
+    /// a caller could be stopped from forging the marker — `build_command` overwrote it after the
+    /// overrides *only* for a genuinely wrapped spawn, so a coordinator with an inactive sandbox (the
+    /// default posture) defended nothing. C-289 closed that at the spawn, in both directions; what
+    /// this test still pins is that the startup seam never carries the key that far. The assertion
+    /// below covers every `FLUX_SANDBOX*` spelling, and the filter (`sandbox::SANDBOX_ENV_KEYS`)
+    /// covers exactly the same set, so neither over-promises.
     #[test]
     fn a_startup_env_may_not_push_a_sandbox_posture_or_forge_the_marker() {
         let runtime = ProcessRuntime::with_program("/nonexistent/worker").with_startup(
