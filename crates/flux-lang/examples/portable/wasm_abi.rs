@@ -65,5 +65,5 @@ pub unsafe extern "C" fn flux_eval(ptr: i32, len: i32) -> i64 {
     let bytes = json.into_bytes().into_boxed_slice();
     let out_len = bytes.len() as i64;
     let out_ptr = Box::into_raw(bytes) as *mut u8 as i64;
-    (out_ptr << 32) | (out_len - 1)
+    (out_ptr << 32) | out_len
 }
