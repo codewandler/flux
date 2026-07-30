@@ -2,7 +2,7 @@
 id: C-254
 title: "`WhatIf::run`'s pure-substitution path mints before its own refusals, so \"no trace\" is still not a property of minting"
 pillar: Core
-status: in-progress
+status: done
 priority: 12
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
