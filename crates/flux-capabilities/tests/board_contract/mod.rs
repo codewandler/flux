@@ -15,8 +15,12 @@
 //! 3. **An illegal edge errors and writes nothing** — the item is byte-identical afterwards.
 //! 4. `claim` is idempotent for the same assignee and conflicts for a different one.
 //! 5. `list` honours the declared page bounds and the `state` filter.
-//! 6. `comment` and `get` behave for present and absent ids.
-//! 7. **A dispatch is recorded durably** — `runner` + `task_id` survive a fresh read, replace on a
+//! 6. **The `depends_on` filter treats an item as blocked until every dependency is `done`** —
+//!    no dependencies is trivially unblocked; an absent dependency never resolves (C-236).
+//! 7. `comment` and `get` behave for present and absent ids.
+//! 8. **`comments` reads back what `comment` wrote**, oldest first, and errors on an absent id
+//!    (C-236).
+//! 9. **A dispatch is recorded durably** — `runner` + `task_id` survive a fresh read, replace on a
 //!    redispatch, and never move the state machine (A-130).
 
 #![allow(dead_code)]
@@ -43,7 +47,10 @@ pub async fn assert_work_board_contract(board: Arc<dyn WorkBoard>, ctx: &ToolCon
     an_illegal_transition_errors_and_writes_nothing(&board, ctx).await;
     claim_is_idempotent_for_one_assignee_and_conflicts_for_another(&board, ctx).await;
     list_honours_declared_page_bounds_and_the_state_filter(&board, ctx).await;
+    the_depends_on_filter_treats_an_item_as_blocked_until_every_dependency_is_done(&board, ctx)
+        .await;
     comment_and_get_agree_about_which_items_exist(&board, ctx).await;
+    comments_read_back_what_comment_wrote(&board, ctx).await;
     a_dispatch_is_recorded_and_survives_a_fresh_read(&board, ctx).await;
 }
 
@@ -317,6 +324,111 @@ async fn list_honours_declared_page_bounds_and_the_state_filter(
     );
 }
 
+/// C-236: the `depends_on` filter makes "ready and unblocked" one query. An item is unblocked
+/// exactly when every id in its `depends_on` is `done` — an item with no dependencies is trivially
+/// unblocked, and an absent dependency is not `done`, so it keeps the item blocked.
+async fn the_depends_on_filter_treats_an_item_as_blocked_until_every_dependency_is_done(
+    board: &Arc<dyn WorkBoard>,
+    ctx: &ToolContext,
+) {
+    async fn listed_ids(
+        board: &Arc<dyn WorkBoard>,
+        ctx: &ToolContext,
+        depends_on: &str,
+    ) -> Vec<String> {
+        let mut filters = Filters::new();
+        filters.insert(
+            "depends_on",
+            FilterValue::String(depends_on.to_string()),
+        );
+        board
+            .list(
+                ctx,
+                &filters,
+                PageRequest {
+                    cursor: None,
+                    limit: board.schema().max_page,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("list(depends_on={depends_on}) failed: {error}"))
+            .rows
+            .iter()
+            .map(|item| item.id.clone())
+            .collect()
+    }
+
+    let parent_a = create(board, ctx, "dependency a").await;
+    let parent_b = create(board, ctx, "dependency b").await;
+    let child = board
+        .create(
+            ctx,
+            ItemDraft {
+                title: "blocked on both".to_string(),
+                depends_on: vec![parent_a.id.clone(), parent_b.id.clone()],
+                ..ItemDraft::default()
+            },
+        )
+        .await
+        .expect("create child");
+    let orphan = board
+        .create(
+            ctx,
+            ItemDraft {
+                title: "blocked on an absent id".to_string(),
+                depends_on: vec!["definitely-not-an-item".to_string()],
+                ..ItemDraft::default()
+            },
+        )
+        .await
+        .expect("create orphan");
+
+    // Nothing is done: both parents (no dependencies) are unblocked; the child and the orphan
+    // (an absent dependency is never `done`) are blocked.
+    let unblocked = listed_ids(board, ctx, "satisfied").await;
+    assert!(unblocked.contains(&parent_a.id), "{unblocked:?}");
+    assert!(unblocked.contains(&parent_b.id), "{unblocked:?}");
+    assert!(!unblocked.contains(&child.id), "{unblocked:?}");
+    assert!(!unblocked.contains(&orphan.id), "{unblocked:?}");
+    let blocked = listed_ids(board, ctx, "unsatisfied").await;
+    assert!(blocked.contains(&child.id), "{blocked:?}");
+    assert!(blocked.contains(&orphan.id), "{blocked:?}");
+    assert!(!blocked.contains(&parent_a.id), "{blocked:?}");
+
+    // One of two dependencies done: the child is still blocked.
+    walk(
+        board,
+        ctx,
+        &parent_a.id,
+        &[State::Claimed, State::InProgress, State::Review, State::Done],
+        0,
+    )
+    .await;
+    assert!(
+        !listed_ids(board, ctx, "satisfied").await.contains(&child.id),
+        "a half-satisfied dependency set is still blocked"
+    );
+
+    // Every dependency done: the child unblocks.
+    walk(
+        board,
+        ctx,
+        &parent_b.id,
+        &[State::Claimed, State::InProgress, State::Review, State::Done],
+        0,
+    )
+    .await;
+    let unblocked = listed_ids(board, ctx, "satisfied").await;
+    assert!(
+        unblocked.contains(&child.id),
+        "all dependencies done unblocks the child: {unblocked:?}"
+    );
+    assert!(
+        !unblocked.contains(&orphan.id),
+        "an absent dependency never resolves: {unblocked:?}"
+    );
+}
+
 async fn comment_and_get_agree_about_which_items_exist(
     board: &Arc<dyn WorkBoard>,
     ctx: &ToolContext,
@@ -355,6 +467,45 @@ async fn comment_and_get_agree_about_which_items_exist(
             .await
             .is_err(),
         "claiming an absent id is an error"
+    );
+}
+
+/// C-236: the read half of `comment`. A sweep can see what a worker recorded — the notes come
+/// back oldest-first, reading an absent id is the same error the write path reports, and the notes
+/// never become part of the item's identity (a read changes nothing).
+async fn comments_read_back_what_comment_wrote(board: &Arc<dyn WorkBoard>, ctx: &ToolContext) {
+    let item = create(board, ctx, "takes readable notes").await;
+    board
+        .comment(ctx, &item.id, "worker started")
+        .await
+        .expect("first comment");
+    board
+        .comment(ctx, &item.id, "gate is green")
+        .await
+        .expect("second comment");
+
+    assert_eq!(
+        board
+            .comments(ctx, &item.id)
+            .await
+            .expect("reading comments on a present item succeeds"),
+        vec!["worker started".to_string(), "gate is green".to_string()],
+        "the notes come back oldest-first, exactly as written"
+    );
+    assert_eq!(
+        fetch(board, ctx, &item.id).await,
+        item,
+        "comments sit beside the item; reading them changes nothing"
+    );
+
+    let absent = board
+        .comments(ctx, "definitely-not-an-item")
+        .await
+        .expect_err("reading comments on an absent id is an error")
+        .to_string();
+    assert!(
+        absent.contains("definitely-not-an-item"),
+        "the error names the id, got: {absent}"
     );
 }
 

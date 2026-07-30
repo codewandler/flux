@@ -1,4 +1,4 @@
-//! The seven generated `<domain>.*` board operations (A-113, A-130).
+//! The nine generated `<domain>.*` board operations (A-113, A-130, C-236).
 //!
 //! Mirrors `live_datasource_operations.rs` — the board port follows `try_register_live_datasource`
 //! exactly for op generation, atomic registration on a clone, and the evidence surface. What is new
@@ -63,16 +63,18 @@ fn mutating_params(op: &str, id: &str) -> Value {
 }
 
 #[test]
-fn registration_installs_seven_source_labelled_generated_contracts() {
+fn registration_installs_nine_source_labelled_generated_contracts() {
     let registry = registry();
     assert_eq!(
         registry.names(),
         [
             "board.claim",
             "board.comment",
+            "board.comments",
             "board.create",
             "board.get",
             "board.list",
+            "board.query",
             "board.record_dispatch",
             "board.transition",
         ]
@@ -106,7 +108,7 @@ fn registration_installs_seven_source_labelled_generated_contracts() {
 }
 
 #[test]
-fn the_surface_groups_all_seven_operations_behind_the_domain_signal() {
+fn the_surface_groups_all_nine_operations_behind_the_domain_signal() {
     let mut registry = ToolRegistry::new();
     let surface =
         try_register_work_board(&mut registry, "board", Arc::new(MemoryBoard::new())).unwrap();
@@ -125,6 +127,8 @@ fn the_surface_groups_all_seven_operations_behind_the_domain_signal() {
                 "board.claim".into(),
                 "board.comment".into(),
                 "board.record_dispatch".into(),
+                "board.query".into(),
+                "board.comments".into(),
             ],
             surface_when: vec![SignalMatch {
                 kind: KIND_SIGNAL.into(),
@@ -142,7 +146,7 @@ fn the_surface_groups_all_seven_operations_behind_the_domain_signal() {
                 &HashSet::from([surface.ambient_signal.clone()])
             )
             .len(),
-        7
+        9
     );
 }
 
@@ -255,6 +259,31 @@ fn the_read_operations_are_scoped_to_the_item_they_touch() {
         .unwrap(),
         vec![AuthorityRequirement::datasource_read("board/item/PROJ-42")]
     );
+
+    // C-236: `query` pages the whole board like `list`; `comments` touches one item like `get`.
+    let query = operation(&registry, "board.query");
+    assert_eq!(query.permission_subjects(&json!({})), vec!["board/item"]);
+    assert_eq!(
+        query
+            .authority_requirements(&json!({}), &["board/item".to_string()])
+            .unwrap(),
+        vec![AuthorityRequirement::datasource_read("board/item")]
+    );
+
+    let comments = operation(&registry, "board.comments");
+    assert_eq!(
+        comments.permission_subjects(&json!({"id": "PROJ-42"})),
+        vec!["board/item/PROJ-42"]
+    );
+    assert_eq!(
+        comments
+            .authority_requirements(
+                &json!({"id": "PROJ-42"}),
+                &["board/item/PROJ-42".to_string()]
+            )
+            .unwrap(),
+        vec![AuthorityRequirement::datasource_read("board/item/PROJ-42")]
+    );
 }
 
 /// C-191's metadata-coherence invariants, applied to a generated catalog: a `Write` op may not keep
@@ -346,6 +375,219 @@ async fn the_generated_operations_drive_the_backend_and_render_consistently() {
         .await
         .unwrap();
     assert_eq!(empty.content, "no items");
+}
+
+/// C-236: `query` is the machine-readable sibling of `list` — a JSON array of typed rows with
+/// every field present (absent optionals are `null`, never missing keys), and an `output_schema`
+/// that says so. `list` keeps its prose for humans.
+#[tokio::test]
+async fn query_returns_typed_rows_under_an_output_schema() {
+    let mut registry = ToolRegistry::new();
+    let board = Arc::new(MemoryBoard::new());
+    try_register_work_board(&mut registry, "board", board.clone()).unwrap();
+    let ctx = ctx();
+
+    let spec = operation(&registry, "board.query").spec();
+    let output_schema = spec
+        .output_schema
+        .as_ref()
+        .expect("board.query must declare an output_schema");
+    assert_eq!(output_schema["type"], "array");
+    let row = &output_schema["items"];
+    for field in [
+        "id",
+        "title",
+        "state",
+        "assignee",
+        "runner",
+        "task_id",
+        "depends_on",
+        "repo",
+        "attempts",
+    ] {
+        assert!(
+            row["properties"].get(field).is_some(),
+            "output_schema row is missing `{field}`: {row}"
+        );
+        assert!(
+            row["required"]
+                .as_array()
+                .expect("row required is an array")
+                .iter()
+                .any(|r| r == field),
+            "every row carries `{field}` (null when absent), so `$item.{field}` never errors"
+        );
+    }
+
+    operation(&registry, "board.create")
+        .execute(
+            &ctx,
+            json!({"title": "port the board", "repo": "codewandler/flux", "depends_on": ["A-112"]}),
+        )
+        .await
+        .unwrap();
+    operation(&registry, "board.claim")
+        .execute(&ctx, json!({"id": "item-1", "assignee": "worker-a"}))
+        .await
+        .unwrap();
+    operation(&registry, "board.record_dispatch")
+        .execute(
+            &ctx,
+            json!({"id": "item-1", "runner": "https://worker-1.internal:8787", "task_id": "t_1"}),
+        )
+        .await
+        .unwrap();
+
+    let queried = operation(&registry, "board.query")
+        .execute(&ctx, json!({}))
+        .await
+        .unwrap();
+    let rows: Vec<Value> = serde_json::from_str(&queried.content)
+        .expect("board.query returns a JSON array, not prose");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        json!({
+            "id": "item-1",
+            "title": "port the board",
+            "state": "claimed",
+            "assignee": "worker-a",
+            "runner": "https://worker-1.internal:8787",
+            "task_id": "t_1",
+            "depends_on": ["A-112"],
+            "repo": "codewandler/flux",
+            "attempts": 0,
+        })
+    );
+
+    // An empty page is an empty array, still machine-readable.
+    let none = operation(&registry, "board.query")
+        .execute(&ctx, json!({"filters": {"state": "done"}}))
+        .await
+        .unwrap();
+    assert_eq!(none.content, "[]");
+}
+
+/// C-236: "ready and unblocked" is one call — the `depends_on` filter rides `query` (and only
+/// `query`: `list` keeps the human filter vocabulary unchanged).
+#[tokio::test]
+async fn query_filters_ready_and_unblocked_in_one_call() {
+    let mut registry = ToolRegistry::new();
+    let board = Arc::new(MemoryBoard::new());
+    try_register_work_board(&mut registry, "board", board.clone()).unwrap();
+    let ctx = ctx();
+
+    let parent = board
+        .create(
+            &ctx,
+            ItemDraft {
+                title: "parent".into(),
+                ..ItemDraft::default()
+            },
+        )
+        .await
+        .unwrap();
+    board
+        .create(
+            &ctx,
+            ItemDraft {
+                title: "child".into(),
+                depends_on: vec![parent.id.clone()],
+                ..ItemDraft::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let query = operation(&registry, "board.query");
+    async fn query_titles(
+        query: &Arc<dyn flux_runtime::Tool>,
+        ctx: &ToolContext,
+        filters: Value,
+    ) -> Vec<String> {
+        let out = query
+            .execute(ctx, json!({"filters": filters}))
+            .await
+            .unwrap();
+        let rows: Vec<Value> = serde_json::from_str(&out.content).unwrap();
+        rows.iter()
+            .map(|row| row["title"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // The child is ready but blocked; only the parent is ready and unblocked.
+    assert_eq!(
+        query_titles(&query, &ctx, json!({"state": "ready", "depends_on": "satisfied"})).await,
+        vec!["parent".to_string()]
+    );
+    assert_eq!(
+        query_titles(&query, &ctx, json!({"state": "ready", "depends_on": "unsatisfied"})).await,
+        vec!["child".to_string()]
+    );
+
+    // `list` does not take the filter — the human surface is unchanged.
+    let error = operation(&registry, "board.list")
+        .execute(&ctx, json!({"filters": {"depends_on": "satisfied"}}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("board.list.filters.depends_on: unknown filter"),
+        "{error}"
+    );
+
+    // A bad filter value is rejected with the closed enum's vocabulary.
+    let error = query
+        .execute(&ctx, json!({"filters": {"depends_on": "maybe"}}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("board.query.filters.depends_on: expected one of"),
+        "{error}"
+    );
+}
+
+/// C-236: the read half of `board.comment` — a sweep can see what was recorded, oldest first.
+#[tokio::test]
+async fn comments_reads_back_what_comment_wrote() {
+    let mut registry = ToolRegistry::new();
+    let board = Arc::new(MemoryBoard::new());
+    try_register_work_board(&mut registry, "board", board.clone()).unwrap();
+    let ctx = ctx();
+
+    let spec = operation(&registry, "board.comments").spec();
+    assert_eq!(
+        spec.output_schema.as_ref().expect("comments output_schema")["type"],
+        "array"
+    );
+
+    operation(&registry, "board.create")
+        .execute(&ctx, json!({"title": "noted"}))
+        .await
+        .unwrap();
+    operation(&registry, "board.comment")
+        .execute(&ctx, json!({"id": "item-1", "text": "first note"}))
+        .await
+        .unwrap();
+    operation(&registry, "board.comment")
+        .execute(&ctx, json!({"id": "item-1", "text": "second note"}))
+        .await
+        .unwrap();
+
+    let out = operation(&registry, "board.comments")
+        .execute(&ctx, json!({"id": "item-1"}))
+        .await
+        .unwrap();
+    let notes: Vec<String> = serde_json::from_str(&out.content).unwrap();
+    assert_eq!(notes, vec!["first note", "second note"]);
+
+    let error = operation(&registry, "board.comments")
+        .execute(&ctx, json!({"id": "nope"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no item `nope`"), "{error}");
 }
 
 #[tokio::test]

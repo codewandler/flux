@@ -1927,6 +1927,25 @@ mod tests {
                 .content,
             "null"
         );
+        // C-235/C-236: a string element yields the raw string, not its JSON encoding — the same
+        // rule `regex_extract` follows. An object element stays JSON-encoded (the re-parse rule
+        // reads it back).
+        assert_eq!(
+            FirstTool
+                .execute(&c, json!({"items": ["alpha", "beta"]}))
+                .await
+                .unwrap()
+                .content,
+            "alpha"
+        );
+        assert_eq!(
+            LastTool
+                .execute(&c, json!({"items": [{"k": 1}, {"k": 2}]}))
+                .await
+                .unwrap()
+                .content,
+            r#"{"k":2}"#
+        );
     }
 
     #[tokio::test]
@@ -2354,7 +2373,8 @@ mod tests {
     #[tokio::test]
     async fn regex_extract_first_and_all() {
         let c = ctx();
-        // Extract first match of group 0 (whole match)
+        // Extract first match of group 0 (whole match) — the raw string, NOT its JSON encoding
+        // (C-235/C-236): the value must be directly usable as another op's argument.
         let r = RegexExtractTool
             .execute(
                 &c,
@@ -2362,9 +2382,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(r.content, r#""v1.2.3""#);
+        assert_eq!(r.content, "v1.2.3");
 
-        // Extract all matches of group 0
+        // Extract all matches of group 0 — a structured (array) result stays JSON-encoded; the
+        // runtime's string-leaf re-parse rule (C-10) reads it back.
         let r2 = RegexExtractTool
             .execute(
                 &c,
@@ -2383,7 +2404,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(r3.content, r#""1.2.3""#);
+        assert_eq!(r3.content, "1.2.3");
 
         // Extract all matches of a capture group
         let r4 = RegexExtractTool
@@ -2392,6 +2413,26 @@ mod tests {
             .unwrap();
         let arr2: Vec<String> = serde_json::from_str(&r4.content).unwrap();
         assert_eq!(arr2, vec!["1", "4"]);
+    }
+
+    /// C-235: the extracted string feeds an argument parser verbatim — with the old JSON-quoted
+    /// form the URL parse below fails with "relative URL without a base" (the 0.36.0 smoke test).
+    #[tokio::test]
+    async fn regex_extract_yields_a_string_usable_as_another_ops_argument() {
+        let c = ctx();
+        let r = RegexExtractTool
+            .execute(
+                &c,
+                json!({"s": "runner: http://127.0.0.1:9101 task t_1", "pattern": "runner: (\\S+)", "group": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !r.content.contains('"'),
+            "the extracted string must not carry JSON quotes: {}",
+            r.content
+        );
+        assert_eq!(r.content, "http://127.0.0.1:9101");
     }
 
     #[tokio::test]
@@ -2481,7 +2522,8 @@ mod tests {
             .execute(&c, json!({"values": [null, "", "first"]}))
             .await
             .unwrap();
-        assert_eq!(r.content, "\"first\"");
+        // C-235/C-236: the raw string, not its JSON encoding.
+        assert_eq!(r.content, "first");
     }
 
     #[tokio::test]
