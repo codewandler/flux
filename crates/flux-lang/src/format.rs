@@ -790,17 +790,15 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("repeat ");
             out.push_str(&max.to_string());
+            if let Some(u) = until {
+                out.push_str(", until: ");
+                out.push_str(&fmt_expr(u, multiline));
+            }
             if let Some(c) = collect {
                 out.push_str(" -> ");
                 out.push_str(&fmt_symbol(c));
             }
             out.push('\n');
-            if let Some(u) = until {
-                out.push_str(&indent_of(level + 1, indent));
-                out.push_str("until ");
-                out.push_str(&fmt_expr(u, multiline));
-                out.push('\n');
-            }
             fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Seq { body, bind } if opt_ident(bind) => {
@@ -921,19 +919,17 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("loop for ");
             out.push_str(&fmt_duration(*for_ms));
-            out.push_str(" every ");
+            out.push_str(", every: ");
             out.push_str(&fmt_duration(*every_ms));
+            if let Some(u) = until {
+                out.push_str(", until: ");
+                out.push_str(&fmt_expr(u, multiline));
+            }
             if let Some(b) = bind {
                 out.push_str(" -> ");
                 out.push_str(&fmt_symbol(b));
             }
             out.push('\n');
-            if let Some(u) = until {
-                out.push_str(&indent_of(level + 1, indent));
-                out.push_str("until ");
-                out.push_str(&fmt_expr(u, multiline));
-                out.push('\n');
-            }
             fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Timeout { ms, body, bind } if opt_ident(bind) => {
@@ -996,11 +992,11 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str("retry ");
             out.push_str(&max.to_string());
             if let Some(b) = backoff {
-                out.push_str(" backoff ");
+                out.push_str(", backoff: ");
                 out.push_str(b);
             }
             if let Some(ms) = delay_ms {
-                out.push_str(" delay ");
+                out.push_str(", delay: ");
                 out.push_str(&fmt_duration(*ms));
             }
             if let Some(s) = bind {
@@ -1121,7 +1117,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str("confirm ");
             out.push_str(&compact_str(message, multiline));
             if let Some(r) = risk {
-                out.push_str(" risk ");
+                out.push_str(", risk: ");
                 out.push_str(r);
             }
             out.push('\n');
@@ -1136,7 +1132,10 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("throttle ");
             out.push_str(&compact_str(name, multiline));
-            out.push_str(&format!(" {max} per {}\n", fmt_duration(*window_ms)));
+            out.push_str(&format!(
+                ", max: {max}, per: {}\n",
+                fmt_duration(*window_ms)
+            ));
             fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Debounce {
@@ -1147,7 +1146,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&ind);
             out.push_str("debounce ");
             out.push_str(&compact_str(name, multiline));
-            out.push_str(&format!(" {}\n", fmt_duration(*wait_ms)));
+            out.push_str(&format!(", wait: {}\n", fmt_duration(*wait_ms)));
             fmt_body(body, level + 1, indent, multiline, out);
         }
         Node::Verify {
@@ -1229,7 +1228,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             }
             out.push_str(&compact_str(source, multiline));
             if let Some(condition) = condition {
-                out.push_str(" when ");
+                out.push_str(", when: ");
                 out.push_str(&fmt_expr(condition, multiline));
             }
             out.push('\n');

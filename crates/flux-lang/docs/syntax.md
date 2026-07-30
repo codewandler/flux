@@ -57,8 +57,12 @@ accept today; everything unmarked is implemented.
   spelled `fmt`/`assert`-message/`ctx`-purpose/`route`-case-label strings). `format` emits it
   automatically for any string containing a newline; see [§ Multi-line strings](#multi-line-strings)
   below for the full grammar.
-- **Aspirational** (described below as the *target* language, **not** yet parsed): comma-kwarg
-  flow-control headers (`retry 3, backoff: exponential`);
+- **Canonical named-option headers** (L-96, implemented): a parameterized control header spells
+  everything after its first operand as `name: value` — `confirm "Open issue?", risk: medium`,
+  `retry 3, backoff: exponential, delay: 500ms -> out`,
+  `loop for 10s, every: 1s, until: done -> last`. The older fixed-order space-keyword spellings are
+  still accepted and lower to the identical AST; see [§ Named arguments](#named-arguments).
+- **Aspirational** (described below as the *target* language, **not** yet parsed):
   `@kind(…)` thing references (the implemented spelling is `thing <kind> <selector> "…"`);
   file-scope `type`/union declarations; and the `block`/`watch` spellings (the implemented keywords
   are `seq` and `loop`). The AST type is **`DraftAst`** (this doc historically said `FlowAst`,
@@ -405,15 +409,25 @@ src = read("README.md")              # sole-required-param sugar
 
 Two or more bare identifiers form a named-input map through punning. Legacy sigiled arguments retain
 the deprecated positional AST shape. Named entries cannot mix with arbitrary positional expressions,
-and duplicate names are a parse error. Comma-kwarg flow-control headers remain unsupported
-(`retry 3, backoff: exponential` / `race timeout: 5000`); those headers use
-**space-keyword** tokens in fixed order (see [§ Native control-flow forms
-(P6)](#native-control-flow-forms-p6)):
+and duplicate names are a parse error.
+
+Parameterized control headers use the **same** `name: value` vocabulary (L-96). The rule is one
+line: the *first* operand stays positional — with its structural connector word where it has one
+(`for`, `in`) — everything after it is a comma-separated named option, and the result target stays
+`-> name`. The older fixed-order **space-keyword** spellings are still accepted and lower to the
+identical AST, so no shipped `.flux` file had to change.
 
 ```flux
-retry 3 backoff exponential delay 500ms -> out
-loop for 10s every 1s
+retry 3, backoff: exponential, delay: 500ms -> out
+loop for 10s, every: 1s, until: done -> last
+confirm "Open issue?", risk: medium
 ```
+
+Two headers keep an all-positional shape because they have nothing after their first operand:
+`race <timeout> [-> $bind]` (`race timeout: 5s` is accepted as an alias) and
+`each <item> in <source> [-> [flat] <collect>]`. The **structural** words — `parallel`/`branch`,
+`match`/`case`, `try`/`catch`, `scope`/`finally`, `saga`/`step`/`undo` — carry control flow rather
+than options and never grow a `name: value` tail.
 
 ### Memo (cross-turn cache)
 
@@ -493,8 +507,16 @@ repeat 5
   bash("poll.sh")
 ```
 
-With an early-exit condition. `until` is written on its own line as the **first**
-statement of the body; it is a stop-when-true guard evaluated **after** each iteration:
+With an early-exit condition. `until` is a canonical header option — a stop-when-true guard
+evaluated **after** each iteration:
+
+```flux
+repeat 10, until: $done
+  $done = bash("poll.sh")
+```
+
+The older spelling, `until` on its own line as the **first** statement of the body, is still
+accepted and lowers to the same AST. Giving both is an error.
 
 ```flux
 repeat 10
@@ -533,13 +555,13 @@ budget](#loop--timeout--budget)); the `watch` spelling and its comma-kwarg heade
 (`watch for: 10000, every: 1000`) never landed and do **not** parse. The real spelling:
 
 ```flux
-loop for 30000 every 2000 -> $last
-  until $done
+loop for 30s, every: 2s, until: $done -> $last
   $done = bash("health-check.sh")
 ```
 
-`until` is the optional first body line (a stop-when-true guard evaluated after each iteration);
-`-> $name` optionally captures the last iteration's result.
+`until` is an optional stop-when-true guard evaluated after each iteration; `-> $name` optionally
+captures the last iteration's result. The older `loop for 30000 every 2000 -> $last` header with
+`until` as the first body line is still accepted.
 
 ---
 
@@ -596,13 +618,11 @@ fallback -> $value
 
 ### loop / timeout / budget
 
-`loop` is a time-bounded loop (`for`/`every` in ms; optional `until` as the first body line, like
-`repeat`); `timeout` bounds its body by wall-clock ms; `budget` caps the number of dispatches. All three
-take an optional `-> $bind`.
+`loop` is a time-bounded loop (`for` positional, `every`/`until` named); `timeout` bounds its body by
+wall-clock ms; `budget` caps the number of dispatches. All three take an optional `-> $bind`.
 
 ```flux
-loop for 30000 every 2000 -> $last
-  until $done
+loop for 30s, every: 2s, until: $done -> $last
   $done = bash("health-check.sh")
 
 timeout 5000 -> $out
@@ -637,16 +657,16 @@ assert ok($a, $b)
 assert $score >= 0.8, "score too low"
 ```
 
-**`retry <max> [backoff <ident>] [delay <ms>] [-> $bind]`** + body — space-keyword tokens in fixed
-order (`backoff` is `none`/`linear`/`exponential`):
+**`retry <max>[, backoff: <ident>][, delay: <ms>] [-> $bind]`** + body — the max is positional, the
+rest are named options (`backoff` is `none`/`linear`/`exponential`):
 
 ```flux
-retry 3 backoff exponential delay 500 -> $out
+retry 3, backoff: exponential, delay: 500ms -> $out
   do flaky_step
 ```
 
-> Note: the `retry 3, backoff: exponential` comma form shown under [§ Named arguments](#named-arguments)
-> is aspirational; the implemented spelling is the space-keyword form above.
+> The older fixed-order space-keyword header — `retry 3 backoff exponential delay 500 -> $out` —
+> is still accepted and lowers to the identical AST.
 
 **`parallel`** + indented `branch $name` arms — each branch runs concurrently and binds its result to
 `$name` (no `default` arm):
@@ -725,9 +745,9 @@ sequential bind); a `parallel` with zero branches round-trips as an empty block.
 
 ### race
 
-Run branches concurrently; the first branch to complete **successfully** wins. The deadline is
-required and positional; the header is `race <timeout_ms> [-> $bind]`, followed by the same
-`branch $name` arms as `parallel`:
+Run branches concurrently; the first branch to complete **successfully** wins. The deadline is the
+required primary operand, so it stays positional: `race <timeout_ms> [-> $bind]`, followed by the
+same `branch $name` arms as `parallel`. (`race timeout: 5s` is accepted as an alias.)
 
 ```flux
 race 5000 -> $result
@@ -764,18 +784,18 @@ catch $err
 
 ### retry
 
-Retry the body on failure up to `max` times. The header uses **space-keyword** tokens in fixed
-order (the comma-kwarg form `retry 3, backoff: exponential, delay: 500` is aspirational and does
-not parse):
+Retry the body on failure up to `max` times. The max is the positional primary operand; the rest are
+named options. The older fixed-order space-keyword header
+(`retry 3 backoff exponential delay 500 -> $out`) is still accepted.
 
 ```flux
-retry 3 backoff exponential delay 500 -> $out
+retry 3, backoff: exponential, delay: 500ms -> $out
   bash("flaky.sh")
 ```
 
 - `max` (positional, required) — maximum attempts including the first
-- `backoff none | linear | exponential` — default `none`
-- `delay <ms>` — base delay in milliseconds; when omitted the runtime defaults to `500`
+- `backoff: none | linear | exponential` — default `none`
+- `delay: <ms>` — base delay in milliseconds; when omitted the runtime defaults to `500`
 - `-> $name` — binds the last expression of the body on success
 - Fatal errors (policy denial, unknown op) are never retried
 - A denied `confirm` inside a `retry` body is **not** retried
@@ -799,18 +819,18 @@ retry 3
 ### confirm
 
 Explicit approval gate. The `--yes` flag and the TUI modal satisfy it automatically. The header
-is `confirm "<message>" [risk <level>]` + an optional indented body (the comma-kwarg spelling
-`confirm "…", risk: high` does not parse):
+is `confirm "<message>"[, risk: <level>]` + an optional indented body. The older
+`confirm "…" risk high` spelling is still accepted.
 
 ```flux
-confirm "Delete all temp files?" risk high
+confirm "Delete all temp files?", risk: high
   bash("rm -rf tmp/")
 
 confirm "Proceed?"
 ```
 
-- `message` (required)
-- `risk`: `low | medium | high | critical` — default `medium` (omitted from the header)
+- `message` (required, positional)
+- `risk:` `low | medium | high | critical` — default `medium` (omitted from the header)
 - Body runs only on approval; denial causes the node to error
 - A `confirm` with **no body** is valid — a pure gate with no conditional action
 
@@ -818,17 +838,18 @@ confirm "Proceed?"
 
 ## Rate limiting and debouncing
 
-Both headers use space-keyword tokens (the comma-kwarg forms shown in earlier drafts do not
-parse). See [`reference.md`](reference.md) for full semantics.
+Both headers take the keyed name positionally and name the rest. Their older space-keyword
+spellings (`throttle "fetches" 5 per 60000`, `debounce "rebuild" 300`) are still accepted. See
+[`reference.md`](reference.md) for full semantics.
 
 ### throttle
 
 At most `max` **op dispatches** inside the body per sliding `window_ms`; the bucket is tracked in
 the session store, atomically, keyed by the required name. The header is
-`throttle "<name>" <max> per <window_ms>`:
+`throttle "<name>", max: <max>, per: <window_ms>`:
 
 ```flux
-throttle "fetches" 5 per 60000
+throttle "fetches", max: 5, per: 60s
   web.fetch($url)
 ```
 
@@ -836,10 +857,10 @@ throttle "fetches" 5 per 60000
 
 Keyed cross-turn coalescing: each arrival records a last-trigger timestamp for the name in the
 session store; the body runs only once `wait_ms` has elapsed since that key's last trigger. The
-header is `debounce "<name>" <wait_ms>`:
+header is `debounce "<name>", wait: <wait_ms>`:
 
 ```flux
-debounce "rebuild" 300
+debounce "rebuild", wait: 300ms
   bash("rebuild.sh")
 ```
 
@@ -883,8 +904,7 @@ lowered into the `expr.vars` map, and dotted `$issue.state` becomes lenient dott
 $ok = $score >= 0.8
 when $issue.state == "opened" && $issue.upvotes > 2
   return true
-repeat 10
-  until len($queue) == 0
+repeat 10, until: len($queue) == 0
   do poll
 ```
 
@@ -1047,16 +1067,19 @@ bind).
 
 ### await
 
-Suspend until an external event arrives. The header is `await [$bind[: Type] =] "source"`:
+Suspend until an external event arrives. The header is
+`await [$bind[: Type] =] "source"[, when: <cond>]`:
 
 ```flux
 await $push = "github.push"
 await $count: Number = "user_input"
 await "webhook"
+await $reply = "user_input", when: $decision_needed
 ```
 
 The event source is a string label. The optional type annotation (`as_type`) is coerced leniently
-onto the received value; a type annotation requires a binding.
+onto the received value; a type annotation requires a binding. `when:` gates the suspension; the
+older `await "source" when <cond>` spelling is still accepted.
 
 **Implemented (P6a):** a **top-level** `await` suspends the flow for cross-turn resume — the interpreter
 records the suspend point (`FlowOutcome.suspension` + a `RunEvent::Awaiting` trace), and the engine
@@ -1229,7 +1252,8 @@ they are documentation and are preserved in the AST.
 | `retry` wrapping `confirm` | denial is fatal — not retried |
 | Flow with empty body | **parses** to an empty-body flow (emptiness checks are the analyzer's job) |
 | `loop` `until` | stop-when-true guard, evaluated **after** each iteration |
-| `repeat` `until` | `until` must be the first line of the body; evaluated after each iteration |
+| `repeat` `until` | `until:` header option (or, legacy, the first body line); evaluated after each iteration |
+| `until` given twice | header option **and** body clause on one node is a parse error |
 
 ---
 
@@ -1265,8 +1289,7 @@ flow improve -> EvalReport
 
   $candidates = improvements_aggregate({mined: $mined, reviewed: $reviewed})
 
-  repeat 3
-    until $done
+  repeat 3, until: $done
     $tasks    = task({role: "planner", task: "Turn these candidates into AT MOST 2 tasks:\n{candidates}"})
     $snapshot = git_snapshot()
     change_implement({tasks: $tasks, limit: 2})

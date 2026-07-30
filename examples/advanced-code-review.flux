@@ -54,11 +54,11 @@ flow code_review_pipeline(pr_branch: String, base_branch: String, notify_channel
   # (2 attempts, 30s each); style gets a single 20s timeout.
   parallel
     branch $security_claims
-      retry 2 backoff exponential
+      retry 2, backoff: exponential
         timeout 30000
           $security_claims = ai.extract({ from: $review_ctx, ask: "Extract every security concern (injection, auth bypass, secret leak, unsafe deserialization) as a Claim with a severity score 1-10.", schema: "Claim[]" })
     branch $logic_claims
-      retry 2 backoff exponential
+      retry 2, backoff: exponential
         timeout 30000
           $logic_claims = ai.extract({ from: $review_ctx, ask: "Extract logic bugs, off-by-one errors, incorrect error handling, and missing edge cases as Claims.", schema: "Claim[]" })
     branch $style_claims
@@ -86,7 +86,7 @@ flow code_review_pipeline(pr_branch: String, base_branch: String, notify_channel
     case "escalate"
       $action_label = "ESCALATED"
       # `confirm` — human-in-the-loop gate; the body runs only on approval, denial errors the arm.
-      confirm "AI flagged this PR for security escalation. Review the top claims and approve sending the escalation notice." risk high
+      confirm "AI flagged this PR for security escalation. Review the top claims and approve sending the escalation notice.", risk: high
         observe({ kind: "escalation.approved" })
     default
       $action_label = "CHANGES_REQUESTED"

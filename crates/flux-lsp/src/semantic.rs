@@ -312,6 +312,22 @@ mod tests {
     }
 
     #[test]
+    fn canonical_header_option_labels_are_keyword_tokens() {
+        // L-96: `confirm "go?", risk: high` must colour like the `risk high` it replaces.
+        let src =
+            "flow f\n  confirm \"go?\", risk: high\n    bash(\"rm -rf tmp/\")\n  return \"ok\"\n";
+        let decoded = decode(src, &tokens_for(src, None));
+        let find = |t: &str| {
+            decoded
+                .iter()
+                .find(|(text, _, _)| text == t)
+                .unwrap_or_else(|| panic!("no token {t:?} in {decoded:?}"))
+        };
+        assert_eq!(find("confirm").1, TOK_KEYWORD);
+        assert_eq!(find("risk").1, TOK_KEYWORD);
+    }
+
+    #[test]
     fn semantic_tokens_distinguish_known_op_from_unknown_and_bind_from_use() {
         let src =
             "flow f\n  # a note\n  $x = read(\"a.txt\")\n  $y = made_up(\"z\")\n  return $x\n";
