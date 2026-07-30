@@ -1408,6 +1408,56 @@ mod tests {
         }
     }
 
+    /// C-270: the engine runs a plan against a **non-SQLite** implementation of the state port and
+    /// observes the same thing it does against the SQLite one — the whole point of the port. The
+    /// store is built with [`FlowStore::with_backend`] over [`crate::state::MemoryState`], so no
+    /// `rusqlite` handle exists anywhere on the state path.
+    #[tokio::test]
+    async fn execute_flow_runs_a_linear_plan_over_a_non_sqlite_state_backend() {
+        let store = FlowStore::with_backend(
+            Arc::new(crate::state::MemoryState::default()),
+            Arc::new(flux_events::EventStore::in_memory().unwrap()),
+        );
+        let ex = temp_executor(true);
+        // $a = echo("hi"); $b = echo($a); return $b — the same plan the SQLite-backed
+        // `execute_flow_runs_a_linear_plan_through_dispatch` above drives.
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", "echo", vec![flow_lit(json!("hi"))]),
+                flow_bind("b", "echo", vec![flow_var("a")]),
+                Node::Return {
+                    value: Box::new(flow_var("b")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps, 2, "both echo ops dispatched");
+        assert_eq!(outcome.result, "hi");
+        assert_eq!(sink.calls, vec!["echo", "echo"]);
+        // The durable state the engine actually relies on landed in the portable backend: both
+        // symbols resolve, and the values they point at are readable back.
+        for name in ["a", "b"] {
+            let vid = store
+                .resolve("sess", &SymbolName(name.into()))
+                .unwrap()
+                .unwrap_or_else(|| panic!("${name} bound in the portable backend"));
+            assert_eq!(
+                store.get_value(&vid).unwrap(),
+                Some(Value::String("hi".into())),
+                "${name}'s value reads back from the portable backend"
+            );
+        }
+        assert!(
+            store.total_value_bytes("sess").unwrap() > 0,
+            "byte accounting works off the port, not off SQLite's SUM()"
+        );
+    }
+
     #[tokio::test]
     async fn execute_flow_runs_a_linear_plan_through_dispatch() {
         let store = FlowStore::in_memory().unwrap();

@@ -10,21 +10,34 @@
 //! Values are append-only and versioned: a revision creates a new [`ValueId`] and the old version
 //! stays addressable. A symbol points at its *current* value; the symbol table is the model-facing
 //! projection mechanism, and only visible/pinned symbols appear in [`FlowStore::view`].
+//!
+//! **Storage is a port** (C-270). [`FlowStore`] holds an `Arc<dyn FlowStateBackend>` and owns
+//! everything above it: serialization, the projection policy, the timestamps, and the run-event
+//! forwarding. [`SqliteState`] is the native backend and the default for every existing constructor,
+//! so nothing about native behaviour changed; [`MemoryState`] is a driver-free implementation of the
+//! same port, and [`FlowStore::with_backend`] is how an embedder supplies its own. The engine
+//! therefore no longer reaches a database directly — see [`port`] for why "no such row" had to become
+//! the port's own outcome rather than a driver error.
+
+mod memory;
+pub mod port;
+mod sqlite;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-
-use rusqlite::Connection;
 
 use flux_core::{Error, Result};
 use flux_events::EventStore;
 
 use crate::ast::{Node, NodeId, RunEvent, SymbolName, Value, ValueId, Visibility};
 
-fn map_sql<E: std::fmt::Display>(e: E) -> Error {
-    Error::Other(format!("flow store: {e}"))
-}
+pub use memory::MemoryState;
+pub use port::{FlowStateBackend, Lookup, StoredSymbol, Suspension, SymbolBinding};
+pub use sqlite::SqliteState;
 
+/// Wall-clock milliseconds, read once per write and handed to the backend. The single clock
+/// dependency left on this path — a backend never reads one itself, which is what lets a non-native
+/// one exist at all (`SystemTime::now` is unavailable on `wasm32-unknown-unknown`).
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -32,19 +45,13 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn value_rowid(id: &ValueId) -> Result<i64> {
-    id.0.strip_prefix("v_")
-        .and_then(|n| n.parse::<i64>().ok())
-        .ok_or_else(|| Error::Other(format!("invalid value id: {:?}", id.0)))
-}
-
 /// The model-facing session-projection types live in the language crate ([`flux_lang::store`]);
 /// re-exported so `flux_flow::state::{SessionView, SymbolView}` paths are unchanged.
 pub use flux_lang::store::{SessionView, SymbolView};
 
 /// flux-flow's durable [`FlowStore`] is the engine's [`ValueStore`](flux_lang::store::ValueStore):
-/// the interpreter (in `flux-lang`) reads and writes session state through this trait, with the SQLite
-/// implementation staying here. Methods forward to the inherent ones (inherent methods win in
+/// the interpreter (in `flux-lang`) reads and writes session state through this trait, with the
+/// storage backend staying here. Methods forward to the inherent ones (inherent methods win in
 /// `self.method()` resolution, so there is no recursion).
 impl flux_lang::store::ValueStore for FlowStore {
     fn put_value(&self, session_id: &str, value: &Value) -> Result<ValueId> {
@@ -158,10 +165,11 @@ pub struct OpenHalt {
     pub ledger: flux_lang::runtime::ResumeLedger,
 }
 
-/// flux-flow's own SQLite store for values, symbols, and the suspension latch. Run-event traces are
-/// forwarded to the shared [`EventStore`] rather than stored here.
+/// flux-flow's store for values, symbols, the suspension latch, and session composites. Storage is
+/// reached through [`FlowStateBackend`] ([`SqliteState`] natively); run-event traces are forwarded to
+/// the shared [`EventStore`] rather than stored here.
 pub struct FlowStore {
-    conn: Mutex<Connection>,
+    backend: Arc<dyn FlowStateBackend>,
     /// The unified event log this store forwards run-trace events to (and reads them back from).
     events: Arc<EventStore>,
     /// C-43: the active cassette scope (record / replay), if any. Rides on the store — the one
@@ -171,76 +179,38 @@ pub struct FlowStore {
 }
 
 impl FlowStore {
-    /// Open (creating if needed) a store at `path`, with WAL enabled. Run-trace events are forwarded
-    /// to the shared `events` log.
+    /// Open (creating if needed) a SQLite store at `path`, with WAL enabled. Run-trace events are
+    /// forwarded to the shared `events` log.
     pub fn open(path: impl AsRef<Path>, events: Arc<EventStore>) -> Result<Self> {
-        // flux-allow-direct-io: FlowStore is the owner of this host-selected SQLite state backend;
-        // operation implementations receive the store, never a model-supplied database path.
-        let conn = Connection::open(path).map_err(map_sql)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sql)?;
-        Self::init(conn, events)
+        Ok(Self::with_backend(
+            Arc::new(SqliteState::open(path)?),
+            events,
+        ))
     }
 
-    /// An in-memory store (for tests), with its own throwaway event log.
+    /// An in-memory **SQLite** store (for tests), with its own throwaway event log. Note this still
+    /// links `rusqlite`; [`MemoryState`] is the driver-free backend.
     pub fn in_memory() -> Result<Self> {
         Self::in_memory_with_events(Arc::new(EventStore::in_memory()?))
     }
 
-    /// An in-memory store sharing a given event log — so the engine's run trace, message log, and turn
-    /// telemetry all land in one place even in tests.
+    /// An in-memory SQLite store sharing a given event log — so the engine's run trace, message log,
+    /// and turn telemetry all land in one place even in tests.
     pub fn in_memory_with_events(events: Arc<EventStore>) -> Result<Self> {
-        // flux-allow-direct-io: in-memory FlowStore backend owns no filesystem or external resource.
-        Self::init(Connection::open_in_memory().map_err(map_sql)?, events)
+        Ok(Self::with_backend(
+            Arc::new(SqliteState::in_memory()?),
+            events,
+        ))
     }
 
-    fn init(conn: Connection, events: Arc<EventStore>) -> Result<Self> {
-        // `values` is a SQL keyword, so the value store table is `values_store`.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS values_store (
-                 n          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id TEXT NOT NULL,
-                 data       TEXT NOT NULL,
-                 bytes      INTEGER NOT NULL,
-                 created_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS symbols (
-                 session_id TEXT NOT NULL,
-                 name       TEXT NOT NULL,
-                 value_id   TEXT NOT NULL,
-                 ty         TEXT,
-                 summary    TEXT NOT NULL,
-                 visibility TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL,
-                 PRIMARY KEY (session_id, name)
-             );
-             CREATE TABLE IF NOT EXISTS suspensions (
-                 session_id TEXT PRIMARY KEY,
-                 flow_name  TEXT,
-                 body       TEXT NOT NULL,
-                 node       INTEGER NOT NULL,
-                 source     TEXT NOT NULL,
-                 created_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS session_composites (
-                 session_id TEXT NOT NULL,
-                 name       TEXT NOT NULL,
-                 source     TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL,
-                 PRIMARY KEY (session_id, name)
-             );",
-        )
-        .map_err(map_sql)?;
-        // Migration (L-21): pre-existing stores created the `suspensions` table without the
-        // `flow_name` column (a named flow's resume then derived its checkpoint key hash-only).
-        // `ALTER TABLE ADD COLUMN` errors when the column already exists — that error is the
-        // "already migrated" signal, so it is deliberately ignored.
-        let _ = conn.execute("ALTER TABLE suspensions ADD COLUMN flow_name TEXT", []);
-        Ok(Self {
-            conn: Mutex::new(conn),
+    /// Build a store over an arbitrary [`FlowStateBackend`] — the seam a non-native substrate uses
+    /// (C-270). Every other constructor is this one with [`SqliteState`] supplied.
+    pub fn with_backend(backend: Arc<dyn FlowStateBackend>, events: Arc<EventStore>) -> Self {
+        Self {
+            backend,
             events,
             cassette: Mutex::new(None),
-        })
+        }
     }
 
     /// C-43: install (or clear) the active cassette scope. The engine arms a fresh `Record` scope
@@ -266,29 +236,13 @@ impl FlowStore {
     pub fn put_value(&self, session_id: &str, value: &Value) -> Result<ValueId> {
         let data = serde_json::to_string(value)?;
         let bytes = data.len() as i64;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO values_store (session_id, data, bytes, created_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, data, bytes, now_ms()],
-        )
-        .map_err(map_sql)?;
-        Ok(ValueId(format!("v_{}", conn.last_insert_rowid())))
+        self.backend.put_value(session_id, &data, bytes, now_ms())
     }
 
     /// Fetch a stored value by id.
     pub fn get_value(&self, id: &ValueId) -> Result<Option<Value>> {
-        let n = value_rowid(id)?;
-        let conn = self.conn.lock().unwrap();
-        let data: Option<String> =
-            match conn.query_row("SELECT data FROM values_store WHERE n = ?1", [n], |r| {
-                r.get(0)
-            }) {
-                Ok(d) => Some(d),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(e) => return Err(map_sql(e)),
-            };
-        match data {
-            Some(d) => Ok(Some(serde_json::from_str(&d)?)),
+        match self.backend.get_value(id)?.found() {
+            Some(data) => Ok(Some(serde_json::from_str(&data)?)),
             None => Ok(None),
         }
     }
@@ -303,42 +257,26 @@ impl FlowStore {
         summary: &str,
         visibility: Visibility,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO symbols (session_id, name, value_id, ty, summary, visibility, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(session_id, name) DO UPDATE SET
-                 value_id   = excluded.value_id,
-                 ty         = excluded.ty,
-                 summary    = excluded.summary,
-                 visibility = excluded.visibility,
-                 updated_at = excluded.updated_at",
-            rusqlite::params![
-                session_id,
-                name.0,
-                value_id.0,
+        self.backend.bind(
+            session_id,
+            &name.0,
+            SymbolBinding {
+                value_id: &value_id.0,
                 ty,
                 summary,
-                visibility.as_str(),
-                now_ms()
-            ],
+                visibility,
+            },
+            now_ms(),
         )
-        .map_err(map_sql)?;
-        Ok(())
     }
 
     /// Resolve a symbol to its current value id.
     pub fn resolve(&self, session_id: &str, name: &SymbolName) -> Result<Option<ValueId>> {
-        let conn = self.conn.lock().unwrap();
-        match conn.query_row(
-            "SELECT value_id FROM symbols WHERE session_id = ?1 AND name = ?2",
-            rusqlite::params![session_id, name.0],
-            |r| r.get::<_, String>(0),
-        ) {
-            Ok(v) => Ok(Some(ValueId(v))),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(map_sql(e)),
-        }
+        Ok(self
+            .backend
+            .resolve(session_id, &name.0)?
+            .found()
+            .map(ValueId))
     }
 
     /// Pre-bind a named input so a flow's `$name` resolves to `value` **before** the run — the
@@ -389,7 +327,7 @@ impl FlowStore {
     ///
     /// Folded fresh from the run-event log on every call — the `once_lookup`/`checkpoint_resume`
     /// house pattern above, delegating the ledger half to [`flux_lang::runtime::ResumeLedger::fold`]
-    /// so the one fold algorithm isn't duplicated. No new SQLite table, so this is crash-tolerant and
+    /// so the one fold algorithm isn't duplicated. No new state table, so this is crash-tolerant and
     /// cross-process by construction: any `FlowStore` opened over the same `events.db` sees the same
     /// latch.
     pub fn open_halted_plan(&self, session_id: &str) -> Result<Option<OpenHalt>> {
@@ -441,38 +379,13 @@ impl FlowStore {
 
     /// Persist a session-scoped composite op definition as normalized Flux-Lang source.
     pub fn save_session_composite(&self, session_id: &str, name: &str, source: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO session_composites (session_id, name, source, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(session_id, name) DO UPDATE SET
-                 source     = excluded.source,
-                 updated_at = excluded.updated_at",
-            rusqlite::params![session_id, name, source, now_ms()],
-        )
-        .map_err(map_sql)?;
-        Ok(())
+        self.backend
+            .save_session_composite(session_id, name, source, now_ms())
     }
 
     /// Load every composite op definition registered for `session_id`.
     pub fn session_composites(&self, session_id: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, source FROM session_composites
-                 WHERE session_id = ?1 ORDER BY updated_at ASC, name ASC",
-            )
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map([session_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(map_sql)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(map_sql)?);
-        }
-        Ok(out)
+        self.backend.session_composites(session_id)
     }
 
     /// Persist a flow suspended on a top-level `await`: the flow's declared name (if any), its body,
@@ -491,15 +404,14 @@ impl FlowStore {
         node: NodeId,
         source: &str,
     ) -> Result<()> {
-        let body_json = serde_json::to_string(body)?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO suspensions (session_id, flow_name, body, node, source, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![session_id, flow_name, body_json, node.0, source, now_ms()],
-        )
-        .map_err(map_sql)?;
-        Ok(())
+        let suspension = Suspension {
+            flow_name: flow_name.map(str::to_string),
+            body: serde_json::to_string(body)?,
+            node: i64::from(node.0),
+            source: source.to_string(),
+        };
+        self.backend
+            .save_suspension(session_id, &suspension, now_ms())
     }
 
     /// Whether a session has a pending suspension — a **non-consuming** peek (unlike
@@ -507,16 +419,7 @@ impl FlowStore {
     /// voice session (D-132) to tell a re-suspended flow (keep speaking prompts) from a completed one
     /// (speak the final line, then hang up), after a turn has run.
     pub fn has_suspension(&self, session_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        match conn.query_row(
-            "SELECT 1 FROM suspensions WHERE session_id = ?1 LIMIT 1",
-            rusqlite::params![session_id],
-            |_| Ok(()),
-        ) {
-            Ok(()) => Ok(true),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-            Err(e) => Err(map_sql(e)),
-        }
+        self.backend.has_suspension(session_id)
     }
 
     /// Load a session's pending continuation without consuming it.
@@ -529,42 +432,28 @@ impl FlowStore {
         &self,
         session_id: &str,
     ) -> Result<Option<(Option<String>, Vec<Node>, NodeId, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let row = conn.query_row(
-            "SELECT flow_name, body, node, source FROM suspensions WHERE session_id = ?1",
-            [session_id],
-            |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            },
-        );
-        match row {
-            Ok((flow_name, body_json, node, source)) => {
-                let body = serde_json::from_str::<Vec<Node>>(&body_json).map_err(|error| {
-                    Error::Other(format!(
-                        "stored suspension for session `{session_id}` is invalid: {error}"
-                    ))
-                })?;
-                Ok(Some((flow_name, body, NodeId(node as u32), source)))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(map_sql(error)),
-        }
+        let Some(row) = self.backend.load_suspension(session_id)?.found() else {
+            return Ok(None);
+        };
+        // Non-consuming, so an undeserializable body is reported rather than silently swallowed —
+        // the latch is still there to retry against. (`take_suspension` recovers instead, because it
+        // has already consumed it.)
+        let body = serde_json::from_str::<Vec<Node>>(&row.body).map_err(|error| {
+            Error::Other(format!(
+                "stored suspension for session `{session_id}` is invalid: {error}"
+            ))
+        })?;
+        Ok(Some((
+            row.flow_name,
+            body,
+            NodeId(row.node as u32),
+            row.source,
+        )))
     }
 
     /// Clear a pending continuation after the engine has durably handled its terminal outcome.
     pub fn clear_suspension(&self, session_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM suspensions WHERE session_id = ?1",
-            [session_id],
-        )
-        .map_err(map_sql)?;
-        Ok(())
+        self.backend.clear_suspension(session_id)
     }
 
     /// Take (load **and** remove) a session's pending suspension, if any — a one-shot resume point.
@@ -575,84 +464,42 @@ impl FlowStore {
         &self,
         session_id: &str,
     ) -> Result<Option<(Option<String>, Vec<Node>, NodeId, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let row = conn.query_row(
-            "SELECT flow_name, body, node, source FROM suspensions WHERE session_id = ?1",
-            [session_id],
-            |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            },
-        );
-        match row {
-            Ok((flow_name, body_json, node, source)) => {
-                // One-shot: clear the row regardless. A body that no longer deserializes (e.g. AST
-                // schema drift across an upgrade) is discarded and reported as "no suspension" so the
-                // turn recovers through a fresh adaptive drive rather than hard-erroring forever.
-                conn.execute(
-                    "DELETE FROM suspensions WHERE session_id = ?1",
-                    [session_id],
-                )
-                .map_err(map_sql)?;
-                match serde_json::from_str::<Vec<Node>>(&body_json) {
-                    Ok(body) => Ok(Some((flow_name, body, NodeId(node as u32), source))),
-                    Err(_) => Ok(None),
-                }
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(map_sql(e)),
+        let Some(row) = self.backend.take_suspension(session_id)?.found() else {
+            return Ok(None);
+        };
+        // One-shot: the backend has already cleared the latch. A body that no longer deserializes
+        // (e.g. AST schema drift across an upgrade) is discarded and reported as "no suspension" so
+        // the turn recovers through a fresh adaptive drive rather than hard-erroring forever.
+        match serde_json::from_str::<Vec<Node>>(&row.body) {
+            Ok(body) => Ok(Some((
+                row.flow_name,
+                body,
+                NodeId(row.node as u32),
+                row.source,
+            ))),
+            Err(_) => Ok(None),
         }
     }
 
     /// Total stored value bytes for a session (the budget-accounting surface; eviction lands later).
     pub fn total_value_bytes(&self, session_id: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        let sum: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(bytes), 0) FROM values_store WHERE session_id = ?1",
-                [session_id],
-                |r| r.get(0),
-            )
-            .map_err(map_sql)?;
-        Ok(sum.max(0) as u64)
+        self.backend.total_value_bytes(session_id)
     }
 
     /// Project the model-facing view: visible + pinned symbols, newest-updated first, summaries only.
     pub fn view(&self, session_id: &str) -> Result<SessionView> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, ty, summary, visibility FROM symbols
-                 WHERE session_id = ?1 ORDER BY updated_at DESC, name ASC",
-            )
-            .map_err(map_sql)?;
-        let rows = stmt
-            .query_map([session_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
+        let symbols = self
+            .backend
+            .symbols(session_id)?
+            .into_iter()
+            .filter(|s| s.visibility.is_shown())
+            .map(|s| SymbolView {
+                name: s.name,
+                ty: s.ty,
+                summary: s.summary,
+                visibility: s.visibility,
             })
-            .map_err(map_sql)?;
-        let mut symbols = Vec::new();
-        for row in rows {
-            let (name, ty, summary, vis) = row.map_err(map_sql)?;
-            let visibility = Visibility::from_tag(&vis).unwrap_or(Visibility::Hidden);
-            if visibility.is_shown() {
-                symbols.push(SymbolView {
-                    name: SymbolName(name),
-                    ty,
-                    summary,
-                    visibility,
-                });
-            }
-        }
+            .collect();
         Ok(SessionView { symbols })
     }
 }
@@ -938,5 +785,205 @@ mod tests {
         s.put_value("sess", &Value::String("some content".into()))
             .unwrap();
         assert!(s.total_value_bytes("sess").unwrap() > 0);
+    }
+
+    // ---- C-270: the state port's conformance suite -------------------------------------------
+
+    /// Every durability property the engine relies on, asserted against an arbitrary
+    /// [`FlowStateBackend`]. Run once per implementation below, so a non-SQLite backend is held to
+    /// exactly the observable behaviour the SQLite one has — this module's invariants: values are
+    /// append-only and versioned, symbols are last-writer-wins, and the suspension latch is one-shot.
+    fn assert_state_port_conformance(s: &FlowStore) {
+        // Values: append-only and versioned — a revision mints a new id and the old one stays
+        // addressable. An unknown id is absence, not an error.
+        let v1 = s.put_value("sess", &Value::String("one".into())).unwrap();
+        let v2 = s.put_value("sess", &Value::String("two".into())).unwrap();
+        assert_ne!(v1, v2, "a revision mints a new id");
+        assert_eq!(
+            s.get_value(&v1).unwrap(),
+            Some(Value::String("one".into())),
+            "the superseded version stays addressable"
+        );
+        assert_eq!(s.get_value(&v2).unwrap(), Some(Value::String("two".into())));
+        assert!(
+            s.get_value(&ValueId("v_999999".into())).unwrap().is_none(),
+            "an unknown value id is absence, not an error"
+        );
+
+        // Symbols: last-writer-wins over a pointer table, scoped per session.
+        let draft = SymbolName("draft".into());
+        assert!(
+            s.resolve("sess", &draft).unwrap().is_none(),
+            "an unbound symbol is absence, not an error"
+        );
+        s.bind(
+            "sess",
+            &draft,
+            &v1,
+            Some("Draft"),
+            "first",
+            Visibility::Visible,
+        )
+        .unwrap();
+        assert_eq!(s.resolve("sess", &draft).unwrap(), Some(v1.clone()));
+        s.bind(
+            "sess",
+            &draft,
+            &v2,
+            Some("Draft"),
+            "second",
+            Visibility::Visible,
+        )
+        .unwrap();
+        assert_eq!(
+            s.resolve("sess", &draft).unwrap(),
+            Some(v2.clone()),
+            "last writer wins"
+        );
+        assert!(
+            s.resolve("other", &draft).unwrap().is_none(),
+            "symbols are per-session"
+        );
+
+        // The model-facing view projects visible + pinned only.
+        s.bind(
+            "sess",
+            &SymbolName("hid".into()),
+            &v1,
+            None,
+            "h",
+            Visibility::Hidden,
+        )
+        .unwrap();
+        s.bind(
+            "sess",
+            &SymbolName("pin".into()),
+            &v1,
+            None,
+            "p",
+            Visibility::Pinned,
+        )
+        .unwrap();
+        let names: Vec<String> = s
+            .view("sess")
+            .unwrap()
+            .symbols
+            .iter()
+            .map(|sym| sym.name.0.clone())
+            .collect();
+        assert!(names.contains(&"draft".to_string()));
+        assert!(names.contains(&"pin".to_string()));
+        assert!(!names.contains(&"hid".to_string()), "hidden stays hidden");
+
+        // Byte accounting rides on the stored values.
+        assert!(s.total_value_bytes("sess").unwrap() > 0);
+        assert_eq!(
+            s.total_value_bytes("empty").unwrap(),
+            0,
+            "an untouched session accounts for nothing"
+        );
+
+        // The suspension latch: at most one per session, a new save replaces the old, a peek does
+        // not consume, and a take is one-shot.
+        let body = vec![Node::Await {
+            binding: Some(SymbolName("x".into())),
+            source: "user_input".into(),
+            as_type: None,
+            condition: None,
+        }];
+        assert!(!s.has_suspension("sess").unwrap(), "none initially");
+        assert!(s.load_suspension("sess").unwrap().is_none());
+        s.save_suspension("sess", None, &body, NodeId(3), "user_input")
+            .unwrap();
+        s.save_suspension("sess", Some("wf"), &body, NodeId(5), "other")
+            .unwrap();
+        assert!(s.has_suspension("sess").unwrap(), "a peek does not consume");
+        let (name, got, node, source) = s.load_suspension("sess").unwrap().expect("a suspension");
+        assert_eq!(
+            (name.as_deref(), node, source.as_str()),
+            (Some("wf"), NodeId(5), "other"),
+            "the latest save replaces the earlier one, name included"
+        );
+        assert_eq!(got, body, "the body round-trips");
+        assert!(
+            s.has_suspension("sess").unwrap(),
+            "load is non-consuming (unlike take)"
+        );
+        assert!(s.take_suspension("sess").unwrap().is_some());
+        assert!(
+            s.take_suspension("sess").unwrap().is_none(),
+            "take is one-shot"
+        );
+        s.save_suspension("sess", None, &body, NodeId(1), "again")
+            .unwrap();
+        s.clear_suspension("sess").unwrap();
+        assert!(
+            !s.has_suspension("sess").unwrap(),
+            "clear removes the latch"
+        );
+
+        // Session-scoped composite definitions persist, replace by name, and come back in
+        // registration order.
+        assert!(s.session_composites("sess").unwrap().is_empty());
+        s.save_session_composite("sess", "a", "src-a").unwrap();
+        s.save_session_composite("sess", "b", "src-b").unwrap();
+        s.save_session_composite("sess", "a", "src-a2").unwrap();
+        let composites = s.session_composites("sess").unwrap();
+        assert_eq!(composites.len(), 2, "replaced by name, not appended");
+        assert!(composites.contains(&("a".to_string(), "src-a2".to_string())));
+        assert!(composites.contains(&("b".to_string(), "src-b".to_string())));
+        assert!(
+            s.session_composites("other").unwrap().is_empty(),
+            "composites are per-session"
+        );
+    }
+
+    #[test]
+    fn the_sqlite_backend_conforms_to_the_state_port() {
+        assert_state_port_conformance(&FlowStore::in_memory().unwrap());
+    }
+
+    /// The acceptance test for C-270: a **non-SQLite** implementation of the port gives identical
+    /// observable behaviour. If this and the SQLite twin above both pass, the port is real rather
+    /// than a rename.
+    #[test]
+    fn a_non_sqlite_backend_conforms_to_the_state_port() {
+        let store = FlowStore::with_backend(
+            Arc::new(MemoryState::default()),
+            Arc::new(EventStore::in_memory().unwrap()),
+        );
+        assert_state_port_conformance(&store);
+    }
+
+    /// The port owns its own "no such row" outcome. Five call sites used to match
+    /// `rusqlite::Error::QueryReturnedNoRows` structurally; absence now crosses the port as
+    /// [`Lookup::NoSuchRow`], a value the trait defines, so a backend with no notion of SQLite errors
+    /// can express it.
+    #[test]
+    fn absence_crosses_the_port_as_its_own_outcome() {
+        let backend = MemoryState::default();
+        assert_eq!(
+            backend.get_value(&ValueId("v_1".into())).unwrap(),
+            Lookup::NoSuchRow
+        );
+        assert_eq!(backend.resolve("sess", "nope").unwrap(), Lookup::NoSuchRow);
+        assert_eq!(backend.load_suspension("sess").unwrap(), Lookup::NoSuchRow);
+        assert_eq!(backend.take_suspension("sess").unwrap(), Lookup::NoSuchRow);
+        assert!(!backend.has_suspension("sess").unwrap());
+        // And `Found` is the other arm, not a sentinel value.
+        let vid = backend.put_value("sess", "\"x\"", 3, 0).unwrap();
+        assert_eq!(
+            backend.get_value(&vid).unwrap(),
+            Lookup::Found("\"x\"".to_string())
+        );
+        // The SQLite backend answers the same way — absence is the port's, not the driver's.
+        let sqlite = SqliteState::in_memory().unwrap();
+        assert_eq!(
+            sqlite.get_value(&ValueId("v_1".into())).unwrap(),
+            Lookup::NoSuchRow
+        );
+        assert_eq!(sqlite.resolve("sess", "nope").unwrap(), Lookup::NoSuchRow);
+        assert_eq!(sqlite.load_suspension("sess").unwrap(), Lookup::NoSuchRow);
+        assert_eq!(sqlite.take_suspension("sess").unwrap(), Lookup::NoSuchRow);
     }
 }
