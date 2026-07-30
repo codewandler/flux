@@ -2,7 +2,7 @@
 id: D-211
 title: Agent screenshare — publish a rendered flux surface into the call
 pillar: Agent
-status: backlog
+status: blocked
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels, flux-tui]
@@ -30,6 +30,8 @@ it into the room as a video track, so humans in the call see what the agent is w
 - [ ] Frame rate and resolution are bounded and configurable; a static pane must not burn a core.
 
 ## Progress
+
+- **Blocked on D-208 — screenshare rides the same media sidecar as D-210.** Recorded rather than left in `backlog`, so the board says *why* it is not takeable instead of implying nobody has decided.
 - 2026-07-30 — **attempted and failed; recorded so the next attempt starts here.**
   1. `getDisplayMedia({video:true})` in headless Chrome 150 → `NotReadableError: Could not start video
      source`. Headless has no display to capture, and `--auto-select-desktop-capture-source` /

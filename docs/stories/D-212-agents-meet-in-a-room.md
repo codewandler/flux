@@ -2,7 +2,7 @@
 id: D-212
 title: Agents meet in a room — the room as an A2A transport with humans present
 pillar: Agent
-status: backlog
+status: blocked
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels, flux-a2a]
@@ -31,6 +31,8 @@ point-to-point connection — which is the property no existing flux transport h
 - [ ] Occupant identity distinguishes agent from human, and an agent cannot claim to be a human.
 
 ## Progress
+
+- **Blocked on D-205, D-206 and D-207 — agents meeting in a room needs a room backend plus addressing and the reply budget, or two agents answer each other without bound.** Recorded rather than left in `backlog`, so the board says *why* it is not takeable instead of implying nobody has decided.
 - (not started)
 
 ## Notes

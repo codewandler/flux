@@ -2,7 +2,8 @@
 id: D-207
 title: Addressing and reply budget — the agent answers only when spoken to
 pillar: Agent
-status: backlog
+status: ready
+priority: 28
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels, flux-flow]

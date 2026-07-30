@@ -2,7 +2,8 @@
 id: D-206
 title: JaaS / Brave Talk room backend — guest-token acquisition and refresh
 pillar: Agent
-status: backlog
+status: ready
+priority: 27
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels]

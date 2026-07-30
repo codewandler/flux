@@ -2,7 +2,7 @@
 id: D-210
 title: Room audio out — the agent speaks into the call, interruptibly
 pillar: Agent
-status: backlog
+status: blocked
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-flow, flux-audio]
@@ -31,6 +31,8 @@ moment a human starts talking, and never silently inaudible.
 - [ ] The agent's own speech is never fed back as inbound audio (no self-echo turn).
 
 ## Progress
+
+- **Blocked on D-208 — audio out rides the media sidecar; without that peer there is nothing to emit through.** Recorded rather than left in `backlog`, so the board says *why* it is not takeable instead of implying nobody has decided.
 - 2026-07-30 — **audible in a real call, confirmed by the human ("now, i hear you!").** Chain:
   `piper en_US-ryan-high` (local neural TTS, 43 s of speech synthesized in 7.6 s) → `sox` to 48 kHz mono
   → `paplay` into a private PipeWire null sink → remapped source → the browser capture stream moved onto
