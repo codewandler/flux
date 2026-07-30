@@ -79,13 +79,15 @@ pub(crate) fn provider_credential_env(
 /// - the sandbox posture *and the confinement marker* (C-282). The harness resolves a posture and
 ///   `sandbox::posture_env` forwards it *before* this slot, so a fixture naming `FLUX_SANDBOX=off`
 ///   would land after it and hand the child `flux-cli`'s kill switch — which beats the child's own
-///   `[sandbox] require` and C-262's unattended fail-closed profile. `FLUX_SANDBOXED` is refused for
-///   a sharper reason: `build_command` overwrites the marker after the overrides *only* when the
-///   spawn is genuinely wrapped, so against an inactive sandbox a fixture could claim a confinement
-///   that never happened and the child would skip wrapping itself. A benchmark task has no business
-///   moving the harness's confinement in either direction, so the keys are dropped rather than
-///   honored. Filtered against `flux_system::sandbox::SANDBOX_ENV_KEYS` so the set cannot drift from
-///   what the spawn actually forwards.
+///   `[sandbox] require` and C-262's unattended fail-closed profile. `FLUX_SANDBOXED` is refused
+///   alongside it, though since C-289 no longer because it *has* to be: `build_command` now renders
+///   the marker after the overrides in both directions, so a fixture claiming a confinement that
+///   never happened is overwritten there whether or not the spawn was wrapped. It stays in the
+///   refusal set so an operator sees the key named as refused here, at the fixture that wrote it,
+///   rather than watching it disappear a layer down. A benchmark task has no business moving the
+///   harness's confinement in either direction, so the keys are dropped rather than honored.
+///   Filtered against `flux_system::sandbox::SANDBOX_ENV_KEYS` so the set cannot drift from what the
+///   spawn actually forwards.
 fn extend_task_env(
     env: &mut Vec<(String, String)>,
     task_env: &std::collections::BTreeMap<String, String>,
@@ -463,12 +465,13 @@ mod tests {
     /// for. A fixture has no legitimate reason to move the harness's posture in either direction,
     /// so the keys are refused here instead.
     ///
-    /// `FLUX_SANDBOXED` is in the input on purpose, and refused for a sharper reason than the rest:
-    /// `build_command` overwrites the marker after the overrides *only* for a genuinely wrapped
-    /// spawn, so against an inactive sandbox — the default posture — this filter is the only thing
-    /// standing between a fixture and a child that believes it is already confined. The assertion
-    /// covers every `FLUX_SANDBOX*` spelling and the filter
-    /// (`sandbox::SANDBOX_ENV_KEYS`) covers exactly the same set, so neither over-promises.
+    /// `FLUX_SANDBOXED` is in the input on purpose. This filter used to be the only thing standing
+    /// between a fixture and a child that believes it is already confined, because `build_command`
+    /// overwrote the marker after the overrides *only* for a genuinely wrapped spawn; since C-289 it
+    /// renders the marker in both directions and that gap is closed at the spawn. What this test
+    /// still pins is that the fixture's copy never gets that far. The assertion covers every
+    /// `FLUX_SANDBOX*` spelling and the filter (`sandbox::SANDBOX_ENV_KEYS`) covers exactly the same
+    /// set, so neither over-promises.
     #[test]
     fn a_task_fixture_may_not_name_the_eval_childs_sandbox_posture_or_forge_the_marker() {
         let mut env = Vec::new();

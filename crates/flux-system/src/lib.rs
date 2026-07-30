@@ -2084,13 +2084,13 @@ impl System {
             "RUSTUP_HOME",
             "CARGO_HOME",
             "RUSTUP_TOOLCHAIN",
-            // The nested-sandbox marker (D-130): a truly-sandboxed spawn sets this (see
-            // `build_command`), and it must survive the env-clear so a child `flux` process sees
-            // it and skips re-wrapping (`Sandbox::resolve`) instead of attempting to nest inside
-            // its own containment. C-276: the marker never travels alone any more — the *posture*
-            // that decides whether confinement actually happens goes with it, appended below from
-            // `sandbox::posture_env`.
-            "FLUX_SANDBOXED",
+            // The nested-sandbox marker (D-130) is deliberately NOT here. It used to be, forwarded
+            // like any other allow-listed value, which is what left it forgeable: a caller-supplied
+            // `FLUX_SANDBOXED` landed after this loop and there was nothing after *that* unless the
+            // spawn was genuinely wrapped. It is now rendered once in `build_command` from
+            // `sandbox::sandbox_marker`, past the override slot, in both directions — including the
+            // ambient-marker case this entry used to serve, which that function reads for itself
+            // (C-289).
             // C-207: the path to the kubeconfig, forwarded because the *surfacing* side already
             // honors it — `flux_runtime`'s `kubeconfig_present` surfaces the `endpoint` group when
             // `KUBECONFIG` is set — and a probe that reads a variable the executor drops offers ops
@@ -2124,25 +2124,21 @@ impl System {
         // - the *posture* lands **before** it, because a posture is an inherited default a trusted
         //   call site may legitimately override (`flux-eval`'s child host is one);
         // - the `FLUX_SANDBOXED` *marker* lands **after** it — in `build_command`, past this
-        //   function — because it asserts confinement that genuinely happened.
+        //   function — because it states whether the child is actually confined, which is not a
+        //   caller's opinion to hold.
         //
         // So `posture_env`'s floor guarantee is a property of *that function*, not of this path:
         // anything a call site puts in `env` wins, `FLUX_SANDBOX=off` included, which on the reading
-        // side is `flux-cli`'s kill switch rather than "no opinion".
+        // side is `flux-cli`'s kill switch rather than "no opinion". A call site assembling `env` out
+        // of material it does not control — a benchmark fixture, an embedder's startup env — must
+        // therefore refuse the posture keys itself, against `sandbox::SANDBOX_ENV_KEYS` rather than a
+        // hand-copied list (C-282). Two such forwarders existed and hand-rolled the whole decision
+        // from `std::env`; both are gone.
         //
-        // The marker's protection is narrower than the ordering above suggests, and the difference
-        // matters here. `sandbox_marker` returns `Some` only for a `Sandboxed` spawn over an
-        // **active** sandbox, and `build_command` writes the key only on `Some` — so the marker
-        // outranks a caller exactly when the spawn is *genuinely wrapped*. For an `Exempt` spawn, or
-        // the inactive sandbox that is this project's default posture, nothing is written after this
-        // loop and a caller-supplied `FLUX_SANDBOXED=1` reaches the child verbatim, where it reads
-        // as "already confined, do not nest". That gap is pre-existing and filed separately.
-        //
-        // Either way the obligation lands in the same place: a call site assembling `env` out of
-        // material it does not control — a benchmark fixture, an embedder's startup env — must
-        // refuse these keys itself, against `sandbox::SANDBOX_ENV_KEYS` (posture *and* marker)
-        // rather than a hand-copied list (C-282). Two such forwarders existed and hand-rolled the
-        // whole decision from `std::env`; both are gone.
+        // The marker needs no such help from its call sites (C-289). `build_command` renders it
+        // after this loop in **both** directions — set when something genuinely confines the child,
+        // removed when nothing does — so a forged `FLUX_SANDBOXED` here is overwritten either way.
+        // It is still in `SANDBOX_ENV_KEYS` (see there for why), just no longer load-bearing.
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -2169,14 +2165,15 @@ impl System {
     /// — the spawn is never wrapped and never subject to `require`.
     ///
     /// Two env facts about the sandbox cross into the child, and they are deliberately different
-    /// shapes. [`sandbox::sandbox_marker`] stamps `FLUX_SANDBOXED=1` only when the spawn was
-    /// *genuinely* wrapped — a claim of confinement must never outrun the thing it claims — and it
-    /// is applied last, after the caller's overrides, so for a wrapped spawn no call site can forge
-    /// or clear it. Scope that to the wrapped case, because the `if let Some(..)` below is what
-    /// enforces it: when the marker is `None` (an `Exempt` spawn, or an inactive sandbox — the
-    /// default posture) nothing is written after the overrides, and a caller-supplied
-    /// `FLUX_SANDBOXED` survives. Pre-existing, filed separately; see `sandbox::SANDBOX_ENV_KEYS`
-    /// for what a call site owes in the meantime.
+    /// shapes. [`sandbox::sandbox_marker`] decides what `FLUX_SANDBOXED` says, and the write below
+    /// applies that decision **last**, after the caller's overrides, in both directions: the key is
+    /// stamped `1` when something genuinely confines the child (this spawn is wrapped, or an outer
+    /// flux sandbox already confines this whole process tree) and **removed** when nothing does. So
+    /// no call site can either forge the marker or clear it, whether or not this particular spawn is
+    /// wrapped — a claim of confinement never outruns the thing it claims, and a real confinement is
+    /// never talked down (C-289; C-276 fixed the mirror-image defect, the marker travelling without
+    /// the posture). What that does *not* cover is stated on `sandbox::sandbox_marker`: the ambient
+    /// environment of the flux process itself, which only its own parent can set.
     /// [`sandbox::posture_env`] adds the posture that decides whether confinement happens at all,
     /// so a child `flux` inherits the confinement this process resolved rather than reading `off`
     /// out of an environment with no posture in it (C-276). It is applied *before* the caller's
@@ -2220,8 +2217,13 @@ impl System {
             self.sandbox.configure(&mut cmd)?;
         }
         Self::apply_safe_env(&mut cmd, env, &self.sandbox);
-        if let Some((key, value)) = sandbox::sandbox_marker(confinement, &self.sandbox) {
-            cmd.env(key, value);
+        match sandbox::sandbox_marker(confinement, &self.sandbox) {
+            sandbox::Marker::Confined => {
+                cmd.env(sandbox::MARKER_ENV, "1");
+            }
+            sandbox::Marker::Unconfined => {
+                cmd.env_remove(sandbox::MARKER_ENV);
+            }
         }
         Ok(cmd)
     }
@@ -3314,11 +3316,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// D-130: `FLUX_SANDBOXED` is in `SAFE_ENV`, so a flux process that is itself already marked
-    /// (inherited from an outer real sandbox) forwards the marker to ITS OWN children even though
-    /// `apply_safe_env` clears the environment first — the nested-run detection
-    /// (`Sandbox::resolve`) depends on the marker surviving every hop down the process tree, not
-    /// just the first.
+    /// D-130: a flux process that is itself already marked (inherited from an outer real sandbox)
+    /// hands the marker to ITS OWN children even though `apply_safe_env` clears the environment
+    /// first — the nested-run detection (`Sandbox::resolve`) depends on the marker surviving every
+    /// hop down the process tree, not just the first.
+    ///
+    /// C-289 changed the *mechanism* and kept the guarantee: the marker used to ride `SAFE_ENV` like
+    /// any other allow-listed value, and is now rendered by `sandbox::sandbox_marker` past the
+    /// caller-override slot. This test is deliberately still written against the observable — what
+    /// the child's environment says — so it keeps holding whichever mechanism carries it.
     #[tokio::test]
     async fn flux_sandboxed_marker_survives_env_clear_like_other_safe_env_entries() {
         let (dir, sys) = temp_workspace();
@@ -3336,6 +3342,129 @@ mod tests {
             out.stdout.contains("FLUX_SANDBOXED=1"),
             "FLUX_SANDBOXED did not survive the env-clear: {}",
             out.stdout
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every `FLUX_SANDBOXED` line in a spawned `env` dump — the **child's own** environment, which
+    /// is the only thing that decides whether it re-wraps. These tests assert on that rather than on
+    /// the parent's intent; the parent's intent was never in doubt.
+    fn child_marker_lines(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("FLUX_SANDBOXED="))
+            .collect()
+    }
+
+    /// C-289: the marker is not forgeable from the caller-override slot when the sandbox is
+    /// **inactive** — this project's default posture, and the case `build_command`'s marker write
+    /// used to leave completely undefended. Nothing wraps this spawn and nothing confines this
+    /// process, so a child that read `FLUX_SANDBOXED=1` and skipped `Sandbox::resolve`'s re-wrap
+    /// would believe in a boundary that does not exist.
+    ///
+    /// This is C-276's defect pointed the other way: there the marker travelled without the posture,
+    /// here it travelled without the confinement.
+    #[tokio::test]
+    async fn an_inactive_sandbox_refuses_a_forged_confinement_marker() {
+        let (dir, sys) = temp_workspace();
+        // The marker's one legitimate source is this process's own ambient environment (an outer
+        // flux sandbox put it there). Clear it under the shared lock so the only `FLUX_SANDBOXED` in
+        // play is the forged one below, and so a concurrent test cannot supply a real one.
+        let _env = sandbox::EnvGuard::new(&["FLUX_SANDBOXED"]);
+        // `temp_workspace` builds `System::new`, whose sandbox is `Sandbox::disabled()` — inactive,
+        // exactly the shipped default.
+        assert!(
+            !sys.sandbox().is_active(),
+            "the default posture is inactive"
+        );
+        let out = sys
+            .run_with_env(
+                &["env".to_string()],
+                &[("FLUX_SANDBOXED".to_string(), "1".to_string())],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            child_marker_lines(&out.stdout).is_empty(),
+            "a call site forged the confinement marker through the override slot: child marker \
+             lines: {:?}\nfull child env:\n{}",
+            child_marker_lines(&out.stdout),
+            out.stdout
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other direction, and the one a fix must not break by clearing the marker unconditionally:
+    /// a process running inside an **outer** flux sandbox genuinely *is* confined without having
+    /// wrapped anything itself (`Backend::AlreadyConfined`), and so is every descendant of it.
+    /// Communicating that is the marker's entire purpose — a nested `flux` that lost it would try to
+    /// re-wrap inside its own containment, which bwrap does not do cleanly under `--unshare-pid`.
+    ///
+    /// A call site cannot talk it *down* either: `FLUX_SANDBOXED=0` is the falsy spelling
+    /// `Sandbox::resolve` reads as "not confined", so honoring it in the override slot would be a way
+    /// to force a descendant to re-wrap. The marker is rendered, not forwarded — it comes out `1`.
+    #[tokio::test]
+    async fn an_outer_flux_sandbox_still_marks_its_descendants_and_a_caller_cannot_clear_it() {
+        let (dir, sys) = temp_workspace();
+        let _env = sandbox::EnvGuard::new(&["FLUX_SANDBOXED"]);
+        // What an outer flux sandbox leaves in this process's environment once it has wrapped us.
+        std::env::set_var("FLUX_SANDBOXED", "1");
+        let out = sys
+            .run_with_env(
+                &["env".to_string()],
+                &[("FLUX_SANDBOXED".to_string(), "0".to_string())],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            child_marker_lines(&out.stdout),
+            vec!["FLUX_SANDBOXED=1"],
+            "an outer sandbox's confinement must reach every hop down the process tree, and no call \
+             site may talk it down.\nfull child env:\n{}",
+            out.stdout
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same inherited confinement over the **exempt** seam. `Confinement::Exempt` says "this
+    /// spawn is not wrapped by *us*"; it says nothing about whether an outer boundary already holds,
+    /// and the trusted-host children behind it (the local-eval child `flux`, `spawn_debug_pipe`) sit
+    /// inside that boundary exactly as a wrapped spawn would.
+    ///
+    /// Without such a boundary the exempt seam forges nothing either — that child is precisely the
+    /// one that must confine its OWN descendants.
+    #[tokio::test]
+    async fn an_exempt_spawn_inherits_outer_confinement_but_forges_nothing_without_it() {
+        let (dir, sys) = temp_workspace();
+        let _env = sandbox::EnvGuard::new(&["FLUX_SANDBOXED"]);
+        std::env::set_var("FLUX_SANDBOXED", "1");
+        let inherited = sys
+            .run_with_env_exempt(&["env".to_string()], &[], Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            child_marker_lines(&inherited.stdout),
+            vec!["FLUX_SANDBOXED=1"],
+            "an exempt spawn is still inside whatever confines its parent.\nfull child env:\n{}",
+            inherited.stdout
+        );
+
+        std::env::remove_var("FLUX_SANDBOXED");
+        let forged = sys
+            .run_with_env_exempt(
+                &["env".to_string()],
+                &[("FLUX_SANDBOXED".to_string(), "1".to_string())],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            child_marker_lines(&forged.stdout).is_empty(),
+            "child marker lines: {:?}\nfull child env:\n{}",
+            child_marker_lines(&forged.stdout),
+            forged.stdout
         );
         std::fs::remove_dir_all(&dir).ok();
     }

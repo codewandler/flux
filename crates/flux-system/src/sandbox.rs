@@ -897,16 +897,64 @@ pub enum Confinement {
     Exempt,
 }
 
-/// The `(key, value)` env override a spawn gets once it is genuinely wrapped — split out from
-/// `build_command` so the decision is unit-testable without a live backend. `None` for an
-/// `Exempt` spawn or an inactive sandbox: the marker must only ever claim confinement that
-/// genuinely happened, because a nested child trusts it to skip re-wrapping.
-pub(crate) fn sandbox_marker(
-    confinement: Confinement,
-    sandbox: &Sandbox,
-) -> Option<(&'static str, &'static str)> {
-    (confinement == Confinement::Sandboxed && sandbox.is_active())
-        .then_some(("FLUX_SANDBOXED", "1"))
+/// The confinement marker's env key: the one variable a child `flux` reads as *"you are already
+/// inside a wrapper — do not nest"* ([`Sandbox::resolve`]). Named rather than spelled out at each
+/// use so the write side, the removal side, and [`SANDBOX_ENV_KEYS`] cannot drift apart.
+pub const MARKER_ENV: &str = "FLUX_SANDBOXED";
+
+/// What [`MARKER_ENV`] must say in a child's environment — split out from `build_command` so the
+/// decision is unit-testable without a live backend.
+///
+/// Both variants are an *instruction*, and that is the point (C-289). The marker's integrity is
+/// what stops a process from skipping its own confinement, so `build_command` states it in both
+/// directions instead of only writing it when it happens to be true: an unconfined child gets the
+/// key **removed**, not left at whatever a call site put in the override slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Marker {
+    /// Something genuinely confines this child — stamp `FLUX_SANDBOXED=1`.
+    Confined,
+    /// Nothing confines this child — remove the key from its environment.
+    Unconfined,
+}
+
+/// Whether the child of a spawn is genuinely confined, and therefore what `build_command` writes to
+/// [`MARKER_ENV`]. Rendered from facts, never forwarded from the caller's `env`.
+///
+/// Two things confine a child, and both must count:
+///
+/// - **This spawn is wrapped by us** — a [`Confinement::Sandboxed`] spawn over an *active* sandbox.
+///   [`Sandbox::wrap_argv`] has put a bubblewrap/Seatbelt prefix in front of it.
+/// - **An outer flux sandbox already confines this whole process tree** — [`Backend::AlreadyConfined`],
+///   or the truthy ambient marker that resolves to it. Such a process wrapped nothing itself and is
+///   still confined, and so is every descendant it spawns, `Exempt` ones included. Communicating
+///   that is the marker's entire purpose; clearing it here would make a nested `flux` re-wrap inside
+///   its own containment, which bwrap does not do cleanly under `--unshare-pid`.
+///
+/// The second fact is read from this process's **ambient environment**, deliberately unlike
+/// [`posture_env`], which renders from `sandbox` and never from `std::env`. The two are different
+/// kinds of fact. A posture is *configuration* an embedder may legitimately pin against the ambient
+/// env (`System::with_sandbox` exists for that), so taking it from the environment would ship the
+/// wrong one. Whether this process is inside somebody else's namespaces is *inherited process
+/// state*, set by the parent that actually wrapped us — no pinned `Sandbox` can make it true or
+/// false, and [`Sandbox::resolve`] already trusts exactly this source for exactly this question. It
+/// is also read through [`env_truthy`], so a falsy `FLUX_SANDBOXED=0` is "not confined" here just as
+/// it is there. [`Sandbox::confined_by_parent`] is consulted as well, so a `Sandbox` resolved at
+/// startup keeps deciding correctly if the ambient env is mutated later.
+///
+/// **The limit, stated so it is not re-derived as a guarantee:** this makes the marker unforgeable
+/// from the *caller-override slot* — the in-process `env` argument every spawn mode threads through
+/// `build_command`, and the slot C-282 found two forwarders filling from untrusted material. It does
+/// not defend the ambient environment of the flux process itself, which cannot be defended from
+/// inside: whoever sets it is the process's own parent, and a parent that can lie about confinement
+/// could equally have skipped launching flux at all.
+pub(crate) fn sandbox_marker(confinement: Confinement, sandbox: &Sandbox) -> Marker {
+    let wrapped_by_this_spawn = confinement == Confinement::Sandboxed && sandbox.is_active();
+    let confined_by_an_outer_flux = sandbox.confined_by_parent() || env_truthy(MARKER_ENV);
+    if wrapped_by_this_spawn || confined_by_an_outer_flux {
+        Marker::Confined
+    } else {
+        Marker::Unconfined
+    }
 }
 
 /// The `FLUX_SANDBOX` spelling of a mode — the exact vocabulary [`SandboxSettings::from_env`]
@@ -930,10 +978,14 @@ fn mode_env_value(mode: SandboxMode) -> &'static str {
 /// env) must therefore be able to refuse a posture key, and it must refuse against *this* list
 /// rather than a hand-copied one that drifts as the posture grows.
 ///
-/// `FLUX_SANDBOXED` is **absent by definition**, not by judgement: this list is exactly what
-/// [`posture_env`] emits, and the marker is not part of the posture. A call site filtering an
-/// untrusted env wants [`SANDBOX_ENV_KEYS`] instead, which is this list *plus* the marker — see
-/// there for why the marker needs filtering too.
+/// [`MARKER_ENV`] is **absent by definition**, not by judgement: this list is exactly what
+/// [`posture_env`] emits, and the marker is not part of the posture. C-289 re-asked the question —
+/// C-282 had left the marker out partly on the strength of a "cannot be forged" claim that only held
+/// for a wrapped spawn — and the answer did not change, for a now-stronger reason. The marker is no
+/// longer a *forwarded* value at all: [`sandbox_marker`] renders it and `build_command` writes or
+/// removes it after the override slot in every case, so it is not something a posture filter has to
+/// reach. A call site filtering an untrusted env wants [`SANDBOX_ENV_KEYS`], which is this list
+/// *plus* the marker — see there for why it still lists it.
 pub const POSTURE_ENV_KEYS: &[&str] = &[
     "FLUX_SANDBOX",
     "FLUX_SANDBOX_NET",
@@ -943,30 +995,28 @@ pub const POSTURE_ENV_KEYS: &[&str] = &[
 ];
 
 /// Every sandbox-related key a call site must refuse when it assembles a child's environment out of
-/// material it does not itself control — [`POSTURE_ENV_KEYS`] **plus the `FLUX_SANDBOXED` marker**.
+/// material it does not itself control — [`POSTURE_ENV_KEYS`] **plus the [`MARKER_ENV`] marker**.
 ///
-/// The marker is here because forging it is *worse* than pushing `FLUX_SANDBOX=off`, and because
-/// nothing else stops it. Be exact about the guarantee, since the obvious reading of
-/// `build_command` overstates it: [`sandbox_marker`] returns `Some` only for a
-/// [`Confinement::Sandboxed`] spawn over an **active** sandbox, and `build_command` writes the key
-/// only on `Some`. So the marker is unforgeable exactly when the spawn is *genuinely wrapped* —
-/// there the marker is written after the caller's overrides and wins. When the spawn is **not**
-/// wrapped — an `Exempt` spawn, or the inactive sandbox that is this project's default posture —
-/// nothing is written after the caller's env at all, and a caller-supplied `FLUX_SANDBOXED=1` goes
-/// through verbatim. A child `flux` reads that marker as "you are already inside a wrapper, do not
-/// nest" ([`Sandbox::resolve`]) and declines to confine itself.
+/// The posture keys are here because they are genuinely undefended downstream: `build_command`
+/// applies [`posture_env`] *before* the override slot, so whatever a call site puts there wins.
+/// Refusing them is the only thing standing between an untrusted env and the posture.
 ///
-/// That the unwrapped case is undefended is a **pre-existing property of `build_command`**, filed
-/// separately; this list does not fix it. What it does is stop the two call sites that build a
-/// child env from untrusted material (a benchmark fixture's `env`, an embedder's startup `env`)
-/// from being the vehicle for it.
+/// The marker is here for a weaker but still real reason, and the difference is worth keeping
+/// straight. Since C-289 `build_command` **renders** the marker after the override slot in every
+/// case — writing `1` when something genuinely confines the child, removing the key when nothing
+/// does ([`sandbox_marker`]) — so a forged `FLUX_SANDBOXED=1` in a caller's `env` no longer reaches
+/// any child, wrapped or not, and this list is no longer what stops it. It stays for two reasons
+/// worth the entry: a call site that *does* carry the key is describing a child environment it
+/// cannot actually produce, and dropping it at the source keeps the two honest; and refusing it here
+/// means an operator sees the refusal named at the forwarder (`flux-eval`'s runner does exactly
+/// that) rather than watching a value vanish silently one layer down.
 pub const SANDBOX_ENV_KEYS: &[&str] = &[
     "FLUX_SANDBOX",
     "FLUX_SANDBOX_NET",
     "FLUX_SANDBOX_WRITABLE",
     "FLUX_BWRAP_BIN",
     "FLUX_SANDBOX_EXEC_BIN",
-    "FLUX_SANDBOXED",
+    MARKER_ENV,
 ];
 
 /// Whether `key` names part of the sandbox posture — see [`POSTURE_ENV_KEYS`]. This is the
@@ -1814,15 +1864,11 @@ mod tests {
         assert_eq!(wrapped, argv);
     }
 
-    // -- sandbox_marker (the FLUX_SANDBOXED injection decision) --------------------------------
+    // -- sandbox_marker (the FLUX_SANDBOXED decision) -------------------------------------------
 
-    #[test]
-    fn sandbox_marker_is_none_when_inactive_or_exempt() {
-        let inactive = Sandbox::disabled();
-        assert_eq!(sandbox_marker(Confinement::Sandboxed, &inactive), None);
-
-        // Even an `active` (fake, test-only) backend is not marked when the spawn is Exempt.
-        let active = Sandbox {
+    /// An `active` (fake, test-only) backend — the wrapper binary is never actually run here.
+    fn active_backend() -> Sandbox {
+        Sandbox {
             settings: SandboxSettings {
                 mode: SandboxMode::On,
                 network: true,
@@ -1831,25 +1877,72 @@ mod tests {
             backend: Backend::Bubblewrap {
                 bwrap: PathBuf::from("/usr/bin/bwrap"),
             },
-        };
-        assert_eq!(sandbox_marker(Confinement::Exempt, &active), None);
+        }
+    }
+
+    /// Nothing wrapped this spawn and nothing confines this process, so the marker is an
+    /// instruction to **remove** the key — not merely "don't write one". C-289: leaving it at
+    /// whatever the caller's `env` said is what made it forgeable in the default posture.
+    #[test]
+    fn sandbox_marker_is_unconfined_when_nothing_wrapped_the_spawn() {
+        let _env = EnvGuard::new(&[MARKER_ENV]);
+        assert_eq!(
+            sandbox_marker(Confinement::Sandboxed, &Sandbox::disabled()),
+            Marker::Unconfined
+        );
+        // An `Exempt` spawn is not wrapped either, active backend or not.
+        assert_eq!(
+            sandbox_marker(Confinement::Exempt, &active_backend()),
+            Marker::Unconfined
+        );
     }
 
     #[test]
-    fn sandbox_marker_fires_only_for_sandboxed_confinement_over_an_active_backend() {
-        let active = Sandbox {
+    fn sandbox_marker_is_confined_for_a_sandboxed_spawn_over_an_active_backend() {
+        let _env = EnvGuard::new(&[MARKER_ENV]);
+        assert_eq!(
+            sandbox_marker(Confinement::Sandboxed, &active_backend()),
+            Marker::Confined
+        );
+    }
+
+    /// The case a fix must not break: a process inside an **outer** flux sandbox wrapped nothing
+    /// itself and is still confined, and so is everything it spawns — `Exempt` spawns included.
+    /// Both spellings of that fact count, so a `Sandbox` resolved at startup keeps deciding
+    /// correctly even if the ambient env is mutated afterwards.
+    #[test]
+    fn sandbox_marker_is_confined_when_an_outer_flux_sandbox_already_holds() {
+        let _env = EnvGuard::new(&[MARKER_ENV]);
+
+        let already_confined = Sandbox {
             settings: SandboxSettings {
                 mode: SandboxMode::On,
                 network: true,
                 extra_writable: Vec::new(),
             },
-            backend: Backend::Bubblewrap {
-                bwrap: PathBuf::from("/usr/bin/bwrap"),
-            },
+            backend: Backend::AlreadyConfined,
         };
+        assert!(!already_confined.is_active(), "it wraps nothing of its own");
+        for confinement in [Confinement::Sandboxed, Confinement::Exempt] {
+            assert_eq!(
+                sandbox_marker(confinement, &already_confined),
+                Marker::Confined,
+                "{confinement:?}"
+            );
+        }
+
+        // The ambient marker alone, with a sandbox that never re-read it (`System::new`'s default).
+        std::env::set_var(MARKER_ENV, "1");
         assert_eq!(
-            sandbox_marker(Confinement::Sandboxed, &active),
-            Some(("FLUX_SANDBOXED", "1"))
+            sandbox_marker(Confinement::Exempt, &Sandbox::disabled()),
+            Marker::Confined
+        );
+        // Read with `env_truthy` semantics, exactly as `Sandbox::resolve` reads it: the falsy
+        // spelling is "not confined" in both places, so the two can never disagree.
+        std::env::set_var(MARKER_ENV, "0");
+        assert_eq!(
+            sandbox_marker(Confinement::Exempt, &Sandbox::disabled()),
+            Marker::Unconfined
         );
     }
 
