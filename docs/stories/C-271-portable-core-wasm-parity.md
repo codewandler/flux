@@ -2,7 +2,7 @@
 id: C-271
 title: "Prove the portable core compiles to `wasm32` and evaluates a model-free flow"
 pillar: Core
-status: blocked
+status: ready
 priority: 5
 epic: portable-wasm-runtime
 design: docs/designs/portable-wasm-runtime.md
@@ -32,7 +32,17 @@ engine produces for the same source.
 
 ## Progress
 
-- (blocked on C-269, C-270 and **C-274** — C-270 has landed, and in landing it found that C-274 is the
+- **2026-07-30 — UNBLOCKED.** All three prerequisites are on `main`: C-269 (the `System` port),
+  C-270 (the engine state port) and C-274 (SQLite made an opt-out feature, verified by
+  `cargo tree -p codewandler-flux-flow --no-default-features -e normal -i rusqlite` reporting nothing).
+  C-274's implementor also enumerated the remaining SQLite reach for you: **none** in the portable core —
+  `flux-tools` is a dev-dependency only, `flux-capabilities` is L5, `flux-cli` is L6. So this story
+  inherits no SQLite work. What it still owns, per the design and C-270's findings: `flux-system`'s
+  concrete `System` is now a port but the file family is unported, `tokio`, and `now_ms()` calling
+  `SystemTime::now` in both state facades — unavailable on `wasm32-unknown-unknown`, so the clock is a
+  host import.
+
+- (superseded) (blocked on C-269, C-270 and **C-274** — C-270 has landed, and in landing it found that C-274 is the
   real `wasm32` prerequisite: `rusqlite` reaches the engine via flux-events non-optionally, so nothing
   here can build until that dependency is made optional. Also inherited from C-270: `now_ms()` calls
   `SystemTime::now`, which does not exist on `wasm32-unknown-unknown` — the clock is a host import.)
