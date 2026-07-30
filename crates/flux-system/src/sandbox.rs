@@ -909,6 +909,104 @@ pub(crate) fn sandbox_marker(
         .then_some(("FLUX_SANDBOXED", "1"))
 }
 
+/// The `FLUX_SANDBOX` spelling of a mode — the exact vocabulary [`SandboxSettings::from_env`]
+/// parses back, so a rendered posture round-trips into the same posture.
+fn mode_env_value(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Off => "off",
+        SandboxMode::On => "on",
+        SandboxMode::Require => "require",
+    }
+}
+
+/// C-276: the posture a spawn hands to its child, alongside the `FLUX_SANDBOXED` marker
+/// [`sandbox_marker`] injects. Split out from `apply_safe_env` so the decision is unit-testable
+/// without a live backend.
+///
+/// The defect this closes was an **asymmetry**: `SAFE_ENV` carried `FLUX_SANDBOXED` — the marker
+/// whose whole job is to assert *"you are already confined"* — and none of the variables that
+/// decide whether confinement happens. A spawned `flux` therefore resolved its posture from an
+/// environment containing no posture, got `off` (the opt-in default), and so declined to confine
+/// its own descendants while the operator had demanded `require`. Forwarding a claim of
+/// confinement without the means to enforce it is strictly worse than forwarding nothing.
+///
+/// **Every value here is rendered from `sandbox`, never read back out of `std::env`.** That is not
+/// a stylistic choice. `System::with_sandbox` exists so an embedder can pin a posture *independent
+/// of the ambient environment* (`flux-sdk`'s `SystemBuilder`: "pass one only to pin a posture
+/// independent of ambient env"), so the two sources legitimately disagree. Deciding *whether* to
+/// forward from the resolved sandbox while taking *what* to forward from the environment produced
+/// exactly the failure this function exists to prevent: a pinned `On` sandbox under an ambient
+/// `FLUX_SANDBOX=off` passed the gate and then handed the child the kill switch — leaving it less
+/// confined than forwarding nothing at all. One source, or the guarantee is fiction.
+///
+/// The posture travels as a **floor, never a ceiling**. Two consequences, and both are load-bearing
+/// because on the reading side these values do not merely *inform* a child, they *beat* it:
+/// - An `Off` sandbox forwards **nothing** — not even `FLUX_SANDBOX=off`. `off` is not "no
+///   opinion"; it is `flux-cli`'s explicit kill switch, which short-circuits ahead of a child's own
+///   `[sandbox] require` *and* C-262's unattended fail-closed profile.
+/// - An **open** network forwards nothing either. `FLUX_SANDBOX_NET` is emitted only to say
+///   *closed*, because a truthy value likewise beats both `[sandbox] network` and C-262's
+///   unattended-closed default. An unrestricted network is the absence of a restriction, and
+///   absence is not something a parent gets to impose. This mirrors `flux-cli`'s own exporter,
+///   which writes the variable when narrowing and otherwise leaves it alone.
+///
+/// Withholding in both cases leaves the child free to resolve its own (possibly stricter) posture,
+/// which is exactly the pre-C-276 behaviour. So for those two keys — and **only** those two — what
+/// this function returns can never loosen a child; read the `FLUX_SANDBOX_WRITABLE` bullet below
+/// for the one that is a union rather than a narrowing. The guarantee is a property of *this
+/// function*, not of the whole spawn path: `apply_safe_env` applies a caller's explicit `env`
+/// overrides after this, and a call site is free to push anything it likes into that slot.
+///
+/// Why each key is safe to add to the allow-list, against the deny-by-default rule that flux never
+/// forwards a host credential to a child:
+/// - `FLUX_SANDBOX` / `FLUX_SANDBOX_NET`: an `off|on|require` enum and a flag. Controls, not
+///   values, and per the floor rule they can only tighten.
+/// - `FLUX_SANDBOX_WRITABLE`: the extra writable set **this process resolved**, which is also the
+///   set it just bound into the child's own wrapper via [`SpawnPolicy::for_workspace`]. This one is
+///   *not* a strict narrowing, and saying so matters: `flux-cli`'s reader **unions** the forwarded
+///   list with the child's own `[sandbox] writable` and de-dupes it, so a child that would have
+///   confined its descendants to its own roots now also grants the parent's. That is bounded, not
+///   an escape — every path in it is already writable in the envelope the child itself is running
+///   under, in both the wrapped and the `Exempt` case, so a grandchild cannot reach outside what
+///   the parent already permitted. Same category as the already-forwarded `PATH`/`HOME`/
+///   `KUBECONFIG` — a filename is not a credential.
+/// - `FLUX_BWRAP_BIN` / `FLUX_SANDBOX_EXEC_BIN`: the **absolute path discovery resolved and the
+///   preflight probe verified** — the wrapper this process actually runs, not whatever the
+///   environment asked for. A sandbox with no backend of its own ([`Backend::Unsupported`], or
+///   [`Backend::AlreadyConfined`], which needs none) forwards neither, and the child discovers for
+///   itself; it cannot inherit a wrapper this process never established. Forwarding the verified
+///   path is strictly better than dropping it, since the child's fallback is a `PATH` lookup and
+///   `PATH` is already forwarded — dropping it would hand wrapper selection to the weaker channel.
+pub(crate) fn posture_env(sandbox: &Sandbox) -> Vec<(&'static str, String)> {
+    let settings = sandbox.settings();
+    if settings.mode == SandboxMode::Off {
+        return Vec::new();
+    }
+    let mut out = vec![("FLUX_SANDBOX", mode_env_value(settings.mode).to_string())];
+    if !settings.network {
+        out.push(("FLUX_SANDBOX_NET", "0".to_string()));
+    }
+    if !settings.extra_writable.is_empty() {
+        // `:`-joined, the separator `SandboxSettings::from_env` splits on. A path containing `:`
+        // cannot survive that channel — a pre-existing property of the variable, not of this hop.
+        let joined = settings
+            .extra_writable
+            .iter()
+            .map(|p| path_str(p))
+            .collect::<Vec<_>>()
+            .join(":");
+        out.push(("FLUX_SANDBOX_WRITABLE", joined));
+    }
+    match &sandbox.backend {
+        Backend::Bubblewrap { bwrap } => out.push(("FLUX_BWRAP_BIN", path_str(bwrap))),
+        Backend::Seatbelt { sandbox_exec } => {
+            out.push(("FLUX_SANDBOX_EXEC_BIN", path_str(sandbox_exec)))
+        }
+        Backend::AlreadyConfined | Backend::Unsupported { .. } => {}
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Backend argv builders (D-131 bubblewrap, D-132 Seatbelt)
 // ---------------------------------------------------------------------------
@@ -1690,6 +1788,137 @@ mod tests {
         assert_eq!(
             sandbox_marker(Confinement::Sandboxed, &active),
             Some(("FLUX_SANDBOXED", "1"))
+        );
+    }
+
+    // -- posture_env (C-276: the marker never travels alone) ------------------------------------
+
+    /// Build a `Sandbox` directly, bypassing `resolve` — these tests are about what a *given*
+    /// resolved posture hands on, with no host, env or backend probe in the loop.
+    fn pinned(mode: SandboxMode, network: bool, extra: &[&str], backend: Backend) -> Sandbox {
+        Sandbox {
+            settings: SandboxSettings {
+                mode,
+                network,
+                extra_writable: extra.iter().map(PathBuf::from).collect(),
+            },
+            backend,
+        }
+    }
+
+    /// A confining sandbox hands its posture on **as values, not as key names**. Asserted
+    /// exhaustively rather than by membership: a setting added to `SandboxSettings` and forgotten
+    /// here recreates this story's defect — a child told it is confined without being told with
+    /// what.
+    ///
+    /// Note what the wrapper path is: the absolute binary *discovery resolved and the probe
+    /// verified*, which is what this process actually runs. It is not an echo of `FLUX_BWRAP_BIN`,
+    /// and no ambient environment is consulted to produce any of these.
+    #[test]
+    fn a_posture_travels_whole_so_a_child_can_enforce_what_the_marker_claims() {
+        let confining = pinned(
+            SandboxMode::Require,
+            false,
+            &["/output", "/scratch"],
+            Backend::Bubblewrap {
+                bwrap: PathBuf::from("/nix/store/abc/bin/bwrap"),
+            },
+        );
+        assert_eq!(
+            posture_env(&confining),
+            vec![
+                ("FLUX_SANDBOX", "require".to_string()),
+                ("FLUX_SANDBOX_NET", "0".to_string()),
+                ("FLUX_SANDBOX_WRITABLE", "/output:/scratch".to_string()),
+                ("FLUX_BWRAP_BIN", "/nix/store/abc/bin/bwrap".to_string()),
+            ]
+        );
+
+        // macOS resolves the other wrapper; same rule, same source.
+        let seatbelt = pinned(
+            SandboxMode::On,
+            false,
+            &[],
+            Backend::Seatbelt {
+                sandbox_exec: PathBuf::from("/usr/bin/sandbox-exec"),
+            },
+        );
+        assert_eq!(
+            posture_env(&seatbelt),
+            vec![
+                ("FLUX_SANDBOX", "on".to_string()),
+                ("FLUX_SANDBOX_NET", "0".to_string()),
+                ("FLUX_SANDBOX_EXEC_BIN", "/usr/bin/sandbox-exec".to_string()),
+            ]
+        );
+    }
+
+    /// A sandbox with no wrapper of its own hands on the *request* and no wrapper path: it cannot
+    /// pass down a binary it never established. `On`-but-unavailable still forwards the mode, so a
+    /// child that does have a backend honors what this process asked for and could not do.
+    #[test]
+    fn a_sandbox_without_a_backend_forwards_the_request_but_no_wrapper_path() {
+        let unbacked = pinned(
+            SandboxMode::On,
+            true,
+            &[],
+            Backend::Unsupported {
+                reason: "bwrap not found".to_string(),
+            },
+        );
+        assert_eq!(
+            posture_env(&unbacked),
+            vec![("FLUX_SANDBOX", "on".to_string())]
+        );
+
+        // Already inside an outer flux sandbox: the marker carries that fact, and a nested process
+        // needs no wrapper path because it will not wrap.
+        let nested = pinned(SandboxMode::Require, true, &[], Backend::AlreadyConfined);
+        assert_eq!(
+            posture_env(&nested),
+            vec![("FLUX_SANDBOX", "require".to_string())]
+        );
+    }
+
+    /// Floor-never-ceiling, first consequence: an `Off` sandbox forwards NOTHING rather than
+    /// `FLUX_SANDBOX=off`. On the reading side `off` is not "no opinion" — it is `flux-cli`'s kill
+    /// switch, which short-circuits ahead of a child's own `[sandbox] require` and C-262's
+    /// unattended fail-closed profile. Handing it down would make this fix a new bypass channel.
+    #[test]
+    fn an_off_sandbox_forwards_no_posture_so_a_parent_can_never_downgrade_a_child() {
+        assert!(posture_env(&Sandbox::disabled()).is_empty());
+        // Even with a real backend discovered and a narrowed network to talk about: `Off` is the
+        // absence of a posture, and absence is what gets forwarded.
+        let off_with_backend = pinned(
+            SandboxMode::Off,
+            false,
+            &["/output"],
+            Backend::Bubblewrap {
+                bwrap: PathBuf::from("/usr/bin/bwrap"),
+            },
+        );
+        assert!(posture_env(&off_with_backend).is_empty());
+    }
+
+    /// Floor-never-ceiling, second consequence: `FLUX_SANDBOX_NET` is emitted only to say *closed*.
+    /// A truthy value beats both `[sandbox] network` and C-262's unattended-closed default on the
+    /// reading side, so forwarding "open" would let a parent re-open a network the child would have
+    /// shut — a ceiling. An unrestricted network is the absence of a restriction, and absence is
+    /// not a parent's to impose.
+    #[test]
+    fn an_open_network_forwards_nothing_because_only_a_narrowing_is_a_floor() {
+        let open = pinned(
+            SandboxMode::Require,
+            true,
+            &[],
+            Backend::Bubblewrap {
+                bwrap: PathBuf::from("/usr/bin/bwrap"),
+            },
+        );
+        let forwarded = posture_env(&open);
+        assert!(
+            !forwarded.iter().any(|(k, _)| *k == "FLUX_SANDBOX_NET"),
+            "an open network must not be forwarded: {forwarded:?}"
         );
     }
 

@@ -5,13 +5,17 @@
 //! side: that flux still *works* when a backend exists, and that the confinement it then claims is
 //! real. Until this file, that path ran on no CI runner at all.
 //!
-//! Both tests are gated on `FLUX_TEST_SANDBOX_BACKEND=1` — the caller's promise that a usable backend
-//! is installed — for the same reason the Postgres suites are gated on `TEST_POSTGRES_URL`: the
-//! posture a test needs must be *declared*, never inferred from whatever the host happens to have.
+//! Every test here is gated on `FLUX_TEST_SANDBOX_BACKEND=1` — the caller's promise that a usable
+//! backend is installed — for the same reason the Postgres suites are gated on `TEST_POSTGRES_URL`:
+//! the posture a test needs must be *declared*, never inferred from whatever the host happens to have.
 //! Unset, they skip. Set, they are unforgiving: [`a_promised_backend_is_real_and_functional`] fails
 //! the run when the promise is empty, because a lane that installs `bubblewrap` onto a kernel that
 //! refuses unprivileged user namespaces silently degrades into a second copy of the no-backend lane —
 //! green, and proving nothing. That specific false assurance is what this story exists to remove.
+//!
+//! C-276 then landed here for exactly that reason: the guarded spawn forwarded the confinement
+//! *marker* and not the posture, and only a lane with a real backend can see that — without one the
+//! marker is never stamped either, so the asymmetry has nothing to stand against.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -88,6 +92,22 @@ fn run_flux(tag: &str, extra: &[(&str, &str)], args: &[&str]) -> Run {
     }
 }
 
+/// The successful `bash` tool_result line of a mock run — what the child process reported back —
+/// or a panic carrying both streams. Every test here keys on a real child having actually run,
+/// because "the command succeeded" is also what a silently-degraded lane reports.
+fn tool_result_line(run: &Run) -> String {
+    run.stdout
+        .lines()
+        .find(|line| line.contains(r#""name":"bash""#) && line.contains(r#""is_error":false"#))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a bash tool_result proving a child process actually ran.\nstdout:\n{}\nstderr:\n{}",
+                run.stdout, run.stderr
+            )
+        })
+        .to_string()
+}
+
 /// The lane's premise, asserted instead of assumed. `doctor` deliberately probes with `on` regardless
 /// of the configured posture, so its `sandbox backend` check reports what is ACTUALLY available:
 /// `PASS` only when discovery found the wrapper *and* the functional preflight probe succeeded.
@@ -155,16 +175,7 @@ fn an_auto_approved_turn_runs_its_children_inside_the_sandbox() {
         "`require` + a real backend must START, not fail closed.\nstderr:\n{}",
         run.stderr
     );
-    let pid_line = run
-        .stdout
-        .lines()
-        .find(|line| line.contains(r#""name":"bash""#) && line.contains(r#""is_error":false"#))
-        .unwrap_or_else(|| {
-            panic!(
-                "expected a bash tool_result proving a child process actually ran.\nstdout:\n{}\nstderr:\n{}",
-                run.stdout, run.stderr
-            )
-        });
+    let pid_line = tool_result_line(&run);
     let pid: u32 = pid_line
         .split("pid=")
         .nth(1)
@@ -183,5 +194,135 @@ fn an_auto_approved_turn_runs_its_children_inside_the_sandbox() {
         !run.stderr.contains("UNCONFINED"),
         "a confined run must not disclose an unconfined posture.\nstderr:\n{}",
         run.stderr
+    );
+}
+
+/// C-276: the guarded spawn's env allow-list forwarded the confinement **marker** — `FLUX_SANDBOXED`,
+/// whose entire job is to assert *"you are already confined"* — and none of the variables that decide
+/// whether confinement actually happens. A child therefore read its posture out of an environment
+/// containing no posture, resolved `off` (sandboxing is opt-in), and declined to confine its own
+/// descendants while the operator had demanded `require`.
+///
+/// This proof has to live in *this* lane rather than in `sandbox_posture.rs`. Without a backend the
+/// parent's sandbox is never active, so the marker is never stamped on the child either, and the
+/// asymmetry is invisible — `off` and `require`-but-unavailable are indistinguishable from inside the
+/// child. With a backend the parent genuinely wraps the spawn, genuinely stamps `FLUX_SANDBOXED=1`,
+/// and a missing posture stands alone as the defect. That is exactly how this hid.
+///
+/// The child here is the sandboxed `bash` the agent ran, reporting its own environment. That is the
+/// same `build_command` a child `flux` goes through, and the variables it echoes are verbatim the ones
+/// `SandboxSettings::from_env` and backend discovery read back on the other side.
+#[test]
+fn a_confined_child_inherits_the_posture_and_not_only_the_marker() {
+    if !backend_promised("a_confined_child_inherits_the_posture_and_not_only_the_marker") {
+        return;
+    }
+    let run = run_flux(
+        "c276-posture-reaches-child",
+        &[
+            ("FLUX_SANDBOX", "require"),
+            ("FLUX_ENABLE_BASH", "1"),
+            (
+                "FLUX_MOCK_BASH",
+                // Exactly one wrapper variable is ever set (bwrap on Linux, sandbox-exec on
+                // macOS), so concatenating them reads whichever this host resolved.
+                "echo posture=[$FLUX_SANDBOX] marker=[$FLUX_SANDBOXED] \
+                 net=[$FLUX_SANDBOX_NET] wrapper=[$FLUX_BWRAP_BIN$FLUX_SANDBOX_EXEC_BIN]",
+            ),
+        ],
+        &[
+            "run",
+            "--stream-json",
+            "--yes",
+            "-m",
+            "mock",
+            "run a command",
+        ],
+    );
+    assert!(
+        run.success,
+        "`require` + a real backend must START, not fail closed.\nstderr:\n{}",
+        run.stderr
+    );
+    let reported = tool_result_line(&run);
+
+    // The marker travelled before this story and must keep travelling: nested-run detection depends
+    // on it surviving every hop. Asserted here so the test states the *asymmetry*, not half of it.
+    assert!(
+        reported.contains("marker=[1]"),
+        "the confinement marker must reach a genuinely wrapped child.\ntool_result: {reported}"
+    );
+    assert!(
+        reported.contains("posture=[require]"),
+        "the child was told it is confined (`marker=[1]`) but not with what: it reads no \
+         `FLUX_SANDBOX`, resolves `off`, and leaves its own descendants unconfined while the \
+         operator demanded `require`.\ntool_result: {reported}"
+    );
+    // `--yes` is an auto-approved surface, so C-262 narrowed the sandbox network to closed. That
+    // decision has to reach the child too, or a descendant re-opens what the parent shut.
+    assert!(
+        reported.contains("net=[0]"),
+        "the resolved network posture did not reach the child.\ntool_result: {reported}"
+    );
+    // The wrapper path is the sharpest evidence that these values come from the RESOLVED sandbox
+    // rather than from the ambient environment: nothing set `FLUX_BWRAP_BIN` on this run, so an
+    // env-echoing forwarder has nothing to echo. What the child sees is the absolute binary
+    // discovery found and the preflight probe verified — the one actually wrapping it.
+    let wrapper = reported
+        .split("wrapper=[")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or_else(|| panic!("no wrapper field in the tool_result: {reported}"));
+    assert!(
+        wrapper.starts_with('/'),
+        "the child inherited no resolved wrapper path (got {wrapper:?}), so it would rediscover \
+         one through `PATH` instead of using the binary this process verified.\n\
+         tool_result: {reported}"
+    );
+}
+
+/// The behavioural half: a real child `flux`, spawned through the guarded path from a parent running
+/// under `require`, must *resolve* `require` — not `off`.
+///
+/// The observable is the child's own startup audit line. A flux that resolves a non-`off` posture and
+/// finds itself already confined by an outer flux sandbox prints the C-217 OUTER-CONFINEMENT trust
+/// disclosure; a flux that resolved `off` short-circuits before any of that and is silent, because
+/// `Sandbox::resolve` checks `Off` first and never re-reads a marker as confinement. So the line's
+/// presence is precisely the difference between the two resolutions, observed from outside.
+#[test]
+fn a_child_flux_resolves_the_parents_require_posture() {
+    if !backend_promised("a_child_flux_resolves_the_parents_require_posture") {
+        return;
+    }
+    // Quoted so a path with spaces still spawns one process; `2>&1 >/dev/null` keeps the child's
+    // stderr (the only thing under test) and discards its stdout.
+    let nested = format!("'{}' changelog 2>&1 >/dev/null", env!("CARGO_BIN_EXE_flux"));
+    let run = run_flux(
+        "c276-child-flux-posture",
+        &[
+            ("FLUX_SANDBOX", "require"),
+            ("FLUX_ENABLE_BASH", "1"),
+            ("FLUX_MOCK_BASH", nested.as_str()),
+        ],
+        &[
+            "run",
+            "--stream-json",
+            "--yes",
+            "-m",
+            "mock",
+            "run a command",
+        ],
+    );
+    assert!(
+        run.success,
+        "`require` + a real backend must START, not fail closed.\nstderr:\n{}",
+        run.stderr
+    );
+    let reported = tool_result_line(&run);
+    assert!(
+        reported.contains("OUTER-CONFINEMENT"),
+        "the child flux said nothing about its confinement, which is what a resolved `off` looks \
+         like: it inherited the marker but no posture, so `Sandbox::resolve` returned early on \
+         `Off` and the operator's `require` died at the process boundary.\ntool_result: {reported}"
     );
 }
