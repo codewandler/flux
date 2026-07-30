@@ -6,6 +6,93 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A host can bound what a runtime *uses*, not only what it spends (C-290).** `ResourceLimits` adds a
+  ceiling on simultaneously executing tool calls, enforced in the funnel every in-process dispatch
+  traverses and reachable from `ClientBuilder`, `FlowClientBuilder` and `flux-config`'s `[limits]`.
+  Until now the only concurrency control in the tree was server-side and per-principal, so an in-process
+  embedder had none.
+  The memory half was **narrowed rather than shipped**: a library cannot observe or refuse an allocation
+  made by its caller, a provider SDK or a plugin subprocess, so an RSS knob would be inert. What is
+  bounded is the executor's op cache, previously capped at 512 *entries* with no byte bound at all.
+  ⚠ Scope, stated rather than implied: the ceiling does not descend into sub-agents and the `flux`
+  binary does not yet read `[limits]` — both tracked as C-299.
+
+- **The evidence log can be bounded without dropping a single observation (C-298).** It was a bare
+  `Vec` with no `clear`, no `retain` and no trim API, growing for the process lifetime — the largest
+  unbounded retention in a long-lived runtime. A configurable ceiling now elides the oldest *payloads*
+  behind a self-describing marker that travels into the durable event-store mirror, so an offline
+  auditor sees the elision too.
+  Dropping entries was rejected on evidence, not taste: four of seven readers depend on the log's
+  length, indices or per-kind counts. `metrics()` is cumulative, and `flux-flow`'s audit spill
+  addresses the log by absolute index, so front-compaction would silently stop it. The split is
+  **shape versus payload**. ⚠ Entry count remains unbounded, and the code says so rather than implying
+  a bound it does not deliver.
+
+- **The sub-agent fleet is visible in the TUI (C-224).** The `SpawnActivity` stream the terminal UI was
+  discarding now renders as a host-owned pane: role, status, elapsed, and a bounded activity line. A
+  worker's prose and thinking are never shown. The pane is the host's — a model can neither close,
+  repaint nor shadow it, and `pane.list` labels it as host-owned.
+
+### Changed
+
+- **Canonical control headers use call-like named options (L-96).** `confirm "Open issue?", risk: medium`
+  · `retry 3, backoff: exponential, delay: 500ms -> out` · `loop for 10s, every: 1s, until: done -> last`.
+  The `.flux` source change is **strictly additive** — every header spelling that parsed before still
+  parses to an identical AST, which is why the frozen AST hashes and every documentation fence needed no
+  edit. ⚠ The Rust API of `codewandler-flux-lang` is technically breaking: a new `SyntaxKind` variant on
+  a non-`#[non_exhaustive]` enum breaks a downstream exhaustive `match`.
+  The two new option labels are mirrored into all four editor grammars, and an in-repo guard now fails
+  when a label ships unmirrored (C-300) — the rule existed in `AGENTS.md` with no mechanism behind it.
+  ⚠ Known cost: `max` is also a prelude builtin, so `max(1, 2)` colours as a keyword in the three
+  context-free keyword-list grammars. Flux's own highlighter classifies by parent node and gets it right.
+
+- **Harness benchmarking is now flux-bench's job, and `flux eval` points at it (C-296).** `flux eval`
+  runs unchanged — a pointer on stderr, not a deprecation. The repository self-improvement loop stays
+  here, and the docs now argue why: it edits flux's own tree, and an instrument the measured harness can
+  rewrite is what flux-bench's own vision principle forbids.
+
+- **The harness discovery and scan layer moved out of the CLI binary into `flux-capabilities` (C-213).**
+  Behaviour is unchanged, pinned by the twelve existing tests passing with no edited assertions.
+
+### Fixed
+
+- **An agent-authored pane can no longer imitate the approval sheet (C-222).** The approval sheet is the
+  surface a human reads to grant permission; a pane that could counterfeit it made the approval boundary
+  decorative. Payloads are sanitized of styling, escape sequences, control bytes and — the part that
+  matters — every glyph from the drawing blocks, because ordinary box-drawing text paints a
+  pixel-accurate forgery without any escape sequence at all. An unsanitized payload is now unstorable
+  rather than merely unrendered.
+  ⚠ What is guaranteed and what is not, stated in the code: no styling, no drawing-block glyph, and not
+  one cell of the sheet reachable. **Not** guaranteed is that nothing a payload writes can *resemble* a
+  frame — ASCII always can. The rule kills the accurate imitation; the agent mark is what stands between
+  a user and a phish.
+  ⚠ Cost: a `Log` or `Markdown` payload can no longer echo `tree(1)` output, a progress bar or arrows.
+  Structure has typed channels for all three.
+
+- **The confinement marker is unforgeable in both directions (C-289).** `FLUX_SANDBOXED` tells a child
+  *"you are already confined, do not wrap yourself again"*, and any call site could forge it whenever the
+  sandbox was inactive — the default posture — so a child could be told it was confined when nothing
+  confined it. It is now rendered past the caller-override slot and can be neither forged nor cleared.
+  `Backend::AlreadyConfined` still works: a process inside an outer flux sandbox genuinely is confined
+  without having wrapped anything itself, and that case is distinguished rather than flattened.
+
+- **Two unverified claims about child-process spawning are now pinned (C-277).** A doc comment described
+  a `Confinement::Exempt` call site that was never built — and had been cited as precedent in a review
+  instruction, which is exactly how a fictional design gets followed. The exemption was deliberately not
+  wired to match it, because the spawn in question is sandboxed on purpose.
+  Worker readiness was a private string in an L6 crate matched by an L3 consumer, so no test could pin
+  the pair from either side. It is one shared L0 contract now. A fourth copy of the wording lived in a
+  test fixture and agreed with the *consumer*, so rewording the server would have left the whole
+  lifecycle suite green while every real worker timed out.
+
+- **A busy machine no longer reds the gate on no defect (C-297).** Skill and command discovery read the
+  operator's real home directory, so a concurrent session writing there failed an unrelated test — and
+  the failure signature was a truncated log that reads as a compile error. Discovery now resolves from an
+  injected environment. ⚠ The wider class is 73 hazardous tests across 11 crates, enumerated in the
+  story rather than half-fixed.
+
 ## [0.40.0] - 2026-07-30
 
 ### Added
