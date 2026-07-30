@@ -2,7 +2,7 @@
 id: C-247
 title: "`WhatIf::run`'s re-plan path mints the child before validating, so a refused re-plan still leaves a trace"
 pillar: Core
-status: in-progress
+status: done
 priority: 6
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
@@ -27,20 +27,37 @@ Hold the invariant everywhere it applies, so it stops being a property of the fo
 a property of session minting.
 
 ## Acceptance
-- [ ] **Failing-first test**: a re-plan refused because the parent history is invalid leaves **no**
+- [x] **Failing-first test**: a re-plan refused because the parent history is invalid leaves **no**
       child session behind — assert the session count is unchanged. It fails today.
-- [ ] A second failing-first case for the other bail: a re-plan refused because the target turn does
+- [x] A second failing-first case for the other bail: a re-plan refused because the target turn does
       not exist also leaves no child session behind.
-- [ ] Both checks are hoisted above the mint in `WhatIf::run`, mirroring C-211's shape at the fork
+- [x] Both checks are hoisted above the mint in `WhatIf::run`, mirroring C-211's shape at the fork
       sites — the validation, not the mint, comes first.
-- [ ] The refusals stay clean recoverable errors naming the session and the reason, as C-211's do.
-- [ ] Standard gate green in both workspaces.
+- [x] The refusals stay clean recoverable errors naming the session and the reason, as C-211's do.
+- [x] Standard gate green in both workspaces.
 
 ## Progress
 - 2026-07-30 — filed from the C-211 implementation. The implementor found it, correctly did not widen
   its own diff to cover it, and recorded it rather than dropping it. Hoisting the history check is
   mechanical; the turn-existence check is a second judgement call (it needs the turn resolved before
   anything is created), which is why this is its own story rather than a C-211 hunk.
+- 2026-07-30 — **done.** Recovered as an orphan: the implementor was killed mid-task by a coordinating
+  session crash, having left the work uncommitted but crate-test green. Its branch was preserved
+  verbatim before anything else, then reviewed independently and integrated without a rework round —
+  the only story of the four-story recovery wave that needed none.
+  The failing-first evidence had to be reconstructed, since a killed implementor files no
+  `BASE_PROOF`. It was established **analytically**: at the merge base the mint is unconditional and
+  precedes both refusals, and `EventStore::list` is a plain `SELECT` with no empty-stream filter
+  (`crates/flux-events/src/store/sqlite.rs:668-680`), so the orphan is genuinely observable by the
+  tests' probe. The refusals are also proven *reached* at the base rather than short-circuited by the
+  earlier `trace.is_empty()` guard, because `record_bind_session` performs a real run first.
+  The load-bearing detail is that both tests capture `events.list(1_000).len()` **before** the
+  refusal and re-assert equality after, and `panic!` on the `Ok` arm — so they observe the *absence
+  of a trace*, not merely that an error came back. A test asserting only `is_err()` would have passed
+  with the child still minted, which is the way this fix would most plausibly have been faked.
+  Scope held: the pure-substitution (`!replan`) path still mints before its **own** refusals, which
+  is outside this story's enumerated Acceptance and is filed as [C-254](C-254-whatif-substitution-path-mints-before-validating.md)
+  rather than widened into this diff — the same discipline that produced C-247 out of C-211.
 
 ## Notes
 - Sibling of C-211 (`docs/stories/C-211-fork-validates-before-minting-child.md`) — read its diff

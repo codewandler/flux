@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A refused `whatif` re-plan no longer leaves a child session behind (C-247).** C-211 established
+  the invariant *a failed operation leaves no trace* by hoisting `ValidHistory::new` above
+  `create_session_with_context` at both fork sites. `WhatIf::run`'s re-plan path had the identical
+  defect and was deliberately outside C-211's Acceptance — worse, it had **two** bails after the child
+  existed (an invalid parent history, and `session {src} has no turn {t} to re-plan`), so a refused
+  re-plan could orphan a session by either route. Both resolutions are pure reads of the source
+  session, so both now precede the mint, mirroring C-211's shape exactly.
+  **The load-bearing part is how it is tested, not the reorder.** Both tests capture
+  `events.list(1_000).len()` before the refusal and re-assert equality after, and `panic!` on the `Ok`
+  arm — so they observe the *absence of a trace* rather than merely that an error came back. An
+  `is_err()`-only assertion would pass with the child still minted, which is precisely how this class
+  of fix gets faked. The orphan is genuinely observable by that probe because `EventStore::list` is a
+  plain `SELECT` with no empty-stream filter, and the refusals are reached rather than short-circuited
+  by the earlier `trace.is_empty()` guard, because the fixture performs a real run first.
+  Recovered as an orphaned branch after a coordinating session crash killed its implementor mid-task,
+  so no `BASE_PROOF` existed and the failing-first evidence was reconstructed analytically at the merge
+  base. Scope was held rather than widened: the pure-substitution path still mints before its own three
+  refusals and is filed as **C-254** instead of being folded in — the same discipline that produced
+  C-247 out of C-211.
+
 - **The release-tag audit raced the release it audits, reddening `ci` on `main` on every cut (C-252).**
   `scripts/check-release-tags.sh` runs on every push to `main`; the tag workflow publishes the Release
   *asynchronously*. So a cut pushed `main`, the audit ran immediately, and it correctly-but-uselessly
