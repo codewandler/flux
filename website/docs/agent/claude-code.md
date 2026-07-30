@@ -31,7 +31,7 @@ your subscription.
 | Spec | Resolves to | Tier |
 |---|---|---|
 | `claude/fable` | `claude-fable-5` | Most capable — hardest, long-horizon work |
-| `claude/opus` | `claude-opus-4-8` | Frontier coding / agentic |
+| `claude/opus` | `claude-opus-5` | Frontier coding / agentic |
 | `claude/sonnet` (and bare `claude`) | `claude-sonnet-5` | Default — speed/quality balance |
 | `claude/haiku` | `claude-haiku-4-5` | Fastest, cheapest |
 | `claude/<full-id>` | verbatim | e.g. `claude/claude-sonnet-4-6` to pin a previous generation |

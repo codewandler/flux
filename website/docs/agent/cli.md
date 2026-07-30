@@ -52,7 +52,7 @@ and [Safety & approvals](./safety.md).
 | `flux preset …` | list, inspect, render, or run prebuilt flow recipes |
 | `flux changelog [version]` | read the embedded customer changelog (`--all` / `--unreleased`) |
 | `flux completion [shell]` | generate a completion script (fish by default) |
-| `flux doctor` | diagnose the install: credentials, plugin-pack integrity, sandbox backend, `events.db` health, egress config, `[tools] disable`, and version skew (`--json` for scripting) |
+| `flux doctor` | diagnose the install: credentials, plugin-pack integrity, sandbox backend, `events.db` health, egress config, version skew, `[tools] disable`, and config provenance (`--json` for scripting) |
 
 ## Global flags
 
@@ -199,7 +199,7 @@ consider "the plan" or "the result". Line `type`s:
 | `tool_call` | an operation is about to run | `session`, `name`, `input` |
 | `tool_result` | it finished | `session`, `name`, `is_error`, `content`, `view`, `duration_us` |
 | `steered` | mid-turn guidance was folded in (see below) | `session`, `messages` |
-| `turn_end` | once, at the end | `session`, `answer`, `usage`, `cost_usd` |
+| `turn_end` | once, at the end | `session`, `outcome` (`ok`/`error`), `error` (only when set), `answer`, `usage`, `cost_usd` |
 | `error` | the turn itself failed to run | `session`, `message` |
 
 `--stream-json-input` additionally reads the same NDJSON framing on stdin, for a multi-message
@@ -256,8 +256,8 @@ Bare `flux` opens a line-oriented REPL. Its built-in commands:
 | `/loop <n> <task>` | repeat a task up to `n` times |
 | `/exit` · `/quit` | leave the REPL (`Ctrl-D` also exits; `Ctrl-C` interrupts a running turn) |
 
-The [TUI](./tui.md#slash-commands) has its own, partly different set — it adds `/usage`, `/queue`,
-and `/theme`, and does not carry `/pd`, `/goal`, or `/loop`.
+The [TUI](./tui.md#slash-commands) has its own, partly different set — it adds `/new`, `/usage`,
+`/queue` and `/theme`, and does not carry `/pd`, `/goal`, or `/loop`.
 
 ## Command files
 

@@ -53,7 +53,9 @@ while let Some(event) = stream.next().await {
 let out = stream.finish().await?; // the same TurnOutput a plain `send` would return
 ```
 
-`AgentEvent` mirrors `AgentSink` one-to-one — every sink method has a variant.
+`AgentEvent` mirrors `AgentSink` closely, but not exhaustively: the sink's `tool_timing` callback has
+no event variant, so per-operation timing is available to an embedded sink and not to a stream
+consumer. Every other sink method has a variant.
 
 ## Cancelling a turn
 

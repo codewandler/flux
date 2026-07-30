@@ -54,6 +54,8 @@ different path on one substrate:
 
 ## Progress
 
+- **2026-07-30 — UNBLOCKED.** All three prerequisites landed on `main`: C-269 (the `System` port),
+  C-270 (the engine state port) and C-274 (SQLite made an opt-out feature).
 - **Landed.** `flux-lang` — the language *and its reference interpreter* — now builds for
   `wasm32-unknown-unknown`, and a parity test proves the wasm build and the native build produce
   byte-identical results (whole transcript, not just the return value) for the same `.flux` source.
@@ -87,6 +89,41 @@ different path on one substrate:
   prerequisite, so the parity test *skips* (loudly) when the artifact is absent and the build script
   is the thing that proves it. Wiring a CI job is a follow-up.
 - **No resource bound.** C-273.
+
+## Finding: this story needed none of its three prerequisites
+
+C-271 was blocked on C-269, C-270 and C-274. **As scoped, it required none of them.** The work was
+done on a branch based at `a0e431f9`, which predates all three merges (C-269 at `14d6673c`, C-274 at
+`10f1804f`), and the wasm32 build and the parity proof were already green there. `main` was merged in
+afterwards and changed nothing about the result.
+
+That is not an argument that the three were unnecessary — it is a correction to the epic's dependency
+graph. **They are prerequisites for the *engine* crossing, not for the *language core* crossing**, and
+this story turned out to be the second of those:
+
+- `flux-lang` reaches no `rusqlite` at all, so C-274's SQLite work never applied to it.
+- `flux-lang` reaches no `flux-system`, so C-269's `System` port never applied to it either.
+- `flux-lang` has its own value store (`MemStore`), not the engine's, so C-270's `FlowStateBackend`
+  never applied to it.
+
+The one real blocker was orthogonal to all three: `tokio`'s `net` feature pulling `mio`. The
+prerequisites become load-bearing at the *next* step — a `flux-flow` `FlowEngine` that crosses —
+which is the follow-up scoped above.
+
+## Traps for a later editor
+
+- **`flux_alloc` must return an allocation whose capacity equals its length.** It uses a boxed slice
+  (`vec![0u8; len].into_boxed_slice()`) precisely so `flux_dealloc` can rebuild it from `(ptr, len)`
+  alone. A `Vec::with_capacity` there may over-allocate, and freeing it as though capacity == len is
+  **undefined behaviour**. This is the only `unsafe` in the story's diff and the only place it is
+  subtle. The `(ptr << 32) | len` result packing likewise assumes a 32-bit address space — correct
+  for wasm32, silently wrong on wasm64.
+- **The parity test skips when the artifact is absent**, so `cargo test --workspace` is green on a
+  machine without the `wasm32-unknown-unknown` target — it prints `SKIP: …` and passes. That is
+  deliberate (the target is a manual `rustup target add`), but it means
+  **`scripts/build-portable-wasm.sh` is the load-bearing run** until a CI job wires it: the script
+  sets `FLUX_PORTABLE_WASM_REQUIRED=1`, which turns the skip into a failure. A regression in the
+  wasm build will not red the ordinary gate.
 
 ## Notes
 

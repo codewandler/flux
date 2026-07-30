@@ -52,8 +52,9 @@ flux stores tokens for both **providers** and **plugins** in a single file:
 ```
 
 Entries are keyed by purpose — `claude` and `codex` for provider subscriptions, and
-`plugin:<name>:<purpose>` for a plugin (for example `plugin:gitlab:api_token` or
-`plugin:slack:bot_token`). Each entry holds the access token and, for OAuth entries, the refresh
+`plugin:<name>:<purpose>` for a plugin, where the purpose is the one the plugin's own manifest
+declares (for example `plugin:gitlab:personal_token` or `plugin:slack:bot_token` —
+`flux plugin status <name>` prints the purposes it accepts). Each entry holds the access token and, for OAuth entries, the refresh
 token, an expiry, and an optional account id.
 
 :::note
@@ -94,13 +95,19 @@ credential** (from `~/.claude` / `~/.codex`). See the provider table in
 
 ## Logging in a plugin (OAuth)
 
-Plugins that talk to an OAuth2-protected API can be logged in the same way:
+A plugin whose manifest declares an **OAuth2** auth method is logged in the same way:
 
 ```bash
-flux auth login gitlab           # browser + loopback-callback PKCE (default)
-flux auth login gitlab --password  # resource-owner password grant instead
-flux plugin login gitlab         # equivalent alias
+flux auth login <plugin>             # browser + loopback-callback PKCE (default)
+flux auth login <plugin> --password  # resource-owner password grant instead
+flux plugin login <plugin>           # equivalent alias
 ```
+
+:::note No shipped plugin declares OAuth2 yet
+Every plugin in the signed pack authenticates with a plain bearer token, so this path is for
+third-party plugins today. Against a token-only plugin the command refuses with
+`plugin <name> declares no OAuth2 auth method` — use `flux auth set <plugin> <purpose>` instead.
+:::
 
 The security-relevant part is **who runs the OAuth flow**: flux does, not the plugin. The plugin only
 *declares* an `oauth2` block in its manifest (a token endpoint, scopes, and which grants it supports).

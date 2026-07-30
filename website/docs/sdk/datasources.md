@@ -179,14 +179,16 @@ cargo run -p codewandler-flux-sdk --example datasource_recipe
 |---|---|---|
 | `MemoryBackend` | `MemoryBackend::new()` | Tests, ephemeral indexes, program-declared knowledge rebuilt at startup. |
 | `SqliteBackend` | `SqliteBackend::open(path)` (WAL, created if absent) or `SqliteBackend::in_memory()` | A persistent index that survives restarts. |
+| `PostgresBackend` | `PostgresBackend::new(handle, namespace)` (needs `codewandler-flux-capabilities`' `postgres` feature) | A shared index several processes read and write. |
 | `SemanticIndex` | `SemanticIndex::new(inner, embedder)` | Wrap any backend to add embedding rerank on top of keyword search. |
 
 `SemanticIndex` blends the two scores — `with_keyword_weight(w)` sets the keyword share (the cosine
 share is `1 - w`; the default is `0.5`). `with_semantic_sources([..])` opts individual sources in
 rather than embedding everything, `with_source_embedder(source, embedder)` routes different
 knowledge bases to different embedding models, and `with_vector_store(..)` replaces the default
-in-memory vectors. An `Embedder` is a trait too; the SDK's optional `embeddings` /
-`local-embeddings` / `sqlite-vec` features supply concrete ones.
+in-memory vectors. An `Embedder` is a trait too; concrete ones come from optional features on
+**`codewandler-flux-capabilities`**, not on the SDK crate: `embeddings` (`OpenAiEmbedder`),
+`local-embeddings` (`FastEmbedEmbedder`) and `sqlite-vec` (`SqliteVecStore`).
 
 Ingest helpers all take `&dyn DatasourceBackend` and return the number of records written:
 

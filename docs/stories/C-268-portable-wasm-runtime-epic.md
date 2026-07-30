@@ -23,7 +23,12 @@ can run without installing flux.
 ## Acceptance
 
 - [ ] C-269 lands a `System` trait, so guarded IO has a seam a non-native backend can implement.
-- [ ] C-270 extracts the engine's state store behind a port, off the direct `rusqlite` binding.
+- [x] C-270 extracts the engine's state store behind a port. Landed with `Lookup::{Found, NoSuchRow}`
+      so the driver's error type does not cross the port, and a real plan executing over a non-SQLite
+      backend. **Dropping the direct `rusqlite` line moved to C-274**, because C-270 proved that doing
+      it alone buys nothing: the driver also arrives via flux-events, non-optionally.
+- [ ] C-274 makes flux-events' SQLite dependency optional, so both direct dependencies go at once.
+      This, not C-270, is what unblocks C-271.
 - [ ] C-271 proves a portable core compiles to `wasm32` and evaluates a **model-free** flow to the
       same result as the native engine — the same `.flux`, the same output, asserted against each
       other rather than against a golden file.

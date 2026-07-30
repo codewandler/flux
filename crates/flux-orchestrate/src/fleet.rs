@@ -612,8 +612,10 @@ impl Tool for FleetStatusTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fleet.status".into(),
-            description: "Read the current state of a task previously dispatched to a remote flux \
-                          worker with fleet.dispatch."
+            description: "Read the current state of a TASK previously dispatched to a remote flux \
+                          worker with fleet.dispatch. For the liveness of the worker itself, use \
+                          fleet.worker_status — a task can read `completed` on a worker that has \
+                          since died, and a live worker may hold no task at all."
                 .into(),
             input_schema: tool_input_schema::<TaskRefInput>(),
             output_schema: None,

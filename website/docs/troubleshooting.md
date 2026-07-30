@@ -65,9 +65,16 @@ Deleting `events.db` discards history; it does not corrupt anything. See
 
 ## The server refuses to start
 
-Binding to a non-loopback address without a token is refused:
-`refusing unauthenticated non-loopback bind on <addr>; set FLUX_SERVER_TOKEN or bind …`. The
-daemon auto-approves tools, so an open listener would be remote code execution.
+Binding to a non-loopback address without authentication is refused:
+
+```text
+refusing to serve on a non-loopback address (0.0.0.0:8787) without authentication — set
+FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>` (or configure
+`[server] introspect_url` for per-request principal auth), or bind 127.0.0.1
+```
+
+The daemon auto-approves tools, so an open listener would be remote code execution. Either supply a
+shared secret, configure principal auth, or bind loopback:
 
 ```bash
 export FLUX_SERVER_TOKEN=$(openssl rand -hex 32)
@@ -94,7 +101,9 @@ Grant the specific host to the native web family if you really need it:
 web = ["localhost"]     # or `true` for any private host; covers http.request, web.fetch, browser.*
 ```
 
-The retired `web_fetch = …` key is ignored; use the family-wide `web` key shown above.
+The retired `web_fetch = …` key is **not** ignored — `[private_net]` rejects unknown keys, so an old
+config still carrying it refuses to load with `unknown field \`web_fetch\``. Migrate it to the
+family-wide `web` key shown above.
 
 See [Configuration](./reference/config.md) for the full grant shape (plugins are granted
 separately under `[private_net.plugins]`).
@@ -144,8 +153,10 @@ Inside the REPL, `/sessions` lists recent sessions and `/resume <id>` reattaches
 ## A model spec is rejected
 
 Use `-m <provider>/<model>`, e.g. `-m anthropic/claude-sonnet-4-6` or
-`-m openrouter/anthropic/claude-sonnet-4.5`. The bare aliases `opus` / `sonnet` / `haiku` resolve
-to Anthropic. The string after the provider is forwarded verbatim, so any model that provider
+`-m openrouter/anthropic/claude-sonnet-4.5`. The bare aliases `opus` / `sonnet` / `haiku` / `fable`
+resolve to Anthropic; `claude`, `codex` and `aws` are bare aliases for their own providers. The
+rejection message lists the accepted bare aliases, so trust it over this page if the two ever
+disagree. The string after the provider is forwarded verbatim, so any model that provider
 serves works — a typo surfaces as a provider-side error, not a flux one.
 
 ## Plugin install fails verification

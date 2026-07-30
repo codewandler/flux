@@ -15,6 +15,10 @@
 //! child re-enters the SAME test function, sees the env vars, and acts as a plain writer process
 //! instead of spawning anything further.
 
+// Cross-process contention on a shared FILE is a property of the SQLite backend, so the whole
+// binary is scoped to the feature that provides one (C-274).
+#![cfg(feature = "sqlite")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

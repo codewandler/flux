@@ -28,6 +28,10 @@ use flux_runtime::{
 use flux_spec::{AccessKind, Effect, FlowEffect, Idempotency, Risk, StagingDisposition, ToolSpec};
 #[cfg(feature = "host")]
 use flux_system::net::PrivateNetAllow;
+// The guarded-IO port (C-269): the host's capability bridge is written against these traits, not
+// against the concrete `System`, so a non-syscall substrate can serve `process.run` / `fs.read`.
+#[cfg(feature = "host")]
+use flux_system::port::{GuardedEnv, GuardedHostFiles, GuardedProcess};
 
 // The wire contract lives in its own crate on its own version line (C-142/C-143) so a guest plugin
 // can depend on the protocol without depending on flux's host half. Re-exported here so every

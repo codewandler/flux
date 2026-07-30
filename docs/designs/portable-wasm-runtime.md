@@ -107,12 +107,22 @@ Two concrete blockers, both measured rather than assumed:
    **structurally** (`:287`, `:339`, `:517`, `:554`, `:606`). A port therefore has to give the trait
    its own "no such row" representation, or that error variant leaks straight through the abstraction
    and the port is portable in name only.
-   **`flux-events` does NOT need this work** — it already has the seam: `trait EventBackend` at
-   `crates/flux-events/src/store/mod.rs:255`, with `mod sqlite` and `mod postgres` behind it. Its
-   residual `rusqlite` mentions are test-only. That trait is also the in-repo precedent for what a
-   backend port looks like here, so C-270 should follow it rather than invent a shape.
-   *(Both counts above were corrected after the first measurement: `ls src/*.rs` missed
-   subdirectories, and the claim that flux-events needed the same treatment was simply wrong.)*
+   **`flux-events` has the seam but NOT the dependency, and that distinction is the whole problem.**
+   `trait EventBackend` exists (`crates/flux-events/src/store/mod.rs:255`, with `mod sqlite` and
+   `mod postgres` behind it) and is the right precedent for what a backend port looks like here — but
+   `flux-events/Cargo.toml:31` names `rusqlite` **non-optionally**, and `mod sqlite` is unconditional.
+   `cargo tree -p codewandler-flux-flow -i rusqlite` shows the driver reaching the engine by **two**
+   paths: flux-flow directly, and via flux-events. flux-flow cannot drop flux-events, because
+   `Arc<EventStore>` is in `FlowStore`'s public signature.
+   **So removing flux-flow's own `rusqlite` line buys nothing on its own** — the crate links SQLite
+   either way, and gating `SqliteState` behind a feature would only make `FlowStore::in_memory`
+   conditionally absent from a published API for zero capability gain. Making flux-events' SQLite
+   dependency optional is therefore the real prerequisite, and it drops both direct dependencies at
+   once. Tracked as **C-274**, and it is what actually unblocks C-271.
+   *(This section has been corrected twice by implementors, both times because a claim here was
+   inferred rather than measured: first the file counts — `ls src/*.rs` missed subdirectories — and
+   then "flux-events does NOT need this work", which was right about the seam and wrong about the
+   dependency. `cargo tree` settles it; reading a manifest for a trait does not.)*
 
 Encouragingly, the codebase idiom is already trait ports — `flux-runtime` exposes `LoopHost`,
 `Spawner`, `DispatchLedger`, `SkillLoader`, `SurfaceSink` and more — so this is continuing an existing
@@ -154,6 +164,17 @@ These are genuinely open and should be settled by their stories, not here:
   See [§ Settled: the Wasm flavour](#settled-the-wasm-flavour) below.
 - ~~**`tokio` in the portable core.**~~ **Settled by C-271: feature-gate it, and use no async runtime
   at all.** See [§ Settled: what replaces `tokio`](#settled-what-replaces-tokio) below.
+- **The clock.** `now_ms()` in the engine's state facade calls `SystemTime::now`. C-270 deliberately
+  left it in the facade as the single seam an embedder-supplied clock replaces.
+  **Still open, and C-271 did not close it** — but it measured two things that change its shape:
+  - It is **not a compile blocker.** `std` compiles `SystemTime::now`/`Instant::now` for
+    `wasm32-unknown-unknown`; they panic only when *called*. So a clock seam is a **runtime**
+    correctness problem, not a build one, and it will not announce itself by failing a build.
+  - The language core has its own instances, independent of the engine's facade —
+    `flux_lang::runtime::now_millis` (throttle) and the `Instant::now` deadline in the
+    time-bounded `loop`. A portable clock has to cover those too, or `throttle`/`loop`/`debounce`
+    panic inside the module. C-271's model-free fragment never reaches them, which is exactly why
+    its green parity test says nothing about this question.
 - **Determinism as a product feature.** A Wasm module plus a recorded set of import responses is a
   perfectly reproducible run — which is very close to what the Time Machine (C-43) and the Agent Lab
   cassette already do. Whether to unify them is worth asking, but not in v1.
@@ -239,3 +260,4 @@ budget with a real one.
 | C-271 | Prove the portable core compiles to `wasm32` and evaluates a model-free flow |
 | C-272 | The host-import ABI, with every guard on the host side — and a test that proves a module cannot bypass one |
 | C-273 | Embedder resource limits: fuel, memory ceiling, wall-clock deadline |
+| C-274 | Make flux-events' SQLite dependency optional — the actual `wasm32` prerequisite |

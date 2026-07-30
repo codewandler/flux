@@ -15,6 +15,25 @@
 
 ## [Unreleased]
 
+- **A coordinating workflow can now start its own workers, so it can work several tasks at once.**
+  Previously one worker served one task at a time, which capped a coordinated run at a single item
+  regardless of how much work was waiting. A workflow can now start a worker for a task, check whether it
+  is still alive, and stop it — each worker in its own private checkout. Depth and count are bounded by
+  default (one generation, sixteen workers) and a worker cannot raise its own limit.
+  **Two things you may need to set.** A coordinator that starts workers needs sandbox network access
+  enabled, because a network-isolated worker cannot be reached — flux refuses to start one rather than
+  hand you a worker that looks alive and is not. And dispatching to a worker needs private-network access
+  allowed, because the worker answers on a local address and flux does not trust local addresses
+  implicitly. Both refusals say what to set.
+
+- **A coordinating workflow can give each task its own private checkout.** Previously a workflow could
+  move itself into an isolated checkout, but only one at a time — so it could not hand several workers a
+  workspace each in the same run. Now it can create one per task, off a clean starting point, without
+  disturbing its own working directory. Each is refused up front if the starting point is dirty or the
+  name is taken, rather than half-created. **Removing them afterwards is your workflow's job**: they are
+  kept on purpose because they hold work that has not been merged yet, and nothing cleans them up for
+  you — so a long-running coordinator should delete the ones it is finished with, or it will fill the disk.
+
 ## [0.39.0] - 2026-07-30
 
 ### Improved

@@ -25,7 +25,7 @@ flux run -m ollama/qwen2.5-coder:7b "explain the provider layer"
 ```
 
 Bare aliases resolve to Anthropic and track the current generation of each tier: `fable` →
-`claude-fable-5`, `opus` → `claude-opus-4-8`, `sonnet` → `claude-sonnet-5`, `haiku` →
+`claude-fable-5`, `opus` → `claude-opus-5`, `sonnet` → `claude-sonnet-5`, `haiku` →
 `claude-haiku-4-5`. The default model is `sonnet`. Bare `claude` is shorthand for `claude/sonnet`
 (the [Claude Code subscription](./claude-code.md) provider).
 

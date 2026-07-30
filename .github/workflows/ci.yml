@@ -13,8 +13,18 @@ env:
 
 jobs:
   check:
-    name: build · test · clippy · fmt · layering
+    name: build · test · clippy · fmt · layering (no sandbox backend)
     runs-on: ubuntu-latest
+    # C-266: this is the WITHOUT-a-backend side of C-262's fail-closed sandbox switch, and it is now
+    # so by construction rather than by luck. Stock runners happen to have no `bubblewrap` today, so
+    # every step below was already exercising the unconfined path — but nothing said so, nothing
+    # asserted it, and a runner image that starts shipping bwrap would silently retire the coverage.
+    # Forcing discovery at a nonexistent path is exactly the reproduction that found the three
+    # regression sites during the 0.38.0 cut, applied to the whole job — the workspace tests AND the
+    # smoke-live shape guard, whose step 5 (`app run --serve`) a `cargo test` run does not cover.
+    # The with-a-backend side is the `sandbox-backend` job below; both sides must stay green.
+    env:
+      FLUX_BWRAP_BIN: /nonexistent/bwrap
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -54,8 +64,11 @@ jobs:
         run: cargo test --workspace
 
       # The architecture lint (fluxplane `codegate` analog): inner crates must not depend on outer
-      # layers. Run explicitly too so a layering regression is an obvious, named failure.
-      - name: Architecture layering lint
+      # layers. Run explicitly too so a layering regression is an obvious, named failure. Since C-266
+      # this crate also owns the sandbox-posture lint on test spawns — the named check that turns "a
+      # new auto-approved spawn forgot to declare its posture" into a local failure with a file:line,
+      # instead of a red CI run three pushes later.
+      - name: Architecture layering + test sandbox-posture lints
         run: cargo test -p flux-codegate
 
       # Hermetic drift guard for the live smoke gate (C-39): re-runs steps 1-5's invocation *shapes*
@@ -64,6 +77,66 @@ jobs:
       # of only being caught the next time someone remembers to run the real live gate by hand.
       - name: Live smoke gate — CLI shape guard (hermetic, no credentials)
         run: FLUX_BIN="$PWD/target/debug/flux" ./scripts/smoke-live.sh --shapes
+
+  sandbox-backend:
+    name: fail-closed sandbox switch · with a real backend
+    runs-on: ubuntu-latest
+    # C-266: the other side of the switch C-262 installed. `check` above proves flux still works when
+    # NO sandbox backend exists; nothing proved it works when one DOES, because no runner had
+    # bubblewrap and every developer machine has it — so the confined path was exercised on no CI
+    # host at all, and the unconfined path was the only one anyone ever saw here.
+    #
+    # `FLUX_TEST_SANDBOX_BACKEND=1` is this lane's promise that a usable backend is installed.
+    # `crates/flux-cli/tests/sandbox_backend.rs` treats it as a claim to verify, not a hint: its first
+    # test FAILS the job when `doctor` reports no functional backend. That matters because installing
+    # bubblewrap is not the same as having it work — a kernel that refuses unprivileged user
+    # namespaces (Ubuntu 23.10+'s AppArmor restriction, default-seccomp Docker) resolves
+    # `Unsupported`, which would quietly turn this lane into a second copy of `check`: green, and
+    # proving nothing. If that ever happens, this job says so loudly instead.
+    #
+    # Note what is NOT duplicated from `check`: clippy and fmt are posture-independent, so this lane
+    # runs only the parts whose behavior a backend can change.
+    env:
+      FLUX_TEST_SANDBOX_BACKEND: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust toolchain
+        # Pinned for the same reason as the `check` job — see its comment.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # `cargo test --workspace` includes flux-codegate's layering lint, which resolves
+      # `cargo metadata --locked --offline` over the FULL lockfile closure — see the same step in the
+      # `check` job for why a fresh cache fails the lint without this.
+      - name: Fetch locked dependencies (all targets)
+        run: cargo fetch --locked
+
+      - name: Install bubblewrap (the Linux sandbox backend)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+
+      - name: Build
+        run: cargo build --workspace
+
+      # The whole suite, with a live backend. `sandbox_posture.rs` stays green here because it forces
+      # backend discovery at nonexistent paths itself — it asserts the no-backend postures hermetically
+      # rather than by inferring them from the host, which is what makes a two-sided gate possible at
+      # all without weakening a single one of its assertions.
+      - name: Test (workspace, sandbox backend available)
+        run: cargo test --workspace
+
+      # Step 5 of the shape guard (`app run --serve`) is a serving surface, and serving surfaces
+      # inherit `require`. With a real backend it must start CONFINED — the posture the guard could
+      # never check before, and the site the 0.38.0 cut found last.
+      - name: Live smoke gate — CLI shape guard, confined (hermetic, no credentials)
+        run: FLUX_SANDBOX=require FLUX_BIN="$PWD/target/debug/flux" ./scripts/smoke-live.sh --shapes
 
   plugins:
     name: plugins workspace · build · test · clippy · fmt

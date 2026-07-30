@@ -9,10 +9,10 @@ Pure nodes handle the data work inside a plan: formatting, field access, JSON ex
 type coercion, and value assembly. They perform no IO, dispatch no operation, and never pause for
 approval. Use them anywhere you would otherwise shell out just to reshape data.
 
-In the text form, `fmt(…)`, `parse(…)`, `peek $x`, `$var.path` field access, value templates, and
-invertible native expressions have first-class spellings. The `@json` escape remains only for
-pathological shapes: non-invertible `expr` formulas and `jq` with bracket paths or non-symbol
-inputs. All of them are ordinary nodes in the JSON wire form.
+In the text form, `fmt(…)`, `parse(…)`, `peek $x`, field access including array indexes
+(`$var.items[0].name`), value templates, and invertible native expressions have first-class
+spellings. The `@json` escape remains only for pathological shapes: non-invertible `expr` formulas
+and `jq` over a non-symbol input. All of them are ordinary nodes in the JSON wire form.
 
 ## `fmt` — string interpolation
 
@@ -84,7 +84,8 @@ This lowers to a `jq` node. Notes:
 ## `jq` — JSON path extraction
 
 The full `jq` node supports dot paths with `[n]` array indexing, applied to the JSON content
-of its input. Bracket paths and non-symbol inputs are written via `@json`:
+of its input. Both are native in source — `first = results[0].value` — and the formatter emits the
+bracket spelling. Only a **non-symbol input** still needs `@json`:
 
 ```flux
 @json {"kind": "bind", "name": "first", "value": {"kind": "jq", "path": ".results[0].value", "input": {"kind": "var", "name": "response"}}}

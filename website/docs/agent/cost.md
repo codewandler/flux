@@ -83,11 +83,13 @@ input = 2.0
 output = 6.0
 ```
 
-Recognized fields per model: `input`, `output`, `cache_write`, `cache_read`, `reasoning`,
-`audio_input`, `audio_output`. `reasoning`, `audio_input`, and `audio_output` are *surcharge* tiers —
-those token counts are subsets of output/input and already billed once at the base rate, so the
-built-ins keep them at `0.0`; set them only for a provider that prices those tokens apart. Key entries
-by the model id as `flux usage` reports it (a bare id like `claude-opus-4-8`, or an OpenRouter
+Recognized fields per model: `input`, `output`, `cache_write`, `cache_write_1h`, `cache_read`,
+`reasoning`, `audio_input`, `audio_output`. Four of those are *surcharge* tiers: `cache_write_1h`,
+`reasoning`, `audio_input` and `audio_output` count tokens that are subsets of
+`cache_write`/output/input and already billed once at the base rate, so the built-ins keep them at
+`0.0` except where a provider really does price them apart (Anthropic's one-hour cache write carries a
+0.75x-input surcharge over the five-minute default). Key entries
+by the model id as `flux usage` reports it (a bare id like `claude-opus-5`, or an OpenRouter
 `vendor/model` id); lookup also tries the spec with its provider prefix stripped. A missing or
 malformed file is ignored wholesale — a typo never takes cost reporting down, the built-ins stand.
 

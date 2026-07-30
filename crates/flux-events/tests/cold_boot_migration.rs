@@ -21,6 +21,10 @@
 //! merely by being spawned. Spawn latency alone (milliseconds) dwarfs the probe→`ALTER` window
 //! (microseconds), so without the rendezvous the processes would queue up rather than collide.
 
+// Every assertion here is about SQLite's schema bootstrap on a shared FILE, so the whole binary is
+// scoped to the backend that has one (C-274 made it a feature).
+#![cfg(feature = "sqlite")]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

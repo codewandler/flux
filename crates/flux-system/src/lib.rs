@@ -4,6 +4,10 @@
 //! rejected if it escapes — lexically (`..`) or via symlink (a path that canonicalizes outside
 //! the root). Process execution is **argv-only** (no shell), so the model cannot inject shell
 //! operators. Tools never touch `std::fs`/`Command` directly; they go through [`System`].
+//!
+//! [`System`] is the **native** guarded backend. The same guarded operations are also stated as
+//! capability traits in [`port`], so a non-syscall substrate (a Wasm embedder reaching host imports,
+//! a remote executor, a test double) can serve them — see that module for what is and is not a port.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -13,6 +17,7 @@ use std::time::Duration;
 use flux_core::{Error, Result};
 
 pub mod net;
+pub mod port;
 pub mod sandbox;
 
 use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};
