@@ -98,6 +98,14 @@ run_shape_checks() {
   step "shape guard — steps 1-5 invocation shapes (mock, no credentials)"
   # NOTE: deliberately NOT run inside a `( … )` subshell — check_parses/check_serve_parses call the
   # global ok/bad, whose pass/fail/skipped counters must survive in *this* shell for the final tally.
+  #
+  # C-262 makes serving surfaces fail closed without an OS sandbox backend, and no stock CI runner
+  # has bubblewrap — so step 5's server would refuse to start and the guard would read that as shape
+  # drift. This guard asserts only that an invocation still PARSES, never its confinement posture
+  # (that lives in flux-cli's sandbox_posture.rs), so it declares unconfined operation. Scoped to
+  # this function on purpose: the live legs below share the same wrapper functions and must keep
+  # their real posture, so this must not become a flag on `flux_serve` itself.
+  export FLUX_SANDBOX=off
   local sws port addr
   sws="$(mktemp -d)"
   cd "$sws" || { bad "could not enter shape-check scratch dir"; return; }
