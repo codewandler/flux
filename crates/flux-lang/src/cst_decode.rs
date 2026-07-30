@@ -415,13 +415,24 @@ fn lower_each(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_repeat(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let rest = rest_after_keyword(statement, "repeat")?;
+    let rest = positional_rest(statement, "repeat")?;
     let (digits, tail) = take_while(rest.trim_start(), |c| c.is_ascii_digit());
     let max = digits
         .parse::<u32>()
         .map_err(|_| error(statement, "`repeat` expects a count"))?;
     let collect = parse_optional_arrow(tail, "repeat", statement)?;
-    let (until, body) = statement
+    let mut header_until = None;
+    for option in header_options(statement) {
+        match option_label(&option).as_str() {
+            "until" => set_option(
+                &mut header_until,
+                Box::new(option_expression(&option)?),
+                &option,
+            )?,
+            _ => return Err(unknown_option(&option, "repeat")),
+        }
+    }
+    let (body_until, body) = statement
         .children()
         .find(|node| node.kind() == SyntaxKind::BLOCK)
         .map(|block| lower_until_block(&block))
@@ -429,10 +440,26 @@ fn lower_repeat(statement: &SyntaxNode) -> DecodeResult<Node> {
         .unwrap_or_default();
     Ok(Node::Repeat {
         max,
-        until,
+        until: single_until(header_until, body_until, statement, "repeat")?,
         body,
         collect,
     })
+}
+
+/// `until` is spelled either as a header option or as the first body line — never both.
+fn single_until(
+    header: Option<Box<Node>>,
+    body: Option<Box<Node>>,
+    statement: &SyntaxNode,
+    context: &str,
+) -> DecodeResult<Option<Box<Node>>> {
+    match (header, body) {
+        (Some(_), Some(_)) => Err(error(
+            statement,
+            format!("`{context}` accepts `until` once, in the header or the body"),
+        )),
+        (header, body) => Ok(header.or(body)),
+    }
 }
 
 fn lower_match(statement: &SyntaxNode, routed: bool) -> DecodeResult<Node> {
@@ -495,8 +522,11 @@ fn lower_match(statement: &SyntaxNode, routed: bool) -> DecodeResult<Node> {
 }
 
 fn lower_fallback(statement: &SyntaxNode) -> DecodeResult<Node> {
+    if let Some(option) = header_options(statement).first() {
+        return Err(unknown_option(option, "fallback"));
+    }
     let bind = parse_optional_arrow(
-        &rest_after_keyword(statement, "fallback")?,
+        &positional_rest(statement, "fallback")?,
         "fallback",
         statement,
     )?;
@@ -514,15 +544,31 @@ fn lower_fallback(statement: &SyntaxNode) -> DecodeResult<Node> {
 
 fn lower_parallel(statement: &SyntaxNode, race: bool) -> DecodeResult<Node> {
     let (timeout_ms, bind) = if race {
-        let rest = rest_after_keyword(statement, "race")?;
-        let (timeout, tail) = take_duration(&rest, statement)?;
+        let rest = positional_rest(statement, "race")?;
+        let rest = rest.trim();
+        // `race 5s` spells the timeout positionally; `race timeout: 5s` names it.
+        let (mut timeout, tail) = if rest.starts_with("->") || rest.is_empty() {
+            (None, rest)
+        } else {
+            let (value, tail) = take_duration(rest, statement)?;
+            (Some(value), tail)
+        };
+        for option in header_options(statement) {
+            match option_label(&option).as_str() {
+                "timeout" => set_option(&mut timeout, option_duration(&option)?, &option)?,
+                _ => return Err(unknown_option(&option, "race")),
+            }
+        }
         (
-            Some(timeout),
+            Some(timeout.ok_or_else(|| error(statement, "`race` expects a timeout"))?),
             parse_optional_arrow(tail, "race", statement)?,
         )
     } else {
-        if !rest_after_keyword(statement, "parallel")?.trim().is_empty() {
+        if !positional_rest(statement, "parallel")?.trim().is_empty() {
             return Err(error(statement, "`parallel` takes no header"));
+        }
+        if let Some(option) = header_options(statement).first() {
+            return Err(unknown_option(option, "parallel"));
         }
         (None, None)
     };
@@ -550,15 +596,32 @@ fn lower_parallel(statement: &SyntaxNode, race: bool) -> DecodeResult<Node> {
 }
 
 fn lower_loop(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let rest = rest_after_keyword(statement, "loop")?;
+    let rest = positional_rest(statement, "loop")?;
     let rest = keyword_rest(rest.trim_start(), "for")
         .ok_or_else(|| error(statement, "`loop` expects `for <ms>`"))?;
     let (for_ms, rest) = take_duration(rest, statement)?;
-    let rest = keyword_rest(rest.trim_start(), "every")
-        .ok_or_else(|| error(statement, "`loop` expects `every <ms>`"))?;
-    let (every_ms, tail) = take_duration(rest, statement)?;
+    // `every` is positional in the legacy header and a named option in the canonical one.
+    let (mut every_ms, tail) = match keyword_rest(rest.trim_start(), "every") {
+        Some(after) => {
+            let (every, tail) = take_duration(after, statement)?;
+            (Some(every), tail)
+        }
+        None => (None, rest),
+    };
     let bind = parse_optional_arrow(tail, "loop", statement)?;
-    let (until, body) = statement
+    let mut header_until = None;
+    for option in header_options(statement) {
+        match option_label(&option).as_str() {
+            "every" => set_option(&mut every_ms, option_duration(&option)?, &option)?,
+            "until" => set_option(
+                &mut header_until,
+                Box::new(option_expression(&option)?),
+                &option,
+            )?,
+            _ => return Err(unknown_option(&option, "loop")),
+        }
+    }
+    let (body_until, body) = statement
         .children()
         .find(|node| node.kind() == SyntaxKind::BLOCK)
         .map(|block| lower_until_block(&block))
@@ -566,8 +629,8 @@ fn lower_loop(statement: &SyntaxNode) -> DecodeResult<Node> {
         .unwrap_or_default();
     Ok(Node::Loop {
         for_ms,
-        every_ms,
-        until,
+        every_ms: every_ms.ok_or_else(|| error(statement, "`loop` expects `every <ms>`"))?,
+        until: single_until(header_until, body_until, statement, "loop")?,
         body,
         bind,
     })
@@ -608,7 +671,7 @@ fn lower_cap_scope(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_retry(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let rest = rest_after_keyword(statement, "retry")?;
+    let rest = positional_rest(statement, "retry")?;
     let (digits, mut tail) = take_while(rest.trim_start(), |c| c.is_ascii_digit());
     let max = digits
         .parse::<u32>()
@@ -627,6 +690,13 @@ fn lower_retry(statement: &SyntaxNode) -> DecodeResult<Node> {
         let (delay, rest) = take_duration(after, statement)?;
         delay_ms = Some(delay);
         tail = rest;
+    }
+    for option in header_options(statement) {
+        match option_label(&option).as_str() {
+            "backoff" => set_option(&mut backoff, option_word(&option)?, &option)?,
+            "delay" => set_option(&mut delay_ms, option_duration(&option)?, &option)?,
+            _ => return Err(unknown_option(&option, "retry")),
+        }
     }
     Ok(Node::Retry {
         max,
@@ -773,7 +843,7 @@ fn lower_checkpoint(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_await(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let rest = rest_after_keyword(statement, "await")?;
+    let rest = positional_rest(statement, "await")?;
     let binding = if rest.trim_start().starts_with('"') {
         None
     } else {
@@ -794,10 +864,20 @@ fn lower_await(statement: &SyntaxNode) -> DecodeResult<Node> {
         .map(|(_, text)| parse_string_token(text, statement))
         .transpose()?
         .ok_or_else(|| error(statement, "`await` expects a quoted source"))?;
-    let condition = expression_children(statement)
+    let mut condition = expression_children(statement)
         .next()
         .map(|node| lower_expression(&node).map(Box::new))
         .transpose()?;
+    for option in header_options(statement) {
+        match option_label(&option).as_str() {
+            "when" => set_option(
+                &mut condition,
+                Box::new(option_expression(&option)?),
+                &option,
+            )?,
+            _ => return Err(unknown_option(&option, "await")),
+        }
+    }
     Ok(Node::Await {
         binding,
         source,
@@ -807,10 +887,10 @@ fn lower_await(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_confirm(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let rest = rest_after_keyword(statement, "confirm")?;
+    let rest = positional_rest(statement, "confirm")?;
     let (message, tail) = parse_string_prefix(rest.trim_start(), statement, "confirm")?;
     let tail = tail.trim();
-    let risk = if tail.is_empty() {
+    let mut risk = if tail.is_empty() {
         None
     } else {
         let after = keyword_rest(tail, "risk")
@@ -821,6 +901,12 @@ fn lower_confirm(statement: &SyntaxNode) -> DecodeResult<Node> {
         }
         Some(risk.to_string())
     };
+    for option in header_options(statement) {
+        match option_label(&option).as_str() {
+            "risk" => set_option(&mut risk, option_word(&option)?, &option)?,
+            _ => return Err(unknown_option(&option, "confirm")),
+        }
+    }
     Ok(Node::Confirm {
         message,
         risk,
@@ -829,36 +915,61 @@ fn lower_confirm(statement: &SyntaxNode) -> DecodeResult<Node> {
 }
 
 fn lower_throttle(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let rest = rest_after_keyword(statement, "throttle")?;
+    let rest = positional_rest(statement, "throttle")?;
     let (name, rest) = parse_string_prefix(rest.trim_start(), statement, "throttle")?;
-    let (digits, rest) = take_while(rest.trim_start(), |c| c.is_ascii_digit());
-    let max = digits
-        .parse::<u32>()
-        .map_err(|_| error(statement, "`throttle` expects a numeric max"))?;
-    let rest = keyword_rest(rest.trim_start(), "per")
-        .ok_or_else(|| error(statement, "`throttle` expects `per <window_ms>`"))?;
-    let (window_ms, tail) = take_duration(rest, statement)?;
-    if !tail.trim().is_empty() {
-        return Err(error(statement, "trailing text after `throttle` header"));
+    let rest = rest.trim();
+    let (mut max, mut window_ms) = (None, None);
+    if !rest.is_empty() {
+        let (digits, rest) = take_while(rest, |c| c.is_ascii_digit());
+        max = Some(
+            digits
+                .parse::<u32>()
+                .map_err(|_| error(statement, "`throttle` expects a numeric max"))?,
+        );
+        let rest = keyword_rest(rest.trim_start(), "per")
+            .ok_or_else(|| error(statement, "`throttle` expects `per <window_ms>`"))?;
+        let (window, tail) = take_duration(rest, statement)?;
+        if !tail.trim().is_empty() {
+            return Err(error(statement, "trailing text after `throttle` header"));
+        }
+        window_ms = Some(window);
+    }
+    for option in header_options(statement) {
+        match option_label(&option).as_str() {
+            "max" => set_option(&mut max, option_count(&option)?, &option)?,
+            "per" => set_option(&mut window_ms, option_duration(&option)?, &option)?,
+            _ => return Err(unknown_option(&option, "throttle")),
+        }
     }
     Ok(Node::Throttle {
         name,
-        max,
-        window_ms,
+        max: max.ok_or_else(|| error(statement, "`throttle` expects a max"))?,
+        window_ms: window_ms.ok_or_else(|| error(statement, "`throttle` expects a window"))?,
         body: lower_first_block(statement)?,
     })
 }
 
 fn lower_debounce(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let rest = rest_after_keyword(statement, "debounce")?;
+    let rest = positional_rest(statement, "debounce")?;
     let (name, rest) = parse_string_prefix(rest.trim_start(), statement, "debounce")?;
-    let (wait_ms, tail) = take_duration(rest, statement)?;
-    if !tail.trim().is_empty() {
-        return Err(error(statement, "trailing text after `debounce` header"));
+    let rest = rest.trim();
+    let mut wait_ms = None;
+    if !rest.is_empty() {
+        let (wait, tail) = take_duration(rest, statement)?;
+        if !tail.trim().is_empty() {
+            return Err(error(statement, "trailing text after `debounce` header"));
+        }
+        wait_ms = Some(wait);
+    }
+    for option in header_options(statement) {
+        match option_label(&option).as_str() {
+            "wait" => set_option(&mut wait_ms, option_duration(&option)?, &option)?,
+            _ => return Err(unknown_option(&option, "debounce")),
+        }
     }
     Ok(Node::Debounce {
         name,
-        wait_ms,
+        wait_ms: wait_ms.ok_or_else(|| error(statement, "`debounce` expects a wait"))?,
         body: lower_first_block(statement)?,
     })
 }
@@ -1919,6 +2030,167 @@ fn rest_after_keyword(node: &SyntaxNode, keyword: &str) -> DecodeResult<String> 
     keyword_rest(&line, keyword)
         .map(str::to_string)
         .ok_or_else(|| error(node, format!("expected `{keyword}`")))
+}
+
+// ---------------------------------------------------------------------------
+// Canonical `name: value` control-header options (L-96)
+// ---------------------------------------------------------------------------
+//
+// A parameterized control header spells its non-primary values the way a call spells named inputs:
+// `confirm "Open issue?", risk: medium`. The parser lifts each option — leading comma included —
+// into a `HEADER_OPTION` node, so what remains of the header text on either side is *exactly* the
+// legacy space-keyword spelling. Every lowering below therefore runs the pre-existing positional
+// decode over [`positional_header`] and then overlays the named options, which is what makes both
+// spellings lower to the identical `DraftAst`.
+
+/// The canonical `name: value` options of a control header, in source order.
+fn header_options(statement: &SyntaxNode) -> Vec<SyntaxNode> {
+    statement
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::HEADER_OPTION)
+        .collect()
+}
+
+/// The label of one header option (`risk` in `, risk: medium`).
+fn option_label(option: &SyntaxNode) -> String {
+    option
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.kind() == SyntaxKind::IDENT)
+        .map(|token| token.text().to_string())
+        .unwrap_or_default()
+}
+
+/// The scalar text of one header option's value — everything after its `:`, trimmed.
+fn option_value_text(option: &SyntaxNode) -> String {
+    let mut text = String::new();
+    let mut seen_colon = false;
+    for token in option
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+    {
+        if !seen_colon {
+            seen_colon = token.kind() == SyntaxKind::COLON;
+            continue;
+        }
+        text.push_str(token.text());
+    }
+    text.trim().to_string()
+}
+
+/// The header text of `statement` with its option tail lifted out — the positional operands plus
+/// any trailing `-> $bind`, i.e. the legacy space-keyword header verbatim.
+fn positional_header(statement: &SyntaxNode) -> String {
+    let mut text = String::new();
+    collect_positional_header(statement, &mut text);
+    text.trim().to_string()
+}
+
+/// Append `node`'s header tokens to `out`, skipping option and body subtrees. Returns `false` once
+/// the header line has ended, so the caller stops walking siblings.
+fn collect_positional_header(node: &SyntaxNode, out: &mut String) -> bool {
+    for element in node.children_with_tokens() {
+        match element {
+            rowan::NodeOrToken::Node(child) => match child.kind() {
+                SyntaxKind::HEADER_OPTION => continue,
+                SyntaxKind::BLOCK => return false,
+                _ => {
+                    if !collect_positional_header(&child, out) {
+                        return false;
+                    }
+                }
+            },
+            rowan::NodeOrToken::Token(token) => match token.kind() {
+                SyntaxKind::NEWLINE | SyntaxKind::COMMENT => return false,
+                SyntaxKind::STRING if token.text().starts_with("\"\"\"") => {
+                    let content = token
+                        .text()
+                        .strip_prefix("\"\"\"")
+                        .and_then(|rest| rest.strip_suffix("\"\"\""))
+                        .unwrap_or_default()
+                        .replace("\r\n", "\n");
+                    out.push_str(
+                        &serde_json::to_string(&content).unwrap_or_else(|_| "\"\"".to_string()),
+                    );
+                }
+                _ => out.push_str(token.text()),
+            },
+        }
+    }
+    true
+}
+
+/// The positional header of `statement` with its leading keyword removed.
+fn positional_rest(statement: &SyntaxNode, keyword: &str) -> DecodeResult<String> {
+    let header = positional_header(statement);
+    keyword_rest(&header, keyword)
+        .map(str::to_string)
+        .ok_or_else(|| error(statement, format!("expected `{keyword}`")))
+}
+
+/// Record an option value, refusing a field the positional header already supplied.
+fn set_option<T>(slot: &mut Option<T>, value: T, option: &SyntaxNode) -> DecodeResult<()> {
+    if slot.is_some() {
+        return Err(error(
+            option,
+            format!("`{}` is given twice in this header", option_label(option)),
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// A bare-word option value (`backoff: exponential`, `risk: medium`).
+fn option_word(option: &SyntaxNode) -> DecodeResult<String> {
+    let text = option_value_text(option);
+    let (word, rest) = take_while(&text, is_name_char);
+    if word.is_empty() || !rest.trim().is_empty() {
+        return Err(error(
+            option,
+            format!("`{}` expects a bare word", option_label(option)),
+        ));
+    }
+    Ok(word.to_string())
+}
+
+/// A duration option value (`delay: 500ms`, `per: 1m`).
+fn option_duration(option: &SyntaxNode) -> DecodeResult<u64> {
+    let text = option_value_text(option);
+    let (millis, rest) = take_duration(&text, option)?;
+    if !rest.trim().is_empty() {
+        return Err(error(
+            option,
+            format!("`{}` expects a duration", option_label(option)),
+        ));
+    }
+    Ok(millis)
+}
+
+/// A count option value (`max: 5`).
+fn option_count(option: &SyntaxNode) -> DecodeResult<u32> {
+    option_value_text(option)
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| {
+            error(
+                option,
+                format!("`{}` expects a count", option_label(option)),
+            )
+        })
+}
+
+/// An expression option value (`until: $done`, `when: $ready`) — the parser built a real
+/// expression node for these, so nothing is decoded from text.
+fn option_expression(option: &SyntaxNode) -> DecodeResult<Node> {
+    required_expression(option, &format!("a `{}` expression", option_label(option)))
+}
+
+/// The error for an option a header does not define.
+fn unknown_option(option: &SyntaxNode, context: &str) -> LowerError {
+    error(
+        option,
+        format!("`{context}` has no `{}` option", option_label(option)),
+    )
 }
 
 fn keyword_rest<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {

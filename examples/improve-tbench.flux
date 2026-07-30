@@ -6,8 +6,7 @@ flow improve_tbench -> EvalReport
 
 Return ONLY a JSON array: [{"area":..,"symptom":..,"suggested_fix":..,"severity":1-5}]."""))
   candidates = improvements_aggregate(mined: "[]", reviewed)
-  repeat 1
-    until candidates_empty(candidates)
+  repeat 1, until: candidates_empty(candidates)
     tasks = task(role: "planner", task: fmt("""Turn these flux-harness improvement candidates into AT MOST 2 concrete, small, safe engineering tasks for the flux codebase (tool specs, tool output/views, system prompt, a new tool, or an agent-loop efficiency fix). Do NOT touch crates/flux-eval, bench/, the loop flows, or CI. The candidates are RANKED by measured weight — take them in order and only skip one if it is infeasible or out of bounds; every task must name the candidate id it addresses in an `addresses` field. Candidates:
 {candidates}
 

@@ -8,8 +8,7 @@ flow cognition-research -> Answer
     budget 6000
     include src, claims
   open = gaps({"claims":[],"need":{}})
-  repeat 2
-    until open
+  repeat 2, until: open
     more = grep("pricing change")
     pack += more
     open = gaps({"claims":[],"need":{}})

@@ -29,12 +29,12 @@
 # bounded by a timeout and fallback; a provider failure returns the gathered Zendesk evidence.
 
 flow setup() -> Any
-  retry 3 backoff exponential delay 500 -> $identity
+  retry 3, backoff: exponential, delay: 500ms -> $identity
     zendesk.test({})
   return $identity
 
 flow triage(query: String) -> Any
-  retry 3 backoff exponential delay 500 -> $search
+  retry 3, backoff: exponential, delay: 500ms -> $search
     zendesk.ticket.search({ query: $query, page: 1, per_page: 100 })
 
   ctx $triage_context
@@ -54,10 +54,10 @@ flow triage(query: String) -> Any
 flow brief(ticket_id: Number) -> Any
   parallel
     branch $ticket
-      retry 3 backoff exponential delay 500
+      retry 3, backoff: exponential, delay: 500ms
         zendesk.ticket.show({ ticket_id: $ticket_id })
     branch $comments
-      retry 3 backoff exponential delay 500
+      retry 3, backoff: exponential, delay: 500ms
         zendesk.ticket.comment.list({ ticket_id: $ticket_id, page: 1, per_page: 100 })
 
   ctx $brief_context
@@ -75,7 +75,7 @@ flow brief(ticket_id: Number) -> Any
   return { ticket_id: $ticket_id, ticket: $ticket, comments: $comments, briefing: $briefing }
 
 flow eod(query: String) -> Any
-  retry 3 backoff exponential delay 500 -> $search
+  retry 3, backoff: exponential, delay: 500ms -> $search
     zendesk.ticket.search({ query: $query, page: 1, per_page: 100 })
 
   ctx $eod_context

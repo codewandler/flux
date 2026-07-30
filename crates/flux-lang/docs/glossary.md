@@ -48,9 +48,9 @@
 ### Loops
 | Node | What it does |
 |---|---|
-| `repeat` | Counter loop — `repeat 3`; optional `until` as the first body line |
+| `repeat` | Counter loop — `repeat 3, until: $done` (`until` also accepted as the first body line) |
 | `each` | List iteration — `each $f in $files -> $results`; the `-> $name` collects results |
-| `loop` | Time-bounded polling — `loop for 30000 every 1000`; optional `until` as the first body line |
+| `loop` | Time-bounded polling — `loop for 30s, every: 1s, until: $done` |
 
 ### Error & recovery
 | Node | What it does |

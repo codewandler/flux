@@ -281,6 +281,13 @@ fn wants_space(prev: &SyntaxToken, cur: &SyntaxToken, spaced_in_source: bool) ->
         return spaced_in_source;
     }
 
+    // A duration literal is two tokens the lexer never joins — `500ms` is NUMBER + IDENT, and so is
+    // the (meaningless) `500 ms`. Inserting a space would change `delay: 500ms` into something the
+    // header decoder rejects, so the author's own adjacency decides here too.
+    if p == NUMBER && c == IDENT {
+        return spaced_in_source;
+    }
+
     // Never a space before a closer, a separator, or a postfix marker.
     if matches!(c, R_PAREN | R_BRACK | COMMA | COLON | QUESTION | DOT) {
         return false;
@@ -329,6 +336,23 @@ mod tests {
         assert_eq!(
             formatted,
             "flow f\n  # a leading note\n  $x = 1  # trailing\n  return $x\n"
+        );
+    }
+
+    #[test]
+    fn duration_suffixes_stay_attached_to_their_number() {
+        // `500ms` is NUMBER + IDENT; splitting it makes the header undecodable, so the CST
+        // formatter must leave the pair tight (and must not join a genuinely separated pair).
+        let src = "flow f\n  retry 3, backoff: exponential, delay: 500ms -> out\n    flaky()\n  return out\n";
+        assert_eq!(
+            format_source(src),
+            None,
+            "a canonical duration header is already canonical"
+        );
+        let ragged = "flow f\n  timeout   5s\n    slow()\n  return \"ok\"\n";
+        assert_eq!(
+            format_source(ragged).as_deref(),
+            Some("flow f\n  timeout 5s\n    slow()\n  return \"ok\"\n")
         );
     }
 

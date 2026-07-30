@@ -423,6 +423,72 @@ impl<'s> Parser<'s> {
         self.eat(SyntaxKind::NEWLINE);
     }
 
+    // --- canonical named-option header tails (L-96) ----------------------
+
+    /// Consume a control header's positional operands: every token up to the first *top-level*
+    /// comma, which is where the `, name: value` option tail starts. Bracketed commas
+    /// (`with_tools ["a", "b"]`) belong to the operand, so nesting is tracked.
+    fn eat_positional_operands(&mut self) {
+        let mut depth = 0usize;
+        while !self.at_eof() && !self.at_newline() {
+            match self.nth(0) {
+                SyntaxKind::COMMA if depth == 0 => return,
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACK | SyntaxKind::L_BRACE => depth += 1,
+                SyntaxKind::R_PAREN | SyntaxKind::R_BRACK | SyntaxKind::R_BRACE => {
+                    depth = depth.saturating_sub(1)
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    /// Parse the canonical `, name: value` option tail of a control header (L-96), one
+    /// [`SyntaxKind::HEADER_OPTION`] node per option — leading comma included, so the text on
+    /// either side of the run is exactly the legacy space-keyword header.
+    ///
+    /// `expr_valued` names the options whose value is a full expression (`until`, `when`) and is
+    /// therefore parsed into a real expression node. Every other value is a scalar the semantic
+    /// lowerer decodes from its tokens (a duration like `500ms` is *not* one expression), so it is
+    /// captured verbatim up to the next top-level `,` / `->` / end of line.
+    /// The start of an option run that is *not* preceded by a comma — a header whose only value is
+    /// named, with no positional operand in front of it (`race timeout: 5s`).
+    fn at_option_start(&self) -> bool {
+        self.at(SyntaxKind::IDENT) && self.nth(1) == SyntaxKind::COLON
+    }
+
+    fn header_options(&mut self, expr_valued: &[&str]) {
+        while self.at(SyntaxKind::COMMA) || self.at_option_start() {
+            self.start(SyntaxKind::HEADER_OPTION);
+            self.eat(SyntaxKind::COMMA);
+            let name = self.cur_text().to_string();
+            self.expect(SyntaxKind::IDENT, "an option name after `,`");
+            self.expect(SyntaxKind::COLON, "`:` after an option name");
+            if expr_valued.contains(&name.as_str()) {
+                self.expr(0);
+            } else {
+                self.eat_option_value();
+            }
+            self.finish_node();
+        }
+    }
+
+    /// A scalar option value: tokens up to the next top-level `,` / `->` / end of line.
+    fn eat_option_value(&mut self) {
+        let mut depth = 0usize;
+        while !self.at_eof() && !self.at_newline() {
+            match self.nth(0) {
+                SyntaxKind::COMMA | SyntaxKind::ARROW if depth == 0 => return,
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACK | SyntaxKind::L_BRACE => depth += 1,
+                SyntaxKind::R_PAREN | SyntaxKind::R_BRACK | SyntaxKind::R_BRACE => {
+                    depth = depth.saturating_sub(1)
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
     // --- grammar --------------------------------------------------------
 
     fn module(&mut self) {
@@ -777,7 +843,7 @@ impl<'s> Parser<'s> {
                 "timeout" => return self.simple_block_stmt(SyntaxKind::TIMEOUT_STMT, false),
                 "budget" => return self.simple_block_stmt(SyntaxKind::BUDGET_STMT, false),
                 "with_tools" => return self.simple_block_stmt(SyntaxKind::WITH_TOOLS_STMT, false),
-                "retry" => return self.simple_block_stmt(SyntaxKind::RETRY_STMT, false),
+                "retry" => return self.option_block_stmt(SyntaxKind::RETRY_STMT),
                 "seq" => return self.simple_block_stmt(SyntaxKind::SEQ_STMT, false),
                 "ctx" => return self.ctx_stmt(),
                 "return" => return self.return_stmt(),
@@ -786,9 +852,9 @@ impl<'s> Parser<'s> {
                 "once" => return self.simple_block_stmt(SyntaxKind::ONCE_STMT, false),
                 "checkpoint" => return self.header_only_stmt(SyntaxKind::CHECKPOINT_STMT),
                 "await" => return self.await_stmt(),
-                "confirm" => return self.simple_block_stmt(SyntaxKind::CONFIRM_STMT, false),
-                "throttle" => return self.simple_block_stmt(SyntaxKind::THROTTLE_STMT, false),
-                "debounce" => return self.simple_block_stmt(SyntaxKind::DEBOUNCE_STMT, false),
+                "confirm" => return self.option_block_stmt(SyntaxKind::CONFIRM_STMT),
+                "throttle" => return self.option_block_stmt(SyntaxKind::THROTTLE_STMT),
+                "debounce" => return self.option_block_stmt(SyntaxKind::DEBOUNCE_STMT),
                 "verify" => return self.verify_stmt(),
                 "try" => return self.try_stmt(),
                 "scope" => return self.scope_stmt(),
@@ -929,10 +995,18 @@ impl<'s> Parser<'s> {
         self.finish_node();
     }
 
-    /// `repeat`/`loop`: header to end of line, then a body whose first line may be `until <cond>`.
+    /// `repeat`/`loop`: the count/interval operands, an optional `, until: <cond>` (and, for
+    /// `loop`, `, every: <ms>`) option tail, the `-> $bind` clause, then a body whose first line
+    /// may still be the legacy `until <cond>` clause.
     fn repeat_like(&mut self, kind: SyntaxKind) {
         self.start(kind);
-        self.eat_to_end_of_line();
+        self.bump(); // repeat / loop
+        self.eat_positional_operands();
+        self.header_options(&["until"]);
+        while !self.at_newline() && !self.at_eof() {
+            self.bump(); // `-> $bind`
+        }
+        self.eat(SyntaxKind::NEWLINE);
         self.block_if_indented(Self::block_with_optional_until);
         self.finish_node();
     }
@@ -975,7 +1049,16 @@ impl<'s> Parser<'s> {
 
     fn branch_block(&mut self, kind: SyntaxKind) {
         self.start(kind);
-        self.eat_to_end_of_line();
+        self.bump(); // parallel / race / fallback
+        if !self.at_option_start() {
+            // `race 5s` spells its timeout positionally; `race timeout: 5s` names it instead.
+            self.eat_positional_operands();
+        }
+        self.header_options(&[]);
+        while !self.at_newline() && !self.at_eof() {
+            self.bump(); // `-> $bind`
+        }
+        self.eat(SyntaxKind::NEWLINE);
         self.block_if_indented(|p| p.arm_block(&["branch"]));
         self.finish_node();
     }
@@ -1112,6 +1195,7 @@ impl<'s> Parser<'s> {
             self.bump();
             self.expr(0);
         }
+        self.header_options(&["when"]);
         self.eat(SyntaxKind::NEWLINE);
         self.finish_node();
     }
@@ -1175,6 +1259,22 @@ impl<'s> Parser<'s> {
             }
             self.finish_node();
         }
+        self.finish_node();
+    }
+
+    /// A header statement whose non-primary values use the canonical `, name: value` vocabulary
+    /// (`confirm`/`retry`/`throttle`/`debounce`, L-96): positional operands, then the structured
+    /// option tail, then the verbatim `-> $bind` clause, then an indented body.
+    fn option_block_stmt(&mut self, kind: SyntaxKind) {
+        self.start(kind);
+        self.bump(); // the keyword
+        self.eat_positional_operands();
+        self.header_options(&[]);
+        while !self.at_newline() && !self.at_eof() {
+            self.bump(); // `-> $bind` and anything else the lowerer must reject
+        }
+        self.eat(SyntaxKind::NEWLINE);
+        self.block_if_indented(Self::block);
         self.finish_node();
     }
 
