@@ -429,7 +429,10 @@ pub(super) fn format_model_call(o: &flux_evidence::Observation) -> String {
 /// without any per-op log to read.
 ///
 /// Nothing here reads a worker's tool input or observation data; the projection never exposes them.
-pub(super) fn fleet_status_line(rows: &[flux_tui::fleet::WorkerRow], width: usize) -> Option<String> {
+pub(super) fn fleet_status_line(
+    rows: &[flux_tui::fleet::WorkerRow],
+    width: usize,
+) -> Option<String> {
     if rows.is_empty() {
         return None;
     }

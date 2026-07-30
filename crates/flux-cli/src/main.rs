@@ -97,8 +97,7 @@ mod tests {
     use super::{
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
         credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts, fleet_status_line,
-        format_evidence,
-        implicit_plugin_group, integration_plugin_caps, loop_machinery_label,
+        format_evidence, implicit_plugin_group, integration_plugin_caps, loop_machinery_label,
         merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
         plugin_status_one, redact_plugin_echo, render_endpoint_row, render_review_markdown,
         resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
@@ -2955,8 +2954,8 @@ mod tests {
     /// legible in the one line an operator watching a wave actually sees.
     #[test]
     fn the_fleet_line_marks_the_hung_worker_and_not_the_working_one() {
-        use flux_tui::fleet::FleetProjection;
         use flux_runtime::{SpawnActivity, SpawnActivityEvent};
+        use flux_tui::fleet::FleetProjection;
 
         let event = |spawn_id: u64, role: &str, call_id: u64| SpawnActivity {
             spawn_id,
@@ -3004,8 +3003,8 @@ mod tests {
     /// still means something.
     #[test]
     fn the_fleet_line_yields_its_width_to_live_workers() {
-        use flux_tui::fleet::FleetProjection;
         use flux_runtime::{SpawnActivity, SpawnActivityEvent};
+        use flux_tui::fleet::FleetProjection;
 
         let event = |spawn_id: u64, role: &str, event: SpawnActivityEvent| SpawnActivity {
             spawn_id,
@@ -3037,7 +3036,11 @@ mod tests {
         );
 
         fleet.apply(
-            &event(2, "live-worker", SpawnActivityEvent::Planning { active: true }),
+            &event(
+                2,
+                "live-worker",
+                SpawnActivityEvent::Planning { active: true },
+            ),
             t0,
         );
         let with_live = fleet_status_line(&fleet.rows(t0), 400).expect("a live wave renders");

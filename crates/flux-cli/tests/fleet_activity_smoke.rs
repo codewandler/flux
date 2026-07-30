@@ -71,8 +71,11 @@ fn run_fleet_flow(tag: &str) -> (bool, String) {
     .expect("write flow");
     // The file the workers are told to read. Its NAME is the sentinel, so the secret rides in the
     // child's tool *input* — exactly the field A-79 documents as the internal half of its contract.
-    std::fs::write(work.join(format!("{SENTINEL}.txt")), "nothing secret in here\n")
-        .expect("write probe file");
+    std::fs::write(
+        work.join(format!("{SENTINEL}.txt")),
+        "nothing secret in here\n",
+    )
+    .expect("write probe file");
 
     let out = Command::new(env!("CARGO_BIN_EXE_flux"))
         .args(["flow", "run", "fleet.flux", "-m", "mock", "--yes"])

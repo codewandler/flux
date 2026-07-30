@@ -99,9 +99,20 @@ pub struct WorkerRow {
     /// the same role share a `child_session_id` (`s_1` in every fresh store) but never a spawn id,
     /// so pairing rows on anything else misattributes their events.
     pub spawn_id: u64,
+    /// The worker's file-defined role (`.flux/agents/<role>.md`) — what an operator calls it, and
+    /// the only human-meaningful name a surface has. Sanitized and length-bounded on the way in,
+    /// because a role name reaching surface chrome is still untrusted text.
     pub role: String,
+    /// The child's own session id, carried so a surface can point an operator at the run to open
+    /// for detail. Not an identity: a fresh storeless store hands every child `s_1`, which is why
+    /// `spawn_id` and not this is the correlation key.
     pub child_session_id: String,
+    /// Delegation nesting, `1` for a top-level agent's direct child. Nested delegation relays
+    /// grandchildren through the same reporter, so this is what tells a fleet's own workers apart
+    /// from the workers those workers spawned.
     pub depth: usize,
+    /// What the worker is doing, from the closed label set — the answer to "working or hung?"
+    /// together with [`WorkerRow::idle`].
     pub status: WorkerStatus,
     /// Operations this worker completed (results reported).
     pub ops: usize,
@@ -147,6 +158,9 @@ impl Default for FleetProjection {
 }
 
 impl FleetProjection {
+    /// An empty projection at the [`DEFAULT_STALL_AFTER`] threshold. A surface builds one per run
+    /// and folds every [`SpawnActivity`] into it; use [`FleetProjection::with_stall_after`] to be
+    /// more or less patient than the default.
     pub fn new() -> Self {
         FleetProjection {
             workers: Vec::new(),
@@ -359,13 +373,15 @@ mod tests {
         assert_eq!(rows.len(), 2, "two workers tracked: {rows:?}");
         let first = rows.iter().find(|r| r.spawn_id == 1).expect("worker 1");
         let second = rows.iter().find(|r| r.spawn_id == 2).expect("worker 2");
-        assert_eq!(first.status, WorkerStatus::Idle, "worker 1 resolved its read");
+        assert_eq!(
+            first.status,
+            WorkerStatus::Idle,
+            "worker 1 resolved its read"
+        );
         assert_eq!(first.ops, 1);
         assert_eq!(
             second.status,
-            WorkerStatus::Running {
-                op: "grep".into()
-            },
+            WorkerStatus::Running { op: "grep".into() },
             "worker 2's grep must not be closed by worker 1's result"
         );
         assert_eq!(second.ops, 0);
@@ -487,7 +503,11 @@ mod tests {
         let t0 = Instant::now();
         for spawn_id in 0..(MAX_TRACKED as u64 + 8) {
             fleet.apply(
-                &activity(spawn_id, "worker", SpawnActivityEvent::Planning { active: true }),
+                &activity(
+                    spawn_id,
+                    "worker",
+                    SpawnActivityEvent::Planning { active: true },
+                ),
                 t0,
             );
         }
