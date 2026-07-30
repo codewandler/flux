@@ -31,7 +31,10 @@
 //! - `guard_protected` is NOT a blanket restore, despite matching [`BLANKET_RESTORES`] on `-fd`:
 //!   its `clean`/`checkout` argv end in `--` and an explicit pathspec list filtered through
 //!   `is_protected`, so its blast radius is bounded by construction. It holds a stated, tested
-//!   exemption rather than a precondition.
+//!   exemption from a *clean-tree* precondition — it exists to run after the worker has dirtied
+//!   the tree — but **C-281 later added the other half of `git_reset`'s check to it**: the
+//!   snapshot it restores from must be an ancestor of the current `HEAD`. The exemption is about
+//!   which paths it touches; the precondition is about which commit they come from.
 
 use std::path::PathBuf;
 
