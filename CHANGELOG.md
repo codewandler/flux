@@ -18,6 +18,45 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A worker can no longer be handed the sandbox kill switch (C-282).** A coordinator with a resolved
+  `on` posture, running under an ambient `FLUX_SANDBOX=off`, passed `off` to the workers it spawned —
+  with the "you are already confined" marker beside it. The child was told it was confined *and* told
+  not to confine its own descendants. The cause was two hand-rolled forwarders writing into the
+  caller-override slot, which is applied after the posture and therefore won. Both are deleted rather
+  than corrected: a corrected copy is still a copy of a decision that already has one enforced
+  implementation. The defence moved to the source — a benchmark fixture's environment and a worker's
+  startup environment now have the sandbox keys dropped, beside the provider credentials that were
+  already dropped for the same reason.
+
+- **The anti-cheat restore can no longer pull from an unrelated history (C-281).** `guard_protected`
+  restores the protected grader and loop paths after a worker has had its way with the tree, and never
+  checked *where* it was restoring them from. A bogus commit failed safe, but a valid commit on a
+  divergent line silently replaced the protected paths with that line's version — the integrity check
+  itself quietly reset to a state nobody chose. It now refuses a snapshot it cannot place on this
+  checkout's line, through the same code path `git_reset` uses rather than a second copy of it.
+  ⚠ Deliberately *not* also demanding a clean tree: this op exists to run after the worker has dirtied
+  it, so that half would refuse it in normal operation. Two tests enforce the asymmetry, so adding the
+  missing-looking check goes red instead of shipping.
+
+- **A simulation can no longer leave a trace of itself (C-254).** `WhatIf` exists to answer "what would
+  happen" without it happening, and its pure-substitution path minted a counterfactual session *before*
+  its own refusals ran. "No trace" was therefore not a property of minting — it was a property of which
+  paths happened to refuse first, and the failure was silent, because nothing downstream distinguishes
+  a minted-then-refused run from one that never minted. The ordering is now structural: the only route
+  to a minted session is a method on a value whose fallible constructor has already discharged every
+  refusal, so reaching a mint with a refusal outstanding does not compile.
+
+- **A busy machine no longer reds the gate on no defect (C-253).** The checkpoint contention test
+  asserted a wall-clock duration, so it failed under concurrent build load while nothing was wrong. The
+  clock is gone rather than widened — a wider tolerance converts a flaky test into one that passes
+  whether or not the behaviour it names still holds. What the duration stood in for was causality, so
+  that is what is asserted now: the checkpoint connection's busy timeout is zero, a contended
+  checkpoint returns immediately, and the writer *still held the lock* when it did.
+  The finding underneath is worth more than the fix: **rusqlite installs a 5-second `busy_timeout` on
+  every connection it opens**, so the explicit zero on the checkpoint connection is undoing rusqlite's
+  default, not restating SQLite's — deleting it as redundant silently restores a five-second wait
+  behind any writer.
+
 - **The two destructive git ops the self-improvement loop relies on now state and enforce a
   precondition (C-278).** `git_reset` (`reset --hard` plus an unscoped `clean -fd`) and
   `guard_protected` destroyed uncommitted *and untracked* work unconditionally — and `clean -fd`

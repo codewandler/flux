@@ -15,6 +15,29 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **A confined flux now confines what it starts.** When you run flux with OS sandboxing on, the
+  processes it launches — including other flux processes, such as fleet workers — now inherit that
+  confinement instead of quietly running unconfined. Previously a child was told *"you are already
+  confined"* without being told **with what**, so it declined to confine its own descendants even
+  when you had demanded sandboxing. The setting only ever travels downward: a child can be stricter
+  than its parent, never looser, and a parent that is not sandboxing imposes nothing.
+
+### Fixed
+
+- **A "what if" simulation can no longer leave anything behind.** Asking flux what *would* have
+  happened sometimes created the counterfactual session before it decided it could not answer, so a
+  refused simulation could leave a stray session in your history. A refusal now leaves nothing at
+  all, and that is guaranteed by construction rather than by the order the checks happen to run in.
+
+- **Sandboxing is now proven on every build, in both directions.** Flux's continuous integration
+  exercises both the case where the operating system offers no sandbox and the case where a real one
+  is present. Until now the confined path was tested on no machine at all, so a regression in it
+  could reach a release unnoticed.
+
+### New
+
 - **Flux's built-in operations and language nodes now have one machine-readable catalogue.** Run
   `flux catalog core --format json` to export the current foundational tool contracts, language-node
   schemas, and stable specification links without running a tool or contacting the network. The
@@ -39,6 +62,14 @@
   name is taken, rather than half-created. **Removing them afterwards is your workflow's job**: they are
   kept on purpose because they hold work that has not been merged yet, and nothing cleans them up for
   you — so a long-running coordinator should delete the ones it is finished with, or it will fill the disk.
+
+### Action needed
+
+- **If you embed flux and re-run a recorded turn, one function's arguments have changed.** Re-running
+  a pinned turn now takes a resolved selection rather than a session name and turn number, so the
+  refusals that used to happen part-way through are settled before anything is created. If you build
+  against the flux libraries you will get a compile error pointing at the call; if you only run the
+  `flux` command line, nothing changes for you.
 
 ## [0.39.0] - 2026-07-30
 

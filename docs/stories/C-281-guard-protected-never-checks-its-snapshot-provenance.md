@@ -2,7 +2,7 @@
 id: C-281
 title: "`guard_protected` restores the anti-cheat paths from a snapshot whose provenance it never checks"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 epic: security-assurance
 design: docs/designs/security-assurance.md
