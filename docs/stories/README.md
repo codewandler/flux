@@ -37,9 +37,16 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   against the integrated tree finding no reproducible High-severity containment defect.
   **Zendesk automation** (D-199) now tracks the replacement: L-92 and A-136 are done, while
   D-200/D-201/D-202 are `blocked` on the flux-connectors interop that supersedes the withdrawn plugin.
-  **Security assurance** (C-186) is nearly closed — **C-195** (approval-sheet redaction) and
-  **C-210** (`gather_safe` ignores `semantic_effects`) remain; C-205 is blocked on the ratatui 0.29
-  hold.
+  **Security assurance** (C-186) has its closure evidence recorded (C-267 →
+  [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md)):
+  desk-review findings 1–4 and classification trust are **closed with evidence** against the tree at
+  `0.38.0`, and assurance moved 5/10 → 7.5/10. C-195 closed as **won't do** (redaction is a boundary
+  control, not an approval-sheet concern) and C-210 is `done`. It stays open on three things:
+  **envelope-integrity finding 4** (`file_stat`'s discarded second read, `flux-tools/src/extra.rs:96-107`)
+  is still open and was never filed as a story; **C-266** (neither side of the fail-closed sandbox
+  switch is proven in CI) is `ready`; and **C-205** is deliberately blocked — `lru` is transitive via
+  `ratatui 0.29.0`, so the fix is a breaking `ratatui 0.30.x` bump for an *unsound*-class advisory
+  reachable only via `LruCache::iter_mut`, which flux never calls.
 - **Newly designed:** **the agent-authored surface** (C-219; C-220…C-225 filed, none started) — the
   agent gets typed panes on the TUI and an allowlisted config surface. Most of the plumbing already
   exists (`ToolProgressSink`/`SpawnActivitySink` are the template; `op.register` is the precedent),
@@ -58,8 +65,10 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Now (in progress)
 - [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
+- [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
 - [C-239 — The fleet runs the track / impl-coord loop — complete and usable (epic)](C-239-fleet-loop-epic.md) · Core · EPIC — the model reasons, the host enforces: a WaveCoordinator does isolation/gate/merge/revert/ledger so the loop's invariants hold even when the model is wrong
 - [C-255 — Adversarial review remediation — close every actionable finding from the three 2026-07-30 reviews (epic)](C-255-adversarial-review-remediation-epic.md) · Core · REVIEW EPIC — three independent passes rated 5.5/10, 6/10, and 7/10; all reject Flux as a standalone unattended boundary
+- [C-267 — Record C-186's closure evidence against the 2026-07-29 baseline](C-267-security-assurance-closure-evidence.md) · Core · C-186's last unchecked acceptance bullet — every child is done, but nothing records that findings 1-4 and classification trust are closed, so the next review re-derives instead of verifying
 - [D-199 — Zendesk automation — deterministic support workflows with bounded AI (epic)](D-199-zendesk-automation-epic.md) · Agent · EPIC — L-92 (--entry) and A-136 (reference flow) shipped; the plugin is withdrawn, so D-200/D-201/D-202 await the flux-connectors interop
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
 
@@ -102,9 +111,7 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 - [C-274 — Make flux-events' SQLite dependency optional — the actual `wasm32` prerequisite](C-274-flux-events-optional-sqlite.md) · Core · found by C-270: rusqlite reaches flux-flow by TWO paths, and flux-events names it non-optionally — so dropping flux-flow's own line buys nothing. This one drops both at once and is what unblocks C-271
 
 ### Security assurance — close the gap between the envelope and its proof
-- [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
 - [C-266 — Both sides of the fail-closed sandbox switch are unproven in CI](C-266-sandbox-backend-ci-coverage.md) · Core · SURFACED BY the 0.38.0 cut — C-262's fail-closed switch cost four fix commits because no CI job exercises either side of it; the without-backend path was proven only by hand
-- [C-267 — Record C-186's closure evidence against the 2026-07-29 baseline](C-267-security-assurance-closure-evidence.md) · Core · C-186's last unchecked acceptance bullet — every child is done, but nothing records that findings 1-4 and classification trust are closed, so the next review re-derives instead of verifying
 
 ### Transactional turns — a compensating undo for the world, not just the session
 - [A-103 — The Compensation contract on ToolSpec — every mutating op declares how it is reversed](A-103-compensation-contract-on-toolspec.md) · Agent · Inverse | Snapshot | NotNeeded | None{why}; a registry-walk test fails on any mutating built-in with no declaration, which is what stops the contract rotting as ops are added
