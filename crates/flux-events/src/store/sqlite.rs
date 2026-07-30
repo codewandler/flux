@@ -366,6 +366,27 @@ impl SqliteEvents {
         Self::open_with_threshold(path, threshold)
     }
 
+    /// Test-only seam for C-253: read back the busy timeout SQLite currently holds on the
+    /// dedicated checkpoint connection, in milliseconds. `None` for an in-memory store, which has
+    /// no checkpoint connection at all.
+    ///
+    /// This is C-126's guarantee stated as something a test can *observe*: zero means no busy
+    /// handler is installed, and a connection with no busy handler cannot wait for a contended
+    /// lock — it is handed `SQLITE_BUSY` on the spot. `busy_timeout` is the only waiting mechanism
+    /// this crate ever installs, so "the timeout is zero" is the whole of "the checkpoint cannot
+    /// block". That lets the contention test assert causality instead of reading a clock; see
+    /// `checkpoint_hook_never_blocks_or_errors_under_writer_contention`.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_busy_timeout_ms(&self) -> Result<Option<i64>> {
+        let Some(checkpoint_conn) = &self.checkpoint_conn else {
+            return Ok(None);
+        };
+        let conn = checkpoint_conn.lock().unwrap();
+        conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .map(Some)
+            .map_err(map_sql)
+    }
+
     fn open_with_threshold(path: impl AsRef<Path>, threshold: Duration) -> Result<Self> {
         let path = path.as_ref();
         let conn = Connection::open(path).map_err(map_sql)?;
@@ -393,6 +414,11 @@ impl SqliteEvents {
         // zero busy-timeout means a contended `PRAGMA wal_checkpoint` attempt returns `SQLITE_BUSY`
         // at once instead of waiting, so `checkpoint` (called on a periodic serve-loop tick) can
         // never stall behind a writer or a pinned reader.
+        //
+        // C-253: the explicit zero is NOT redundant — rusqlite sets a 5s busy_timeout on every
+        // `Connection::open`, so deleting this line restores that default and a contended
+        // checkpoint silently starts waiting the writer out. Guarded by
+        // `checkpoint_hook_never_blocks_or_errors_under_writer_contention`.
         let checkpoint_conn = Connection::open(path).map_err(map_sql)?;
         checkpoint_conn
             .busy_timeout(Duration::ZERO)
