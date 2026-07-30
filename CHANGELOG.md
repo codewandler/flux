@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The in-repo operation reference was unguarded against omission (C-248).** `ops-reference.md` had a
+  guard already — C-233's risk-column check — but it walks the **document** and holds each row to the
+  catalog, so an op that was never written down is not a row and is invisible to it by construction.
+  That asymmetry is exactly why a *rename* reddened the gate while an *omission* never did. The missing
+  direction now exists: iterate the production catalog and require a table **row** per op — a row rather
+  than a substring, because the file already carried prose naming the very ops it was missing, which a
+  `contains()` check would have accepted as coverage. Closing the guard properly grew the fill from the
+  eval family to **33 ops**, adding the datasource (`get`/`list`/`relation`/`batch_get`), `endpoint.*`,
+  `review.*`, `schedule_wakeup`, `home_dir` and `flux_reload` families; every row was generated from
+  dumped `Tool::spec()` values rather than recalled. Four wrong parameter lists in the website catalog
+  were corrected in passing — `improvements_aggregate` was documented `painpoints, findings` and takes
+  `mined, reviewed`, and `git_tag`'s required `name` was absent entirely; a coverage test asserts a name
+  is present, never that its signature is real, so those were invisible to both guards. `AGENTS.md`
+  claimed a missing op reds the gate via the website test for **both** files, which was false for the
+  in-repo one and is plausibly how the omission survived an implementor following the contract.
+
 ### Changed
 
 - **Flux-Lang source is smaller and has one honest file format (L-93).** Canonical source now uses
