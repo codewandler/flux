@@ -2,7 +2,7 @@
 id: C-280
 title: "The with-a-backend sandbox lane cannot confine on the runner it was given, so it fails every run"
 pillar: Core
-status: ready
+status: in-progress
 priority: 1
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -35,7 +35,10 @@ repo, and only the second half is this story's problem.
 - [ ] The lane confines for real on its runner: `flux doctor --json` reports the `sandbox backend`
       check as `PASS`, and both `a_promised_backend_is_real_and_functional` and
       `an_auto_approved_turn_runs_its_children_inside_the_sandbox` go green in CI.
-- [ ] **The chosen mechanism is argued, not just applied.** At least these three are real options and
+      **Deliberately left unchecked — this one is only tickable by a runner.** The implementor has no
+      way to execute a GitHub Actions job, and a green local run proves nothing here (see Progress).
+      Tick it from run output, not from a diff review.
+- [x] **The chosen mechanism is argued, not just applied.** At least these three are real options and
       they are not equivalent:
       - `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` in the lane's install step —
         smallest change, but it means the lane proves confinement on a host reconfigured to permit
@@ -44,19 +47,67 @@ repo, and only the second half is this story's problem.
         announced retirement, so it buys time rather than a fix.
       - run the lane inside a container that provides the namespace itself.
       Pick one, state why, and say what it costs.
-- [ ] The lane's existing comment block is updated so it records what *happened* rather than what
+- [x] The lane's existing comment block is updated so it records what *happened* rather than what
       might: the trap it names is no longer hypothetical, and the next reader should learn that
       `ubuntu-latest` needed work to host this lane at all.
-- [ ] **The vacuity guard stays load-bearing.** Whatever fix lands must not weaken
+- [x] **The vacuity guard stays load-bearing.** Whatever fix lands must not weaken
       `a_promised_backend_is_real_and_functional` into tolerating a `WARN`. That test failing is the
       only reason this defect was visible instead of silently green; a fix that relaxes it converts a
       loud lane back into the decorative one C-266 existed to prevent.
-- [ ] A note in the story states plainly whether the fix is durable against the next runner-image
+- [x] A note in the story states plainly whether the fix is durable against the next runner-image
       bump, or whether it will need revisiting — `ubuntu-latest` moves under us by design.
 
 ## Progress
 
-- (not started)
+**The diff.** `.github/workflows/ci.yml`, `sandbox-backend` job only. No Rust file changed, and in
+particular `crates/flux-cli/tests/sandbox_backend.rs` is untouched — `git diff main -- crates/` is
+empty for this story. Three changes:
+
+1. The job's comment block now records run `30564156249` as history rather than naming the trap as a
+   possibility.
+2. A new best-effort step clears `kernel.apparmor_restrict_unprivileged_userns`.
+3. A new fail-fast step runs `bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true` — a strict
+   subset of `bwrap_probe_argv`'s flag set (`crates/flux-system/src/sandbox.rs`), so it cannot fail
+   where flux's own probe would have succeeded. It attributes a runner-side failure to the runner in
+   seconds instead of after a ten-minute build.
+
+**Why the sysctl and not the alternatives** — the full argument is in the ci.yml comment. In short:
+`ubuntu-22.04` is a dated reprieve and would make this the only lane not running on the image the
+rest of CI uses; a container is the heaviest option *and* carries a vacuity hazard, because GitHub
+container jobs run as root and root can create a user namespace even under the AppArmor restriction,
+so the lane would go green for a reason unrelated to the posture flux runs in.
+
+**What it costs, stated plainly.** The lane now proves flux confines on a host *reconfigured to
+permit* unprivileged userns, not on a stock `ubuntu-latest`. That is the right subject — the code
+under test is flux's confinement path, not Ubuntu's kernel policy — and the refusing-host posture is
+not lost, because it resolves to "no backend", which the `check` job asserts hermetically.
+
+**Durability: no, and it is not meant to be.** The knob is Ubuntu/AppArmor-specific and
+`ubuntu-latest` moves by design, so this will need revisiting — on the next image bump at the latest.
+What is durable is the *failure mode*: the enabling step is deliberately non-fatal, so if the knob
+disappears on a host that confines fine the lane still passes, and if the runner genuinely cannot
+confine, `a_promised_backend_is_real_and_functional` fails the job with `doctor`'s diagnosis attached.
+The fix can rot; it cannot rot quietly.
+
+**Verification — read this before ticking acceptance item 1.**
+
+- **No GitHub runner has executed any of this.** The implementor cannot trigger a CI run. Item 1 is
+  unchecked for that reason and must be ticked from run output.
+- A local `FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend` passes on the
+  dev box — **and that is not evidence.** This machine is Manjaro, has no
+  `kernel.apparmor_restrict_unprivileged_userns` knob at all, and permits unprivileged userns
+  (`/proc/sys/kernel/unprivileged_userns_clone` = 1). Passing here is exactly why the defect reached
+  CI unnoticed; it says nothing about a 24.04 runner.
+- What *was* proved locally is the diagnosis. Pointing `FLUX_BWRAP_BIN` at a stub that exits 1 with
+  `Creating new namespace failed: Operation not permitted` (one of `NAMESPACE_DENIAL_PATTERNS`)
+  reproduces run `30564156249` byte-for-byte on this box, at the merge base, with no ci.yml change:
+  both tests fail — `a_promised_backend_is_real_and_functional` with `left: String("WARN")` against
+  `right: "PASS"`, and `an_auto_approved_turn_runs_its_children_inside_the_sandbox` with the same
+  "must START, not fail closed" panic quoted in the Notes below. So the failure is confirmed to be
+  the userns denial and not the diff under test — but the *fix* for it lives on the runner, and only
+  a runner can confirm it.
+- The enabling step's non-fatal path was exercised directly: run under `bash -e` with a `sudo` stub
+  that fails the way a missing knob does, the step emits its `::notice::` and exits 0.
 
 ## Notes
 
