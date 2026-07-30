@@ -1101,7 +1101,15 @@ fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
 /// `flux`, and `FlowEngine`'s turn gate serves one concurrent turn per worker, so a wave was a wave of
 /// one. `ProcessRuntime` is constructed here rather than passed in for the same reason the dispatch
 /// ops are — one site, one catalog — and it owns the live child handles, so its lifetime is the
-/// process's and a coordinator exit kills every worker it started (`kill_on_drop`).
+/// process's.
+///
+/// **Cleanup is best-effort, and the gap is real.** `ManagedChild` is `kill_on_drop`, so an orderly
+/// exit — and any panic that unwinds — stops every worker this coordinator started. `SIGKILL` and
+/// `std::process::exit` run no destructor, so neither does. bubblewrap's `--die-with-parent` closes
+/// that hole, but only when the coordinator's own sandbox is active; an unsandboxed coordinator that
+/// is `SIGKILL`ed therefore leaves its workers running — auto-approving (`--yes`) daemons on loopback
+/// ports. Until a worker registry survives a coordinator restart (the board write C-243 left owed),
+/// recovery is `fleet.stop` from the next coordinator, or by hand.
 ///
 /// `ExternalRuntime` is deliberately **not** wired: naming already-running workers is operator
 /// configuration that does not exist yet, and inventing a config key for it here would add public

@@ -478,6 +478,11 @@ const NON_PUBLIC_ENV: &[&str] = &[
     "FLUX_BG_MARKER",
     "FLUX_C67_CWD_CHILD",
     "FLUX_EVAL_MARKER",
+    // C-243: the fleet-worker generation a `ProcessRuntime` child is granted. Set by flux on its own
+    // workers and read back by their runtimes to bound nesting; `build_command` clears the child's
+    // environment first, so it is not something an operator (or a model) can hand in. Raising it by
+    // hand only ever shrinks the budget, so it is not a knob worth documenting as one.
+    "FLUX_FLEET_DEPTH",
     "FLUX_SANDBOXED",
     "FLUX_SECRET",
     "FLUX_SYSTEM_ENV_TRUTHY_PROBE",

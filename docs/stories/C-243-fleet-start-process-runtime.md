@@ -45,9 +45,11 @@ This story absorbs A-120, A-121 and A-122 from the `agent-fleet-runtime` epic.
 - [x] The worker is scoped to the worktree `fleet.isolate` returned and bound to the item's
       `context_id`, so a later `fleet.dispatch` resumes the same session (A2A continuity on
       `contextId` is already implemented — `crates/flux-server/src/a2a.rs:88`).
-      → `a_worker_is_confined_to_the_checkout_it_was_given` asserts the child's real cwd via
-      `System::rerooted`; the `context_id` is minted per item and read back by
-      `fleet.worker_status`. The worktree is a **parameter**, because C-241 is not on `main` yet.
+      → `a_worker_is_confined_to_a_checkout_outside_the_workspace_root` (the arrangement
+      `fleet.isolate` actually produces) + `a_workers_cwd_is_the_checkout_it_was_given` (the child's
+      real cwd) + `a_worktree_must_be_an_existing_absolute_directory`. The `context_id` is minted per
+      item and read back by `fleet.worker_status`. The worktree is a **parameter** the coordinator
+      passes from `fleet.isolate`, not a call into it.
 - [ ] Its A2A endpoint is registered on the board item, so a restarted coordinator can re-derive
       in-flight workers.
       → NOT landed as a ledger write. `fleet.start` returns the endpoint and the following
@@ -78,6 +80,40 @@ This story absorbs A-120, A-121 and A-122 from the `agent-fleet-runtime` epic.
 
 ## Progress
 
+**2026-07-30 (rework round 1).** Independent review returned three blocking findings; all three were
+real and all three are fixed. Recorded here because each one is a property, not a patch:
+
+- **B1 — the op could not accept a `fleet.isolate` worktree.** It resolved the caller's path through
+  `Workspace::resolve`, the *write*-path resolver, which admits only the primary and `@named` roots —
+  while `allocate_worktree_dir` creates its parent *outside* every workspace root on purpose. So the
+  documented composition errored at step 2. The resolve is gone; `System::rerooted`
+  (`Workspace::with_root`: canonicalizes, must exist, does not require containment) is the guard, and
+  what keeps it from being a blank cheque is the new authority contract — the checkout is a named
+  `workspace.write` subject an operator approves — plus a hard absolute-path requirement. The original
+  test missed this by building its checkout *inside* the test root; the regression test now mirrors
+  `allocate_worktree_dir`'s sibling relationship.
+- **B2 — under the C-262 unattended posture the returned endpoint was unreachable.** Unattended
+  surfaces get `FLUX_SANDBOX=require` + `FLUX_SANDBOX_NET=0`; `spawn_background` is
+  `Confinement::Sandboxed`, and `bubblewrap_argv` then adds `--unshare-net`, so the worker bound
+  `127.0.0.1` inside its own netns while `await_ready` reported `live`. Two fixes: `start` now
+  **refuses** when the coordinator's sandbox is active with the network closed, naming the remedy; and
+  the sandbox posture is forwarded to the worker (`FLUX_SANDBOX`, `_NET`, `_WRITABLE`, `FLUX_BWRAP_BIN`,
+  `FLUX_SANDBOX_EXEC_BIN`) while `FLUX_SANDBOXED` is withheld, mirroring `flux_eval`'s
+  `SANDBOX_CHILD_ENV_KEYS` — without it a worker resolved its posture from an *empty* environment and
+  ran unconfined while the operator demanded `require`. Proven in **both** lanes; see the report for
+  what the ideal fix would need and why it is out of scope.
+- **B3 — a worker's own catalog contained `fleet.start`, auto-approved.** `--yes` installs an
+  `AllowApprover`, so the coordinator's first start was gated on `process.exec` and every start below
+  it was not. Bounded by `FLUX_FLEET_DEPTH` (default 1 generation, matching `LocalSpawner`'s
+  `max_depth`) plus a concurrent-worker cap. The marker travels only through the runtime's explicit env
+  override, and `build_command` clears the child's environment first, so it cannot be forged.
+
+Also fixed: the workers mutex is no longer held across the readiness wait (a stalling start blocked
+`fleet.stop`/`fleet.worker_status` on every *other* worker); `with_base_port` actually works; the
+cleanup claim at the construction site now states the `SIGKILL`/`process::exit` gap; `fleet.status`
+carries the back-reference to `fleet.worker_status`; and `fleet.start` names the
+`--allow-private-net` requirement in both its description and its result.
+
 **2026-07-30 — landed (PARTIAL).** The port and both implementations are in, the ops are registered
 in the production catalog, and a worker is a real guarded child process. What a resuming agent needs
 to know:
@@ -86,9 +122,10 @@ to know:
    (A-116) and reads a *task* on a worker; a registry cannot hold two ops of one name, and the two
    questions have genuinely different answers — a task can be `completed` on a worker that has since
    died. The `AgentRuntime` port's method is still `status`, as the Acceptance specifies.
-2. **The worktree is a parameter, not a `fleet.isolate` call.** C-241 is still `ready` on `main`, so
-   there was nothing to call. `fleet.start { worktree }` takes the path C-241 will hand back, and
-   composes: `fleet.isolate → fleet.start(worktree:) → fleet.dispatch(worker:, item:)`.
+2. **The worktree is a parameter, not a `fleet.isolate` call.** `fleet.start { worktree }` takes the
+   absolute path C-241 hands back, and composes:
+   `fleet.isolate → fleet.start(worktree:) → fleet.dispatch(worker:, item:)`. Verified against C-241 as
+   landed on `main`: it returns `<allocate_worktree_dir()>/checkout`, outside every workspace root.
 3. **Board endpoint registration is owed.** `fleet.start` returns the endpoint but writes nothing.
    The composed path already registers it — `fleet.dispatch item=…` records the endpoint as the
    item's `runner` through `BoardLedger` — but a *first-class* `fleet.start` write needs a new
@@ -104,3 +141,8 @@ to know:
    to hit when wiring F7/F9.
 6. **`ExternalRuntime` is implemented but not wired into the CLI** — naming already-running workers
    is operator configuration that does not exist yet.
+7. **A network-isolated coordinator cannot start workers at all**, by design (see B2). The ideal fix —
+   exempt the worker spawn from wrapping the way the local-eval child flux host is described as being,
+   and let it apply the posture to its own descendants instead — needs a `spawn_background` counterpart
+   to `System::run_with_env_exempt`, i.e. a change in `flux-system`. Out of scope here; the refusal is
+   the honest interim.

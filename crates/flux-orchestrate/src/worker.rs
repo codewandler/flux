@@ -38,7 +38,7 @@
 //! on how its workers came to exist. It deliberately refuses to `stop` — it did not start the
 //! process and must not pretend it can end it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
@@ -47,8 +47,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_core::{Error, Result};
+use flux_policy::{ResourceKind, ResourceRef};
 use flux_runtime::{
-    AgentRuntime, Tool, ToolContext, ToolResult, Worker, WorkerSpec, WorkerState, WorkerStatus,
+    AgentRuntime, AuthorityRequirement, Tool, ToolContext, ToolResult, Worker, WorkerSpec,
+    WorkerState, WorkerStatus,
 };
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_system::{ManagedChild, System};
@@ -79,6 +81,49 @@ const LISTENING_MARKER: &str = "listening on http://";
 /// (`ManagedChild` already caps what one drain returns; this caps what is *retained*).
 const RETAINED_LOG: usize = 8 * 1024;
 
+/// How deep this `flux` sits in a chain of fleet workers: absent or `0` in a coordinator a human
+/// started, `n+1` in a worker started by a coordinator at depth `n`.
+///
+/// **A marker flux sets on its own children, not a knob.** It travels only through
+/// [`ProcessRuntime`]'s explicit env override, and `build_command` *clears* the child's environment
+/// before applying those overrides — so a model cannot inject or lower it, and a worker cannot mint
+/// itself more depth than its parent granted. Raising it by hand only ever shrinks the budget.
+const DEPTH_ENV: &str = "FLUX_FLEET_DEPTH";
+
+/// How many fleet generations may exist below a human-started coordinator. `1` means a coordinator
+/// starts workers and those workers start none.
+///
+/// The bound exists because a worker is spawned with `--yes` and its catalog contains `fleet.start`:
+/// its approver is `AllowApprover`, so the coordinator's first start is gated and every start below
+/// it would not be. That is the same unbounded-recursion hazard `LocalSpawner` bounds with
+/// `max_depth` (`crate::SpawnRequest`, default 1), answered the same way and with the same default.
+const DEFAULT_MAX_FLEET_DEPTH: u32 = 1;
+
+/// How many workers one coordinator may hold at once. A second bound with a different shape: depth
+/// stops a chain, this stops a fan. Sized to the loopback range a runtime can actually place workers
+/// in, so exhausting it reports a budget rather than a port scan.
+const DEFAULT_MAX_WORKERS: usize = 16;
+
+/// Sandbox-posture variables forwarded verbatim into a worker.
+///
+/// Copied in spirit from `flux_eval`'s `SANDBOX_CHILD_ENV_KEYS`, which forwards exactly these into
+/// the eval child `flux` host, and for the same reason: none of them is in `build_command`'s
+/// `SAFE_ENV`, so without this a worker resolves its posture from an **empty** environment and
+/// silently runs `FLUX_SANDBOX=off` while the operator asked for `require`. A worker is a full
+/// `flux` that spawns processes of its own; it must confine them exactly as its parent would.
+///
+/// `FLUX_SANDBOXED` is deliberately **absent**, as it is in the eval list: that marker means "you
+/// are already inside a wrapper, do not nest", and only `build_command` may set it — it does so
+/// itself when the wrapper is genuinely active. Forwarding it by hand would let a worker skip its
+/// own confinement on the strength of a claim nobody checked.
+const SANDBOX_POSTURE_ENV: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOX_NET",
+    "FLUX_SANDBOX_WRITABLE",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+];
+
 // ── ProcessRuntime ──────────────────────────────────────────────────────────
 
 /// One live child `flux`, plus what the ops need to answer about it after the fact.
@@ -99,22 +144,56 @@ struct ProcessWorker {
     announced: bool,
 }
 
+/// What one runtime knows about its workers. One lock over both halves, because "is this id taken?"
+/// must be answered against *live and starting* workers together — two locks would let two concurrent
+/// starts for one item both pass the check.
+#[derive(Default)]
+struct WorkerTable {
+    live: HashMap<String, ProcessWorker>,
+    /// Ids whose spawn+readiness wait is in flight. Held only as a reservation, so the lock itself is
+    /// never held across the wait.
+    starting: HashSet<String>,
+}
+
+impl WorkerTable {
+    fn occupied(&self, id: &str) -> bool {
+        self.live.contains_key(id) || self.starting.contains(id)
+    }
+
+    fn count(&self) -> usize {
+        self.live.len() + self.starting.len()
+    }
+}
+
 /// A fleet worker as a **child `flux` process on this machine**, started through the guarded spawn.
 pub struct ProcessRuntime {
     /// The `flux` binary a worker is started from.
     program: PathBuf,
+    /// First port of this runtime's loopback range.
+    base_port: u16,
     /// Cursor over the loopback port range, so N concurrent starts do not all begin at the same
     /// candidate and serialize on each other's bind failures.
     next_port: AtomicU16,
-    /// Live workers by id. A `tokio` mutex because a `start` holds it across the readiness await.
-    workers: tokio::sync::Mutex<HashMap<String, ProcessWorker>>,
+    /// Live and starting workers. A `tokio` mutex, but **never held across an await**: a `start`
+    /// reserves its id, releases, then spawns and waits. Holding it across the readiness wait would
+    /// serialize every start and block `fleet.stop` / `fleet.worker_status` on *other* workers behind
+    /// one stalling one — a coordinator could not sweep or cancel its own wave.
+    workers: tokio::sync::Mutex<WorkerTable>,
     ready_timeout: Duration,
+    /// How deep this runtime's `flux` already sits in a chain of workers (see [`DEPTH_ENV`]).
+    depth: u32,
+    /// How many generations may exist below a human-started coordinator (see
+    /// [`DEFAULT_MAX_FLEET_DEPTH`]).
+    max_depth: u32,
+    /// How many workers this runtime may hold at once.
+    max_workers: usize,
     /// Extra environment for every worker, applied on top of `build_command`'s cleared, allow-listed
-    /// base. **Empty in production, deliberately**: a worker resolves its own provider credentials
-    /// from its own configuration through the forwarded `HOME`, exactly as any other `flux` process
-    /// does, and forwarding anything from the coordinator's environment here would be the one thing
-    /// the env-clear exists to prevent. It is a seam so a host — and the tests below — can steer a
-    /// non-default worker program without a second spawn path.
+    /// base — the sandbox posture ([`SANDBOX_POSTURE_ENV`]) and the depth marker ([`DEPTH_ENV`]) are
+    /// added per spawn on top of this. Nothing secret is forwarded: a worker resolves its own provider
+    /// credentials from its own configuration through the forwarded `HOME`, exactly as any other
+    /// `flux` process does, and forwarding a credential from the coordinator's environment is the one
+    /// thing the env-clear exists to prevent. This field is a seam so a host — and the tests below —
+    /// can steer a non-default worker program without a second spawn path.
     env: Vec<(String, String)>,
 }
 
@@ -138,16 +217,25 @@ impl ProcessRuntime {
     pub fn with_program(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
-            next_port: AtomicU16::new(DEFAULT_WORKER_BASE_PORT),
-            workers: tokio::sync::Mutex::new(HashMap::new()),
+            base_port: DEFAULT_WORKER_BASE_PORT,
+            next_port: AtomicU16::new(0),
+            workers: tokio::sync::Mutex::new(WorkerTable::default()),
             ready_timeout: DEFAULT_READY_TIMEOUT,
+            // Read from the host environment, not from a parameter: this is what a *parent* granted
+            // this process, and nothing model-reachable may restate it.
+            depth: std::env::var(DEPTH_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0),
+            max_depth: DEFAULT_MAX_FLEET_DEPTH,
+            max_workers: DEFAULT_MAX_WORKERS,
             env: Vec::new(),
         }
     }
 
     /// Override the loopback port range's start — for an operator whose default range is taken.
     pub fn with_base_port(mut self, base: u16) -> Self {
-        self.next_port = AtomicU16::new(base);
+        self.base_port = base;
         self
     }
 
@@ -160,13 +248,24 @@ impl ProcessRuntime {
         self
     }
 
-    /// The next port candidate, wrapping inside the span so a long-lived coordinator that has
-    /// started and stopped many workers keeps reusing the same bounded range.
+    /// Override the nesting budget and the concurrent-worker cap. Host configuration; a worker can
+    /// never call this, because it does not construct its own runtime.
+    pub fn with_bounds(mut self, max_depth: u32, max_workers: usize) -> Self {
+        self.max_depth = max_depth;
+        self.max_workers = max_workers;
+        self
+    }
+
+    /// This runtime's own depth in the worker chain — `0` in a human-started coordinator.
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    /// The next port candidate, wrapping inside the span so a long-lived coordinator that has started
+    /// and stopped many workers keeps reusing the same bounded range.
     fn next_candidate(&self) -> u16 {
-        let base = DEFAULT_WORKER_BASE_PORT;
         let taken = self.next_port.fetch_add(1, Ordering::Relaxed);
-        // `wrapping_*` keeps this total for any configured base; the modulus keeps it in the span.
-        base.wrapping_add(taken.wrapping_sub(base) % PORT_SPAN)
+        self.base_port.wrapping_add(taken % PORT_SPAN)
     }
 
     /// The argv one worker is started with. Argv-only by construction — there is no string here that
@@ -180,8 +279,13 @@ impl ProcessRuntime {
             // would swallow a following positional as the address.
             format!("--serve={addr}"),
             // A served worker has no interactive approver, so `flux app run --serve` requires this.
-            // It is not a widening: the worker's authority is bounded by its own policy and — via
-            // the re-rooted system below — by a writable set confined to its own checkout.
+            //
+            // Be exact about what it costs. Path-scoped write authority confines the worker's
+            // *filesystem* writes to its own checkout (via the re-rooted system below), but `--yes`
+            // installs an `AllowApprover`, and the worker's catalog contains `fleet.start` — so
+            // **process creation** is auto-approved inside it. Left alone that is unbounded
+            // recursion: a coordinator's first start is gated, and every start below it is not.
+            // [`DEPTH_ENV`] is what bounds it, and the depth check in `start` is what enforces it.
             "--yes".to_string(),
         ];
         if let Some(model) = spec
@@ -194,6 +298,76 @@ impl ProcessRuntime {
             argv.push(model.to_string());
         }
         argv
+    }
+
+    /// The environment one worker is started with: the host seam's `env`, the coordinator's sandbox
+    /// posture, and the depth this worker is granted.
+    ///
+    /// Ordering is load-bearing — `apply_safe_env` applies these last and lets later entries win — so
+    /// the depth marker is appended after everything else. A `with_startup` caller therefore cannot
+    /// overwrite the budget by passing `FLUX_FLEET_DEPTH` itself.
+    fn worker_env(&self, system: &System) -> Vec<(String, String)> {
+        let mut env = self.env.clone();
+        for key in SANDBOX_POSTURE_ENV {
+            if let Some(value) = system.env(key) {
+                env.push(((*key).to_string(), value));
+            }
+        }
+        env.push((DEPTH_ENV.to_string(), (self.depth + 1).to_string()));
+        env
+    }
+
+    /// Spawn a worker onto the first loopback port it can actually bind, and return it once it has
+    /// announced that it is serving.
+    ///
+    /// Split out of `start` so the whole spawn-and-wait runs with **no lock held** — `start` reserves
+    /// the id, calls this, then re-locks to publish. Every failure path drops `child`, whose
+    /// `kill_on_drop` stops the process, so no exit from here leaks one.
+    async fn place(
+        &self,
+        system: &System,
+        id: &str,
+        spec: &WorkerSpec,
+    ) -> Result<(String, String, ManagedChild)> {
+        let env = self.worker_env(system);
+        let mut refused = Vec::new();
+        for _ in 0..PORT_SPAN {
+            let port = self.next_candidate();
+            let addr = format!("127.0.0.1:{port}");
+            let argv = self.argv(&addr, spec);
+            let mut child = system.spawn_background(&argv, &env)?;
+            match self.await_ready(&mut child).await {
+                Readiness::Serving(log) => return Ok((format!("http://{addr}"), log, child)),
+                // The child's own bind is the port-availability test; a conflict just means the next
+                // candidate. `child` is dropped here, so nothing is left behind either way.
+                Readiness::Exited { log, .. } if port_conflict(&log) => refused.push(port),
+                Readiness::Exited { log, exit_code } => {
+                    return Err(Error::Other(format!(
+                        "fleet.start: worker `{id}` exited before it began serving (exit {}): {}",
+                        exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signalled".into()),
+                        tail(&log, 12)
+                    )));
+                }
+                Readiness::TimedOut(log) => {
+                    // Killed by the drop below. A worker that never announces is not usable, and
+                    // leaving it running would leak a process no id refers to.
+                    return Err(Error::Other(format!(
+                        "fleet.start: worker `{id}` did not begin serving within {}s and was \
+                         stopped: {}",
+                        self.ready_timeout.as_secs(),
+                        tail(&log, 12)
+                    )));
+                }
+            }
+        }
+        Err(Error::Other(format!(
+            "fleet.start: worker `{id}` found no free loopback port — {} candidate(s) in the \
+             {}..+{PORT_SPAN} range were all in use ({refused:?})",
+            refused.len(),
+            self.base_port
+        )))
     }
 
     /// Wait for a freshly spawned child to announce that it is serving, or to die trying.
@@ -287,15 +461,46 @@ impl AgentRuntime for ProcessRuntime {
                     .into(),
             ));
         }
-        let mut workers = self.workers.lock().await;
-        if workers.contains_key(id) {
+        // The nesting bound, before anything else: a worker that may not start workers must not even
+        // get as far as reserving an id.
+        if self.depth >= self.max_depth {
             return Err(Error::Other(format!(
-                "fleet.start: a worker for `{id}` is already running — stop it with fleet.stop \
-                 before starting another, or dispatch to the one that exists"
+                "fleet.start: refusing to start worker `{id}` — this flux is itself fleet worker \
+                 generation {} of a maximum {}, and a worker runs with `--yes`, so allowing it to \
+                 start workers of its own would auto-approve process creation without bound. The \
+                 coordinator a human started is the only one that may open a wave",
+                self.depth, self.max_depth
+            )));
+        }
+        // A worker started under a network-isolated sandbox binds inside its own network namespace,
+        // so the endpoint this op would hand back is unreachable from here — and the worker has no
+        // egress to reach a provider either. Refuse: the port contract is that `start` returns an
+        // *addressable* worker, and returning a live-looking endpoint nothing can reach would make
+        // this op work interactively and fail silently in exactly the automation it exists for.
+        //
+        // The wrapping decision belongs to the coordinator's own sandbox, so it is knowable here
+        // without probing: `spawn_background` passes `Confinement::Sandboxed`, and `bubblewrap_argv`
+        // adds `--unshare-net` precisely when the policy closes the network.
+        if system.sandbox().is_active() && !system.sandbox().settings().network {
+            return Err(Error::Other(format!(
+                "fleet.start: refusing to start worker `{id}` — this coordinator's sandbox is \
+                 active with the network closed ({}), so the worker would bind inside its own \
+                 network namespace and no endpoint could reach it. Re-run the coordinator with the \
+                 sandbox network open (FLUX_SANDBOX_NET=1, or `[sandbox] network = true`), or start \
+                 the worker from a coordinator that is not network-isolated",
+                system.sandbox().describe()
             )));
         }
         // Scope the worker to its checkout BEFORE spawning: the re-rooted system carries both the
         // child's cwd and the sandbox's writable set, so this is the confinement, not a hint.
+        //
+        // `rerooted` is the *whole* guard on this path, deliberately. `Workspace::with_root`
+        // canonicalizes and requires the directory to exist, and it does **not** require the new root
+        // to sit under the old one — which is the only reason `fleet.isolate`'s checkout can be
+        // accepted at all: `allocate_worktree_dir` creates it outside every workspace root on purpose
+        // (`$FLUX_WORKTREE_DIR`, else `$HOME/.flux/worktrees`). An earlier revision also ran the path
+        // through `Workspace::resolve`, the write-path resolver, which admits only the primary and
+        // `@named` roots — so it rejected the one input this parameter exists to take.
         let rerooted = match spec.worktree.as_deref() {
             Some(dir) => Some(system.rerooted(dir).map_err(|e| {
                 Error::Other(format!(
@@ -307,75 +512,70 @@ impl AgentRuntime for ProcessRuntime {
         };
         let system = rerooted.as_ref().unwrap_or(system);
 
-        let mut refused = Vec::new();
-        for _ in 0..PORT_SPAN {
-            let port = self.next_candidate();
-            let addr = format!("127.0.0.1:{port}");
-            let argv = self.argv(&addr, &spec);
-            let mut child = system.spawn_background(&argv, &self.env)?;
-            match self.await_ready(&mut child).await {
-                Readiness::Serving(log) => {
-                    let endpoint = format!("http://{addr}");
-                    workers.insert(
-                        id.to_string(),
-                        ProcessWorker {
-                            child,
-                            endpoint: endpoint.clone(),
-                            context_id: spec.context_id.clone(),
-                            log,
-                            exit_code: None,
-                            announced: true,
-                        },
-                    );
-                    return Ok(Worker {
-                        id: id.to_string(),
-                        endpoint,
-                        context_id: spec.context_id,
-                    });
-                }
-                // The child's own bind is the port-availability test; a conflict just means the next
-                // candidate. `child` is dropped here, so nothing is left behind either way.
-                Readiness::Exited { log, exit_code } if port_conflict(&log) => {
-                    refused.push(port);
-                    let _ = exit_code;
-                }
-                Readiness::Exited { log, exit_code } => {
-                    return Err(Error::Other(format!(
-                        "fleet.start: worker `{id}` exited before it began serving (exit {}): {}",
-                        exit_code
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "signalled".into()),
-                        tail(&log, 12)
-                    )));
-                }
-                Readiness::TimedOut(log) => {
-                    // Killed by the drop below. A worker that never announces is not usable, and
-                    // leaving it running would leak a process no id refers to.
-                    return Err(Error::Other(format!(
-                        "fleet.start: worker `{id}` did not begin serving within {}s and was \
-                         stopped: {}",
-                        self.ready_timeout.as_secs(),
-                        tail(&log, 12)
-                    )));
-                }
+        // Reserve the id, then release the lock. Everything below awaits, and holding this across the
+        // readiness wait would block every other verb on every other worker.
+        {
+            let mut workers = self.workers.lock().await;
+            if workers.occupied(id) {
+                return Err(Error::Other(format!(
+                    "fleet.start: a worker for `{id}` is already running or starting — stop it with \
+                     fleet.stop before starting another, or dispatch to the one that exists"
+                )));
             }
+            if workers.count() >= self.max_workers {
+                return Err(Error::Other(format!(
+                    "fleet.start: refusing to start worker `{id}` — this coordinator already holds \
+                     {} of a maximum {} workers; stop one with fleet.stop first",
+                    workers.count(),
+                    self.max_workers
+                )));
+            }
+            workers.starting.insert(id.to_string());
         }
-        Err(Error::Other(format!(
-            "fleet.start: worker `{id}` found no free loopback port — {} candidate(s) in the \
-             {DEFAULT_WORKER_BASE_PORT}..+{PORT_SPAN} range were all in use ({refused:?})",
-            refused.len()
-        )))
+        let placed = self.place(system, id, &spec).await;
+        // Release the reservation on **every** path, then publish on success. Written as one
+        // re-lock over an already-computed outcome so no `?` can escape between the two.
+        let mut workers = self.workers.lock().await;
+        workers.starting.remove(id);
+        match placed {
+            Ok((endpoint, log, child)) => {
+                workers.live.insert(
+                    id.to_string(),
+                    ProcessWorker {
+                        child,
+                        endpoint: endpoint.clone(),
+                        context_id: spec.context_id.clone(),
+                        log,
+                        exit_code: None,
+                        announced: true,
+                    },
+                );
+                Ok(Worker {
+                    id: id.to_string(),
+                    endpoint,
+                    context_id: spec.context_id,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn stop(&self, _system: &System, id: &str) -> Result<()> {
         let mut workers = self.workers.lock().await;
         // Removing the handle kills the child on drop, so the stop is the removal — there is no
         // window in which the map claims a worker this runtime has already signalled.
-        match workers.remove(id) {
+        match workers.live.remove(id) {
             Some(mut worker) => {
                 worker.child.kill();
                 Ok(())
             }
+            // A worker still inside its readiness wait is deliberately NOT stoppable: its handle
+            // belongs to the in-flight `place` call, which kills it on any failure. Saying so beats
+            // reporting "no such worker" for something the caller just asked to start.
+            None if workers.starting.contains(id) => Err(Error::Other(format!(
+                "fleet.stop: worker `{id}` is still starting — wait for fleet.start to return, \
+                 which either publishes the worker or stops it"
+            ))),
             None => Err(Error::Other(format!(
                 "fleet.stop: no worker `{id}` was started by this coordinator"
             ))),
@@ -384,7 +584,20 @@ impl AgentRuntime for ProcessRuntime {
 
     async fn status(&self, _system: &System, id: &str) -> Result<WorkerStatus> {
         let mut workers = self.workers.lock().await;
+        if !workers.live.contains_key(id) && workers.starting.contains(id) {
+            return Ok(WorkerStatus {
+                id: id.to_string(),
+                state: WorkerState::Starting,
+                // No endpoint yet: which port the worker took is not settled until it binds, and
+                // offering a guess is exactly the not-dispatchable-looking thing `Starting` is for.
+                endpoint: None,
+                context_id: None,
+                exit_code: None,
+                detail: "the worker is still inside its readiness wait".to_string(),
+            });
+        }
         let worker = workers
+            .live
             .get_mut(id)
             .ok_or_else(|| Error::Other(format!("fleet.worker_status: no worker `{id}`")))?;
         // Drain before the liveness test, and retain: a worker that just died explains itself in
@@ -422,9 +635,15 @@ impl AgentRuntime for ProcessRuntime {
 
     async fn endpoint(&self, _system: &System, id: &str) -> Result<String> {
         let workers = self.workers.lock().await;
-        workers.get(id).map(|w| w.endpoint.clone()).ok_or_else(|| {
-            Error::Other(format!("fleet worker `{id}` is not known to this runtime"))
-        })
+        // Only a *published* worker has an endpoint. One still inside its readiness wait has not
+        // settled which port it took, so there is nothing truthful to return yet.
+        workers
+            .live
+            .get(id)
+            .map(|w| w.endpoint.clone())
+            .ok_or_else(|| {
+                Error::Other(format!("fleet worker `{id}` is not known to this runtime"))
+            })
     }
 }
 
@@ -525,6 +744,17 @@ fn worker_subject(id: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The checkout a start would give a worker write authority over, as its own grantable subject. A
+/// different resource family from the worker id, which is why `authority_requirements` discriminates
+/// rather than iterating.
+fn worktree_subject(worktree: Option<&str>) -> Vec<String> {
+    worktree
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| vec![dir.to_string()])
+        .unwrap_or_default()
+}
+
 /// Arguments for `fleet.start`.
 #[derive(Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -583,9 +813,11 @@ impl Tool for FleetStartTool {
         ToolSpec {
             name: "fleet.start".into(),
             description: "Start a flux worker for one board item and return the A2A endpoint to \
-                          dispatch to. Confine it to an isolated checkout with `worktree`; the \
-                          returned `context_id` resumes the same worker session on a later \
-                          fleet.dispatch. Stop it with fleet.stop."
+                          dispatch to. Pass the `worktree` fleet.isolate returned to confine the \
+                          worker to that checkout; the returned `context_id` resumes the same worker \
+                          session on a later fleet.dispatch. Stop it with fleet.stop. The endpoint \
+                          is on loopback, which fleet.dispatch refuses unless the operator started \
+                          flux with --allow-private-net."
                 .into(),
             input_schema: tool_input_schema::<StartInput>(),
             output_schema: None,
@@ -602,9 +834,52 @@ impl Tool for FleetStartTool {
         }
     }
 
+    /// Two independently grantable subjects, kept apart by resource family exactly as
+    /// `fleet.dispatch` keeps a worker origin apart from a board item (A-130): the **worker** this
+    /// start creates, and the **checkout** it is given write authority over. A start with no
+    /// `worktree` reports only the first, because then it grants no tree.
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
         let args = serde_json::from_value::<StartInput>(params.clone()).ok();
-        worker_subject(args.as_ref().map(|a| a.item.as_str()))
+        let mut subjects = worker_subject(args.as_ref().map(|a| a.item.as_str()));
+        subjects.extend(worktree_subject(
+            args.as_ref().and_then(|a| a.worktree.as_deref()),
+        ));
+        subjects
+    }
+
+    /// Derived here rather than from the declaration, for the reason A-130 records on
+    /// `fleet.dispatch`: the declaration path applies every declared access kind to every subject, so
+    /// it would demand `process.exec` on a *directory*. Each subject earns only the family that fits
+    /// it — `process.exec` on the worker, `workspace.write` on the checkout the worker may write.
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        let args = serde_json::from_value::<StartInput>(params.clone()).ok();
+        let worker = worker_subject(args.as_ref().map(|a| a.item.as_str()));
+        // An unnameable worker yields no subject — but never an empty requirement list, which would
+        // mean this op demands nothing at all. `Executor::gate` walks the requirements for its policy
+        // floor, so the fallback is the conservative wildcard, exactly as `fleet.dispatch` argues.
+        let mut requirements = match worker.first() {
+            Some(subject) => vec![AuthorityRequirement::new(
+                "process.exec",
+                ResourceRef::named(ResourceKind::Process, subject),
+            )],
+            None => vec![AuthorityRequirement::new(
+                "process.exec",
+                ResourceRef::any(ResourceKind::Process),
+            )],
+        };
+        if let Some(dir) = args
+            .as_ref()
+            .and_then(|a| a.worktree.as_deref())
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            requirements.push(AuthorityRequirement::workspace_write(dir));
+        }
+        Ok(requirements)
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -618,15 +893,32 @@ impl Tool for FleetStartTool {
             .map(str::to_string)
             .unwrap_or_else(|| default_context_id(&item));
         let system = ctx.system();
-        // A caller-named worktree is resolved through the workspace guard, so a path outside it is
-        // refused here rather than becoming a child's cwd.
+        // Deliberately NOT run through `Workspace::resolve`. That is the write-path resolver, which
+        // admits only the primary root and `@named` roots — and `fleet.isolate`'s checkout lives
+        // outside every workspace root by design (`allocate_worktree_dir`), so resolving here refused
+        // the exact input this parameter exists to accept. The guard is `System::rerooted` inside the
+        // runtime: it canonicalizes, requires the directory to exist, and is the same seam a
+        // context-local worktree transition uses. What keeps it from being a blank cheque is the
+        // authority contract above — the checkout is a named `workspace.write` subject an operator
+        // approves — plus an absolute path, so nothing is interpreted relative to a cwd the caller
+        // cannot see.
         let worktree = match args
             .worktree
             .as_deref()
             .map(str::trim)
             .filter(|w| !w.is_empty())
         {
-            Some(dir) => Some(system.workspace().resolve(dir)?),
+            Some(dir) => {
+                let path = std::path::Path::new(dir);
+                if !path.is_absolute() {
+                    return Err(Error::Other(format!(
+                        "fleet.start: `worktree` must be an absolute path — `{dir}` is relative, and \
+                         a worker's checkout is not resolved against this session's cwd. Pass the \
+                         `worktree` fleet.isolate returned verbatim"
+                    )));
+                }
+                Some(path.to_path_buf())
+            }
             None => None,
         };
         let spec = WorkerSpec {
@@ -643,6 +935,13 @@ impl Tool for FleetStartTool {
                     "context_id": worker.context_id,
                     "runtime": self.runtime.kind(),
                     "state": WorkerState::Live.as_str(),
+                    // Said in the result, not only in the description: the endpoint this op just
+                    // handed back is on loopback, and `fleet.dispatch` guards every caller-supplied
+                    // URL through the SSRF guard, whose default refuses private addresses. Without
+                    // this line the next call fails with a guard message that names no remedy.
+                    "dispatch_note": "This endpoint is on loopback. fleet.dispatch resolves worker \
+                                      URLs through the SSRF guard, which refuses private addresses \
+                                      unless flux was started with --allow-private-net.",
                 })
                 .to_string(),
             )),
@@ -791,65 +1090,79 @@ mod tests {
     use flux_system::Workspace;
     use serde_json::json;
 
-    /// A stand-in worker: an executable that announces itself the way `flux_server::serve` does and
-    /// then stays up. It exists so the lifecycle can be proven against a **real guarded spawn** and
-    /// a real OS process — the parts that can actually be wrong — without paying for a full `flux`
-    /// boot, a provider, or a port that a CI box may not let us bind twice.
+    /// The committed stand-in worker (`tests/fixtures/stand-in-worker.sh`) — see its own header for
+    /// why it is a fixture rather than a file these tests write, and for the marker protocol.
     ///
-    /// It is handed the same argv a real worker gets (`app run --serve=<addr> --yes`), so the
-    /// address it echoes is the one `ProcessRuntime` chose, which is what makes the returned
-    /// endpoint meaningful rather than assumed.
-    fn fake_worker(dir: &std::path::Path, body: &str) -> PathBuf {
-        let path = dir.join("fake-worker.sh");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\n\
-                 # $1=app $2=run $3=--serve=<addr>\n\
-                 addr=${{3#--serve=}}\n\
-                 {body}\n"
-            ),
-        )
-        .expect("write the stand-in worker");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make the stand-in worker executable");
-        }
+    /// It speaks the real worker argv and announces itself exactly as `flux_server::serve` does, so
+    /// the lifecycle is proven against a **real guarded spawn** and a real OS process without booting
+    /// a full `flux`.
+    fn stand_in_worker() -> PathBuf {
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/stand-in-worker.sh"
+        ));
+        assert!(
+            path.is_file(),
+            "the committed stand-in worker is missing: {}",
+            path.display()
+        );
         path
     }
 
-    /// A worker that serves: announces, then blocks until it is killed.
-    const SERVES: &str = "echo \"flux server listening on http://$addr\" >&2\n\
-                          while true; do sleep 1; done";
+    /// Ask the stand-in worker in `checkout` to never announce — the shape of a worker that starts but
+    /// never binds.
+    fn never_announces(checkout: &std::path::Path) {
+        std::fs::write(checkout.join("no-announce"), "").expect("the no-announce marker");
+    }
 
-    /// A worker that dies on its own after announcing — the shape a crashed worker has.
-    const ANNOUNCES_THEN_DIES: &str = "echo \"flux server listening on http://$addr\" >&2\nexit 17";
+    /// Ask the stand-in worker in `checkout` to exit with `code` right after announcing — the shape of
+    /// a worker that crashes on its own.
+    fn exits_with(checkout: &std::path::Path, code: i32) {
+        std::fs::write(checkout.join("exit-code"), code.to_string()).expect("the exit-code marker");
+    }
 
     /// A guarded system over a throwaway root, with the sandbox **disabled** — the spawn path under
     /// test is `build_command` itself, and `Sandbox::disabled()` is what every hermetic test site
-    /// uses so a box without bubblewrap and a box with one behave the same here.
+    /// uses so a box without bubblewrap and a box with one behave the same here. The sandbox-posture
+    /// tests below build their own `System` instead, precisely because this one cannot see that path.
     fn test_system(root: &std::path::Path) -> System {
-        System::new(Workspace::new(root).expect("workspace over the temp root"))
+        System::new(Workspace::new(root).expect("workspace over the test root"))
     }
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "flux-c243-{tag}-{}-{}",
+    /// A throwaway directory **on the real disk**, under the workspace's own gitignored `target/`.
+    ///
+    /// Deliberately not `std::env::temp_dir()`: `/tmp` here is a 32G tmpfs shared with every other
+    /// build on the box, and filling it wedges unrelated processes. `target/` is where build output
+    /// already goes.
+    fn test_root(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/c243-tests"
+        ))
+        .join(format!(
+            "{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).expect("temp root");
+        std::fs::create_dir_all(&dir).expect("test root");
         dir
     }
 
-    /// Fast startup budget + no marker env, so a failing test fails in seconds rather than a minute.
+    /// Fast startup budget + no extra env, so a failing test fails in seconds rather than a minute.
     fn runtime_for(program: PathBuf) -> ProcessRuntime {
         ProcessRuntime::with_program(program).with_startup(Duration::from_secs(10), Vec::new())
+    }
+
+    /// A spec for one worker, with the fields most tests do not care about defaulted.
+    fn spec_for(name: &str) -> WorkerSpec {
+        WorkerSpec {
+            name: name.into(),
+            context_id: "ctx".into(),
+            ..Default::default()
+        }
     }
 
     /// C-243 Acceptance 1: the round trip. Start a worker, see it live at the endpoint the runtime
@@ -857,8 +1170,8 @@ mod tests {
     /// real guarded spawn.
     #[tokio::test]
     async fn a_worker_round_trips_start_status_stop() {
-        let root = temp_root("roundtrip");
-        let program = fake_worker(&root, SERVES);
+        let root = test_root("roundtrip");
+        let program = stand_in_worker();
         let runtime: Arc<dyn AgentRuntime> = Arc::new(runtime_for(program));
         let ctx = ToolContext::new(Arc::new(test_system(&root)));
 
@@ -922,8 +1235,8 @@ mod tests {
     /// process itself rather than from a flag the runtime set when it was asked to stop.
     #[tokio::test]
     async fn a_killed_worker_is_reported_dead_rather_than_live() {
-        let root = temp_root("killed");
-        let program = fake_worker(&root, SERVES);
+        let root = test_root("killed");
+        let program = stand_in_worker();
         let runtime = Arc::new(runtime_for(program));
         let system = test_system(&root);
 
@@ -948,6 +1261,7 @@ mod tests {
             .workers
             .lock()
             .await
+            .live
             .get_mut("C-243")
             .expect("the worker is registered")
             .child
@@ -977,9 +1291,10 @@ mod tests {
     /// code and output**, because that tail is the only place the reason exists.
     #[tokio::test]
     async fn a_worker_that_exits_reports_its_exit_code_and_output() {
-        let root = temp_root("exits");
-        let program = fake_worker(&root, ANNOUNCES_THEN_DIES);
-        let runtime = runtime_for(program);
+        let root = test_root("exits");
+        // No `worktree`, so the worker's cwd is the workspace root — that is where its markers live.
+        exits_with(&root, 17);
+        let runtime = runtime_for(stand_in_worker());
         let system = test_system(&root);
 
         runtime
@@ -1015,23 +1330,75 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Acceptance 4: the worker is scoped to the checkout it was given. Proven through the guarded
-    /// system's own resolution — a worktree outside the workspace is refused before anything spawns,
-    /// which is what makes the confinement structural rather than an instruction.
+    /// Acceptance 4, and the regression for the defect review finding B1 caught: the worker is scoped
+    /// to the checkout it was given, **and that checkout lives outside the workspace root**.
+    ///
+    /// The arrangement here is the one `fleet.isolate` actually produces, which is the whole point.
+    /// `flux_system::allocate_worktree_dir` creates its parent under `$FLUX_WORKTREE_DIR` (else
+    /// `$HOME/.flux/worktrees`) — "outside any workspace root **on purpose**", per its own doc — and
+    /// C-241 hands back `<that>/checkout`. An earlier revision of this op ran the path through
+    /// `Workspace::resolve`, the write-path resolver, which admits only the primary and `@named`
+    /// roots; it therefore rejected every real `fleet.isolate` output with "escapes the workspace
+    /// root", and the original version of this test missed it by putting the checkout *inside* the
+    /// test root — an arrangement the composition never produces.
     #[tokio::test]
-    async fn a_worker_is_confined_to_the_checkout_it_was_given() {
-        let root = temp_root("worktree");
-        let checkout = root.join("wt-C-243");
+    async fn a_worker_is_confined_to_a_checkout_outside_the_workspace_root() {
+        let base = test_root("worktree");
+        let root = base.join("repo");
+        // A sibling of the workspace root, not a descendant — exactly `allocate_worktree_dir`'s
+        // relationship to the caller's root.
+        let checkout = base.join("flux-worktree-stand-in").join("checkout");
+        std::fs::create_dir_all(&root).expect("the workspace root");
         std::fs::create_dir_all(&checkout).expect("the isolated checkout");
-        // The stand-in worker reports its own cwd, so the assertion is about where the OS actually
-        // put the child, not about what the runtime intended.
-        let program = fake_worker(
-            &root,
-            "echo \"flux server listening on http://$addr\" >&2\n\
-             echo \"cwd=$(pwd)\" >&2\n\
-             while true; do sleep 1; done",
+        assert!(
+            !checkout.starts_with(&root),
+            "this test is only meaningful if the checkout is outside the workspace root"
         );
-        let runtime = runtime_for(program);
+        let runtime = runtime_for(stand_in_worker());
+
+        // Through the **op**, not the runtime: the op is where the rejected resolve used to live.
+        let ctx = ToolContext::new(Arc::new(test_system(&root)));
+        let started = FleetStartTool::new(Arc::new(runtime))
+            .execute(
+                &ctx,
+                json!({ "item": "C-243", "worktree": checkout.display().to_string() }),
+            )
+            .await
+            .expect("fleet.start dispatches");
+        assert!(
+            !started.is_error,
+            "a checkout outside the workspace root is exactly what fleet.isolate returns, so \
+             fleet.start must accept it: {}",
+            started.content
+        );
+
+        // The endpoint it handed back is real, and it tells the caller about the SSRF guard it is
+        // about to meet — the refusal was correct but undiscoverable before.
+        let started: Value = serde_json::from_str(&started.content).expect("start returns JSON");
+        assert!(started["endpoint"]
+            .as_str()
+            .expect("an endpoint")
+            .starts_with("http://127.0.0.1:"));
+        assert!(
+            started["dispatch_note"]
+                .as_str()
+                .expect("a dispatch note")
+                .contains("--allow-private-net"),
+            "the loopback endpoint must name the grant fleet.dispatch will demand: {started}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same confinement, asserted where the child's cwd is observable: the runtime handle stays
+    /// in the test, so a status poll can read the `cwd=` line the stand-in worker prints.
+    #[tokio::test]
+    async fn a_workers_cwd_is_the_checkout_it_was_given() {
+        let base = test_root("cwd");
+        let root = base.join("repo");
+        let checkout = base.join("flux-worktree-stand-in").join("checkout");
+        std::fs::create_dir_all(&root).expect("the workspace root");
+        std::fs::create_dir_all(&checkout).expect("the isolated checkout");
+        let runtime = runtime_for(stand_in_worker());
         let system = test_system(&root);
 
         runtime
@@ -1060,19 +1427,39 @@ mod tests {
             "the child's cwd must be its checkout, got {detail:?} (wanted {})",
             expected.display()
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
 
-        // And a path outside the workspace never reaches a spawn at all — the guarded workspace
-        // refuses it while resolving, before any child exists to have to clean up.
-        let outside = FleetStartTool::new(Arc::new(runtime_for(fake_worker(&root, SERVES))))
-            .execute(
-                &ToolContext::new(Arc::new(test_system(&checkout))),
-                json!({ "item": "escape", "worktree": "../../etc" }),
-            )
-            .await;
-        let refusal = outside.expect_err("a worktree outside the workspace must be refused");
+    /// Dropping the write-path resolver is not a blank cheque. A **relative** `worktree` is refused
+    /// outright — there is no cwd a caller could reason about for a worker's checkout — and a
+    /// non-existent one is refused by `Workspace::with_root`, which is now the guard.
+    #[tokio::test]
+    async fn a_worktree_must_be_an_existing_absolute_directory() {
+        let root = test_root("worktree-guard");
+        let ctx = ToolContext::new(Arc::new(test_system(&root)));
+        let op = FleetStartTool::new(Arc::new(runtime_for(stand_in_worker())));
+
+        let relative = op
+            .execute(&ctx, json!({ "item": "rel", "worktree": "../../etc" }))
+            .await
+            .expect_err("a relative worktree is refused");
         assert!(
-            refusal.to_string().contains("escapes the workspace root"),
-            "the refusal must come from the workspace guard, got {refusal}"
+            relative.to_string().contains("must be an absolute path"),
+            "{relative}"
+        );
+
+        let missing = op
+            .execute(
+                &ctx,
+                json!({ "item": "missing", "worktree": root.join("no-such-checkout").display().to_string() }),
+            )
+            .await
+            .expect("fleet.start dispatches");
+        assert!(missing.is_error, "{}", missing.content);
+        assert!(
+            missing.content.contains("cannot be scoped to"),
+            "the refusal must name the checkout: {}",
+            missing.content
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1082,8 +1469,8 @@ mod tests {
     /// (which would orphan a running process no id refers to).
     #[tokio::test]
     async fn concurrent_workers_get_distinct_endpoints_and_an_id_cannot_be_reused() {
-        let root = temp_root("distinct");
-        let program = fake_worker(&root, SERVES);
+        let root = test_root("distinct");
+        let program = stand_in_worker();
         let runtime = runtime_for(program);
         let system = test_system(&root);
 
@@ -1112,11 +1499,301 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Review finding B2, the posture half: a coordinator whose sandbox is **active with the network
+    /// closed** must refuse to start a worker rather than hand back an endpoint nothing can reach.
+    ///
+    /// Under the C-262 unattended profile (`flux app run --serve`, `flux run --yes`, …)
+    /// `apply_sandbox_env` sets `FLUX_SANDBOX=require` and `FLUX_SANDBOX_NET=0`; `spawn_background`
+    /// passes `Confinement::Sandboxed`, and `bubblewrap_argv` then adds `--unshare-net`. The worker
+    /// binds `127.0.0.1:<port>` inside its **own** network namespace, so the announcement arrives and
+    /// the endpoint is unreachable — works interactively (sandbox off, unwrapped), silently broken in
+    /// exactly the automation this op exists for.
+    ///
+    /// This test asserts the right thing in **both** gate lanes rather than only where a backend
+    /// exists, which is the gap that let the defect through in the first place: `System::new` is
+    /// `Sandbox::disabled()`, so a test built on it can never see this path. With a usable backend the
+    /// posture resolves active and the start must refuse; without one it resolves inactive, nothing is
+    /// wrapped, and the start must succeed.
+    #[tokio::test]
+    async fn a_network_isolated_coordinator_refuses_to_start_an_unreachable_worker() {
+        use flux_system::sandbox::{Sandbox, SandboxMode, SandboxSettings};
+
+        let root = test_root("netns");
+        let program = stand_in_worker();
+        let runtime = runtime_for(program);
+
+        // `On` rather than `Require` on purpose: `Require` without a backend refuses at
+        // `ensure_available`, which would prove something else entirely.
+        let closed = Sandbox::resolve(SandboxSettings {
+            mode: SandboxMode::On,
+            network: false,
+            extra_writable: Vec::new(),
+        });
+        let active = closed.is_active();
+        // Printed so `--nocapture` says which lane actually ran: a test that silently takes the
+        // no-backend branch everywhere would prove nothing, which is how B2 survived in the first
+        // place. CI runs both lanes (C-266's backend job, and the ordinary no-backend one).
+        eprintln!(
+            "C-243 netns lane: sandbox active = {active} ({})",
+            closed.describe()
+        );
+        let system = System::new(Workspace::new(&root).expect("workspace")).with_sandbox(closed);
+
+        let started = runtime.start(&system, spec_for("C-243")).await;
+        if active {
+            let refusal = started.expect_err(
+                "a network-isolated coordinator must refuse rather than return an \
+                             endpoint nothing can reach",
+            );
+            let refusal = refusal.to_string();
+            assert!(
+                refusal.contains("network namespace") && refusal.contains("FLUX_SANDBOX_NET=1"),
+                "the refusal must explain the netns and name the remedy, got {refusal}"
+            );
+        } else {
+            // No backend on this box: nothing is wrapped, so there is no namespace to be trapped in
+            // and the start is legitimate. Asserting the *refusal* here would pass for the wrong
+            // reason on CI and hide a regression on a developer box.
+            started.expect("without an active backend nothing is wrapped, so the start is fine");
+        }
+
+        // The other half of the same posture question: with the network OPEN, an active sandbox is
+        // fine — the child shares the host's loopback — so the start must succeed either way.
+        let open = Sandbox::resolve(SandboxSettings {
+            mode: SandboxMode::On,
+            network: true,
+            extra_writable: Vec::new(),
+        });
+        let system = System::new(Workspace::new(&root).expect("workspace")).with_sandbox(open);
+        runtime
+            .start(&system, spec_for("C-244"))
+            .await
+            .expect("an open-network sandbox leaves the worker on the host's loopback");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Review finding B2, the inheritance half: a worker must receive its parent's sandbox **posture**
+    /// so it confines its own descendants — and must NOT receive `FLUX_SANDBOXED`, which only
+    /// `build_command` may set and which means "you are already wrapped, do not nest".
+    ///
+    /// None of `FLUX_SANDBOX*` is in `build_command`'s `SAFE_ENV`, so without this forwarding a worker
+    /// resolves its posture from an empty environment and runs `FLUX_SANDBOX=off` while the operator
+    /// demanded `require`. Same list, same omission, same reasoning as `flux_eval`'s
+    /// `SANDBOX_CHILD_ENV_KEYS`.
+    #[test]
+    fn a_worker_inherits_the_sandbox_posture_but_never_the_confined_marker() {
+        let root = test_root("posture-env");
+        let runtime = ProcessRuntime::with_program("/nonexistent/worker");
+        // Read through the guarded accessor the runtime itself uses, so this reflects the real path.
+        let system = test_system(&root);
+        let env = runtime.worker_env(&system);
+
+        assert!(
+            !env.iter().any(|(k, _)| k == "FLUX_SANDBOXED"),
+            "FLUX_SANDBOXED is build_command's to set when the wrapper is genuinely active; \
+             forwarding it would let a worker skip its own confinement: {env:?}"
+        );
+        // Every posture key the host has set must be forwarded; ones it has not set must not be
+        // invented. Asserted against the live environment so the list cannot drift from reality.
+        for key in SANDBOX_POSTURE_ENV {
+            let forwarded = env.iter().any(|(k, _)| k == key);
+            assert_eq!(
+                forwarded,
+                std::env::var(key).is_ok(),
+                "`{key}` forwarding must follow whether the host actually set it: {env:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Review finding B3: a worker is spawned with `--yes`, and its own catalog contains
+    /// `fleet.start` with an `AllowApprover` behind it — so the coordinator's first start is gated by
+    /// `process.exec` approval and every start below it would not be. The depth marker bounds it, the
+    /// same way `LocalSpawner` bounds sub-agent recursion with `max_depth`.
+    #[tokio::test]
+    async fn a_worker_may_not_start_workers_of_its_own() {
+        let root = test_root("depth");
+        let program = stand_in_worker();
+        let system = test_system(&root);
+
+        // What a worker's own runtime looks like: depth 1 under the default budget of 1.
+        let nested = runtime_for(program.clone()).with_bounds(1, DEFAULT_MAX_WORKERS);
+        let nested = ProcessRuntime { depth: 1, ..nested };
+        let refusal = nested
+            .start(&system, spec_for("C-244"))
+            .await
+            .expect_err("generation 1 of 1 must not open a wave of its own");
+        let refusal = refusal.to_string();
+        assert!(
+            refusal.contains("generation 1 of a maximum 1") && refusal.contains("--yes"),
+            "the refusal must name the budget and why it exists, got {refusal}"
+        );
+
+        // The marker a worker is started with is what makes that true, and it is one more than the
+        // parent's — a coordinator at depth 0 grants 1, never 0.
+        let coordinator = runtime_for(program);
+        assert_eq!(coordinator.depth(), 0, "a test process is not a worker");
+        let env = coordinator.worker_env(&system);
+        assert_eq!(
+            env.iter()
+                .filter(|(k, _)| k == DEPTH_ENV)
+                .map(|(_, v)| v.as_str())
+                .next_back(),
+            Some("1"),
+            "a worker must be told the generation it occupies: {env:?}"
+        );
+        // And the budget cannot be widened from inside: the depth marker is appended last, so a host
+        // seam passing its own value loses to the runtime's.
+        let spoofed = ProcessRuntime::with_program("/nonexistent/worker")
+            .with_startup(Duration::from_secs(1), vec![(DEPTH_ENV.into(), "0".into())]);
+        assert_eq!(
+            spoofed
+                .worker_env(&system)
+                .iter()
+                .filter(|(k, _)| k == DEPTH_ENV)
+                .map(|(_, v)| v.as_str())
+                .next_back(),
+            Some("1"),
+            "the runtime's depth must win over any value handed to it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The concurrent-worker cap: depth stops a chain, this stops a fan.
+    #[tokio::test]
+    async fn a_coordinator_cannot_hold_more_workers_than_its_cap() {
+        let root = test_root("fan");
+        let program = stand_in_worker();
+        let runtime = runtime_for(program).with_bounds(DEFAULT_MAX_FLEET_DEPTH, 2);
+        let system = test_system(&root);
+
+        runtime.start(&system, spec_for("a")).await.expect("first");
+        runtime.start(&system, spec_for("b")).await.expect("second");
+        let refusal = runtime
+            .start(&system, spec_for("c"))
+            .await
+            .expect_err("the third exceeds the cap");
+        assert!(
+            refusal.to_string().contains("2 of a maximum 2"),
+            "{refusal}"
+        );
+        // Stopping one frees the budget, so the cap is a live count and not a high-water mark.
+        runtime.stop(&system, "a").await.expect("stop frees a slot");
+        runtime
+            .start(&system, spec_for("c"))
+            .await
+            .expect("the freed slot is usable");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Review finding, the lock: a start that stalls in its readiness wait must not block the other
+    /// verbs. Before this, `start` held the workers mutex across the whole wait — up to 60s — so a
+    /// coordinator could neither sweep nor cancel its wave while one worker was slow to bind.
+    ///
+    /// One runtime, therefore one lock, therefore a real test: the stand-in worker announces only when
+    /// its checkout lacks a `no-announce` marker, so the same program gives a live worker and a
+    /// stalling one.
+    #[tokio::test]
+    async fn a_stalling_start_does_not_block_the_other_verbs() {
+        let base = test_root("lock");
+        let root = base.join("repo");
+        let announcing = base.join("announcing");
+        let silent = base.join("silent");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&announcing).expect("announcing checkout");
+        std::fs::create_dir_all(&silent).expect("silent checkout");
+        // One program, two behaviours chosen by the checkout — which is what lets a single runtime
+        // (and therefore a single lock) hold both a stalling start and a live worker.
+        never_announces(&silent);
+
+        let program = stand_in_worker();
+        let runtime = Arc::new(
+            ProcessRuntime::with_program(program).with_startup(Duration::from_secs(30), Vec::new()),
+        );
+        let system = Arc::new(test_system(&root));
+
+        // A live worker first, so there is something to sweep.
+        runtime
+            .start(
+                &system,
+                WorkerSpec {
+                    name: "live".into(),
+                    worktree: Some(announcing.clone()),
+                    context_id: "ctx".into(),
+                    model: None,
+                },
+            )
+            .await
+            .expect("the marked checkout announces");
+
+        // Now a start that will sit in its readiness wait for the full 30s budget.
+        let stalling = {
+            let (runtime, system) = (runtime.clone(), system.clone());
+            tokio::spawn(async move {
+                runtime
+                    .start(
+                        &system,
+                        WorkerSpec {
+                            name: "stalling".into(),
+                            worktree: Some(silent.clone()),
+                            context_id: "ctx".into(),
+                            model: None,
+                        },
+                    )
+                    .await
+            })
+        };
+        // Let it get past the reservation and into the wait.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The whole point: these must answer now, not in 30s.
+        let swept = tokio::time::timeout(Duration::from_secs(2), runtime.status(&system, "live"))
+            .await
+            .expect("a status poll must not queue behind a stalling start")
+            .expect("the live worker resolves");
+        assert_eq!(swept.state, WorkerState::Live);
+
+        // The stalling worker is visible as `starting` — not missing, and not dispatchable.
+        let starting =
+            tokio::time::timeout(Duration::from_secs(2), runtime.status(&system, "stalling"))
+                .await
+                .expect("a status poll for the starting worker must not block either")
+                .expect("a reserved id resolves");
+        assert_eq!(starting.state, WorkerState::Starting);
+        assert!(starting.endpoint.is_none(), "{starting:?}");
+
+        tokio::time::timeout(Duration::from_secs(2), runtime.stop(&system, "live"))
+            .await
+            .expect("a stop must not queue behind a stalling start")
+            .expect("the live worker stops");
+
+        stalling.abort();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `with_base_port` is public API on an exported type, and it did nothing: `next_candidate`
+    /// hardcoded the default base, so a configured range was silently ignored.
+    #[test]
+    fn a_configured_base_port_is_the_one_that_gets_offered() {
+        let runtime = ProcessRuntime::with_program("/nonexistent/worker").with_base_port(9100);
+        let offered: Vec<u16> = (0..4).map(|_| runtime.next_candidate()).collect();
+        assert_eq!(offered, vec![9100, 9101, 9102, 9103], "{offered:?}");
+
+        let default = ProcessRuntime::with_program("/nonexistent/worker");
+        assert_eq!(default.next_candidate(), DEFAULT_WORKER_BASE_PORT);
+        // And the range wraps inside its span rather than walking off into arbitrary ports.
+        let far = ProcessRuntime::with_program("/nonexistent/worker").with_base_port(9100);
+        for _ in 0..PORT_SPAN {
+            far.next_candidate();
+        }
+        assert_eq!(far.next_candidate(), 9100, "the range must wrap in-span");
+    }
+
     /// `ExternalRuntime` makes an operator-run worker addressable through the same port — and is
     /// honest about what it does not own: it refuses to stop a process it never started.
     #[tokio::test]
     async fn an_external_worker_is_addressable_but_not_stoppable() {
-        let root = temp_root("external");
+        let root = test_root("external");
         let system = test_system(&root);
         let runtime = ExternalRuntime::new(HashMap::from([(
             "C-243".to_string(),
