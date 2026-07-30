@@ -174,7 +174,7 @@ fn the_scan_budget_skips_and_counts_instead_of_failing() {
     let text: Vec<String> = lines
         .filter_map(|line| match line {
             JsonlLine::Text(t) => Some(t),
-            JsonlLine::Unreadable => None,
+            JsonlLine::Unreadable | JsonlLine::TooLarge => None,
         })
         .collect();
     assert_eq!(text, vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]);

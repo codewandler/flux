@@ -1,28 +1,41 @@
 //! Local coding-harness state: which harnesses exist, where each one keeps its state, and how to
 //! walk that state without falling over.
 //!
-//! This is the acquisition layer shared by everything that reads another harness's local files. It
-//! deliberately stops short of any projection: it answers *"where does this harness keep its state,
-//! and how do I iterate it"* and nothing about what the records mean. `flux usage` layers its
-//! token-shaped model on top; the harness-history datasource (C-214+) layers a message-shaped one.
+//! This is the acquisition layer shared by everything that reads another harness's local files.
+//! [`scan`] answers *"where does this harness keep its state, and how do I iterate it"*; the
+//! per-harness adapters answer *"what was said"* ([`HarnessMessage`], C-214). `flux usage` keeps
+//! its own token-shaped projection on top of the same scan — two consumers, two projections, one
+//! scan.
 //!
-//! Two properties are contracts rather than implementation details:
+//! Three properties are contracts rather than implementation details:
 //!
 //! - **Read-only, always.** No adapter may write another harness's state — [`open_sqlite_read_only`]
 //!   is the only database entry point here, and it passes `SQLITE_OPEN_READ_ONLY`.
 //! - **The scan budget degrades, it does not fail.** Over-budget input is skipped *and counted*
 //!   (see [`ScanBudget`]); only an unreadable root propagates as an error.
+//! - **Messages stream.** Message extraction never returns a collection: a message record carries
+//!   full text where a usage record carries eight integers, so materializing a multi-year history
+//!   is not a thing this layer is allowed to do. Adapters push into a [`MessageSink`].
 
+mod claude;
+mod codex;
+mod message;
+mod opencode;
 mod scan;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+pub use claude::claude_messages;
+pub use codex::codex_messages;
+pub use message::{HarnessMessage, MessageRole, MessageSink, MessageStats};
+pub use opencode::opencode_messages;
 pub use scan::{
     jsonl_files, open_jsonl, open_sqlite_read_only, sqlite_column_exists, sqlite_table_exists,
     JsonlLine, JsonlLines, JsonlScan, ScanBudget, SkipReason, MAX_JSONL_FILES,
-    MAX_JSONL_FILE_BYTES,
+    MAX_JSONL_FILE_BYTES, MAX_JSONL_LINE_BYTES, MAX_MESSAGES, MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_TOTAL_BYTES,
 };
 
 /// A coding harness whose local state flux can read.
