@@ -6,7 +6,7 @@ status: blocked
 priority: 5
 epic: portable-wasm-runtime
 design: docs/designs/portable-wasm-runtime.md
-note: "the epic's first end-to-end proof; blocked on C-269 + C-270. Parity against the NATIVE engine on the same .flux, not against a golden file"
+note: "the epic's first end-to-end proof; blocked on C-269 + C-274 (C-270 landed and found C-274 is the real wasm32 prerequisite). Parity against the NATIVE engine on the same .flux, not against a golden file"
 ---
 
 # Prove the portable core compiles to `wasm32` and evaluates a model-free flow
@@ -32,7 +32,10 @@ engine produces for the same source.
 
 ## Progress
 
-- (blocked on C-269 and C-270 — there is no seam to build against until both land)
+- (blocked on C-269, C-270 and **C-274** — C-270 has landed, and in landing it found that C-274 is the
+  real `wasm32` prerequisite: `rusqlite` reaches the engine via flux-events non-optionally, so nothing
+  here can build until that dependency is made optional. Also inherited from C-270: `now_ms()` calls
+  `SystemTime::now`, which does not exist on `wasm32-unknown-unknown` — the clock is a host import.)
 
 ## Notes
 

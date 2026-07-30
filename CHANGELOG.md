@@ -6,6 +6,32 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The public documentation corpus had drifted, and the enumerations that keep rotting are now pinned
+  (C-250).** 37 corrections across 25 pages, each grounded in a non-doc `file:line` rather than in
+  another document's agreement — which is the failure mode the story exists to fix. Representative:
+  `getting-started` asked for Rust 1.85+ against a `rust-version` of 1.87; `opus` resolved to
+  `claude-opus-4-8` and resolves to `claude-opus-5`; the board state machine was documented as four
+  states against `State::ALL`'s seven, and its operations as six against eleven; a legacy
+  `[private_net] web_fetch` key was documented as "silently ignored" while `deny_unknown_fields` makes
+  the config **refuse to load**; `http-api` claimed `usage` reports every token tier and it reports five
+  of eight. The durable half is a new guard: board pages had rotted twice on the same axis, so the
+  operation and row-field lists are now generated from `work_board_tools`/`MemoryBoard` and the pages
+  must enumerate them — proven by breaking a page and watching the test name the exact omission.
+
+- **The engine's state store is behind a port (C-270).** `FlowStore` is now a facade over
+  `Arc<dyn FlowStateBackend>` with the SQLite implementation behind it and an in-memory second
+  implementation, both held to one conformance suite, plus a real two-operation plan executing end to
+  end over the non-SQLite backend — so the port is falsifiable rather than decorative. The trait owns
+  its own absence outcome (`Lookup::{Found, NoSuchRow}`), which is what stops it being portable in name
+  only: every `rusqlite` reference, including all four `QueryReturnedNoRows` matches, now sits inside
+  the SQLite backend. `take_suspension`'s atomicity moved from the facade into the backend and is a
+  stated trait obligation, which is stricter than the read-then-delete it replaced. Dropping the direct
+  `rusqlite` dependency is **not** part of this and is now C-274: the driver also arrives via
+  `flux-events` non-optionally, so removing one line of two buys no portability and would gate
+  `FlowStore::in_memory` behind a feature for nothing.
+
 ## [0.39.0] - 2026-07-30
 
 ### Fixed

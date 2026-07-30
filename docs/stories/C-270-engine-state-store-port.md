@@ -2,7 +2,7 @@
 id: C-270
 title: "Extract the engine's state store behind a port, off the direct `rusqlite` binding"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 epic: portable-wasm-runtime
 design: docs/designs/portable-wasm-runtime.md
@@ -22,7 +22,12 @@ implementation is the current SQLite one.
 
 - [x] The engine's state operations are expressed as a port; the SQLite implementation moves behind it
       and stays the default natively.
-- [ ] `crates/flux-flow` no longer names `rusqlite` in its own dependencies.
+- [~] `crates/flux-flow` no longer names `rusqlite` in its own dependencies — **REASSIGNED to
+      [C-274](C-274-flux-events-optional-sqlite.md), not skipped.** `cargo tree -p codewandler-flux-flow
+      -i rusqlite` shows two paths in: flux-flow directly, and flux-events non-optionally. flux-flow
+      cannot drop flux-events (`Arc<EventStore>` is in `FlowStore`'s public signature), so removing one
+      line of two buys no portability and would make `FlowStore::in_memory` conditionally absent from a
+      published API. C-274 removes both at once.
 - [x] A failing-first test drives the engine through a non-SQLite implementation of the port (an
       in-memory one is enough) and gets identical observable behaviour for the durability properties
       the engine actually relies on.

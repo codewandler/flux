@@ -2,7 +2,7 @@
 id: C-250
 title: "Public docs describe a product that has moved — sweep for staleness and keep the enumerations honest"
 pillar: Core
-status: in-progress
+status: done
 priority: 9
 areas: [website]
 note: "the published board pages listed seven generated ops when the code shipped nine, within hours of the change — closed enumerations in public docs rot silently because nothing tests them"
