@@ -343,43 +343,109 @@ pub struct PinnedRerun {
     pub cells_consumed: usize,
 }
 
-/// Re-execute `src`'s recorded plan executions (optionally narrowed to one 1-based `turn`) into the
-/// correlated session `dst`, entirely under the caller-supplied `scope` — **no model call**: this
-/// driver only replays already-accepted `plan_source`s, so a pure [`crate::cassette::FrozenTape`]
-/// substitution is fully offline by construction. Every executed plan is re-recorded on `dst` (the
-/// same `plan_source` contract [`crate::fork::replay_prefix`] uses) inside one begin/end-turn
-/// bracket, so [`flux_events::EventStore::run_trace`]`(dst)` is self-contained and diffs
-/// positionally against `src`'s own trace via [`flux_events::run_diff`].
+/// The source-session executions a [`rerun_pinned`] will replay, resolved up front — and the whole
+/// of that driver's **refusal** surface: an unrecorded source, a `turn` that does not exist, a turn
+/// that executed no plan.
+///
+/// Resolving reads only the SOURCE session (its run trace, its accepted plans, its turn windows) and
+/// never touches a destination, so a caller can decide "can this rerun run at all?" *before* it mints
+/// the session the rerun would write into. That ordering is the point (C-254): a what-if answers
+/// "what would happen" **without** it happening, so a driver that refuses once its destination
+/// already exists has left behind exactly the artifact the simulation promised not to leave — and
+/// silently, since nothing downstream tells a minted-then-refused rerun apart from one that never
+/// minted. Passing a `RerunSelection` rather than a `(src, turn)` pair makes that structural instead
+/// of incidental: there is no way to reach the driver, or the `dst` writes it opens with, while a
+/// refusal is still outstanding, and no later reordering of the driver's body can reintroduce one.
+///
+/// What remains fallible inside `rerun_pinned` is execution, not refusal — a store write that fails,
+/// or a replayed plan that errors. Those cannot be decided in advance, and a session recording the
+/// attempt is the correct trace for them.
+#[derive(Debug, Clone)]
+pub struct RerunSelection {
+    src: String,
+    trace: Vec<flux_lang::ast::RunEvent>,
+    plans: std::collections::HashMap<String, DraftAst>,
+    exec_keys: Vec<String>,
+}
+
+impl RerunSelection {
+    /// Resolve `src`'s recorded plan executions, optionally narrowed to one 1-based `turn`, refusing
+    /// loudly if there is nothing to rerun. Reads `src` only — never `dst`, which need not exist yet.
+    pub fn resolve(events: &EventStore, src: &str, turn: Option<usize>) -> Result<Self> {
+        let trace = events.run_trace(src)?;
+        if trace.is_empty() {
+            return Err(whatif_err(format!(
+                "session {src} has no run trace recorded — nothing to rerun"
+            )));
+        }
+        let (plans, accepted_order) = crate::replay::plans_by_key(events, src)?;
+        let exec_keys = selected_execution_keys(events, src, &trace, accepted_order, turn)?;
+        if exec_keys.is_empty() {
+            return Err(whatif_err(format!(
+                "session {src} has no executed plan to rerun{}",
+                turn.map(|t| format!(" in turn {t}")).unwrap_or_default()
+            )));
+        }
+        Ok(Self {
+            src: src.to_string(),
+            trace,
+            plans,
+            exec_keys,
+        })
+    }
+
+    /// The source session this selection was resolved from.
+    pub fn source(&self) -> &str {
+        &self.src
+    }
+
+    /// The source session's full recorded run trace — what a caller pins its
+    /// [`crate::cassette::FrozenTape`] to, so it need not read it a second time.
+    pub fn trace(&self) -> &[flux_lang::ast::RunEvent] {
+        &self.trace
+    }
+
+    /// How many recorded plan executions this selection will replay (never zero — an empty selection
+    /// is a refusal, not a value).
+    pub fn len(&self) -> usize {
+        self.exec_keys.len()
+    }
+
+    /// Always `false`: [`Self::resolve`] refuses an empty selection outright. Present because clippy
+    /// requires it alongside [`Self::len`], and honest about why it is a constant.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// Re-execute a resolved [`RerunSelection`]'s recorded plan executions into the correlated session
+/// `dst`, entirely under the caller-supplied `scope` — **no model call**: this driver only replays
+/// already-accepted `plan_source`s, so a pure [`crate::cassette::FrozenTape`] substitution is fully
+/// offline by construction. Every executed plan is re-recorded on `dst` (the same `plan_source`
+/// contract [`crate::fork::replay_prefix`] uses) inside one begin/end-turn bracket, so
+/// [`flux_events::EventStore::run_trace`]`(dst)` is self-contained and diffs positionally against the
+/// source's own trace via [`flux_events::run_diff`].
+///
+/// Taking a `RerunSelection` rather than a `(src, turn)` pair is deliberate — see that type for why
+/// the refusals must be discharged before `dst` exists at all.
 ///
 /// `store` is `dst`'s [`FlowStore`] (a fresh one for a throwaway variant engine, or the live
 /// client's own, per the caller's isolation needs) — this function installs `scope` on it and
 /// leaves it installed on return (the caller's next action, if any, reuses or replaces it).
-#[allow(clippy::too_many_arguments)]
 pub async fn rerun_pinned(
     events: &EventStore,
     store: &FlowStore,
     executor: &Executor,
-    src: &str,
+    selection: &RerunSelection,
     dst: &str,
-    turn: Option<usize>,
     scope: Arc<CassetteScope>,
     sink: &mut dyn AgentSink,
 ) -> Result<PinnedRerun> {
-    let trace = events.run_trace(src)?;
-    if trace.is_empty() {
-        return Err(whatif_err(format!(
-            "session {src} has no run trace recorded — nothing to rerun"
-        )));
-    }
-    let cells_total = Cell::collect(&trace).len();
-    let (plans, accepted_order) = crate::replay::plans_by_key(events, src)?;
-    let exec_keys = selected_execution_keys(events, src, &trace, accepted_order, turn)?;
-    if exec_keys.is_empty() {
-        return Err(whatif_err(format!(
-            "session {src} has no executed plan to rerun{}",
-            turn.map(|t| format!(" in turn {t}")).unwrap_or_default()
-        )));
-    }
+    let src = selection.source();
+    let trace = selection.trace();
+    let plans = &selection.plans;
+    let exec_keys = &selection.exec_keys;
+    let cells_total = Cell::collect(trace).len();
 
     store.set_cassette(Some(scope.clone()));
 
@@ -403,7 +469,7 @@ pub async fn rerun_pinned(
     if live {
         rec_sink = rec_sink.defer_for_live_bridge();
     }
-    for key in &exec_keys {
+    for key in exec_keys {
         let Some(ast) = plans.get(key) else {
             continue;
         };
@@ -660,9 +726,10 @@ mod tests {
             )
             .unwrap();
 
+        let selection = RerunSelection::resolve(&events, &src, None).unwrap();
         let mut sink = TestSink;
         let report = rerun_pinned(
-            &events, &dst_store, &executor, &src, &dst, None, scope, &mut sink,
+            &events, &dst_store, &executor, &selection, &dst, scope, &mut sink,
         )
         .await
         .unwrap();
@@ -691,15 +758,15 @@ mod tests {
 
         let dst_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
         let dst = events.create_session("mock").unwrap();
+        let selection = RerunSelection::resolve(&events, &src, None).unwrap();
         let mut sink = TestSink;
 
         let report = rerun_pinned(
             &events,
             &dst_store,
             &executor,
-            &src,
+            &selection,
             &dst,
-            None,
             scope.clone(),
             &mut sink,
         )
@@ -713,6 +780,45 @@ mod tests {
         if let CassetteScope::Frozen(frozen) = scope.as_ref() {
             assert!(frozen.diverged().is_some());
         }
+    }
+
+    /// C-254: `rerun_pinned`'s refusals are discharged by [`RerunSelection::resolve`], which takes no
+    /// destination at all — so they are decidable before a caller has minted anything, and cannot be
+    /// reordered back below the driver's own `dst` writes. Both refusals are exercised here against a
+    /// store holding exactly one session; the assertion that no second session appears is what proves
+    /// the refusal is genuinely free of a destination rather than merely early in one.
+    #[tokio::test]
+    async fn rerun_selection_refuses_without_a_destination_session() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let executor = test_executor();
+        let src = record_one_op_session(&events, &executor).await;
+        let before = events.list(1_000).unwrap().len();
+
+        // A turn that exists but executed no plan — nothing to rerun.
+        let turn_id = events.begin_turn(&src, "just answer", "mock").unwrap();
+        events
+            .end_turn(&src, turn_id, "ok", 0, "no plan", None)
+            .unwrap();
+        let err = RerunSelection::resolve(&events, &src, Some(2))
+            .expect_err("a turn with no executed plan has nothing to rerun");
+        assert!(
+            err.to_string().contains("no executed plan to rerun"),
+            "the refusal must name the reason: {err}"
+        );
+
+        // A turn that does not exist at all.
+        let err = RerunSelection::resolve(&events, &src, Some(99))
+            .expect_err("turn 99 is not there at all");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "the refusal must name the reason: {err}"
+        );
+
+        assert_eq!(
+            events.list(1_000).unwrap().len(),
+            before,
+            "resolving a rerun reads the source session only — a refusal cannot have created anything"
+        );
     }
 
     /// Two turns on the same session run the BYTE-IDENTICAL plan (same `flow_key`) — records it
@@ -765,17 +871,11 @@ mod tests {
 
         let dst_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
         let dst = events.create_session("mock").unwrap();
+        let selection = RerunSelection::resolve(&events, &src, Some(1)).unwrap();
         let mut sink = TestSink;
 
         let report = rerun_pinned(
-            &events,
-            &dst_store,
-            &executor,
-            &src,
-            &dst,
-            Some(1),
-            scope,
-            &mut sink,
+            &events, &dst_store, &executor, &selection, &dst, scope, &mut sink,
         )
         .await
         .unwrap();

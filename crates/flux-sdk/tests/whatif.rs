@@ -857,3 +857,176 @@ async fn substitute_at_a_dead_node_errors_instead_of_silently_no_opping() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// --- C-254: no path in `WhatIf::run` mints before it has finished validating ---
+//
+// C-211 hoisted validation above the mint at both fork sites; C-247 did the same for `WhatIf::run`'s
+// re-plan path and its two bails. Three refusals still fired after the child session existed, all on
+// paths those stories' Acceptance did not enumerate. Each test below asserts the *absence of a
+// trace* — the session count is unchanged across the refusal — and never merely `is_err()`: an
+// `is_err()`-only assertion (like `substitute_at_a_dead_node_errors_instead_of_silently_no_opping`
+// directly above) passes with the orphan still minted, which is precisely how this class of fix gets
+// faked.
+
+/// Generous limit: these fixtures hold one session, and the bug adds exactly one more.
+fn session_count(client: &Client) -> usize {
+    client.event_store().list(1_000).unwrap().len()
+}
+
+/// C-254 **failing-first**, refusal 1: the `build_frozen` dead-node refusal on the PURE-SUBSTITUTION
+/// (`!replan`) path. `WhatIf` exists to answer "what would happen" *without* it happening, so a
+/// refused simulation that leaves a minted session behind has broken the feature's single promise —
+/// and silently, since nothing downstream tells a minted-then-refused run apart from one that never
+/// minted at all. At the merge base `dst` was minted first and `build_frozen` refused after it.
+#[tokio::test]
+async fn substitute_at_a_dead_node_refuses_before_minting_the_child() {
+    let dir = tmp_dir("dead-node-no-orphan");
+    let record = record_client(
+        &dir,
+        vec![("bump", json!({}))],
+        "bumped",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    record.run("bump once").await.unwrap();
+    let src = record.session_id().unwrap();
+    let before = session_count(&record);
+
+    let session = record.open_session(&src).unwrap();
+    let no_such_node = 9_999u32;
+    let rendered = match session
+        .what_if()
+        .substitute_at(no_such_node, json!("should never be served"))
+        .run()
+        .await
+    {
+        Err(e) => e.to_string(),
+        Ok(cf) => panic!(
+            "a dead node target must be refused, not run as if nothing changed — got {}",
+            cf.session().id()
+        ),
+    };
+    assert!(
+        rendered.contains(&no_such_node.to_string()),
+        "the refusal must name the offending node: {rendered}"
+    );
+
+    assert_eq!(
+        session_count(&record),
+        before,
+        "a refused pure substitution must not leave a counterfactual session behind — resolve every \
+         `substitute_at` target before minting anything"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C-254 **failing-first**, refusal 2: `rerun_pinned`'s `session {src} has no executed plan to rerun
+/// in turn {t}`. That refusal lives one crate down, inside the driver the SDK hands `dst` to, so it
+/// could not fire before the mint by construction — the fix moves the whole selection out in front of
+/// the driver (`flux_flow::whatif::RerunSelection`), where the SDK resolves it first.
+///
+/// The fixture seeds a second turn that answered without ever executing a plan (a prose-only turn —
+/// ordinary, and exactly what makes that turn unrerunnable). Turn 1 did run a plan, so the SDK's own
+/// `trace.is_empty()` guard passes and the refusal under test is genuinely the one reached.
+#[tokio::test]
+async fn a_turn_with_no_executed_plan_refuses_before_minting_the_child() {
+    let dir = tmp_dir("no-executed-plan-no-orphan");
+    let record = record_client(
+        &dir,
+        vec![("bump", json!({}))],
+        "bumped",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    record.run("bump once").await.unwrap();
+    let src = record.session_id().unwrap();
+
+    let events = record.event_store();
+    let turn_id = events
+        .begin_turn(&src, "and now just answer", "mock")
+        .unwrap();
+    events
+        .end_turn(&src, turn_id, "ok", 0, "answered without a plan", None)
+        .unwrap();
+    let before = session_count(&record);
+
+    let session = record.open_session(&src).unwrap();
+    let rendered = match session
+        .what_if()
+        .turn(2)
+        .substitute("bump", json!("substituted"))
+        .run()
+        .await
+    {
+        Err(e) => e.to_string(),
+        Ok(cf) => panic!(
+            "a turn that executed no plan has nothing to rerun and must be refused — got {}",
+            cf.session().id()
+        ),
+    };
+    assert!(
+        rendered.contains(&src) && rendered.contains("no executed plan to rerun"),
+        "the refusal must name the session and the reason: {rendered}"
+    );
+
+    assert_eq!(
+        session_count(&record),
+        before,
+        "a rerun with nothing to rerun must not leave a counterfactual session behind — resolve the \
+         execution selection before minting anything"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C-254 **failing-first**, refusal 3: the same `build_frozen` dead-node refusal on the RE-PLAN path.
+/// C-247 hoisted the two refusals its Acceptance named, and this third one sat below its mint — so
+/// the orphan it leaves is the worse kind: minted *and* rewritten with the parent's whole
+/// conversation (`SessionLog::rewrite`), hence not even empty enough for `prune_empty` to collect it
+/// later. "Self-cleaning" does not generalise, which is why the invariant is held rather than
+/// re-derived from the pruning rule.
+#[tokio::test]
+async fn replan_with_a_dead_node_substitution_refuses_before_minting_the_child() {
+    let dir = tmp_dir("replan-dead-node-no-orphan");
+    let record = record_client(
+        &dir,
+        vec![("bump", json!({}))],
+        "bumped",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    record.run("bump once").await.unwrap();
+    let src = record.session_id().unwrap();
+    let before = session_count(&record);
+
+    let session = record.open_session(&src).unwrap();
+    let no_such_node = 9_999u32;
+    // A `system_prompt` change is what selects the re-plan path.
+    let rendered = match session
+        .what_if()
+        .system_prompt("You are a different agent.")
+        .substitute_at(no_such_node, json!("should never be served"))
+        .run()
+        .await
+    {
+        Err(e) => e.to_string(),
+        Ok(cf) => panic!(
+            "a dead node target must be refused on the re-plan path too — got {}",
+            cf.session().id()
+        ),
+    };
+    assert!(
+        rendered.contains(&no_such_node.to_string()),
+        "the refusal must name the offending node: {rendered}"
+    );
+
+    assert_eq!(
+        session_count(&record),
+        before,
+        "a refused re-plan must not leave a counterfactual session behind — resolve every \
+         `substitute_at` target before minting anything"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
