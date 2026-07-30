@@ -391,6 +391,12 @@ impl Session {
     pub async fn fork(&self, at: usize) -> Result<Fork> {
         let _turn = self.turn_guard.lock().await;
         let info = self.engine.events.info(&self.id)?;
+        // Establish that the parent is forkable BEFORE minting anything (C-211). A parent whose log
+        // ends mid-tool-pair would otherwise be copied through unexamined, and the child would 400
+        // on its first live turn — and because the refusal came after the child existed, a refused
+        // fork used to leave an empty orphan session behind. Validating first keeps the simpler
+        // invariant: a failed fork leaves no trace. The source stream is only read.
+        let history = ValidHistory::new(self.engine.events.conversation(&self.id)?)?;
         let fork_id = self.engine.events.create_session_with_context(
             &info.model,
             &EventContext {
@@ -400,10 +406,7 @@ impl Session {
             },
         )?;
         // Copy the conversation so the fork's adaptive tail sees the same history — as one checked
-        // rewrite (A-102). Checking it here is the point: a parent whose log ends mid-tool-pair
-        // would otherwise be copied through unexamined, and the child would 400 on its first live
-        // turn. The source stream is only read.
-        let history = ValidHistory::new(self.engine.events.conversation(&self.id)?)?;
+        // rewrite (A-102).
         SessionLog::open(&self.engine.events, &fork_id)?.rewrite(history)?;
         // Replay the prefix into the fork session. The replay is hermetic (cassette-served), so its
         // events don't need surfacing — discard them.

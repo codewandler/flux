@@ -293,11 +293,19 @@ pub(super) async fn run_fork(
         .ok()
         .and_then(|ts| ts.last().map(|t| t.user_input.clone()));
 
+    // Establish that the parent is forkable BEFORE minting anything (C-211). The tail runs live, so
+    // a parent history that no provider would accept — one ending mid-tool-pair, say — is refused
+    // here rather than 400ing on the fork's first turn; checking before the child exists is what
+    // keeps a refused fork from leaving an empty orphan session behind.
+    let history = flux_events::ValidHistory::new(
+        events
+            .conversation(&sid)
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    )
+    .with_context(|| format!("session `{sid}` cannot be forked"))?;
     // Mint the fork session, correlated to its source (the A-08 linkage `flux replay
     // --sub-agents` and cost rollups already understand), and seed its conversation with the
-    // parent's messages so an adaptive tail has the recorded context. The seeding is one checked
-    // rewrite (A-102): the tail runs live, so a parent history that no provider would accept — one
-    // ending mid-tool-pair, say — is refused here rather than 400ing on the fork's first turn.
+    // parent's messages so an adaptive tail has the recorded context — one checked rewrite (A-102).
     let fork_sid = events
         .create_session_with_context(
             &src_info.model,
@@ -308,12 +316,6 @@ pub(super) async fn run_fork(
             },
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let history = flux_events::ValidHistory::new(
-        events
-            .conversation(&sid)
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-    )
-    .with_context(|| format!("session `{sid}` cannot be forked"))?;
     flux_events::SessionLog::open(&events, &fork_sid)
         .and_then(|mut log| log.rewrite(history))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
