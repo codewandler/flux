@@ -72,6 +72,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
 
 ## Next (ready — take the top one unless the user named a story)
+- [C-290 — A runtime has no memory ceiling and no general concurrency limit](C-290-runtime-resource-limits.md) · Core · surveyed while designing the flux-connectors interop: context_budget/max_iterations/max_tokens/max_calls exist, but nothing bounds memory and the only concurrency control is server-side max_inflight_per_principal — so an embedding host cannot bound a runtime it constructs
 - [C-251 — Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version](C-251-release-from-a-push-flux-authored.md) · Core · flux automating its own release is the most honest dogfood there is; the load-bearing decision is that the MODEL writes prose and the HOST does version math, because a wrong version on crates.io is irreversible
 
 ### The agent-authored surface — panes the model opens, config it can safely change
@@ -127,6 +128,9 @@ _Every channel flux has is either **1:1** or **fire-and-forget**. `flux-channels
 - [C-229 — Unattended run integrity — survive provider transport failure, and be honest when you don't (epic)](C-229-unattended-run-integrity-epic.md) · Core · three separately-filed stories are one failure at three depths — a provider bug, no resume, and no way to tell a dead turn from a live one; C-228 must be DIAGNOSED before C-227 is designed, or the retry masks a deterministic codec bug as a flaky network
 - [C-228 — Gemini 3.x over OpenRouter drops the stream mid-exploration, reproducibly](C-228-gemini-3x-over-openrouter-drops-the-stream-mid-exploration.md) · Core · gemini-3.6-flash and gemini-3.5-flash both die with `stream closed before completion` during exploration at 12-21k ctx; gemini-2.5-flash (no reasoning stream) survives the same workload — points at reasoning-delta handling on the Messages path, not at OpenRouter generally
 - [C-227 — A dropped provider stream ends the whole turn — no automatic resume for a transport-class failure](C-227-no-automatic-resume-on-transport-class-provider-failure.md) · Core · `stream closed before completion` mid-exploration kills a 34-step run outright; flux has `--continue` but nothing retries, so long headless runs are a coin flip on provider transport
+
+### Zendesk automation
+- [D-214 — Re-point the Zendesk reference flow at the flux-connectors Tool pack](D-214-connectors-interop-repoint.md) · Agent · the interop layer D-199 has been waiting for: flux-connectors registers a pack of dyn Tool via ClientBuilder::try_register_pack, each delegating to flux's OWN http.request — so flux keeps every byte of egress. Unblocks D-200/D-201/D-202
 
 ## Blocked
 - [A-117 — The coordinator.flux reference Program + offline end-to-end journey test](A-117-coordinator-program.md) · Agent · the epic's headline proof — intake → dispatch → sweep → done against MemoryBoard and a stub A2A worker, no credentials, no network
