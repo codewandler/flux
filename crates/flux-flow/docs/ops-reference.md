@@ -191,6 +191,7 @@ workers in flight and reconcile them later.
 | `fleet.dispatch` | `worker, task[, role, context_id]` | Medium | Send a task to a remote worker and return its `task_id` without waiting. A worker that answers synchronously returns `task_id: null` plus its answer, rather than an id that would be polled forever |
 | `fleet.status` | `worker, task_id` | Low | Read a dispatched task's current state → `{task_id, state, terminal, text}` |
 | `fleet.cancel` | `worker, task_id` | Medium | Stop a dispatched task. An already-finished task reports that it was not cancelable |
+| `fleet.isolate` | `item` | High | Create branch `impl/<item>` in its own git worktree off the current clean HEAD and return `{worktree, branch, base_commit}` — a per-item checkout for ONE local worker. Unlike `git_worktree_enter` it does not move the caller's own working root, so a coordinator can call it once per item in a single turn. Refuses a dirty base, an existing `impl/<item>`, and nesting inside a worktree session; removing the worktree afterwards is the caller's job, because it holds the worker's unmerged diff |
 
 **Egress posture.** `worker` is a caller-supplied argument, not configuration, so it is
 model-reachable and treated as such:

@@ -249,6 +249,7 @@ reconcile them later.
 | `fleet.dispatch` | `worker, task[, role, context_id]` | Send a task to a remote worker and return its task id without waiting. A worker that replies synchronously returns a null task id plus its answer, instead of an id that would be polled forever |
 | `fleet.status` | `worker, task_id` | Read a dispatched task's current state, whether it is terminal, and its final text |
 | `fleet.cancel` | `worker, task_id` | Stop a dispatched task. An already-finished task reports that it was not cancelable |
+| `fleet.isolate` | `item` | Create branch `impl/<item>` in its own git worktree and return the checkout path — a per-item isolated workspace for one local worker. Unlike a worktree session it does not move the caller's own working root, so one call per item in a wave is legal. Requires a clean checkout and a free branch name; removing the worktree afterwards is the caller's job |
 
 The `worker` address is an argument, not configuration, so it is model-reachable and gated as such.
 Every call resolves the endpoint through the same egress guard as `web.fetch` before any request,

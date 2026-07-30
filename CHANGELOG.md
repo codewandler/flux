@@ -6,6 +6,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`fleet.isolate` — a per-item checkout the caller's root never pays for (C-241).** A coordinator can
+  now give each work item its own git worktree in a single turn, which `git_worktree_enter` structurally
+  cannot: that op moves the caller's *own* working root, so N workers could never each have one. Creates
+  `impl/<item>` off the current clean HEAD and returns `{worktree, branch, base_commit}`. Refuses a dirty
+  base, an existing branch of that name, and nesting inside a worktree session — each recoverably, and
+  the preflights are ordered so a refusal creates nothing.
+  Every git invocation goes through the single guarded `System` path, argv-only, and the item name is
+  restricted to `[A-Za-z0-9._-]` with no `/` or `..`, so the ref cannot escape `refs/heads/impl/` and
+  `git worktree add`'s argv can never receive an option-lookalike.
+  `permission_subjects` names the **branch** (`fleet.isolate:impl/<item>`), not the checkout path — the
+  directory is allocated mid-execution, after approval. Independent review confirmed that is safe:
+  nothing in the call arguments influences where the checkout lands, and with `access: [Process]` and no
+  `Filesystem` the declaration emits `process.exec` on the branch-named subject and no filesystem
+  requirement — the same shape `git_commit`, `git_checkout` and `git_worktree_enter` already have. The
+  subject is in fact more scoped than `git_worktree_enter`'s, which is the bare op name.
+  ⚠ **Cleanup is the caller's, deliberately** — the host never removes an isolated worktree, because it
+  holds the worker's unmerged diff. Nothing bounds the count, so a grant of `fleet.isolate:impl/*`
+  authorizes an unlimited number of full checkouts under `$FLUX_WORKTREE_DIR`/`~/.flux/worktrees`. Budget
+  disk accordingly.
+
 ### Fixed
 
 - **The public documentation corpus had drifted, and the enumerations that keep rotting are now pinned

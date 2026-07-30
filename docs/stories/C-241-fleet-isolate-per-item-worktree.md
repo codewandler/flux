@@ -2,7 +2,7 @@
 id: C-241
 title: "`fleet.isolate` — a per-item isolated checkout, because `git_worktree_enter` cannot give N workers their own"
 pillar: Core
-status: in-progress
+status: done
 priority: 3
 epic: fleet-loop
 design: docs/designs/fleet-loop.md
@@ -32,9 +32,13 @@ isolation it does not have.
 - [x] Explicit preflights, with `git_worktree_enter`'s existing checks as the template: no nesting,
       and a clean base. Each refuses as a clean recoverable `ToolResult` error naming what was wrong,
       not a plan-halting raw error.
-- [x] Concrete `permission_subjects` (the worktree path and the branch), accurate
-      `effects`/`access`/`intents` — consistent with the `git_*` family. *(Branch only — see
-      Progress: the checkout path is allocated during execution, after approval.)*
+- [~] Concrete `permission_subjects` (the worktree path and the branch), accurate
+      `effects`/`access`/`intents` — consistent with the `git_*` family. **Half-met, and marked as
+      such rather than ticked:** the branch is named, the path is not. Independent review confirmed
+      this is safe (see Progress 1) but corrected the reasoning — the *specific* path genuinely cannot
+      be a subject, yet `worktree_base_dir()` is deterministic from `FLUX_WORKTREE_DIR`/`HOME` and
+      could truthfully name where the checkout lands; it is merely private today. So this is a
+      completeness gap, not an impossibility. Closing it needs a `flux-system` change.
 - [ ] Both op references list the op; the catalog-coherence and website-contract tests stay green.
       *(Both reference files were fenced to other agents in this wave; the two rows are owed to the
       integrator — see Progress.)*
@@ -75,6 +79,26 @@ Two deliberate deviations from the Acceptance wording:
    params)` sees only the call arguments, and the parent directory is allocated during execution,
    i.e. after approval. A path synthesized at declaration time would name a directory that never
    exists, which is worse than naming one thing truthfully.
+   **Reviewed and refined (C-241 review, PASS):** the deviation is safe, but not because naming a
+   location is impossible. It is safe because the omission carries **no authorization information** —
+   nothing in `params` influences where the checkout lands, and `access: [AccessKind::Process]` with no
+   `Filesystem` means `authority_requirements_from_declaration` emits `process.exec` on the
+   branch-named subject and no filesystem requirement at all: the same shape `git_commit`,
+   `git_checkout` and `git_worktree_enter` already have while writing the user's tree. The subject is
+   in fact *more* scoped than `git_worktree_enter`'s, which is the bare op name. The AGENTS.md rule
+   about accurate subjects concerns an **empty** list on a `Write`-declaring tool; this op declares no
+   `Write` and never returns empty. What the review *did* overturn is the "cannot" —
+   `worktree_base_dir()` (`crates/flux-system/src/lib.rs:352-362`) is fully deterministic and could
+   name the directory; only the per-call `flux-worktree-<pid>-<seq>` suffix is runtime-chosen.
+   **Also found by review — one more state-leak window than recorded above:** at
+   `crates/flux-tools/src/lib.rs:4162` the `git worktree add` result is taken with `.await?`, so if
+   `System::run` itself errors (60 s timeout, or `sandbox.ensure_available()` refusing under
+   `mode = "require"`) the function returns `Err` *before* the `remove_worktree_dir` cleanup on the
+   next line, leaking the 0700 parent and any ref git had already written. The preflight `run_git`
+   calls share the shape: a spawn/timeout failure surfaces as a plan-halting raw error rather than the
+   recoverable `ToolResult::error` the Acceptance asks for. This is copied faithfully from
+   `git_worktree_enter` (`lib.rs:3668-3683`), so it is a **family-wide pre-existing shape, not a
+   regression here** — but it is unrecorded anywhere else, so it is recorded here.
 2. **Two catalog rows are owed to the integrator.** `crates/flux-flow/docs/ops-reference.md` and
    `website/docs/language/ops.md` were both fenced to other agents in this wave, so
    `operations_reference_covers_the_registered_public_catalog`
