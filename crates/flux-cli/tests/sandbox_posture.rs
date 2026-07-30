@@ -171,7 +171,9 @@ fn no_disclosure_when_the_sandbox_is_off_or_confinement_is_inherited() {
     // that branch's observable marker, so asserting it also pins the branch the disclosure change
     // deliberately left alone.
     assert!(
-        nested.stderr.contains("already confined by the outer flux run"),
+        nested
+            .stderr
+            .contains("already confined by the outer flux run"),
         "expected the nested run to reach the AlreadyConfined branch.\nstderr:\n{}",
         nested.stderr
     );
@@ -190,39 +192,6 @@ fn require_still_fails_closed_instead_of_disclosing_and_continuing() {
     assert!(
         !discloses_unconfined(&run.stderr),
         "`require` never runs unconfined, so it must not claim to.\nstderr:\n{}",
-        run.stderr
-    );
-}
-
-/// Once per **process**, not once per **spawn** — the bullet a `wrap_argv`-level warning would
-/// violate, burying the signal in exactly the sessions that spawn most. `FLUX_ENABLE_BASH` +
-/// `FLUX_MOCK_BASH` drive the offline mock provider into a real `bash` op, so this run genuinely
-/// creates an OS subprocess through the same `build_command` choke point the sandbox wraps; the
-/// echoed marker is asserted so the test cannot pass by silently never spawning at all.
-#[test]
-fn the_disclosure_is_once_per_process_even_when_the_run_spawns_a_subprocess() {
-    let run = run_flux_with_env(
-        "c217-spawn",
-        Some("on"),
-        false,
-        &[
-            ("FLUX_ENABLE_BASH", "1"),
-            ("FLUX_MOCK_BASH", "echo c217-spawn-marker"),
-        ],
-        &["run", "--yes", "-m", "mock", "run a command"],
-    );
-
-    let both = format!("{}{}", run.stdout, run.stderr);
-    assert!(
-        both.contains("c217-spawn-marker"),
-        "the mock run must actually spawn a subprocess for this test to mean anything.\nstdout:\n{}\nstderr:\n{}",
-        run.stdout,
-        run.stderr
-    );
-    assert_eq!(
-        run.stderr.matches("UNCONFINED").count(),
-        1,
-        "a real spawn must not add a second disclosure.\nstderr:\n{}",
         run.stderr
     );
 }
@@ -325,11 +294,16 @@ fn the_disclosure_is_emitted_once_per_process_not_once_per_spawn() {
         ],
     );
 
-    // Non-vacuity: assert the spawn really happened. Without this, a run that errored out before
-    // executing anything would trivially satisfy the count assertion below.
+    // Non-vacuity, and note what it deliberately does NOT key on: the marker text `hello` also
+    // appears inside the *command string* (`echo hello`), which the plan and `tool_call` events echo
+    // back before anything is executed — so searching the output for the marker would pass even if
+    // the op were denied and no process ever spawned. Keying on the `tool_result` instead is
+    // decisive: that event carries the child's captured stdout, so it exists only if the process
+    // really ran.
     assert!(
-        run.stdout.contains("\"name\":\"bash\"") && run.stdout.contains("hello"),
-        "expected the run to actually spawn a shell process.\nstdout:\n{}\nstderr:\n{}",
+        run.stdout
+            .contains(r#""name":"bash","is_error":false,"content":"hello\n""#),
+        "expected a bash tool_result proving a child process actually ran.\nstdout:\n{}\nstderr:\n{}",
         run.stdout,
         run.stderr
     );
