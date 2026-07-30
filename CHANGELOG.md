@@ -8,6 +8,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The two destructive git ops the self-improvement loop relies on now state and enforce a
+  precondition (C-278).** `git_reset` (`reset --hard` plus an unscoped `clean -fd`) and
+  `guard_protected` destroyed uncommitted *and untracked* work unconditionally — and `clean -fd`
+  deletes untracked files outright, the case where "commit or stash them first" is unactionable advice.
+  `git_reset`'s licence is now checked rather than trusted. `git_snapshot` refuses a dirty tree and only
+  then emits `clean: true`, so that field was already a proof the op was discarding; it now also asks
+  git whether the snapshot sits on this checkout's line, which the flag alone cannot say.
+  ⚠ What that guarantees, stated exactly because the first cut claimed more: **a reset can only rewind
+  within this checkout's own line of history.** It is not "you may only discard the round's own
+  changes". `clean: true` is forgeable — a flow can hand-write it — so it catches the caller who forgot
+  to snapshot, not one that lies; the ancestry check interrogates the repository and is where the bound
+  actually lives. Neither check looks at recency.
+  `guard_protected` keeps a stated, tested exemption instead: its argv are explicit pathspec lists it
+  filters itself, so its blast radius is bounded by construction rather than by its caller. That covers
+  which paths it may touch, and nothing about which commit they are restored to — tracked as C-281.
+  The self-improvement loop is unaffected: both shipped flows snapshot inside the repeat body and reset
+  with HEAD at or ahead of it, so the ancestry check passes reflexively.
+
 - **A confined process now hands its sandbox posture to the children it spawns (C-276).** The scrubbed
   child environment carried `FLUX_SANDBOXED` — the marker whose whole job is to assert *"you are already
   confined"* — and none of the variables that decide whether confinement happens. A spawned `flux`

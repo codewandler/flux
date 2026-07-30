@@ -2,7 +2,7 @@
 id: C-280
 title: "The with-a-backend sandbox lane cannot confine on the runner it was given, so it fails every run"
 pillar: Core
-status: in-progress
+status: done
 priority: 1
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -32,12 +32,15 @@ repo, and only the second half is this story's problem.
 
 ## Acceptance
 
-- [ ] The lane confines for real on its runner: `flux doctor --json` reports the `sandbox backend`
+- [x] The lane confines for real on its runner: `flux doctor --json` reports the `sandbox backend`
       check as `PASS`, and both `a_promised_backend_is_real_and_functional` and
       `an_auto_approved_turn_runs_its_children_inside_the_sandbox` go green in CI.
-      **Deliberately left unchecked — this one is only tickable by a runner.** The implementor has no
-      way to execute a GitHub Actions job, and a green local run proves nothing here (see Progress).
-      Tick it from run output, not from a diff review.
+      **Ticked from run output, not from a diff review** — which is what this item existed to insist
+      on. CI run `30568751301` (2026-07-30, commit `389f1c95`) reports
+      `success  fail-closed sandbox switch · with a real backend`. That is the first time this lane
+      has ever been green, and the first time flux's confined path has been exercised on any CI host.
+      The implementor left this box unchecked and reported `PARTIAL` rather than tick it from a local
+      run — correctly, since a local pass proves nothing here.
 - [x] **The chosen mechanism is argued, not just applied.** At least these three are real options and
       they are not equivalent:
       - `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` in the lane's install step —
