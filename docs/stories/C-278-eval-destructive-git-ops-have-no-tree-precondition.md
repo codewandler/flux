@@ -2,7 +2,7 @@
 id: C-278
 title: "`flux-eval`'s two most destructive git ops carry no tree precondition at all"
 pillar: Core
-status: in-progress
+status: done
 priority: 6
 epic: security-assurance
 design: docs/designs/security-assurance.md
