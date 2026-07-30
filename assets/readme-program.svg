@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="561" height="436" viewBox="0 0 561 436" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="15">
+  <rect width="561" height="436" rx="10" fill="#282c34"/>
+  <circle cx="20" cy="22" r="6" fill="#e06c75"/>
+  <circle cx="40" cy="22" r="6" fill="#e5c07b"/>
+  <circle cx="60" cy="22" r="6" fill="#98c379"/>
+  <text x="22" y="60" xml:space="preserve"><tspan fill="#828997">agent</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#828997">assistant</tspan></text>
+  <text x="22" y="82" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">model</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#98c379">"claude-sonnet-5"</tspan></text>
+  <text x="22" y="104" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">tools</tspan><tspan fill="#abb2bf"> [</tspan><tspan fill="#828997">search</tspan><tspan fill="#abb2bf">]</tspan></text>
+  <text x="22" y="126" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">datasources</tspan><tspan fill="#abb2bf"> [</tspan><tspan fill="#828997">docs</tspan><tspan fill="#abb2bf">]</tspan></text>
+  <text x="22" y="148" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">description</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#98c379">"answers support questions from the docs"</tspan></text>
+  <text x="22" y="170" xml:space="preserve"></text>
+  <text x="22" y="192" xml:space="preserve"><tspan fill="#828997">channel</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#828997">slack</tspan></text>
+  <text x="22" y="214" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">bot_token</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#828997">secret</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#98c379">"SLACK_BOT_TOKEN"</tspan></text>
+  <text x="22" y="236" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">app_token</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#828997">secret</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#98c379">"SLACK_APP_TOKEN"</tspan></text>
+  <text x="22" y="258" xml:space="preserve"></text>
+  <text x="22" y="280" xml:space="preserve"><tspan fill="#828997">datasource</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#828997">docs</tspan></text>
+  <text x="22" y="302" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">kind</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#98c379">"markdown"</tspan></text>
+  <text x="22" y="324" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">path</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#98c379">"./docs"</tspan></text>
+  <text x="22" y="346" xml:space="preserve"></text>
+  <text x="22" y="368" xml:space="preserve"><tspan fill="#828997">trigger</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#828997">on_message</tspan></text>
+  <text x="22" y="390" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">on</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#98c379">"slack"</tspan></text>
+  <text x="22" y="412" xml:space="preserve"><tspan fill="#abb2bf">  </tspan><tspan fill="#828997">agent</tspan><tspan fill="#abb2bf"> </tspan><tspan fill="#828997">assistant</tspan></text>
+</svg>

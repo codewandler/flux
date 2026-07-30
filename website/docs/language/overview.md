@@ -59,7 +59,8 @@ One flow, three ways to say it. All of them describe the same AST:
 - **Text** — `.flux` files. Human-writable, comment-friendly, version-controllable. This is what
   you write in an editor and what the docs mostly show.
 - **JSON AST** — the canonical programmatic and storage format used by SDKs, tooling, replay, and
-  host-derived execution records. Not meant to be hand-written.
+  host-derived execution records. Not meant to be hand-written, and **not** an alternate content type
+  for a `.flux` file: the CLI parses `.flux` as text and refuses a JSON body rather than sniffing it.
 - **Rust DSL** — the `flux_lang::dsl` builders, re-exported as `flux_sdk::dsl`. Typed, composable
   Rust that constructs a `DraftAst` directly, for embedders who want the compiler to check the
   program they are assembling. See the [SDK overview](../sdk/overview.md).

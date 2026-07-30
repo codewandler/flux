@@ -15,6 +15,16 @@
 
 ## [Unreleased]
 
+- **A coordinating workflow can give each task its own private checkout.** Previously a workflow could
+  move itself into an isolated checkout, but only one at a time — so it could not hand several workers a
+  workspace each in the same run. Now it can create one per task, off a clean starting point, without
+  disturbing its own working directory. Each is refused up front if the starting point is dirty or the
+  name is taken, rather than half-created. **Removing them afterwards is your workflow's job**: they are
+  kept on purpose because they hold work that has not been merged yet, and nothing cleans them up for
+  you — so a long-running coordinator should delete the ones it is finished with, or it will fill the disk.
+
+## [0.39.0] - 2026-07-30
+
 ### Improved
 
 - **Workflow source is shorter and easier to scan.** Locals no longer need `$` on every use, named

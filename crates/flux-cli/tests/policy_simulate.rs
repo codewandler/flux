@@ -94,6 +94,11 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("FLUX_STORE_DIR", &self.store)
             .env("NO_COLOR", "1")
+            // C-266: state the posture rather than inherit the host's. `policy simulate` is a pure
+            // read — no provider, no spawned process, nothing to confine — so unconfined is the
+            // honest declaration, and it also keeps the test hermetic against an operator shell
+            // that exports `FLUX_SANDBOX=require`.
+            .env("FLUX_SANDBOX", "off")
             .stdin(Stdio::null());
         // A pure read constructs no provider, so it must not need — or quietly pick up — a
         // credential. Removing them all is the behavioral proof of "constructs no providers":

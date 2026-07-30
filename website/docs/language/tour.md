@@ -6,9 +6,12 @@ description: An example-driven walk through Flux-Lang — flows, calls, pure dat
 # A ten-minute tour
 
 This tour builds one small Flux-Lang vocabulary at a time: flows, calls, pure values, branches,
-iteration, concurrency, guard rails, and context packs. Every snippet uses current syntax; complete
+iteration, concurrency, guard rails, and context packs. Every snippet parses as-is; complete
 flows run as-is in a `.flux` file, and the shorter fragments show a flow body (wrap them in a `flow`
-header to run standalone).
+header to run standalone). The snippets use the `$`-sigil spelling, which the parser still accepts —
+the formatter's canonical output now drops the sigil and writes named arguments brace-free. See
+[Symbols](./flows-and-syntax.md#symbols) and
+[Named arguments](./flows-and-syntax.md#named-arguments) for both spellings.
 
 ## A minimal flow
 
@@ -34,7 +37,8 @@ with a value. This flow never touches a model, so it runs without any API creden
 
 ## Calls and named arguments
 
-Operations take **named arguments as a single object**. An op with one required parameter
+Operations take **named arguments**, written brace-free (`grep(pattern: "x", glob: "*.rs")`) or as an
+explicit object — both lower to the same single object argument. An op with one required parameter
 accepts a bare value as sugar:
 
 ```flux

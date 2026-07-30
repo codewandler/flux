@@ -3,7 +3,8 @@
 </h1>
 
 <p align="center">
-  A Rust agent platform for typed stages, authored flows, guarded execution, and replayable evidence.
+  <strong>A Rust agent platform where the model proposes and a deterministic runtime disposes.</strong><br>
+  Typed stages, authored flows, guarded execution, replayable evidence.
 </p>
 
 <p align="center">
@@ -17,46 +18,78 @@
   <a href="#install"><strong>Install</strong></a> ·
   <a href="#quickstart"><strong>Quickstart</strong></a> ·
   <a href="https://codewandler.github.io/flux/"><strong>Documentation</strong></a> ·
-  <a href="docs/architecture.md"><strong>Architecture</strong></a>
+  <a href="docs/architecture.md"><strong>Architecture</strong></a> ·
+  <a href="AGENTS.md"><strong>Contributing</strong></a>
 </p>
 
 ---
 
 ## The LLM is not the runtime
 
-In flux, the model never becomes the execution engine—or the author of executable Flux code. It
-declares intent, explores through exact provider-native operation schemas, and proposes literal
-actions. An authored Flux-Lang loop and deterministic Rust runtime own what happens next.
+The model never becomes the execution engine, and never authors executable code. It declares intent,
+explores through exact provider-native operation schemas, and proposes literal actions. An authored
+Flux-Lang loop and a deterministic Rust runtime own everything after that.
 
 ```text
 request → typed intent → scoped exploration → action batch → approval → guarded execution
                        authored Flux-Lang + deterministic runtime
 ```
 
-That hard boundary makes effects reviewable before they run, authored workflows repeatable, and every
-operation governable. The same execution envelope covers local tools, plugins, sub-agents, the SDK,
-and the server.
+That boundary is what makes effects reviewable *before* they run, authored workflows repeatable, and
+every operation governable. The same envelope covers local tools, plugins, sub-agents, the SDK and the
+server — there is no second path.
 
-## What flux includes
+## An entire app, declared
 
-Three co-equal pillars:
+A Slack support agent: the agent, the channel it answers on, the corpus it answers from, and the
+trigger that wakes it.
 
-- **Agent** — local CLI/TUI, Rust SDK, HTTP server, A2A support.
-- **Flux-Lang** — typed, authored flows for orchestration and reliable structure, with the in-repo
-  `flux-lsp` language server (diagnostics, completion, hover, formatting) and a
-  [tree-sitter grammar](https://github.com/codewandler/flux-tree-sitter) for Helix/Neovim/Zed.
-- **Improvement loop** — evidence-driven eval and self-improvement tooling.
+<p align="center">
+  <img src="assets/readme-program.svg" alt="A Flux-Lang program declaring an agent, a Slack channel, a markdown datasource, and a trigger" width="620">
+</p>
+
+```bash
+flux app run support-bot.flux
+```
+
+Secrets are environment-variable *references*, never inline values — the host resolves them at load and
+redacts them from every log. The full example, with setup notes, is
+[`crates/flux-app/examples/support-bot.flux`](crates/flux-app/examples/support-bot.flux).
+
+## Why flux
+
+| | |
+| --- | --- |
+| **Agent** | Local CLI and TUI, a Rust SDK, an HTTP server, A2A support — one execution envelope behind all four. |
+| **Flux-Lang** | Typed authored flows for orchestration, with an in-repo language server (diagnostics, completion, hover, formatting) and a [tree-sitter grammar](https://github.com/codewandler/flux-tree-sitter) for Helix, Neovim and Zed. |
+| **Improvement loop** | Evidence-driven eval and self-improvement tooling. |
 
 Reach for flux when you want an action batch you can inspect and approve before it runs, guardrails
-that are explicit rather than implied, deterministic replay/fork/diff, or an embeddable agent
-surface inside your own product.
+that are explicit rather than implied, deterministic replay/fork/diff, or an embeddable agent surface
+inside your own product.
 
 ## Install
 
-### Prebuilt binary
+```bash
+cargo install --git https://github.com/codewandler/flux flux-cli
 
-For sensitive environments, download a version-pinned archive and verify its GitHub provenance
-before extracting it. Replace the placeholders with a release and target listed on the release page:
+# optional: the .flux language server for your editor
+cargo install --git https://github.com/codewandler/flux flux-lsp
+```
+
+Or take a prebuilt binary for Linux and macOS:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf -o flux-installer.sh \
+  https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh
+sh flux-installer.sh   # downloaded first, so the script is reviewable before it runs
+```
+
+<details>
+<summary><strong>Hardened install — verify GitHub provenance before extracting</strong></summary>
+
+For sensitive environments, pin a version and verify its attestation. Replace the placeholders with a
+release and target from the [release page](https://github.com/codewandler/flux/releases/latest):
 
 ```bash
 release=vX.Y.Z
@@ -70,61 +103,81 @@ gh attestation verify "$archive" --repo codewandler/flux \
 tar -xJf "$archive"
 ```
 
-Releases produced before provenance publication should be built from a reviewed tag/commit instead.
-For convenience, the latest Linux/macOS installer remains available, but downloading it separately
-makes the code visible before execution and still trusts the release origin:
+Verification binds the tag to its exact source commit and rejects any asset outside the closed,
+attestation-checked distribution set. Releases predating provenance publication should be built from a
+reviewed tag instead.
 
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf -o flux-installer.sh https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh
-sh flux-installer.sh
-```
+</details>
 
-### From source
-
-```bash
-cargo install --git https://github.com/codewandler/flux flux-cli
-# optional: the .flux language server for your editor (diagnostics, completion, hover, formatting)
-cargo install --git https://github.com/codewandler/flux flux-lsp
-# …or clone and build: cargo build --release   → target/release/flux
-#    (from a clone, `task install` installs flux and flux-lsp together)
-```
-
-Release assets (including checksums and plugin-release checks) are in each
-[GitHub release](https://github.com/codewandler/flux/releases/latest). Plugin packs ship separately as
-`plugins-v*` and install via the plugin CLI.
+From a clone: `cargo build --release` → `target/release/flux`, or `task install` for `flux` and
+`flux-lsp` together. Plugin packs ship separately as `plugins-v*`.
 
 ## Quickstart
 
-```bash
-# Start a normal turn
-flux run "add a test for the parser"
-
-# Reveal intent, capability selection, and batch machinery
-flux run --show-loop "summarize README.md into SUMMARY.txt"
-
-# Inspect the authored outer loop; ejecting it does not activate it implicitly
-flux loop show
-
-# Start REPL / TUI / server
-flux
-flux tui
-flux app run --serve 127.0.0.1:8787 --yes
-```
-
-Run without API keys using the offline provider:
+No API key required — the offline `mock` provider exercises the full pipeline:
 
 ```bash
 flux run --yes -m mock "write a quick note"
 ```
 
-## Providers and auth
+```text
+mock · session s_1658
+routing intent…
+◆ intent: complete the offline mock turn
+  capabilities: workspace.write · 5 operations
+exploring…
 
-A provider is a **wire codec × credential** pair selected with `-m <provider>/<model>`.
+→ [1/50] append    flux-mock.txt (+21 bytes)
+  ✓ appended 21 bytes to flux-mock.txt  · exec 731µs
+Finished.
+─────────────────────── 1 step · 790ms · ctx 1.4k · out 12 · cache 87% ↺1.2k ✎0
+```
+
+The intent, the capabilities it unlocked, every operation with its arguments and effect, and the cost.
+Then with a real provider:
+
+```bash
+flux run "add a test for the parser"
+flux run --show-loop "summarize README.md into SUMMARY.txt"   # reveal the batch machinery
+flux loop show                                                # inspect the authored outer loop
+
+flux            # REPL
+flux tui        # full-screen UI
+flux app run --serve 127.0.0.1:8787 --yes    # HTTP server
+```
+
+## Safety and execution model
+
+Every operation passes the same chain:
+
+```text
+capability scope floor → policy (deny by default) → permissions → approval → guarded IO
+```
+
+There is no bypass path:
+
+- workspace file, process and network operations are guarded by `flux-system` — one path, not one of several
+- unsafe or ambiguous commands can be denied at analysis time or at approval time
+- effectful native calls are frozen into an approved batch and **re-checked at dispatch**
+- every secret is registered with the redactor and scrubbed from tool output and logs
+- evidence is persisted per session and per event, for audit and replay
+
+Sub-agents inherit the identical chain: their loops and operation calls face the same checks.
+
+## Providers
+
+A provider is a **wire codec × credential** pair, selected with `-m <provider>/<model>`.
 
 ```bash
 flux auth status
-flux auth login claude   # optional opt-in OAuth path
+flux auth login claude   # opt-in OAuth
 ```
+
+Bare aliases skip the prefix: `fable`, `opus`, `sonnet` and `haiku` resolve on `anthropic`; `claude`,
+`codex` and `aws` resolve their provider's default model; `mock` runs offline.
+
+<details>
+<summary><strong>All providers and their credentials</strong></summary>
 
 | `-m` provider | Wire | Auth |
 | --- | --- | --- |
@@ -138,17 +191,14 @@ flux auth login claude   # optional opt-in OAuth path
 | `aws` | Bedrock Anthropic | AWS env / SSO / IRSA / EKS Pod Identity |
 | `mock` | — | none — offline test provider, exercises the full pipeline |
 
-Bare aliases need no prefix: `fable`, `opus`, `sonnet`, `haiku` resolve on `anthropic`; bare
-`claude`, `codex`, and `aws` resolve their provider's default model; `mock` runs offline.
+</details>
 
-## Configuration (`.flux/config.toml`)
+## Configuration
 
-Configuration precedence is:
+Precedence: CLI flags → project `.flux/config.toml` → user `~/.flux/config.toml` → defaults.
 
-1. CLI flags
-2. project `.flux/config.toml`
-3. user `~/.flux/config.toml`
-4. defaults
+<details>
+<summary><strong>Example <code>.flux/config.toml</code></strong></summary>
 
 ```toml
 model = "claude/opus"
@@ -169,45 +219,66 @@ resources = [{ kind = "path", path = "src/**" }]
 actions = ["workspace.write"]
 ```
 
-`allow_private_net = true` is still honored for compatibility, but plugin private-network grants still
-require explicit `[private_net.plugins]`.
+`allow_private_net = true` is still honored for compatibility, but plugin private-network grants always
+require an explicit `[private_net.plugins]` entry.
 
-## Safety and execution model
+</details>
 
-Every operation goes through:
+Full reference: [configuration](https://codewandler.github.io/flux/docs/reference/config).
 
+## Capabilities
+
+- Built-in tools cover file, search, web and delegation operations. The generic shell (`bash`) is
+  **opt-in**, behind the `shell` signal — prefer a dedicated, accurately-gated operation.
+- Skills and markdown slash-commands load from both `.flux/` and `.claude/` trees, project and
+  user-global, nested multi-file skills included. Manual-only by default, with an opt-in
+  model-invoked mode.
+- Plugin operations are manifest-scoped with enforced privileges. Approval and policy hooks
+  (`.flux/hooks/*.js`) can validate, transform or deny calls.
+- `flux tui` is the same daily driver in a dense borderless UI: mid-turn steering (type while a turn
+  runs, with queued messages still editable), themes, history and transcript search, `@` path
+  completion, hunk-view diffs, session picker and replay, live model switching.
+
+## Programs, presets, and the SDK
+
+Programs compose multi-agent journeys in Flux-Lang — a `.flux` file declaring agents, channels,
+datasources, triggers and journeys. Presets cover common flow structures.
+
+```bash
+flux app run support-bot.flux            # serve its declared channels until Ctrl-C
+flux run support-bot.flux                # same program, path auto-detected
+flux run workflows.flux --entry triage --arg queue=new   # one named flow from a multi-flow module
+
+flux preset list
+flux preset retry_with_backoff max=3 delay_ms=200 op=read input='"README.md"' bind=r --run --yes
 ```
-capability scope floor → policy (deny by default) → permissions → approval → guarded IO
+
+To embed flux in Rust, the SDK assembles the same flow engine and safety pipeline the CLI uses:
+
+```rust
+let provider = Box::new(flux_providers::anthropic::anthropic_from_env()?);
+let client = flux_sdk::Client::builder().model("anthropic/opus").build(provider, ".")?;
+let out = client.run("Summarize the README").await?;
+println!("{}", out.text);
 ```
 
-No bypass path exists:
+## Plugin packs
 
-- workspace file/process/net operations are guarded by `flux-system`
-- unsafe/ambiguous commands can be denied at analysis or approval time
-- effectful native calls are frozen into an approved batch and re-checked at dispatch time
-- all secrets are registered with the redactor and scrubbed from tool output/logs
-- evidence is persisted per session and event for auditability
+Official integrations — GitLab, Slack, Kubernetes, SQL and more — ship as a signed pack. The release
+index is minisign-checked and every archive hash is verified before install.
 
-Sub-agents inherit the same safety chain; their loops and operation calls are validated with the same checks.
-
-## Capabilities and operations
-
-- Built-in tools cover file, search, web, and delegation operations. Optional shell (`bash`) sits
-  behind the `shell` signal.
-- Skills and markdown slash-commands load from both the `.flux/` and `.claude/` trees (project and
-  user-global, nested multi-file skills included). Skills are manual-only by default, with an
-  opt-in model-invoked mode.
-- Plugin operations are manifest-scoped, with explicit enforced privileges. Approval and policy
-  hooks (`.flux/hooks/*.js`) can validate, transform, or deny calls.
-- REPL slash commands include `/tools`, `/sessions`, `/compact`, `/evidence`, and more.
-- `flux tui` is the same daily driver in a dense borderless UI — mid-turn steering (type while a
-  turn runs; queued messages stay editable in `/queue`), themes, history and transcript search
-  (Ctrl-R / Ctrl-F), `@` path completion, hunk-view diffs, session picker/replay, and live model
-  switching.
+```bash
+flux plugin install gitlab
+flux plugin install --all
+```
 
 ## HTTP API
 
-`flux app run --serve <addr> --yes` hosts a Flux agent.
+`flux app run --serve <addr> --yes` hosts a Flux agent. All non-health routes require bearer auth by
+default, and a non-loopback bind without `FLUX_SERVER_TOKEN` is **rejected at startup**.
+
+<details>
+<summary><strong>Routes</strong></summary>
 
 | Route | Purpose |
 | --- | --- |
@@ -220,77 +291,37 @@ Sub-agents inherit the same safety chain; their loops and operation calls are va
 | `GET /sessions/:id/stream?input=...` | SSE stream |
 | `POST /webhook` | External trigger |
 
-All non-health routes require bearer auth by default. A non-loopback bind without `FLUX_SERVER_TOKEN` is rejected.
-
-## Presets and programs
-
-flux includes a preset library (`flux preset`) for common flow structures (retries, fan-out, loops,
-fallbacks). Programs let you compose multi-agent journeys in Flux-Lang: a `.flux` file declaring
-agents, channels, datasources, triggers, and journeys. Run one with `flux app run <program.flux>`,
-or hand it to bare `flux run <app.flux>` — a `.flux` path is detected instead of treated as a prompt.
-
-```bash
-flux preset list
-flux preset retry_with_backoff max=3 delay_ms=200 op=read input='"README.md"' bind=r --run --yes
-
-flux app run support-bot.flux          # serve its declared channels until Ctrl-C
-flux run support-bot.flux              # same program, auto-detected
-flux run workflows.flux --entry triage --arg queue=new
-                                          # select one authored flow from a multi-flow module, run once
-```
-
-## SDK
-
-For an embed path in Rust, use the SDK client, which assembles the same flow engine and safety
-pipeline used by the CLI.
-
-```rust
-let provider = Box::new(flux_providers::anthropic::anthropic_from_env()?);
-let client = flux_sdk::Client::builder().model("anthropic/opus").build(provider, ".")?;
-let out = client.run("Summarize the README").await?;
-println!("{}", out.text);
-```
-
-## Plugin packs
-
-Official integrations (GitLab, Slack, Kubernetes, SQL, etc.) are published as a signed plugin pack.
-
-```bash
-flux plugin install gitlab
-flux plugin install --all
-```
-
-The plugin release index is minisign-checked and each archive hash is verified before install.
+</details>
 
 ## Documentation
 
-Full docs: **[codewandler.github.io/flux](https://codewandler.github.io/flux/)** —
+**[codewandler.github.io/flux](https://codewandler.github.io/flux/)** —
 [getting started](https://codewandler.github.io/flux/docs/getting-started) ·
 [the agent loop](https://codewandler.github.io/flux/docs/agent/agent-loop) ·
 [Flux-Lang](https://codewandler.github.io/flux/docs/language/overview) ·
 [editor setup](https://codewandler.github.io/flux/docs/language/editors) ·
 [SDK](https://codewandler.github.io/flux/docs/sdk/overview) ·
-[plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins).
+[plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins)
 
-In-repo: [`docs/architecture.md`](docs/architecture.md) ·
-[`docs/vision.md`](docs/vision.md) · [`docs/usage.md`](docs/usage.md) (command surface map).
+In-repo: [`docs/architecture.md`](docs/architecture.md) · [`docs/vision.md`](docs/vision.md) ·
+[`docs/usage.md`](docs/usage.md) (command surface map)
 
-## Development
+## Contributing
 
-flux is a layered Rust workspace from contracts to extensions; the safety guarantees are enforced by
-the runtime layer and checked by an architecture gate (`flux-codegate`).
+flux is a layered Rust workspace, contracts through extensions. The safety guarantees are enforced by
+the runtime layer and checked by an architecture gate.
 
 ```bash
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
-cargo test -p flux-codegate                              # architecture layering lint
+cargo test -p flux-codegate      # architecture layering lint
 ```
 
-**[AGENTS.md](AGENTS.md) is the authoritative contributor contract** — architecture boundaries,
-safety invariants, conventions, and release mechanics.
+**[AGENTS.md](AGENTS.md) is the authoritative contributor contract** — architecture boundaries, safety
+invariants, conventions and release mechanics. Read it before opening a PR.
 
 ## License
 
-Licensed under MIT OR Apache-2.0, at your option.
+MIT OR Apache-2.0, at your option.

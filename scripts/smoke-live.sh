@@ -105,7 +105,13 @@ run_shape_checks() {
   # (that lives in flux-cli's sandbox_posture.rs), so it declares unconfined operation. Scoped to
   # this function on purpose: the live legs below share the same wrapper functions and must keep
   # their real posture, so this must not become a flag on `flux_serve` itself.
-  export FLUX_SANDBOX=off
+  #
+  # C-266: a caller that DOES have a backend may pin the posture itself (the `sandbox-backend` CI
+  # lane sets FLUX_SANDBOX=require), and this honors it — that is the only way step 5's serving
+  # surface, the third and last site the 0.38.0 cut found, gets shape-checked in both postures rather
+  # than only the unconfined one.
+  export FLUX_SANDBOX="${FLUX_SANDBOX:-off}"
+  echo "  posture: FLUX_SANDBOX=$FLUX_SANDBOX"
   local sws port addr
   sws="$(mktemp -d)"
   cd "$sws" || { bad "could not enter shape-check scratch dir"; return; }

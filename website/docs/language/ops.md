@@ -249,6 +249,7 @@ reconcile them later.
 | `fleet.dispatch` | `worker, task[, role, context_id]` | Send a task to a remote worker and return its task id without waiting. A worker that replies synchronously returns a null task id plus its answer, instead of an id that would be polled forever |
 | `fleet.status` | `worker, task_id` | Read a dispatched task's current state, whether it is terminal, and its final text |
 | `fleet.cancel` | `worker, task_id` | Stop a dispatched task. An already-finished task reports that it was not cancelable |
+| `fleet.isolate` | `item` | Create branch `impl/<item>` in its own git worktree and return the checkout path — a per-item isolated workspace for one local worker. Unlike a worktree session it does not move the caller's own working root, so one call per item in a wave is legal. Requires a clean checkout and a free branch name; removing the worktree afterwards is the caller's job |
 
 The `worker` address is an argument, not configuration, so it is model-reachable and gated as such.
 Every call resolves the endpoint through the same egress guard as `web.fetch` before any request,
@@ -378,7 +379,7 @@ See [Improvement](../agent/improvement.md).
 
 | op | arguments | description |
 |---|---|---|
-| `eval_run` | `adapter, …` | Run a benchmark suite against the flux binary; returns `{adapter, pass_rate, scalar, total, …}` |
+| `eval_run` | `adapter[, limit, model, tasks]` | Run a benchmark suite against the flux binary; returns `{adapter, pass_rate, scalar, total, …}` |
 | `eval_scalar` | `report` | The report's score scalar as a plain string |
 | `eval_report_md` | `report` | Render a report as categorized Markdown (headline score, per-task table) |
 | `eval_sessions` | `report` | Extract session references `[{id, db, task_id}]` from a report |
@@ -396,21 +397,21 @@ every member benchmark's pass rate and check rate to be at least the baseline's.
 |---|---|---|
 | `sessions_digest` | `sessions` | Render each session's run trace into a compact transcript for review |
 | `painpoints_collect` | `sessions` | Mine pain-points — tool errors, retry loops, missing tools, churn — from session references |
-| `improvements_aggregate` | `painpoints, findings` | Cluster mined pain-points and review findings into ranked candidates |
+| `improvements_aggregate` | `mined, reviewed` | Cluster mined pain-points (`mined`) and review findings (`reviewed`) into ranked candidates |
 | `candidates_advance` | `candidates` | Drop the consumed candidate and return the rest |
 | `candidates_empty` | `candidates` | `"true"` iff the candidate list is empty |
-| `improve_log` | round record | Append a timestamped round record to `.flux/eval/improve-log.jsonl` |
+| `improve_log` | `record` | Append a timestamped round record to `.flux/eval/improve-log.jsonl` |
 
 **Applying a round, under guard**
 
 | op | arguments | description |
 |---|---|---|
-| `change_implement` | tasks | Implement each derived task by spawning a `worker` sub-agent; returns a per-task summary |
-| `gate_check` | | Run the dev gate (build/test/clippy/fmt) and return `"true"` or `"false"` |
-| `guard_protected` | snapshot | Restore grader/suite/loop/CI paths to the round snapshot after the worker runs |
+| `change_implement` | `tasks[, limit]` | Implement each derived task by spawning a `worker` sub-agent; returns a per-task summary |
+| `gate_check` | `[build, test, clippy, fmt, timeout_secs]` | Run the dev gate (build/test/clippy/fmt) and return `"true"` or `"false"`; each step is individually toggleable |
+| `guard_protected` | `snapshot` | Restore grader/suite/loop/CI paths to the round snapshot after the worker runs |
 | `git_snapshot` | | Capture `HEAD` for later revert; errors if the working tree is dirty |
-| `git_reset` | snapshot | **Destructive** — hard-reset the working tree to a snapshot, discarding the round's changes |
-| `git_tag` | `[message]` | Tag the current commit (annotated when a message is given) |
+| `git_reset` | `snapshot` | **Destructive** — hard-reset the working tree to a snapshot, discarding the round's changes |
+| `git_tag` | `name[, message]` | Tag the current commit (`name` is a prefix — the short `HEAD` sha is appended; annotated when `message` is given) |
 
 `guard_protected` is the anti-cheat step: it restores the grader, the suite, the loop, and the CI
 config after each worker run, so a round cannot raise its own score by editing what measures it.

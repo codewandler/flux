@@ -6,6 +6,102 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Both sides of the fail-closed sandbox switch are now proven in CI (C-266).** C-262's fail-closed
+  default cost the 0.38.0 cut four successive fix commits, each found only by pushing and reading a red
+  run, because every developer machine has `bwrap` and no runner does. The `check` job now sets
+  `FLUX_BWRAP_BIN=/nonexistent/bwrap` job-wide, so all seven of its steps run the no-backend posture **by
+  construction** rather than by the accident of a runner image — including `smoke-live.sh --shapes`,
+  whose serving-surface step a `cargo test` run does not reach. A new `sandbox-backend` job installs
+  bubblewrap and runs the suite plus the shape guard at `FLUX_SANDBOX=require`.
+  The story's stated premise turned out to be **false**, and the implementor falsified it rather than
+  inheriting it: `sandbox_posture.rs` does *not* require the absence of a backend — every spawn there
+  already pins both discovery variables at nonexistent paths, so it is hermetic and passes on a host
+  that has `bwrap`. Nothing had to be weakened and no test relocated. The real trap was the inverse:
+  `apt-get install bubblewrap` does not mean bwrap *works* — a kernel refusing unprivileged user
+  namespaces resolves `Unsupported` and the new lane would have become a silently-green copy of `check`.
+  So the lane asserts its own premise via `flux doctor --json` and proves confinement behaviourally by
+  the child's pid inside `--unshare-pid`, not by exit status. Recurrence is guarded by
+  `every_unattended_test_spawn_declares_its_sandbox_posture`, with its non-coverage stated plainly.
+
+- **The security-assurance epic's closure is now recorded rather than re-derivable (C-267).** Every
+  2026-07-29 desk-review finding and the classification-trust concern is mapped to a commit, test name
+  and `file:line` verified against the shipped tree — landed as a dated artifact under `reviews/` with a
+  per-axis delta against that baseline, so the next reviewer verifies instead of starting over. Two
+  results worth naming: **no `done`-but-unreachable child was found** — looked for deliberately, since
+  C-233 and C-234 are prior instances of exactly that pattern — and **envelope-integrity finding 4 is
+  reported OPEN**, now filed as C-275. It had survived by never being filed rather than by decision.
+  C-186 is consequently `in-progress`, not `done`, and says why.
+
+### Added
+
+- **`fleet.isolate` — a per-item checkout the caller's root never pays for (C-241).** A coordinator can
+  now give each work item its own git worktree in a single turn, which `git_worktree_enter` structurally
+  cannot: that op moves the caller's *own* working root, so N workers could never each have one. Creates
+  `impl/<item>` off the current clean HEAD and returns `{worktree, branch, base_commit}`. Refuses a dirty
+  base, an existing branch of that name, and nesting inside a worktree session — each recoverably, and
+  the preflights are ordered so a refusal creates nothing.
+  Every git invocation goes through the single guarded `System` path, argv-only, and the item name is
+  restricted to `[A-Za-z0-9._-]` with no `/` or `..`, so the ref cannot escape `refs/heads/impl/` and
+  `git worktree add`'s argv can never receive an option-lookalike.
+  `permission_subjects` names the **branch** (`fleet.isolate:impl/<item>`), not the checkout path — the
+  directory is allocated mid-execution, after approval. Independent review confirmed that is safe:
+  nothing in the call arguments influences where the checkout lands, and with `access: [Process]` and no
+  `Filesystem` the declaration emits `process.exec` on the branch-named subject and no filesystem
+  requirement — the same shape `git_commit`, `git_checkout` and `git_worktree_enter` already have. The
+  subject is in fact more scoped than `git_worktree_enter`'s, which is the bare op name.
+  ⚠ **Cleanup is the caller's, deliberately** — the host never removes an isolated worktree, because it
+  holds the worker's unmerged diff. Nothing bounds the count, so a grant of `fleet.isolate:impl/*`
+  authorizes an unlimited number of full checkouts under `$FLUX_WORKTREE_DIR`/`~/.flux/worktrees`. Budget
+  disk accordingly.
+
+### Fixed
+
+- **The public documentation corpus had drifted, and the enumerations that keep rotting are now pinned
+  (C-250).** 37 corrections across 25 pages, each grounded in a non-doc `file:line` rather than in
+  another document's agreement — which is the failure mode the story exists to fix. Representative:
+  `getting-started` asked for Rust 1.85+ against a `rust-version` of 1.87; `opus` resolved to
+  `claude-opus-4-8` and resolves to `claude-opus-5`; the board state machine was documented as four
+  states against `State::ALL`'s seven, and its operations as six against eleven; a legacy
+  `[private_net] web_fetch` key was documented as "silently ignored" while `deny_unknown_fields` makes
+  the config **refuse to load**; `http-api` claimed `usage` reports every token tier and it reports five
+  of eight. The durable half is a new guard: board pages had rotted twice on the same axis, so the
+  operation and row-field lists are now generated from `work_board_tools`/`MemoryBoard` and the pages
+  must enumerate them — proven by breaking a page and watching the test name the exact omission.
+
+- **The engine's state store is behind a port (C-270).** `FlowStore` is now a facade over
+  `Arc<dyn FlowStateBackend>` with the SQLite implementation behind it and an in-memory second
+  implementation, both held to one conformance suite, plus a real two-operation plan executing end to
+  end over the non-SQLite backend — so the port is falsifiable rather than decorative. The trait owns
+  its own absence outcome (`Lookup::{Found, NoSuchRow}`), which is what stops it being portable in name
+  only: every `rusqlite` reference, including all four `QueryReturnedNoRows` matches, now sits inside
+  the SQLite backend. `take_suspension`'s atomicity moved from the facade into the backend and is a
+  stated trait obligation, which is stricter than the read-then-delete it replaced. Dropping the direct
+  `rusqlite` dependency is **not** part of this and is now C-274: the driver also arrives via
+  `flux-events` non-optionally, so removing one line of two buys no portability and would gate
+  `FlowStore::in_memory` behind a feature for nothing.
+
+## [0.39.0] - 2026-07-30
+
+### Fixed
+
+- **The in-repo operation reference was unguarded against omission (C-248).** `ops-reference.md` had a
+  guard already — C-233's risk-column check — but it walks the **document** and holds each row to the
+  catalog, so an op that was never written down is not a row and is invisible to it by construction.
+  That asymmetry is exactly why a *rename* reddened the gate while an *omission* never did. The missing
+  direction now exists: iterate the production catalog and require a table **row** per op — a row rather
+  than a substring, because the file already carried prose naming the very ops it was missing, which a
+  `contains()` check would have accepted as coverage. Closing the guard properly grew the fill from the
+  eval family to **33 ops**, adding the datasource (`get`/`list`/`relation`/`batch_get`), `endpoint.*`,
+  `review.*`, `schedule_wakeup`, `home_dir` and `flux_reload` families; every row was generated from
+  dumped `Tool::spec()` values rather than recalled. Four wrong parameter lists in the website catalog
+  were corrected in passing — `improvements_aggregate` was documented `painpoints, findings` and takes
+  `mined, reviewed`, and `git_tag`'s required `name` was absent entirely; a coverage test asserts a name
+  is present, never that its signature is real, so those were invisible to both guards. `AGENTS.md`
+  claimed a missing op reds the gate via the website test for **both** files, which was false for the
+  in-repo one and is plausibly how the omission survived an implementor following the contract.
+
 ### Changed
 
 - **Flux-Lang source is smaller and has one honest file format (L-93).** Canonical source now uses

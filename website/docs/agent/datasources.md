@@ -13,8 +13,8 @@ A **datasource** is a governed data boundary the agent reaches through
 | Data lives | In a flux-owned index of records | In an external API, database, or in-process backend | In a board backend flux writes to |
 | Best for | Searchable docs and contributed knowledge | Current tickets, customers, inventory, and similar domain data | Work the agent hands out, claims, and finishes |
 | Read shape | Search, address lookup, relations, offset paging | Typed entity filters, cursor paging, stable-id lookup | State-filtered item paging, stable-id lookup |
-| Writes | No | No | Yes—`create`, `transition`, `claim`, `comment` |
-| Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` | `<domain>.list`/`.get`/`.create`/`.transition`/`.claim`/`.comment` |
+| Writes | No | No | Yes—`create`, `transition`, `claim`, `comment`, `record_dispatch`, `reassign`, `record_evidence` |
+| Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` | eleven, [enumerated below](#work-boards) |
 
 The split is intentional. A stable local snapshot benefits from indexing and ranked search; a
 changing system of record needs async calls and backend-owned continuation cursors; work that is
@@ -192,8 +192,9 @@ For embedding code and the indexed `try_register_pack` recipe, see
 
 ## Work boards
 
-A **work board** is the write-capable third form: a typed item state machine—`Ready`, `Claimed`,
-`Done`, `Failed`—behind a swappable backend. A read-only knowledge index cannot express work that is
+A **work board** is the write-capable third form: a typed item state machine—`ready`, `claimed`,
+`in_progress`, `review`, `done`, `blocked`, `failed`—behind a swappable backend. The full spine, and
+which transitions are legal, is in [Work boards and the fleet](./fleet.md#the-item-lifecycle). A read-only knowledge index cannot express work that is
 claimed, moved, retried, and commented on, which is what a coordinator agent needs in order to hand
 tasks out and reconcile them after a crash.
 

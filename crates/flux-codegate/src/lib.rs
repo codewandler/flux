@@ -1259,6 +1259,468 @@ pub fn guarded_port_impls(src: &str) -> syn::Result<Vec<GuardedPortImpl>> {
     Ok(visitor.hits.into_iter().collect())
 }
 
+// ---------------------------------------------------------------------------
+// Sandbox posture of test spawns (C-266)
+// ---------------------------------------------------------------------------
+
+/// argv tokens that select an auto-approving or serving surface. Mirrors the flag arms of
+/// `unattended_sandbox_surface` (`crates/flux-cli/src/dispatch.rs`); [`unattended_surface_arms`]
+/// keeps the *flagless* half of that function from drifting away from the list below.
+pub const UNATTENDED_ARGV_FLAGS: &[&str] = &["--yes", "-y", "--serve"];
+
+/// Subcommands that are unattended with **no flag at all** — the trap `--yes`-keyed matching misses.
+/// Kept honest against `dispatch.rs` by the drift check on [`unattended_surface_arms`].
+pub const FLAGLESS_UNATTENDED_SUBCOMMANDS: &[&str] = &["review"];
+
+/// Environment variables whose appearance in a spawn's builder chain *is* a posture declaration:
+/// each one pins the resolved posture (or forces backend discovery) instead of inheriting whatever
+/// the host happens to have installed.
+pub const SANDBOX_POSTURE_ENV: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOXED",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+];
+
+/// Why one test spawn of the `flux` binary owes an explicit sandbox posture.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AmbientSandboxKind {
+    /// The literal argv already names an auto-approving / serving surface; the token is carried so
+    /// the failure message can point at it.
+    Unattended(String),
+    /// The argv is caller-supplied in bulk (`.args(expr)`), so any call site can turn this spawn
+    /// into an unattended one without touching the spawn itself.
+    ForwardedArgv,
+}
+
+/// One spawn of the `flux` binary from test code that never states which sandbox posture it needs,
+/// and therefore silently inherits the host's — green on a developer machine with `bwrap`, red on a
+/// runner without it (C-266).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AmbientSandboxSpawn {
+    pub line: usize,
+    /// Nearest containing function, or `<module>` for a module-level initializer.
+    pub function: String,
+    pub kind: AmbientSandboxKind,
+}
+
+/// Whether `token` names an auto-approving or serving surface. `--serve=<addr>` is the attached-value
+/// spelling of `--serve` and counts the same.
+fn unattended_argv_token(token: &str) -> bool {
+    UNATTENDED_ARGV_FLAGS.contains(&token)
+        || token.starts_with("--serve=")
+        || FLAGLESS_UNATTENDED_SUBCOMMANDS.contains(&token)
+}
+
+/// Everything one builder chain said about itself. Accumulated per Command *binding* so a chain
+/// split across statements (`let mut cmd = Command::new(..); cmd.args(..); cmd.env(..)`) is judged
+/// as the single spawn it is.
+#[derive(Default)]
+struct SpawnFacts {
+    line: usize,
+    function: String,
+    literal_argv: Vec<String>,
+    forwards_argv: bool,
+    declares_posture: bool,
+}
+
+impl SpawnFacts {
+    /// The finding this spawn owes, if any. A declared posture settles it; otherwise a literal
+    /// unattended token is reported in preference to the weaker "could become one" finding.
+    fn finding(&self) -> Option<AmbientSandboxKind> {
+        // `--no-sandbox` states the posture in argv rather than in the environment; it is the CLI's
+        // own kill switch and wins outright (`apply_sandbox_env`, flux-cli's dispatch.rs).
+        if self.declares_posture
+            || self
+                .literal_argv
+                .iter()
+                .any(|token| token == "--no-sandbox")
+        {
+            return None;
+        }
+        if let Some(token) = self
+            .literal_argv
+            .iter()
+            .find(|token| unattended_argv_token(token))
+        {
+            return Some(AmbientSandboxKind::Unattended(token.clone()));
+        }
+        self.forwards_argv
+            .then_some(AmbientSandboxKind::ForwardedArgv)
+    }
+}
+
+/// The string literal an expression *is*, peeling references and `.to_string()`-style wrappers.
+fn literal_str(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Str(s) => Some(s.value()),
+            _ => None,
+        },
+        syn::Expr::Reference(reference) => literal_str(&reference.expr),
+        syn::Expr::Paren(paren) => literal_str(&paren.expr),
+        syn::Expr::Group(group) => literal_str(&group.expr),
+        _ => None,
+    }
+}
+
+/// The elements of an array/slice/`vec![]` literal, or `None` when the expression is opaque.
+fn array_elements(expr: &syn::Expr) -> Option<Vec<&syn::Expr>> {
+    match expr {
+        syn::Expr::Array(array) => Some(array.elems.iter().collect()),
+        syn::Expr::Reference(reference) => array_elements(&reference.expr),
+        syn::Expr::Paren(paren) => array_elements(&paren.expr),
+        syn::Expr::Group(group) => array_elements(&group.expr),
+        _ => None,
+    }
+}
+
+struct SandboxSpawnVisitor<'a> {
+    aliases: &'a ProcessAliases,
+    /// Locals bound to `env!("CARGO_BIN_EXE_flux")`, so an indirected program path still resolves.
+    flux_bin_idents: BTreeSet<String>,
+    /// Local ident → index into `facts` for a binding holding a `flux` Command builder.
+    command_bindings: HashMap<String, usize>,
+    functions: Vec<String>,
+    facts: Vec<SpawnFacts>,
+}
+
+impl SandboxSpawnVisitor<'_> {
+    /// Does this expression evaluate to the `flux` binary's path? Keyed on the exact
+    /// `CARGO_BIN_EXE_flux` env key — the sibling `CARGO_BIN_EXE_flux_sdk_plugin_fixture` is a
+    /// different binary and must not match.
+    fn is_flux_bin(&self, expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Macro(mac) => {
+                mac.mac.path.is_ident("env")
+                    && mac
+                        .mac
+                        .parse_body::<syn::LitStr>()
+                        .is_ok_and(|lit| lit.value() == "CARGO_BIN_EXE_flux")
+            }
+            syn::Expr::Reference(reference) => self.is_flux_bin(&reference.expr),
+            syn::Expr::Paren(paren) => self.is_flux_bin(&paren.expr),
+            syn::Expr::Group(group) => self.is_flux_bin(&group.expr),
+            // `env!("…").to_string()` / `.into()` and friends stay the same program.
+            syn::Expr::MethodCall(call) => self.is_flux_bin(&call.receiver),
+            syn::Expr::Path(path) => path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.flux_bin_idents.contains(&ident.to_string())),
+            _ => false,
+        }
+    }
+
+    /// A `Command::new(<flux binary>)`-style construction, as a fresh facts record.
+    fn new_flux_command(&mut self, expr: &syn::Expr) -> Option<usize> {
+        let syn::Expr::Call(call) = expr else {
+            return None;
+        };
+        let path = transparent_expr_path(&call.func)?;
+        let mut segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        segments.pop()?;
+        self.aliases.resolve_type_segments(&segments)?;
+        if !call.args.iter().any(|arg| self.is_flux_bin(arg)) {
+            return None;
+        }
+        self.facts.push(SpawnFacts {
+            line: start_line(path.span()),
+            function: self
+                .functions
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<module>".into()),
+            ..SpawnFacts::default()
+        });
+        Some(self.facts.len() - 1)
+    }
+
+    /// The facts record a chain root belongs to: a fresh one for a constructor, the existing one for
+    /// a local already bound to a `flux` Command.
+    fn root_record(&mut self, root: &syn::Expr) -> Option<usize> {
+        if let Some(index) = self.new_flux_command(root) {
+            return Some(index);
+        }
+        let syn::Expr::Path(path) = root else {
+            return None;
+        };
+        let ident = path.path.get_ident()?.to_string();
+        self.command_bindings.get(&ident).copied()
+    }
+
+    /// Fold one builder call into a spawn's facts.
+    fn absorb(&mut self, index: usize, call: &syn::ExprMethodCall) {
+        let method = call.method.to_string();
+        let mut args = call.args.iter();
+        match method.as_str() {
+            // A single positional argument has a fixed shape at the call site: a non-literal one is
+            // a *value* (a path, a session id), never a hidden flag, so it is not "forwarded argv".
+            "arg" => {
+                if let Some(literal) = args.next().and_then(literal_str) {
+                    self.facts[index].literal_argv.push(literal);
+                }
+            }
+            // Plural: an array literal is still auditable element by element; anything else is an
+            // opaque, unbounded argv this spawn cannot vouch for.
+            "args" => match args.next() {
+                Some(expr) => match array_elements(expr) {
+                    Some(elements) => {
+                        for literal in elements.into_iter().filter_map(literal_str) {
+                            self.facts[index].literal_argv.push(literal);
+                        }
+                    }
+                    None => self.facts[index].forwards_argv = true,
+                },
+                None => self.facts[index].forwards_argv = true,
+            },
+            "env" | "env_remove" => {
+                if let Some(key) = args.next().and_then(literal_str) {
+                    if SANDBOX_POSTURE_ENV.contains(&key.as_str()) {
+                        self.facts[index].declares_posture = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a method-call chain from the outside in, folding every call into the facts of whichever
+    /// spawn the chain's root names. Returns that spawn, so a `let` can bind its ident to it.
+    fn chain(&mut self, expr: &syn::Expr) -> Option<usize> {
+        let mut calls = Vec::new();
+        let mut cursor = expr;
+        let root = loop {
+            match cursor {
+                syn::Expr::MethodCall(call) => {
+                    calls.push(call);
+                    cursor = &call.receiver;
+                }
+                syn::Expr::Reference(reference) => cursor = &reference.expr,
+                syn::Expr::Paren(paren) => cursor = &paren.expr,
+                syn::Expr::Group(group) => cursor = &group.expr,
+                syn::Expr::Try(inner) => cursor = &inner.expr,
+                other => break other,
+            }
+        };
+        let index = self.root_record(root)?;
+        for call in &calls {
+            self.absorb(index, call);
+        }
+        // The chain itself is consumed here, so recurse only into the arguments — a nested spawn
+        // inside one of them must still be seen.
+        for call in calls {
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+        }
+        if let syn::Expr::Call(call) = root {
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+        }
+        Some(index)
+    }
+}
+
+impl<'ast> Visit<'ast> for SandboxSpawnVisitor<'_> {
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        let Some(init) = &local.init else {
+            return;
+        };
+        let ident = simple_binding_ident(&local.pat);
+        if let Some(ident) = &ident {
+            if self.is_flux_bin(&init.expr) {
+                self.flux_bin_idents.insert(ident.clone());
+                return;
+            }
+        }
+        let record = self.chain(&init.expr);
+        if record.is_none() {
+            self.visit_expr(&init.expr);
+        }
+        // Bind unconditionally when the root resolved: over-binding a terminal call's result
+        // (`let out = cmd.output()`) is harmless — nothing later calls a builder method on it.
+        if let (Some(ident), Some(index)) = (ident, record) {
+            self.command_bindings.insert(ident, index);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if matches!(expr, syn::Expr::MethodCall(_) | syn::Expr::Call(_))
+            && self.chain(expr).is_some()
+        {
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+}
+
+/// Resolve every spawn of the `flux` binary in one **test** source that inherits its sandbox posture
+/// from the host instead of declaring it. Test code is the point: `cfg(test)` items are deliberately
+/// *not* skipped here, unlike the production scanners above.
+pub fn ambient_sandbox_spawns(src: &str) -> syn::Result<Vec<AmbientSandboxSpawn>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = ProcessAliases::default();
+    AliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_type_aliases();
+    let mut visitor = SandboxSpawnVisitor {
+        aliases: &aliases,
+        flux_bin_idents: BTreeSet::new(),
+        command_bindings: HashMap::new(),
+        functions: Vec::new(),
+        facts: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor
+        .facts
+        .iter()
+        .filter_map(|facts| {
+            facts.finding().map(|kind| AmbientSandboxSpawn {
+                line: facts.line,
+                function: facts.function.clone(),
+                kind,
+            })
+        })
+        .collect())
+}
+
+/// One `match` arm of `flux-cli`'s `unattended_sandbox_surface`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnattendedArm {
+    /// The `Commands::<Variant>` this arm matches, lowercased into its CLI subcommand spelling.
+    pub subcommand: String,
+    /// Whether the arm is selected by a flag (`yes`, `serve`, `"--run"`) rather than by the
+    /// subcommand alone. A flagless arm is invisible to argv-flag matching.
+    pub keyed_on_flag: bool,
+}
+
+/// Collect the surfaces `flux-cli`'s `unattended_sandbox_surface` classifies as unattended, so a
+/// newly-added *flagless* one (the `review` shape) cannot silently escape
+/// [`FLAGLESS_UNATTENDED_SUBCOMMANDS`] — the argv-flag list needs no such help.
+pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
+    #[derive(Default)]
+    struct FlagWords {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for FlagWords {
+        fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+            let ident = ident.to_string();
+            if ident == "yes" || ident == "serve" {
+                self.found = true;
+            }
+        }
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            // Any dash-prefixed literal in the pattern or guard means the arm is selected by a flag
+            // that argv matching can see (`"--run"`, `"--yes"`), not by the subcommand alone.
+            if literal.value().starts_with('-') {
+                self.found = true;
+            }
+        }
+    }
+
+    struct Arms {
+        arms: Vec<UnattendedArm>,
+    }
+    impl<'ast> Visit<'ast> for Arms {
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            // Only arms that actually classify something as unattended matter; `_ => None` does not.
+            let mut classifies = Classifies::default();
+            classifies.visit_expr(&arm.body);
+            if !classifies.found {
+                return;
+            }
+            // syn models `pat if guard` as `Pat::Guard`, so one walk of the arm's pattern covers the
+            // guard expression too.
+            let mut variant = Variant::default();
+            variant.visit_pat(&arm.pat);
+            let mut flags = FlagWords::default();
+            flags.visit_pat(&arm.pat);
+            if let Some(subcommand) = variant.name {
+                self.arms.push(UnattendedArm {
+                    subcommand: subcommand.to_lowercase(),
+                    keyed_on_flag: flags.found,
+                });
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Classifies {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Classifies {
+        fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+            if ident == "Some" {
+                self.found = true;
+            }
+        }
+    }
+
+    /// The `Commands::<Variant>` name inside a pattern.
+    #[derive(Default)]
+    struct Variant {
+        name: Option<String>,
+    }
+    impl Variant {
+        fn take(&mut self, path: &syn::Path) {
+            let segments: Vec<String> = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            if let [enum_name, variant] = segments.as_slice() {
+                if enum_name == "Commands" && self.name.is_none() {
+                    self.name = Some(variant.clone());
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Variant {
+        fn visit_pat_struct(&mut self, pat: &'ast syn::PatStruct) {
+            self.take(&pat.path);
+            syn::visit::visit_pat_struct(self, pat);
+        }
+        fn visit_pat_tuple_struct(&mut self, pat: &'ast syn::PatTupleStruct) {
+            self.take(&pat.path);
+            syn::visit::visit_pat_tuple_struct(self, pat);
+        }
+        // A bare path pattern (`Commands::Review`) is modelled as an expression path in syn.
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            self.take(&path.path);
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+
+    let file = syn::parse_file(src)?;
+    let mut arms = Arms { arms: Vec::new() };
+    for item in &file.items {
+        if let syn::Item::Fn(function) = item {
+            if function.sig.ident == "unattended_sandbox_surface" {
+                arms.visit_block(&function.block);
+            }
+        }
+    }
+    arms.arms.sort();
+    arms.arms.dedup();
+    Ok(arms.arms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,19 +1743,25 @@ mod tests {
     ];
     const EXTERNAL_CFG_TEST_MODULES: &[&str] = &["crates/flux-flow/src/voice/tests.rs"];
 
-    fn direct_io_allow_reason(source: &str, line: usize) -> Option<String> {
+    /// The non-empty reason of a `// <marker> <reason>` waiver in the comment block immediately above
+    /// `line`. A bare marker with no reason is not a waiver.
+    fn allow_reason(source: &str, line: usize, marker: &str) -> Option<String> {
         let lines = source.lines().collect::<Vec<_>>();
         let mut cursor = line.saturating_sub(1);
         while cursor > 0 {
             cursor -= 1;
             let trimmed = lines.get(cursor)?.trim();
             let comment = trimmed.strip_prefix("//")?.trim();
-            if let Some(reason) = comment.strip_prefix("flux-allow-direct-io:") {
+            if let Some(reason) = comment.strip_prefix(marker) {
                 let reason = reason.trim();
                 return (!reason.is_empty()).then(|| reason.to_string());
             }
         }
         None
+    }
+
+    fn direct_io_allow_reason(source: &str, line: usize) -> Option<String> {
+        allow_reason(source, line, "flux-allow-direct-io:")
     }
 
     /// Collect production Rust sources from both Cargo workspaces. Keeping this traversal shared
@@ -2298,6 +2766,232 @@ fn fixture() { std::fs::read_to_string(".flux/config.toml"); }
                 out.push(path);
             }
         }
+    }
+
+    /// Collect the integration-test sources of both Cargo workspaces. `CARGO_BIN_EXE_*` exists only
+    /// in test targets, so this is the whole surface where a `flux` spawn can appear.
+    fn workspace_test_files(repo_root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for workspace_dir in [repo_root.join("crates"), repo_root.join("plugins")] {
+            let Ok(entries) = std::fs::read_dir(workspace_dir) else {
+                continue;
+            };
+            for entry in entries {
+                let dir = entry.unwrap().path();
+                if dir.is_dir() {
+                    collect_rs(&dir.join("tests"), &mut files);
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn ambient_sandbox_scanner_flags_unattended_and_forwarded_spawns() {
+        // An auto-approved spawn with no posture: the exact 0.38.0 regression class.
+        let bare = r#"
+use std::process::Command;
+#[test]
+fn t() {
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["run", "--yes", "-m", "mock", "hi"])
+        .output()
+        .unwrap();
+}
+"#;
+        let hits = ambient_sandbox_spawns(bare).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].function, "t");
+        assert_eq!(
+            hits[0].kind,
+            AmbientSandboxKind::Unattended("--yes".to_string())
+        );
+
+        // The same spawn, posture declared — settled, whatever the host has installed.
+        let declared = bare.replace(
+            r#".args(["run", "--yes", "-m", "mock", "hi"])"#,
+            r#".args(["run", "--yes", "-m", "mock", "hi"]).env("FLUX_SANDBOX", "off")"#,
+        );
+        assert!(ambient_sandbox_spawns(&declared).unwrap().is_empty());
+
+        // Forcing backend discovery at a nonexistent path is equally a declaration: the spawn is
+        // hermetically no-backend and cannot read the host's posture (sandbox_posture.rs's shape).
+        let forced = bare.replace(
+            ".output()",
+            r#".env("FLUX_BWRAP_BIN", "/nonexistent/bwrap").output()"#,
+        );
+        assert!(ambient_sandbox_spawns(&forced).unwrap().is_empty());
+
+        // `--no-sandbox` states the posture in argv instead of the environment.
+        let flagged_off = bare.replace(r#""run", "--yes""#, r#""run", "--no-sandbox", "--yes""#);
+        assert!(ambient_sandbox_spawns(&flagged_off).unwrap().is_empty());
+
+        // Chain split across statements, through a `let` binding, with the posture declared last.
+        let split = r#"
+use std::process::Command;
+fn helper(args: &[&str]) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flux"));
+    cmd.arg("app").args(args);
+    cmd.env("FLUX_SANDBOXED", "1");
+    let _ = cmd.output();
+}
+"#;
+        assert!(ambient_sandbox_spawns(split).unwrap().is_empty());
+
+        // The same helper without a declaration: bulk-forwarded argv can become unattended at any
+        // call site, which is precisely why the spawn — not the caller — must state its posture.
+        let forwarding = split.replace("\n    cmd.env(\"FLUX_SANDBOXED\", \"1\");", "");
+        let hits = ambient_sandbox_spawns(&forwarding).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, AmbientSandboxKind::ForwardedArgv);
+
+        // A flagless unattended surface (`flux review`) carries no `--yes` to key on.
+        let review = bare.replace(
+            r#""run", "--yes", "-m", "mock", "hi""#,
+            r#""review", "-m", "mock""#,
+        );
+        let hits = ambient_sandbox_spawns(&review).unwrap();
+        assert_eq!(
+            hits[0].kind,
+            AmbientSandboxKind::Unattended("review".to_string()),
+            "{hits:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_sandbox_scanner_ignores_attended_spawns_and_other_binaries() {
+        // A fixed-shape array with a non-literal *value* is auditable at the site; an interactive
+        // `flux run` with no `--yes` is not an unattended surface and owes nothing.
+        let attended = r#"
+use std::process::Command;
+fn t(sid: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["fork", sid, "--at", "0", "-m", "mock"])
+        .arg("--store")
+        .arg(sid)
+        .output()
+        .unwrap();
+}
+"#;
+        assert!(ambient_sandbox_spawns(attended).unwrap().is_empty());
+
+        // A different test binary is a different program: `CARGO_BIN_EXE_flux` is matched exactly,
+        // never as a prefix of `CARGO_BIN_EXE_flux_sdk_plugin_fixture`.
+        let other_binary = r#"
+use std::process::Command;
+fn t(args: &[&str]) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_flux_sdk_plugin_fixture"))
+        .args(args)
+        .arg("--serve")
+        .output();
+}
+"#;
+        assert!(ambient_sandbox_spawns(other_binary).unwrap().is_empty());
+
+        // The binary path reached through a local binding still resolves.
+        let indirect = r#"
+use std::process::Command;
+fn t() {
+    let bin = env!("CARGO_BIN_EXE_flux");
+    let _ = Command::new(bin).arg("--serve=127.0.0.1:1").output();
+}
+"#;
+        let hits = ambient_sandbox_spawns(indirect).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+    }
+
+    /// The guard itself (C-266): a test that spawns `flux` into an auto-approving or serving surface
+    /// must say which sandbox posture it needs. Inheriting the host's is what made three rounds of
+    /// the same bug pass every developer's gate and red only CI, where no runner has `bwrap`.
+    ///
+    /// What this covers: `std`/`tokio` Command builders spawning `CARGO_BIN_EXE_flux` in any test
+    /// target of either workspace, whose literal argv names an unattended surface, or which forwards
+    /// argv in bulk so a caller could make it one.
+    ///
+    /// What it does NOT cover, deliberately: shell scripts (`scripts/smoke-live.sh` — covered
+    /// behaviorally instead, by the two sandbox lanes in `.github/workflows/ci.yml`), a spawn whose
+    /// program is computed at runtime rather than from `CARGO_BIN_EXE_flux`, argv assembled through a
+    /// helper that returns a `Vec` built elsewhere, and posture injected via `.envs(map)`.
+    #[test]
+    fn every_unattended_test_spawn_declares_its_sandbox_posture() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let mut violations = Vec::new();
+        let mut scanned = 0usize;
+        for file in workspace_test_files(repo_root) {
+            let relative_path = file
+                .strip_prefix(repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = std::fs::read_to_string(&file).unwrap();
+            scanned += 1;
+            for hit in ambient_sandbox_spawns(&source).unwrap_or_else(|error| {
+                panic!("parse {relative_path} for the sandbox-posture gate: {error}")
+            }) {
+                if allow_reason(&source, hit.line, "flux-allow-ambient-sandbox:").is_some() {
+                    continue;
+                }
+                let why = match &hit.kind {
+                    AmbientSandboxKind::Unattended(token) => {
+                        format!("argv names an unattended surface ({token})")
+                    }
+                    AmbientSandboxKind::ForwardedArgv => {
+                        "argv is forwarded in bulk, so a call site can make it unattended"
+                            .to_string()
+                    }
+                };
+                violations.push(format!(
+                    "{relative_path}:{} in {}: {why}, but the spawn declares no sandbox posture",
+                    hit.line, hit.function
+                ));
+            }
+        }
+
+        assert!(
+            scanned > 20,
+            "test-source walk scanned only {scanned} files"
+        );
+        assert!(
+            violations.is_empty(),
+            "test spawns inherit the host's sandbox posture — C-262 fails these closed on a runner \
+             without a backend while they pass on every developer machine. Declare the posture in \
+             the spawn ({}), pass --no-sandbox, or waive it with a reasoned \
+             `// flux-allow-ambient-sandbox: …` comment:\n  {}",
+            SANDBOX_POSTURE_ENV.join(" / "),
+            violations.join("\n  ")
+        );
+    }
+
+    /// The trigger table above is only as good as its agreement with the CLI. A new unattended
+    /// surface keyed on a flag is already caught by argv matching; a new *flagless* one (the `review`
+    /// shape) is invisible, so it must be taught to the scanner here.
+    #[test]
+    fn flagless_unattended_surfaces_match_the_cli_classifier() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dispatch = crates_dir.join("flux-cli/src/dispatch.rs");
+        let source = std::fs::read_to_string(&dispatch).expect("read flux-cli dispatch");
+        let arms = unattended_surface_arms(&source).expect("parse flux-cli dispatch");
+
+        assert!(
+            arms.len() > 4,
+            "did not find `unattended_sandbox_surface`'s arms — has it moved or been renamed? {arms:?}"
+        );
+        let flagless: BTreeSet<String> = arms
+            .iter()
+            .filter(|arm| !arm.keyed_on_flag)
+            .map(|arm| arm.subcommand.clone())
+            .collect();
+        let declared: BTreeSet<String> = FLAGLESS_UNATTENDED_SUBCOMMANDS
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            flagless, declared,
+            "FLAGLESS_UNATTENDED_SUBCOMMANDS has drifted from `unattended_sandbox_surface`: a \
+             subcommand that is unattended with no flag at all cannot be recognized in a test's \
+             argv unless it is listed there"
+        );
     }
 
     #[test]

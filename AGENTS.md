@@ -53,12 +53,25 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings   # must be clean
 cargo fmt --all                                          # then commit the result
-cargo test -p flux-codegate                              # architecture layering lint
+cargo test -p flux-codegate                              # architecture + test-posture lints
 ```
 
 CI enforces all of these. Docs-only changes may use a narrower check — say explicitly in the final
 report what was and was not run. `cargo fmt --check` must also be clean in the **nested `plugins/`
 workspace** if you touched it.
+
+**Your machine is not a CI runner in one specific way: it has `bwrap`.** C-262 fails auto-approved
+and serving surfaces closed without an OS sandbox backend, so a test that spawns one and never
+declares its posture passes here and reds CI (three times over, during the 0.38.0 cut). If you added
+or changed such a spawn, run the posture CI runs in:
+
+```bash
+FLUX_BWRAP_BIN=/nonexistent/bwrap cargo test --workspace   # the no-backend side, as CI sees it
+FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend  # the with-backend side
+```
+
+`cargo test -p flux-codegate` catches the common case statically; `docs/stories/C-266-*.md` records
+exactly what that lint does and does not cover.
 
 ---
 
@@ -106,7 +119,7 @@ network call, or a plugin capability.
 
 ## Where to make a change
 
-- **Add a built-in tool:** implement `flux_runtime::Tool` (spec + `permission_subjects` + `intents` + `execute`) in `flux-tools`, IO via `ctx.system`, register in `register_builtins`. Declare accurate `effects`. Tools with a `group` are surfaced only when that group's signal is detected — add the op to `groups.rs` and to the `builtins_register` test's expected names. Mirror the catalog in **both** `crates/flux-flow/docs/ops-reference.md` **and** `website/docs/language/ops.md` — a registered *public* op missing from either reds the gate via `operations_reference_covers_the_registered_public_catalog` (`crates/flux-cli/tests/website_contract.rs:330`). Verify the finished `ToolSpec` with `flux_spec::metadata_violations` rather than by eye; since C-210 that check reads `semantic_effects` too, so declare those honestly.
+- **Add a built-in tool:** implement `flux_runtime::Tool` (spec + `permission_subjects` + `intents` + `execute`) in `flux-tools`, IO via `ctx.system`, register in `register_builtins`. Declare accurate `effects`. Tools with a `group` are surfaced only when that group's signal is detected — add the op to `groups.rs` and to the `builtins_register` test's expected names. Mirror the catalog in **both** `crates/flux-flow/docs/ops-reference.md` **and** `website/docs/language/ops.md` — a registered *public* op missing from either reds the gate, but via a **different** test per file: the website file by `operations_reference_covers_the_registered_public_catalog` (`crates/flux-cli/tests/website_contract.rs:330`), the in-repo file by `the_in_repo_reference_covers_the_whole_production_catalog` (`crates/flux-cli/src/catalog_coherence.rs`, C-248 — it wants a table **row**, not a prose mention, and any row in a table with a Risk column is additionally held to the declared tier). Verify the finished `ToolSpec` with `flux_spec::metadata_violations` rather than by eye; since C-210 that check reads `semantic_effects` too, so declare those honestly.
 - **The generic `bash` op is opt-in** (off-by-default `shell` group; `enable_shell = true`, `FLUX_ENABLE_BASH=1`, or `/shell`). Prefer a dedicated, accurately-gated op over widening reliance on `bash`.
 - **Add a provider:** a provider = `WireCodec` × `Credential` composed by `NativeProvider`. Add the codec/credential in the relevant `flux-providers` module — Messages-protocol providers reuse `crate::messages` — and wire routing in `flux-cli`'s `build_provider`.
 - **Define an agent:** an `AgentSpec` (model, persona, skills, tools, permissions) assembled onto a `FlowEngine`. The markdown `Role` (`.flux/agents/<role>.md`) is the file-defined form.

@@ -1,0 +1,187 @@
+//! C-266: the **with-a-backend** half of C-262's fail-closed switch. Its sibling
+//! `sandbox_posture.rs` owns the without-a-backend half and is hermetic about it — every spawn there
+//! forces `FLUX_BWRAP_BIN`/`FLUX_SANDBOX_EXEC_BIN` at nonexistent paths, so it proves the same thing
+//! on a host that has `bwrap` and on one that does not. Nothing, therefore, was proving the other
+//! side: that flux still *works* when a backend exists, and that the confinement it then claims is
+//! real. Until this file, that path ran on no CI runner at all.
+//!
+//! Both tests are gated on `FLUX_TEST_SANDBOX_BACKEND=1` — the caller's promise that a usable backend
+//! is installed — for the same reason the Postgres suites are gated on `TEST_POSTGRES_URL`: the
+//! posture a test needs must be *declared*, never inferred from whatever the host happens to have.
+//! Unset, they skip. Set, they are unforgiving: [`a_promised_backend_is_real_and_functional`] fails
+//! the run when the promise is empty, because a lane that installs `bubblewrap` onto a kernel that
+//! refuses unprivileged user namespaces silently degrades into a second copy of the no-backend lane —
+//! green, and proving nothing. That specific false assurance is what this story exists to remove.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// A temp dir that removes itself on drop — so a failing assertion (a panic) can't leak it.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "flux-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        TempDir(p)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Whether this run was promised a usable OS sandbox backend. Printed rather than silent, so a
+/// skipped posture is visible in `cargo test -- --nocapture` and in the CI log.
+fn backend_promised(test: &str) -> bool {
+    if std::env::var("FLUX_TEST_SANDBOX_BACKEND").as_deref() == Ok("1") {
+        return true;
+    }
+    println!("skipping {test}: set FLUX_TEST_SANDBOX_BACKEND=1 on a host with a working backend");
+    false
+}
+
+/// The captured streams of one `flux` invocation.
+struct Run {
+    stdout: String,
+    stderr: String,
+    success: bool,
+}
+
+/// Run `flux <args>` in an isolated HOME + CWD, with backend discovery left ALONE — this suite is
+/// about the real backend, so it must not force the discovery vars the way `sandbox_posture.rs` does.
+fn run_flux(tag: &str, extra: &[(&str, &str)], args: &[&str]) -> Run {
+    let tmp = TempDir::new(tag);
+    let work = tmp.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // flux-allow-ambient-sandbox: this suite's whole subject is the posture the host resolves, and
+    // it runs only when FLUX_TEST_SANDBOX_BACKEND=1 promised a real backend — the one place where
+    // reading the host is the point rather than the bug. The per-test posture arrives in `extra`.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flux"));
+    cmd.args(args)
+        .current_dir(work)
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .env_remove("FLUX_SANDBOXED")
+        .stdin(Stdio::null());
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn flux");
+    Run {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        success: out.status.success(),
+    }
+}
+
+/// The lane's premise, asserted instead of assumed. `doctor` deliberately probes with `on` regardless
+/// of the configured posture, so its `sandbox backend` check reports what is ACTUALLY available:
+/// `PASS` only when discovery found the wrapper *and* the functional preflight probe succeeded.
+/// `WARN` is the shape of the failure this guards against — bwrap installed, namespaces refused.
+#[test]
+fn a_promised_backend_is_real_and_functional() {
+    if !backend_promised("a_promised_backend_is_real_and_functional") {
+        return;
+    }
+    let run = run_flux("c266-doctor", &[], &["doctor", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "`doctor --json` stdout must be one JSON document ({e}).\nstdout:\n{}\nstderr:\n{}",
+            run.stdout, run.stderr
+        )
+    });
+    let check = report["checks"]
+        .as_array()
+        .expect("doctor checks array")
+        .iter()
+        .find(|check| check["name"] == "sandbox backend")
+        .expect("doctor reports a `sandbox backend` check")
+        .clone();
+    assert_eq!(
+        check["status"], "PASS",
+        "FLUX_TEST_SANDBOX_BACKEND=1 promised a usable backend and this host has none, so every \
+         confinement assertion in this lane would pass vacuously. Install `bubblewrap` (Linux) or \
+         the Xcode command line tools (macOS), and on Ubuntu 23.10+ check that unprivileged user \
+         namespaces are not refused — doctor says: {check}"
+    );
+}
+
+/// The other side of the switch, behaviorally: an auto-approved turn under `require` starts (it does
+/// not fail closed, because a backend exists) and its child process really is inside the sandbox.
+///
+/// The confinement proof is the child's own pid. The bubblewrap argv includes `--unshare-pid` with a
+/// fresh `/proc`, so a confined child sees a single-digit pid; an unconfined one sees a real OS pid.
+/// Keying on that rather than on "the command succeeded" is deliberate: success alone is exactly what
+/// a silently-degraded lane also reports.
+#[test]
+fn an_auto_approved_turn_runs_its_children_inside_the_sandbox() {
+    if !backend_promised("an_auto_approved_turn_runs_its_children_inside_the_sandbox") {
+        return;
+    }
+    let run = run_flux(
+        "c266-confined-spawn",
+        &[
+            ("FLUX_SANDBOX", "require"),
+            // `bash` is opt-in (off-by-default `shell` group), so it must be enabled explicitly.
+            ("FLUX_ENABLE_BASH", "1"),
+            ("FLUX_MOCK_BASH", "echo pid=$$"),
+        ],
+        &[
+            "run",
+            "--stream-json",
+            "--yes",
+            "-m",
+            "mock",
+            "run a command",
+        ],
+    );
+
+    assert!(
+        run.success,
+        "`require` + a real backend must START, not fail closed.\nstderr:\n{}",
+        run.stderr
+    );
+    let pid_line = run
+        .stdout
+        .lines()
+        .find(|line| line.contains(r#""name":"bash""#) && line.contains(r#""is_error":false"#))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a bash tool_result proving a child process actually ran.\nstdout:\n{}\nstderr:\n{}",
+                run.stdout, run.stderr
+            )
+        });
+    let pid: u32 = pid_line
+        .split("pid=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("no child pid in the tool_result: {pid_line}"));
+    assert!(
+        pid < 100,
+        "the child reported pid {pid}: it ran OUTSIDE the sandbox's pid namespace, so an \
+         auto-approved turn was not actually confined even though a backend was available.\n\
+         stdout:\n{}",
+        run.stdout
+    );
+    // `require` is satisfied, so there is nothing unconfined to disclose.
+    assert!(
+        !run.stderr.contains("UNCONFINED"),
+        "a confined run must not disclose an unconfined posture.\nstderr:\n{}",
+        run.stderr
+    );
+}
