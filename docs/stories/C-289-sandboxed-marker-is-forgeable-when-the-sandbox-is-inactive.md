@@ -2,7 +2,7 @@
 id: C-289
 title: "`FLUX_SANDBOXED` is forgeable by any call site whenever the sandbox is inactive — the project's default posture"
 pillar: Core
-status: in-progress
+status: done
 priority: 3
 epic: security-assurance
 design: docs/designs/security-assurance.md
