@@ -33,7 +33,6 @@ const sidebars = {
         'agent/a2a',
         'agent/a2a-conformance',
         'agent/programs',
-        'agent/slack-channel',
         'agent/datasources',
         'agent/fleet',
         'agent/endpoints',
@@ -44,6 +43,15 @@ const sidebars = {
         'agent/time-machine',
         'agent/cost',
         'agent/realtime',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Channels',
+      items: [
+        'channels/overview',
+        'channels/inventory',
+        'agent/slack-channel',
       ],
     },
     {
