@@ -9,6 +9,11 @@
 //!   mutating operations gated on concrete `<domain>/item/<id>` subjects and a closed item state
 //!   machine.
 //!
+//! - [`harness`] — where every local coding harness (`flux | codex | claude-code | opencode`) keeps
+//!   its state, and how to walk it read-only under a bounded scan budget. Acquisition only: it
+//!   carries no opinion about what the records mean, so `flux usage`'s token-shaped projection and
+//!   the message-shaped history datasource sit on the same discovery.
+//!
 //! Web access (`http.request`, `web.fetch`, `browser.*`) moved to the native `flux-web` crate
 //! (web-capabilities epic, D-120); the former `browser` module retired with it.
 //!
@@ -17,6 +22,7 @@
 
 pub mod datasource;
 pub mod endpoint;
+pub mod harness;
 
 pub use datasource::{
     chunk_text, datasource_tools, freshness, ingest_markdown, ingest_openapi, ingest_text,

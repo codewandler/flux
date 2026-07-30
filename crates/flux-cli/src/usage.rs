@@ -3,25 +3,28 @@
 //! flux-native data already lives in `flux-events`; other agent harnesses keep local state in
 //! JSONL/SQLite shapes. The important boundary in this module is: adapters emit normalized usage
 //! records, and every table/metric/JSON view is derived from that one intermediate model.
+//!
+//! *Where* each harness keeps that state, and how to walk it under a scan budget, is not this
+//! module's business — it is `flux_capabilities::harness`, shared with the message-shaped history
+//! datasource (C-213). What stays here is the token-shaped projection: this command's answer to its
+//! own question.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Days, Duration, Local, NaiveDate, TimeZone};
 use clap::{Args, ValueEnum};
+use flux_capabilities::harness::{
+    self, HarnessEnv, HarnessKind, HarnessLocation, JsonlLine, ScanBudget,
+};
 use flux_core::{CostSource, PricingTable, Usage};
 use flux_events::{EventKind, EventStore, StoredEvent};
-use rusqlite::OpenFlags;
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::style;
-
-const MAX_JSONL_FILES: usize = 20_000;
-const MAX_JSONL_FILE_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Flags for `flux usage`.
 #[derive(Args, Clone, Debug, Default)]
@@ -74,34 +77,6 @@ pub enum ProgressMode {
     Always,
     /// Never show progress.
     Never,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum HarnessKind {
-    Flux,
-    Codex,
-    Claude,
-    Opencode,
-}
-
-impl HarnessKind {
-    fn id(self) -> &'static str {
-        match self {
-            HarnessKind::Flux => "flux",
-            HarnessKind::Codex => "codex",
-            HarnessKind::Claude => "claude-code",
-            HarnessKind::Opencode => "opencode",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            HarnessKind::Flux => "flux",
-            HarnessKind::Codex => "Codex",
-            HarnessKind::Claude => "Claude Code",
-            HarnessKind::Opencode => "opencode",
-        }
-    }
 }
 
 impl From<UsageHarnessFilter> for HarnessKind {
@@ -602,9 +577,12 @@ pub fn run_usage(args: UsageArgs, pricing: &PricingTable) -> Result<()> {
     let requested = requested_harnesses(&args);
     let explicit = args.no_external || !args.harness.is_empty();
     let mut progress = ProgressRenderer::new(args.progress, args.json);
+    // Snapshot the discovery environment once, so every harness in one run is resolved against the
+    // same view of `HOME` and the overrides.
+    let env = HarnessEnv::from_process();
     let mut reports = Vec::new();
     for kind in requested {
-        let dataset = collect_harness(kind, pricing, &mut progress);
+        let dataset = collect_harness(kind, &env, pricing, &mut progress);
         let report = report_from_dataset(dataset, &filter);
         if report.has_rows() || report.note.is_some() || explicit {
             reports.push(report);
@@ -640,12 +618,7 @@ fn requested_harnesses(args: &UsageArgs) -> Vec<HarnessKind> {
         return vec![HarnessKind::Flux];
     }
     if args.harness.is_empty() {
-        return vec![
-            HarnessKind::Flux,
-            HarnessKind::Codex,
-            HarnessKind::Claude,
-            HarnessKind::Opencode,
-        ];
+        return HarnessKind::ALL.to_vec();
     }
     let mut out = Vec::new();
     for h in &args.harness {
@@ -659,24 +632,45 @@ fn requested_harnesses(args: &UsageArgs) -> Vec<HarnessKind> {
 
 fn collect_harness(
     kind: HarnessKind,
+    env: &HarnessEnv,
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> HarnessDataset {
     match kind {
-        HarnessKind::Flux => collect_flux(pricing, progress),
-        HarnessKind::Codex => collect_codex(pricing, progress),
-        HarnessKind::Claude => collect_claude(pricing, progress),
-        HarnessKind::Opencode => collect_opencode(pricing, progress),
+        HarnessKind::Flux => collect_flux(env, pricing, progress),
+        HarnessKind::Codex => collect_codex(env, pricing, progress),
+        HarnessKind::Claude => collect_claude(env, pricing, progress),
+        HarnessKind::Opencode => collect_opencode(env, pricing, progress),
     }
 }
 
-fn collect_flux(pricing: &PricingTable, progress: &mut ProgressRenderer) -> HarnessDataset {
-    let Some(path) = flux_events_path() else {
-        return HarnessDataset::warning(HarnessKind::Flux, None, "HOME is not set");
-    };
-    if !path.exists() {
-        return HarnessDataset::missing(HarnessKind::Flux, path);
+/// Discovery's outcome projected onto this command's two answers: a path to scan, or the dataset
+/// that explains why there is nothing to scan. The miss cases are typed values in the discovery
+/// layer; their wording is this command's.
+enum HarnessSource {
+    Scan(PathBuf),
+    Note(HarnessDataset),
+}
+
+fn harness_source(kind: HarnessKind, env: &HarnessEnv) -> HarnessSource {
+    match kind.locate(env) {
+        HarnessLocation::Found(path) => HarnessSource::Scan(path),
+        HarnessLocation::NotFound(path) => HarnessSource::Note(HarnessDataset::missing(kind, path)),
+        HarnessLocation::Unresolved => {
+            HarnessSource::Note(HarnessDataset::warning(kind, None, "HOME is not set"))
+        }
     }
+}
+
+fn collect_flux(
+    env: &HarnessEnv,
+    pricing: &PricingTable,
+    progress: &mut ProgressRenderer,
+) -> HarnessDataset {
+    let path = match harness_source(HarnessKind::Flux, env) {
+        HarnessSource::Scan(path) => path,
+        HarnessSource::Note(dataset) => return dataset,
+    };
     match EventStore::open(&path)
         .with_context(|| format!("open {}", path.display()))
         .and_then(|store| {
@@ -813,14 +807,15 @@ fn flux_records_from_events(
     records
 }
 
-fn collect_codex(pricing: &PricingTable, progress: &mut ProgressRenderer) -> HarnessDataset {
-    let Some(root) = harness_root("CODEX_HOME", ".codex") else {
-        return HarnessDataset::warning(HarnessKind::Codex, None, "HOME is not set");
+fn collect_codex(
+    env: &HarnessEnv,
+    pricing: &PricingTable,
+    progress: &mut ProgressRenderer,
+) -> HarnessDataset {
+    let sessions = match harness_source(HarnessKind::Codex, env) {
+        HarnessSource::Scan(path) => path,
+        HarnessSource::Note(dataset) => return dataset,
     };
-    let sessions = root.join("sessions");
-    if !sessions.exists() {
-        return HarnessDataset::missing(HarnessKind::Codex, sessions);
-    }
     match parse_codex_sessions(&sessions, pricing, progress) {
         Ok((records, session_records, scanned, skipped)) => external_dataset(
             HarnessKind::Codex,
@@ -834,14 +829,15 @@ fn collect_codex(pricing: &PricingTable, progress: &mut ProgressRenderer) -> Har
     }
 }
 
-fn collect_claude(pricing: &PricingTable, progress: &mut ProgressRenderer) -> HarnessDataset {
-    let Some(root) = env_path("CLAUDE_CONFIG_DIR").or_else(|| harness_root("", ".claude")) else {
-        return HarnessDataset::warning(HarnessKind::Claude, None, "HOME is not set");
+fn collect_claude(
+    env: &HarnessEnv,
+    pricing: &PricingTable,
+    progress: &mut ProgressRenderer,
+) -> HarnessDataset {
+    let projects = match harness_source(HarnessKind::Claude, env) {
+        HarnessSource::Scan(path) => path,
+        HarnessSource::Note(dataset) => return dataset,
     };
-    let projects = root.join("projects");
-    if !projects.exists() {
-        return HarnessDataset::missing(HarnessKind::Claude, projects);
-    }
     match parse_claude_projects(&projects, pricing, progress) {
         Ok((records, session_records, scanned, skipped)) => external_dataset(
             HarnessKind::Claude,
@@ -855,16 +851,15 @@ fn collect_claude(pricing: &PricingTable, progress: &mut ProgressRenderer) -> Ha
     }
 }
 
-fn collect_opencode(pricing: &PricingTable, progress: &mut ProgressRenderer) -> HarnessDataset {
-    let Some(root) = env_path("OPENCODE_DATA_DIR")
-        .or_else(|| home_dir().map(|h| h.join(".local").join("share").join("opencode")))
-    else {
-        return HarnessDataset::warning(HarnessKind::Opencode, None, "HOME is not set");
+fn collect_opencode(
+    env: &HarnessEnv,
+    pricing: &PricingTable,
+    progress: &mut ProgressRenderer,
+) -> HarnessDataset {
+    let db = match harness_source(HarnessKind::Opencode, env) {
+        HarnessSource::Scan(path) => path,
+        HarnessSource::Note(dataset) => return dataset,
     };
-    let db = root.join("opencode.db");
-    if !db.exists() {
-        return HarnessDataset::missing(HarnessKind::Opencode, db);
-    }
     match parse_opencode_db(&db, pricing, progress) {
         Ok((records, session_records, scanned, skipped)) => external_dataset(
             HarnessKind::Opencode,
@@ -905,33 +900,27 @@ fn parse_claude_projects(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let (files, mut skipped) = jsonl_files(projects)?;
+    let scan = jsonl_scan(projects)?;
+    let files = scan.files();
+    let mut skipped = scan.skipped();
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     let mut sessions = BTreeMap::<String, SessionBuild>::new();
 
     progress.begin(HarnessKind::Claude.label(), files.len());
     for (idx, file) in files.iter().enumerate() {
-        if too_large(file) {
-            skipped += 1;
-            progress.tick(HarnessKind::Claude.label(), idx + 1, files.len(), skipped);
-            continue;
-        }
-        // One unreadable file must not abort the scan: skip it like a bad line and keep the rest.
-        let Ok(open) = File::open(file) else {
+        // An over-budget or unreadable file must not abort the scan: skip it like a bad line and
+        // keep the rest.
+        let Ok(lines) = harness::open_jsonl(file, ScanBudget::default()) else {
             skipped += 1;
             progress.tick(HarnessKind::Claude.label(), idx + 1, files.len(), skipped);
             continue;
         };
-        let reader = BufReader::new(open);
         let fallback_session = file_stem(file);
-        for line in reader.lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
+        for line in lines {
+            let JsonlLine::Text(line) = line else {
+                skipped += 1;
+                continue;
             };
             if !line.contains("\"type\"") {
                 continue;
@@ -1019,24 +1008,21 @@ fn parse_codex_sessions(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let (files, mut skipped) = jsonl_files(sessions_root)?;
+    let scan = jsonl_scan(sessions_root)?;
+    let files = scan.files();
+    let mut skipped = scan.skipped();
     let mut records = Vec::new();
     let mut session_records = Vec::new();
 
     progress.begin(HarnessKind::Codex.label(), files.len());
     for (idx, file) in files.iter().enumerate() {
-        if too_large(file) {
-            skipped += 1;
-            progress.tick(HarnessKind::Codex.label(), idx + 1, files.len(), skipped);
-            continue;
-        }
-        // One unreadable file must not abort the scan: skip it like a bad line and keep the rest.
-        let Ok(open) = File::open(file) else {
+        // An over-budget or unreadable file must not abort the scan: skip it like a bad line and
+        // keep the rest.
+        let Ok(lines) = harness::open_jsonl(file, ScanBudget::default()) else {
             skipped += 1;
             progress.tick(HarnessKind::Codex.label(), idx + 1, files.len(), skipped);
             continue;
         };
-        let reader = BufReader::new(open);
         let mut session_id = file_stem(file);
         let mut build = SessionBuild::default();
         let mut model = "codex/gpt-5.5".to_string();
@@ -1044,13 +1030,10 @@ fn parse_codex_sessions(
         let mut fallback_records = Vec::<UsageRecord>::new();
         let mut seen_fallback = HashSet::new();
 
-        for line in reader.lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
+        for line in lines {
+            let JsonlLine::Text(line) = line else {
+                skipped += 1;
+                continue;
             };
             let interesting = line.contains("\"session_meta\"")
                 || line.contains("\"turn_context\"")
@@ -1179,12 +1162,12 @@ fn parse_opencode_db(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let conn = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", db.display()))?;
-    let has_session_table = sqlite_table_exists(&conn, "session")?;
-    let message_has_session_id = sqlite_column_exists(&conn, "message", "session_id")?;
-    let message_has_time_created = sqlite_column_exists(&conn, "message", "time_created")?;
-    let message_has_time_updated = sqlite_column_exists(&conn, "message", "time_updated")?;
+    let conn =
+        harness::open_sqlite_read_only(db).with_context(|| format!("open {}", db.display()))?;
+    let has_session_table = harness::sqlite_table_exists(&conn, "session")?;
+    let message_has_session_id = harness::sqlite_column_exists(&conn, "message", "session_id")?;
+    let message_has_time_created = harness::sqlite_column_exists(&conn, "message", "time_created")?;
+    let message_has_time_updated = harness::sqlite_column_exists(&conn, "message", "time_updated")?;
 
     let mut sessions = BTreeMap::<String, SessionBuild>::new();
     if has_session_table {
@@ -2302,79 +2285,11 @@ fn plural(n: u64) -> &'static str {
     }
 }
 
-/// Collect `.jsonl` files under `root`, returning the files plus the count of unreadable entries
-/// skipped along the way. Only an unreadable root propagates as an error (it becomes the harness
-/// note); below the root, unreadable subdirectories and entries get the same per-item tolerance as
-/// bad lines and oversized files, so one permission-denied path cannot blank out the whole scan.
-fn jsonl_files(root: &Path) -> Result<(Vec<PathBuf>, usize)> {
-    let read = fs::read_dir(root).with_context(|| format!("read {}", root.display()))?;
-    let mut out = Vec::new();
-    let mut skipped = 0usize;
-    collect_jsonl_files(read, &mut out, &mut skipped);
-    out.sort();
-    if out.len() > MAX_JSONL_FILES {
-        out.truncate(MAX_JSONL_FILES);
-    }
-    Ok((out, skipped))
-}
-
-fn collect_jsonl_files(read: fs::ReadDir, out: &mut Vec<PathBuf>, skipped: &mut usize) {
-    if out.len() >= MAX_JSONL_FILES {
-        return;
-    }
-    let mut entries = Vec::new();
-    for entry in read {
-        match entry {
-            Ok(entry) => entries.push(entry),
-            Err(_) => *skipped += 1,
-        }
-    }
-    entries.sort_by_key(|e| e.path());
-    for entry in entries {
-        let path = entry.path();
-        let Ok(ty) = entry.file_type() else {
-            *skipped += 1;
-            continue;
-        };
-        if ty.is_dir() {
-            match fs::read_dir(&path) {
-                Ok(read) => collect_jsonl_files(read, out, skipped),
-                Err(_) => *skipped += 1,
-            }
-        } else if ty.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            out.push(path);
-        }
-        if out.len() >= MAX_JSONL_FILES {
-            break;
-        }
-    }
-}
-
-fn too_large(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|m| m.len() > MAX_JSONL_FILE_BYTES)
-        .unwrap_or(false)
-}
-
-fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
-    let exists: i64 = conn.query_row(
-        "select count(*) from sqlite_master where type = 'table' and name = ?1",
-        [table],
-        |row| row.get(0),
-    )?;
-    Ok(exists > 0)
-}
-
-fn sqlite_column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+/// The `.jsonl` files under a harness root at the standard scan budget. Only an unreadable root
+/// propagates as an error — it becomes the harness note, with the same wording it always had.
+fn jsonl_scan(root: &Path) -> Result<harness::JsonlScan> {
+    harness::jsonl_files(root, ScanBudget::default())
+        .with_context(|| format!("read {}", root.display()))
 }
 
 fn sqlite_count_assistant_token_messages(conn: &rusqlite::Connection) -> Result<usize> {
@@ -2388,33 +2303,10 @@ fn sqlite_count_assistant_token_messages(conn: &rusqlite::Connection) -> Result<
     Ok(count.max(0) as usize)
 }
 
-fn flux_events_path() -> Option<PathBuf> {
-    env_path("FLUX_HOME")
-        .map(|p| p.join("events.db"))
-        .or_else(|| home_dir().map(|h| h.join(".flux").join("events.db")))
-}
-
-fn harness_root(env_key: &str, home_child: &str) -> Option<PathBuf> {
-    if !env_key.is_empty() {
-        if let Some(path) = env_path(env_key) {
-            return Some(path);
-        }
-    }
-    home_dir().map(|h| h.join(home_child))
-}
-
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File};
+
     use super::*;
 
     const DAY_MS: i64 = 86_400_000;
