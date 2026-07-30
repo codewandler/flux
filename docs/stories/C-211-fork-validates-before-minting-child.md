@@ -2,7 +2,7 @@
 id: C-211
 title: "Validate the parent history before minting the fork's child session, and test the CLI refusal"
 pillar: Core
-status: ready
+status: in-progress
 priority: 8
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
