@@ -919,9 +919,71 @@ fn mode_env_value(mode: SandboxMode) -> &'static str {
     }
 }
 
+/// The complete set of keys [`posture_env`] may emit — the sandbox posture rendered as an
+/// environment vocabulary.
+///
+/// Published because the **reverse** direction needs it (C-282). `System::build_command` applies a
+/// caller's `env` overrides *after* [`posture_env`], so any of these keys reaching that slot
+/// silently replaces the posture this process resolved — including with `off`, which on the reading
+/// side is `flux-cli`'s kill switch rather than "no opinion". A call site that assembles an env for
+/// a child out of material it does not itself control (a benchmark fixture, an embedder's startup
+/// env) must therefore be able to refuse a posture key, and it must refuse against *this* list
+/// rather than a hand-copied one that drifts as the posture grows.
+///
+/// `FLUX_SANDBOXED` is **absent by definition**, not by judgement: this list is exactly what
+/// [`posture_env`] emits, and the marker is not part of the posture. A call site filtering an
+/// untrusted env wants [`SANDBOX_ENV_KEYS`] instead, which is this list *plus* the marker — see
+/// there for why the marker needs filtering too.
+pub const POSTURE_ENV_KEYS: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOX_NET",
+    "FLUX_SANDBOX_WRITABLE",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+];
+
+/// Every sandbox-related key a call site must refuse when it assembles a child's environment out of
+/// material it does not itself control — [`POSTURE_ENV_KEYS`] **plus the `FLUX_SANDBOXED` marker**.
+///
+/// The marker is here because forging it is *worse* than pushing `FLUX_SANDBOX=off`, and because
+/// nothing else stops it. Be exact about the guarantee, since the obvious reading of
+/// `build_command` overstates it: [`sandbox_marker`] returns `Some` only for a
+/// [`Confinement::Sandboxed`] spawn over an **active** sandbox, and `build_command` writes the key
+/// only on `Some`. So the marker is unforgeable exactly when the spawn is *genuinely wrapped* —
+/// there the marker is written after the caller's overrides and wins. When the spawn is **not**
+/// wrapped — an `Exempt` spawn, or the inactive sandbox that is this project's default posture —
+/// nothing is written after the caller's env at all, and a caller-supplied `FLUX_SANDBOXED=1` goes
+/// through verbatim. A child `flux` reads that marker as "you are already inside a wrapper, do not
+/// nest" ([`Sandbox::resolve`]) and declines to confine itself.
+///
+/// That the unwrapped case is undefended is a **pre-existing property of `build_command`**, filed
+/// separately; this list does not fix it. What it does is stop the two call sites that build a
+/// child env from untrusted material (a benchmark fixture's `env`, an embedder's startup `env`)
+/// from being the vehicle for it.
+pub const SANDBOX_ENV_KEYS: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOX_NET",
+    "FLUX_SANDBOX_WRITABLE",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+    "FLUX_SANDBOXED",
+];
+
+/// Whether `key` names part of the sandbox posture — see [`POSTURE_ENV_KEYS`]. This is the
+/// *rendering* question ("could `posture_env` emit this?"). A call site deciding what to refuse in
+/// a child's env wants [`is_sandbox_env_key`], which also covers the confinement marker.
+pub fn is_posture_env_key(key: &str) -> bool {
+    POSTURE_ENV_KEYS.contains(&key)
+}
+
+/// Whether `key` is one a call site must refuse in a child's environment — see [`SANDBOX_ENV_KEYS`].
+pub fn is_sandbox_env_key(key: &str) -> bool {
+    SANDBOX_ENV_KEYS.contains(&key)
+}
+
 /// C-276: the posture a spawn hands to its child, alongside the `FLUX_SANDBOXED` marker
 /// [`sandbox_marker`] injects. Split out from `apply_safe_env` so the decision is unit-testable
-/// without a live backend.
+/// without a live backend. Every key it can emit is listed in [`POSTURE_ENV_KEYS`].
 ///
 /// The defect this closes was an **asymmetry**: `SAFE_ENV` carried `FLUX_SANDBOXED` — the marker
 /// whose whole job is to assert *"you are already confined"* — and none of the variables that
@@ -1919,6 +1981,82 @@ mod tests {
         assert!(
             !forwarded.iter().any(|(k, _)| *k == "FLUX_SANDBOX_NET"),
             "an open network must not be forwarded: {forwarded:?}"
+        );
+    }
+
+    /// C-282: [`POSTURE_ENV_KEYS`] is published so a downstream call site can refuse a posture key
+    /// in a caller override. That is only worth anything while it stays the **complete** set — a
+    /// key `posture_env` emits but the list omits is a hole that looks closed, and the filter built
+    /// on it would let exactly that key through into the slot that lands last and wins.
+    ///
+    /// Driven over every backend and settings shape rather than over one sandbox, so a new key
+    /// added on any branch of `posture_env` is caught here rather than downstream.
+    #[test]
+    fn every_key_posture_env_can_emit_is_named_in_the_published_list() {
+        let backends = [
+            Backend::Bubblewrap {
+                bwrap: PathBuf::from("/usr/bin/bwrap"),
+            },
+            Backend::Seatbelt {
+                sandbox_exec: PathBuf::from("/usr/bin/sandbox-exec"),
+            },
+            Backend::AlreadyConfined,
+            Backend::Unsupported {
+                reason: "none".to_string(),
+            },
+        ];
+        let mut seen: Vec<&'static str> = Vec::new();
+        for backend in backends {
+            for mode in [SandboxMode::Off, SandboxMode::On, SandboxMode::Require] {
+                for network in [true, false] {
+                    for extra in [&[][..], &["/output"][..]] {
+                        let sandbox = pinned(mode, network, extra, backend.clone());
+                        for (key, _) in posture_env(&sandbox) {
+                            assert!(
+                                is_posture_env_key(key),
+                                "`{key}` is forwarded by posture_env but missing from \
+                                 POSTURE_ENV_KEYS, so every downstream filter silently lets it \
+                                 through into the caller-override slot"
+                            );
+                            if !seen.contains(&key) {
+                                seen.push(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seen.sort_unstable();
+        let mut published = POSTURE_ENV_KEYS.to_vec();
+        published.sort_unstable();
+        assert_eq!(
+            seen, published,
+            "the list must also not be *wider* than reality: a key nothing emits is a filter that \
+             drops a variable for no reason"
+        );
+    }
+
+    /// The refusal list is the rendering list **plus the marker**, and that relationship is the
+    /// whole reason there are two constants rather than one. Held mechanically so neither can drift
+    /// from the other: widening `POSTURE_ENV_KEYS` would silently narrow nothing, but *forgetting*
+    /// to widen `SANDBOX_ENV_KEYS` alongside it would leave a newly-forwarded posture key that
+    /// every downstream filter lets through into the slot that lands last and wins.
+    #[test]
+    fn the_refusal_list_is_the_posture_list_plus_the_confinement_marker() {
+        let mut expected = POSTURE_ENV_KEYS.to_vec();
+        expected.push("FLUX_SANDBOXED");
+        expected.sort_unstable();
+        let mut published = SANDBOX_ENV_KEYS.to_vec();
+        published.sort_unstable();
+        assert_eq!(expected, published);
+
+        // And the two predicates differ on exactly that one key — the distinction a call site is
+        // choosing between when it picks one over the other.
+        assert!(is_sandbox_env_key("FLUX_SANDBOXED"));
+        assert!(
+            !is_posture_env_key("FLUX_SANDBOXED"),
+            "the marker is not a posture: `posture_env` never emits it, and a filter built on the \
+             rendering list must not pretend otherwise"
         );
     }
 
