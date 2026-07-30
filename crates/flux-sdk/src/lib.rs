@@ -308,6 +308,14 @@ pub mod subagents {
 /// taking a direct `flux-system` dependency.
 pub use flux_system::sandbox::{Sandbox, SandboxSettings};
 
+/// The runtime **resource ceilings** (C-290), re-exported so a consumer can bound a runtime it
+/// constructs — via [`ClientBuilder::resource_limits`] or
+/// [`FlowClientBuilder::resource_limits`](flow::FlowClientBuilder::resource_limits) — without
+/// taking a direct `flux-runtime` dependency. These bound what the runtime *uses* (simultaneously
+/// executing tool calls, retained result bytes), where `context_budget` / `max_iterations` /
+/// `max_tokens` bound what it *spends*.
+pub use flux_runtime::{ConcurrencyRefusal, ResourceLimits, DEFAULT_TOOL_CALL_QUEUE_TIMEOUT};
+
 /// The Rust **embedded DSL** for authoring flows — builder primitives that construct the Flux-Lang
 /// AST. Build a [`flux_lang::ast::DraftAst`] with `dsl::Flow`/`dsl::Block` (loops and control-flow are
 /// first-class), then drive it through [`FlowClient::analyze`] + [`FlowClient::execute`]. Re-exported
@@ -731,6 +739,35 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound what this runtime **uses**, not just what it spends (C-290).
+    ///
+    /// [`context_budget`](Self::context_budget), [`max_iterations`](Self::max_iterations),
+    /// [`max_tokens`](Self::max_tokens) and the adaptive policy's call budget all cap *spend*.
+    /// [`ResourceLimits`] caps *use*: how many tool calls may execute simultaneously
+    /// ([`with_max_concurrent_tool_calls`](ResourceLimits::with_max_concurrent_tool_calls)) and how
+    /// many bytes of tool results the runtime retains
+    /// ([`with_max_retained_result_bytes`](ResourceLimits::with_max_retained_result_bytes)).
+    ///
+    /// Enforced inside the safety envelope, so it binds for this in-process client — not only for
+    /// `flux-server`, whose `max_inflight_per_principal` was the only concurrency control before
+    /// this existed. Exceeding the concurrency ceiling is an actionable refusal, never a silent
+    /// truncation; the wait before that refusal is bounded by
+    /// [`with_tool_call_queue_timeout`](ResourceLimits::with_tool_call_queue_timeout), which
+    /// defaults to 30s and is *not* clamped, so a host that sets an absurd value gets an absurd
+    /// wait. Unbounded by default.
+    ///
+    /// **Scope:** these ceilings cover the ops *this client's own executors* run. They do **not**
+    /// descend into sub-agents — `task`-delegated work is spawned with a fresh, unbounded executor,
+    /// so it runs in the same process without counting against this budget (C-290, recorded as
+    /// owed).
+    ///
+    /// A file-configured host builds the same value from `[limits]` with
+    /// [`ResourceLimits::from_config`].
+    pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.envelope.resource_limits = limits;
+        self
+    }
+
     /// Opt into Claude-style progressive skill disclosure (D-188): every skill discovered under
     /// the workspace root (resolved at [`build`](Self::build)) gets its name+description surfaced
     /// to the model, except those declaring `disable-model-invocation: true`; the model can pull a
@@ -843,6 +880,7 @@ impl ClientBuilder {
         }
         spec.cwd = root;
         let authorization = self.envelope.authorization.clone();
+        let resource_limits = self.envelope.resource_limits.clone();
         let mut environment = ExecutionEnvironment::new(
             system.clone(),
             registry,
@@ -850,7 +888,9 @@ impl ClientBuilder {
             approver,
             authorization.clone(),
         )
-        .with_redactor(self.envelope.redactor.clone());
+        .with_redactor(self.envelope.redactor.clone())
+        // C-290: shared, not copied — every executor the engine derives counts against one budget.
+        .with_resource_limits(resource_limits.clone());
         // Thread the sub-agent spawner into the shared environment when sub-agents are attached, so
         // a `task` call delegates through the same guarded `System`; `None` (the common case) leaves
         // the context exactly as before. Mirrors `FlowClient::build_executor`.
@@ -888,6 +928,7 @@ impl ClientBuilder {
             default_session: std::sync::Mutex::new(None),
             turn_guard: Arc::new(tokio::sync::Mutex::new(())),
             auto_resurrect,
+            resource_limits,
         })
     }
 }
@@ -912,12 +953,20 @@ pub struct Client {
     turn_guard: Arc<tokio::sync::Mutex<()>>,
     // D-178: handed to every `Session` this client mints — see `ClientBuilder::auto_resurrect`.
     auto_resurrect: bool,
+    // C-290: the ceilings this client was built with. The same shared handle the engine's
+    // executors enforce, so reading it here reports what actually binds.
+    resource_limits: ResourceLimits,
 }
 
 impl Client {
     /// Start building a [`Client`].
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
+    }
+
+    /// The resource ceilings this client enforces — see [`ClientBuilder::resource_limits`].
+    pub fn resource_limits(&self) -> &ResourceLimits {
+        &self.resource_limits
     }
 
     /// The default session's id, minting it on first call. Returns owned since the id lives behind

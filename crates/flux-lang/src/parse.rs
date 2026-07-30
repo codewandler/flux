@@ -204,7 +204,7 @@ mod tests {
         assert!(text.contains("once \"charge\" -> receipt"), "{text}");
         assert!(text.contains("checkpoint \"phase-1\""), "{text}");
         assert!(
-            text.contains("await reply = \"user_input\" when decision_needed"),
+            text.contains("await reply = \"user_input\", when: decision_needed"),
             "{text}"
         );
         assert!(text.contains("await \"webhook\""), "{text}");
@@ -259,11 +259,11 @@ mod tests {
             "batch-2 nodes should render natively:\n{text}"
         );
         assert!(
-            text.contains("confirm \"delete prod?\" risk high"),
+            text.contains("confirm \"delete prod?\", risk: high"),
             "{text}"
         );
-        assert!(text.contains("throttle \"api\" 5 per 1s"), "{text}");
-        assert!(text.contains("debounce \"save\" 250ms"), "{text}");
+        assert!(text.contains("throttle \"api\", max: 5, per: 1s"), "{text}");
+        assert!(text.contains("debounce \"save\", wait: 250ms"), "{text}");
         assert!(
             text.contains("verify bash(\"echo hi\") contains \"hi\": \"must greet\""),
             "{text}"
@@ -521,7 +521,7 @@ mod tests {
         };
         let text = format(&full);
         assert!(
-            text.contains("retry 3 backoff exponential delay 500ms -> out"),
+            text.contains("retry 3, backoff: exponential, delay: 500ms -> out"),
             "{text}"
         );
         assert!(!text.contains("@json"), "native: {text}");
@@ -748,8 +748,10 @@ mod tests {
         let text = format(&ast);
         assert!(text.contains("fallback -> win"), "{text}");
         assert!(text.contains("branch"), "{text}");
-        assert!(text.contains("loop for 1s every 100ms -> ticks"), "{text}");
-        assert!(text.contains("until done"), "{text}");
+        assert!(
+            text.contains("loop for 1s, every: 100ms, until: done -> ticks"),
+            "{text}"
+        );
         assert!(text.contains("timeout 5s"), "{text}");
         assert!(text.contains("budget 10 -> used"), "{text}");
         assert!(!text.contains("@json"), "all native: {text}");
@@ -2227,7 +2229,7 @@ journey answer
         assert!(formatted.contains("ok = $score >= 0.8"));
         assert!(formatted.contains("unless $count == 0"));
         assert!(formatted.contains("assert $score > 0.5"));
-        assert!(formatted.contains("until $count == 0"));
+        assert!(formatted.contains(", until: $count == 0"));
 
         // Roundtrip test
         let reparsed = parse(&formatted).unwrap();

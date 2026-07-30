@@ -42,7 +42,7 @@ and [Safety & approvals](./safety.md).
 | `flux export <run> -o run.html` | render a recorded run — plan tree, per-op results/diffs, cost, timeline, nested sub-agents — as one self-contained, redacted static HTML file; the read-only, shareable sibling of `replay`/`fork`/`diff` |
 | `flux record <name> "…"` | record one live turn as a committed-safe scenario fixture — see the [Agent Lab](../sdk/agent-lab.md) |
 | `flux test [name]` | replay recorded fixtures offline as a test gate ($0, no key, no network; exit 1 on a regression) |
-| `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) |
+| `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) — the in-repo scoring engine; harness benchmarking is [flux-bench](https://github.com/codewandler/flux-bench) |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |

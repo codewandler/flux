@@ -15,6 +15,7 @@
 use crate::parser::parse_cst;
 use crate::syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::TextRange;
+use std::collections::BTreeSet;
 
 /// The visual class of one source token, named for what the token *is*, not for a colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,6 +101,9 @@ fn classify_ident(tok: &SyntaxToken) -> HighlightClass {
         K::FIELD_EXPR => C::Var,          // `$sym.path` — the path reads as part of the variable
         K::EFFECT_ANNOT => C::Annotation, // the tag in `@effect(tag)`
         K::THING_EXPR => thing_class(tok, &parent),
+        // `, risk: medium` — the label of a canonical header option reads as a keyword of the
+        // form, exactly like the space-keyword spelling it replaces (L-96).
+        K::HEADER_OPTION => option_class(tok, &parent),
         K::EACH_STMT if matches!(tok.text(), "in" | "flat") => C::Keyword,
         K::LOOP_STMT if matches!(tok.text(), "for" | "every") => C::Keyword,
         K::RETRY_STMT if tok.text() == "backoff" => C::Keyword,
@@ -130,6 +134,21 @@ fn name_class(name: &SyntaxNode) -> HighlightClass {
         K::ARG_LIST if followed_by_colon(name) => C::Punct,
         // Op names: `do <op>`, `op(args)`, `fmt(…)`/`parse(…)`, and bare references.
         _ => C::Op,
+    }
+}
+
+/// Inside a `HEADER_OPTION` the *label* is the form's keyword (`risk`, `backoff`, `until`); a bare
+/// ident in value position (`backoff: exponential`) is ordinary punctuation, as it was in the
+/// space-keyword spelling.
+fn option_class(tok: &SyntaxToken, parent: &SyntaxNode) -> HighlightClass {
+    let label = parent
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT);
+    if label.as_ref() == Some(tok) {
+        HighlightClass::Keyword
+    } else {
+        HighlightClass::Punct
     }
 }
 
@@ -207,6 +226,30 @@ fn keyword_leads(kind: SyntaxKind) -> bool {
             | K::PIPE_STMT
             | K::PEEK_EXPR
     )
+}
+
+/// Every canonical header-option label (L-96) that `src` contains, as **the highlighter itself**
+/// classifies it: a token inside a [`SyntaxKind::HEADER_OPTION`] that [`option_class`] calls a
+/// [`HighlightClass::Keyword`].
+///
+/// This is the option-label vocabulary the editor grammars owe a mirror, and it is derived by
+/// running the classifier rather than by restating its rule — a second copy of "the label is the
+/// first `IDENT`" would agree with itself, not with the highlighter. Consumer:
+/// `tests/named_option_headers.rs`, which asserts the website's Prism grammar lists every label
+/// the canonical corpus spells.
+pub fn header_option_labels(src: &str) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    for node in parse_cst(src).syntax().descendants() {
+        if node.kind() != SyntaxKind::HEADER_OPTION {
+            continue;
+        }
+        for tok in node.children_with_tokens().filter_map(|el| el.into_token()) {
+            if option_class(&tok, &node) == HighlightClass::Keyword {
+                labels.insert(tok.text().to_string());
+            }
+        }
+    }
+    labels
 }
 
 /// Is the next non-trivia sibling of `name` a `:`? (Distinguishes a named-arg label from a bare
@@ -296,6 +339,18 @@ mod tests {
         assert_eq!(class_of(src, "# a comment"), HighlightClass::Comment);
         assert_eq!(class_of(src, "42"), HighlightClass::Number);
         assert_eq!(class_of(src, "true"), HighlightClass::Number);
+        assert_total(src);
+    }
+
+    #[test]
+    fn canonical_header_option_labels_are_keywords() {
+        // L-96: `, risk: medium` must read exactly like the `risk medium` it replaces — the label
+        // is a keyword of the form, the value is not.
+        let src = "flow f\n  confirm \"go?\", risk: high\n    retry 2, backoff: exponential\n      flaky()\n  return \"ok\"\n";
+        assert_eq!(class_of(src, "confirm"), HighlightClass::Keyword);
+        assert_eq!(class_of(src, "risk"), HighlightClass::Keyword);
+        assert_eq!(class_of(src, "backoff"), HighlightClass::Keyword);
+        assert_eq!(class_of(src, "exponential"), HighlightClass::Punct);
         assert_total(src);
     }
 

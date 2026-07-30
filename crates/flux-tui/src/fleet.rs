@@ -179,7 +179,7 @@ impl FleetProjection {
     /// projection refused (over [`MAX_TRACKED`]), so a caller can render on every accepted event
     /// without tracking state itself.
     pub fn apply(&mut self, activity: &SpawnActivity, now: Instant) -> bool {
-        self.retire(now);
+        self.prune(now);
         let index = match self
             .workers
             .iter()
@@ -297,7 +297,13 @@ impl FleetProjection {
     /// Drop finished rows once their retention has elapsed. A live worker is never retired, however
     /// long it has been quiet — a stalled worker going missing from the surface is the failure this
     /// story exists to fix.
-    fn retire(&mut self, now: Instant) {
+    ///
+    /// **Public because retirement is time-driven, not event-driven** (C-224). [`FleetProjection::apply`]
+    /// prunes on its way in, but a fleet whose last worker has finished receives no further event,
+    /// so a surface that decides whether to show a fleet region at all has to be able to advance the
+    /// retention clock itself. [`FleetProjection::rows`] deliberately stays `&self` — a renderer
+    /// must not mutate — which is why this is a separate call rather than folded into it.
+    pub fn prune(&mut self, now: Instant) {
         self.workers.retain(|worker| {
             !worker.status.is_finished()
                 || now.saturating_duration_since(worker.last_activity) < FINISHED_RETENTION

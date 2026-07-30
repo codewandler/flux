@@ -64,7 +64,7 @@ use flux_provider::{Provider, RealtimeConfig, RealtimeProvider};
 use flux_runtime::ToolContext;
 use flux_runtime::{
     AllowApprover, Approver, DenyApprover, ExecutionAuthorization, ExecutionEnvironment, Executor,
-    PermissionManager, Spawner, Tool, ToolRegistry,
+    PermissionManager, ResourceLimits, Spawner, Tool, ToolRegistry,
 };
 use flux_secret::Redactor;
 use flux_system::sandbox::Sandbox;
@@ -178,6 +178,18 @@ impl FlowClientBuilder {
         self.envelope.redactor = redactor;
         self
     }
+    /// Bound what this runtime **uses** (C-290): a ceiling on simultaneously executing tool calls
+    /// and on retained result bytes. Enforced inside the safety envelope, so it binds every op this
+    /// client's own executors run — including the branches of a `parallel` block, which is where an
+    /// authored flow actually produces concurrency. It does **not** descend into sub-agents
+    /// attached via [`with_sub_agents`](FlowClient::with_sub_agents): a `task`-delegated child gets
+    /// a fresh, unbounded executor. Unbounded by default; see
+    /// [`ClientBuilder::resource_limits`](crate::ClientBuilder::resource_limits) for the full
+    /// contract, including why the queue timeout is not clamped.
+    pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.envelope.resource_limits = limits;
+        self
+    }
     /// Skip seeding the operation catalog `$defs` with the prelude artifact ontology (default: seed).
     pub fn without_prelude(mut self) -> Self {
         self.seed_prelude = false;
@@ -232,6 +244,7 @@ impl FlowClientBuilder {
             approver: self.envelope.approver,
             authorization: self.envelope.authorization,
             redactor: self.envelope.redactor,
+            resource_limits: self.envelope.resource_limits,
             prelude_defs,
             session_id: "flux-sdk".to_string(),
             spawner: None,
@@ -258,6 +271,10 @@ pub struct FlowClient {
     authorization: ExecutionAuthorization,
     /// Shared secret scrubber installed on every per-run execution environment.
     redactor: Redactor,
+    /// C-290: the host's resource ceilings. Installed on every per-run executor; because the
+    /// concurrency ceiling rides a shared handle, the per-run executors this client mints all count
+    /// against one budget instead of each getting a private one.
+    resource_limits: ResourceLimits,
     /// The merged `$defs` artifact map, seeded from `prelude_schema()` and extended by
     /// [`register_prelude`](Self::register_prelude); available for catalog enrichment / inspection.
     prelude_defs: Value,
@@ -737,7 +754,8 @@ impl FlowClient {
             approver,
             self.authorization.clone(),
         )
-        .with_redactor(self.redactor.clone());
+        .with_redactor(self.redactor.clone())
+        .with_resource_limits(self.resource_limits.clone());
         // Thread the sub-agent spawner into the per-run context when one is attached, so a `task`
         // call can delegate. `None` (the common case) leaves the context exactly as before.
         if let Some(spawner) = &self.spawner {

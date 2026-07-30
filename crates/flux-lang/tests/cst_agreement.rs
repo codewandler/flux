@@ -430,6 +430,15 @@ fn native_spelling_battery_agreement() {
         "flow f\n  parallel\n    branch $a\n      one()\n    branch $b\n      two()\n  return $a\n",
         "flow f\n  fallback -> $r\n    branch\n      first()\n    branch\n      second()\n  return $r\n",
         "flow f\n  retry 2 backoff exponential\n    timeout 30000\n      slow()\n  return \"ok\"\n",
+        // L-96 canonical named-option control headers — the same nodes, the canonical spelling.
+        "flow f\n  confirm \"Proceed?\", risk: high\n    bash(\"rm -rf tmp/\")\n  return \"ok\"\n",
+        "flow f\n  throttle \"api\", max: 5, per: 1s\n    fetch(\"u\")\n  return \"ok\"\n",
+        "flow f\n  debounce \"save\", wait: 300ms\n    write(\"f\", \"x\")\n  return \"ok\"\n",
+        "flow f\n  retry 2, backoff: exponential, delay: 500ms -> out\n    slow()\n  return out\n",
+        "flow f\n  repeat 3, until: acc -> acc\n    probe()\n  return acc\n",
+        "flow f\n  loop for 10s, every: 1s, until: done -> last\n    poll()\n  return last\n",
+        "flow f\n  await reply: String = \"reply\", when: ready\n  return reply\n",
+        "flow f\n  race timeout: 5s -> w\n    branch a\n      slow()\n    branch b\n      fast()\n  return w\n",
         "flow f\n  $s = fmt(\"hello {name}\")\n  return $s\n",
         "flow f\n  $o = { path: $p, content: \"x\" }\n  $l = [ $o, \"lit\" ]\n  return $l\n",
         // module declarations must use the same accepting grammar as flows

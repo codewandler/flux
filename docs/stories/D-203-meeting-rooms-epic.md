@@ -3,7 +3,7 @@ id: D-203
 title: "Meeting rooms — a multi-party channel where humans and agents meet (epic)"
 pillar: Agent
 status: ready
-priority: 22
+priority: 3
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels, flux-flow, flux-audio, docs]

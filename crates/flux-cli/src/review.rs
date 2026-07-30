@@ -1,5 +1,20 @@
 use super::*;
 
+/// Name the supported harness benchmark once per `flux eval` invocation (C-296).
+///
+/// **On stderr, deliberately.** stdout carries the scored summary a caller reads and `--report`
+/// writes a Markdown artifact a caller diffs; a courtesy line in either is a corrupted parse, not a
+/// nicety. This is the same routing `Sandbox::posture_disclosure` already uses for the same reason.
+/// It is a pointer and not a deprecation: `flux eval` runs unchanged, with the same suites and the
+/// same exit codes. Pinned by `crates/flux-cli/tests/bench_pointer.rs`.
+fn bench_pointer() {
+    eprintln!(
+        "note: harness benchmarking lives in flux-bench — it runs the shipped flux binary against a\n\
+         curated corpus with the model held fixed: https://github.com/codewandler/flux-bench\n\
+         `flux eval` is unchanged: the in-repo scoring engine the self-improvement loop drives."
+    );
+}
+
 /// `flux eval <adapter> [--tasks a,b] [--members a,b] [--limit N] [-m model] [--trials N]
 /// [--report out.md] [--watch]` — run a benchmark suite ad-hoc through flux-eval and print a summary
 /// (same adapters + scoring the `eval_run` op and improve loop use). `--watch` streams each task's
@@ -26,6 +41,8 @@ pub(super) async fn run_eval_cmd(
             adapter.as_str()
         );
     }
+    bench_pointer();
+
     let mut params = serde_json::json!({
         "adapter": adapter.as_str(),
         "tasks": tasks,
