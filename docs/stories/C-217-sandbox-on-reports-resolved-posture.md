@@ -2,8 +2,7 @@
 id: C-217
 title: "`sandbox on` reports its resolved posture instead of degrading silently"
 pillar: Core
-status: in-progress
-priority: 7
+status: done
 epic: security-assurance
 design: docs/designs/security-assurance.md
 note: "the prerequisite the epic deferred the default-flip behind — `on` + no backend returns Ok and says nothing, so an operator who asked to be sandboxed is told nothing when they are not"

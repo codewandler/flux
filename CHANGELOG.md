@@ -6,6 +6,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **`sandbox on` now states the posture it actually resolved to, and that line is finally tested
+  (C-217).** The story's premise turned out to be **false**, and the correction is the useful part: `on`
+  + no backend was *never* silent from the CLI — since `aed01f7e`, `apply_sandbox_env` has printed a
+  once-per-process stderr warning. What was actually wrong was narrower and, for a security surface,
+  worse:
+  **nothing tested that line.** `git log -S` shows `aed01f7e` relocated a security disclosure across a
+  module split with zero coverage, so deleting it would have been silent — and a refactor had already
+  moved it once. For a security disclosure, "correct but unpinned" *is* the exposure.
+  Two further defects fixed with it: the posture existed only as an L5 `format!`, so `flux-sdk`,
+  `flux-app` and `flux-eval` could resolve a `Sandbox` but not obtain the posture as data (`reason()`
+  alone cannot distinguish "`on` and unconfined" from "`require` about to fail closed"); and the wording
+  led with the *request* ("requested but unavailable"), reading as a fault — wrong for the dominant
+  `NamespacesDenied` case, which is an expected, healthy state on default-seccomp Docker, Debian ≤11
+  and Ubuntu 23.10+.
+  **Purely additive reporting — the safety envelope did not move.** `ensure_available` is byte-for-byte
+  unchanged; `require` still fails closed through the same branch and is *structurally* excluded from the
+  disclosure (which matches only `(On, Unsupported)`); no confinement decision, backend selection or
+  `wrap_argv` behaviour changed. Independent review enumerated the reachable `(mode, backend)` state
+  space and confirmed behavioural identity with the previous release.
+  Routed to **stderr, unsuppressed** — the channel the CLI already reserves for diagnostics, so it
+  structurally cannot corrupt a parse, and no per-subcommand `--json` list was invented to rot. Proven
+  by tests that parse *every* stdout line of a real `--stream-json` run and of `doctor --json`, each
+  with a non-vacuity guard.
+  Also closes a **vacuous assertion** inherited from an earlier attempt: the per-spawn test keyed on an
+  echoed marker that also appears in the `tool_call` line emitted *before* anything executes, so it
+  would have passed with the op denied and no process ever spawned. It now keys on the `tool_result`'s
+  `is_error`/`content` pair, which carries the child's captured stdout and therefore exists only if the
+  process really ran.
+
 ## [0.37.0] - 2026-07-30
 
 ### Added
