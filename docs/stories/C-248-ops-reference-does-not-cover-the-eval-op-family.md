@@ -2,7 +2,7 @@
 id: C-248
 title: "`ops-reference.md` documents none of the eval op family, so a rename there has one unguarded reference"
 pillar: Core
-status: in-progress
+status: done
 priority: 7
 areas: [flux-flow, flux-eval]
 note: "found while renaming git_revert→git_reset for C-238: only the website file is coverage-tested, so the in-repo op reference can silently rot for any eval op"
