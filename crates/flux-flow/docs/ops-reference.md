@@ -313,7 +313,7 @@ a gain on one benchmark must not be allowed to mask a loss on another.
 | `gate_check` | `[build, test, clippy, fmt, timeout_secs]` | Medium | Run the dev gate (`cargo build`/`test`/`clippy`/`fmt --check`) → `"true"` (all green) or `"false"`; each step is individually toggleable and `timeout_secs` bounds each one |
 | `git_snapshot` | | Low | Capture `HEAD` as a round snapshot; **errors if the working tree is dirty**, so a round can always be undone |
 | `guard_protected` | `snapshot` | Medium | Restore the grader/suite/loop/CI paths to the round snapshot after the worker runs → `{tampered, restored}` |
-| `git_reset` | `snapshot` | Destructive | Hard-reset the working tree to a `git_snapshot`, discarding the round's changes |
+| `git_reset` | `snapshot` | Destructive | Hard-reset the working tree to a `git_snapshot`, discarding the round's changes → `{reset_to, discarded}`; **refuses a snapshot it cannot verify** |
 | `git_tag` | `name[, message]` | Medium | Tag the current commit (`name` is a prefix — the short `HEAD` sha is appended for uniqueness; annotated when `message` is given) |
 
 `guard_protected` is the anti-cheat step, and it is the reason a round is measurable at all: the worker
@@ -324,6 +324,25 @@ the snapshot *before* the candidate is scored. Tampering is reported rather than
 accordingly. Note the name: the **builtin** `git_revert` appends an inverse commit and never touches
 the working tree, while this op discards it. They are different operations with different blast
 radii — C-238 renamed this one out of the collision.
+
+Because `git_reset` is a *blanket* restore — `reset --hard` plus an unscoped `git clean -fd`, which
+deletes untracked files outright — C-278 gave it a precondition. What it guarantees is bounded and
+worth stating exactly: **a reset can only rewind within this checkout's own line of history.** Two
+things are checked, and they are not equally strong. The snapshot must carry `clean: true`, which
+only `git_snapshot` sets and only after finding the tree clean — but nothing verifies the payload
+came from `git_snapshot`, so a flow writing `git_reset({"head": h, "clean": true})` by hand is
+licensed anyway; that check catches the caller who forgot to snapshot, not one that lies. The second
+check, that `head` is an ancestor of the current `HEAD`, asks git rather than the payload and is the
+one no caller can talk its way past. A snapshot taken on a divergent line is refused with the
+working tree listed and untouched. Neither check looks at *recency*, so a snapshot reused from an
+earlier round is still honoured and the commits since are rewound. What a licensed reset destroyed
+comes back in `discarded` — though that is built from `git status --porcelain`, so it reports
+working-tree losses only, never rewound commits.
+
+`guard_protected` needs no such precondition and states the exemption instead: its `checkout` and
+`clean` argv always end in `--` and an explicit pathspec list filtered through the `PROTECTED` set,
+so it cannot reach a path outside it however dirty the tree is. Requiring a clean tree would also be
+incoherent — the op runs *after* the worker has deliberately dirtied one.
 
 ## Release ops (`examples/release.flux`)
 
