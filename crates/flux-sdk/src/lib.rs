@@ -3184,6 +3184,115 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-247 **failing-first**: `WhatIf::run`'s re-plan path carried C-211's defect at a third site
+    /// — it minted the counterfactual session before asking whether the parent history was a valid
+    /// provider history, so a refused re-plan left an empty orphan session behind. Same invariant,
+    /// same reason: a failed operation leaves no trace.
+    #[tokio::test]
+    async fn whatif_replan_refuses_an_invalid_history_before_minting_the_child() {
+        let (dir, store, sid) = record_bind_session("whatif-no-orphan").await;
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let events = client.event_store();
+
+        // The same unusable parent C-211's fork tests use: a trailing `tool_use` nothing answers.
+        seed_raw_message(&events, &sid, flux_core::Message::user_text("and again"));
+        seed_raw_message(
+            &events,
+            &sid,
+            flux_core::Message::assistant(vec![ContentBlock::ToolUse {
+                id: "orphan-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            }]),
+        );
+        // Generous limit: the fixture holds one session, and the bug adds a second.
+        let before = events.list(1_000).unwrap().len();
+
+        // A `system_prompt` change is what selects the re-plan path; `NeverMock` panics if the
+        // refusal ever fails to fire and the live turn actually runs.
+        let session = client.open_session(&sid).unwrap();
+        let rendered = match session
+            .what_if()
+            .system_prompt("You are a different agent.")
+            .run()
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(cf) => panic!(
+                "a re-plan over a mid-tool-pair history must be refused, not copied through — \
+                 got {}",
+                cf.session().id()
+            ),
+        };
+        assert!(
+            rendered.contains("tool_use") && rendered.contains("orphan-1"),
+            "the refusal must name the invariant it protects: {rendered}"
+        );
+
+        assert_eq!(
+            events.list(1_000).unwrap().len(),
+            before,
+            "a refused re-plan must not leave a child session behind — validate the parent before \
+             minting anything"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-247 **failing-first**, the second bail: a re-plan aimed at a turn the session does not have
+    /// is refused too, and that refusal used to fire even later than the history check — *after* the
+    /// child had been minted AND had the parent's whole conversation rewritten into it, so the orphan
+    /// it left was not even empty enough for `prune_empty` to collect.
+    #[tokio::test]
+    async fn whatif_replan_refuses_a_missing_target_turn_before_minting_the_child() {
+        let (dir, store, sid) = record_bind_session("whatif-no-such-turn").await;
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let events = client.event_store();
+        let before = events.list(1_000).unwrap().len();
+
+        // The history here is perfectly valid — the fixture records exactly one turn. Turn 99 is
+        // simply not there.
+        let session = client.open_session(&sid).unwrap();
+        let rendered = match session
+            .what_if()
+            .turn(99)
+            .system_prompt("You are a different agent.")
+            .run()
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(cf) => panic!(
+                "a re-plan of a turn the session does not have must be refused — got {}",
+                cf.session().id()
+            ),
+        };
+        assert!(
+            rendered.contains(&sid) && rendered.contains("has no turn 99"),
+            "the refusal must name the session and the reason: {rendered}"
+        );
+
+        assert_eq!(
+            events.list(1_000).unwrap().len(),
+            before,
+            "a refused re-plan must not leave a child session behind — resolve the target turn \
+             before minting anything"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The parent's history reaches the child as **one** checked rewrite, not one append per
     /// message — the other half of moving this path onto `rewrite(ValidHistory)`.
     #[tokio::test]

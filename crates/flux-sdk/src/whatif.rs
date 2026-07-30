@@ -22,6 +22,7 @@ use std::sync::Arc;
 use flux_core::{PricingTable, Result};
 use flux_events::{DiffRow, EventContext, ModelCost, RunDiff, SessionLog, ValidHistory};
 use flux_flow::cassette::{CassetteScope, FrozenTape, RecordScope, ReplayTape};
+use flux_flow::engine::FlowEngine;
 use flux_flow::host::OpOutcome;
 use flux_flow::AgentSink;
 
@@ -242,6 +243,23 @@ fn node_to_cell_index(trace: &[flux_lang::ast::RunEvent], node: u32) -> Option<u
     None
 }
 
+/// Mint the throwaway counterfactual session on `variant`, correlated back to the source session
+/// `src` and labelled with the targeted turn.
+///
+/// A function rather than an inline statement so both of [`WhatIf::run`]'s paths can call it at the
+/// point they have established they can actually finish (C-247): the mint is the first trace a
+/// what-if leaves, so no refusal may follow it.
+fn mint_counterfactual(variant: &FlowEngine, src: &str, label: &str) -> Result<String> {
+    variant.events.create_session_with_context(
+        &variant.model,
+        &EventContext {
+            correlation_id: Some(src.to_string()),
+            agent_id: Some(format!("what_if:{src}@{label}")),
+            ..Default::default()
+        },
+    )
+}
+
 /// Build the [`FrozenTape`] a `WhatIf::run()` pins: `src`'s recorded trace, every `.substitute`/
 /// `.substitute_at` applied, off-tape mode `off_tape` — `Live` needs `bridge` (a [`RecordScope`]
 /// pointed at the destination session).
@@ -437,18 +455,11 @@ impl WhatIf {
             .turn
             .map(|t| t.to_string())
             .unwrap_or_else(|| "latest".to_string());
-        let dst = variant.events.create_session_with_context(
-            &variant.model,
-            &EventContext {
-                correlation_id: Some(src.clone()),
-                agent_id: Some(format!("what_if:{src}@{label}")),
-                ..Default::default()
-            },
-        )?;
 
         let mut sink = NullSink;
 
         if !replan {
+            let dst = mint_counterfactual(&variant, &src, &label)?;
             let bridge = matches!(self.off_tape, OffTape::Live)
                 .then(|| RecordScope::new(variant.events.clone(), dst.clone()));
             let frozen = build_frozen(
@@ -490,12 +501,19 @@ impl WhatIf {
             ));
         }
 
-        // Re-plan path: copy the conversation so the re-planned turn sees the same history, rebuild
-        // every earlier turn hermetically, then drive exactly one LIVE turn under the pinned scope.
-        // The copy is one checked rewrite (A-102) — the variant's live turn goes to a real provider,
-        // so a source history that is not a valid provider history must fail here, not there.
+        // Re-plan path. Everything that can REFUSE the re-plan is resolved first, before anything is
+        // minted (C-247, the same move C-211 made at the fork sites): both refusals below used to
+        // fire after `dst` existed, so a refused re-plan left an orphan session behind — an artifact
+        // that did not exist before the refusal paths did. Holding "a failed operation leaves no
+        // trace" is cheaper than re-deriving it from a pruning rule on every read of this path, and
+        // the turn refusal did not even have that fallback: it fired after the rewrite below, so its
+        // orphan carried a full copy of the parent's conversation and `prune_empty` never saw an
+        // empty stream to collect. Both resolutions only read the source session.
+        //
+        // The pure-substitution path above deliberately checks neither: it can never reach a
+        // provider, so it has no stake in the source being a valid *provider* history, and
+        // `rerun_pinned` selects its own turn out of the run trace.
         let history = ValidHistory::new(events.conversation(&src)?)?;
-        SessionLog::open(&variant.events, &dst)?.rewrite(history)?;
         let turns = events.turns(&src)?;
         let target_turn = self.turn.unwrap_or(turns.len().max(1));
         let user_input = turns
@@ -506,6 +524,13 @@ impl WhatIf {
                     "session {src} has no turn {target_turn} to re-plan"
                 ))
             })?;
+
+        // Now mint: copy the conversation so the re-planned turn sees the same history, rebuild every
+        // earlier turn hermetically, then drive exactly one LIVE turn under the pinned scope. The
+        // copy is one checked rewrite (A-102) — the variant's live turn goes to a real provider, so a
+        // source history that is not a valid provider history must fail above, not there.
+        let dst = mint_counterfactual(&variant, &src, &label)?;
+        SessionLog::open(&variant.events, &dst)?.rewrite(history)?;
 
         flux_flow::whatif::replay_turns_prefix(
             &variant.events,

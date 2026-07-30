@@ -2,7 +2,7 @@
 id: C-247
 title: "`WhatIf::run`'s re-plan path mints the child before validating, so a refused re-plan still leaves a trace"
 pillar: Core
-status: ready
+status: in-progress
 priority: 6
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
