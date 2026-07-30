@@ -416,6 +416,31 @@ every member benchmark's pass rate and check rate to be at least the baseline's.
 config after each worker run, so a round cannot raise its own score by editing what measures it.
 `git_reset` carries the `Destructive` risk tier and is approval-gated accordingly.
 
+## Cutting a release
+
+These four drive [`examples/release.flux`](https://github.com/codewandler/flux/blob/main/examples/release.flux),
+which cuts a flux release as a Flux-Lang program. They exist as separate, narrow ops rather than as
+`proc.run` calls because a release flow needs exactly two programs and three writable files: fixed
+argv and a fixed path set are authority you cannot mistype.
+
+| op | arguments | description |
+|---|---|---|
+| `release_plan` | | The last `v*` tag, the commit subjects and diffstat since it, and the **host's** bump decision + next version |
+| `release_verify_versions` | | Run `scripts/check-crate-versions.sh` (fixed argv); errors with the offending protocol-line crate named |
+| `changelog_insert` | `file, body, [section], [apply]` | Insert markdown under a changelog's `## [<section>]` heading, deterministically and idempotently. `apply` defaults to false (preview) |
+| `release_cut` | `bump, [apply]` | Cut with `scripts/cut-release.sh <bump>` (fixed argv), stopping at the **local** annotated tag. `apply` defaults to false |
+
+The division of labour is the point: **the model writes prose, the host decides the version.**
+`release_plan` derives the bump from conventional-commit titles — a `!` means breaking, and breaking
+means a minor bump while flux is `0.y` — so no version is ever read back out of a model reply.
+crates.io is yank-only, and a wrong version cannot be withdrawn. A model may return a `bump_opinion`
+and disagree in writing; the run surfaces the disagreement and cuts the host's number anyway.
+
+`changelog_insert` addresses only `CHANGELOG.md`, `WHATS-NEW.md`, and `website/docs/whats-new.md`,
+resolving its target through the canonicalizing IO boundary first — so the model's prose is an *input*
+to the file, never the file's contents. `release_cut` never pushes and never publishes: the tag it
+leaves is local, and the existing tag-triggered workflows promote it.
+
 ## The loop itself
 
 flux's own agent turn loop is a Flux-Lang flow, driven by reflexive planning and evidence ops

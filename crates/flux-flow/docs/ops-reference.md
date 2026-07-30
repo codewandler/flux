@@ -241,6 +241,32 @@ These are registered **only by the `flux-app` runtime host** (`flux run app.flux
 All four are Medium-risk / non-idempotent (`emit`/`spawn` fan out to other journeys, gated separately at
 their own dispatch). See [`flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6.
 
+## Release ops (`examples/release.flux`)
+
+Registered by `flux_eval::register_eval_ops` alongside the self-improvement pack — top-level-only,
+repo-mutating orchestration ops, never a sub-agent's. They exist as four narrow ops rather than as
+`proc.run` calls because a release flow needs exactly two programs and three writable files, and fixed
+argv plus a fixed path set is authority that cannot be mistyped.
+
+*(The rest of the eval/self-improvement family — `gate_check`, `git_snapshot`, `git_tag`, `git_reset`,
+`guard_protected`, `eval_*` — is still missing from this reference; that gap is C-248. All of it is
+documented in [`website/docs/language/ops.md`](../../../website/docs/language/ops.md).)*
+
+| op | signature | description |
+|---|---|---|
+| `release_plan` | | The last `v*` tag, the commit subjects + diffstat since it, and the **host's** bump and next version |
+| `release_verify_versions` | | `scripts/check-crate-versions.sh` (fixed argv); errors with the offending protocol-line crate named |
+| `changelog_insert` | `file, body[, section][, apply]` | Insert markdown under a changelog's `## [<section>]` heading, deterministically and idempotently; `apply` defaults to false (preview) |
+| `release_cut` | `bump[, apply]` | `scripts/cut-release.sh <bump>` (fixed argv), stopping at the **local** annotated tag; never pushes, never publishes; `apply` defaults to false |
+
+**The model writes prose, the host decides the version.** `release_plan` derives the bump from
+conventional-commit titles (`!` ⇒ breaking ⇒ minor while `0.y`), so no version is ever read back out
+of a model reply — crates.io is yank-only and a wrong version cannot be withdrawn. A model may return
+a `bump_opinion`; a disagreement is surfaced as a `release.bump_disagreement` observation and changes
+nothing. `changelog_insert` addresses only `CHANGELOG.md`, `WHATS-NEW.md` and
+`website/docs/whats-new.md`, resolved through the canonicalizing IO boundary first, so model text is an
+*input* to the file rather than its contents.
+
 ## Agent-loop ops (the self-hosted turn loop)
 
 The turn loop is the authored Flux-Lang flow in `crates/flux-flow/assets/agent-loop.flux`. Its model

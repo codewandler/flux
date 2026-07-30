@@ -2,7 +2,7 @@
 id: C-251
 title: "Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version"
 pillar: Core
-status: ready
+status: in-progress
 priority: 10
 areas: [flux-cli, flux-tools, ci]
 note: "flux automating its own release is the most honest dogfood there is; the load-bearing decision is that the MODEL writes prose and the HOST does version math, because a wrong version on crates.io is irreversible"
