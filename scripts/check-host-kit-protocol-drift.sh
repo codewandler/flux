@@ -92,6 +92,13 @@ check_drift() {
   if version_gt "$protocol_norm" "$floor"; then
     fail "codewandler-flux-plugin-protocol@$protocol_live is live on crates.io, but the published codewandler-flux-host-kit only requires '${host_kit_req:-<none — no such dependency>}' ($floor)"
     echo "   a plugin pack release is now owed: run .github/workflows/release-plugins.yml with publish: true at pack version ${pack_version:-<see plugins/Cargo.toml>}" >&2
+    # Republishing alone is NOT always the fix, and saying only "a release is owed" has already cost
+    # someone a fruitless pack cut: host-kit records whatever `plugins/Cargo.toml`'s
+    # [workspace.dependencies] declares, so if that is a bare `^1` the floor stays 1.0.0 and this
+    # check fails again on the freshly published pack. Check the pin before cutting.
+    echo "   FIRST check plugins/Cargo.toml [workspace.dependencies] flux-plugin-protocol: a bare" >&2
+    echo "   'version = \"1\"' records a ^1 floor of 1.0.0 and will fail this check again after the" >&2
+    echo "   release — pin it to the protocol MINOR (e.g. \"1.1\") in the same commit" >&2
     return 1
   fi
   printf '\033[32mPASS\033[0m codewandler-flux-host-kit'"'"'s published protocol requirement ('"'"'%s'"'"' -> %s) covers the live protocol version (%s)\n' \

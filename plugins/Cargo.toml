@@ -52,7 +52,11 @@ license = "MIT OR Apache-2.0"
 # version. A flux release does not move these, so `scripts/cut-release.sh` never edits this file
 # and a plugin binary is rebuilt only when the wire itself changes. Path deps keep local
 # development working against the sibling crates.
-flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1", path = "../crates/flux-plugin-protocol" }
+# Pinned to the protocol MINOR, not bare `^1`. host-kit's published dependency requirement is what
+# `scripts/check-host-kit-protocol-drift.sh` reads to answer "which wire does a plugin built against
+# this host-kit actually speak" — and `^1` records a floor of 1.0.0, so it keeps reporting drift no
+# matter how often the pack is republished. Bump this alongside the protocol crate's MINOR.
+flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.1", path = "../crates/flux-plugin-protocol" }
 flux-datasource = { package = "codewandler-flux-datasource", version = "1", path = "../crates/flux-datasource" }
 flux-secret = { package = "codewandler-flux-secret", version = "1", path = "../crates/flux-secret" }
 flux-spec = { package = "codewandler-flux-spec", version = "1", path = "../crates/flux-spec" }
