@@ -6,6 +6,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release verifier had never met a real release (C-259 follow-up).** `verify-github-release.sh`
+  classified a closed set of `flux-cli-*` assets and rejected everything else — but cargo-dist also
+  ships the protocol-mandated `flux-lsp` app, a `.sha256` sidecar beside every asset, and a
+  `source.tar.gz`. So the `host` job failed on v0.38.0 at the first sidecar it met, *after* the release
+  itself had published correctly. Its `--self-test` passed throughout, because the fixture was a
+  hand-written `flux-cli`-only list that agreed with the classifier rather than with reality — the same
+  shape as C-264's CodeQL lane, which pinned a build mode Rust rejects and guarded that value too.
+  The closed-set rule is kept, since an extra filename becoming a second unverified distribution
+  channel is exactly what it exists to prevent: sidecars and the source archive are admitted as
+  metadata, `flux-lsp` archives and installers are admitted **and attestation-verified**, and a sidecar
+  shadowing no real asset is still rejected. `flux-lsp` is allowed but not required, so dropping it
+  from a release does not red the gate. The self-test now runs on a real 28-asset listing and asserts
+  14 executables get classified, so an app whose archives would ship unattested fails the test.
+  Verified against the published v0.38.0 rather than a fixture: 28 assets, 14 executables with valid
+  provenance bound to the tag's exact source commit. The v0.38.0 assets themselves were always
+  correctly signed — `gh attestation verify` succeeds on them — only flux's own check of them was wrong.
+
 ## [0.38.0] - 2026-07-30
 
 ### Added

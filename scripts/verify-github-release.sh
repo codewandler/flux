@@ -28,18 +28,35 @@ err() {
   fi
 }
 
+# cargo-dist ships TWO apps (`flux-cli` and the protocol-mandated `flux-lsp`), a `.sha256` sidecar
+# beside every asset, and a `source.tar.gz`. The closed-set rule below is the point of this function —
+# an extra filename must never become a second, unverified distribution channel — but it has to be
+# closed over the set that is actually published. Keep `--self-test` fed from a REAL release listing:
+# the first version of this check was written against a hand-made `flux-cli`-only list, passed its own
+# self-test, and then rejected every real release on the first `.sha256` it met.
 executable_assets=()
+sidecar_targets=()
 validate_asset_set() {
   local name
   local has_unix_archive=0
   local has_windows_zip=0
   executable_assets=()
+  sidecar_targets=()
   for name in "$@"; do
     case "$name" in
-      dist-manifest.json|sha256.sum) ;;
+      # Checksum sidecars and the source archive are metadata, not an install channel: they carry no
+      # executable code, so they are allowed without an attestation. A sidecar naming an asset that
+      # does not exist IS a stray file, and is rejected below.
+      *.sha256) sidecar_targets+=("${name%.sha256}") ;;
+      dist-manifest.json|sha256.sum|source.tar.gz) ;;
       flux-cli-installer.sh|flux-cli-installer.ps1) executable_assets+=("$name") ;;
+      flux-lsp-installer.sh|flux-lsp-installer.ps1) executable_assets+=("$name") ;;
       flux-cli-*.tar.xz) executable_assets+=("$name"); has_unix_archive=1 ;;
       flux-cli-*.zip) executable_assets+=("$name"); has_windows_zip=1 ;;
+      # flux-lsp is shipped but optional — allowed and attestation-verified when present, never
+      # required, so dropping the LSP from a release does not red this gate.
+      flux-lsp-*.tar.xz) executable_assets+=("$name") ;;
+      flux-lsp-*.zip) executable_assets+=("$name") ;;
       *)
         err "release contains an unsupported/unverified asset: $name"
         return 1
@@ -48,6 +65,17 @@ validate_asset_set() {
   done
   [ "$has_unix_archive" -eq 1 ] || { err "release has no flux-cli-*.tar.xz asset"; return 1; }
   [ "$has_windows_zip" -eq 1 ] || { err "release has no flux-cli-*.zip asset"; return 1; }
+
+  # Every `.sha256` must shadow a real asset in this same listing. Without this a stray
+  # `anything.sha256` would pass as "metadata" and reintroduce the hole the closed set exists to shut.
+  local target found
+  for target in "${sidecar_targets[@]}"; do
+    found=0
+    for name in "$@"; do
+      [ "$name" = "$target" ] && { found=1; break; }
+    done
+    [ "$found" -eq 1 ] || { err "release has a checksum sidecar for a missing asset: $target.sha256"; return 1; }
+  done
 }
 
 verify_attestation() {
@@ -61,14 +89,39 @@ verify_attestation() {
 }
 
 if [ "${1:-}" = "--self-test" ]; then
-  validate_asset_set \
-    dist-manifest.json sha256.sum flux-cli-installer.sh flux-cli-installer.ps1 \
-    flux-cli-x86_64-unknown-linux-gnu.tar.xz flux-cli-x86_64-pc-windows-msvc.zip
-  if validate_asset_set \
-    dist-manifest.json sha256.sum flux-cli-installer.sh flux-cli-installer.ps1 \
-    flux-cli-x86_64-unknown-linux-gnu.tar.xz flux-cli-x86_64-pc-windows-msvc.zip \
-    flux-cli-backdoor.exe >/dev/null 2>&1; then
+  # The REAL asset set of a cut release (v0.38.0, 28 assets), not a hand-picked subset. The earlier
+  # fixture listed only flux-cli archives and so agreed with a classifier that rejected every actual
+  # release. If cargo-dist's output shape changes, update this from `gh release view <tag> --json
+  # assets --jq '.assets[].name'` — never by trimming it until the check passes.
+  real_release_assets=(
+    dist-manifest.json sha256.sum source.tar.gz source.tar.gz.sha256
+    flux-cli-installer.sh flux-cli-installer.ps1
+    flux-cli-aarch64-apple-darwin.tar.xz         flux-cli-aarch64-apple-darwin.tar.xz.sha256
+    flux-cli-aarch64-unknown-linux-gnu.tar.xz    flux-cli-aarch64-unknown-linux-gnu.tar.xz.sha256
+    flux-cli-x86_64-apple-darwin.tar.xz          flux-cli-x86_64-apple-darwin.tar.xz.sha256
+    flux-cli-x86_64-unknown-linux-gnu.tar.xz     flux-cli-x86_64-unknown-linux-gnu.tar.xz.sha256
+    flux-cli-x86_64-pc-windows-msvc.zip          flux-cli-x86_64-pc-windows-msvc.zip.sha256
+    flux-lsp-installer.sh flux-lsp-installer.ps1
+    flux-lsp-aarch64-apple-darwin.tar.xz         flux-lsp-aarch64-apple-darwin.tar.xz.sha256
+    flux-lsp-aarch64-unknown-linux-gnu.tar.xz    flux-lsp-aarch64-unknown-linux-gnu.tar.xz.sha256
+    flux-lsp-x86_64-apple-darwin.tar.xz          flux-lsp-x86_64-apple-darwin.tar.xz.sha256
+    flux-lsp-x86_64-unknown-linux-gnu.tar.xz     flux-lsp-x86_64-unknown-linux-gnu.tar.xz.sha256
+    flux-lsp-x86_64-pc-windows-msvc.zip          flux-lsp-x86_64-pc-windows-msvc.zip.sha256
+  )
+  validate_asset_set "${real_release_assets[@]}"
+  # Both apps' archives and installers must be classified as executable, or they would ship
+  # unattested. 10 archives + 4 installers = 14.
+  if [ "${#executable_assets[@]}" -ne 14 ]; then
+    echo "self-test expected 14 executable assets in a real release, got ${#executable_assets[@]}" >&2
+    exit 1
+  fi
+  if validate_asset_set "${real_release_assets[@]}" flux-cli-backdoor.exe >/dev/null 2>&1; then
     echo "self-test accepted an executable outside the attestation download set" >&2
+    exit 1
+  fi
+  # A sidecar is only metadata because it shadows a real asset; one that shadows nothing is a stray.
+  if validate_asset_set "${real_release_assets[@]}" flux-cli-backdoor.tar.xz.sha256 >/dev/null 2>&1; then
+    echo "self-test accepted a checksum sidecar for a nonexistent asset" >&2
     exit 1
   fi
   captured=()
@@ -164,11 +217,20 @@ fi
 verify_dir="$(mktemp -d)"
 cleanup() { rm -rf -- "$verify_dir"; }
 trap cleanup EXIT
+# These patterns must cover exactly the assets validate_asset_set classified as executable — the
+# equality check below compares the two sets and fails on any drift, so adding an executable asset
+# class above without a pattern here is caught rather than silently left unverified.
+# Patterns stay per-app rather than a broad `flux-*` glob so that a future third app has to be
+# classified above and listed here deliberately, instead of being downloaded by accident.
 gh release download "$TAG" --repo "$REPO" --dir "$verify_dir" \
   --pattern 'flux-cli-*.tar.xz' \
   --pattern 'flux-cli-*.zip' \
   --pattern 'flux-cli-installer.sh' \
-  --pattern 'flux-cli-installer.ps1'
+  --pattern 'flux-cli-installer.ps1' \
+  --pattern 'flux-lsp-*.tar.xz' \
+  --pattern 'flux-lsp-*.zip' \
+  --pattern 'flux-lsp-installer.sh' \
+  --pattern 'flux-lsp-installer.ps1'
 
 mapfile -t expected_downloads < <(printf '%s\n' "${executable_assets[@]}" | sort)
 downloaded_assets=()
