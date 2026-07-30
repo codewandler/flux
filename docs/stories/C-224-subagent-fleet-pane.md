@@ -2,7 +2,7 @@
 id: C-224
 title: The sub-agent fleet pane — render the SpawnActivity stream the TUI currently discards
 pillar: Core
-status: in-progress
+status: done
 priority: 15
 epic: agent-authored-surface
 design: docs/designs/agent-authored-surface.md
