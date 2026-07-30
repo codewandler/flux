@@ -2447,6 +2447,244 @@ impl Tool for GitLogTool {
 }
 
 // ---------------------------------------------------------------------------
+// The guarded git family's tree preconditions — stated once, here (C-249)
+// ---------------------------------------------------------------------------
+//
+// Some `git_*` ops undo a failure with a **blanket restore**: `git merge --abort`,
+// `git revert --abort`. A blanket restore is only safe when the state it restores is state THIS
+// call created — otherwise it silently discards a half-finished, possibly hand-resolved operation
+// the caller never committed, which is the invariant AGENTS.md holds hardest.
+//
+// Before C-249 each op re-derived that reasoning for itself: `git_worktree_leave` and `git_revert`
+// grew the same clean-tree guard independently and `git_merge` grew none, which is how C-238's
+// blocking defect existed. The policy is now one helper — [`require_tree_precondition`] — and every
+// abort-capable op must call it, so the next merging or aborting op has to *decide* rather than
+// inherit an accident. `crates/flux-tools/tests/git_tree_policy.rs` fails the suite if one doesn't.
+//
+// The policy has two parts, and they are deliberately not the same question:
+//
+//   1. **No operation of the same kind may already be in flight** (`MERGE_HEAD`, `REVERT_HEAD`,
+//      `CHERRY_PICK_HEAD`). Mandatory for every abort-capable op, and it is what *licenses* the
+//      abort further down: reaching that path proves the marker seen there is one this call made.
+//   2. **A clean working tree.** Required only where the abort restores the *whole* tree rather
+//      than just what this call staged. NOT universal, on purpose: a dirty index makes `git merge`
+//      refuse to start (leaving no `MERGE_HEAD` and the tree untouched) and unrelated unstaged
+//      edits survive `git merge --abort` intact, so refusing every dirty tree reflexively would
+//      make the family unusable in exactly the multi-author situation `git_stage_hunks` exists to
+//      serve. Where it IS required it is **flux policy, stricter than git** — git itself only
+//      refuses a dirty index, or unstaged changes to the paths it would touch.
+
+/// Whether an abort-capable `git_*` op additionally requires a clean working tree before it starts.
+/// Both variants carry the *stated reason*: an op that declines the precondition has to say why it
+/// is safe to, in the same place an op that requires it says why it is not.
+#[derive(Clone, Copy)]
+enum CleanTree {
+    /// Required — this op's failure path restores more than it staged.
+    Required(&'static str),
+    /// Deliberately not required — a dirty tree is outside this op's blast radius.
+    NotRequired(&'static str),
+}
+
+impl CleanTree {
+    /// The stated reason, whichever way the decision went.
+    fn because(self) -> &'static str {
+        match self {
+            Self::Required(why) | Self::NotRequired(why) => why,
+        }
+    }
+}
+
+/// The tree precondition one abort-capable `git_*` op states for one checkout. Ops that guard two
+/// checkouts (`git_worktree_leave`) declare one of these per checkout.
+struct TreePrecondition {
+    /// The op name, so every refusal is attributable.
+    op: &'static str,
+    /// How the refusal names the checkout being guarded ("this checkout", "the worktree", …).
+    subject: &'static str,
+    /// `(in-progress marker ref, the git command that owns it)` — an op's failure path may only
+    /// abort a marker it can prove it created, so any of these present at preflight is a refusal.
+    in_flight: &'static [(&'static str, &'static str)],
+    clean_tree: CleanTree,
+    /// Op-specific trailing guidance (e.g. where the context is left), or empty.
+    note: &'static str,
+}
+
+const GIT_MERGE_TREE: TreePrecondition = TreePrecondition {
+    op: "git_merge",
+    subject: "this checkout",
+    in_flight: &[("MERGE_HEAD", "git merge")],
+    clean_tree: CleanTree::NotRequired(
+        "git refuses to start a merge that would overwrite local changes, and unrelated unstaged \
+         edits survive `git merge --abort` — so uncommitted work is outside this op's blast radius",
+    ),
+    note: "",
+};
+
+const GIT_REVERT_TREE: TreePrecondition = TreePrecondition {
+    op: "git_revert",
+    subject: "this checkout",
+    in_flight: &[
+        ("REVERT_HEAD", "git revert"),
+        ("CHERRY_PICK_HEAD", "git cherry-pick"),
+    ],
+    clean_tree: CleanTree::Required(
+        "a conflicted revert is undone with a blanket `git revert --abort`, which cannot tell this \
+         call's revert from edits that were already in the tree",
+    ),
+    note: "",
+};
+
+const GIT_WORKTREE_ENTER_TREE: TreePrecondition = TreePrecondition {
+    op: "git_worktree_enter",
+    subject: "the checkout",
+    in_flight: &[("MERGE_HEAD", "git merge"), ("REVERT_HEAD", "git revert")],
+    clean_tree: CleanTree::Required(
+        "the session branches off this checkout's HEAD and `git_worktree_leave` later refuses to \
+         merge unless `main` is still exactly there — uncommitted work would strand outside the \
+         session and block the merge back",
+    ),
+    note: "",
+};
+
+const GIT_WORKTREE_LEAVE_SESSION_TREE: TreePrecondition = TreePrecondition {
+    op: "git_worktree_leave",
+    subject: "the worktree",
+    in_flight: &[("MERGE_HEAD", "git merge"), ("REVERT_HEAD", "git revert")],
+    clean_tree: CleanTree::Required(
+        "leave never stages or commits, so anything uncommitted here is discarded with the \
+         worktree",
+    ),
+    note: "The context stays in the worktree.",
+};
+
+const GIT_WORKTREE_LEAVE_ORIGINAL_TREE: TreePrecondition = TreePrecondition {
+    op: "git_worktree_leave",
+    subject: "the original checkout",
+    in_flight: &[("MERGE_HEAD", "git merge")],
+    clean_tree: CleanTree::Required(
+        "the trial merge into `main` is ALWAYS aborted, and a blanket `git merge --abort` cannot \
+         tell this call's trial from work that was already there",
+    ),
+    note: "Refusing to merge — the context stays in the worktree.",
+};
+
+/// A preflight that could not run git at all. Recoverable, never a plan-halting raw error: the
+/// whole promise of a preflight is that a refusal leaves nothing behind (C-241 review).
+fn preflight_unavailable(op: &str, what: &str, detail: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "{op}: could not run `git {what}` to check its preconditions ({detail}); refusing to \
+         start — nothing was changed"
+    ))
+}
+
+/// `git status --porcelain`, as a refusal on any failure.
+async fn tree_status(
+    system: &flux_system::System,
+    op: &str,
+) -> std::result::Result<String, ToolResult> {
+    match run_git(system, &["status", "--porcelain"]).await {
+        Ok((true, status)) => Ok(status),
+        Ok((false, out)) => Err(preflight_unavailable(op, "status --porcelain", &out)),
+        Err(e) => Err(preflight_unavailable(
+            op,
+            "status --porcelain",
+            &e.to_string(),
+        )),
+    }
+}
+
+/// The one dirty-tree refusal wording in the family.
+///
+/// `git status --porcelain` reports untracked (`??`) entries alongside tracked ones, and a plain
+/// `git stash` leaves untracked files exactly where they are — so "commit or stash them first" is
+/// advice the caller cannot follow, and an agent that follows it retries and fails identically.
+/// Split the two and give each the remedy that actually clears it.
+fn dirty_tree_refusal(p: &TreePrecondition, status: &str) -> ToolResult {
+    let (untracked, tracked): (Vec<&str>, Vec<&str>) = status
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .partition(|l| l.starts_with("??"));
+    let mut body = String::new();
+    if !tracked.is_empty() {
+        body.push_str(&format!(
+            "\nTracked changes ({}) — `git commit` or `git stash` clears these:\n{}",
+            tracked.len(),
+            tracked.join("\n")
+        ));
+    }
+    if !untracked.is_empty() {
+        body.push_str(&format!(
+            "\nUntracked files ({}) — a plain `git stash` does NOT clear these; use \
+             `git stash -u`, `git clean -fd`, or move them aside:\n{}",
+            untracked.len(),
+            untracked.join("\n")
+        ));
+    }
+    let note = if p.note.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", p.note)
+    };
+    ToolResult::error(format!(
+        "{}: refusing — {} has uncommitted changes, and {}.{note}{body}",
+        p.op,
+        p.subject,
+        p.clean_tree.because()
+    ))
+}
+
+/// Enforce `p` against the checkout `system` is rooted at.
+///
+/// `Some(refusal)` is a recoverable `ToolResult::error` to return unchanged — nothing was created
+/// and nothing was touched. `None` means the op may proceed, and (part 1 of the policy) that any
+/// in-progress marker it later sees is one it created itself.
+async fn require_tree_precondition(
+    system: &flux_system::System,
+    p: &TreePrecondition,
+) -> Option<ToolResult> {
+    for (marker, owner) in p.in_flight {
+        let present = match run_git(system, &["rev-parse", "-q", "--verify", marker]).await {
+            Ok((present, head)) => present.then_some(head),
+            Err(e) => {
+                return Some(preflight_unavailable(
+                    p.op,
+                    &format!("rev-parse -q --verify {marker}"),
+                    &e.to_string(),
+                ))
+            }
+        };
+        let Some(head) = present else { continue };
+        let status = match tree_status(system, p.op).await {
+            Ok(s) => s,
+            Err(refusal) => return Some(refusal),
+        };
+        let note = if p.note.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", p.note)
+        };
+        return Some(ToolResult::error(format!(
+            "{}: `{owner}` is already in progress in {} ({marker} {head}) — refusing to start, \
+             and refusing to abort the one in flight because its resolution may be uncommitted \
+             work. Conclude it (`git commit`) or abandon it (`{owner} --abort`) by hand, then \
+             retry.{note} Working tree:\n{status}",
+            p.op, p.subject
+        )));
+    }
+    if matches!(p.clean_tree, CleanTree::NotRequired(_)) {
+        return None;
+    }
+    let status = match tree_status(system, p.op).await {
+        Ok(s) => s,
+        Err(refusal) => return Some(refusal),
+    };
+    if status.is_empty() {
+        return None;
+    }
+    Some(dirty_tree_refusal(p, &status))
+}
+
+// ---------------------------------------------------------------------------
 // git_merge
 // ---------------------------------------------------------------------------
 
@@ -2525,27 +2763,14 @@ impl Tool for GitMergeTool {
         }
         let system = ctx.system();
 
-        // A merge already in flight is NOT this call's to touch. `git merge` refuses to start
-        // while `MERGE_HEAD` exists, so without this guard the failure path below reads that
-        // PRE-EXISTING `MERGE_HEAD` as "this call conflicted" and runs `git merge --abort` —
-        // discarding a half-finished merge the user may have hand-resolved but not yet committed.
-        // That is the invariant in AGENTS.md ("never reset, discard"), so refuse up front.
+        // The family's shared tree precondition (C-249). For `git_merge` that is the in-flight
+        // check and deliberately NOT a clean tree — see `GIT_MERGE_TREE` for both reasons.
         //
-        // The guard is also what licenses the abort further down: reaching that path PROVES no
+        // The in-flight half is what licenses the abort further down: reaching that path PROVES no
         // merge was in progress when this call began, so the `MERGE_HEAD` seen there is one this
-        // call created and aborting it destroys nothing it did not create. Same discipline as
-        // `git_worktree_leave`, which refuses to merge into a dirty original checkout so its
-        // always-abort trial merge cannot eat someone else's work.
-        let (merge_in_flight, merge_head) =
-            run_git(&system, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
-        if merge_in_flight {
-            let (_, status) = run_git(&system, &["status", "--porcelain"]).await?;
-            return Ok(ToolResult::error(format!(
-                "git_merge: a merge is already in progress (MERGE_HEAD {merge_head}) — refusing \
-                 to start a merge of `{branch}`, and refusing to abort the one in flight because \
-                 its resolution may be uncommitted work. Conclude it (`git commit`) or abandon it \
-                 (`git merge --abort`) by hand, then retry. Working tree:\n{status}"
-            )));
+        // call created and aborting it destroys nothing it did not create.
+        if let Some(refusal) = require_tree_precondition(&system, &GIT_MERGE_TREE).await {
+            return Ok(refusal);
         }
 
         let mut argv = vec!["merge".to_string()];
@@ -2827,27 +3052,12 @@ impl Tool for GitRevertTool {
         }
         let system = ctx.system();
 
-        // Require a clean tree — DELIBERATELY stricter than git. `git revert` only refuses a dirty
-        // index, or unstaged changes to the paths it would touch; verified otherwise: an unstaged
-        // edit to an unrelated file, or an untracked file, and git reverts and commits happily.
-        // That is too permissive here, because the conflict abort below is a blanket
-        // `git revert --abort` — it needs a state it can restore without guessing which of the
-        // caller's own edits were in the tree first.
-        let (ok, status) = run_git(&system, &["status", "--porcelain"]).await?;
-        if !ok {
-            return Ok(ToolResult::error(format!(
-                "git_revert: git status failed: {status}"
-            )));
-        }
-        if !status.is_empty() {
-            // Do not say "commit or stash" alone: `status --porcelain` also reports untracked
-            // (`??`) entries, which a plain `git stash` leaves exactly where they are — an agent
-            // that followed that advice would retry and fail identically.
-            return Ok(ToolResult::error(format!(
-                "git_revert: a revert must start from a clean tree, and this checkout is not \
-                 clean. Commit or stash the tracked changes; move, remove, or `git stash -u` any \
-                 untracked (`??`) entries, which a plain `git stash` will NOT clear:\n{status}"
-            )));
+        // The family's shared tree precondition (C-249). For `git_revert` that is a clean tree —
+        // DELIBERATELY stricter than git, which only refuses a dirty index or unstaged changes to
+        // the paths it would touch — plus no revert/cherry-pick already in flight, which is what
+        // licenses the blanket `git revert --abort` below. See `GIT_REVERT_TREE`.
+        if let Some(refusal) = require_tree_precondition(&system, &GIT_REVERT_TREE).await {
+            return Ok(refusal);
         }
 
         // Never open an editor for the revert message (same reason as `git_merge`): the guarded
@@ -3627,18 +3837,10 @@ impl Tool for GitWorktreeEnterTool {
                 "git_worktree_enter: current branch is `{branch_now}`; requires `main`"
             )));
         }
-        // Preflight 3: clean checkout.
-        let (ok, status) = run_git(&system, &["status", "--porcelain"]).await?;
-        if !ok {
-            return Ok(ToolResult::error(format!(
-                "git_worktree_enter: git status failed: {status}"
-            )));
-        }
-        if !status.is_empty() {
-            return Ok(ToolResult::error(format!(
-                "git_worktree_enter: the checkout has uncommitted changes; commit or stash them \
-                 first:\n{status}"
-            )));
+        // Preflight 3: the family's shared tree precondition (C-249) — a clean checkout, and
+        // nothing mid-merge/mid-revert. See `GIT_WORKTREE_ENTER_TREE`.
+        if let Some(refusal) = require_tree_precondition(&system, &GIT_WORKTREE_ENTER_TREE).await {
+            return Ok(refusal);
         }
         // Capture `main`'s HEAD — the base the eventual merge is verified against.
         let (ok, head) = run_git(&system, &["rev-parse", "HEAD"]).await?;
@@ -3797,19 +3999,13 @@ impl Tool for GitWorktreeLeaveTool {
         let branch = session.branch.clone();
 
         if session.phase == flux_runtime::WorktreePhase::Active {
-            // (1) The worktree itself must be clean — leave never stages or commits.
+            // (1) The worktree itself must be clean — leave never stages or commits. Shared tree
+            // precondition (C-249); see `GIT_WORKTREE_LEAVE_SESSION_TREE`.
             let active = ctx.system();
-            let (ok, wt_status) = run_git(&active, &["status", "--porcelain"]).await?;
-            if !ok {
-                return Ok(ToolResult::error(format!(
-                    "git_worktree_leave: git status in the worktree failed: {wt_status}"
-                )));
-            }
-            if !wt_status.is_empty() {
-                return Ok(ToolResult::error(format!(
-                    "git_worktree_leave: the worktree has uncommitted changes; commit them first \
-                     (leave never stages or commits automatically):\n{wt_status}"
-                )));
+            if let Some(refusal) =
+                require_tree_precondition(&active, &GIT_WORKTREE_LEAVE_SESSION_TREE).await
+            {
+                return Ok(refusal);
             }
             // (2) The original `main` must be untouched since enter: still on `main`, clean, and
             // at the captured base commit. Otherwise error and stay in the worktree.
@@ -3821,12 +4017,13 @@ impl Tool for GitWorktreeLeaveTool {
                      {orig_branch}); refusing to merge — the context stays in the worktree"
                 )));
             }
-            let (ok, orig_status) = run_git(&original, &["status", "--porcelain"]).await?;
-            if !ok || !orig_status.is_empty() {
-                return Ok(ToolResult::error(format!(
-                    "git_worktree_leave: the original checkout has uncommitted changes; refusing \
-                     to merge — the context stays in the worktree:\n{orig_status}"
-                )));
+            // The original `main` must be clean, and free of a merge this call would otherwise
+            // abort: the trial merge below is ALWAYS aborted. Shared tree precondition (C-249);
+            // see `GIT_WORKTREE_LEAVE_ORIGINAL_TREE`.
+            if let Some(refusal) =
+                require_tree_precondition(&original, &GIT_WORKTREE_LEAVE_ORIGINAL_TREE).await
+            {
+                return Ok(refusal);
             }
             let (ok, orig_head) = run_git(&original, &["rev-parse", "HEAD"]).await?;
             if !ok || orig_head != session.base_commit {
@@ -7075,6 +7272,191 @@ mod tests {
             let r = call_op(&registry, &c, "git_revert", json!({"commit": bad})).await;
             assert!(r.is_error, "commit {bad:?} must be refused");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // C-249: the family's shared tree precondition
+    // -----------------------------------------------------------------------
+
+    /// A checkout dirtied in both ways at once: one tracked modification, one untracked file.
+    /// Every clean-tree refusal has to be actionable for BOTH.
+    fn dirty_both_ways(dir: &std::path::Path) {
+        std::fs::write(dir.join("base.txt"), "locally modified\n").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "untracked\n").unwrap();
+    }
+
+    /// The refusal must name the two kinds of dirtiness separately and give each a remedy that
+    /// actually clears it: `git status --porcelain` reports untracked (`??`) entries too, and a
+    /// plain `git stash` leaves those exactly where they are — so an agent told to "commit or
+    /// stash them first" retries and fails identically.
+    fn assert_actionable_dirty_refusal(content: &str) {
+        assert!(
+            content.contains("Tracked changes (1)"),
+            "the refusal counts the tracked modifications: {content}"
+        );
+        assert!(
+            content.contains("base.txt"),
+            "the refusal names the tracked file: {content}"
+        );
+        assert!(
+            content.contains("Untracked files (1)"),
+            "the refusal counts the untracked files separately: {content}"
+        );
+        assert!(
+            content.contains("scratch.txt"),
+            "the refusal names the untracked file: {content}"
+        );
+        assert!(
+            content.contains("git stash -u") && content.contains("git clean -fd"),
+            "untracked entries get advice that clears them: {content}"
+        );
+        assert!(
+            content.contains("a plain `git stash` does NOT clear these"),
+            "the refusal says why bare `git stash` is not enough: {content}"
+        );
+    }
+
+    /// C-249: `git_revert` and `git_worktree_enter` refuse a dirty tree with the SAME true
+    /// wording — one policy, one message, tracked and untracked told apart.
+    #[tokio::test]
+    async fn dirty_tree_refusals_are_reconciled_and_actionable() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+        let head = raw_git(&dir, &["rev-parse", "HEAD"]);
+        dirty_both_ways(&dir);
+
+        let revert = call_op(&registry, &c, "git_revert", json!({"commit": head})).await;
+        assert!(
+            revert.is_error,
+            "a dirty tree blocks revert: {}",
+            revert.content
+        );
+        assert_actionable_dirty_refusal(&revert.content);
+
+        let enter = call_op(&registry, &c, "git_worktree_enter", json!({})).await;
+        assert!(
+            enter.is_error,
+            "a dirty tree blocks enter: {}",
+            enter.content
+        );
+        assert_actionable_dirty_refusal(&enter.content);
+        assert!(c.workspace_context().worktree_session().is_none());
+
+        // Nothing was created on either refusal, and the caller's work is untouched.
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), head);
+        assert_eq!(raw_git(&dir, &["branch", "--list", "flux/worktree/*"]), "");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            "locally modified\n"
+        );
+        assert!(dir.join("scratch.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-249: the clean-tree precondition is scoped to what is actually dangerous. `git_merge`
+    /// declares `CleanTree::NotRequired` — git refuses a merge that would overwrite local changes
+    /// and unrelated edits survive `merge --abort` — so it must NOT grow a reflexive dirty-tree
+    /// refusal, which would break the multi-author case `git_stage_hunks` exists to serve.
+    #[tokio::test]
+    async fn git_merge_still_works_on_a_dirty_tree() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        raw_git(&dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("side.txt"), "side\n").unwrap();
+        raw_git(&dir, &["add", "side.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "side"]);
+        raw_git(&dir, &["checkout", "-q", "main"]);
+
+        // Uncommitted work on unrelated paths, of both kinds.
+        dirty_both_ways(&dir);
+
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "side", "no_ff": true}),
+        )
+        .await;
+        assert!(
+            !r.is_error,
+            "a dirty tree must not block an otherwise safe merge: {}",
+            r.content
+        );
+        assert!(dir.join("side.txt").exists(), "the merge landed");
+        // And the caller's uncommitted work is exactly as it was.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            "locally modified\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "untracked\n"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-249 generalises C-238's merge invariant to the whole family: a `git revert` already in
+    /// flight belongs to whoever started it. `git_revert`'s failure path ends in a blanket
+    /// `git revert --abort`, so it must refuse up front rather than abort a hand-resolved,
+    /// uncommitted revert — the same hazard `git_merge` was fixed for.
+    #[tokio::test]
+    async fn git_revert_refuses_when_a_revert_is_already_in_progress() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // Two stacked edits to the same line: reverting the first conflicts with the second.
+        std::fs::write(dir.join("base.txt"), "v1\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "v1"]);
+        let first = raw_git(&dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("base.txt"), "v2\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "v2"]);
+        let second = raw_git(&dir, &["rev-parse", "HEAD"]);
+
+        // The USER starts that revert by hand, hits the conflict, and resolves it WITHOUT
+        // committing — exactly the state a blanket abort would destroy.
+        let (reverted, _) = raw_git_try(&dir, &["revert", "--no-edit", &first]);
+        assert!(!reverted, "the setup revert is supposed to conflict");
+        const RESOLVED: &str = "carefully hand-resolved content\n";
+        std::fs::write(dir.join("base.txt"), RESOLVED).unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        let user_revert_head = std::fs::read_to_string(dir.join(".git/REVERT_HEAD")).unwrap();
+
+        let r = call_op(&registry, &c, "git_revert", json!({"commit": second})).await;
+
+        // THE INVARIANT: the user's uncommitted resolution, and their revert, both survive.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            RESOLVED,
+            "the hand-resolved, uncommitted revert must survive; op said: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/REVERT_HEAD")).unwrap(),
+            user_revert_head,
+            "the in-flight revert must not be aborted"
+        );
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), second);
+        assert!(r.is_error, "refusal is a recoverable error: {}", r.content);
+        assert!(
+            r.content.contains("already in progress"),
+            "the error explains a revert is in flight: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("conflicted"),
+            "it must not claim this call's revert conflicted — it never started: {}",
+            r.content
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -67,6 +67,37 @@ fn short(sha: &str) -> &str {
 /// revert is exact). Erroring here aborts the flow — the safety floor for the autonomous loop.
 pub struct GitSnapshotTool;
 
+/// The dirty-tree refusal wording, reconciled with the guarded `git_*` family (C-249; the shared
+/// policy and helper live in `flux-tools`, which this crate deliberately does not depend on).
+///
+/// `git status --porcelain` reports untracked (`??`) entries alongside tracked ones, and a plain
+/// `git stash` leaves untracked files exactly where they are — so "commit or stash first" is advice
+/// the caller cannot follow, and an agent that follows it retries and fails identically. Split the
+/// two and give each the remedy that actually clears it.
+fn dirty_tree_refusal(op: &str, because: &str, status: &str) -> String {
+    let (untracked, tracked): (Vec<&str>, Vec<&str>) = status
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .partition(|l| l.starts_with("??"));
+    let mut body = String::new();
+    if !tracked.is_empty() {
+        body.push_str(&format!(
+            "\nTracked changes ({}) — `git commit` or `git stash` clears these:\n{}",
+            tracked.len(),
+            tracked.join("\n")
+        ));
+    }
+    if !untracked.is_empty() {
+        body.push_str(&format!(
+            "\nUntracked files ({}) — a plain `git stash` does NOT clear these; use \
+             `git stash -u`, `git clean -fd`, or move them aside:\n{}",
+            untracked.len(),
+            untracked.join("\n")
+        ));
+    }
+    format!("{op}: refusing — this checkout has uncommitted changes, and {because}.{body}")
+}
+
 /// Arguments for the `git_snapshot` op (none).
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -87,8 +118,12 @@ impl Tool for GitSnapshotTool {
         let head = git(ctx, &["rev-parse", "HEAD"]).await?;
         let status = git(ctx, &["status", "--porcelain"]).await?;
         if !status.is_empty() {
-            return Ok(ToolResult::error(format!(
-                "refusing to operate on a dirty working tree — commit or stash first:\n{status}"
+            return Ok(ToolResult::error(dirty_tree_refusal(
+                "git_snapshot",
+                "the snapshot is the exact point `git_reset` restores the round to, so work that \
+                 is not committed here is indistinguishable from the round's own changes and \
+                 would be discarded with them",
+                &status,
             )));
         }
         json_result(
@@ -327,6 +362,52 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok, "command failed: {args:?}");
+    }
+
+    /// C-249: `git_snapshot` shares the guarded family's dirty-tree refusal wording — tracked and
+    /// untracked told apart, each with a remedy that actually clears it. "commit or stash first"
+    /// is unactionable for the `??` entries `git status --porcelain` also reports.
+    #[tokio::test]
+    async fn git_snapshot_refusal_separates_tracked_from_untracked() {
+        let dir = crate::util::unique_temp_dir("flux-snapshot-test").unwrap();
+        std::fs::write(dir.join("tracked.rs"), "fn main() {}\n").unwrap();
+        sh(&dir, &["git", "init", "-q"]);
+        sh(&dir, &["git", "config", "user.email", "a@b.c"]);
+        sh(&dir, &["git", "config", "user.name", "t"]);
+        sh(&dir, &["git", "add", "-A"]);
+        sh(&dir, &["git", "commit", "-qm", "init"]);
+
+        let ctx = ToolContext::new(std::sync::Arc::new(System::new(
+            Workspace::new(&dir).unwrap(),
+        )));
+        // Clean: a snapshot is taken.
+        let ok = GitSnapshotTool.execute(&ctx, json!({})).await.unwrap();
+        assert!(!ok.is_error, "{}", ok.content);
+
+        // Dirty in both ways at once.
+        std::fs::write(dir.join("tracked.rs"), "fn main() { /* edited */ }\n").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "untracked\n").unwrap();
+        let r = GitSnapshotTool.execute(&ctx, json!({})).await.unwrap();
+        assert!(r.is_error, "a dirty tree is refused: {}", r.content);
+        assert!(
+            r.content.contains("Tracked changes (1)") && r.content.contains("tracked.rs"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains("Untracked files (1)") && r.content.contains("scratch.txt"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content
+                .contains("a plain `git stash` does NOT clear these")
+                && r.content.contains("git stash -u")
+                && r.content.contains("git clean -fd"),
+            "untracked entries get advice that clears them: {}",
+            r.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
