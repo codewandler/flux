@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-07-30
+
 ### New
 
 - Flows can now create a branch, merge it, and undo a merge. Together with the existing stage, commit
