@@ -46,7 +46,7 @@ export default function prismIncludeLanguages(PrismObject) {
       alias: 'important',
     },
     keyword:
-      /\b(?:flow|op|permissions|agent|channel|datasource|trigger|journey|goal|when|else|unless|match|route|case|default|fallback|branch|parallel|each|in|repeat|loop|seq|retry|timeout|budget|with_tools|assert|return|until|ctx|include|exclude|purpose|do|backoff|delay|for|every|flat|secret|description|risk|idempotency|effects|limits|expose|view|memo|once|checkpoint|await|confirm|throttle|debounce|verify|peek|try|catch|race|scope|saga|pipe|thing|finally|step|undo|per|contains)\b/,
+      /\b(?:flow|op|permissions|agent|channel|datasource|trigger|journey|goal|when|else|unless|match|route|case|default|fallback|branch|parallel|each|in|repeat|loop|seq|retry|timeout|budget|with_tools|assert|return|until|ctx|include|exclude|purpose|do|backoff|delay|for|every|flat|secret|description|risk|idempotency|effects|limits|expose|view|memo|once|checkpoint|await|confirm|throttle|debounce|verify|peek|try|catch|race|scope|saga|pipe|thing|finally|step|undo|per|max|wait|contains)\b/,
     variable: /\$[a-z_][a-z0-9_]*(?:\.[A-Za-z0-9_]+)*/,
     boolean: /\b(?:true|false|null)\b/,
     number: /\b\d+(?:\.\d+)?\b/,

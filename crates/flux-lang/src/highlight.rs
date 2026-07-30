@@ -15,6 +15,7 @@
 use crate::parser::parse_cst;
 use crate::syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::TextRange;
+use std::collections::BTreeSet;
 
 /// The visual class of one source token, named for what the token *is*, not for a colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -225,6 +226,30 @@ fn keyword_leads(kind: SyntaxKind) -> bool {
             | K::PIPE_STMT
             | K::PEEK_EXPR
     )
+}
+
+/// Every canonical header-option label (L-96) that `src` contains, as **the highlighter itself**
+/// classifies it: a token inside a [`SyntaxKind::HEADER_OPTION`] that [`option_class`] calls a
+/// [`HighlightClass::Keyword`].
+///
+/// This is the option-label vocabulary the editor grammars owe a mirror, and it is derived by
+/// running the classifier rather than by restating its rule — a second copy of "the label is the
+/// first `IDENT`" would agree with itself, not with the highlighter. Consumer:
+/// `tests/named_option_headers.rs`, which asserts the website's Prism grammar lists every label
+/// the canonical corpus spells.
+pub fn header_option_labels(src: &str) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    for node in parse_cst(src).syntax().descendants() {
+        if node.kind() != SyntaxKind::HEADER_OPTION {
+            continue;
+        }
+        for tok in node.children_with_tokens().filter_map(|el| el.into_token()) {
+            if option_class(&tok, &node) == HighlightClass::Keyword {
+                labels.insert(tok.text().to_string());
+            }
+        }
+    }
+    labels
 }
 
 /// Is the next non-trivia sibling of `name` a `:`? (Distinguishes a named-arg label from a bare
