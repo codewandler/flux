@@ -8,6 +8,40 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A Flux-Lang program can now curate a release, with the host owning every irreversible decision
+  (C-251, partial — the story stays open).** `examples/release.flux` reads ground truth from git, has a
+  `release-scribe` role draft both changelogs, and drives the existing `cut-release.sh`; four new ops
+  back it (`release_plan`, `release_cut`, `release_verify_versions`, `changelog_insert`), documented in
+  both the ops reference and the website catalog.
+  **The authority split is the point, and it was verified rather than asserted.** The *host* derives the
+  version from commit titles by regex — nothing parses a version out of the model reply, and a scribe
+  asking for a different bump provably does not move it. An unbumped protocol-line crate halts the flow
+  before anything is written. The flow is transactional and re-runnable: a second run on an
+  already-released SHA is a no-op, and a red gate leaves no tag and no phantom changelog section.
+  `cargo publish` is reachable by **no** automated path — the workflow is dispatch-only with
+  `contents: read` and no registry token, `release_cut` has fixed argv, and `cut-release.sh` only echoes
+  the push instructions. The program's own authority is bounded by its *op set* rather than by prose: its
+  compiled ops were extracted independently, so adding `bash`, `proc.run` or a general write to it fails
+  a guard test.
+  **What is NOT delivered, so the merged state is not mistaken for the whole story:** there is no `push`
+  trigger, no tag push and no GitHub release creation — cutting still requires a human dispatch, which is
+  the right first step, since an unattended auto-cut is the hazard C-252 was just fixed to avoid. And
+  `.flux/policies/release.toml` is currently **decorative**: nothing loads it, so there is no
+  path-scoped policy floor at runtime (`default_local_grants()` already grants `workspace.write` on
+  `path: "*"`). The structural refusal comes from the op set, which is stronger — but the story's "refused
+  by policy" wording is wrong as written and is recorded as such.
+
+### Fixed
+
+- **Two artifacts the release flow depends on were gitignored, which would have reddened `ci` on `main`
+  (C-251).** `.flux/agents/release-scribe.md` and `.flux/policies/release.toml` were excluded by
+  `.gitignore`, so the tests that read them passed only because untracked files sat beside them in one
+  worktree, and `task({role: "release-scribe"})` would have failed closed with `unknown role` in every
+  other checkout — the feature was inert everywhere but the machine that wrote it. Fixed with narrow
+  negations following the same precedent that tracked the reviewer roles, verified to leave `.flux/plans/`,
+  `.flux/state.json` and scratch roles/policies still ignored, and proven from the commit itself via
+  `git archive | tar -x` into a clean directory rather than from a working tree.
+
 - **Delegated work is now visible while it runs, instead of only when it finishes (C-246).**
   `SpawnActivitySink` shipped in A-79 and **nothing ever installed it**, so a running fleet produced no
   observable activity at all. The CLI sink now carries a `⚇ fleet · …` status line built from a new

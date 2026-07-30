@@ -2,7 +2,7 @@
 id: C-251
 title: "Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version"
 pillar: Core
-status: in-progress
+status: ready
 priority: 10
 areas: [flux-cli, flux-tools, ci]
 note: "flux automating its own release is the most honest dogfood there is; the load-bearing decision is that the MODEL writes prose and the HOST does version math, because a wrong version on crates.io is irreversible"
@@ -55,12 +55,12 @@ run loudly rather than silently changing the number.
       loudly with the reason. **Failing-first test**: the program's offline journey — a fixture repo
       with a known commit log, a stub model, and no network — produces the expected version, the
       expected two changelog sections, and a tag; and produces **no tag** when the gate is red.
-- [ ] The version is derived by the host from commit titles (`!` / `BREAKING`), never from model
+- [x] The version is derived by the host from commit titles (`!` / `BREAKING`), never from model
       output. A test pins: a log containing `feat(x)!:` yields `minor`; a log of only `fix:`/`docs:`
       yields `patch`; and a model reply asking for a different bump does **not** change it.
-- [ ] `scripts/check-crate-versions.sh` failing **halts the flow before any tag exists**, with the
+- [x] `scripts/check-crate-versions.sh` failing **halts the flow before any tag exists**, with the
       protocol-line crate named. Pinned by a test.
-- [ ] The model's prose is inserted under `[Unreleased]` deterministically by the host, and
+- [x] The model's prose is inserted under `[Unreleased]` deterministically by the host, and
       `website/docs/whats-new.md` is regenerated in the **same commit** — the mirror is a tested input
       (`website_customer_changelog_is_in_sync`), so a bare `WHATS-NEW.md` edit is a red gate.
 - [ ] The program runs under a **narrow, explicit authorization**: write authority path-scoped to
@@ -69,10 +69,10 @@ run loudly rather than silently changing the number.
       prompt. Pinned by a test that has the model try.
 - [ ] The smoke test runs in CI against a cheap OpenRouter model (`FLUX_SMOKE_MODEL`), and its
       failure blocks the cut. Legs whose credential is absent SKIP rather than fail.
-- [ ] The flow is idempotent and re-runnable: a second run on an already-released SHA is a no-op, and
+- [x] The flow is idempotent and re-runnable: a second run on an already-released SHA is a no-op, and
       a failed run leaves **no** partially-rolled changelog (the C-147 transactionality property that
       `cut-release.sh` already has must not be lost by wrapping it).
-- [ ] Standard gate green in both workspaces.
+- [x] Standard gate green in both workspaces.
 
 ## First draft of the `.flux` part
 
@@ -173,6 +173,46 @@ after it does `git push origin main`, runs the candidate build, verifies
 means a bug in the program cannot publish.
 
 ## Progress
+- 2026-07-30 — **the foundation is merged and this story stays `ready` for the rest.** Recovered as an
+  orphan after a coordinating session crash killed its implementor mid-task; branch preserved verbatim,
+  reviewed independently, four blocking findings discharged, then integrated.
+  **Ticked (2, 3, 4, 7, 8) — each with a named test:** the host derives the bump and the model cannot
+  move it (`a_breaking_title_derives_a_minor_bump`,
+  `a_scribe_asking_for_a_different_bump_does_not_change_the_number`); an unbumped protocol-line crate
+  halts before anything is written (`an_unbumped_protocol_line_crate_halts_before_anything_is_written`);
+  the host inserts the prose (`an_applied_run_inserts_the_prose_and_produces_exactly_one_new_tag`); and
+  the flow is re-runnable and transactional (`a_second_run_on_an_already_released_sha_is_a_no_op`,
+  `a_red_gate_in_the_cut_leaves_no_tag_and_no_phantom_version_section`). Gate green on the integration
+  branch.
+  **Item 1 — NOT met, deliberately.** `.github/workflows/release-flow.yml` is `workflow_dispatch` only,
+  `permissions: contents: read`, `apply` defaulting to false. No `push:` trigger, no tag push, no
+  GitHub release. This is the right first step rather than a shortfall: an unattended auto-cut is the
+  hazard C-252 was just fixed to avoid, and this posture cannot push a tag at all, so it can never
+  produce a remote Release-less tag. Remaining work is the trigger and the promotion path.
+  **Item 5 — NOT met, and the wording needs correcting when it is picked up.** `.flux/policies/release.toml`
+  is **decorative**: no crate, script, workflow or program loads it — the only references anywhere are the
+  three lines in `release_authority.rs` that read and parse it, so
+  `the_checked_in_release_policy_grants_exactly_the_three_changelogs_and_two_scripts` verifies a *document
+  against constants*, not runtime enforcement. There is no path-scoped policy floor at runtime, because
+  `flux-cli` composes `[[policy.grants]]` additively on top of `default_local_grants()`, which already
+  grants `workspace.write` on `path: "*"`. What *does* refuse structurally is the **op set** — fixed-argv
+  process ops, `changelog_insert`'s canonicalized allow-list, and `tools: []` on the role — and that is
+  genuinely stronger than a policy rule, since no policy composition can widen it. So "refused
+  structurally by policy" should be reworded to credit the op set, or a real path-scoped floor should be
+  installed. Do not read the merged state as having a policy floor.
+  **Item 6 — NOT met/unverified.** No CI smoke leg against `FLUX_SMOKE_MODEL` exists yet, and the
+  workflow cannot be verified end to end here (it needs a credential and a dispatch). One `apply: false`
+  dispatch would settle it now that the role file is tracked.
+  **The blocking find worth remembering:** `.flux/agents/release-scribe.md` and
+  `.flux/policies/release.toml` were gitignored and untracked, so two tests passed only because untracked
+  files sat beside them in the implementor's worktree, and `task({role: "release-scribe"})` would have
+  failed closed with `unknown role` in every other checkout — the feature was inert and the gate would
+  have gone red on `main`. Fixed with narrow `.gitignore` negations following the L-14 precedent, and
+  proven from the commit via `git archive | tar -x` into a clean directory rather than from the working
+  tree. `.flux/plans/`, `.flux/state.json` and scratch roles/policies remain ignored.
+  Also noted, not fixed: `PERMITTED_OPS` lists `fmt`/`jq`/`expr`, which never appear in the collected op
+  set, and neither guard test asserts the set is non-empty — so a future AST-serialization change could
+  defang both silently.
 - **Shipped (2026-07-30).** The Flux-Lang program (`examples/release.flux`) plus its host half
   (`crates/flux-eval/src/release.rs`): `derive_bump` reads the bump from commit titles by regex and
   nothing reads a version back out of a model reply, so the version decision never leaves the host.

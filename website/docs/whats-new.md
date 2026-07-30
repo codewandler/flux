@@ -14,6 +14,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Release notes can be drafted by a model without letting it decide the release.** A flux program can
+  now read a project's commit history, have a model write both the engineering and the customer-facing
+  changelog prose, and run the release — while the version number itself is worked out from the commit
+  titles, not from anything the model says. A model asking for a different version cannot change it. If
+  the run is interrupted or a check fails, nothing is left half-written and no version is tagged.
+  Publishing still requires a person to start it.
+
 - **You can see what delegated helpers are doing while they work.** When flux hands work to helper
   agents, a status line now shows each one's role, how long since it last did anything, and whether it
   is working or stuck. Previously a delegated run was silent until it finished, so a wedged helper
