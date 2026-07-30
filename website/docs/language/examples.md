@@ -166,6 +166,32 @@ Everything here is ordinary language surface: `parallel` fan-out, a bounded `rep
 `until` guard, nested `when`/`else`, and every op — including the sub-agent `task` calls —
 crossing the safety envelope.
 
+## A third-party workflow: Zendesk triage
+
+[`examples/zendesk.triage.flux`](https://github.com/codewandler/flux/blob/main/examples/zendesk.triage.flux)
+is a multi-flow module with four one-shot entrypoints. Authored control flow owns retry, concurrency,
+timeouts, context budgets, and fallback; the model only analyzes bounded ticket evidence.
+
+:::note The backing integration is being replaced
+The `zendesk` plugin these flows call was removed before its first release, pending a flux-connectors
+interop layer, so the commands below cannot run yet. The module is kept as a worked example of the
+authored-control-flow shape — which is what this page is illustrating — and its `zendesk.*` operation
+names are the part expected to change.
+:::
+
+```bash
+flux run examples/zendesk.triage.flux --entry setup --yes
+flux run examples/zendesk.triage.flux --entry triage \
+  --arg 'query=type:ticket status:new' --yes
+flux run examples/zendesk.triage.flux --entry brief --arg ticket_id=12345 --yes
+flux run examples/zendesk.triage.flux --entry eod \
+  --arg 'query=type:ticket updated>24hours' --yes
+```
+
+The module is read-only: no write operation is reachable from any entrypoint, and the replacement
+integration is expected to keep writes separately approval-gated rather than reachable here. Provider
+failure falls back to the gathered response instead of losing the deterministic work.
+
 ## Going further
 
 - The repository ships runnable examples in

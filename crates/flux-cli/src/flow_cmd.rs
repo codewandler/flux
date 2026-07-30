@@ -92,6 +92,7 @@ pub(super) async fn run_render_in(
     Ok(())
 }
 
+#[derive(Debug)]
 pub(super) struct LoadedCliFlow {
     pub(super) ast: flux_flow::ast::DraftAst,
     pub(super) composites: Vec<flux_lang::program::CompositeOpDecl>,
@@ -138,6 +139,90 @@ pub(super) fn parse_cli_flow_source(label: &str, source: &str) -> Result<LoadedC
             })
         }
     }
+}
+
+/// Parse `label` and select one authored top-level flow by name. Unlike `flux flow run`, this mode
+/// intentionally accepts a program containing several flows: `flux run file.flux --entry name`
+/// makes the selection explicit. Journeys remain app-level orchestration and are not entrypoints.
+pub(super) fn parse_cli_flow_entry_source(
+    label: &str,
+    source: &str,
+    entry: &str,
+) -> Result<LoadedCliFlow> {
+    let parsed = if source.trim_start().starts_with('{') {
+        let ast: flux_flow::ast::DraftAst = serde_json::from_str(source)
+            .with_context(|| format!("parse {label} as a Flux-Lang DraftAst (JSON)"))?;
+        if ast.name.as_deref() != Some(entry) {
+            bail!(
+                "flow entrypoint `{entry}` was not found in {label}; available flow: {}",
+                ast.name.as_deref().unwrap_or("<unnamed>")
+            );
+        }
+        return Ok(LoadedCliFlow {
+            ast,
+            composites: Vec::new(),
+        });
+    } else {
+        flux_lang::program::Module::parse_str(source)
+            .map_err(|e| anyhow::anyhow!("parse {label} as Flux-Lang text: {e}"))?
+    };
+
+    match parsed {
+        flux_lang::program::Module::Flow(ast) if ast.name.as_deref() == Some(entry) => {
+            Ok(LoadedCliFlow {
+                ast,
+                composites: Vec::new(),
+            })
+        }
+        flux_lang::program::Module::Flow(ast) => bail!(
+            "flow entrypoint `{entry}` was not found in {label}; available flow: {}",
+            ast.name.as_deref().unwrap_or("<unnamed>")
+        ),
+        flux_lang::program::Module::Program(program) => {
+            let available = program
+                .flows
+                .iter()
+                .filter_map(|flow| flow.name.as_deref())
+                .collect::<Vec<_>>();
+            let Some(ast) = program
+                .flows
+                .iter()
+                .find(|flow| flow.name.as_deref() == Some(entry))
+                .cloned()
+            else {
+                let names = if available.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    available.join(", ")
+                };
+                bail!(
+                    "flow entrypoint `{entry}` was not found in {label}; available flows: {names}"
+                );
+            };
+            Ok(LoadedCliFlow {
+                ast,
+                composites: program.ops,
+            })
+        }
+    }
+}
+
+/// Validate the positional shape of `flux run <file.flux> --entry <flow>` before provider/session
+/// construction. Flow values belong to `--inputs`/`--arg`; accepting trailing prompt words would
+/// otherwise make a typo look like model input on a deterministic path.
+pub(super) fn named_entry_target<'a>(prompt: &'a [String], entry: &str) -> Result<&'a str> {
+    let Some(target) = prompt.first() else {
+        bail!("`flux run --entry {entry}` needs a `.flux` program path");
+    };
+    if !target.ends_with(".flux") {
+        bail!("`--entry` requires a `.flux` program path, got `{target}`");
+    }
+    if prompt.len() != 1 {
+        bail!(
+            "`flux run <file.flux> --entry <flow>` accepts exactly one program path; pass flow values with --inputs or --arg"
+        );
+    }
+    Ok(target)
 }
 
 /// Resolve the positional target as a real file first, then as a saved-flow filename stem or
@@ -600,6 +685,25 @@ pub(super) async fn run_flow(
     .await
 }
 
+/// Run one explicitly selected top-level flow through the same authorization, approval, guarded IO,
+/// validation, and audit path as `flux flow run`. Selection and deterministic input validation are
+/// completed before the provider/session runtime is constructed.
+pub(super) async fn run_flow_entry(
+    target: &str,
+    entry: &str,
+    inputs: Option<String>,
+    args: Vec<String>,
+    flags: &AgentFlags,
+) -> Result<()> {
+    let source = std::fs::read_to_string(target).with_context(|| format!("read flow {target}"))?;
+    let LoadedCliFlow {
+        mut ast,
+        composites,
+    } = parse_cli_flow_entry_source(target, &source, entry)?;
+    prepare_cli_flow_inputs(&mut ast, inputs.as_deref(), &args, None)?;
+    run_draft_ast_with_composites(flags, &ast, &composites).await
+}
+
 /// Execute a pre-built `DraftAst` through the full envelope — the shared core behind both
 /// `flux flow run <name|file>` and `flux preset <name> --run`. Builds the agent, validates the flow
 /// against the live op registry, previews risk + installs the per-op approver, runs it, and prints the
@@ -1001,5 +1105,84 @@ pub(super) fn print_diagnostics(diags: &[flux_flow::analyze::Diagnostic]) {
     eprintln!("{}", style::yellow(header));
     for d in diags {
         eprintln!("{}", style::dim(&format!("  - {}", d.message)));
+    }
+}
+
+#[cfg(test)]
+mod named_entry_tests {
+    use super::*;
+
+    const MULTI_FLOW: &str = r#"
+flow setup() -> String
+  return "ready"
+
+flow triage(query: String) -> String
+  return $query
+"#;
+
+    #[test]
+    fn named_entry_selects_one_flow_from_a_multi_flow_program() {
+        let loaded = parse_cli_flow_entry_source("example.flux", MULTI_FLOW, "triage")
+            .expect("select triage");
+        assert_eq!(loaded.ast.name.as_deref(), Some("triage"));
+        assert_eq!(loaded.ast.params[0].name.0, "query");
+    }
+
+    #[test]
+    fn named_entry_rejects_an_unknown_flow_with_available_names() {
+        let err = parse_cli_flow_entry_source("example.flux", MULTI_FLOW, "missing")
+            .expect_err("unknown entrypoint must fail before runtime construction");
+        let message = err.to_string();
+        assert!(message.contains("missing"), "{message}");
+        assert!(
+            message.contains("setup") && message.contains("triage"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn named_entry_rejects_missing_non_flux_and_trailing_targets() {
+        assert!(named_entry_target(&[], "triage").is_err());
+        assert!(named_entry_target(&["prompt".into()], "triage").is_err());
+        let err = named_entry_target(
+            &["workflow.flux".into(), "accidental prompt".into()],
+            "triage",
+        )
+        .expect_err("trailing prompt must be rejected");
+        assert!(err.to_string().contains("exactly one program path"));
+    }
+
+    #[test]
+    fn zendesk_reference_exposes_four_read_only_entrypoints() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/zendesk.triage.flux");
+        let source = std::fs::read_to_string(&path).expect("read Zendesk reference workflow");
+        for entry in ["setup", "triage", "brief", "eod"] {
+            let loaded = parse_cli_flow_entry_source("zendesk.triage.flux", &source, entry)
+                .unwrap_or_else(|error| panic!("select `{entry}`: {error}"));
+            let mut calls = Vec::new();
+            flux_lang::analyze::for_each_node(&loaded.ast.body, &mut |node| {
+                if let flux_flow::ast::Node::Call { op, .. } = node {
+                    calls.push(op.clone());
+                }
+            });
+            assert!(
+                calls.iter().any(|op| op.starts_with("zendesk.")),
+                "`{entry}` should call Zendesk: {calls:?}"
+            );
+            assert!(
+                calls.iter().all(|op| !matches!(
+                    op.as_str(),
+                    "zendesk.ticket.update"
+                        | "zendesk.ticket.comment.add"
+                        | "zendesk.ticket.tag.add"
+                )),
+                "reference entry `{entry}` must remain read-only: {calls:?}"
+            );
+        }
+
+        for kind in ["retry", "parallel", "timeout", "fallback", "ctx"] {
+            assert!(source.contains(kind), "example should demonstrate `{kind}`");
+        }
     }
 }
