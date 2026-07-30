@@ -145,6 +145,13 @@ Browser confinement instead stays as it was before this epic: an env-cleared spa
 interception (the SSRF guard applied to everything the browser fetches). Sandboxing the browser
 process itself is a candidate follow-up, not solved here.
 
+**Building a plugin from source** (`flux plugin install --git …`) is the other trusted-host exemption:
+`git clone`/`fetch` and the cargo registry fetch + build need the host toolchain and network, so those
+steps skip the OS child sandbox. Argv-only execution and the cleared, allow-listed environment stay
+intact, and the clone runs under a `System` rooted at the clone directory rather than a cwd override.
+This is an operator-initiated install of code you chose to trust, never a model-reachable path — a
+plugin installed from the signed pack does not go through it.
+
 The **terminal-bench rebuild step** remains a trusted-host exemption: it runs a fixed `cargo build`
 only when the operator enables `FLUX_TERMINAL_BENCH_REBUILD`, and may need the host toolchain and
 network. Model-facing eval input cannot enable it or select its dataset, `tb` executable, Python

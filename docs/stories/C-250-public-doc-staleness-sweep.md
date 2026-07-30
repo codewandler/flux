@@ -2,7 +2,7 @@
 id: C-250
 title: "Public docs describe a product that has moved — sweep for staleness and keep the enumerations honest"
 pillar: Core
-status: ready
+status: in-progress
 priority: 9
 areas: [website]
 note: "the published board pages listed seven generated ops when the code shipped nine, within hours of the change — closed enumerations in public docs rot silently because nothing tests them"
@@ -35,17 +35,61 @@ appear in it at all.
       rename, naming the hazard that the old call *still looks valid* while doing something different.
 - [x] The `board.query` row enumeration is complete — it listed eight fields while `item_row` emits
       nine, omitting `attempts`, next to a sentence asserting "every row carries every field".
-- [ ] Sweep the **remaining** public surface not yet covered: `README.md`, `docs/usage.md`, and the
+- [x] Sweep the **remaining** public surface not yet covered: `README.md`, `docs/usage.md`, and the
       rest of `website/docs/**` beyond the board/ops pages.
-- [ ] Decide whether the closed enumerations that caused this are worth pinning. A doc listing "the
+- [x] Decide whether the closed enumerations that caused this are worth pinning. A doc listing "the
       N generated board ops" cannot be checked by `website_contract` today because generated
       datasource ops never enter the builtin catalog it walks. Either pin them or state why prose that
       cannot be tested is acceptable there — the point is that the choice becomes deliberate.
+      **Decision: pinned.** The premise was half right — generated ops really are absent from the
+      builtin catalog, but `work_board_tools` and `MemoryBoard` are both public, so a test can
+      *generate* the list instead of walking a registry. See the Progress note.
 - [x] Standard gate green (the two suites that pin `ops.md` against the registry:
       `flux-cli --test website_contract` 18/18, `flux-tools --test toolspec_invariants` 5/5, plus
       `flux-lang --test website_in_sync` 3/3).
 
 ## Progress
+- 2026-07-30 — **second pass: the rest of `website/docs/**`, and the enumerations are now pinned.**
+
+  **The pin.** `board_pages_enumerate_every_generated_board_operation_and_query_row_field`
+  (`crates/flux-cli/tests/website_contract.rs`) calls `work_board_tools("board", MemoryBoard::new())`
+  and reads the op names *and* the `board.query` row fields off `Tool::spec`, then requires
+  `fleet.md`/`datasources.md` to name every one. Proved it has teeth the way the blog commit did:
+  deleting two ops from `fleet.md` fails naming `board.reassign`/`board.record_evidence`; deleting one
+  row field fails naming `attempts` — i.e. it reproduces both historical defects. Row fields are
+  asserted on `fleet.md` only, because `datasources.md` links to it instead of keeping a second copy.
+  This story's own earlier ticks were **already stale** when this pass started: C-240 took the
+  generated ops from nine to eleven. The pages had been updated; nothing had checked them.
+
+  **What the sweep found.** Verified corrections landed across 25 pages. The highest-consequence ones:
+  a `[private_net] web_fetch` key documented as "ignored" that actually *refuses to load the config*
+  (`deny_unknown_fields`); `opus` documented as `claude-opus-4-8` when it resolves to `claude-opus-5`;
+  a `fleet.md` "Current limits" bullet still saying board ops return only text, contradicting the same
+  file's own `board.query` section; the board state machine given as four states when seven ship; a
+  quoted server-refusal error string that exists nowhere in the tree; MSRV 1.85 when `rust-version` is
+  1.87; `AgentEvent` claimed to mirror `AgentSink` "one-to-one" while `tool_timing` has no variant; and
+  three `.flux`-is-not-JSON / `$`-sigil-is-mandatory / "exactly one calling convention" claims that
+  L-93 falsified hours earlier.
+
+  **Method, so it is repeatable.** Four parallel read-only audits, one per doc area, each required to
+  cite a **non-doc** `file:line` for every claimed correction — two docs agreeing was explicitly not
+  evidence. Then every finding re-verified here against the tree before editing. That caught one of my
+  own edits: I wrote "read the 1h cache tier from the usage endpoints instead", then found those
+  endpoints share the same `usage_json` and omit it too.
+
+  **Deliberately not done.** L-93 made the compact form canonical and left the whole example corpus in
+  the older `$`-sigil spelling. Those snippets still parse (`complete_flux_fences…` bans only `let`),
+  so they are not *false*; migrating the corpus is a separate story. The pages that *claimed* the old
+  spelling was mandatory or canonical were corrected, and `tour.md`'s "Every snippet uses current
+  syntax" was softened to what is true. Also left: the four `flux plugin status` sample outputs, whose
+  pack version (0.1.4 now) and `op(s)` counts are both stale — the counts include a host-injected
+  `plugin.validate`, so getting them right needs the plugin binaries built and run, not read.
+
+  Gate: `cargo test --workspace` 167 suites all green, `cargo clippy --workspace --all-targets
+  -D warnings` clean, `cargo fmt --all --check` clean, `cargo test -p flux-codegate` green,
+  `website_contract` 19/19, `website_in_sync` 3/3, and `npm run build` exit 0 with
+  `onBrokenLinks`/`onBrokenAnchors` at `throw` — which is what proves the two anchors this pass added
+  resolve.
 - 2026-07-30 — **first pass merged.** Left `ready` rather than `done`: the four ticked items shipped,
   the remaining public surface (`README.md`, `docs/usage.md`, the rest of `website/docs/**`) and the
   decision about pinning enumerations are still open.

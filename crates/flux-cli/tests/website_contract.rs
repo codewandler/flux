@@ -1135,3 +1135,68 @@ fn os_sandbox_page_exists_and_states_its_key_claims() {
         "must document the browser exemption"
     );
 }
+
+/// C-250: the enumeration that has now rotted twice — the board pages listed **seven** generated ops
+/// while the code generated nine (C-236's `query`/`comments`), then nine while it generated eleven
+/// (C-240's `reassign`/`record_evidence`). Both times the docs went stale within hours and nothing
+/// went red, because a board's ops are *generated per backend* and never enter the builtin catalog
+/// `operations_reference_covers_the_registered_public_catalog` walks.
+///
+/// The generator is public, though, so the list can be read off the code rather than retyped: the
+/// same discipline that keeps the op names in that test honest applies here. Read the names and the
+/// `query` row fields off `Tool::spec`, so adding an op or a row field is a red test rather than a
+/// silent documentation gap.
+#[test]
+fn board_pages_enumerate_every_generated_board_operation_and_query_row_field() {
+    let tools = flux_capabilities::work_board_tools(
+        "board",
+        Arc::new(flux_capabilities::MemoryBoard::new()),
+    )
+    .expect("the in-memory board satisfies its own contract");
+    let names: Vec<String> = tools.iter().map(|tool| tool.spec().name).collect();
+
+    // The typed `query` rows are the half a Program consumes as data, and the field list is the same
+    // closed-enumeration hazard one level down: `attempts` was omitted next to a sentence asserting
+    // "every row carries every field".
+    let row_fields: Vec<String> = tools
+        .iter()
+        .map(|tool| tool.spec())
+        .find(|spec| spec.name == "board.query")
+        .and_then(|spec| spec.output_schema)
+        .and_then(|schema| schema["items"]["properties"].as_object().cloned())
+        .expect("`board.query` declares an output schema of typed row objects")
+        .keys()
+        .cloned()
+        .collect();
+
+    for rel in [
+        "website/docs/agent/fleet.md",
+        "website/docs/agent/datasources.md",
+    ] {
+        let page = read(rel);
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|name| !page.contains(&format!("`{name}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{rel} omits {} of the {} generated board operation(s): {missing:?}",
+            missing.len(),
+            names.len()
+        );
+    }
+
+    // Only `fleet.md` enumerates the row fields; `datasources.md` links to it rather than repeating
+    // the list, which is the right shape — a second copy is a second thing to let rot.
+    let rows = read("website/docs/agent/fleet.md");
+    let missing: Vec<&String> = row_fields
+        .iter()
+        .filter(|field| !rows.contains(&format!("`{field}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "website/docs/agent/fleet.md omits {} of the {} `board.query` row field(s): {missing:?}",
+        missing.len(),
+        row_fields.len()
+    );
+}

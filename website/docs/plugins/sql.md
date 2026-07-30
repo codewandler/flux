@@ -167,7 +167,10 @@ at a read-only role anyway.
 
 ## 6. Dialects
 
-- **PostgreSQL** — the primary target. All six operations run whitelisted introspection SQL.
+- **PostgreSQL** — the primary target; all six operations work. Only `sql.query` runs SQL you
+  supplied, behind the read-only statement guard above. The four introspection ops
+  (`sql.database.list`, `sql.table.list`, `sql.table.show`, `sql.index.list`) run per-dialect SQL the
+  plugin wrote, and `sql.test` runs `SELECT 1`.
 - **MySQL / MariaDB** — supported, with per-dialect introspection SQL. Note that
   `sql.database.list` means something different here: MySQL treats schema and database as one
   object, so every entry is `kind: "database"` and no `kind: "schema"` entries are returned, where
