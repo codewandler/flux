@@ -55,6 +55,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-248 — `ops-reference.md` documents none of the eval op family, so a rename there has one unguarded reference](C-248-ops-reference-does-not-cover-the-eval-op-family.md) · Core · found while renaming git_revert→git_reset for C-238: only the website file is coverage-tested, so the in-repo op reference can silently rot for any eval op
+- [C-249 — The git family's clean-tree preconditions are per-op accidents, and \"commit or stash them first\" is unactionable for untracked files](C-249-git-family-clean-tree-policy-and-stash-wording.md) · Core · surfaced by C-238's review: git_worktree_leave and git_revert each grew their own clean-tree guard for the same reason, git_merge had none, and three ops share advice that a plain `git stash` cannot carry out
 - [C-230 — Two flux processes cold-booting one fresh events.db race the schema migration](C-230-sqlite-cold-boot-migration-race.md) · Core · found by accident during A-107: four processes cold-booting the SAME brand-new events.db died with `duplicate column name: account` — D-76 fixed exactly this for Postgres with a `flux:ddl` advisory lock; SQLite has no equivalent, and every existing multi-process test creates the DB first, so nothing covers it
 
 ### The agent-authored surface — panes the model opens, config it can safely change
