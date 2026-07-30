@@ -2,7 +2,7 @@
 id: L-95
 title: "Railflux — render DraftAst as a 7-bit ASCII dataflow diagram"
 pillar: Language
-status: in-progress
+status: done
 priority: 6
 epic: flux-notation-workbench
 design: docs/designs/flux-notation-workbench.md

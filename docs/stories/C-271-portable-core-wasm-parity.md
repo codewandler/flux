@@ -2,7 +2,7 @@
 id: C-271
 title: "Prove the portable core compiles to `wasm32` and evaluates a model-free flow"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 epic: portable-wasm-runtime
 design: docs/designs/portable-wasm-runtime.md
