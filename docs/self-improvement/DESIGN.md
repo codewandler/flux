@@ -42,7 +42,7 @@ implemented across the `flux-eval` modules (`ops.rs`, `git.rs`, `gate.rs`, `aggr
  9. eval_run (candidate)     rebuild the musl binary from candidate source, re-eval same subset
 10. score_compare            strict, lexicographic improvement?
        ├─ keep:   git_stage → git_commit → git_tag improve-tbench-<score> → eval_adopt
-       └─ revert: git_revert to the snapshot
+       └─ revert: git_reset to the snapshot
 11. improve_log              append the round's decision + scores to the audit trail
 ```
 
@@ -227,7 +227,7 @@ The loop is implemented in the L3 crate `flux-eval`, driven by the flux-flow eng
 - `crates/flux-eval/src/ops.rs` — the core eval ops: `eval_run`, `eval_sessions`, `eval_scalar`,
   `eval_adopt`, `score_compare` / `score_compare_multi`, `eval_report_md`, `change_implement`,
   `painpoints_collect`, `improve_log`.
-- `crates/flux-eval/src/git.rs` — `git_snapshot` / `git_tag` / `git_revert` + `guard_protected`;
+- `crates/flux-eval/src/git.rs` — `git_snapshot` / `git_tag` / `git_reset` + `guard_protected`;
   `gate.rs` — `gate_check`; `aggregate.rs` — `improvements_aggregate`, `candidates_empty` /
   `candidates_advance`. (`git_stage` / `git_commit` are deliberately the flux-tools built-ins —
   the loop reuses them rather than duplicating them.)

@@ -247,8 +247,11 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(GitStatusTool),
             Arc::new(GitDiffTool),
             Arc::new(GitLogTool),
+            Arc::new(GitMergeTool),
+            Arc::new(GitRevertTool),
             Arc::new(GitPushTool),
             Arc::new(GitCheckoutTool),
+            Arc::new(GitBranchTool),
             Arc::new(GitUnstageTool),
             Arc::new(GitHunksTool),
             Arc::new(GitStageHunksTool),
@@ -474,6 +477,39 @@ struct GitCheckoutInput {
     /// Create the branch if it doesn't exist
     #[serde(default)]
     create: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitBranchInput {
+    /// Branch name to create (or to delete with `delete: true`)
+    name: String,
+    /// Delete the branch instead of creating it (safe delete: git refuses unmerged work and the
+    /// checked-out branch)
+    #[serde(default)]
+    delete: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitMergeInput {
+    /// Branch or ref to merge into the current branch
+    branch: String,
+    /// Always create a merge commit (`--no-ff`), even when a fast-forward is possible — the
+    /// integration loop's audit trail
+    #[serde(default)]
+    no_ff: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitRevertInput {
+    /// Commit to revert (a full or abbreviated sha, or a ref)
+    commit: String,
+    /// Mainline parent (`git revert -m N`), required when reverting a merge commit — usually 1:
+    /// the branch the merge landed on
+    #[serde(default)]
+    mainline: Option<u64>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2404,6 +2440,160 @@ impl Tool for GitLogTool {
 }
 
 // ---------------------------------------------------------------------------
+// git_merge
+// ---------------------------------------------------------------------------
+
+pub struct GitMergeTool;
+
+#[async_trait]
+impl Tool for GitMergeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_merge".into(),
+            description: "Merge a branch or ref into the current branch (`git merge`). \
+                          `no_ff: true` always creates a merge commit even when a fast-forward \
+                          is possible — the integration loop's audit trail. A conflict is a \
+                          recoverable error naming the conflicting files: the merge is aborted \
+                          and the tree restored (never left half-merged, never auto-resolved). \
+                          If a merge is ALREADY in progress this op refuses and aborts nothing, \
+                          since that merge's resolution may be uncommitted work."
+                .into(),
+            input_schema: tool_input_schema::<GitMergeInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // High like `git_worktree_leave`: a merge moves the integration branch's tip and can
+            // conflict — the caller must be able to trust the reported outcome.
+            risk: Risk::High,
+            // A repeated merge of the same ref converges ("Already up to date."), but what lands
+            // depends on both refs at call time — never replay a merge result from a cache.
+            idempotency: Idempotency::Conditional,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        // C-238: name the merged ref — `git_merge:impl/x` matches a `git_merge:*` grant the way
+        // `rm:…` matches `Bash(rm:*)`; fall back to the bare op name on malformed params so
+        // subjects are never empty (a write with no subjects is forced to approval).
+        params
+            .get("branch")
+            .and_then(|v| v.as_str())
+            .map(|b| vec![format!("git_merge:{b}")])
+            .unwrap_or_else(|| vec!["git_merge".to_string()])
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let branch = params.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+        let no_ff = params
+            .get("no_ff")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: if no_ff {
+                    format!("git merge --no-ff {branch}")
+                } else {
+                    format!("git merge {branch}")
+                },
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitMergeInput = parse_params(params, "git_merge")?;
+        let branch = args.branch;
+        // Same guard as `git_checkout` (C-85): a model-chosen ref must never read as an option.
+        let trimmed = branch.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            return Ok(ToolResult::error(format!(
+                "git_merge: refusing ref {branch:?} — it is empty or looks like an option, \
+                 not a ref"
+            )));
+        }
+        let system = ctx.system();
+
+        // A merge already in flight is NOT this call's to touch. `git merge` refuses to start
+        // while `MERGE_HEAD` exists, so without this guard the failure path below reads that
+        // PRE-EXISTING `MERGE_HEAD` as "this call conflicted" and runs `git merge --abort` —
+        // discarding a half-finished merge the user may have hand-resolved but not yet committed.
+        // That is the invariant in AGENTS.md ("never reset, discard"), so refuse up front.
+        //
+        // The guard is also what licenses the abort further down: reaching that path PROVES no
+        // merge was in progress when this call began, so the `MERGE_HEAD` seen there is one this
+        // call created and aborting it destroys nothing it did not create. Same discipline as
+        // `git_worktree_leave`, which refuses to merge into a dirty original checkout so its
+        // always-abort trial merge cannot eat someone else's work.
+        let (merge_in_flight, merge_head) =
+            run_git(&system, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
+        if merge_in_flight {
+            let (_, status) = run_git(&system, &["status", "--porcelain"]).await?;
+            return Ok(ToolResult::error(format!(
+                "git_merge: a merge is already in progress (MERGE_HEAD {merge_head}) — refusing \
+                 to start a merge of `{branch}`, and refusing to abort the one in flight because \
+                 its resolution may be uncommitted work. Conclude it (`git commit`) or abandon it \
+                 (`git merge --abort`) by hand, then retry. Working tree:\n{status}"
+            )));
+        }
+
+        let mut argv = vec!["merge".to_string()];
+        if args.no_ff.unwrap_or(false) {
+            argv.push("--no-ff".to_string());
+        }
+        // Never open an editor for the merge message: the guarded system clears the environment,
+        // and git's default message already names the merged branch — the audit trail the
+        // integration loop needs.
+        argv.push("--no-edit".to_string());
+        argv.push(branch.clone());
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let (ok, out) = run_git(&system, &argv).await?;
+        if ok {
+            return Ok(ToolResult::ok(if out.is_empty() {
+                format!("merged {branch}")
+            } else {
+                out
+            }));
+        }
+        // A failed merge with MERGE_HEAD present stopped on a conflict — and because the guard
+        // above proved none was in flight beforehand, this MERGE_HEAD is ours. Name the unmerged
+        // paths, abort, and hand back a recoverable error: never left half-merged silently.
+        let (in_progress, _) =
+            run_git(&system, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
+        if in_progress {
+            let (_, unmerged) =
+                run_git(&system, &["diff", "--name-only", "--diff-filter=U"]).await?;
+            let (aborted, abort_out) = run_git(&system, &["merge", "--abort"]).await?;
+            if !aborted {
+                return Ok(ToolResult::error(format!(
+                    "git_merge: the merge of `{branch}` failed AND `git merge --abort` failed — \
+                     the tree may be mid-merge; resolve by hand before any further git op.\n\
+                     merge: {out}\nabort: {abort_out}"
+                )));
+            }
+            // Report the count and the list from one source, so the message can never read
+            // "conflicts in 0 file(s)" next to a list saying there were none.
+            let paths: Vec<&str> = unmerged.lines().filter(|l| !l.is_empty()).collect();
+            let detail = if paths.is_empty() {
+                "git reported no unmerged paths".to_string()
+            } else {
+                format!("Conflicting files ({}):\n{}", paths.len(), paths.join("\n"))
+            };
+            return Ok(ToolResult::error(format!(
+                "git_merge: the merge of `{branch}` conflicted; the merge was aborted and the \
+                 tree restored to the state this call found it in. Resolve the conflict on the \
+                 source branch and retry. {detail}"
+            )));
+        }
+        Ok(ToolResult::error(format!("git merge failed: {out}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // git_push
 // ---------------------------------------------------------------------------
 
@@ -2550,6 +2740,261 @@ impl Tool for GitCheckoutTool {
         }
         Ok(ToolResult::ok(if body.is_empty() {
             format!("switched to {branch}")
+        } else {
+            body
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_revert
+// ---------------------------------------------------------------------------
+
+pub struct GitRevertTool;
+
+#[async_trait]
+impl Tool for GitRevertTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_revert".into(),
+            description: "Revert a commit by appending its inverse (`git revert --no-edit`); \
+                          pass `mainline` (usually 1) to revert a merge commit. This is the \
+                          integration loop's recovery op: a NEW commit undoes the target, so \
+                          history is never rewritten and never reset. Requires a clean tree. A \
+                          conflicted revert is a recoverable error naming the conflicting files; \
+                          the revert is aborted and the tree left as the call found it."
+                .into(),
+            input_schema: tool_input_schema::<GitRevertInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // High like `git_merge`: a revert moves the integration branch's tip and can
+            // conflict — the caller must be able to trust the reported outcome.
+            risk: Risk::High,
+            // Reverting the same commit twice does not converge — the second attempt conflicts
+            // against the first revert's own change.
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        // C-238: name the reverted commit — `git_revert:abc123` matches a `git_revert:*` grant
+        // the way `rm:…` matches `Bash(rm:*)`; fall back to the bare op name on malformed params
+        // so subjects are never empty (a write with no subjects is forced to approval).
+        params
+            .get("commit")
+            .and_then(|v| v.as_str())
+            .map(|c| vec![format!("git_revert:{c}")])
+            .unwrap_or_else(|| vec!["git_revert".to_string()])
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let commit = params.get("commit").and_then(|v| v.as_str()).unwrap_or("");
+        let mainline = params.get("mainline").and_then(|v| v.as_u64());
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: match mainline {
+                    Some(n) => format!("git revert --no-edit -m {n} {commit}"),
+                    None => format!("git revert --no-edit {commit}"),
+                },
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitRevertInput = parse_params(params, "git_revert")?;
+        let commit = args.commit;
+        // Same guard as `git_merge` (C-85): a model-chosen ref must never read as an option.
+        let trimmed = commit.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            return Ok(ToolResult::error(format!(
+                "git_revert: refusing commit {commit:?} — it is empty or looks like an option, \
+                 not a ref"
+            )));
+        }
+        let system = ctx.system();
+
+        // Require a clean tree — DELIBERATELY stricter than git. `git revert` only refuses a dirty
+        // index, or unstaged changes to the paths it would touch; verified otherwise: an unstaged
+        // edit to an unrelated file, or an untracked file, and git reverts and commits happily.
+        // That is too permissive here, because the conflict abort below is a blanket
+        // `git revert --abort` — it needs a state it can restore without guessing which of the
+        // caller's own edits were in the tree first.
+        let (ok, status) = run_git(&system, &["status", "--porcelain"]).await?;
+        if !ok {
+            return Ok(ToolResult::error(format!(
+                "git_revert: git status failed: {status}"
+            )));
+        }
+        if !status.is_empty() {
+            // Do not say "commit or stash" alone: `status --porcelain` also reports untracked
+            // (`??`) entries, which a plain `git stash` leaves exactly where they are — an agent
+            // that followed that advice would retry and fail identically.
+            return Ok(ToolResult::error(format!(
+                "git_revert: a revert must start from a clean tree, and this checkout is not \
+                 clean. Commit or stash the tracked changes; move, remove, or `git stash -u` any \
+                 untracked (`??`) entries, which a plain `git stash` will NOT clear:\n{status}"
+            )));
+        }
+
+        // Never open an editor for the revert message (same reason as `git_merge`): the guarded
+        // system clears the environment, and git's default "Revert ..." subject is the audit trail
+        // the integration loop needs.
+        let mut argv = vec!["revert".to_string(), "--no-edit".to_string()];
+        if let Some(n) = args.mainline {
+            argv.push("-m".to_string());
+            argv.push(n.to_string());
+        }
+        argv.push(commit.clone());
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let (ok, out) = run_git(&system, &argv).await?;
+        if ok {
+            let (_, head) = run_git(&system, &["log", "-1", "--oneline"]).await?;
+            return Ok(ToolResult::ok(if out.is_empty() {
+                format!("reverted {commit} — {head}")
+            } else {
+                format!("{out}\nreverted {commit} — {head}")
+            }));
+        }
+
+        // A revert that never started (bad rev, …) leaves no REVERT_HEAD and an untouched
+        // tree; one that started and stopped is a conflict — name the files, then abort.
+        let (started, _) =
+            run_git(&system, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]).await?;
+        if !started {
+            return Ok(ToolResult::error(format!(
+                "git_revert: git revert `{commit}` failed: {out}"
+            )));
+        }
+        let (_, conflicts) = run_git(&system, &["diff", "--name-only", "--diff-filter=U"]).await?;
+        let (aborted, abort_out) = run_git(&system, &["revert", "--abort"]).await?;
+        if !aborted {
+            return Ok(ToolResult::error(format!(
+                "git_revert: the revert of `{commit}` conflicted and the abort ALSO failed \
+                 ({abort_out}); the tree is left mid-revert — resolve it or run \
+                 `git revert --abort` manually. Conflicting files:\n{conflicts}"
+            )));
+        }
+        // Count and list from one source, so the message can never read "conflicts in 0 file(s)"
+        // alongside a list stating there were none.
+        let paths: Vec<&str> = conflicts.lines().filter(|l| !l.is_empty()).collect();
+        let detail = if paths.is_empty() {
+            "git reported no unmerged paths".to_string()
+        } else {
+            format!("Conflicting files ({}):\n{}", paths.len(), paths.join("\n"))
+        };
+        Ok(ToolResult::error(format!(
+            "git_revert: reverting `{commit}` conflicted; the revert was aborted and the tree is \
+             clean. Reconcile and retry. {detail}"
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_branch
+// ---------------------------------------------------------------------------
+
+pub struct GitBranchTool;
+
+#[async_trait]
+impl Tool for GitBranchTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_branch".into(),
+            description: "Create a branch without switching to it (`git branch`), or delete one \
+                          with `delete: true`. Deletion is the SAFE form (`git branch -d`): git \
+                          itself refuses unmerged work and the checked-out branch — there is no \
+                          force-delete."
+                .into(),
+            input_schema: tool_input_schema::<GitBranchInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // Medium like `git_checkout` (which also creates branches): creation is benign, and
+            // the only deletion offered is `-d`, which git refuses for unmerged or checked-out
+            // branches — the destructive `-D` is not reachable.
+            risk: Risk::Medium,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        // C-238: name the branch — `git_branch:impl/x` matches a `git_branch:*` grant the way
+        // `rm:…` matches `Bash(rm:*)`; fall back to the bare op name on malformed params so
+        // subjects are never empty (a write with no subjects is forced to approval).
+        params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|n| vec![format!("git_branch:{n}")])
+            .unwrap_or_else(|| vec!["git_branch".to_string()])
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let delete = params
+            .get("delete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: if delete {
+                    format!("git branch -d {name}")
+                } else {
+                    format!("git branch {name}")
+                },
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitBranchInput = parse_params(params, "git_branch")?;
+        let name = args.name;
+        let delete = args.delete.unwrap_or(false);
+        // Same guard as `git_checkout` (C-85): a model-chosen name must never read as an option
+        // (`git branch -D …` would force-delete) or a path.
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.starts_with('-')
+            || trimmed.contains("..")
+        {
+            return Ok(ToolResult::error(format!(
+                "git_branch: refusing branch name {name:?} — it looks like a path or an option, \
+                 not a branch"
+            )));
+        }
+        let mut argv = vec!["git".to_string(), "branch".to_string()];
+        if delete {
+            argv.push("-d".to_string());
+        }
+        argv.push(name.clone());
+        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!(
+                "git branch failed [exit {}]: {body}",
+                out.exit_code
+            )));
+        }
+        Ok(ToolResult::ok(if body.is_empty() {
+            if delete {
+                format!("deleted {name}")
+            } else {
+                format!("created {name}")
+            }
         } else {
             body
         }))
@@ -4653,12 +5098,15 @@ mod tests {
                 "first",
                 "flatten",
                 "gaps",
+                "git_branch",
                 "git_checkout",
                 "git_commit",
                 "git_diff",
                 "git_hunks",
                 "git_log",
+                "git_merge",
                 "git_push",
+                "git_revert",
                 "git_stage",
                 "git_stage_hunks",
                 "git_status",
@@ -6009,6 +6457,504 @@ mod tests {
         assert_eq!(c.system().workspace().root(), checkout);
 
         std::fs::remove_dir_all(&parent).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // git_branch / git_merge (C-238)
+    //
+    // Driven through the registry by op NAME — the same surface a Program's `call` uses — so the
+    // journey compiles against the merge base and fails there on the ops' absence (the
+    // failing-first), rather than naming the tool structs directly.
+    // -----------------------------------------------------------------------
+
+    /// Dispatch one op call through the registry by name, as the engine would.
+    async fn call_op(
+        registry: &ToolRegistry,
+        c: &ToolContext,
+        name: &str,
+        params: Value,
+    ) -> ToolResult {
+        let tool = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("op `{name}` is not registered"));
+        tool.execute(c, params).await.unwrap()
+    }
+
+    /// C-238: the serial-integration journey — create a branch without leaving `main`, land work
+    /// on it, merge it back with `--no-ff`, and assert the merge commit and the tree.
+    #[tokio::test]
+    async fn git_ops_branch_create_merge_no_ff_journey() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // git_branch creates the branch; HEAD stays on `main`.
+        let r = call_op(&registry, &c, "git_branch", json!({"name": "impl/item-1"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            raw_git(&dir, &["branch", "--list", "impl/item-1"]),
+            "impl/item-1"
+        );
+        assert_eq!(raw_git(&dir, &["branch", "--show-current"]), "main");
+
+        // Concrete subjects name the branch (never `*`, never empty).
+        let tool = registry.get("git_branch").unwrap();
+        assert_eq!(
+            tool.permission_subjects(&json!({"name": "impl/item-1"})),
+            vec!["git_branch:impl/item-1".to_string()]
+        );
+
+        // Land work on the branch through the existing family.
+        let r = call_op(
+            &registry,
+            &c,
+            "git_checkout",
+            json!({"branch": "impl/item-1"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        WriteTool
+            .execute(
+                &c,
+                json!({"path": "feature.txt", "content": "from the branch\n"}),
+            )
+            .await
+            .unwrap();
+        let r = call_op(
+            &registry,
+            &c,
+            "git_stage",
+            json!({"paths": ["feature.txt"]}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_commit",
+            json!({"message": "add feature.txt"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(&registry, &c, "git_checkout", json!({"branch": "main"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            !dir.join("feature.txt").exists(),
+            "main does not have the work yet"
+        );
+
+        // git_merge --no-ff: a real merge commit lands the work on `main`.
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/item-1", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let merges = raw_git(&dir, &["log", "--oneline", "--merges"]);
+        assert!(
+            !merges.is_empty(),
+            "a --no-ff merge commit exists: {merges}"
+        );
+        assert!(
+            dir.join("feature.txt").exists(),
+            "the merge landed the work"
+        );
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+
+        // Concrete subjects name the merged ref.
+        let tool = registry.get("git_merge").unwrap();
+        assert_eq!(
+            tool.permission_subjects(&json!({"branch": "impl/item-1"})),
+            vec!["git_merge:impl/item-1".to_string()]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: a conflicting merge is a clean recoverable error that NAMES the conflicting files,
+    /// and the tree is left consistent — never silently half-merged.
+    #[tokio::test]
+    async fn git_merge_conflict_is_recoverable_and_names_the_files() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // A branch that edits the same line `main` will edit.
+        raw_git(&dir, &["checkout", "-q", "-b", "impl/conflict"]);
+        std::fs::write(dir.join("base.txt"), "branch version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "branch edit"]);
+        raw_git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("base.txt"), "main version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "main edit"]);
+        let pre_merge = raw_git(&dir, &["rev-parse", "HEAD"]);
+
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/conflict", "no_ff": true}),
+        )
+        .await;
+        assert!(
+            r.is_error,
+            "a conflict is a recoverable error, got: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("base.txt"),
+            "the error names the conflicting file: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("aborted"),
+            "the error states the merge was aborted: {}",
+            r.content
+        );
+
+        // The tree is consistent: HEAD unchanged, no merge in progress, nothing half-applied.
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), pre_merge);
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+        assert!(
+            !dir.join(".git/MERGE_HEAD").exists(),
+            "no merge in progress"
+        );
+
+        // Recoverable: align the branch's content with `main` and the same op call succeeds.
+        raw_git(&dir, &["checkout", "-q", "impl/conflict"]);
+        std::fs::write(dir.join("base.txt"), "main version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "align with main"]);
+        raw_git(&dir, &["checkout", "-q", "main"]);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/conflict", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "the retried merge succeeds: {}", r.content);
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Run git and return (success, stdout+stderr) WITHOUT asserting — for setup steps that are
+    /// meant to fail, like the conflicting merge that puts the tree mid-merge below.
+    fn raw_git_try(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let body = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), body.trim().to_string())
+    }
+
+    /// C-238 (review round 1): a merge already in progress belongs to the USER, not to this op.
+    ///
+    /// `git merge` refuses to start at all while `MERGE_HEAD` exists, so a naive conflict path
+    /// reads that PRE-EXISTING `MERGE_HEAD` as "this call conflicted" and runs `git merge --abort`,
+    /// which discards a hand-resolved but uncommitted merge resolution. That is the invariant
+    /// AGENTS.md holds hardest ("Protect the user's worktree … never reset, discard"), so the op
+    /// must refuse up front and abort nothing.
+    #[tokio::test]
+    async fn git_merge_refuses_when_a_merge_is_already_in_progress() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // `side` edits base.txt, and so does `main` — merging `side` conflicts. `other` branches
+        // off `main` before that edit and touches a different file, so it would merge cleanly.
+        raw_git(&dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("base.txt"), "side version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "side edit"]);
+        raw_git(&dir, &["checkout", "-q", "-b", "other", "main"]);
+        std::fs::write(dir.join("other.txt"), "other\n").unwrap();
+        raw_git(&dir, &["add", "other.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "other edit"]);
+        raw_git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("base.txt"), "main version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "main edit"]);
+
+        // The USER starts a merge, hits the conflict, and hand-resolves it WITHOUT committing.
+        let (merged, _) = raw_git_try(&dir, &["merge", "side"]);
+        assert!(!merged, "the setup merge is supposed to conflict");
+        const RESOLVED: &str = "carefully hand-resolved content\n";
+        std::fs::write(dir.join("base.txt"), RESOLVED).unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        let user_merge_head = std::fs::read_to_string(dir.join(".git/MERGE_HEAD")).unwrap();
+        let pre_head = raw_git(&dir, &["rev-parse", "HEAD"]);
+
+        // Now the op is asked to merge something else entirely.
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "other", "no_ff": true}),
+        )
+        .await;
+
+        // THE INVARIANT: the user's uncommitted resolution is still there.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            RESOLVED,
+            "the user's hand-resolved, uncommitted merge must survive; op said: {}",
+            r.content
+        );
+        // Their merge is untouched: same MERGE_HEAD, same HEAD, still in progress.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/MERGE_HEAD")).unwrap(),
+            user_merge_head,
+            "the in-flight merge must not be aborted"
+        );
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), pre_head);
+
+        // And the refusal is a recoverable error that says why — not a success, and not a claim
+        // that the merge of `other` conflicted (it never started).
+        assert!(r.is_error, "refusal is a recoverable error: {}", r.content);
+        assert!(
+            r.content.contains("already in progress"),
+            "the error explains a merge is in flight: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("conflicted"),
+            "it must not claim the merge of `other` conflicted: {}",
+            r.content
+        );
+
+        // Recoverable: once the user concludes their own merge, the same call succeeds.
+        raw_git(&dir, &["commit", "-q", "--no-edit"]);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "other", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "the retried merge succeeds: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            RESOLVED,
+            "and the resolution is still the committed content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: `git_branch` deletes with the SAFE delete (`-d` — git itself refuses unmerged work
+    /// and the checked-out branch), and rejects option/path-shaped names like `git_checkout`
+    /// does (C-85).
+    #[tokio::test]
+    async fn git_branch_delete_and_name_guards() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // Create + delete round trip.
+        let r = call_op(&registry, &c, "git_branch", json!({"name": "scratch"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(raw_git(&dir, &["branch", "--list", "scratch"]), "scratch");
+        let r = call_op(
+            &registry,
+            &c,
+            "git_branch",
+            json!({"name": "scratch", "delete": true}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(raw_git(&dir, &["branch", "--list", "scratch"]), "");
+
+        // Deleting the checked-out branch is refused (by git, surfaced cleanly).
+        let r = call_op(
+            &registry,
+            &c,
+            "git_branch",
+            json!({"name": "main", "delete": true}),
+        )
+        .await;
+        assert!(r.is_error, "{}", r.content);
+        assert_eq!(raw_git(&dir, &["branch", "--show-current"]), "main");
+
+        // Option/path-shaped names are rejected before git ever runs.
+        for bad in ["-D", "--force", ".", "..", "a..b", ""] {
+            let r = call_op(&registry, &c, "git_branch", json!({"name": bad})).await;
+            assert!(r.is_error, "name {bad:?} must be refused");
+        }
+        assert_eq!(
+            raw_git(&dir, &["branch", "--format=%(refname:short)"]),
+            "main"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: the integration rule's recovery op — revert a `--no-ff` merge with `-m 1`. A NEW
+    /// commit undoes the merge (never a reset, history preserved), and the tree is byte-identical
+    /// to the pre-merge state.
+    #[tokio::test]
+    async fn git_revert_mainline_one_restores_the_pre_merge_tree() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // A branch with work, merged into `main` with --no-ff through the family's own ops.
+        let r = call_op(&registry, &c, "git_branch", json!({"name": "impl/item-2"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_checkout",
+            json!({"branch": "impl/item-2"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        WriteTool
+            .execute(
+                &c,
+                json!({"path": "feature.txt", "content": "from the branch\n"}),
+            )
+            .await
+            .unwrap();
+        let r = call_op(
+            &registry,
+            &c,
+            "git_stage",
+            json!({"paths": ["feature.txt"]}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_commit",
+            json!({"message": "add feature.txt"}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(&registry, &c, "git_checkout", json!({"branch": "main"})).await;
+        assert!(!r.is_error, "{}", r.content);
+
+        let pre_merge_tree = raw_git(&dir, &["rev-parse", "HEAD^{tree}"]);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/item-2", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let merge_sha = raw_git(&dir, &["rev-parse", "HEAD"]);
+        assert_ne!(
+            raw_git(&dir, &["rev-parse", "HEAD^{tree}"]),
+            pre_merge_tree,
+            "the merge changed the tree"
+        );
+
+        // The recovery: revert the merge with -m 1.
+        let r = call_op(
+            &registry,
+            &c,
+            "git_revert",
+            json!({"commit": merge_sha, "mainline": 1}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+
+        // The tree is byte-identical to the pre-merge state...
+        assert_eq!(
+            raw_git(&dir, &["rev-parse", "HEAD^{tree}"]),
+            pre_merge_tree,
+            "the revert restored the pre-merge tree"
+        );
+        // ...and history was NOT rewritten: HEAD is a NEW revert commit on top of the merge,
+        // which is still reachable.
+        assert_eq!(
+            raw_git(&dir, &["rev-parse", "HEAD~1"]),
+            merge_sha,
+            "the revert sits on top of the merge — no reset, no rewrite"
+        );
+        let log = raw_git(&dir, &["log", "--oneline"]);
+        assert!(log.contains("Revert"), "a new revert commit exists: {log}");
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+
+        // Concrete subjects name the reverted commit (never `*`, never empty).
+        let tool = registry.get("git_revert").unwrap();
+        assert_eq!(
+            tool.permission_subjects(&json!({"commit": "abc123"})),
+            vec!["git_revert:abc123".to_string()]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: a conflicting revert is a clean recoverable error naming the files, with the
+    /// sequencer aborted and the tree consistent — same contract as `git_merge`.
+    #[tokio::test]
+    async fn git_revert_conflict_is_recoverable_and_names_the_files() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // Two stacked edits to the same line; reverting the FIRST conflicts with the second.
+        std::fs::write(dir.join("base.txt"), "v1\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "v1"]);
+        let first = raw_git(&dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("base.txt"), "v2\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "v2"]);
+        let pre_revert = raw_git(&dir, &["rev-parse", "HEAD"]);
+
+        let r = call_op(&registry, &c, "git_revert", json!({"commit": first})).await;
+        assert!(
+            r.is_error,
+            "a conflicting revert is a recoverable error, got: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("base.txt"),
+            "the error names the conflicting file: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("aborted"),
+            "the error states the revert was aborted: {}",
+            r.content
+        );
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), pre_revert);
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+        assert!(
+            !dir.join(".git/REVERT_HEAD").exists(),
+            "no revert in progress"
+        );
+
+        // A non-conflicting (plain, non-merge) revert succeeds and appends a new commit.
+        let r = call_op(&registry, &c, "git_revert", json!({"commit": pre_revert})).await;
+        assert!(!r.is_error, "the clean revert succeeds: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            "v1\n",
+            "the v2 edit is undone"
+        );
+
+        // Option-shaped / empty commits are rejected before git ever runs.
+        for bad in ["--no-commit", "-e", ""] {
+            let r = call_op(&registry, &c, "git_revert", json!({"commit": bad})).await;
+            assert!(r.is_error, "commit {bad:?} must be refused");
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

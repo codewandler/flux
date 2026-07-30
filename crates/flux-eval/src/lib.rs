@@ -73,7 +73,7 @@ pub fn try_register_eval_ops(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(gate::GateCheckTool),
             Arc::new(git::GitSnapshotTool),
             Arc::new(git::GitTagTool),
-            Arc::new(git::GitRevertTool),
+            Arc::new(git::GitResetTool),
             Arc::new(git::GuardProtectedTool),
         ],
     )
