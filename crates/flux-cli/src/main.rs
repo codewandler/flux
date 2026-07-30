@@ -96,8 +96,8 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
-        credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts, format_evidence,
-        implicit_plugin_group, integration_plugin_caps, loop_machinery_label,
+        credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts, fleet_status_line,
+        format_evidence, implicit_plugin_group, integration_plugin_caps, loop_machinery_label,
         merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
         plugin_status_one, redact_plugin_echo, render_endpoint_row, render_review_markdown,
         resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
@@ -2947,6 +2947,107 @@ mod tests {
         assert!(dir.join("references").join("ops.md").is_file());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-246: the CLI fleet line tells a hung worker from a working one. Same role, same op, both
+    /// live — the only difference is how long each has been quiet, and that difference has to be
+    /// legible in the one line an operator watching a wave actually sees.
+    #[test]
+    fn the_fleet_line_marks_the_hung_worker_and_not_the_working_one() {
+        use flux_runtime::{SpawnActivity, SpawnActivityEvent};
+        use flux_tui::fleet::FleetProjection;
+
+        let event = |spawn_id: u64, role: &str, call_id: u64| SpawnActivity {
+            spawn_id,
+            role: role.into(),
+            child_session_id: "s_1".into(),
+            parent_session: Some("s_parent".into()),
+            depth: 1,
+            event: SpawnActivityEvent::ToolCall {
+                call_id,
+                name: "bash".into(),
+                // The internal half of A-79's contract: never rendered.
+                input: json!({ "cmd": "deploy --token TOKEN-c246-must-not-render" }),
+            },
+        };
+
+        let mut fleet = FleetProjection::new();
+        let t0 = std::time::Instant::now();
+        fleet.apply(&event(1, "implementor", 1), t0);
+        fleet.apply(&event(2, "implementor", 1), t0);
+        // Worker 2 reports again two minutes later; worker 1 has said nothing since.
+        let later = t0 + std::time::Duration::from_secs(120);
+        fleet.apply(&event(2, "implementor", 2), later);
+
+        let line = fleet_status_line(&fleet.rows(later), 400).expect("a live fleet renders a line");
+        assert!(line.starts_with("⚇ fleet · 2 live"), "line: {line}");
+        let (hung, working) = line
+            .split_once(" | ")
+            .expect("one segment per worker: {line}");
+        assert!(
+            hung.contains("implementor#1") && hung.contains("⚠ stalled"),
+            "the silent worker is marked: {hung}"
+        );
+        assert!(
+            working.contains("implementor#2") && !working.contains("stalled"),
+            "the working worker is not: {working}"
+        );
+        assert!(
+            !line.contains("TOKEN-c246-must-not-render"),
+            "a worker's tool input reached the CLI line: {line}"
+        );
+    }
+
+    /// With nothing live, the finished rows ARE the line — that is how a wave's outcome is shown.
+    /// While anything is live they are dropped, so the width goes to the workers whose idle age
+    /// still means something.
+    #[test]
+    fn the_fleet_line_yields_its_width_to_live_workers() {
+        use flux_runtime::{SpawnActivity, SpawnActivityEvent};
+        use flux_tui::fleet::FleetProjection;
+
+        let event = |spawn_id: u64, role: &str, event: SpawnActivityEvent| SpawnActivity {
+            spawn_id,
+            role: role.into(),
+            child_session_id: "s_1".into(),
+            parent_session: None,
+            depth: 1,
+            event,
+        };
+
+        let mut fleet = FleetProjection::new();
+        let t0 = std::time::Instant::now();
+        fleet.apply(
+            &event(
+                1,
+                "done-worker",
+                SpawnActivityEvent::Finished {
+                    usage: None,
+                    is_error: false,
+                },
+            ),
+            t0,
+        );
+        let only_finished =
+            fleet_status_line(&fleet.rows(t0), 400).expect("a finished wave still renders");
+        assert!(
+            only_finished.contains("0 live") && only_finished.contains("done-worker#1 done"),
+            "line: {only_finished}"
+        );
+
+        fleet.apply(
+            &event(
+                2,
+                "live-worker",
+                SpawnActivityEvent::Planning { active: true },
+            ),
+            t0,
+        );
+        let with_live = fleet_status_line(&fleet.rows(t0), 400).expect("a live wave renders");
+        assert!(
+            with_live.contains("live-worker#2 planning") && !with_live.contains("done-worker"),
+            "the finished row yields to the live one: {with_live}"
+        );
     }
 
     /// The turn-end token annotation reports all four figures the user asked for: context-window

@@ -421,6 +421,76 @@ pub(super) fn format_model_call(o: &flux_evidence::Observation) -> String {
     )
 }
 
+/// One stderr line describing every worker a delegated run has live (C-246), or `None` when nothing
+/// is delegated. Each segment names the worker by its A-79 spawn id — the only key that separates
+/// two concurrent children of the same role — its status from the projection's closed label set, the
+/// operation it is in, and **how long it has been quiet**. That last field is the point: a working
+/// worker's idle age stays small while a hung one's grows, so the two are told apart on the surface
+/// without any per-op log to read.
+///
+/// Nothing here reads a worker's tool input or observation data; the projection never exposes them.
+pub(super) fn fleet_status_line(
+    rows: &[flux_tui::fleet::WorkerRow],
+    width: usize,
+) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    // Once a worker is live again, the finished rows have already had their own line and would only
+    // crowd the live ones out of the width — and the live ones carry the idle age that matters.
+    // With nothing live, the finished rows ARE the line: that is how the wave's outcome is shown.
+    let live: Vec<&flux_tui::fleet::WorkerRow> = rows
+        .iter()
+        .filter(|r| !matches!(r.status, flux_tui::fleet::WorkerStatus::Finished { .. }))
+        .collect();
+    let shown: Vec<&flux_tui::fleet::WorkerRow> = if live.is_empty() {
+        rows.iter().collect()
+    } else {
+        live.clone()
+    };
+    let live = live.len();
+    let segments = shown
+        .iter()
+        .map(|row| {
+            let mut segment = format!("{}#{} {}", row.role, row.spawn_id, row.status.label());
+            if let Some(op) = row.status.op() {
+                segment.push(' ');
+                segment.push_str(op);
+            }
+            if row.errors > 0 {
+                segment.push_str(&format!(" ({} err)", row.errors));
+            }
+            segment.push_str(&format!(" · idle {}", style::fmt_elapsed(row.idle)));
+            if row.stalled {
+                segment.push_str(" ⚠ stalled");
+            }
+            segment
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(truncate(
+        &format!("⚇ fleet · {live} live · {segments}"),
+        width.max(40),
+    ))
+}
+
+/// What a fleet line *says*, with the ages excluded. A burst of timing/observation events refreshes
+/// a worker's liveness without changing this, so the same sentence is not reprinted for every one.
+pub(super) fn fleet_signature(rows: &[flux_tui::fleet::WorkerRow]) -> String {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "{}:{}:{}:{}",
+                row.spawn_id,
+                row.status.label(),
+                row.status.op().unwrap_or(""),
+                row.errors
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Renders streaming assistant text to stdout as live-rendered Markdown, and tool activity to stderr,
 /// in the "Refined" style: a syntax-highlighted plan, colored `→`/`✓`/`✗` markers, a live spinner while
 /// each op runs, and a completion rule with timing. All color is tty/`NO_COLOR`/`--color`-aware.
@@ -473,7 +543,22 @@ pub(super) struct CliSink {
     /// Model round-trips started this turn; cycles the truecolor thinking-bar effect
     /// (`flux_tui::spinners::by_round`) so long turns walk through the catalog.
     pub(super) spin_round: usize,
+    /// C-246: the shared surface-side fold of A-79's correlated sub-agent activity stream. This
+    /// sink is the surface a delegated run — a fleet coordinator (`flux flow run`) included —
+    /// actually runs on, and it used to drop every `subagent.activity` observation, so a long wave
+    /// of workers read as silence. Same projection the TUI pane will render (`flux_tui::fleet`);
+    /// there is one activity path, not two.
+    pub(super) fleet: flux_tui::fleet::FleetProjection,
+    /// What the last printed fleet line *said*, ages excluded — see [`fleet_signature`].
+    pub(super) fleet_sig: String,
+    /// When the last fleet line was printed, for the age-refresh reprint.
+    pub(super) fleet_printed: Option<std::time::Instant>,
 }
+
+/// How long a fleet line may stand before it is reprinted with refreshed ages, even though no
+/// worker changed what it is doing. This is what makes a *hung* worker visible while its peers keep
+/// working: its idle age keeps growing on the surface instead of freezing at the last status change.
+const FLEET_REPRINT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl CliSink {
     pub(super) fn new(max_iter: usize) -> Self {
@@ -507,6 +592,9 @@ impl CliSink {
             gather_mode: false,
             gate: PromptGate::global(),
             spin_round: 0,
+            fleet: flux_tui::fleet::FleetProjection::new(),
+            fleet_sig: String::new(),
+            fleet_printed: None,
         }
     }
 
@@ -528,6 +616,30 @@ impl CliSink {
     /// (incl. the C-30 `$? (unpriced)` marker for un-tabled metered cloud models).
     pub(super) fn cost_inline(&self, usage: Option<&Usage>) -> String {
         cost_suffix(self.model_spec.as_deref(), self.pricing.as_ref(), usage)
+    }
+
+    /// Fold one sub-agent activity event into the fleet projection and print the resulting line
+    /// (C-246). Printed when a worker changed what it is *doing*, or when the standing line is older
+    /// than [`FLEET_REPRINT_AFTER`] — the second case is what keeps a hung worker's idle age moving
+    /// on the surface while its peers work, rather than frozen at its last status change.
+    pub(super) fn render_fleet(&mut self, activity: &flux_runtime::SpawnActivity) {
+        let now = std::time::Instant::now();
+        if !self.fleet.apply(activity, now) {
+            return;
+        }
+        let rows = self.fleet.rows(now);
+        let signature = fleet_signature(&rows);
+        let stale = self
+            .fleet_printed
+            .is_none_or(|printed| now.duration_since(printed) >= FLEET_REPRINT_AFTER);
+        if signature == self.fleet_sig && !stale {
+            return;
+        }
+        if let Some(line) = fleet_status_line(&rows, self.width) {
+            eprintln!("{}", style::dim(&line));
+            self.fleet_sig = signature;
+            self.fleet_printed = Some(now);
+        }
     }
 
     /// Commit any in-progress assistant render so subsequent stderr lines appear below it.
@@ -723,6 +835,12 @@ impl AgentSink for CliSink {
             if flux_flow::engine::show_loop() {
                 eprintln!("{}", style::dim(&format_model_call(o)));
             }
+        } else if let Some(activity) = flux_runtime::SpawnActivity::from_observation(o) {
+            // C-246: A-79's correlated child-activity stream reached this sink and died here, so a
+            // delegated run — and a whole fleet of workers — was invisible on the CLI surface. Fold
+            // it into the shared projection and print the per-worker line. `input`/`observation`
+            // payloads are default-denied by the projection itself, not by this call site.
+            self.render_fleet(&activity);
         } else if o.kind == flux_evidence::KIND_DESTRUCTIVE {
             eprintln!(
                 "{}",

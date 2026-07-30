@@ -7,6 +7,7 @@
 //! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
 mod controller;
+pub mod fleet;
 mod panes;
 mod projection;
 mod rendering;
