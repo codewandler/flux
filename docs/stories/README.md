@@ -72,6 +72,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
 
 ## Next (ready — take the top one unless the user named a story)
+- [C-296 — Hand the public benchmarking story to flux-bench, and make `flux eval` point at it](C-296-hand-benchmarking-docs-to-flux-bench.md) · Core · flux-bench is a released standalone benchmark (v0.1.0, 19 stories done) that runs the SHIPPED flux binary; flux's own eval docs still read as the primary path while the pillar behind them is on hold
 - [C-290 — A runtime has no memory ceiling and no general concurrency limit](C-290-runtime-resource-limits.md) · Core · surveyed while designing the flux-connectors interop: context_budget/max_iterations/max_tokens/max_calls exist, but nothing bounds memory and the only concurrency control is server-side max_inflight_per_principal — so an embedding host cannot bound a runtime it constructs
 - [C-251 — Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version](C-251-release-from-a-push-flux-authored.md) · Core · flux automating its own release is the most honest dogfood there is; the load-bearing decision is that the MODEL writes prose and the HOST does version math, because a wrong version on crates.io is irreversible
 
