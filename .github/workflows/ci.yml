@@ -190,6 +190,15 @@ jobs:
     # nothing checked at all: `/releases/latest` is ranked by `published_at`, so publishing an old
     # tag's Release repoints it at that old version. Backfilling v0.9.3 on 2026-07-29 did exactly
     # that to v0.33.0 until it was repaired.
+    #
+    # C-252: this job and the Release workflow are independent, so a cut is always observed
+    # mid-flight from here — the audit on `cedef3f4` went red 74 seconds before v0.36.0's Release
+    # published. The script now asks GitHub whether that tag's Release run is still going and logs a
+    # NOTE instead of failing, which is why it needs `actions: read`. Declaring permissions here
+    # replaces the repo default for this job only, so `contents: read` (for checkout) is explicit.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
