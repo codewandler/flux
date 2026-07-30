@@ -156,15 +156,28 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         },
         ToolGroup {
             name: "fleet".into(),
-            description: "Outbound A2A dispatch to remote flux workers (A-116): hand a task to a \
-                          worker without waiting (`fleet.dispatch`), poll it (`fleet.status`), stop \
-                          it (`fleet.cancel`). The worker endpoint is a per-call argument, not \
-                          configuration, so there is no workspace signal that could gate these — a \
-                          predicate nothing emits would leave them registered but never advertised, \
-                          which is the unreachability A-131 closed. Force-on like `cognition`; the \
-                          group exists so `.flux/groups.toml` can reassign or gate them."
+            description: "Coordinating a fleet of workers: hand a task to a remote worker without \
+                          waiting (`fleet.dispatch`), poll it (`fleet.status`), stop it \
+                          (`fleet.cancel`) — A-116 — and give one board item its own isolated \
+                          checkout to be worked in (`fleet.isolate`, C-241). The worker endpoint is \
+                          a per-call argument, not configuration, so there is no workspace signal \
+                          that could gate these — a predicate nothing emits would leave them \
+                          registered but never advertised, which is the unreachability A-131 \
+                          closed. Force-on like `cognition`; the group exists so \
+                          `.flux/groups.toml` can reassign or gate them."
                 .into(),
-            tools: names(&["fleet.dispatch", "fleet.status", "fleet.cancel"]),
+            // C-241 joins `fleet.isolate` to the family rather than to `git`, even though it is
+            // built from `git worktree add` and needs a repository: gating or reassigning "the
+            // fleet" in `.flux/groups.toml` must move all of it, and a member sitting in another
+            // group could not be gated with the rest. Being advertised where there is no repository
+            // costs a catalog line, and the op's own preflight — not its surfacing — is what
+            // refuses that case.
+            tools: names(&[
+                "fleet.dispatch",
+                "fleet.status",
+                "fleet.cancel",
+                "fleet.isolate",
+            ]),
             // Force-on (empty predicate). A-116 asked for this to be a deliberate decision rather
             // than a default, so here is the argument, and the reason a gate is not the answer.
             //
