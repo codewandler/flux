@@ -130,7 +130,12 @@ fn run_worker_if_invoked() -> bool {
 
 /// Re-exec this very test binary filtered to `test_name`, in the worker role, with stderr piped so
 /// a failing child's panic message can be quoted in the orchestrator's assertion.
-fn spawn_cold_booter(test_name: &str, db: &Path, start_at_ms: u128, index: usize) -> std::process::Child {
+fn spawn_cold_booter(
+    test_name: &str,
+    db: &Path,
+    start_at_ms: u128,
+    index: usize,
+) -> std::process::Child {
     let exe = std::env::current_exe().expect("current_exe for re-exec");
     Command::new(exe)
         .args([test_name, "--exact", "--nocapture"])
