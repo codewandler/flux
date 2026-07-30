@@ -2,7 +2,7 @@
 id: C-277
 title: "Two unpinned couplings around child-process spawning: a stale `Confinement::Exempt` doc and a cross-crate readiness string"
 pillar: Core
-status: in-progress
+status: done
 priority: 7
 epic: security-assurance
 design: docs/designs/security-assurance.md
