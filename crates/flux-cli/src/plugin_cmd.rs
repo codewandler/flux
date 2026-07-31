@@ -757,6 +757,7 @@ pub(super) async fn run_plugin_in(
             }
             Ok(())
         }
+        PluginAction::Refresh { name } => refresh_plugin_catalog(dir, &name).await,
         PluginAction::Status { name } => {
             match name {
                 Some(n) => {
@@ -778,6 +779,127 @@ pub(super) async fn run_plugin_in(
             Ok(())
         }
     }
+}
+
+// --- plugin `refresh`: re-project the catalog from a second manifest fetch (C-310) -----
+
+/// `flux plugin refresh <name>` — load the plugin, re-fetch its manifest over the *same* open
+/// subprocess, and re-project its operations into a catalog, reporting the delta.
+///
+/// The load and the refresh both run here, against one process, which is what makes this the
+/// operator's answer to "does the plugin advertise the new operations yet?" after a
+/// `flux auth login <name>`: the second fetch is the one an already-open session would make.
+/// It is also the drift check on a plugin whose manifest is not stable across two fetches — a
+/// refreshed manifest that widens the granted capabilities, or re-scopes an operation under a name
+/// it already used, is refused here rather than discovered at dispatch time.
+async fn refresh_plugin_catalog(dir: &std::path::Path, name: &str) -> Result<()> {
+    let desc = flux_plugin::load_descriptor(dir, name)
+        .context("load plugin descriptor")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no such plugin `{name}` — add it with `flux plugin add`/`install` first"
+            )
+        })?;
+    // The same guarded boundary + datasource bridge `flux plugin call` uses, over a scratch index.
+    let cwd = std::env::current_dir()?;
+    let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
+    let system = Arc::new(System::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?);
+    let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
+        Arc::new(flux_capabilities::MemoryBackend::new());
+    let private_hosts = effective_plugin_private_hosts(&cfg, name);
+    let grant_source = private_net_grant_source_for(name);
+    let caps_system = system.clone();
+
+    let mut loaded = flux_plugin::load_plugin_tools(&system, name, &desc, move |manifest| {
+        Arc::new(flux_capabilities::DatasourceHostCaps::new(
+            flux_plugin::SystemHostCaps::new(caps_system)
+                .with_manifest(manifest)
+                .with_private_net_grants(private_hosts)
+                .with_grant_source(grant_source),
+            backend,
+        ))
+    })
+    .await
+    .with_context(|| format!("load plugin `{name}` ({})", desc.program))?;
+
+    let source = format!("plugin:{name}");
+    let mut registry = flux_runtime::ToolRegistry::new();
+    for tool in &loaded.tools {
+        registry
+            .try_register_from(source.clone(), tool.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // The refresh itself, through the entry point that moves the registry and the plugin together.
+    // A refusal must not read as a crash: the catalog the plugin loaded with is still intact, and
+    // saying so is the actionable half of the message.
+    let report = loaded
+        .refresh_into(&mut registry, &source)
+        .await
+        .map(|refresh| {
+            format_refresh_report(
+                name,
+                &refresh.added,
+                &refresh.removed,
+                &refresh.retained,
+                &refresh.coherence_warnings,
+            )
+        });
+
+    // Release the tools' shared host references before shutting the subprocess down.
+    let flux_plugin::LoadedPlugin { tools, host, .. } = loaded;
+    drop(tools);
+    drop(registry);
+    if let Ok(host) = Arc::try_unwrap(host) {
+        let _ = host.into_inner().shutdown().await;
+    }
+
+    match report {
+        Ok(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        Err(e) => bail!(
+            "{e}\nthe catalog is unchanged — `{name}`'s operations are still the ones it loaded with"
+        ),
+    }
+}
+
+/// Render a completed refresh for the operator. Pure so the wording is testable without a
+/// subprocess: the delta first (what appeared, what was withdrawn), then any C-191 coherence
+/// warnings, which — as at load — describe operations that still loaded.
+pub(super) fn format_refresh_report(
+    plugin: &str,
+    added: &[String],
+    removed: &[String],
+    retained: &[String],
+    warnings: &[String],
+) -> String {
+    let total = added.len() + retained.len();
+    let mut out = if added.is_empty() && removed.is_empty() {
+        format!("plugin `{plugin}`: catalog refreshed — no change ({total} operation(s))")
+    } else {
+        format!(
+            "plugin `{plugin}`: catalog refreshed — {} added, {} withdrawn, {} unchanged \
+             ({total} operation(s))",
+            added.len(),
+            removed.len(),
+            retained.len()
+        )
+    };
+    for name in added {
+        out.push_str(&format!("\n  + {name}"));
+    }
+    for name in removed {
+        out.push_str(&format!("\n  - {name}"));
+    }
+    for warning in warnings {
+        out.push_str(&format!(
+            "\n{}",
+            style::dim(&format!("  (incoherent metadata) {warning}"))
+        ));
+    }
+    out
 }
 
 // --- plugin `status`: liveness + declared surface (D-19) -------------------------------
@@ -1996,6 +2118,54 @@ pub(super) fn warn_stale_plugins(stale: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C-310: the operator-facing summary names every op that appeared and every one that was
+    /// withdrawn — a count alone would not tell them whether the op they authenticated for is the
+    /// one that showed up.
+    #[test]
+    fn refresh_report_names_the_catalog_delta() {
+        let report = format_refresh_report(
+            "connectors",
+            &["connectors.zendesk.ticket.create".to_string()],
+            &["connectors.placeholder".to_string()],
+            &["connectors.whoami".to_string()],
+            &[],
+        );
+        assert!(
+            report.contains("1 added, 1 withdrawn, 1 unchanged"),
+            "{report}"
+        );
+        assert!(report.contains("2 operation(s)"), "{report}");
+        assert!(
+            report.contains("+ connectors.zendesk.ticket.create"),
+            "{report}"
+        );
+        assert!(report.contains("- connectors.placeholder"), "{report}");
+        // A retained op is not noise in the delta — it is only counted.
+        assert!(!report.contains("+ connectors.whoami"), "{report}");
+    }
+
+    /// A refresh that changed nothing says so rather than printing an empty delta.
+    #[test]
+    fn refresh_report_states_when_nothing_changed() {
+        let report = format_refresh_report("drift", &[], &[], &["drift.alpha".to_string()], &[]);
+        assert!(report.contains("no change (1 operation(s))"), "{report}");
+    }
+
+    /// C-191 warnings travel with the refreshed catalog exactly as they do at load: surfaced, not
+    /// fatal.
+    #[test]
+    fn refresh_report_surfaces_coherence_warnings() {
+        let report = format_refresh_report(
+            "drift",
+            &["drift.delta".to_string()],
+            &[],
+            &[],
+            &["I2 (destructive floor): `drift.delta` declares …".to_string()],
+        );
+        assert!(report.contains("incoherent metadata"), "{report}");
+        assert!(report.contains("I2 (destructive floor)"), "{report}");
+    }
 
     /// D-190: `write_generated_skill` is the only place `references/` are written for a `flux skill
     /// … --install` skill. Prove the round trip end to end — generate a `flux-plugin` skill with a

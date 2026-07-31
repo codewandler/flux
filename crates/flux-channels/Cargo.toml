@@ -20,6 +20,12 @@ tokio-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The `connector` channel kind (D-215/D-216) reads `~/.flux/connectors/<name>.connector.toml`, which
+# the producing repository emits as TOML (`connector-cli`'s seam emitter ends in `toml::to_string`).
+# A connector manifest is a *published artifact* and therefore untrusted input on this path, so it
+# gets a real parser rather than a hand-rolled subset — the refusals D-216 owes are only as sound as
+# the parse beneath them.
+toml.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 cron.workspace = true

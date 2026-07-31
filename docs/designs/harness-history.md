@@ -195,5 +195,72 @@ unresolvable value errors rather than widening to an all-harness search.
   the index's provenance — so **pairing them is a host-wiring obligation**, pinned by
   `the_pack_must_be_registered_with_the_same_history_that_was_ingested`. There is no in-tree host
   wiring yet; the first one should take a single `HarnessHistory` and do both.
-- **The redactor's under-match is not yet measured.** That is C-216's third acceptance item, and its
-  answer belongs in this document.
+- **The redactor's under-match is measured — see the section below.**
+
+## What C-216 measured (the redactor's under-match, and the recourse)
+
+The redactor is a lossy heuristic by design: a fixed prefix list plus registered values matched by
+substring, with a 6-character registration floor. On a log line that is an honest trade. On years of
+conversation it under-matches, and the corpus in
+`crates/flux-capabilities/tests/harness_redaction_corpus.rs` measures by how much rather than
+assuming it away. Every entry below is asserted in both directions by
+`the_measured_under_match_is_exactly_the_list_the_design_records`, so **this table cannot rot in
+either direction** — a widened redactor fails the test just as a narrowed one does.
+
+**Caught** (the prefix list, tokenized on whitespace *and* `" ' \` ( ) [ ] { } , ; = : < >`, with a
+leading `+ - * #` set aside): `sk-ant-…`, `sk-…`, `xoxb/xoxp/xoxe-…`, `ghp_…`, `gho_…`,
+`github_pat_…`, `AKIA…`, `AIza…`, `ya29.…`, and `eyJ…` — which means a JWT *and* any base64 blob
+whose decoded content is JSON, since that is what `eyJ` is. A credential inside a `tool_result`, a
+heredoc or a diff hunk is caught exactly as one in prose is.
+
+**Not caught, in this corpus:**
+
+| shape | why the prefix list misses it |
+| --- | --- |
+| an AWS **secret** access key (`wJalr…`, 40 chars) | no prefix at all — only the *access key id* (`AKIA…`) has one |
+| a password inside a connection URL (`postgres://user:pw@host`) | `:` is a boundary, so the password is its own unprefixed token |
+| a Stripe secret key (`sk_live_…`) | the list has `sk-`, with a hyphen; `sk_` does not match |
+| a Hugging Face token (`hf_…`) | not on the list |
+| a GitLab PAT (`glpat-…`) | not on the list |
+| PEM private-key material | the `-----BEGIN …-----` delimiters are prose and the body is unprefixed base64 |
+
+Two of these are worth naming as the sharp edge: **`sk_live_…` and PEM material**, because a
+transcript in which an agent *writes* a production config is exactly where they appear, and the
+heredoc corpus case is that transcript.
+
+**The operator's recourse, in order.**
+
+1. **Register the value** — `Redactor::add_secret(value)` catches every shape in the table above
+   (asserted). This is the right answer for a credential the host already holds.
+2. **Leave the datasource off.** It is off by default and off means off; see the opt-out audit.
+
+The limit of recourse 1 is also measured: `add_secret` **silently ignores values under 6
+characters**, so a short credential has no recourse but recourse 2.
+
+**Widening the redactor is deliberately out of C-216's scope.** `flux-secret` is shared by the
+stream-json writer, the whatif cassette, the approval sheet and the evidence flush; widening its
+matching changes all of them at once, so it needs its own story and its own blast radius.
+
+### What the corpus also found, and did not fix
+
+- **Only claude-code surfaces tool output.** codex files it as a `function_call_output` response
+  item that carries no `role`, so the adapter's prefilter never parses the line; opencode files it
+  as a `tool` part whose output sits under `state`, which the flattener renders as a bare
+  `[tool_use: …]` marker. Containment is unaffected — dropping is containment — but *coverage* is
+  asymmetric, and a reader would otherwise assume all three behave alike. Pinned by
+  `no_adapter_but_claude_code_surfaces_tool_output`.
+- **No adapter surfaces a tool call's input**, so a credential passed as a tool argument is never
+  indexed. Same shape of finding: containment by omission.
+- **Session-envelope retention is bounded by the schema, not by the code.** `ingest_harness_history`
+  holds one `SessionEnvelope` per session for the whole scan on the reasoning that sessions are three
+  to five orders of magnitude rarer than messages. That ratio is a property of the *harness schema*:
+  an opencode database with no `session_id` column and no `sessionID` in `message.data` falls back to
+  the message's own id, and envelopes then scale one-for-one with messages —
+  `session_envelope_retention_is_bounded_by_sessions_only_when_the_schema_has_them` states the ratio.
+  The scan budget does not bound this retention. Left as a finding rather than fixed: the fix is a
+  bound inside ingest, which is C-215's blast radius, not C-216's.
+- **`meta`'s string values are redacted but not escaped** (`workspace`, `model`, `path`), where the
+  body, title and id are both. Nothing model-visible renders record `meta` today —
+  `records_to_context_blocks` writes only `source`/`entity` as tag attributes, and
+  `render_match`/`render_record` print id, title and body — so this is latent rather than live. A
+  future renderer that prints `meta` would need `contain` applied there too.
