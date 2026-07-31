@@ -2,7 +2,7 @@
 id: C-304
 title: "`http.request` returns one flat string, so no caller can select a field from a response"
 pillar: Core
-status: ready
+status: in-progress
 priority: 12
 areas: [flux-web, flux-runtime]
 note: "the connector pack's source claims this is 'a seam story on flux, filed rather than faked' — the audit found it was never filed. Blocks flux-connectors C-127 and every connector caller that wants .data.id"
@@ -21,27 +21,27 @@ and declares `output_schema: None`. Everything downstream gets that string. A fl
 
 ## Acceptance
 
-- [ ] `http.request` returns a record shaped `{ status, headers, body }` with a declared
+- [x] `http.request` returns a record shaped `{ status, headers, body }` with a declared
       `output_schema`, so the analyzer can type a field access rather than failing at run time.
-- [ ] **Failing-first test**: a flow selecting a field from a JSON response body succeeds. It fails
+- [x] **Failing-first test**: a flow selecting a field from a JSON response body succeeds. It fails
       today because the response is one string.
-- [ ] **Decide how the body is carried, and say why.** `ToolResult.content` is a `String`
+- [x] **Decide how the body is carried, and say why.** `ToolResult.content` is a `String`
       (`crates/flux-runtime/src/lib.rs`), so this is either canonical JSON in `content` with a
       human-readable `view` — the precedent C-10 established — or a change to `ToolResult` itself.
       The second is wider than this story unless the first is shown not to work; state which you
       chose.
-- [ ] **A non-JSON or malformed body does not fail the call.** An HTML error page, an empty body or a
+- [x] **A non-JSON or malformed body does not fail the call.** An HTML error page, an empty body or a
       truncated response must still produce a usable record with the status and headers intact —
       matching the stream-resilience posture that provider bytes never error a stream. A `404` is a
       *result*, not an error.
-- [ ] The human-facing rendering does not regress: whatever a person currently sees for a request in
+- [x] The human-facing rendering does not regress: whatever a person currently sees for a request in
       the evidence log and on the surface stays legible.
-- [ ] Secrets in **response** headers (`set-cookie`, and any header a caller registered) are still
+- [x] Secrets in **response** headers (`set-cookie`, and any header a caller registered) are still
       redacted; a structured header map must not become a new way for a token to reach a
       model-visible surface.
-- [ ] The op catalog is mirrored in **both** `crates/flux-flow/docs/ops-reference.md` and
+- [x] The op catalog is mirrored in **both** `crates/flux-flow/docs/ops-reference.md` and
       `website/docs/language/ops.md`.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -59,3 +59,39 @@ and declares `output_schema: None`. Everything downstream gets that string. A fl
   accordingly — flux uses the minor position as the breaking signal pre-1.0.
 - Related: [C-303](C-303-http-request-structured-query.md) is the other missing `http.request` seam
   story from the same audit, and is the security-relevant one of the pair.
+
+## Progress
+
+**Landed on `impl/C-304`.** `http.request` now returns the record `{status, headers, body}`.
+
+**How the body is carried — canonical JSON in `content`, human `view` beside it (the C-10
+precedent).** `ToolResult` was NOT widened. The split already exists and already does exactly this
+job: `flux_lang::runtime::execute_call` binds `content` into scope (so `$resp.body.data.id`
+resolves) while the sink and the model are shown `view`. Keeping `view` byte-identical to the old
+`HTTP <status>\n<headers>\n<body>` rendering is what makes the human-facing regression zero — the
+model's experience of this op did not move at all. Widening `ToolResult` would have been a change
+to an L2 contract every tool and every surface shares, to buy a property this seam already had.
+
+**`body` is parsed only when it is a JSON object or array**, and is the raw text otherwise. That is
+the interpreter's own rule (`jq_parse_input`), not a `content-type` sniff — plenty of APIs answer
+JSON under `text/plain`. An HTML error page, an empty body, a truncated payload and a bare JSON
+scalar all take the text arm, so the record always survives with its status and headers intact.
+
+**Redaction moved into the op and runs AFTER the parse**, over decoded leaves and keys (response
+header values are redacted as raw text). The dispatcher's redaction of `content` is no longer
+sufficient on its own: by then a registered secret containing `"`, `\` or a newline is JSON-escaped,
+so a literal match misses it — and the pattern redactor, whose token boundaries include `"`, can
+rewrite JSON text into something that no longer parses. Proven by
+`a_credential_echoed_back_in_a_response_header_or_body_is_still_redacted`, whose token carries both
+a quote and a backslash on purpose.
+
+**This is a BREAKING change to a published crate** (`codewandler-flux-web`): the string return is
+replaced, not kept alongside the record. Pre-1.0 that prices a **minor** bump. The coordinator owns
+the CHANGELOG/WHATS-NEW entries — this branch touches neither.
+
+**Left for the caller of this seam:** a header name containing `-` (i.e. most of them) is not
+reachable through the `$resp.headers.content-type` sugar — flux-lang field segments are
+alphanumeric/underscore and `eval_jq_path`'s bracket index must be numeric. The working idiom is
+`pick({items: $resp.headers, keys: ["content-type"]})`, and it is documented in the op's
+`output_schema` and in both catalog files. Making the sugar reach a quoted key is a flux-lang
+change, not a flux-web one.
