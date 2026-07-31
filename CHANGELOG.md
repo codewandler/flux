@@ -6,6 +6,46 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **The Zendesk reference flow is served by the flux-connectors Tool pack, and its operation set is now
+  pinned exactly (D-214).** When `flux-plugin-zendesk` was withdrawn before its first release in 0.38,
+  `examples/zendesk.triage.flux` was kept as "the authored shape the replacement has to satisfy", with
+  the note that **the op names were the part expected to change**. They did not change: flux-connectors'
+  `connector-pack` projects the catalogue id `zendesk-test` to `zendesk.test` and
+  `zendesk-ticket-comment-list` to `zendesk.ticket.comment.list`, which is what the flow already called
+  — the pack was authored to this shape. **Not one line of the flow's body changed**, so what this
+  story actually ships is the guard that keeps it that way plus the correction of documentation that
+  had decayed into misinformation.
+  The guard is `zendesk_reference_calls_exactly_the_connector_pack_read_operations`, which pins the
+  module's `zendesk.*` set **exactly** where the pre-existing check only tested a `zendesk.` prefix
+  plus three known writes. Proven failing-first by renaming `zendesk.test` to `zendesk.tickets.list`
+  in the real example: the new test failed and the old one **passed**, so the gap was real. A name the
+  pack does not project now reds flux's gate, in the repository where such an edit happens; the other
+  half of the pin is that repo's `connector-pack/tests/projection.rs`. Both ends name each other, because
+  neither can be hosted in the other: `connector-pack` depends on `flux-spec`/`flux-runtime`, so a
+  dependency back would resolve two incompatible copies of `dyn Tool`.
+  **The read-only claim was narrowed rather than restated.** `pack(&["zendesk"])` registers all seven
+  catalogue operations, so the three writes are in the host's registry — the plugin era's separate
+  `flux plugin call` surface is gone. What holds is that no entrypoint reaches one; keeping them
+  unreachable at all is the host's approval decision, and the docs now say so instead of implying
+  registry absence. The write-safety substance of D-201 did survive into the connector catalogue
+  (`safe_update` as a const `true` the caller cannot drop, required `updated_stamp`, `conditional`
+  idempotency, internal-note default, additive tagging), verified rather than assumed.
+  **It still cannot reach a live account**, for two flux-connectors reasons that no flux change can
+  close and neither of which is a missing credential: the Zendesk connector declares no `authority`, so
+  there is no `tenants/<tenant>/<authority>/<credential>` address and the pack answers
+  `NoCredentialAddress`; and its `https://{subdomain}.zendesk.com` base URL is not resolved from config,
+  so a built URL names a host that does not resolve. Both refuse rather than sending a broken request.
+  The example's header, `docs/zendesk-triage.md`, `examples/README.md` and the website examples page now
+  name these two gaps instead of the withdrawn plugin — the tutorial had been instructing readers to run
+  `flux plugin add zendesk` and `flux auth set zendesk` against a binary that does not exist, and the
+  examples README to `cargo build --release -p zendesk`.
+  D-200, D-201 and D-202 are closed as superseded rather than re-done; two of D-202's bullets are **void**
+  — there is no plugin to smoke, and the signed plugin-pack release recorded as owed in 0.38 is
+  discharged by deletion, since the binary that would have needed one was removed before it ever shipped.
+  D-199 is left with exactly one open bullet, owned by another repository.
+
 ### Added
 
 - **Authored Flux can produce a form-encoded request body (L-101).** `parse($record, as: "form")`

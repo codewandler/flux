@@ -15,6 +15,23 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Zendesk example's setup instructions no longer describe software that does not exist.** The
+  guide and the examples README told you to build and install a `zendesk` plugin, then store a token
+  through the credential prompt. That plugin was withdrawn before it was ever released, so those steps
+  could not work. The same four workflows are now served by the connectors library instead — under the
+  same operation names, so the example itself is unchanged — and the documentation explains how a host
+  makes them available. It also states plainly what is still missing before the workflows can reach a
+  real Zendesk account: the Zendesk connector has nowhere to look a stored credential up, and its
+  account-specific address (`https://your-company.zendesk.com`) is not yet filled in from
+  configuration. Both stop with an explanation rather than sending a broken request, and neither is
+  something you can work around by supplying a token.
+- **A clearer statement of what "read-only" means for that example.** Making the Zendesk operations
+  available brings the three writing operations along with the four reading ones. None of the four
+  example workflows can reach a write — that is now checked automatically — but keeping writes out of
+  reach entirely is a matter of what you approve, and the guide no longer suggests otherwise.
+
 ### New
 
 - **Your flows can now call APIs that want a form-encoded body — including OAuth2 token endpoints.**
