@@ -2,8 +2,7 @@
 id: C-325
 title: "The redaction corpus's synthetic credentials trip GitHub push protection, and it recurs every time the corpus grows"
 pillar: Core
-status: in-progress
-priority: 4
+status: done
 areas: [flux-capabilities, flux-secret]
 note: "measured on a real push 2026-07-31: 12 detections across 3 commits and 2 files — C-216's corpus, C-315's additions, and a preservation commit. The literals are provably synthetic (a passing test requires a marker), so each block is a false positive, but every push carrying a new one needs a manual unblock and the old commits stay blocked forever"
 ---

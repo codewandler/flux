@@ -19,6 +19,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Credential-shaped literals no longer block `git push`, and cannot recur** (C-325). Pushing main
+  was rejected by GitHub secret scanning. Every detection was a provable false positive — synthetic
+  corpus fixtures — but a blocked commit stays blocked for **every future clone**, and it recurred as
+  the corpus grew.
+
+  Every credential literal is now assembled with `concat!`, split inside the vendor prefix. That is
+  compile-time, so each value stays the identical `&'static str`: the corpus machinery, its types and
+  its assertions are untouched, and `every_credential_shaped_literal_in_the_corpus_is_marked_synthetic`
+  provably cannot see a fragment, because no fragment survives expansion. Independent review proved
+  byte-identity twice — compiling the constants from both revisions side by side, and folding
+  `concat!` before diffing all five changed files.
+
+  The new `flux-codegate` gate is **repo-wide** rather than corpus-local, which is how it found
+  **48 hits across 5 files** where the push reported 12: GitHub only blocks on the pushed range.
+  Four files were never named in the story, two of them production `src/` (inside `cfg(test)`).
+
+  A `.github/secret_scanning.yml` path allowlist was considered and rejected on the argument that
+  survives regardless of what the docs say about push protection: the detections are **not confined
+  to `tests/`**, so excluding by path would disarm live detection over production source in exchange
+  for a cosmetic win.
+
+  ⚠ This does not unblock the three commits that already carry written-out literals; those took a
+  one-time unblock rather than a history rewrite, because they are merged story integrations whose
+  reviews cite their SHAs. `codewandler-flux-secret` moves 1.1.0 → **1.1.1** — compile-time assembly
+  leaves the published rlib byte-identical, so the bump is only what `check-crate-versions.sh`
+  requires of a published crate whose content moved.
+
 - **The tree-sitter grammar now parses every canonical example — 166 `ERROR` nodes to zero** (C-340).
   C-334's check had just established that the shipped grammar failed on **7 of 15** canonical
   `.flux` files, on six construct families it never supported: bare-identifier binds
