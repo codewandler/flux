@@ -17,6 +17,49 @@
 
 ### New
 
+- **flux can now join a real chat room, with no browser and no vendor software.** Point it at any
+  standards-compliant chat server — including a hosted meeting service — and it joins as a visible
+  participant: it sees who is present, notices people arriving and leaving, can speak to the room, and
+  can send a private message to one person. Everything it hears is attributed, so it knows who said
+  what.
+  Two things to know before you use it. **It replies to every message in the room**, because the rule
+  for "only answer when you are spoken to" is not in place yet — so put it in a room deliberately
+  rather than leaving it running in one. And it handles text and presence only; audio and video are not
+  part of this.
+- **Search your own past sessions from other coding tools.** If you use Codex, Claude Code or
+  OpenCode, their transcripts are already on your disk. flux can now search them — the actual
+  conversation text, not just the token counts those tools record.
+  **It is off unless you turn it on, and it is contained before it is searchable.** Sensitive values
+  are removed and the text is neutralised *when it is indexed*, not when it is displayed, so nothing
+  is sitting in the index waiting to leak. You grant access per tool, not all at once. Nothing in flux
+  switches this on for you yet.
+- **A compact notation for showing a flux program to a model.** Programs can be rendered in a short
+  indented form that costs far fewer tokens than the full source, and converted back exactly. Your
+  `.flux` files and how they run are completely unchanged — this is an extra way of *displaying* a
+  program, not a new way of writing one.
+- **An agent can open its own panes in the terminal.** The building blocks for an agent to open,
+  update and close a pane are in place. Nothing installs them yet, so you will not see a change in
+  this release.
+
+### Improved
+
+- **Resource limits now apply to the actual `flux` command, and to the sub-agents it delegates to.**
+  Previously a configured limit only bound if you embedded flux as a library, so the setting quietly
+  did nothing for people running the binary — and delegated work was unbounded either way.
+  Note what the concurrency limit means: it applies **per agent**, not to the whole process. If you set
+  it to 4 and flux delegates to 3 sub-agents, you may see up to 16 tool calls running at once. We tried
+  the whole-process version first; it can deadlock, because a parent waiting on a child can be holding
+  the very slot the child needs.
+  Not yet covered: `flux app run` still ignores these settings.
+
+### Fixed
+
+- **Old memories could have been deleted by routine cleanup.** Cross-session memories were
+  indistinguishable from short-lived scratch data to the cleanup pass, so an untouched memory could
+  have been removed for being old. Memories are now excluded, and "no activity in months" is treated as
+  the knowledge having settled rather than as it being disposable. **Nothing was actually lost** — the
+  cleanup had no caller yet, so this closes a trap before it could bite anyone.
+
 - **Rooms: flux can now sit in a conversation with several people at once.** Until now every way of
   talking to flux was one-to-one — a phone call with a single caller, a webhook, a chat message that
   wakes it and gets a reply. A new `room` channel type lets flux be *one participant among several*: it
