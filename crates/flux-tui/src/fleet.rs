@@ -527,11 +527,17 @@ mod tests {
     /// any of them, because it never reads those fields at all.
     #[test]
     fn no_worker_secret_can_reach_a_surface_through_the_projection() {
+        // C-325: each credential is joined from two fragments at compile time, split inside the
+        // vendor prefix. The corpus keeps the realistic shapes it needs; the file on disk carries
+        // nothing a forge's secret scanning would block the push on.
         const CORPUS: &[&str] = &[
-            "sk-ant-api03-REALLOOKINGKEYMATERIAL",
-            "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
-            "AKIAIOSFODNN7EXAMPLE",
-            "xoxb-000000000000-000000000000-ZZZZZZZZZZZZZZZZZZZZZZZZ",
+            concat!("sk-ant-", "api03-REALLOOKINGKEYMATERIAL"),
+            concat!("ghp", "_0123456789abcdefghijklmnopqrstuvwxyz"),
+            concat!("AKI", "AIOSFODNN7EXAMPLE"),
+            concat!(
+                "xoxb",
+                "-000000000000-000000000000-ZZZZZZZZZZZZZZZZZZZZZZZZ"
+            ),
             "-----BEGIN OPENSSH PRIVATE KEY-----",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3b3JrZXIifQ.s1gn4tur3",
             "postgres://fleet:hunter2@db.internal:5432/prod",

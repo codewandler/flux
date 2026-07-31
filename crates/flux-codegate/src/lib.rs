@@ -1987,6 +1987,80 @@ pub fn test_function_names(src: &str) -> syn::Result<Vec<String>> {
     Ok(tests.names)
 }
 
+/// C-325 — the credential shapes a hosted git forge's secret scanning blocks a push on, as
+/// `(vendor prefix, minimum credential-body characters after it)`.
+///
+/// Deliberately looser than the real partner patterns, which add checksums and validity probes this
+/// cannot reproduce, and deliberately stricter than "whatever fired last time". The asymmetry is the
+/// point: over-flagging costs one fragment split in a fixture, while under-flagging costs a push a
+/// human has to unblock by hand — on a commit that then stays blocked *forever*, for every future
+/// clone, because the literal is in the history rather than in the working tree.
+///
+/// The floors are set below every real token's body length and above the placeholder spellings that
+/// exist to exercise the redactor's **registered-value** path rather than its shape path
+/// (`xoxb-redact-me-1234` and friends, whose bodies are 14 characters).
+///
+/// This table is safe to spell out: every entry is a prefix followed immediately by `"`, which is
+/// not a body character, so the list does not match itself.
+pub const PUSH_PROTECTION_SHAPES: &[(&str, usize)] = &[
+    ("sk-ant-api", 20),
+    ("sk_live_", 20),
+    ("sk_test_", 20),
+    ("xoxb-", 20),
+    ("xoxp-", 20),
+    ("xoxa-", 20),
+    ("xoxr-", 20),
+    ("xoxs-", 20),
+    ("xoxe-", 20),
+    ("ghp_", 20),
+    ("gho_", 20),
+    ("ghu_", 20),
+    ("ghs_", 20),
+    ("ghr_", 20),
+    ("github_pat_", 20),
+    ("glpat-", 20),
+    ("hf_", 30),
+    ("AKIA", 16),
+    ("AIza", 30),
+    ("ya29.", 20),
+];
+
+/// The characters a credential body is spelled from. Base64url plus `-`, which every vendor shape
+/// in [`PUSH_PROTECTION_SHAPES`] draws from.
+fn credential_body_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Every push-protection-shaped literal in one source, as `(1-based line, the matched text)`.
+///
+/// **Byte-level on purpose, not AST-level.** The scanner that blocks the push reads the file, not
+/// the program: a shape assembled from two fragments — `concat!("sk-ant-", "api03-…")`, or a
+/// `format!` of the same two halves — is genuinely absent from the bytes it scans, and so must be
+/// absent from the bytes this scans. Which is exactly why a fixture may keep the full credential
+/// *shape* at run time while the file on disk carries neither half of it in matchable form.
+pub fn push_protection_shapes(src: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (index, line) in src.lines().enumerate() {
+        for (prefix, min_body) in PUSH_PROTECTION_SHAPES {
+            let mut from = 0;
+            while let Some(at) = line[from..].find(prefix) {
+                let body_start = from + at + prefix.len();
+                let body = line[body_start..]
+                    .bytes()
+                    .take_while(|b| credential_body_char(*b as char))
+                    .count();
+                if body >= *min_body {
+                    hits.push((index + 1, line[from + at..body_start + body].to_string()));
+                }
+                from = body_start;
+            }
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3587,5 +3661,112 @@ mod tests {
 
         assert!(relative.contains("crates/flux-system/src/lib.rs"));
         assert!(relative.contains("plugins/host-kit/src/lib.rs"));
+    }
+
+    // =========================================================================================
+    // C-325 — no source file carries a literal a forge's secret scanning would block a push on
+    // =========================================================================================
+
+    /// The fixture credential this file needs in order to prove the scanner works, assembled from
+    /// two fragments so that *this crate's own source* does not carry the shape it forbids.
+    ///
+    /// It is also the worked example of the remedy: the scanner sees the whole credential, the file
+    /// on disk carries neither `sk-ant-api` nor a body long enough to match anything.
+    fn fixture_credential(head: &str, tail: &str) -> String {
+        format!("{head}{tail}")
+    }
+
+    /// The scanner flags a written-out credential and, on the same bytes minus the join, does not.
+    ///
+    /// Both halves matter. Without the first the gate is inert; without the second the remedy the
+    /// gate demands would not actually satisfy it, and there would be no way to keep a corpus that
+    /// contains realistic credential shapes.
+    #[test]
+    fn push_protection_scanner_flags_a_written_literal_but_not_an_assembled_one() {
+        let key = fixture_credential("sk-ant-", "api03-c325scannerfixture000000000000");
+        let written = format!("const K: &str = \"{key}\";\n");
+        let hits = push_protection_shapes(&written);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the scanner missed a written credential: {written}"
+        );
+        assert_eq!(hits[0], (1, key.clone()));
+
+        // The remedy: the same bytes, joined at compile time. `concat!` yields the identical
+        // `&'static str`, so every assertion downstream is over the same value as before.
+        let assembled =
+            "const K: &str = concat!(\"sk-ant-\", \"api03-c325scannerfixture000000000000\");\n";
+        assert!(
+            push_protection_shapes(assembled).is_empty(),
+            "a fragment-joined credential must not be flagged, or the remedy is impossible"
+        );
+    }
+
+    /// The other direction: the floors exist so ordinary identifiers and placeholder values keep
+    /// their spelling. A gate that fires on `hf_hub_download` gets waived, and then it is gone.
+    #[test]
+    fn the_push_protection_scanner_leaves_ordinary_identifiers_alone() {
+        for benign in [
+            "let x = hf_hub_download(path);",
+            "// glpat-example is not a token",
+            "let short = \"sk_live_x\";",
+            // The registered-value fixtures: the redactor is proved on these by `add_secret`, not
+            // by their shape, so they are below every floor on purpose.
+            "redactor.add_secret(\"xoxb-redact-me-1234\");",
+            "\"found: xoxb-app-secret-987\"",
+            "let sha = \"ghp_0123456789abcdef\";",
+        ] {
+            assert!(
+                push_protection_shapes(benign).is_empty(),
+                "over-flagged: {benign}"
+            );
+        }
+    }
+
+    /// **The gate.** No Rust source in either workspace carries a credential-shaped literal.
+    ///
+    /// C-325's measurement: a push of eleven merged stories was rejected with twelve detections
+    /// across three commits and two files, every one a false positive over a provably synthetic
+    /// corpus literal. Each rejection needs a human to click through an unblock URL per detector
+    /// rule, and the commit stays blocked for every future clone of the repository. Assembling the
+    /// literal from fragments costs nothing — the test still sees the whole credential — so the
+    /// only durable answer is to make writing one out fail here first.
+    #[test]
+    fn no_workspace_source_carries_a_push_protection_shaped_literal() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        let mut scanned = 0usize;
+        let mut violations = Vec::new();
+        for file in workspace_source_files(repo_root)
+            .into_iter()
+            .chain(workspace_test_files(repo_root))
+        {
+            let source = std::fs::read_to_string(&file).expect("read source");
+            scanned += 1;
+            let relative = file
+                .strip_prefix(repo_root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (line, hit) in push_protection_shapes(&source) {
+                violations.push(format!("{relative}:{line}: {hit}"));
+            }
+        }
+
+        // Anti-vacuity: a walk that stopped resolving would report zero violations and look green.
+        assert!(
+            scanned > 400,
+            "the push-protection walk scanned only {scanned} files"
+        );
+        assert!(
+            violations.is_empty(),
+            "credential-shaped literals in the source will block `git push` on a forge with secret \
+             scanning enabled — and the commit carrying them stays blocked for every future clone. \
+             Join the literal from fragments instead (`concat!(\"sk-ant-\", \"api03-…\")`), which \
+             leaves the value the test asserts over byte-identical:\n  {}",
+            violations.join("\n  ")
+        );
     }
 }
