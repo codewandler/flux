@@ -10,54 +10,48 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.38.0 (2026-07-30) — see [CHANGELOG](../../CHANGELOG.md) and the
-  [roadmap](../roadmap.md). `[Unreleased]` is empty; everything below shipped in that cut.
-- **Shipped in v0.38.0:** two epics' worth of work plus the older unreleased tail.
-  **Adversarial review remediation** (C-255; C-256…C-265) closes every actionable finding from the
-  three independent 2026-07-30 reviews: guard-vetted address pinning for fleet A2A / plugin HTTP /
-  OAuth / TCP egress, host-selected eval execution, content-authenticated release tooling with
-  artifact provenance, bounded REST SSE lifecycle, principal-aware daemon admission and spend
-  breakers, a fail-closed unattended sandbox profile, a structural direct-I/O gate, adversarial
-  CI lanes, and an immutable toolless built-in `flux review`.
-  **Zendesk automation** (D-199) ships only its integration-independent half: L-92's
-  `flux run <module.flux> --entry <flow>` and A-136's read-only `setup`/`triage`/`brief`/`eod`
-  reference flow. The typed Zendesk plugin is **removed before ever being released**, pending a
-  flux-connectors interop layer, so D-200/D-201/D-202 revert to `blocked`.
-  Plus the earlier tail: C-217, C-218, C-226, C-233, C-234, C-240, C-246, C-247, C-251 (partial),
-  C-252.
-  **It was cut as a MINOR** — C-262 flips unattended and serving surfaces to fail closed on sandbox
-  posture, so hosts with no confinement backend now refuse to start instead of running unconfined.
-  The protocol line moved independently: `codewandler-flux-plugin-protocol` 1.0.0 → 1.1.0
-  (additive `decode_ndjson_frame`/`MAX_FRAME_BYTES`), `codewandler-flux-spec` 1.2.0 → 1.2.1,
-  `codewandler-flux-host-kit` 1.0.0 → 1.0.1, `codewandler-flux-datasource` 1.2.0 → 1.3.0.
-  **No plugin-pack release is owed** — the `flux-plugin-zendesk` binary that would have needed one is
-  removed rather than shipped.
-- **Epics in flight:** **adversarial review remediation** (C-255) has all thirteen child findings
-  implemented and stays open only on its last acceptance bullet — three fresh independent reviews
-  against the integrated tree finding no reproducible High-severity containment defect.
-  **Zendesk automation** (D-199) now tracks the replacement: L-92 and A-136 are done, while
-  D-200/D-201/D-202 are `blocked` on the flux-connectors interop that supersedes the withdrawn plugin.
-  **Security assurance** (C-186) has its closure evidence recorded (C-267 →
-  [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md)):
-  desk-review findings 1–4 and classification trust are **closed with evidence** against the tree at
-  `0.38.0`, and assurance moved 5/10 → 7.5/10. C-195 closed as **won't do** (redaction is a boundary
-  control, not an approval-sheet concern) and C-210 is `done`. It stays open on three things:
-  **envelope-integrity finding 4** (`file_stat`'s discarded second read, `flux-tools/src/extra.rs:96-107`)
-  is still open and was never filed as a story; **C-266** (neither side of the fail-closed sandbox
-  switch is proven in CI) is `ready`; and **C-205** is deliberately blocked — `lru` is transitive via
-  `ratatui 0.29.0`, so the fix is a breaking `ratatui 0.30.x` bump for an *unsound*-class advisory
-  reachable only via `LruCache::iter_mut`, which flux never calls.
-- **Newly designed:** **the agent-authored surface** (C-219; C-220…C-225 filed, none started) — the
-  agent gets typed panes on the TUI and an allowlisted config surface. Most of the plumbing already
-  exists (`ToolProgressSink`/`SpawnActivitySink` are the template; `op.register` is the precedent),
-  and A-79's sub-agent activity stream currently has **no consumer in the TUI at all**. The epic's
-  real weight is trust: a model that can draw a styled region can imitate the approval sheet, so
-  panes carry no field that reaches a `Style`, and the writable config keys are asserted disjoint
-  from `PinnableKey::ALL`. C-220 → C-221 → C-222 land before the model can reach any of it.
+- **Released:** v0.42.0 (2026-07-31) — see [CHANGELOG](../../CHANGELOG.md) and the
+  [roadmap](../roadmap.md). Cut as a **MINOR**, which pre-1.0 is this repo's breaking signal, for two
+  independent breaking changes: `flux_flow::voice::VoiceTurnHandler::turn` gained a `Speaker` (D-204),
+  and `SubAgents` gained a public field (C-299). Both are in the publish closure.
+- **Shipped in v0.42.0** — nine stories, and the honest summary is that three of them are foundations
+  whose *consumers* are not wired yet:
+  **Rooms.** D-204 landed a `Room` port (presence, occupants, attributed inbound text) as channel kind
+  `room`, and D-205 landed a real **XMPP MUC backend** over RFC 7395 — no browser, no vendor SDK. The
+  dependency choice was a safety decision: `tokio-xmpp` opens its own socket and resolves its own DNS,
+  so its egress could not route through `guard_url_scoped`; `quick-xml` plus ~200 lines of our own
+  protocol could. ⚠ `address_rule` is carried and **unenforced** (D-207), so the agent answers every
+  line said in a room — theoretical under `MockRoom`, a live cost now.
+  **Harness history.** C-214 extracts `HarnessMessage` from codex/claude-code/opencode transcripts;
+  C-215 exposes it as `search(query, harness)` with containment that is *structural* rather than
+  maintained — off by default by construction, redacted and escaped **at ingest**, per-harness subject.
+  No in-tree host wires it yet, deliberately.
+  **The rest.** C-231 stopped the ad-hoc prune from silently deleting cross-session memory (caught
+  before it had a caller). C-299 made `[limits]` bind for the binary and descend into sub-agents,
+  **per-child** — a shared ceiling was built first and reproduced a real deadlock. L-97 added Flux
+  Glyph, an opcode projection with a round-trip proven as a property over all 43 node kinds. C-223
+  landed `pane.open/update/close` **partial** — the vocabulary is inert until C-305 wires the sink.
+  D-214 pinned the Zendesk flow's op set to what the connector pack projects.
+- **What the reviews caught, because it is the pattern worth keeping:** three stories shipped with a
+  ticked acceptance box that no test observed. C-299's was found by *mutating the wiring line* and
+  seeing no test name change; C-215's ingest asserted a memory bound its code did not have (an OOM on
+  real data); C-214's byte ceiling was unenforced on one of three adapters. None of these fail a gate.
+- **Epics in flight:** **meeting rooms** (D-203) — D-204/D-205 done, D-207 raised to priority 5 because
+  it now gates safe use rather than polish; the design's self-announcement invariant is still in no
+  story's Acceptance. **harness history** (C-212) — C-214/C-215 done, C-302 (flux adapter) and C-216
+  (redaction corpus) open. **agent-authored surface** (C-219) — C-223 partial, C-305/C-306 filed.
+  **Zendesk automation** (D-199) — one bullet open, owned by another repository.
+- **Filed from review findings this cut, not from planning:** C-302…C-308. Two are security-relevant
+  (C-303 query injection reaches a shipped path; C-304 a seam the connector pack's source wrongly
+  claimed was already filed), and C-308 is a **red test the workspace gate cannot see** — `flux-lang
+  --features cli` fails on main while `cargo test --workspace` stays green.
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green in **both** workspaces — `cargo test` · `clippy --all-targets -D warnings` · `fmt`
-  · the `flux-codegate` layering lint · every `scripts/check-*.sh` policy gate.
+  · the `flux-codegate` layering lint. ⚠ `scripts/check-host-kit-protocol-drift.sh` is **red and
+  pre-existing**: `codewandler-flux-plugin-protocol` 1.1.0 is live on crates.io while the published
+  `codewandler-flux-host-kit` still requires `^1`. The in-repo half is already correct; what is owed is
+  a pack/host-kit publish, which is a registry upload.
 
 <!-- BEGIN track:board -->
 <!-- Generated by /track:board (track plugin) from story frontmatter. Do not hand-edit this region; edit the stories and re-run /track:board. -->
