@@ -1,5 +1,5 @@
 ---
-id: D-217
+id: D-222
 title: "`EventDecl::when` const-equality matching — the narrowed event a connector arm currently refuses"
 pillar: Agent
 status: ready
