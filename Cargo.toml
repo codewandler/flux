@@ -87,7 +87,13 @@ flux-plugin = { package = "codewandler-flux-plugin", version = "0.42.0", path = 
 # The plugin wire contract. Versioned on its own line (1.x) — see crates/flux-plugin-protocol.
 flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.1.0", path = "crates/flux-plugin-protocol" }
 flux-auth = { path = "crates/flux-auth" }
-flux-evidence = { package = "codewandler-flux-evidence", version = "1", path = "crates/flux-evidence" }
+# `1.1`, not `1`. `flux-runtime` calls `EvidenceLog::{set_max_payload_bytes,
+# retained_payload_bytes, compaction_notice}`, which exist only from 1.1.0 — so a bare `"1"` lets a
+# consumer resolve 1.0.0 and then fail to compile *inside this workspace's own published source*.
+# It cannot happen here (the path dependency is 1.1.0) and it cannot happen on a fresh resolve
+# (which picks the newest 1.x); it bites exactly the trees that already hold a lockfile pinning
+# 1.0.0 — i.e. every existing downstream host. Measured against 0.41.0 from flux-connectors' C-192.
+flux-evidence = { package = "codewandler-flux-evidence", version = "1.1", path = "crates/flux-evidence" }
 flux-datasource = { package = "codewandler-flux-datasource", version = "1", path = "crates/flux-datasource" }
 flux-a2a = { package = "codewandler-flux-a2a", version = "0.42.0", path = "crates/flux-a2a" }
 flux-pg = { package = "codewandler-flux-pg", version = "0.42.0", path = "crates/flux-pg" }
