@@ -12,6 +12,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Web requests can now take query parameters as a proper list, instead of you gluing them onto the
+  address yourself.** Give the request a set of named values and flux assembles the address for you,
+  escaping each value correctly. This matters for more than tidiness: previously, a value that
+  happened to contain a character like `&` or `=` — a search phrase, a customer's name, anything the
+  agent picked up along the way — could silently turn into *extra* parameters and change what the
+  request actually asked for. That can no longer happen.
+  Values behave the way you would expect: leaving one empty means "don't send it", while `false` and
+  `0` are sent as real values, and naming the same parameter twice is reported as a mistake rather
+  than one quietly overwriting the other. A stored credential can be used as a query value and stays
+  hidden in logs and in anything the model can see, exactly as it does in a request header.
+
 ## [0.42.0] - 2026-07-31
 
 ### New

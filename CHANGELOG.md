@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`http.request` accepts a structured `query` map, and percent-encodes every value per RFC 3986**
+  (C-303). Authored Flux could previously only build a query by interpolating into the URL string,
+  and nothing encoded the result — so a model-supplied value carrying `&` or `=` rewrote the request
+  into parameters the author never wrote. The map is resolved and appended *before*
+  `guard_url_scoped_pinned`, so the egress guard, the pinning and the redirect re-guard all observe
+  the wire URL; there is no second, unguarded URL. A `null` value is omitted (an unsupplied optional
+  field), `false` and `0` are sent, and a duplicate key is an error rather than a silent last-wins.
+  `permission_subjects` and the `NetworkFetch` intent report the encoded URL.
+
+  A `$secret` placed in a query routes through the same C-76 allowlist as one placed in a header,
+  and **both** its raw and percent-encoded spellings are seeded into the redactor — a token that only
+  ever appears on the wire as `sk-live%2F99` would otherwise survive redaction.
+
+  The encoder is now shared (`flux_core::urlencode`), with `flux-credentials` and `flux-providers`
+  converted onto it. It emits upper-case hex because SigV4 requires it, and it is deliberately
+  distinct from the form encoder: a space is `%20`, never `+`. One private copy remains in
+  `flux-plugin` and the design doc's claim to the contrary is tracked by C-313.
+
 ### Fixed
 
 - **A plugin operation that declared no effects could not be loaded at all** unless its plugin also
