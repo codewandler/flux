@@ -33,7 +33,7 @@ read on 2026-07-30.
 
 ## Progress
 
-- 2026-08-01 — opened from the seven-way validation pass over `docs/reviews/aggregate-complaint-triage.md`.
+- 2026-08-01 — opened from the seven-way validation pass over `docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md`.
 
 ## Notes
 

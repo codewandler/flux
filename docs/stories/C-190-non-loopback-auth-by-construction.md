@@ -73,5 +73,5 @@ no bypass paths; this is one that already exists. Make the invariant structural.
 - Related but distinct: `a2a.rs:1575` admits "only the three loopback spellings" for its own target
   check. Worth confirming both paths agree on what loopback means rather than each deciding
   separately.
-- Source: [2026-07-29 review](../../reviews/2026-07-29-security-posture-desk-review.md), the
+- Source: [2026-07-29 review](../reviews/single/2026-07-29-security-posture-desk-review.md), the
   "Lower-level users can also mount the router directly" caveat — verified.

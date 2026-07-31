@@ -9,9 +9,9 @@ without duplicating stories that were already on the board.
 
 Review evidence:
 
-- [`primary`](../reviews/2026-07-30-independent-adversarial-review-primary.md)
-- [`review A`](../reviews/2026-07-30-independent-adversarial-review-a.md)
-- [`review B`](../reviews/2026-07-30-independent-adversarial-review-b.md)
+- [`primary`](../reviews/archive/2026-07-30-independent-adversarial-review-primary.md)
+- [`review A`](../reviews/archive/2026-07-30-independent-adversarial-review-a.md)
+- [`review B`](../reviews/archive/2026-07-30-independent-adversarial-review-b.md)
 
 ## Finding-to-story traceability
 

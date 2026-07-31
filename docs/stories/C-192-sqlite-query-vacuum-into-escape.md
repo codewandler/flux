@@ -59,7 +59,7 @@ keyword that was missed.
 
 ## Notes
 - **Verified against the tree at `0.33.1` (f8e90d7).** Source review:
-  [`reviews/2026-07-29-envelope-integrity.md`](../../reviews/2026-07-29-envelope-integrity.md),
+  [`reviews/single/2026-07-29-envelope-integrity.md`](../reviews/single/2026-07-29-envelope-integrity.md),
   finding 1.
 - The declaration: `crates/flux-tools/src/extra.rs:278-282` —
   `effects: vec![Effect::Read, Effect::Filesystem]`, `risk: Risk::Low`,

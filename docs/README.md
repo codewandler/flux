@@ -30,6 +30,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | Status + what's next | [roadmap.md](roadmap.md) |
 | **What to work on right now** | [stories/README.md](stories/README.md) — the backlog/status board |
 | Latest repository architecture review | [designs/architecture-review-2026-07-14/review.md](designs/architecture-review-2026-07-14/review.md) — ranked findings, evidence, and linked remediation stories |
+| Security / readiness reviews and their triage state | [reviews/README.md](reviews/README.md) — `single/` passes, `aggregate/` claim ledgers, `archive/` handled passes |
 | Using the CLI / TUI / SDK / server | [usage.md](usage.md) |
 | Choosing a model/provider | [model.md](model.md) |
 | The self-hosted agent loop | [agent-loop.md](agent-loop.md) |

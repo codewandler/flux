@@ -70,5 +70,5 @@ known-vulnerable transitive dependency fails the build instead of shipping silen
 - Deliberately scoped to advisory + license + source. SAST (CodeQL), fuzzing and Miri were also
   found absent by the review; they are larger investments and should be argued separately rather
   than smuggled in here.
-- Source: [2026-07-29 review](../../reviews/2026-07-29-security-posture-desk-review.md), finding
+- Source: [2026-07-29 review](../reviews/single/2026-07-29-security-posture-desk-review.md), finding
   "Security assurance lags behind the architecture" — verified.

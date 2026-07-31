@@ -52,7 +52,7 @@ denylist that is bypassable where it matters and redundant where it works.
 
 ## Notes
 - **Verified against the tree at `0.33.1` (f8e90d7).** Source review:
-  [`reviews/2026-07-29-envelope-integrity.md`](../../reviews/2026-07-29-envelope-integrity.md),
+  [`reviews/single/2026-07-29-envelope-integrity.md`](../reviews/single/2026-07-29-envelope-integrity.md),
   finding 2.
 - The claim: `crates/flux-tools/src/extra.rs:269-271` — *"Only SELECT and PRAGMA statements are
   allowed"*; the refusal message at `:322` repeats it.

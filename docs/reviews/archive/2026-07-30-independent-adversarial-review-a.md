@@ -34,6 +34,18 @@ top_findings:
   - git_diff is classified as a low-risk observer but can invoke configured external diff programs
   - Process sandboxing and sandbox network isolation remain opt-in, with no Windows backend
   - The authenticated daemon has body, timeout, and A2A in-flight bounds but no request rate limiter
+triage:
+  kind: single
+  status: handled
+  triaged_on: 2026-08-01
+  aggregated_into: docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md
+  normalized_claims: [NET-01, REL-01, REL-02, PROC-02, SANDBOX-01, SRV-02, ASSURE-01, ASSURE-04]
+  filed_as: [C-255, C-345, C-352, C-358, C-369]
+  note: >-
+    Every numbered finding in this pass was normalized into the aggregate ledger, validated
+    against the tree on 2026-08-01, and either confirmed closed or filed as a residual story.
+    Archived: cited as evidence, not awaiting triage. Do not re-triage in isolation — the
+    ledger records the cross-review disagreements this document cannot see on its own.
 ---
 
 ## Verdict

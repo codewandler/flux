@@ -39,7 +39,7 @@ mapping evidence, and deliberately handed it over rather than repairing it.
 - [x] A test pins whichever contract is chosen, so a future edit cannot silently reintroduce a
       read-and-discard. Name it in this story.
 - [x] Full gate green, and the finding is marked closed in
-      [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md)
+      [`reviews/single/2026-07-30-security-assurance-closure.md`](../reviews/single/2026-07-30-security-assurance-closure.md)
       so the next reviewer sees it closed rather than re-deriving it — which is the whole point of that
       artifact.
 
@@ -71,7 +71,7 @@ mapping evidence, and deliberately handed it over rather than repairing it.
   - `file_stat_reports_no_mode_anywhere_in_its_contract` — spec description, emitted JSON keys, and
     the rendered view all checked for a mode claim; also pins the four keys and their values.
 - **Review artifact updated** (acceptance item 6): finding 4 in
-  `reviews/2026-07-30-security-assurance-closure.md` is marked **CLOSED (C-275)** in its heading,
+  `reviews/single/2026-07-30-security-assurance-closure.md` is marked **CLOSED (C-275)** in its heading,
   its `top_findings` frontmatter entry and the Verdict bullet. The original analysis is kept verbatim
   beneath a dated closure note — it is the evidence, and the *process* lesson (the finding survived
   by never being filed) is the part that outlives the fix.

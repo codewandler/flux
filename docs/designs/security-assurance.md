@@ -3,7 +3,7 @@
 Story: [C-186](../stories/C-186-security-assurance-epic.md) · Pillar: Core · Status: design
 
 Source: the external adversarial desk review of 2026-07-29,
-[`reviews/2026-07-29-security-posture-desk-review.md`](../../reviews/2026-07-29-security-posture-desk-review.md),
+[`reviews/single/2026-07-29-security-posture-desk-review.md`](../reviews/single/2026-07-29-security-posture-desk-review.md),
 verified claim-by-claim against the tree at `0.33.1`. Every story under this epic traces to a
 **confirmed** finding with a `path:line`. Nothing here rests on the reviewer's prose alone.
 

@@ -2,7 +2,7 @@
 
 ## Context
 
-A seven-way validation pass over [`docs/reviews/aggregate-complaint-triage.md`](../reviews/aggregate-complaint-triage.md)
+A seven-way validation pass over [`docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md`](../reviews/aggregate/2026-08-01-aggregate-complaint-triage.md)
 re-checked every claim in the ledger against the current tree. `NET-01`, `NET-02`, `PROC-01` and
 `PROC-02` are **historical-fixed**: C-256/C-257 bind plugin HTTP, OAuth refresh, raw TCP and every
 fleet A2A client to the addresses the guard vetted, and the regression tests reach real listeners

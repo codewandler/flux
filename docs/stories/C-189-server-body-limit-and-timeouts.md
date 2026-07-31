@@ -62,5 +62,5 @@ between the published promise and the mounted middleware.
 - Note the composition risk the review flags: `--yes` permits automatic approval, so an exposed
   daemon with no resource limits is the worst-case configuration. Worth a line in the serving docs
   once this lands.
-- Source: [2026-07-29 review](../../reviews/2026-07-29-security-posture-desk-review.md), finding
+- Source: [2026-07-29 review](../reviews/single/2026-07-29-security-posture-desk-review.md), finding
   "Server hardening appears incomplete" — verified.

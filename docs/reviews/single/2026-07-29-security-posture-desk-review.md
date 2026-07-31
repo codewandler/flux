@@ -31,6 +31,14 @@ top_findings:
   - Server has no global body limit, request timeout or rate limiting
   - GitHub Actions pinned to movable tags, not commit SHAs
   - Single-maintainer bus factor
+triage:
+  kind: single
+  status: open
+  owner_stories: [C-186, C-267]
+  aggregated_into: null
+  note: >-
+    Not yet rolled into an aggregate ledger. Its findings are tracked directly by the owner
+    stories above; C-186 is still in progress, which is why this pass stays in single/.
 ---
 
 ## Verdict
@@ -231,17 +239,17 @@ defect.
 
 ## Where the findings went
 
-Tracked as epic **[C-186 — Security assurance](../docs/stories/C-186-security-assurance-epic.md)**
-(design: [security-assurance.md](../docs/designs/security-assurance.md)). Every child cites a
+Tracked as epic **[C-186 — Security assurance](../../stories/C-186-security-assurance-epic.md)**
+(design: [security-assurance.md](../../designs/security-assurance.md)). Every child cites a
 `path:line` from the verification table above, not the reviewer's prose:
 
 | Story | Finding |
 | --- | --- |
-| [C-187](../docs/stories/C-187-sha-pin-github-actions.md) | SHA-pin third-party GitHub Actions |
-| [C-188](../docs/stories/C-188-dependency-advisory-scanning.md) | `cargo-audit` + `cargo-deny` in CI |
-| [C-189](../docs/stories/C-189-server-body-limit-and-timeouts.md) | Server body limits + request timeouts |
-| [C-190](../docs/stories/C-190-non-loopback-auth-by-construction.md) | Non-loopback auth invariant by construction |
-| [C-191](../docs/stories/C-191-toolspec-invariant-test.md) | Registry-wide `ToolSpec` invariant test |
+| [C-187](../../stories/C-187-sha-pin-github-actions.md) | SHA-pin third-party GitHub Actions |
+| [C-188](../../stories/C-188-dependency-advisory-scanning.md) | `cargo-audit` + `cargo-deny` in CI |
+| [C-189](../../stories/C-189-server-body-limit-and-timeouts.md) | Server body limits + request timeouts |
+| [C-190](../../stories/C-190-non-loopback-auth-by-construction.md) | Non-loopback auth invariant by construction |
+| [C-191](../../stories/C-191-toolspec-invariant-test.md) | Registry-wide `ToolSpec` invariant test |
 
 **Deliberately not tracked.** The sandbox default — this review's headline finding — is deferred
 with its reasoning recorded in the epic: flipping it while `on` still degrades silently to
@@ -252,6 +260,6 @@ adoption and external audit are context for the score, not work items.
 ## Turning this into repeatable practice
 
 The adversarial lens used here is captured as a repo-local skill:
-[`.agents/skills/adversarial-review/SKILL.md`](../.agents/skills/adversarial-review/SKILL.md)
+[`.agents/skills/adversarial-review/SKILL.md`](../../../.agents/skills/adversarial-review/SKILL.md)
 (exposed as `.claude/skills/adversarial-review`). Use it to re-run this review shape against a later
 version, or against a subsystem, and to diff the result against this baseline.

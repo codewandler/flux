@@ -27,7 +27,7 @@ closure instead of re-deriving it.
       C-188 `e3d67e39` (`security-audit.yml`, push/PR/weekly), C-189 `c9c5086e`
       (`flux-server/src/lib.rs:913`+`:1120`, tests `:2136`/`:2167`), C-190 `8e322973`
       (`guard_open_bind` `:512` called from `router` `:792`, test `:2687`). Evidence table:
-      [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md).
+      [`reviews/single/2026-07-30-security-assurance-closure.md`](../reviews/single/2026-07-30-security-assurance-closure.md).
 - [x] C-191 lands a registry-wide `ToolSpec` invariant test, converting the review's
       "classification trust" concern from an assumption into a gate. → `d25eeab6`;
       `flux-spec/src/coherence.rs` I1/I2/I3 (`:256`/`:268`/`:280`) now gated at **six** seams, four
@@ -44,7 +44,7 @@ closure instead of re-deriving it.
 - [x] A re-run of the [`adversarial-review`](../../.agents/skills/adversarial-review/SKILL.md) skill
       against the then-current version can mark findings 1–4 and classification trust **closed with
       evidence**, diffed against the 2026-07-29 baseline. →
-      [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md)
+      [`reviews/single/2026-07-30-security-assurance-closure.md`](../reviews/single/2026-07-30-security-assurance-closure.md)
       (C-267). ⚠ "findings 1–4" is ambiguous between the two baseline reviews; the artifact settles
       it explicitly as **this design doc's own risk ranking** (items 1–4 = C-187/188/189/190,
       item 5 = classification trust), which is the reading the three bullets above enumerate and the
@@ -68,13 +68,13 @@ closure instead of re-deriving it.
   than implied, so the epic can be closed by evidence rather than by fatigue.
 - 2026-07-29 — epic opened from the review. Design:
   [security-assurance.md](../designs/security-assurance.md). Source review:
-  [`reviews/2026-07-29-security-posture-desk-review.md`](../../reviews/2026-07-29-security-posture-desk-review.md),
+  [`reviews/single/2026-07-29-security-posture-desk-review.md`](../reviews/single/2026-07-29-security-posture-desk-review.md),
   verified claim-by-claim against the tree at `0.33.1` — every child story cites a `path:line`, not
   the reviewer's prose.
 - Ordering is **not** the review's ordering. Ranked by risk × reachability ÷ cost, which puts the
   supply-chain item first and the review's own headline finding out of scope (see Notes).
 - 2026-07-29 — second review, `envelope-integrity` lens:
-  [`reviews/2026-07-29-envelope-integrity.md`](../../reviews/2026-07-29-envelope-integrity.md).
+  [`reviews/single/2026-07-29-envelope-integrity.md`](../reviews/single/2026-07-29-envelope-integrity.md).
   Added C-192, C-193, C-194. C-192 inserted at priority 2 — ahead of advisory scanning and the
   server limits — because it is model-reachable in any default session with no operator mistake and
   no third party required; C-188/C-189/C-190 shifted to 5/6/7. That pass **confirmed** the dispatch
@@ -100,7 +100,7 @@ closure instead of re-deriving it.
   C-191 is `done` (`d25eeab6`), the deferral became **C-217** (`done`, `f616b1ff`), and the re-run is
   **C-267**.
 - 2026-07-30 — **C-267 landed the closure artifact**:
-  [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md),
+  [`reviews/single/2026-07-30-security-assurance-closure.md`](../reviews/single/2026-07-30-security-assurance-closure.md),
   verified against the tree at `0.38.0` (`588144a2`) rather than against these story files. Desk-review
   findings 1–4 and classification trust are **closed with evidence** and each control was separately
   checked for **production reachability** — no child marked `done` was found with an absent or

@@ -1,6 +1,11 @@
 ---
 title: Aggregate review complaint triage and claim-validation ledger
 kind: review-aggregate
+triage:
+  kind: aggregate
+  date: 2026-08-01
+  aggregates: docs/reviews/archive/
+  filed_as: [C-345, C-352, C-358, C-363, C-369, C-375, C-382]
 scope: all documents present under docs/reviews at aggregation time
 status: validated-2026-08-01
 source_documents: 5
@@ -83,11 +88,11 @@ integrity), C-382 (change recovery and provenance).
 
 | Key | Source | Subject / method boundary |
 | --- | --- | --- |
-| A | `docs/reviews/2026-07-30-independent-adversarial-review-a.md` | Security desk review plus four targeted checks; commit `cb3bb057c961db70769330b375299e09a2fabfcb` |
-| B | `docs/reviews/2026-07-30-independent-adversarial-review-b.md` | Security desk review plus root/plugin tests and structural scripts; same commit |
-| P | `docs/reviews/2026-07-30-independent-adversarial-review-primary.md` | Read-only security/configuration review; same commit; no Cargo build/test |
-| C | `docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md` | Session retrospective over staged planning, flow execution, and Git recovery; no flow or Cargo execution |
-| H | `docs/reviews/2026-07-31-harness-tooling-friction-review.md` | Interactive pane exercise plus source comparison; worktree included uncommitted staged-intent changes |
+| A | `docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md` | Security desk review plus four targeted checks; commit `cb3bb057c961db70769330b375299e09a2fabfcb` |
+| B | `docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md` | Security desk review plus root/plugin tests and structural scripts; same commit |
+| P | `docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md` | Read-only security/configuration review; same commit; no Cargo build/test |
+| C | `docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md` | Session retrospective over staged planning, flow execution, and Git recovery; no flow or Cargo execution |
+| H | `docs/reviews/archive/2026-07-31-harness-tooling-friction-review.md` | Interactive pane exercise plus source comparison; worktree included uncommitted staged-intent changes |
 
 The three security reviews are directly comparable at the stated commit, but they do not always
 agree. The two harness reviews concern session-specific capability sets and partially mutable
@@ -142,14 +147,14 @@ Priority expresses validation order, not confirmed severity.
 ### NET-01 — Plugin HTTP, OAuth, and TCP may re-resolve after egress validation
 
 - Status: `unvalidated`
-- Sources: A finding 1 (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:156-195`).
+- Sources: A finding 1 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:156-195`).
 - Normalized claim: plugin HTTP, OAuth token refresh, and raw TCP paths allegedly validate one DNS
   result but connect through a later hostname resolution, permitting DNS-rebinding access outside the
   private-network grant.
 - Preconditions/bounds: a plugin already has a destination capability; the hostname is attacker
   controlled; HTTP secret exposure depends on transport/TLS details. Raw TCP does not depend on HTTP.
 - Disagreement: P's strengths section says plugin HTTP uses the right pattern
-  (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:86-90`), while A later alleges
+  (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:86-90`), while A later alleges
   redirect disabling is insufficient because addresses are not pinned. Validate the full connect path,
   not merely redirect policy.
 - Validation evidence needed: trace each callback from capability check to socket connect; use an
@@ -160,7 +165,7 @@ Priority expresses validation order, not confirmed severity.
 ### NET-02 — Fleet/A2A clients may re-resolve or follow redirects outside the egress guard
 
 - Status: `unvalidated`
-- Sources: P finding 1 (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:106-130`).
+- Sources: P finding 1 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:106-130`).
 - Normalized claim: `fleet.dispatch`, `fleet.status`, and `fleet.cancel` allegedly discard guarded
   addresses, construct a separate A2A client from the original URL, and do not re-guard redirects.
 - Preconditions/bounds: a fleet operation must be available and called; the initially admitted host is
@@ -173,7 +178,7 @@ Priority expresses validation order, not confirmed severity.
 ### PROC-01 — `eval_run` may execute a model-selected sandbox-exempt binary with raw credentials
 
 - Status: `unvalidated`
-- Sources: P finding 2 (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:132-157`).
+- Sources: P finding 2 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:132-157`).
 - Normalized claim: production registration allegedly allows model input to select `flux_bin`, then
   runs it through a trusted-host sandbox exemption while injecting provider credentials.
 - Preconditions/bounds: the eval family must be surfaced; process execution must be approved or
@@ -187,8 +192,8 @@ Priority expresses validation order, not confirmed severity.
 ### REL-01 — Release jobs may execute unauthenticated remote tooling with excessive authority
 
 - Status: `unvalidated`
-- Sources: A finding 2 (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:197-222`);
-  P finding 3 (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:159-174`).
+- Sources: A finding 2 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:197-222`);
+  P finding 3 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:159-174`).
 - Normalized claim: release planning/build/publish paths allegedly execute downloaded cargo-dist and
   rustup installers without locally verifying a digest or signature; P additionally alleges broad
   write-capable token exposure in jobs that execute them.
@@ -205,7 +210,7 @@ Priority expresses validation order, not confirmed severity.
 ### OUTCOME-01 — Provider-stage errors may be reported as successful turns
 
 - Status: `unvalidated`
-- Sources: P finding 4 (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:176-192`).
+- Sources: P finding 4 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:176-192`).
 - Normalized claim: intent/exploration provider errors allegedly become ordinary data, causing NDJSON
   `turn_end` and process exit zero rather than a typed failed outcome.
 - Validation evidence needed: inject failures independently at intent, exploration, planning, and
@@ -216,7 +221,7 @@ Priority expresses validation order, not confirmed severity.
 ### SRV-01 — REST SSE work may outlive disconnects and buffer without bound
 
 - Status: `unvalidated`
-- Sources: B finding 2 (`docs/reviews/2026-07-30-independent-adversarial-review-b.md:141-159`).
+- Sources: B finding 2 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md:141-159`).
 - Normalized claim: the REST session stream allegedly uses an unbounded channel and detached task with
   no disconnect cancellation, unlike the bounded A2A stream.
 - Validation evidence needed: inspect the current route assembly; run disconnect and stalled-reader
@@ -226,7 +231,7 @@ Priority expresses validation order, not confirmed severity.
 ### HAR-01 — Arbitrary workspace flows could not be executed in the staged harness
 
 - Status: `unvalidated`
-- Sources: C finding 1 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:61-83`).
+- Sources: C finding 1 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:61-83`).
 - Normalized claim: the reviewed staged-planning capability set could inspect/render but not execute
   `examples/commit.flux`, so the requested route could not be dogfooded.
 - Scope warning: this is a runtime capability-availability claim, not proof that no flow runner exists
@@ -237,7 +242,7 @@ Priority expresses validation order, not confirmed severity.
 ### HAR-02 — Completion was not bound to the user-required execution route
 
 - Status: `unvalidated`
-- Sources: C finding 2 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:85-105`).
+- Sources: C finding 2 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:85-105`).
 - Normalized claim: direct Git operations reached a similar repository state without running the
   required flow, yet the agent initially reported the route-specific dogfood task as complete.
 - Validation evidence needed: authoritative transcript/receipts for the cited session if available;
@@ -249,7 +254,7 @@ Priority expresses validation order, not confirmed severity.
 ### GIT-01 — No constrained uncommit operation preserved a mistaken local commit's patch
 
 - Status: `unvalidated`
-- Sources: C finding 3 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:107-129`).
+- Sources: C finding 3 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:107-129`).
 - Normalized claim: the surfaced Git family offered revert but no safe mixed-reset-equivalent for an
   unpushed `HEAD`, preventing recovery to the pre-commit working tree.
 - Validation evidence needed: inspect the exact Git operations available after relevant signaling;
@@ -259,9 +264,9 @@ Priority expresses validation order, not confirmed severity.
 ### SANDBOX-01 — Process confinement is opt-in, network-open by default, and platform-dependent
 
 - Status: `unvalidated`
-- Sources: A finding 4 (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:245-261`);
-  B finding 1 (`docs/reviews/2026-07-30-independent-adversarial-review-b.md:121-139`); P finding 5
-  (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:194-204`).
+- Sources: A finding 4 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:245-261`);
+  B finding 1 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md:121-139`); P finding 5
+  (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:194-204`).
 - Normalized claim: unset configuration allegedly selects no OS sandbox and open sandbox networking;
   best-effort `on` can degrade to unconfined execution, only `require` fails closed, and Windows has no
   backend.
@@ -273,9 +278,9 @@ Priority expresses validation order, not confirmed severity.
 ### SRV-02 — The daemon lacks general request, concurrency, and spend controls
 
 - Status: `unvalidated`
-- Sources: A finding 5 (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:263-279`);
-  B finding 3 (`docs/reviews/2026-07-30-independent-adversarial-review-b.md:161-173`); P finding 6
-  (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:206-216`).
+- Sources: A finding 5 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:263-279`);
+  B finding 3 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md:161-173`); P finding 6
+  (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:206-216`).
 - Normalized claim: body/time/A2A bounds allegedly do not provide general per-principal request rate,
   concurrency, queue, or provider-spend limits across REST, webhook, blocking A2A, and streaming paths.
 - Severity disagreement: A/B rate this Medium; P rates it Low. Preserve this because authentication and
@@ -288,9 +293,9 @@ Priority expresses validation order, not confirmed severity.
 ### REL-02 — Core release artifacts lack an independent consumer authenticity root
 
 - Status: `unvalidated`
-- Sources: B finding 4 (`docs/reviews/2026-07-30-independent-adversarial-review-b.md:175-193`);
-  A finding 2 (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:217-222`); P finding 3
-  (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:171-174`).
+- Sources: B finding 4 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md:175-193`);
+  A finding 2 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:217-222`); P finding 3
+  (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:171-174`).
 - Normalized claim: core archives/installers/checksums allegedly lack detached signatures, attestations,
   or consumer-verifiable provenance, while primary install documentation executes same-origin scripts.
 - Keep separate from `REL-01`: producer bootstrap integrity and consumer artifact authenticity require
@@ -302,7 +307,7 @@ Priority expresses validation order, not confirmed severity.
 ### PROC-02 — `git_diff` may invoke external diff/textconv programs despite low-risk metadata
 
 - Status: `unvalidated`
-- Sources: A finding 3 (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:224-243`).
+- Sources: A finding 3 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:224-243`).
 - Normalized claim: `git_diff` allegedly omitted `--no-ext-diff` (and may need `--no-textconv`), allowing
   host/repository Git configuration to execute a program despite observer-style classification.
 - Preconditions/bounds: a malicious or preconfigured driver must exist; this is not model-authored argv.
@@ -312,8 +317,8 @@ Priority expresses validation order, not confirmed severity.
 ### ASSURE-01 — Security automation lacks independent/adversarial execution lanes
 
 - Status: `unvalidated`
-- Sources: A finding 6 (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:281-301`);
-  B finding 5 (`docs/reviews/2026-07-30-independent-adversarial-review-b.md:195-207`).
+- Sources: A finding 6 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:281-301`);
+  B finding 5 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md:195-207`).
 - Normalized claim: repository-controlled automation allegedly lacked fuzzing, SAST, Miri, sanitizers,
   and core release attestations; security validation was mostly implementer-authored.
 - Validation evidence needed: current workflows, scripts, fuzz targets/corpora, scheduled jobs, and
@@ -325,8 +330,8 @@ Priority expresses validation order, not confirmed severity.
 ### ASSURE-02 — The direct-I/O gate is lexical, scoped, and may encode false exclusions
 
 - Status: `unvalidated`
-- Sources: B finding 6 (`docs/reviews/2026-07-30-independent-adversarial-review-b.md:209-223`);
-  P finding 2 assurance component (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:153-157`).
+- Sources: B finding 6 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md:209-223`);
+  P finding 2 assurance component (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:153-157`).
 - Normalized claim: the scanner allegedly matches selected spellings in selected crates rather than
   enforcing the invariant semantically; P reports that `flux-eval` was excluded as non-model-facing even
   though `eval_run` was production-registered.
@@ -337,7 +342,7 @@ Priority expresses validation order, not confirmed severity.
 ### ASSURE-03 — Tool catalog/risk tests may have silent coverage holes
 
 - Status: `unvalidated`
-- Sources: P finding 7 (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:218-228`).
+- Sources: P finding 7 (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:218-228`).
 - Normalized claim: risk-table tests allegedly skipped unresolved rows and catalog census logic could
   miss registrations outside one scanned module or under reused labels.
 - Validation evidence needed: enumerate the production catalog from runtime assembly; compare it with all
@@ -348,9 +353,9 @@ Priority expresses validation order, not confirmed severity.
 
 - Status: `unvalidated`
 - Sources: A ratings/finding 6/open questions
-  (`docs/reviews/2026-07-30-independent-adversarial-review-a.md:105-106`, `:289-316`); B ratings/open
-  questions (`docs/reviews/2026-07-30-independent-adversarial-review-b.md:62-63`, `:242-247`); P ratings
-  (`docs/reviews/2026-07-30-independent-adversarial-review-primary.md:72-73`).
+  (`docs/reviews/archive/2026-07-30-independent-adversarial-review-a.md:105-106`, `:289-316`); B ratings/open
+  questions (`docs/reviews/archive/2026-07-30-independent-adversarial-review-b.md:62-63`, `:242-247`); P ratings
+  (`docs/reviews/archive/2026-07-30-independent-adversarial-review-primary.md:72-73`).
 - Normalized claim: local Git history appeared attributable to one maintainer, while branch protection,
   required review, release environment policy, incident exercises, and operational controls were not
   repository-verifiable.
@@ -362,7 +367,7 @@ Priority expresses validation order, not confirmed severity.
 ### GIT-02 — Change ownership/provenance is not machine-verifiable
 
 - Status: `unvalidated`
-- Sources: C finding 4 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:131-150`).
+- Sources: C finding 4 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:131-150`).
 - Normalized claim: status/diff data did not identify which session or action produced a path/hunk, so
   “commit all your changes” was ambiguous in a mixed user/agent worktree.
 - Validation evidence needed: inspect action receipts and staged-planning state for path/blob/hunk
@@ -372,7 +377,7 @@ Priority expresses validation order, not confirmed severity.
 ### GIT-03 — Read-only Git observers were captured as deferred actions
 
 - Status: `unvalidated`
-- Sources: C finding 5 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:152-169`).
+- Sources: C finding 5 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:152-169`).
 - Normalized claim: `git_status`, `git_log`, and `git_diff` returned proposed-action capture rather than
   immediate evidence in the retrospective turn.
 - Validation evidence needed: reproduce at gather and action-planning stages under the same policy;
@@ -382,7 +387,7 @@ Priority expresses validation order, not confirmed severity.
 ### HAR-03 — Static flow validation was easy to overstate as end-to-end execution
 
 - Status: `unvalidated`
-- Sources: C finding 6 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:171-186`).
+- Sources: C finding 6 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:171-186`).
 - Normalized claim: parse/lower validation of examples did not prove Git outputs, approvals, index
   refusal, commit creation, or rollback, but was presented too strongly in the session.
 - Validation evidence needed: inspect test scope and user-visible labels; add/run hermetic temporary-repo
@@ -391,8 +396,8 @@ Priority expresses validation order, not confirmed severity.
 ### HAR-04 — No authoritative scoped transcript reader supports retrospectives
 
 - Status: `unvalidated`
-- Sources: C finding 8 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:202-210`);
-  H finding 3 (`docs/reviews/2026-07-31-harness-tooling-friction-review.md:122-137`).
+- Sources: C finding 8 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:202-210`);
+  H finding 3 (`docs/reviews/archive/2026-07-31-harness-tooling-friction-review.md:122-137`).
 - Normalized claim: current model context cannot prove transcript completeness after compaction/resume,
   while arbitrary session-database filesystem access would violate scope.
 - Validation evidence needed: inspect available redacted session-history operations and compaction
@@ -402,18 +407,18 @@ Priority expresses validation order, not confirmed severity.
 ### ROUTE-01 — First-pass capability routing depends on a sufficiently rich intent contract
 
 - Status: `unvalidated`
-- Sources: H finding 1 (`docs/reviews/2026-07-31-harness-tooling-friction-review.md:74-102`).
+- Sources: H finding 1 (`docs/reviews/archive/2026-07-31-harness-tooling-friction-review.md:74-102`).
 - Normalized claim: narrow staged surfacing is intentional and desirable, but indirect requests may need
   richer intent fields and family hints to select the right family on the first attempt.
 - Important correction: this is not a request for an ambient all-tools catalog. H explicitly rejects
-  that interpretation (`docs/reviews/2026-07-31-harness-tooling-friction-review.md:151-169`).
+  that interpretation (`docs/reviews/archive/2026-07-31-harness-tooling-friction-review.md:151-169`).
 - Validation evidence needed: fixed evaluation set with first-pass family precision/recall, unnecessary
   families, repair rate, surfaced schema bytes, and latency; compare intent/hint variants.
 
 ### HAR-05 — Capability availability lacks an exact-flow preflight
 
 - Status: `unvalidated`
-- Sources: C finding 7 (`docs/reviews/2026-07-31-commit-workflow-dogfooding-friction-review.md:188-200`).
+- Sources: C finding 7 (`docs/reviews/archive/2026-07-31-commit-workflow-dogfooding-friction-review.md:188-200`).
 - Normalized claim: the agent could not determine before mutation whether a specific workspace flow was
   executable with the current operations and approval posture.
 - Validation evidence needed: inventory current parse/lower/preflight operations; test a flow with present,
@@ -424,7 +429,7 @@ Priority expresses validation order, not confirmed severity.
 ### HAR-06 — Pane command acceptance cannot establish authoritative visible state
 
 - Status: `unvalidated`
-- Sources: H finding 2 (`docs/reviews/2026-07-31-harness-tooling-friction-review.md:104-120`).
+- Sources: H finding 2 (`docs/reviews/archive/2026-07-31-harness-tooling-friction-review.md:104-120`).
 - Normalized claim: pane operations are send-only, so the agent cannot verify state after host expiry,
   suppression, resume, capacity decisions, or user interaction.
 - Existing framing: H says this is an explicit contract decision tracked by C-306, not an overlooked
@@ -436,7 +441,7 @@ Priority expresses validation order, not confirmed severity.
 ### LANG-01 — Timed pane flows are repetitive to author
 
 - Status: `unvalidated`
-- Sources: H finding 4 (`docs/reviews/2026-07-31-harness-tooling-friction-review.md:139-149`).
+- Sources: H finding 4 (`docs/reviews/archive/2026-07-31-harness-tooling-friction-review.md:139-149`).
 - Normalized claim: existing Flux-Lang loops can implement cancellable timed animation safely, but one
   loop/update block per frame is verbose.
 - Validation evidence needed: compare documented/composite patterns, source size, dispatch count, jitter,

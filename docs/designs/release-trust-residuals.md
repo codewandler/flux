@@ -2,7 +2,7 @@
 
 ## Context
 
-The validation pass over [`docs/reviews/aggregate-complaint-triage.md`](../reviews/aggregate-complaint-triage.md)
+The validation pass over [`docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md`](../reviews/aggregate/2026-08-01-aggregate-complaint-triage.md)
 found `REL-01`'s bootstrap allegation **closed** — `scripts/install-release-tooling.sh` verifies
 cargo-dist against a committed SHA-256 and executes no downloaded script — and `REL-02`
 **closed from `v0.38.0` forward**: `actions/attest` runs over every artifact, the attestations were

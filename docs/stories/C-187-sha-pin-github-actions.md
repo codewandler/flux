@@ -68,6 +68,6 @@ trust is not reachable through someone else's tag.
 - Why this ranks first: `release-plugins.yml:166-181` signs the plugin index with Minisign and the
   public half is embedded in the flux binary (D-47). The per-artifact SHA-256 chain is only as
   trustworthy as that key. An unpinned action in the same workflow is a direct path to it.
-- Source: [2026-07-29 review](../../reviews/2026-07-29-security-posture-desk-review.md), finding
+- Source: [2026-07-29 review](../reviews/single/2026-07-29-security-posture-desk-review.md), finding
   "GitHub Actions are generally referenced by movable version tags rather than immutable commit
   hashes" — verified.

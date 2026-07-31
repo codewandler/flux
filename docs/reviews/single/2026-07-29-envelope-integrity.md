@@ -36,6 +36,14 @@ top_findings:
   - "`is_write_sql` is a prefix denylist documented as an allowlist; a leading SQL comment defeats it entirely"
   - "The two invariants this lens rests on have no mechanical enforcement — `validate_authority_contracts` checks declaration coherence, not fidelity to `execute`"
   - "`file_stat` reads the entire file a second time and discards the result (dead code)"
+triage:
+  kind: single
+  status: open
+  owner_stories: [C-186]
+  aggregated_into: null
+  note: >-
+    Not yet rolled into an aggregate ledger. Its findings are tracked directly by the owner
+    stories above; C-186 is still in progress, which is why this pass stays in single/.
 ---
 
 ## Verdict

@@ -47,6 +47,14 @@ top_findings:
   - "C-186 cannot close as `done`: C-266 is a `ready` child filed the same day as this closure story"
   - "The desk review's headline finding (sandbox off by default) is only PARTIALLY closed — unattended and serving surfaces fail closed (C-262), the interactive default is still `Off` with network open"
   - "C-205 is a deliberate, defensible non-closure: the advisory is `unsound`-class and unreachable, and the fix needs a breaking ratatui major bump"
+triage:
+  kind: single
+  status: open
+  owner_stories: [C-186, C-267]
+  aggregated_into: null
+  note: >-
+    Not yet rolled into an aggregate ledger. Its findings are tracked directly by the owner
+    stories above; C-186 is still in progress, which is why this pass stays in single/.
 ---
 
 ## Verdict
@@ -120,7 +128,7 @@ the tick. A reader who disagrees with the reading above still gets the true stat
 
 ## Desk-review findings — the closure table
 
-Baseline: [`reviews/2026-07-29-security-posture-desk-review.md`](2026-07-29-security-posture-desk-review.md).
+Baseline: [`reviews/single/2026-07-29-security-posture-desk-review.md`](2026-07-29-security-posture-desk-review.md).
 
 ### 1 — GitHub Actions pinned to movable tags · **CLOSED** (C-187)
 
@@ -231,7 +239,7 @@ are complementary, and neither subsumes the other.
 
 ## Envelope-integrity findings — the closure table
 
-Baseline: [`reviews/2026-07-29-envelope-integrity.md`](2026-07-29-envelope-integrity.md).
+Baseline: [`reviews/single/2026-07-29-envelope-integrity.md`](2026-07-29-envelope-integrity.md).
 
 ### 1 — HIGH · `sqlite_query` creates files at arbitrary paths via `VACUUM INTO` · **CLOSED** (C-192)
 

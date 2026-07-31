@@ -25,6 +25,18 @@ top_findings:
   - "The Git family lacks a mixed-reset or equivalent operation to undo a local commit while preserving its changes"
   - "The harness has no durable provenance for which uncommitted changes belong to this agent"
   - "Even read-only Git evidence calls were captured as proposed actions in the retrospective turn"
+triage:
+  kind: single
+  status: handled
+  triaged_on: 2026-08-01
+  aggregated_into: docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md
+  normalized_claims: [HAR-01, HAR-02, HAR-03, HAR-04, HAR-05, GIT-01, GIT-02, GIT-03]
+  filed_as: [C-375, C-382]
+  note: >-
+    Every numbered finding in this pass was normalized into the aggregate ledger, validated
+    against the tree on 2026-08-01, and either confirmed closed or filed as a residual story.
+    Archived: cited as evidence, not awaiting triage. Do not re-triage in isolation — the
+    ledger records the cross-review disagreements this document cannot see on its own.
 ---
 
 ## Verdict
@@ -204,7 +216,7 @@ Recommendation:
 This review relies on the conversation supplied to the current turn. It can enumerate the visible
 implementation, commit, dogfood, correction, and undo exchanges, but cannot independently prove that
 no earlier compacted or omitted event contained additional friction. This repeats the scoped-history gap
-already identified in the prior harness review (`docs/reviews/2026-07-31-harness-tooling-friction-review.md:122-137`).
+already identified in the prior harness review (`docs/reviews/archive/2026-07-31-harness-tooling-friction-review.md:122-137`).
 
 Recommendation: provide a policy-scoped, redacted session-history operation with pagination and
 compaction markers. Do not replace it with arbitrary access to session storage.

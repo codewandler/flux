@@ -32,6 +32,18 @@ top_findings:
   - "Core release artifacts are checksummed but neither signed nor accompanied by consumer-verifiable provenance"
   - "Security CI now scans dependencies, but still has no fuzzing, Miri/sanitizer, or SAST lane"
   - "The no-direct-IO gate is a useful lexical tripwire, not a complete invariant checker"
+triage:
+  kind: single
+  status: handled
+  triaged_on: 2026-08-01
+  aggregated_into: docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md
+  normalized_claims: [SANDBOX-01, SRV-01, SRV-02, REL-02, ASSURE-01, ASSURE-02]
+  filed_as: [C-255, C-345, C-352, C-358, C-363, C-369]
+  note: >-
+    Every numbered finding in this pass was normalized into the aggregate ledger, validated
+    against the tree on 2026-08-01, and either confirmed closed or filed as a residual story.
+    Archived: cited as evidence, not awaiting triage. Do not re-triage in isolation — the
+    ledger records the cross-review disagreements this document cannot see on its own.
 ---
 
 ## Verdict

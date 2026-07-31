@@ -25,7 +25,7 @@ the one thing it did not deliver, and the next reviewer starts from zero.
 - [x] Each of the 2026-07-29 findings (1–4 plus classification trust) is mapped to the commit, test
       name and file:line that closes it — evidence, not assertion. A finding whose closure cannot be
       pointed at stays **open** and is said to be open. → all five closed with evidence in
-      [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md)
+      [`reviews/single/2026-07-30-security-assurance-closure.md`](../reviews/single/2026-07-30-security-assurance-closure.md)
       ("Desk-review findings — the closure table"). Both baseline reviews' numbered sets are mapped,
       because "findings 1–4" is genuinely ambiguous between them — the artifact settles the reading
       explicitly instead of picking one silently. **Envelope-integrity finding 4 is reported OPEN**
@@ -38,7 +38,7 @@ the one thing it did not deliver, and the next reviewer starts from zero.
       stated. **No done-but-unreachable child was found**, so no new story is owed on that count.
 - [x] The result lands as a dated artifact under `reviews/`, in the shape the existing review
       artifacts use, diffed explicitly against the 2026-07-29 baseline so the delta is readable. →
-      `reviews/2026-07-30-security-assurance-closure.md`, frontmatter mirroring
+      `reviews/single/2026-07-30-security-assurance-closure.md`, frontmatter mirroring
       `2026-07-29-security-posture-desk-review.md`, with a per-axis Δ table against that baseline.
 - [x] C-186's three stale acceptance boxes are ticked, since C-187/188/189/190, C-191 and
       C-192/193/194 are all `done` — or, if any tick cannot be justified from the tree, it is left
@@ -67,7 +67,7 @@ the one thing it did not deliver, and the next reviewer starts from zero.
 ## Progress
 
 - 2026-07-30 — landed
-  [`reviews/2026-07-30-security-assurance-closure.md`](../../reviews/2026-07-30-security-assurance-closure.md),
+  [`reviews/single/2026-07-30-security-assurance-closure.md`](../reviews/single/2026-07-30-security-assurance-closure.md),
   verified against the tree at `0.38.0` (`588144a2`). Desk-review findings 1–4 and classification
   trust are **closed with evidence**; envelope-integrity findings 1–3 are closed. Assurance moved
   5/10 → 7.5/10 and is no longer flux's weakest axis (bus factor is). Ledger corrections: C-186's

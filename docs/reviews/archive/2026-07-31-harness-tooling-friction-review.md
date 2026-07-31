@@ -24,6 +24,18 @@ top_findings:
   - "Pane mutation works well, including timed Flux-Lang updates and renderer changes"
   - "Pane state is intentionally not readable today; C-306 already owns that contract decision"
   - "A scoped transcript API could help retrospectives, but arbitrary access to session storage should remain forbidden"
+triage:
+  kind: single
+  status: handled
+  triaged_on: 2026-08-01
+  aggregated_into: docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md
+  normalized_claims: [ROUTE-01, HAR-04, HAR-06, LANG-01]
+  filed_as: [C-375, C-382]
+  note: >-
+    Every numbered finding in this pass was normalized into the aggregate ledger, validated
+    against the tree on 2026-08-01, and either confirmed closed or filed as a residual story.
+    Archived: cited as evidence, not awaiting triage. Do not re-triage in isolation — the
+    ledger records the cross-review disagreements this document cannot see on its own.
 ---
 
 ## Verdict

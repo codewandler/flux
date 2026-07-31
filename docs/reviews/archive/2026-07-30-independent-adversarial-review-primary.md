@@ -39,6 +39,18 @@ top_findings:
   - "HIGH: release jobs execute unsigned remote installers while holding write-capable GitHub tokens"
   - "MEDIUM: provider-stage failures are converted to successful turn results and exit zero"
   - "MEDIUM: OS confinement remains off by default, with sandboxed network open by default"
+triage:
+  kind: single
+  status: handled
+  triaged_on: 2026-08-01
+  aggregated_into: docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md
+  normalized_claims: [NET-02, PROC-01, REL-01, REL-02, OUTCOME-01, SANDBOX-01, SRV-02, ASSURE-02, ASSURE-03]
+  filed_as: [C-255, C-345, C-352, C-363, C-369]
+  note: >-
+    Every numbered finding in this pass was normalized into the aggregate ledger, validated
+    against the tree on 2026-08-01, and either confirmed closed or filed as a residual story.
+    Archived: cited as evidence, not awaiting triage. Do not re-triage in isolation — the
+    ledger records the cross-review disagreements this document cannot see on its own.
 ---
 
 # Verdict

@@ -2,7 +2,7 @@
 name: adversarial-review
 description: >-
   Run an adversarial, evidence-anchored review of flux — security posture, production readiness, or a
-  single subsystem — and land it as a dated, verifiable artifact under reviews/. Use this when asked
+  single subsystem — and land it as a dated, verifiable artifact under docs/reviews/single/. Use this when asked
   to review/audit/red-team flux or one of its crates, to assess production or security readiness, to
   challenge the safety envelope, to verify an external review against the tree, to re-run a prior
   review against a newer version, or to answer "is flux actually safe to run unattended?". Not for
@@ -110,10 +110,16 @@ does not read an unfixable line as a to-do.
 
 ## Deliverable
 
-One file: `reviews/YYYY-MM-DD-<slug>.md`. Never overwrite a prior review — reviews are a time series,
-and their value is the diff between them.
+One file: `docs/reviews/single/YYYY-MM-DD-<slug>.md`. Never overwrite a prior review — reviews are a
+time series, and their value is the diff between them.
 
-Required frontmatter (mirror `reviews/2026-07-29-security-posture-desk-review.md`):
+`docs/reviews/` has three directories and they mean different things — read
+[`docs/reviews/README.md`](../../../docs/reviews/README.md) before writing. A review pass you author
+is always a **single** review and always lands in `single/`. You never write into `aggregate/`, and
+you never move a file into `archive/` — that happens when a ledger has normalized the pass *and* its
+residuals are filed as stories.
+
+Required frontmatter (mirror `reviews/single/2026-07-29-security-posture-desk-review.md`):
 
 ```yaml
 ---
@@ -123,6 +129,11 @@ kind: external-review | internal-review | subsystem-review
 lens: <one of the lenses above>
 method: <what you actually did — and did NOT do: no fuzzing, no exploitation, no runtime testing>
 reviewer: <external | internal | agent>
+triage:                 # every single review carries this from birth
+  kind: single
+  status: open          # `handled` only once a ledger normalized it AND residuals were filed
+  owner_stories: []     # story IDs tracking the findings, once they exist
+  aggregated_into: null # the ledger path, once one covers this pass
 subject:
   repo: codewandler/flux
   version_in_tree: <Cargo.toml version>
@@ -172,7 +183,7 @@ rules change:
 
 ## Baseline
 
-`reviews/2026-07-29-security-posture-desk-review.md` — external, `security-and-production-readiness`,
+`reviews/single/2026-07-29-security-posture-desk-review.md` — external, `security-and-production-readiness`,
 flux `0.33.1`, `6/10`, *"Promising security-engineered beta — not yet a trusted security boundary."*
 Fully verified against the tree; no material errors. Diff any later review against it and lead with
 what moved.
