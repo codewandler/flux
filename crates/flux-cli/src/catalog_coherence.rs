@@ -111,6 +111,11 @@ fn production_catalog() -> ToolRegistry {
     flux_tools::try_register_builtins(&mut registry).expect("built-ins register");
     // `--dev`: reachable in production behind a flag, so it is part of the catalog.
     flux_tools::try_register_dev_builtins(&mut registry).expect("dev built-ins register");
+    // C-223: the `pane.*` ops, surfaced by the presence of a `SurfaceSink` at assembly time rather
+    // than by config. Registered here with the decision switched **on**, for the same reason
+    // `[consult] model` and `[wakeup] enabled` are: an op only an interactive surface assembles is
+    // still an op that reaches `Executor::dispatch`, and a reader looking it up must find it.
+    flux_tools::try_register_surface_ops(&mut registry, true).expect("the pane ops register");
     registry
         .try_register_from(TASK_OP_SOURCE, Arc::new(flux_orchestrate::TaskTool))
         .expect("the task op registers");
@@ -540,6 +545,10 @@ fn the_census_is_strictly_wider_than_the_builtin_pack() {
         ("fleet.dispatch", "outbound A2A fleet dispatch"),
         ("census_board.claim", "declared work boards"),
         ("census_stage", "config-authored model stages"),
+        (
+            "pane.open",
+            "the agent-authored surface (sink-presence gated)",
+        ),
     ] {
         assert!(
             catalog.get(op).is_some(),
@@ -605,6 +614,7 @@ fn the_sub_agent_base_registry_is_a_coherent_subset_of_the_catalog() {
 const COVERED_REGISTRATION_SEAMS: &[&str] = &[
     "try_register_builtins",
     "try_register_dev_builtins",
+    "try_register_surface_ops",
     "try_register_eval_ops",
     "try_register_reflect",
     "try_register_flows",

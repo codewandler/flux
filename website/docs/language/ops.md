@@ -295,6 +295,32 @@ command file or skill explicitly marked `agent-triggerable: true` in its own fro
 |---|---|---|
 | `command.invoke` | `kind, name[, arguments]` | Invoke a discovered command file (`kind: "command"`) or skill (`kind: "skill"`) by name — only when it is policy-permitted, discovered in this session, AND explicitly `agent-triggerable`. A command expands `$ARGUMENTS`/`$1..$9` and returns the substituted body as prompt text (no nested execution); a skill returns its body. Any missing gate is a clean refusal, never a partial run |
 
+## Panes on the terminal
+
+Surfaced only when the host running the session installed a pane channel — the interactive TUI does;
+a headless `flux run`, the HTTP server and SDK embeddings do not, and their models never see these
+ops. The decision is taken once, when the session's catalog is assembled, so the advertised tool set
+never changes mid-session.
+
+A pane is a durable container for status or results the user should keep in view (a build's progress,
+a checklist, a table of findings) — not a place to put the answer, which stays in the reply. The
+agent proposes where a pane sits and how long it lives; the surface owns geometry, colour, bounds and
+the mark that identifies a region as agent-authored, and the payload carries no styling field at all.
+
+`data` is one object with exactly one key naming its shape: `rows` (`header`, `rows`), `kv`
+(`pairs`), `log` (`lines`), `progress` (`label`, `done`, `total`), `tree` (`roots`) or `markdown`
+(`text`). `slot` is `left`/`right`/`bottom`/`overlay` (default `right`) and `lifetime` is
+`turn`/`session` (default `session`).
+
+| op | arguments | risk | description |
+|---|---|---|---|
+| `pane.open` | `id, title, data[, slot, kind, lifetime]` | Low | Open a pane under `id`, the handle later calls address. Re-opening a live `id` replaces that pane rather than adding a second one; ids beginning `host:` belong to the surface's own panes and are refused |
+| `pane.update` | `id, data` | Low | Replace an open pane's content — the whole payload each time. An `id` that is not open (closed, or `turn`-scoped after the turn ended) is dropped by the surface |
+| `pane.close` | `id` | Low | Close the pane opened under `id`; closing one that is not open is not an error. `turn`-scoped panes close at the end of the turn, and no pane outlives the session |
+
+Permission rules may scope a pane by name (`pane.update:build`), and pane content passes the same
+redactor as every other tool result before it reaches the screen.
+
 ## Model-invoked skills
 
 Opt-in Claude-style progressive skill disclosure (`--skills-model-invoked` / `[skills]

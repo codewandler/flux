@@ -17,6 +17,7 @@ pub mod groups;
 pub mod reflect;
 pub mod render;
 mod skill_load;
+pub mod surface;
 pub mod toolchains;
 pub mod transform;
 
@@ -28,6 +29,7 @@ pub use flows::{
 };
 pub use reflect::{install_reflect, register_reflect, try_register_reflect};
 pub use render::{register_render, try_register_render};
+pub use surface::{try_register_surface_ops, PANE_OPS};
 
 use async_trait::async_trait;
 use serde_json::Value;

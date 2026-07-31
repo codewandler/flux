@@ -406,6 +406,11 @@ fn operations_reference_covers_the_registered_public_catalog() {
         .into_iter()
         .map(|tool| tool.spec().name),
     );
+    // C-223: the `pane.*` ops are registered by `try_register_surface_ops` — surfaced by the
+    // presence of a `SurfaceSink` at assembly time, so they are absent from the packs above by
+    // design. Named here as literals for the same reason `op.register` is: an op a real session
+    // dispatches must be documented, whatever registers it.
+    names.extend(flux_tools::PANE_OPS.into_iter().map(str::to_string));
     names.extend(
         [
             "ask",

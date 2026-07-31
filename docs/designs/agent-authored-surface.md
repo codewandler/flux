@@ -124,6 +124,25 @@ once, never re-evaluated mid-session — which is what keeps the tool set stable
 cacheable. A session with no sink never sees the ops at all, so the failure path exists for
 correctness rather than as a routine occurrence.
 
+**As built (C-223):** the decision is a *registration* one, `flux_tools::try_register_surface_ops(
+registry, surface_sink_installed)`, exactly like the `consult` precedent it copies — and therefore
+**not** part of `try_register_builtins`. That is forced rather than chosen: an op registered with no
+group is advertised unconditionally (`ToolRegistry::active_specs` filters on groups alone), so the
+built-in pack has no way to hold the ops back from a headless catalog. Conditional registration is
+the only seam that fails closed. The census in `flux-cli/src/catalog_coherence.rs` registers the pack
+with the decision on, so the ops stay inside the metadata/risk/documentation gates regardless.
+
+**`pane.list` is deferred, and it is a contract question, not a coding one.** The vocabulary above
+lists it, but C-220's `SurfaceSink` is send-only by design ("`list` is deliberately absent … reading
+back what is open is a surface-side query, not a sink command"), and the note on these ops forbids the
+tool from keeping its own copy of the store — correctly, since a `turn`-scoped pane or a `/resume`
+would make that copy a lie. The surface already holds the answer (`ChatState::open_panes`), so the
+missing piece is a query on the L2 contract plus a listing type at L2. Until a story makes that
+decision, `pane.list` does not ship; a `pane.list` that answered from the model's own call history
+would report panes the surface has already dropped, which is worse than not having the op. The same
+gap is why an `update` addressed to an id that is not open remains a silent host-side drop rather than
+an error the op can raise.
+
 ### Rendering
 
 `render` grows a horizontal split around the transcript row for `left`/`right`, and one extra
