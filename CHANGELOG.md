@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-07-31
+
 ### Added
 
 - **`search(query, harness)` over local harness transcripts — contained by construction (C-215).** The

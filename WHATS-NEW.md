@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-07-31
+
 ### New
 
 - **flux can now join a real chat room, with no browser and no vendor software.** Point it at any
