@@ -2,7 +2,7 @@
 id: C-307
 title: "`flux app run` ignores `[limits]`, and its review sub-agents are unbounded"
 pillar: Core
-status: in-progress
+status: done
 priority: 9
 areas: [flux-cli]
 note: "C-299 wired [limits] through build_agent_with, which covers run/plan/tui/serve. `flux app run` assembles its own ExecutionEnvironment and never calls with_resource_limits; build_review_sub_agents returns a bare SubAgents::new, so `flux app run strict-review`'s reviewer children run with no ceiling at all"

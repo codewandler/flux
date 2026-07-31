@@ -28,6 +28,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **`flux app run` ignored the operator's `[limits]` table, and its review sub-agents ran with no
+  ceiling at all** (C-307). C-299 wired `[limits]` through `build_agent_with`, which covers
+  `run`/`plan`/`tui`/`serve`, but `flux app run` assembled its own `ExecutionEnvironment` and never
+  called `with_resource_limits`; `build_review_sub_agents` returned a bare `SubAgents::new`, whose
+  default is unbounded — so `flux app run strict-review`'s reviewer children were uncapped. Both now
+  route through one shared seam that takes `resource_limits` as a **required** parameter, which is
+  the fail-closed shape: a future surface cannot forget it by omission. `flux review` and
+  `flux record` are wired too.
+
+  `flux test`'s offline client is deliberately **exempt**, and the reasoning is recorded on the
+  function rather than here: a replay's whole value is that its verdict depends only on the fixture,
+  and reading the local `[limits]` table would let one machine's config decide it — a saturated
+  `max_concurrent_tool_calls` refuses a queued call with a tool error, which is a fixture mismatch on
+  one developer's box and green on another. A replay drives recorded traffic against a never-called
+  provider, so there is no runaway workload to cap.
+
+  Ceilings remain **per-child**, not a shared pool; the shared-ceiling shape was built first during
+  C-299 and reproduced a real deadlock. Two of the newly wired surfaces are not yet observed by any
+  test — tracked as C-314.
+
 - **A plugin operation that declared no effects could not be loaded at all** unless its plugin also
   declared a `process` capability (C-309). The projection derived a tool's `access` purely from the
   manifest's capabilities while defaulting an effect-less operation to `[Process, Network]`, and the
