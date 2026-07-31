@@ -2,7 +2,7 @@
 id: C-299
 title: "A configured resource ceiling reaches neither sub-agents nor the `flux` binary"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 areas: [flux-cli, flux-orchestrate, flux-runtime]
 note: "C-290 built the ceiling and could reach neither consumer — flux-cli and flux-orchestrate were both fenced. Until this lands, `[limits]` is inert for the binary and `task`-delegated work is unbounded, while the SDK doc says the ceiling binds"
@@ -188,3 +188,27 @@ directly observable: 3 in flight under a configured ceiling of 1.
    would take.
 3. **`flux app run`** (`crates/flux-cli/src/app_cmd.rs`) assembles its own environment and does not
    read `[limits]`. Out of this story's named areas; one call site when someone wants it.
+
+- 2026-07-31 — integrated after **two review rounds**, and the second round is the one worth
+  remembering. Round one found Acceptance 2 ticked with **no test that fails before the change**: the
+  reviewer deleted the wiring line at `flux-orchestrate/src/lib.rs` and re-ran the suite, and the set
+  of failing test names was *byte-identical* to baseline. The existing tests discriminated
+  `clone()` vs `independent_copy()`, not "wired" vs "not wired".
+  The rework then **disproved the reviewer's own suggested fix**, which is the useful part: an
+  op-cache test cannot witness the inherited ceiling, because `LocalSpawner::spawn` builds every child
+  with a bare `PermissionManager`, so a child op with no permission subjects resolves to
+  `PermDecision::Ask` → `approval_sensitive` → excluded from the `cacheable` predicate. **A sub-agent's
+  op cache is unreachable by construction.** That test was built, observed to pass with and without
+  the wiring, and discarded rather than shipped — it would have looked rigorous and detected nothing.
+  The route that works is the evidence payload ceiling, and `a_sub_agent_is_built_with_the_parents_ceilings`
+  is proven by mutation: removing the wiring line turns it red, restoring it turns it green.
+  **Verified independently at integration** by performing the same mutation.
+  Also corrected: the deadlock rationale, repeated at six sites, claimed two ancestors hold permits.
+  Only one does — `execute_batch` takes it via `Executor::dispatch`, and the nested `task` runs on the
+  same tokio task and gets an inert slot from the identity-keyed `HELD_SLOTS` exemption. This
+  *strengthens* the case for reverting `ConcurrencyRole::Delegation`: exempting `task` changes nothing
+  because `task` never held a permit.
+  ⚠ Gate note: one full-workspace run went red on `tests/judge_assertions.rs` (4/4) while several
+  agents were building concurrently. All four pass in isolation, and a clean re-run of the whole
+  workspace is `EXIT=0` with 179 targets green and zero failures. Recorded as contention flake rather
+  than silently re-run — these are cassette- and timing-sensitive.

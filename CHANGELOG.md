@@ -94,6 +94,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **A configured resource ceiling now reaches the `flux` binary and its sub-agents (C-299).** C-290
+  built `ResourceLimits` and could wire neither consumer, because both were fenced by concurrent
+  stories. `flux-cli` now reads `[limits]` at executor assembly — resolved exactly once, since a
+  second resolution would mint a second semaphore and executors would silently stop sharing a budget —
+  and `LocalSpawner::spawn` installs the parent's ceilings on every child.
+  **The ceiling is PER-CHILD, and that is a deliberate, documented weakening.** `max_concurrent_tool_calls
+  = N` bounds *each agent*, so a process with k live children may run up to N×(k+1). A shared semaphore
+  was built first and **reproduced a real deadlock**: a parent holds a permit while awaiting a child
+  that queues on the same semaphore, bounded only by the queue timeout, and the re-entrancy exemption
+  is a Tokio task-local that does not survive `tokio::spawn`. Per-child is safe by construction —
+  parent and child hold different semaphores, so no ancestor can block a descendant. Every doc site
+  says N×(k+1) plainly rather than implying a whole-process cap.
+  Two things this does **not** do, both disclosed rather than discovered later: `flux app run`
+  assembles its own environment and still ignores `[limits]` entirely (tracked as C-307, along with
+  its review sub-agents being wholly unbounded), and the ceiling barely binds *inside* a conversational
+  turn, because `execute_batch` is itself a dispatched op holding one permit and the identity-keyed
+  exemption then covers everything nested beneath it. That coarseness is C-290's, not this story's.
+
+- **BREAKING: `SubAgents` gained a public field (C-299).** Breaking for external struct-literal
+  construction; every in-tree caller already uses `SubAgents::new`, matching the precedent C-290 set
+  with `flux_config::Limits`. `ResourceLimits::independent_copy` is additive.
+
 - **BREAKING: `flux_flow::voice::VoiceTurnHandler::turn` carries a `Speaker` (D-204).** It was
   `turn(&self, user_text: &str)` and is now `turn(&self, speaker: &Speaker, user_text: &str)`. `Speaker`
   is a surface-owned id plus an optional display name; the realtime driver passes `Speaker::sole()`, so a
