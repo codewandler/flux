@@ -22,6 +22,7 @@ use controller::{
     ChannelSink, ModelCallTiming, PendingApproval, UiEvent,
 };
 use panes::PaneStore;
+pub use panes::{PaneListing, PaneQueue};
 #[cfg(test)]
 use projection::staged_intent_entry;
 use projection::{historical_observation_entry, load_history};
@@ -88,6 +89,10 @@ pub struct TuiRunOptions {
     pub file_commands: Vec<flux_runtime::metadata::CommandFile>,
     /// Configured theme name (`dark` / `light` / `mono`); `None` falls back to `dark` (C-104).
     pub theme: Option<String>,
+    /// The pane channel this surface minted **before** assembling the agent (C-305), and therefore
+    /// the same handle the agent's `pane.*` ops write to. `None` leaves the agent with no pane
+    /// vocabulary at all — the caller must not register the ops without passing it.
+    pub pane_queue: Option<Arc<PaneQueue>>,
 }
 
 impl TuiRunOptions {
@@ -98,6 +103,7 @@ impl TuiRunOptions {
             model_resolver: None,
             file_commands: Vec::new(),
             theme: None,
+            pane_queue: None,
         }
     }
 }
@@ -974,7 +980,9 @@ impl ChatState {
         Self::for_session(model, String::new())
     }
 
-    fn for_session(model: String, session_id: String) -> Self {
+    /// A fresh state for one session. `pub` so an integration test can drive the same surface the
+    /// event loop draws; the TUI itself builds it in [`run_with_options`].
+    pub fn for_session(model: String, session_id: String) -> Self {
         ChatState {
             entries: Vec::new(),
             transcript_revision: 0,
@@ -1041,19 +1049,43 @@ impl ChatState {
             active_action_id: None,
             ctrl_c_armed_at: None,
             panes: PaneStore::default(),
+            pane_queue: None,
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
         }
     }
 
-    /// Apply one host-pushed pane command (C-221).
+    /// Apply one pane command (C-221). Bounds — count, rows, width — are enforced by
+    /// [`crate::panes`], never by the command.
     ///
-    /// **The only way a pane reaches this surface.** There is deliberately no model path yet: the
-    /// `pane.*` ops and their `SurfaceSink` install are C-223's story, so today only the host (or a
-    /// test) can open a pane. Bounds — count, rows, width — are enforced by [`crate::panes`], never
-    /// by the command.
+    /// Reached two ways and no others: the surface's own C-224 fleet pane calls it directly, and the
+    /// model's `pane.*` ops arrive through [`ChatState::apply_pending_panes`].
     pub fn apply_pane_command(&mut self, command: flux_runtime::PaneCommand) {
         self.panes.apply(command);
+    }
+
+    /// Attach the pane channel the surface minted before assembling the agent (C-305).
+    pub fn with_pane_queue(mut self, queue: Arc<crate::panes::PaneQueue>) -> Self {
+        self.pane_queue = Some(queue);
+        self
+    }
+
+    /// Apply every pane command the agent has pushed since the last call, and report how many.
+    ///
+    /// This is the model's *only* door into the pane store, and it is driven by the event loop
+    /// immediately before it draws — so a pane the agent opened mid-turn appears on the next frame,
+    /// and one belonging to a turn that has just ended is cleared by `end_turn` rather than
+    /// resurrected by a late command.
+    pub fn apply_pending_panes(&mut self) -> usize {
+        let Some(queue) = self.pane_queue.clone() else {
+            return 0;
+        };
+        let commands = queue.drain();
+        let applied = commands.len();
+        for command in commands {
+            self.apply_pane_command(command);
+        }
+        applied
     }
 
     /// Every pane currently open, each labelled with who owns it (C-224).
@@ -3021,9 +3053,6 @@ pub async fn run_with_options(
             .executor
             .set_approver(Arc::new(ChannelApprover { tx: tx.clone() }));
     }
-    let model = agent.model.clone();
-    let events = agent.events.clone();
-
     let out = std::io::stdout();
     if !std::io::stdin().is_terminal() || !out.is_terminal() {
         anyhow::bail!("flux tui requires a real terminal on stdin and stdout");
@@ -3036,10 +3065,58 @@ pub async fn run_with_options(
     // persisted messages show up in the transcript like any other turn's.
     resurrect_on_open(&agent, &session_id).await;
 
+    let mut state = session_state(&agent, &session_id, &options)?;
+    // A-94: share the composer's follow-up queue with the engine, which drains it into the
+    // running turn at the next planner consultation instead of waiting for the turn to finish.
+    agent.set_steering(Some(state.queue.clone()));
+    let agent = Arc::new(tokio::sync::RwLock::new(agent));
+
+    let (mut terminal, mut guard) = TerminalGuard::enter(out)?;
+    // Decorative boot splash; any driver error just skips it. Runs before the
+    // EventStream below exists, so its blocking `event::poll` has no competitor.
+    let _ = splash::splash_intro(&mut terminal);
+    let result = event_loop(
+        &mut terminal,
+        agent,
+        &mut state,
+        tx,
+        rx,
+        options.model_resolver,
+        crossterm::event::EventStream::new(),
+    )
+    .await;
+    let restore = guard.restore(terminal.backend_mut());
+    result.and(restore)
+}
+
+/// The [`ChatState`] the event loop draws from, assembled from the engine, the session and the
+/// launch options — **including C-305's pane-channel install**, the second-to-last link of the
+/// `pane.*` delivery chain.
+///
+/// Split out of [`run_with_options`] because that function cannot be driven from a test at all: it
+/// bails without a real TTY on *both* stdin and stdout, and the loop it starts reads that TTY
+/// through `crossterm::event::EventStream`. The link is worth pinning rather than reading — handing
+/// the loop a state that drains a *different* queue from the one the agent writes to leaves the
+/// vocabulary exactly as inert as never registering the ops, and the failure is silence: the model
+/// reports a pane it opened and the surface stays blank.
+///
+/// `pub` only so `flux-cli` — the one crate that can assemble a [`FlowEngine`] to hand it — can
+/// call it from a test. It is not part of any surface contract.
+#[doc(hidden)]
+pub fn session_state(
+    agent: &FlowEngine,
+    session_id: &str,
+    options: &TuiRunOptions,
+) -> anyhow::Result<ChatState> {
     let verbose = std::env::var("FLUX_VERBOSE").is_ok_and(|v| flag_on(&v));
-    let mut state = ChatState::for_session(model, session_id.clone())
+    let mut state = ChatState::for_session(agent.model.clone(), session_id.to_string())
         .with_verbose(verbose)
         .with_file_commands(options.file_commands.clone());
+    // C-305: connect the pane channel the caller minted before `build_agent` to the state the event
+    // loop draws from. Without this the agent's `pane.*` ops enqueue into a channel nobody reads.
+    if let Some(queue) = options.pane_queue.clone() {
+        state = state.with_pane_queue(queue);
+    }
     // C-104: resolve the configured theme for this terminal (NO_COLOR → mono, truecolor → RGB).
     let (theme_name, theme) = resolve_theme(options.theme.as_deref());
     state.theme = theme;
@@ -3056,52 +3133,92 @@ pub async fn run_with_options(
     if let Some(spec) = options.model_spec.clone() {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
-    // A-94: share the composer's follow-up queue with the engine, which drains it into the
-    // running turn at the next planner consultation instead of waiting for the turn to finish.
-    agent.set_steering(Some(state.queue.clone()));
-    state.project_session(&events, &session_id)?;
-    state.history = load_history(&events);
-    let agent = Arc::new(tokio::sync::RwLock::new(agent));
-
-    let (mut terminal, mut guard) = TerminalGuard::enter(out)?;
-    // Decorative boot splash; any driver error just skips it. Runs before the
-    // EventStream below exists, so its blocking `event::poll` has no competitor.
-    let _ = splash::splash_intro(&mut terminal);
-    let result = event_loop(
-        &mut terminal,
-        agent,
-        &mut state,
-        tx,
-        rx,
-        options.model_resolver,
-    )
-    .await;
-    let restore = guard.restore(terminal.backend_mut());
-    result.and(restore)
+    state.project_session(&agent.events, session_id)?;
+    state.history = load_history(&agent.events);
+    Ok(state)
 }
 
-async fn event_loop(
-    terminal: &mut Tui,
+/// C-305: drive the production [`event_loop`] against an in-memory backend over a scripted event
+/// stream, and hand back the frame it last drew.
+///
+/// The loop touches the concrete terminal in exactly one place (`terminal.draw`) and the crossterm
+/// event source in exactly one place (`input.next()`) — both are parameters for that reason — and
+/// the [`ChatState`] it mutates is already an out-parameter. What that buys is the *last* link of
+/// the pane delivery chain, `state.apply_pending_panes()` at the top of the loop, being observable
+/// without a TTY; before this existed, deleting that line left every test in the repo green while
+/// no model pane could ever reach a terminal.
+///
+/// An **empty** `events` list runs exactly one frame: the stream yields `None` immediately, which
+/// is the loop's own end-of-input exit. The sender half is held for the duration so the `rx` arm of
+/// the select cannot win by closing first.
+///
+/// `pub` only so `flux-cli` — the one crate that can assemble a [`FlowEngine`] to hand it — can
+/// call it from a test. Nothing in the shipped binary calls it.
+#[doc(hidden)]
+pub async fn drive_event_loop_headless(
+    agent: FlowEngine,
+    state: &mut ChatState,
+    events: Vec<crossterm::event::Event>,
+) -> anyhow::Result<String> {
+    let (tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
+        HEADLESS_WIDTH,
+        HEADLESS_HEIGHT,
+    ))?;
+    let input = futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>));
+    event_loop(
+        &mut terminal,
+        Arc::new(tokio::sync::RwLock::new(agent)),
+        state,
+        tx.clone(),
+        rx,
+        None,
+        input,
+    )
+    .await?;
+    drop(tx);
+    Ok(terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect())
+}
+
+/// Frame size [`drive_event_loop_headless`] renders at — wide and tall enough that a right-slot
+/// pane is laid out rather than dropped for want of room.
+const HEADLESS_WIDTH: u16 = 120;
+const HEADLESS_HEIGHT: u16 = 40;
+
+async fn event_loop<B, S>(
+    terminal: &mut Terminal<B>,
     agent: Arc<tokio::sync::RwLock<FlowEngine>>,
     state: &mut ChatState,
     tx: mpsc::UnboundedSender<UiEvent>,
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
     model_resolver: Option<Arc<dyn ModelResolver>>,
-) -> anyhow::Result<()> {
-    use crossterm::event::{
-        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
-    };
+    mut input: S,
+) -> anyhow::Result<()>
+where
+    B: Backend,
+    S: futures_util::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+{
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
     use futures_util::StreamExt as _;
 
     let mut cancel = CancellationToken::new();
     let mut pending_reply: Option<(String, oneshot::Sender<ApprovalChoice>)> = None;
     let mut approval_queue: VecDeque<PendingApproval> = VecDeque::new();
     // A message typed while a turn was running, started as soon as the turn finishes.
-    let mut input = EventStream::new();
     let mut pending_ui: Option<UiEvent> = None;
     let mut exit_after_finish = false;
 
     loop {
+        // C-305: the agent's pane commands, applied BEFORE this iteration's UI events on purpose —
+        // `Finished` clears `turn`-lifetime panes, and draining after it would let a command from
+        // the turn that just ended reopen one that should have expired with it.
+        state.apply_pending_panes();
         // Drain everything the running turn has produced.
         while let Some(ev) = pending_ui.take().or_else(|| rx.try_recv().ok()) {
             let Some(ev) = state.accept_ui_event(ev) else {

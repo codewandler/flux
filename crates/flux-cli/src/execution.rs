@@ -1028,7 +1028,21 @@ pub(super) fn assemble_cli_execution_environment(
 pub(super) async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None).await
+    build_agent_with(flags, true, None, None).await
+}
+
+/// [`build_agent`] for a surface that has a human terminal to draw on (C-305).
+///
+/// `surface_sink` is the pane channel the caller minted **before** calling this — it has to exist
+/// first, because whether the `pane.*` vocabulary is registered at all is decided here, once, while
+/// the catalog is assembled. The one `Option` drives both halves: it registers the ops and it
+/// installs the sink on the engine, so a catalog can never advertise a pane op with nowhere to send
+/// it, and a sink can never be installed for a model that cannot address it.
+pub(super) async fn build_agent_with_surface(
+    flags: &AgentFlags,
+    surface_sink: Arc<dyn flux_runtime::SurfaceSink>,
+) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+    build_agent_with(flags, true, None, Some(surface_sink)).await
 }
 
 /// [`build_agent`] with a LAZY provider (C-11): `flux flow run` / `flux preset --run` replay
@@ -1041,7 +1055,7 @@ pub(super) async fn build_agent_lazy(
     flags: &AgentFlags,
     session_override: Option<String>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, false, session_override).await
+    build_agent_with(flags, false, session_override, None).await
 }
 
 /// Build the workspace view used by every saved-flow consumer. Agent construction creates the two
@@ -1340,6 +1354,9 @@ struct EngineParts {
     /// D-188: the opt-in model-invoked skill catalog, empty unless `--skills-model-invoked` /
     /// `[skills] model_invoked` is set — carried through rather than re-discovered here.
     model_invoked_skills: Vec<flux_skill::Skill>,
+    /// C-305: the assembling surface's pane channel, `Some` only for the TUI. Carried through so the
+    /// engine installs the very sink whose presence registered the `pane.*` ops above.
+    surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
 }
 
 /// Assemble the [`FlowEngine`] from the resolved parts: install the authored-loop host, load the
@@ -1366,6 +1383,7 @@ async fn assemble_engine(
         max_iterations,
         skills,
         model_invoked_skills,
+        surface_sink,
     } = parts;
     let flow = open_flow_store(events.clone())?;
     let spec = AgentSpec {
@@ -1395,9 +1413,15 @@ async fn assemble_engine(
         // engine-identity fields.
         ..AgentSpec::default()
     };
-    let agent = spec
+    let mut agent = spec
         .into_engine(Arc::from(provider), executor, events, flow)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // C-305: install the pane channel on the ENGINE, not on the executor's stored fallback. A turn
+    // runs inside `scope_runtime_turn`, and an active lexical scope is authoritative including the
+    // fields it omits — so a sink parked on the executor is invisible to every op in every real turn.
+    if let Some(sink) = surface_sink {
+        agent = agent.with_surface_sink(sink);
+    }
     agent.loop_host.set_model_stages(model_stages);
     let env_budget = match std::env::var("FLUX_TURN_TOKEN_BUDGET") {
         Ok(v) => Some(v.trim().parse::<u64>().map_err(|e| {
@@ -1417,6 +1441,7 @@ pub(super) async fn build_agent_with(
     flags: &AgentFlags,
     eager_provider: bool,
     session_override: Option<String>,
+    surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
@@ -1539,6 +1564,12 @@ pub(super) async fn build_agent_with(
         flux_tools::try_register_dev_builtins(&mut registry)?;
     }
     registry.try_register_from("flux-cli sub-agent task operation", Arc::new(TaskTool))?;
+    // C-223/C-305: the `pane.*` vocabulary, surfaced by the presence of a `SurfaceSink` at assembly
+    // time — the `[consult] model` precedent, not a `ToolGroup` (there is no `project.signal` for
+    // "a human is watching a terminal"). Fail-closed and decided exactly once: a headless `flux
+    // run`, `flux-server` or SDK embedding passes `None` and never advertises a pane op, which
+    // matters because a registered op with no `group` is advertised unconditionally.
+    flux_tools::try_register_surface_ops(&mut registry, surface_sink.is_some())?;
 
     // Model-backed cognition ops (ai.extract/rank/judge/reason, synth, ai.rewrite): the L3
     // CognitionPack, advertised on the real CLI path so a plan can call the model as a typed op.
@@ -1799,6 +1830,7 @@ pub(super) async fn build_agent_with(
             max_iterations,
             skills,
             model_invoked_skills,
+            surface_sink,
         },
         &cwd,
         &cfg,
