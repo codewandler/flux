@@ -43,15 +43,41 @@ fn record_client(flags: &AgentFlags) -> Result<flux_sdk::Client> {
     let ResolvedProvider {
         provider, model, ..
     } = resolve_cli_provider(&model_spec, true)?;
+    record_client_from(
+        provider,
+        model,
+        &cwd,
+        flux_sdk::Storage::dir(flux_store_dir()?),
+        flags.yes,
+        cli_resource_limits(&cfg),
+    )
+}
+
+/// Assemble the recording client from already-resolved surface decisions.
+///
+/// A named seam rather than an inline chain in [`record_client`] (C-328): `record_client` resolves
+/// the cwd, the config and a *live* provider before it ever reaches the builder, so nothing could
+/// reach the chain below to check what it wires. That is exactly how C-314 happened — the
+/// `.resource_limits(..)` line could be deleted with the whole `flux-cli` suite staying green. The
+/// client this returns is the one `flux record` records against.
+fn record_client_from(
+    provider: Box<dyn Provider>,
+    model: String,
+    cwd: &std::path::Path,
+    storage: flux_sdk::Storage,
+    auto_approve: bool,
+    resource_limits: flux_runtime::ResourceLimits,
+) -> Result<flux_sdk::Client> {
     flux_sdk::Client::builder()
         .model(model)
-        .auto_approve(flags.yes)
+        .auto_approve(auto_approve)
         // C-307: `flux record` runs a real, live turn, so the operator's `[limits]` ceilings apply
         // to it exactly as they do to `flux run`. (`flux test`'s [`offline_client`] is deliberately
         // NOT wired — see its doc comment.)
-        .resource_limits(cli_resource_limits(&cfg))
-        .storage(flux_sdk::Storage::dir(flux_store_dir()?))
-        .build(provider, &cwd)
+        // flux-pin: record_client_carries_the_configured_ceiling_to_its_executor
+        .resource_limits(resource_limits)
+        .storage(storage)
+        .build(provider, cwd)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -241,4 +267,68 @@ fn discover_fixtures(dir: &std::path::Path, name: Option<&str>) -> Result<Vec<st
     // Deterministic order — a test gate's output must not depend on directory iteration order.
     found.sort();
     Ok(found)
+}
+
+#[cfg(test)]
+mod record_client_ceiling_wiring {
+    //! C-314/C-328: the operator's `[limits]` ceilings must reach the client `flux record` records
+    //! against.
+    //!
+    //! This test is deliberately **attributable to one line**: it observes only
+    //! [`record_client_from`]'s `.resource_limits(..)`, so deleting `flux review`'s wiring leaves it
+    //! green and deleting this one reds it alone. C-305's first round was sent back for the opposite
+    //! — a single test that covered both sites and could not say which had regressed.
+    //!
+    //! What it asserts is the ceiling carried by the **executor the client dispatches through**, one
+    //! layer past `Client::resource_limits`'s own field. It stops there rather than measuring
+    //! occupancy (C-299's idiom) because `Client` has no post-build op registration, so no blocking
+    //! probe can be placed in its registry; that an executor carrying these numbers enforces them is
+    //! what `a_configured_limits_table_binds_for_the_cli_executor` already proves.
+
+    use super::*;
+
+    use std::time::Duration;
+
+    /// The `[limits]` values here are ones no default would produce, so a green assertion cannot be
+    /// an accident of the builder's own defaults.
+    #[test]
+    fn record_client_carries_the_configured_ceiling_to_its_executor() {
+        let cfg: flux_config::Config = toml::from_str(
+            "[limits]\nmax_concurrent_tool_calls = 3\ntool_call_queue_timeout_ms = 4321\n",
+        )
+        .expect("the `[limits]` concurrency keys must parse");
+
+        let root = std::env::temp_dir().join(format!(
+            "flux-c314-record-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&root).expect("create the test workspace root");
+
+        let client = record_client_from(
+            Box::<MockCliProvider>::default(),
+            "mock".to_string(),
+            &root,
+            flux_sdk::Storage::in_memory(),
+            true,
+            // The one C-314 seam on this surface: `flux record` turns `[limits]` into ceilings here.
+            cli_resource_limits(&cfg),
+        )
+        .expect("build the recording client");
+
+        let limits = client.engine().executor.resource_limits();
+        assert_eq!(
+            limits.max_concurrent_tool_calls(),
+            Some(3),
+            "`[limits] max_concurrent_tool_calls` did not reach the executor `flux record` \
+             dispatches through — the recording client is running unbounded"
+        );
+        assert_eq!(
+            limits.tool_call_queue_timeout(),
+            Duration::from_millis(4321),
+            "the configured queue window did not reach the recording client's executor"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

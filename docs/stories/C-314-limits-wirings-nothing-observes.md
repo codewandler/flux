@@ -41,7 +41,7 @@ guards less than its prose implies.
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test that reds when `review.rs:185`'s wiring is deleted, and a test that
+- [x] **Failing-first**: a test that reds when `review.rs:185`'s wiring is deleted, and a test that
       reds when `lab_cmd.rs:52`'s is. Prove each by making exactly that deletion and showing the test
       name in the failure output. One test observing both is not acceptable — they must be
       independently attributable, the way C-307's two halves are.
@@ -64,3 +64,38 @@ guards less than its prose implies.
 - The general lesson this story is an instance of: a wiring line with no test is invisible to the
   gate, and mutation is the only cheap way to find one. Consider whether anything more systematic
   than "a reviewer remembered to probe" is available here.
+
+## Progress
+
+**Item 1 is closed by [C-328](C-328-pin-census-wiring-declares-its-test.md); items 2 and 3 are not.**
+This story stays `ready` for that remainder rather than being closed on a partial.
+
+C-328 needed two independently attributable tests as its own failing-first proof, so it built them
+and closed this story's first item on the way:
+
+- `review_flow_client_bounds_tool_calls_at_the_configured_ceiling` — C-299's observed-occupancy
+  idiom (three `parallel` branches, one op inside `Tool::execute`, `Meter`/`Blocker` imported rather
+  than copied).
+- `record_client_carries_the_configured_ceiling_to_its_executor` — reads
+  `client.engine().executor.resource_limits()`, deliberately *past* `Client::resource_limits()`,
+  which is an inert self-report. It stops one layer earlier than its sibling because `flux_sdk::Client`
+  has no post-build op registration, so no blocking probe can be installed in its registry; that an
+  executor carrying those numbers actually bounds occupancy is already pinned by
+  `a_configured_limits_table_binds_for_the_cli_executor`.
+
+Independence verified in both directions by the reviewer, not only by the implementor: deleting one
+wiring line reds its own test and leaves the other **ok**.
+
+**Both call sites had to be extracted into named seams** (`record_client_from`, `review_flow_client`)
+because neither was reachable from any test — `record_client` resolves a cwd, loads config and
+resolves a *live* provider before reaching the builder, and `run_review` ends in `println!` +
+`process::exit`. That unreachability is *how this story happened*, and it is worth remembering when
+items 2 and 3 are picked up.
+
+**Still open:**
+
+- Item 2 — `app_cmd.rs`'s per-child assertion still observes a transformation the test performs
+  itself rather than the one `LocalSpawner::spawn` applies.
+- Item 3 — no journey-level test pins `run_app` → `App::try_with_execution_environment` →
+  `build_executor` → `into_executor`. C-307's reviewer traced it by reading and found it holds; that
+  is still not a test.

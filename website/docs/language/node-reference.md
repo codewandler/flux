@@ -31,7 +31,7 @@ runtime executes top to bottom. A node is tagged by its `"kind"`.
 
 <!-- Generated from the same `flux_lang::schema::node_kind_catalog()` source of truth as
      crates/flux-lang/docs/reference.md and the SKILL.md language skills — do not hand-edit the
-     table below. Regenerate with: `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`. -->
+     table below. Regenerate with: `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync`. -->
 
 This table is derived from the generated node catalog in the repository's
 [language reference](https://github.com/codewandler/flux/blob/main/crates/flux-lang/docs/reference.md),
