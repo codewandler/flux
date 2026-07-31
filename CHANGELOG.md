@@ -178,6 +178,32 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **⚠ Three golden guards could rewrite their goldens and report success having compared nothing**
+  (C-326). `skill_in_sync`, `website_in_sync` and `wire_contract` all gated regeneration on
+  `env::var("UPDATE").is_ok()` — **presence, not value** — and each took its `write(); return;`
+  branch *before* the assertion. So an ambient `UPDATE=0`, or even an empty `UPDATE=`, silently
+  overwrote the golden with whatever the code currently produced and the test printed `ok`.
+
+  This is the *silent* member of the class C-319 belongs to. C-319 failed loudly and misleadingly;
+  this one went green while proving nothing, so a drifted node-kind table, a stale website reference
+  or a broken plugin wire contract would all have been blessed, with the diff showing the golden
+  updating as though someone meant it. Reproduced at the merge base on all three.
+
+  Regeneration is now `FLUX_UPDATE_GOLDEN=1`, matched **exactly**: unset or empty checks, exactly
+  `1` rewrites, and anything else is refused by name rather than guessed at. **A regenerating run
+  now fails**, so a run that wrote is distinguishable from a run that verified — that was the half
+  of the defect the arming question left standing. A `--` test argument was rejected because libtest
+  treats an unknown argument as a name filter, which selects zero tests and prints `ok. 0 passed`:
+  the same vacuous green in a new costume.
+
+  `scripts/cut-release.sh` is the only automated caller; it now discards the armed run's status and
+  re-runs the same check unarmed, which is stricter than before, where a silently-unwritten mirror
+  could reach the release commit.
+
+  `codewandler-flux-plugin-protocol` moves 1.1.0 → **1.1.1**: the crate's published artifact
+  includes its `tests/`, so a test-only change is still a content change under an already-published
+  version. The protocol line is SemVer over the *wire*, which is unchanged — hence a patch.
+
 - **Canonical Flux no longer renders as a syntax error in Helix, Neovim and Zed** (C-301). The
   tree-sitter grammar's number lexer accepted only digits and an optional fraction, so `500ms`,
   `10s` and `1m` produced `ERROR` nodes while the same header spelled `60_000` parsed cleanly.

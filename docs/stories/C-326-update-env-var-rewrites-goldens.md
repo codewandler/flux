@@ -2,8 +2,7 @@
 id: C-326
 title: "An ambient `UPDATE` env var turns three golden assertions into golden rewrites that pass vacuously"
 pillar: Core
-status: in-progress
-priority: 3
+status: done
 areas: [flux-lang, flux-plugin-protocol]
 note: "found by C-319's live-state census and confirmed by its reviewer — skill_in_sync, website_in_sync and wire_contract all gate on env::var(\"UPDATE\").is_ok(), so PRESENCE arms it: UPDATE=0 or even UPDATE= rewrites the goldens and the test passes having compared nothing"
 ---
