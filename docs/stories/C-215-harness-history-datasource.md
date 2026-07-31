@@ -2,7 +2,7 @@
 id: C-215
 title: "The harness datasource — search(query, harness) over transcripts, contained by construction"
 pillar: Core
-status: in-progress
+status: done
 priority: 12
 epic: harness-history
 design: docs/designs/harness-history.md
@@ -117,3 +117,37 @@ attacker can pre-load once and have retrieved forever. Those three properties al
   tier and its `semantic_effects` honestly, and check the pair with `metadata_violations` rather than
   eyeballing it.
 - Keyword search only — no embeddings in this epic (see the design doc's non-goals).
+
+- 2026-07-31 — integrated after two review rounds. **Containment survived every attack the reviewer
+  could make**, and it attacked the right things: off-by-default is *structural* (`datasource_tools`
+  literally **is** `datasource_tools_with_history(backend, &HarnessHistory::disabled())`, so the
+  default advertising no `harness` field is true by construction rather than by two declarations kept
+  in step); redaction is asserted on the record **in the index**, not on a rendered result; and the
+  escaper export is a one-line delegation to the unchanged private function, so the two callers cannot
+  drift into two schemes.
+  **Both blocking findings were correctness, not containment, and both are fixed with failing-first
+  proofs.**
+  1. Ingest **materialized a whole harness history in RAM** before the first upsert — the `emit`
+     closure only pushed, and the sole flush ran after the adapter returned. The real bound was the
+     scan budget (5M messages / 2 GiB): an OOM on exactly the multi-year history this story exists to
+     read. **The comments asserted the opposite**, which is worse than no comment. Proof before the
+     fix: peak batches `[1300, 1]` — one batch of the entire history, then the session record. The
+     drain now lives inside the sink closure, which forced a real design answer (adapters hand messages
+     to a `FnMut` with no error channel, so an upsert failure parks and unwinds the scan at the adapter
+     call). Pinned by **largest batch handed to the backend**, deliberately not flush count — "collect
+     everything, upsert once" and "drain every 512" both give a non-zero flush count.
+  2. The `harness` over-fetch was **inert in the default call shape**: `input.limit.map(...)` on `None`
+     is `None`, so a caller writing `search(query, harness: "opencode")` got 5 rows across *all*
+     harnesses and post-filtered, silently under-returning. The original test masked it by passing
+     `limit: 20`. Now resolve-then-widen, following `SemanticIndex::search`, tested with the shape a
+     caller actually writes.
+  ⚠ **Known and now honestly documented rather than claimed solved:** 8× over-fetch is a *heuristic*,
+  not a bound. Rank skew — one harness holding more than `8 × limit` better-scoring hits — still
+  under-returns **silently**. The clean fix is a `meta` predicate in `DatasourceBackend`, which touches
+  four backends and deserves its own story.
+  ⚠ **Ingest and advertisement can still disagree**: `ingest_harness_history` and
+  `datasource_tools_with_history` take independent `&HarnessHistory`, so a host that ingests enabled
+  but registers disabled puts harness records in an index reachable by plain `datasource:*/*`. It could
+  not be made unrepresentable without an API redesign under release pressure, so it is pinned by a test
+  that asserts the mismatch case too, and written into the design as a host-wiring obligation. **There
+  is no in-tree host wiring yet; the first one must take one `HarnessHistory` and do both.**

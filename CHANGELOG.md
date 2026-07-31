@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`search(query, harness)` over local harness transcripts — contained by construction (C-215).** The
+  extraction C-214 landed now reaches a datasource, so a session can search what was already said in
+  codex, claude-code and opencode histories. Because this is the story that *exposes* the data, it is
+  the story that has to contain it, and each property is structural rather than maintained:
+  **off by default** — `datasource_tools` literally *is* `datasource_tools_with_history(…, disabled())`,
+  so the default advertising no `harness` selector is true by construction; **escaped and redacted at
+  ingest**, asserted on the record in the index rather than on a rendered result; **per-harness
+  permission subject**; and the escaper is A-21's own, exported as a one-line delegation so two callers
+  cannot drift into two schemes. `HarnessKind::Flux` reports *unsupported* rather than looking like an
+  empty history — the flux-native adapter is C-302.
+  ⚠ Two limits are documented rather than claimed solved: the 8× over-fetch behind the harness filter
+  is a **heuristic, not a bound** — rank skew can still under-return silently, and the clean fix is a
+  `meta` predicate across four backends — and ingest and advertisement take independent handles, so a
+  host must pass **one** `HarnessHistory` to both. There is no in-tree host wiring yet; the first one
+  has to do both.
+
 - **An XMPP MUC room backend — flux can sit in a real multi-party room, with no browser and no vendor
   SDK (D-205).** `XmppMucRoom` implements D-204's `Room` port over an RFC 7395 WebSocket: SASL,
   resource bind, MUC presence join, occupant tracking from presence, `groupchat` and private messages,
