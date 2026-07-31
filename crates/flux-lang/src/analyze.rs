@@ -1807,10 +1807,10 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
             check_node(input, ops, bound, d)
         }),
         Node::Parse { value, as_type } => {
-            const VALID: &[&str] = &["f64", "i64", "bool", "json", "string"];
+            const VALID: &[&str] = &["f64", "i64", "bool", "json", "string", "form"];
             if !VALID.contains(&as_type.as_str()) {
                 d.add(format!(
-                    "`parse` as_type must be one of f64/i64/bool/json/string, got `{as_type}`"
+                    "`parse` as_type must be one of f64/i64/bool/json/string/form, got `{as_type}`"
                 ));
             }
             d.with("value", |d| {

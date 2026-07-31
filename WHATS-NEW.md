@@ -15,6 +15,88 @@
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-07-31
+
+### Fixed
+
+- **The Zendesk example's setup instructions no longer describe software that does not exist.** The
+  guide and the examples README told you to build and install a `zendesk` plugin, then store a token
+  through the credential prompt. That plugin was withdrawn before it was ever released, so those steps
+  could not work. The same four workflows are now served by the connectors library instead — under the
+  same operation names, so the example itself is unchanged — and the documentation explains how a host
+  makes them available. It also states plainly what is still missing before the workflows can reach a
+  real Zendesk account: the Zendesk connector has nowhere to look a stored credential up, and its
+  account-specific address (`https://your-company.zendesk.com`) is not yet filled in from
+  configuration. Both stop with an explanation rather than sending a broken request, and neither is
+  something you can work around by supplying a token.
+- **A clearer statement of what "read-only" means for that example.** Making the Zendesk operations
+  available brings the three writing operations along with the four reading ones. None of the four
+  example workflows can reach a write — that is now checked automatically — but keeping writes out of
+  reach entirely is a matter of what you approve, and the guide no longer suggests otherwise.
+
+### New
+
+- **Your flows can now call APIs that want a form-encoded body — including OAuth2 token endpoints.**
+  Writing `parse($fields, as: "form")` turns a record into the `key=value&key=value` body those APIs
+  require, with every value escaped properly. Previously the only body a flow could build was JSON, and
+  hand-assembling a form body with text formatting silently corrupted any value containing `&` or `=`.
+  A field you leave empty is simply not sent, and a nested field is refused with an explanation rather
+  than guessed at — because every service spells nested form fields differently, and a wrong guess is
+  accepted and quietly ignored.
+
+## [0.41.0] - 2026-07-31
+
+### New
+
+- **You can see what your sub-agents are doing, in the terminal, while they work.** Delegated workers now
+  appear in their own panel: what each one is, whether it is working or has gone quiet, and how long it
+  has been going. What a worker is *saying* or *thinking* is never shown. The panel belongs to flux, not
+  to the agent — an agent cannot close it, redraw it, or put anything that looks like it on screen.
+
+- **If you embed flux, you can now cap how much a run uses, not just how much it spends.** Alongside the
+  existing token and iteration budgets, you can set a ceiling on how many tools run at once, and a
+  ceiling on how much tool output a long session keeps in memory. Going over is refused with a message
+  that names the setting — never a silent truncation and never a hang.
+  Two honest limits: there is no whole-process memory cap, because a library cannot refuse an allocation
+  someone else makes, and these ceilings do not yet apply to the `flux` command line or descend into
+  sub-agents.
+
+- **A long-running session can be told to stop growing its audit log without losing any of it.** When the
+  limit is reached, the oldest *contents* are set aside behind a note saying what was there and where to
+  find it — the record of what happened, in what order, stays complete. Nothing is quietly deleted.
+
+### Improved
+
+- **Workflow control lines read like calls.** `confirm "Open issue?", risk: medium`,
+  `retry 3, backoff: exponential, delay: 500ms`, `loop for 10s, every: 1s, until: done`. **Everything you
+  have already written still works** — this is a new spelling, not a replacement, and the formatter emits
+  the new one. Editor highlighting is updated everywhere: the website, VS Code, IntelliJ, and the
+  tree-sitter grammar Helix, Neovim and Zed use.
+
+- **An agent's panel can no longer be made to look like the approval prompt.** The prompt that asks you to
+  allow or deny an action is drawn only by flux, and an agent's own panel now cannot reproduce it — not
+  with colours, not with terminal codes, and not by drawing the box out of ordinary line characters.
+  Worth knowing what this does **not** promise: plain text can always resemble a frame if it tries. What
+  it guarantees is that no accurate copy is possible, and that the `◆ agent` mark on a panel is never
+  something an agent can put there itself. **If you are being asked to approve something, look for the
+  absence of that mark.**
+  One cost: an agent panel can no longer draw diagrams, tables or progress bars out of line characters
+  in free text. It can still ask flux to draw all three properly.
+
+- **`flux eval` now points you at flux-bench**, which is the supported way to benchmark a coding-agent
+  harness. `flux eval` itself is unchanged and still works.
+
+### Fixed
+
+- **A confined flux can no longer be fooled into thinking it is already confined.** The marker that tells
+  a child process "you are inside a sandbox already" could previously be set by the code doing the
+  spawning, even when no sandbox existed — so a child could skip its own sandboxing believing someone
+  else had done it. It can now be neither forged nor cleared.
+
+- **A busy machine no longer fails the build for no reason.** Two kinds of test read state from your home
+  directory, so running several things at once could fail a test that had nothing to do with the change
+  being tested — and the failure looked like a compile error.
+
 ## [0.40.0] - 2026-07-30
 
 ### Improved

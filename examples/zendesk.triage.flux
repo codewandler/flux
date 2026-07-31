@@ -1,30 +1,51 @@
 # zendesk.triage.flux — deterministic Zendesk automation with bounded AI analysis.
 #
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-# NOT RUNNABLE AS SHIPPED — the backing integration is being replaced.
+# WHO SERVES THESE OPERATIONS — the flux-connectors Tool pack, and what it still cannot do.
 #
-# The first-party `zendesk` plugin this flow was written against has been REMOVED. It is to be
-# superseded shortly by a flux-connectors interop layer, and the `zendesk.*` operations below will be
-# re-pointed at that layer once it lands. Until then no provider serves them, so every entrypoint
-# here fails at its first call.
+# The first-party `zendesk` plugin this flow was written against was REMOVED before it ever shipped.
+# Its replacement is flux-connectors' `connector-pack`: a host registers it with
+# `ClientBuilder::try_register_pack(connector_pack::pack(&["zendesk"], http, credentials))` and gets
+# one dotted tool per catalogue operation, each delegating to flux's OWN `http.request` — so flux
+# keeps every byte of egress, and each operation is gated individually by this host's permission and
+# approval envelope rather than inheriting whatever `http.request` happens to get.
 #
-# This file is kept deliberately, as the authored shape the replacement has to satisfy: four
-# read-only entrypoints, retry with exponential backoff, bounded contexts with explicit budgets,
-# model timeouts, and a deterministic evidence fallback. The op NAMES are the part expected to
-# change; the flow structure is not. Its coverage is provider-free — the tests drive these
-# entrypoints against stubbed operations, so they keep passing and keep this shape honest while the
-# integration is absent.
+# The op names below did NOT have to change: the pack projects `zendesk-test` to `zendesk.test` and
+# `zendesk-ticket-comment-list` to `zendesk.ticket.comment.list`, which is exactly what this flow
+# already called. The pack was authored to this shape. Two guards keep it that way — the exact
+# operation set is pinned here by `flux-cli`'s `zendesk_reference_calls_exactly_the_connector_pack_
+# read_operations`, and by the pack's own `projection.rs` at the other end.
+#
+# STILL NOT RUNNABLE AGAINST A LIVE ACCOUNT, for two reasons that are both connector-side and
+# neither of which is a missing credential:
+#   1. `providers/zendesk.toml` declares no `authority`, so the pack has no address to look a
+#      credential up at and refuses with `NoCredentialAddress` rather than sending an
+#      unauthenticated request. Only 7 of the shipped connectors declare one (flux-connectors C-37).
+#   2. Zendesk's `base_url` is `https://{subdomain}.zendesk.com` and the pack does not yet resolve
+#      config, so the request URL carries `{subdomain}` verbatim — a host that does not resolve
+#      (flux-connectors C-86/C-68). 27 of 105 shipped operations share this.
+# Every entrypoint therefore still fails at its first call, but it now fails in a named, fixable
+# place instead of at an operation nothing serves.
+#
+# The flow structure is unchanged and is the point: four read-only entrypoints, retry with
+# exponential backoff, bounded contexts with explicit budgets, model timeouts, and a deterministic
+# evidence fallback. Its coverage is provider-free — the tests drive these entrypoints against
+# stubbed operations, so the shape stays enforced without credentials or network.
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 #
-# Examples (each awaits the replacement integration before it can run):
+# Examples (each needs the two connector-side gaps above closed before it can reach Zendesk):
 #   flux run examples/zendesk.triage.flux --entry setup --yes
 #   flux run examples/zendesk.triage.flux --entry triage --arg 'query=type:ticket status:new' --yes
 #   flux run examples/zendesk.triage.flux --entry brief --arg ticket_id=12345 --yes
 #   flux run examples/zendesk.triage.flux --entry eod --arg 'query=type:ticket updated>24hours' --yes
 #
 # This reference is intentionally READ-ONLY: no write operation is reachable from any of these four
-# flows, and the replacement integration is expected to preserve that — a write must stay separately
-# approval-gated and concurrency-safe rather than becoming reachable here. Ticket descriptions and
+# flows. Note what that does and does not mean now that the pack serves them — `pack(&["zendesk"])`
+# registers all seven catalogue operations, so `zendesk.ticket.update`, `zendesk.ticket.comment.add`
+# and `zendesk.ticket.tag.add` are present in the host's registry. What is guaranteed is that no
+# entrypoint HERE reaches one, asserted from this module's own call graph rather than by comment; a
+# host that wants them unreachable altogether withholds approval, which is where that decision
+# belongs. Ticket descriptions and
 # internal comments enter the configured model context in triage/brief/eod. Every model call is
 # bounded by a timeout and fallback; a provider failure returns the gathered Zendesk evidence.
 

@@ -1174,4 +1174,64 @@ flow triage(query: String) -> String
             assert!(source.contains(kind), "example should demonstrate `{kind}`");
         }
     }
+
+    /// **The reference flow's Zendesk vocabulary is pinned to what the connector pack projects.**
+    ///
+    /// Since D-214 the flow's `zendesk.*` operations are served by flux-connectors'
+    /// `connector-pack`, which registers one dotted tool per catalogue operation id — `zendesk-test`
+    /// becomes `zendesk.test`, `zendesk-ticket-comment-list` becomes `zendesk.ticket.comment.list`.
+    /// A name this flow calls that the pack does not project resolves nowhere, and the failure is a
+    /// missing operation at run time against a live account: exactly the class no offline fixture
+    /// catches, because `crates/flux-eval/tests/zendesk_triage.rs` registers whatever names the
+    /// module happens to contain.
+    ///
+    /// So the set is asserted **exactly**, not by prefix. The sibling half of this pin lives in
+    /// flux-connectors (`crates/connector-pack/tests/projection.rs`, which installs the pack and
+    /// looks these four up by name); this half is what makes an edit *here* fail *here*, in the
+    /// repository where the edit happens. `zendesk_reference_exposes_four_read_only_entrypoints`
+    /// above rules out the three writes the pack also registers; this rules out everything else,
+    /// including a fifth read and a plausible misspelling.
+    #[test]
+    fn zendesk_reference_calls_exactly_the_connector_pack_read_operations() {
+        // Left: the catalogue operation id in flux-connectors' `providers/zendesk.toml`.
+        // Right: the dotted tool name `connector_pack::dotted_name` derives from it, which is what
+        // authored Flux can spell and therefore what this flow must call.
+        const PROJECTED_READS: [(&str, &str); 4] = [
+            ("zendesk-test", "zendesk.test"),
+            ("zendesk-ticket-search", "zendesk.ticket.search"),
+            ("zendesk-ticket-show", "zendesk.ticket.show"),
+            ("zendesk-ticket-comment-list", "zendesk.ticket.comment.list"),
+        ];
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/zendesk.triage.flux");
+        let source = std::fs::read_to_string(&path).expect("read Zendesk reference workflow");
+
+        let mut called: Vec<String> = Vec::new();
+        for entry in ["setup", "triage", "brief", "eod"] {
+            let loaded = parse_cli_flow_entry_source("zendesk.triage.flux", &source, entry)
+                .unwrap_or_else(|error| panic!("select `{entry}`: {error}"));
+            flux_lang::analyze::for_each_node(&loaded.ast.body, &mut |node| {
+                if let flux_flow::ast::Node::Call { op, .. } = node {
+                    if op.starts_with("zendesk.") {
+                        called.push(op.clone());
+                    }
+                }
+            });
+        }
+        called.sort();
+        called.dedup();
+
+        let mut projected: Vec<String> = PROJECTED_READS
+            .iter()
+            .map(|(_, dotted)| (*dotted).to_owned())
+            .collect();
+        projected.sort();
+
+        assert_eq!(
+            called, projected,
+            "the reference flow's Zendesk operations must be exactly the four reads the connector \
+             pack projects — anything else resolves nowhere at run time"
+        );
+    }
 }

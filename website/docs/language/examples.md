@@ -172,11 +172,14 @@ crossing the safety envelope.
 is a multi-flow module with four one-shot entrypoints. Authored control flow owns retry, concurrency,
 timeouts, context budgets, and fallback; the model only analyzes bounded ticket evidence.
 
-:::note The backing integration is being replaced
-The `zendesk` plugin these flows call was removed before its first release, pending a flux-connectors
-interop layer, so the commands below cannot run yet. The module is kept as a worked example of the
-authored-control-flow shape — which is what this page is illustrating — and its `zendesk.*` operation
-names are the part expected to change.
+:::note These operations now come from a connector pack, and two gaps remain
+The `zendesk` plugin these flows called was removed before its first release. The operations are now
+served by flux-connectors' connector pack, which a host registers when it builds its client — and the
+operation names did not have to change, because the pack was authored to this flow's shape. The
+commands below still cannot reach a live account: the Zendesk connector declares no credential
+address, and its `https://{subdomain}.zendesk.com` base URL is not yet resolved from config. Both
+refuse rather than sending a broken request. The module remains a worked example of the
+authored-control-flow shape, which is what this page is illustrating.
 :::
 
 ```bash
@@ -188,9 +191,11 @@ flux run examples/zendesk.triage.flux --entry eod \
   --arg 'query=type:ticket updated>24hours' --yes
 ```
 
-The module is read-only: no write operation is reachable from any entrypoint, and the replacement
-integration is expected to keep writes separately approval-gated rather than reachable here. Provider
-failure falls back to the gathered response instead of losing the deterministic work.
+The module is read-only in a precise sense: registering the pack brings the connector's three write
+operations into the host's registry too, and what is guaranteed — and asserted against the module's own
+call graph — is that no entrypoint here reaches one. Keeping them unreachable altogether is the host's
+approval decision. Provider failure falls back to the gathered response instead of losing the
+deterministic work.
 
 ## Going further
 

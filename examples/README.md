@@ -56,22 +56,20 @@ flux app run examples/channels-app.flux
 
 ## Run the Zendesk workflows
 
-Build and register the first-party plugin, configure its endpoint and username, then store the API
-token through Flux's hidden credential prompt:
+There is no plugin to build or register: the `zendesk` plugin was removed before its first release,
+and these operations are now served by flux-connectors' `connector-pack`, which a **host** installs
+when it builds its client — `try_register_pack(connector_pack::pack(&["zendesk"], http, credentials))`.
+Each operation becomes an ordinary dotted tool that delegates to flux's own `http.request`, so flux
+keeps every byte of egress and gates each operation individually. The names did not change: the pack
+projects `zendesk-test` to `zendesk.test`, which is what this flow already called.
 
-```bash
-(cd plugins && cargo build --release -p zendesk)
-flux plugin add zendesk "$PWD/plugins/target/release/flux-plugin-zendesk"
-
-export ZENDESK_URL="https://company.zendesk.com"
-export ZENDESK_USER="agent@example.com/token"
-flux auth set zendesk
-```
-
-**Not runnable today:** the backing `zendesk` plugin was removed before its first release and is to
-be superseded by a flux-connectors interop layer, so every entrypoint below fails at its first call
-until that lands. The flow is kept as the authored shape the replacement must satisfy, and its tests
-run against stubbed operations so that shape stays enforced meanwhile.
+**Still not runnable against a live account,** for two connector-side reasons, neither of which is a
+missing credential: `providers/zendesk.toml` declares no `authority`, so there is no address to
+resolve a credential at and the pack refuses rather than sending an unauthenticated request; and
+Zendesk's `base_url` is `https://{subdomain}.zendesk.com` with config resolution not yet implemented,
+so the request URL carries `{subdomain}` verbatim. Every entrypoint below therefore still fails at its
+first call — but in a named, fixable place rather than at an operation nothing serves. Its tests run
+against stubbed operations, so the authored shape stays enforced meanwhile.
 
 Each named entrypoint is independently selectable. `setup` only verifies connectivity; the other
 entrypoints use the configured model for bounded analysis and return gathered API evidence if that
@@ -90,8 +88,8 @@ flux run examples/zendesk.triage.flux --entry eod \
   --inputs '{"query":"type:ticket updated>24hours"}' --yes
 ```
 
-See the [Zendesk triage guide](../docs/zendesk-triage.md) for credential behavior, model data
-exposure, and the write boundary the replacement integration inherits.
+See the [Zendesk triage guide](../docs/zendesk-triage.md) for how the pack is registered, what the two
+remaining gaps are, model data exposure, and the write boundary the connector catalogue inherited.
 
 ## Index
 
@@ -111,7 +109,7 @@ exposure, and the write boundary the replacement integration inherits.
 | `multi-perspective.flux` | Parallel 3-lens scout fan-out (technical/product/risk) via `task` + checked-in `.flux/agents/*-scout.md` role files, evidence merged and `synth`esized into a cited `Answer` | `flux flow run examples/multi-perspective.flux --arg 'query=How should Flux surface streaming errors?' -m <model> --yes` — needs a model |
 | `release.flux` | Host-decided release planning: derives the SemVer bump mechanically and renders release metadata without letting a model choose the version | `flux flow run examples/release.flux --arg apply=false --yes` — safe planning mode; does not publish or push |
 | `strict_review.flux` | The strict review protocol: read-only git/context gather → budgeted `ctx` → fixed fan-out to three restricted reviewer roles → deterministic `review.aggregate` (normalize, dedupe, rank) into a typed `ReviewReport` | `flux review --files <path>… -m <model>` — this very file is compiled into the binary (`include_str!` in `crates/flux-app/src/review.rs`) as the flow behind `flux review`; the header's `flux run … --input` line is stale (no such flag) |
-| `zendesk.triage.flux` | Four named, read-only Zendesk support workflows: auth setup, queue triage, ticket+comment brief, and end-of-day summary; deterministic retry/parallel/timeout/fallback with AI confined to analysis | `flux run examples/zendesk.triage.flux --entry <setup\|triage\|brief\|eod> [--arg name=value] --yes` — needs `flux-plugin-zendesk`; all but `setup` need a configured model |
+| `zendesk.triage.flux` | Four named, read-only Zendesk support workflows: auth setup, queue triage, ticket+comment brief, and end-of-day summary; deterministic retry/parallel/timeout/fallback with AI confined to analysis | `flux run examples/zendesk.triage.flux --entry <setup\|triage\|brief\|eod> [--arg name=value] --yes` — needs a host that registered flux-connectors' Zendesk pack (two connector-side gaps still open); all but `setup` need a configured model |
 
 ## Caveats
 

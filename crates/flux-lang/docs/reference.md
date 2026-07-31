@@ -77,7 +77,7 @@ declaration, statement, block, and expression nodes; it does not reconstruct log
 | `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min`, `max`, `sum`), comparison (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`, `any`, `all`, `has`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat/join/split`), list helpers (`first`/`last`), string literals (`'…'`/`"…"`), lists, and objects. Dotted names such as `it.author.name` descend object fields leniently (missing/null/non-object hops read as `""`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("it.state == 'ok' && len(tags) > 0", …)`. |
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
 | `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.  `optional` selects the traversal-through-missing-data policy. When `false` — the default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `$x.field?` sugar, or a legacy JSON AST that omitted the flag — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
-| `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
+| `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`, `"form"`. `"json"` and `"form"` also run the other way, serializing a record as canonical JSON or as `application/x-www-form-urlencoded` text. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
 | `ctx` | Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by visibility tier then declared order until within the char budget, recording any dropped members in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing values, performing no IO (the load-bearing elevation of PRD §13 explicit context management). |
 | `ctx_append` | Accrete more symbols into an existing context pack (the `+=` marker). Immutably rebinds `ctx` to a *new* `Ctx` value (preserving the audit chain `$pack@1 → @2`) with `add` appended, then re-applies the pack's budget. Pure. |
 | `match` | Multi-way **exhaustive** branch: evaluate `subject` (a literal or bound symbol), then run the body of the first `case` whose `value` equals it — by JSON equality, so a *string* subject does not equal a *numeric* literal. If none match, run `default`. A deterministic replacement for chains of `when`. To branch on an op's result, bind it first (`$s = call(); match $s {…}`) or use `route`. The analyzer requires at least one case; at runtime an unmatched subject with no `default` is an error — the exhaustiveness guard-rail. |
@@ -1182,8 +1182,13 @@ stays lenient.
 ### `parse`
 
 Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed
-value. `as_type` (`as` in JSON) is one of `f64`, `i64`, `bool`, `json`, `string`.
+value. `as_type` (`as` in JSON) is one of `f64`, `i64`, `bool`, `json`, `string`, `form`.
 No IO, no approval gate.
+
+Two of those targets run the other way as well, turning a **record into text**: `json` produces
+canonical JSON, and `form` produces `application/x-www-form-urlencoded`. That direction is what makes
+a real request body expressible — `http.request` reads `body` as a string and forwards the bytes
+verbatim, so a record handed to it directly is dropped.
 
 ```json
 {"kind": "parse", "as": "f64",
@@ -1194,12 +1199,32 @@ No IO, no approval gate.
 
 | field | type | required | description |
 |---|---|---|---|
-| `value` | Node | yes | a node producing the string to coerce (typically `jq`/`fmt`) |
-| `as` | string | yes | target type: `f64`, `i64`, `bool`, `json`, or `string` |
+| `value` | Node | yes | a node producing the value to coerce (typically `jq`/`fmt`, or a record for `json`/`form`) |
+| `as` | string | yes | target type: `f64`, `i64`, `bool`, `json`, `string`, or `form` |
 
 Numeric and JSON coercion failures (`"abc"` -> `f64`, invalid JSON -> `json`) error rather than
 silently defaulting. `bool` returns true only for `"true"` or `"1"`; other values become false. The
-analyzer rejects `as_type` values outside `f64`/`i64`/`bool`/`json`/`string`.
+analyzer rejects `as_type` values outside `f64`/`i64`/`bool`/`json`/`string`/`form`.
+
+**`form`** serializes a record as `application/x-www-form-urlencoded` — the body every OAuth2 token
+endpoint requires by specification, and the only body Stripe, Twilio, Mailgun and PayPal classic
+parse. It accepts a record or text holding a JSON object, and its rules are wire decisions rather
+than conveniences:
+
+- fields are emitted in **sorted key order**, so one record always encodes to one body;
+- a **`null` field is omitted**, which is how an unsupplied optional parameter means "do not send this
+  field" instead of sending the literal text `null`;
+- a **nested field is an error**. The format has no agreed nesting convention — Stripe writes
+  `metadata[key]`, PHP and Rails write `a[b]` and `a[b][]` — and a key a vendor does not recognize is
+  accepted and *ignored*, answering `200`. Send the flat spelling the vendor documents;
+- escaping follows the WHATWG urlencoded serializer: ASCII alphanumerics and `*-._` travel as
+  themselves, a space becomes **`+`** (the form convention, not RFC 3986's `%20`), and every other
+  byte becomes `%XX` over its UTF-8 encoding.
+
+```flux
+$body = parse({ grant_type: "password", username: $user, password: $secret }, as: "form")
+$response = http.request(body: $body, headers: { "content-type": "application/x-www-form-urlencoded" }, method: "POST", url: $token_url)
+```
 
 ---
 

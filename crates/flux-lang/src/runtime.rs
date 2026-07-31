@@ -3979,6 +3979,11 @@ fn resolve_expr_vars(
 /// Walk a dot-path (e.g. `".bitcoin.usd"` or `"results[0].price"`) into a JSON value.
 /// Path segments: `.key` (object field), `[n]` (array index). Leading `.` is optional.
 fn coerce_parse(value: &serde_json::Value, as_type: &str) -> Result<String> {
+    // `form` is the one target that needs the *structured* value rather than its text: it serializes a
+    // record's fields, so stringifying first would throw away the very structure it encodes.
+    if as_type == "form" {
+        return form_urlencode(value);
+    }
     let s = match value {
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
@@ -4010,6 +4015,122 @@ fn coerce_parse(value: &serde_json::Value, as_type: &str) -> Result<String> {
         }
         _ => Ok(s), // "string" or unknown — pass through
     }
+}
+
+/// Serialize a record as `application/x-www-form-urlencoded` text.
+///
+/// The sibling of `parse(…, as: "json")` for the *other* body format a real API asks for. Every OAuth2
+/// token endpoint is form-encoded **by specification** (RFC 6749 §4.3.2), and Stripe, Twilio, Mailgun
+/// and PayPal classic parse form bodies and nothing else. Before this, authored Flux could not produce
+/// one at all: `http.request` reads `body` with `Value::as_str` and forwards the bytes verbatim, no
+/// node or `expr` function escapes anything, and the only record-to-text path was JSON. The workaround
+/// — assembling `k={v}&k2={v2}` with `fmt` — interpolates values *unencoded*, so a value carrying `&`
+/// or `=` corrupts the body and can inject a field.
+///
+/// It accepts the same two spellings of "here is my record" that `json` does: a record value, or a
+/// string holding a JSON object — which is how an op result or a composite-op parameter arrives.
+///
+/// # The rules, each of which is a wire decision
+///
+/// - **Fields are emitted in sorted key order.** `serde_json::Map` is a `BTreeMap` in this build, so
+///   the output is deterministic; a body that reordered between runs could not be signed or cached.
+/// - **A `null` field is omitted**, not sent as `key=`. That is what lets an unsupplied optional
+///   parameter mean "do not send this field" rather than sending the literal text `null`.
+/// - **A nested field is an error.** `application/x-www-form-urlencoded` has no agreed nesting
+///   convention — Stripe writes `metadata[key]`, PHP and Rails write `a[b]` and `a[b][]` — so an
+///   object or array value is refused rather than flattened into one vendor's dialect. A vendor that
+///   does not recognize a form key answers `200` and ignores it, which is the worst failure available,
+///   and it is the reason this refuses instead of guessing.
+/// - **Scalars use flux's own number and boolean spelling:** `true`, `42`, `1.5`.
+/// - **Escaping follows the WHATWG urlencoded serializer** — see [`urlencode_component`].
+fn form_urlencode(value: &serde_json::Value) -> Result<String> {
+    let parsed;
+    let fields = match value {
+        serde_json::Value::Object(fields) => fields,
+        serde_json::Value::String(text) => {
+            parsed = serde_json::from_str::<serde_json::Value>(text).map_err(|e| {
+                FlowError::Runtime(format!(
+                    "parse: `form` needs a record of fields to encode, and this text is not JSON: {e}"
+                ))
+            })?;
+            parsed.as_object().ok_or_else(|| {
+                FlowError::Runtime(
+                    "parse: `form` needs a record of fields to encode, got JSON that is not an object"
+                        .to_string(),
+                )
+            })?
+        }
+        other => {
+            return Err(FlowError::Runtime(format!(
+                "parse: `form` needs a record of fields to encode, got {}",
+                shape_word(other)
+            )))
+        }
+    };
+
+    let mut out = String::new();
+    for (key, field) in fields {
+        let text = match field {
+            // Omitted, not `key=`: an absent optional must not become a value.
+            serde_json::Value::Null => continue,
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Bool(flag) => flag.to_string(),
+            serde_json::Value::Number(number) => match number.as_f64() {
+                Some(float) if !number.is_i64() && !number.is_u64() => format_number(float),
+                _ => number.to_string(),
+            },
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                return Err(FlowError::Runtime(format!(
+                    "parse: field `{key}` is {}, and `application/x-www-form-urlencoded` has no \
+                     nesting convention — a flattened guess is a key the vendor accepts and ignores. \
+                     Send the flat spelling the vendor documents (Stripe's `metadata[key]`, for \
+                     instance), one field per pair",
+                    shape_word(field)
+                )))
+            }
+        };
+        if !out.is_empty() {
+            out.push('&');
+        }
+        out.push_str(&urlencode_component(key));
+        out.push('=');
+        out.push_str(&urlencode_component(&text));
+    }
+    Ok(out)
+}
+
+/// What a value *is*, for an error message that has to name the shape rather than dump the value —
+/// a form body can carry a credential, so the value itself must not reach a diagnostic.
+fn shape_word(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "text",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "a record",
+    }
+}
+
+/// One pass of the WHATWG urlencoded byte serializer over `s`.
+///
+/// ASCII alphanumerics and `*`, `-`, `.`, `_` travel as themselves; a space becomes `+`; every other
+/// byte becomes `%XX` over its UTF-8 encoding. **This is the form-body convention, not RFC 3986's** —
+/// the two differ on exactly the character most likely to appear in a real value, because RFC 3986
+/// spells a space `%20`. Both are accepted by every form parser in practice, but only `+` is what
+/// `application/x-www-form-urlencoded` specifies, and a hand-rolled encoder that picked the other one
+/// would be subtly wrong in the format's own name.
+fn urlencode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b' ' => out.push('+'),
+            b'*' | b'-' | b'.' | b'_' => out.push(byte as char),
+            _ if byte.is_ascii_alphanumeric() => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// If `value` is a string that parses as a JSON object or array, return the parsed value; otherwise
@@ -4679,6 +4800,72 @@ mod tests {
         Node::Var {
             name: SymbolName(name.into()),
         }
+    }
+
+    /// `parse($record, as: "form")` is the only way authored Flux can produce the body an OAuth2 token
+    /// endpoint — or Stripe, Twilio, Mailgun, PayPal classic — actually parses. The `fmt` workaround
+    /// interpolates values unencoded, so `&` in a value corrupted the body and could inject a field.
+    #[test]
+    fn parse_as_form_encodes_a_record_as_a_form_body() {
+        assert_eq!(
+            coerce_parse(
+                &json!({"grant_type": "password", "username": "ada", "scope": "read write"}),
+                "form"
+            )
+            .unwrap(),
+            // Sorted keys, and a space is `+` — the form convention, not RFC 3986's `%20`.
+            "grant_type=password&scope=read+write&username=ada"
+        );
+    }
+
+    /// A `null` field is *omitted*, which is what lets an unsupplied optional parameter mean "do not
+    /// send this field" rather than sending the literal text `null`.
+    #[test]
+    fn parse_as_form_omits_a_null_field() {
+        assert_eq!(
+            coerce_parse(&json!({"amount": 500, "note": null, "live": true}), "form").unwrap(),
+            "amount=500&live=true"
+        );
+    }
+
+    /// Every byte a form body reserves is escaped, including the two that made the `fmt` workaround
+    /// unsound: a value carrying `&` or `=` used to end one pair and start another.
+    #[test]
+    fn parse_as_form_escapes_every_byte_a_form_body_reserves() {
+        assert_eq!(
+            coerce_parse(&json!({"q": "a&b=c+d/e?f#g%h", "k é": "ü"}), "form").unwrap(),
+            "k+%C3%A9=%C3%BC&q=a%26b%3Dc%2Bd%2Fe%3Ff%23g%25h"
+        );
+    }
+
+    /// The same two spellings of "here is my record" that `json` accepts: a record, or text holding a
+    /// JSON object — which is how an op result or a composite-op parameter arrives.
+    #[test]
+    fn parse_as_form_accepts_a_record_that_arrived_as_json_text() {
+        assert_eq!(
+            coerce_parse(&json!(r#"{"b":2,"a":"x y"}"#), "form").unwrap(),
+            "a=x+y&b=2"
+        );
+    }
+
+    /// **Nesting is refused, not flattened.** `application/x-www-form-urlencoded` has no agreed
+    /// convention — Stripe writes `metadata[key]`, PHP and Rails write `a[b]` and `a[b][]` — and a key
+    /// a vendor does not recognize is accepted and *ignored*, answering `200`.
+    #[test]
+    fn parse_as_form_refuses_a_nested_field() {
+        for nested in [json!({"metadata": {"a": 1}}), json!({"tags": ["a", "b"]})] {
+            let error = coerce_parse(&nested, "form").expect_err("nesting must be refused");
+            assert!(error.to_string().contains("nesting convention"), "{error}");
+        }
+    }
+
+    /// A scalar has no fields to encode, and the diagnostic names the *shape* rather than the value:
+    /// a form body routinely carries a client secret.
+    #[test]
+    fn parse_as_form_refuses_a_value_that_is_not_a_record() {
+        let error = coerce_parse(&json!(42), "form").expect_err("a number is not a record");
+        assert!(error.to_string().contains("got a number"), "{error}");
+        assert!(!error.to_string().contains("42"), "{error}");
     }
 
     #[test]
