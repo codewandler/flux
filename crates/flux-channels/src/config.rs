@@ -17,7 +17,12 @@ pub struct ScheduleSettings {
 }
 
 /// `kind = "webhook" | "http"` settings.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is **hand-written** rather than derived: this struct holds the host-resolved plaintext
+/// `token` and, since C-291, a `verify` record holding the host-resolved plaintext signing secret. A
+/// derive would print both the first time anyone adds a trace line, and the redactor only scrubs
+/// what it was given — so the type itself must not offer the value to a formatter.
+#[derive(Clone, Deserialize)]
 pub struct WebhookSettings {
     /// Address to bind, e.g. `"127.0.0.1:8790"`.
     pub addr: String,
@@ -28,9 +33,126 @@ pub struct WebhookSettings {
     #[serde(default, rename = "async")]
     pub is_async: bool,
     /// Optional bearer token (host-resolved — use `token secret "KEY"` in the program). Required for a
-    /// non-loopback `addr`.
+    /// non-loopback `addr` that states no verifying scheme.
     #[serde(default)]
     pub token: Option<String>,
+    /// How an inbound delivery's authenticity is established (C-291).
+    ///
+    /// **Tri-state, and the absent arm is the dangerous one.** Absent means the declaration states
+    /// nothing; `verify "none"` means the operator has decided this endpoint carries no signature.
+    /// The two must not normalise together — a decision nobody made and a decision made are
+    /// different facts, and on a non-loopback bind only the second is admissible.
+    #[serde(default)]
+    pub verify: Option<VerifyDecl>,
+}
+
+impl std::fmt::Debug for WebhookSettings {
+    /// Redact everything host-resolved from a `secret "KEY"` reference; keep the shape observable.
+    /// `Some("<redacted>")`/`None` on `token` so "this channel has a token" stays diagnosable
+    /// without the value, exactly as `flux_credentials::OAuthToken` does it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookSettings")
+            .field("addr", &self.addr)
+            .field("path", &self.path)
+            .field("async", &self.is_async)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("verify", &self.verify)
+            .finish()
+    }
+}
+
+/// What a `channel webhook` declaration says about verifying inbound deliveries.
+///
+/// Untagged because the two spellings are genuinely different shapes in the program text:
+/// `verify "none"` is a word, and a scheme is a record. Every field of [`VerifySpec`] is optional
+/// *at this layer* so that a defective record still deserializes and is then refused by name —
+/// `serde`'s untagged fallback would otherwise collapse every mistake into "data did not match any
+/// variant", which names neither the channel nor the field.
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+pub enum VerifyDecl {
+    /// A bare word. Only `"none"` is a verification answer; anything else is a load error.
+    Word(String),
+    /// A `verify { … }` record naming a scheme and its parameters.
+    Scheme(Box<VerifySpec>),
+}
+
+impl std::fmt::Debug for VerifyDecl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Word(word) => f.debug_tuple("Word").field(word).finish(),
+            Self::Scheme(spec) => f.debug_tuple("Scheme").field(spec).finish(),
+        }
+    }
+}
+
+/// The declared signature scheme. **Carried and fully validated here; computed by C-292.**
+///
+/// The parameters are the four axes every vendor scheme in the matrix varies along — which digest,
+/// how it is spelled, what string is signed, and how long a signature stays acceptable — plus the
+/// header it arrives in and the shared secret. See `docs/stories/C-292-webhook-signature-schemes.md`.
+#[derive(Clone, Deserialize)]
+pub struct VerifySpec {
+    /// The scheme's machine token, e.g. `"hmac"`. Required.
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// The digest, e.g. `"sha256"`.
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    /// How the digest is spelled on the wire: `"hex"` or `"base64"`.
+    #[serde(default)]
+    pub encoding: Option<String>,
+    /// The header the signature arrives in, e.g. `"X-Hub-Signature-256"`.
+    #[serde(default)]
+    pub header: Option<String>,
+    /// A literal prefix the header value carries before the digest, e.g. `"sha256="`.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// The signed-string template over `{body}` and `{timestamp}`, e.g. `"v0:{timestamp}:{body}"`.
+    #[serde(default)]
+    pub signed: Option<String>,
+    /// Where the signed timestamp is read from. **Header-borne by construction** — see
+    /// [`VerifySelector`].
+    #[serde(default)]
+    pub timestamp: Option<VerifySelector>,
+    /// The replay window, in the `5m` / `300s` / `1h` grammar.
+    #[serde(default)]
+    pub tolerance: Option<String>,
+    /// The shared signing secret, host-resolved — write it as `secret: secret "KEY"` in the program,
+    /// never as a literal.
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for VerifySpec {
+    /// Redacts `secret` for the same reason [`WebhookSettings`] does, and nothing else: every other
+    /// field here is a declaration an operator wrote and needs to be able to read back.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifySpec")
+            .field("scheme", &self.scheme)
+            .field("algorithm", &self.algorithm)
+            .field("encoding", &self.encoding)
+            .field("header", &self.header)
+            .field("prefix", &self.prefix)
+            .field("signed", &self.signed)
+            .field("timestamp", &self.timestamp)
+            .field("tolerance", &self.tolerance)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Where one named value is read off an inbound request. Mirrors the connector manifest's selector
+/// so an operator writing either reads one grammar.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifySelector {
+    /// `"header"`. `"body"` is spellable and refused: a value read out of the body has to be parsed
+    /// *before* the bytes carrying it are authenticated, which inverts the order C-291 exists to fix.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The header name.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn default_path() -> String {

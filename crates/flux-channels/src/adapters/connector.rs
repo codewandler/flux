@@ -850,7 +850,11 @@ fn validate_hmac(channel: &str, binding: &str, hmac: &ManifestHmac) -> anyhow::R
 }
 
 /// The `5m` / `300s` duration grammar a `tolerance` is written in. `None` is "not a duration".
-fn parse_tolerance(text: &str) -> Option<u64> {
+///
+/// Shared with the `webhook` adapter, whose `verify { … }` record states the same window in the same
+/// grammar (C-291) — an operator writing a tolerance and a connector publishing one must not be
+/// parsing two dialects.
+pub(crate) fn parse_tolerance(text: &str) -> Option<u64> {
     let (digits, scale) = match text.strip_suffix('s') {
         Some(d) => (d, 1),
         None => match text.strip_suffix('m') {
