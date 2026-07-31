@@ -90,9 +90,10 @@ impl ServerAuth {
     /// `None` token → [`ServerAuth::Open`].
     ///
     /// `Some("")` deliberately still yields `SharedSecret { secret: "" }` rather than being
-    /// normalised to `Open` or rejected here: this is an infallible constructor on a published
-    /// crate, and silently rewriting an operator's configuration is how the empty secret stayed
-    /// invisible in the first place. It is instead refused where it can do damage —
+    /// normalised to `Open` or rejected here: silently rewriting an operator's configuration is how
+    /// the empty secret stayed invisible in the first place, and an infallible constructor cannot
+    /// report the config error that would justify the rewrite. It is instead refused where it can
+    /// do damage —
     /// [`guard_open_bind`] will not let it reach a non-loopback bind, and [`require_auth`] will not
     /// let it authenticate anything. Producers that can report a config error should refuse it at
     /// load as well (the CLI's `FLUX_SERVER_TOKEN` filter, the `a2a` adapter's).

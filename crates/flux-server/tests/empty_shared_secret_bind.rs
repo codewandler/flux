@@ -72,10 +72,18 @@ async fn an_empty_shared_secret_may_not_bind_a_public_address() {
         .await
         .unwrap()
         .status();
+    // The state a reader reaches by performing this story's guard-only mutation: `guard_open_bind`
+    // let an empty shared secret build a router for a public bind — the defect this test names —
+    // and only `require_auth`'s independent empty-secret check then stopped the anonymous request.
+    // The second half doing its job is not the first half being fixed.
     assert_ne!(
         status,
         StatusCode::UNAUTHORIZED,
-        "sanity: the anonymous request was rejected after all"
+        "an empty shared secret built a router for the non-loopback bind {addr}: the public-bind \
+         refusal is missing. The `Authorization`-less request that followed was caught by \
+         `require_auth`'s empty-secret check (401), not admitted — so the compare half is intact \
+         and the bind half is not. `guard_open_bind` must refuse `SharedSecret {{ secret: \"\" }}` \
+         exactly as it refuses `Open`"
     );
     panic!(
         "an empty shared secret built a router for the non-loopback bind {addr}, and an \
