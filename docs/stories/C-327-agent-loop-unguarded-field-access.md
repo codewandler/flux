@@ -61,3 +61,33 @@ had no way to know which stage was at fault.
   The `strict_review` test can no longer reach it. **The raw failure transcript from C-304's run
   would settle it** — worth hunting for before assuming this story is purely cosmetic, because if a
   live path exists, the message is only half the defect.
+
+## Sightings
+
+The symptom is **live and intermittent**, which is the missing piece C-319 left open.
+
+- **2026-08-01, C-325's implementor.** A `cargo test --workspace` run showed
+  `flux-app::strict_review_journey::journey_and_direct_flow_produce_the_same_review_report` failing
+  with `runtime error: … field access .kind cannot read field kind of a string`. It **passes at the
+  merge base** (`32c4ed1e`, verified by detaching in that worktree) and passed on every subsequent
+  run — 3 targeted and 2 full `--workspace`, one with `--no-fail-fast`. The diff under test was
+  `#[cfg(test)]`-only outside flux-codegate, so it cannot plausibly be the cause.
+- **2026-07-31, C-304's implementor.** The original sighting, which produced
+  [C-319](C-319-strict-review-test-depends-on-tree-dirtiness.md).
+
+**Why this matters more than a flake report.** C-319 investigated the mechanism C-304's implementor
+blamed — a size-driven truncation of `detect_intent` into invalid JSON — and **disproved it**, with
+a code-path audit plus an empirical run at `FLUX_TOOL_OUTPUT_CAP=100` against a 34,609-char fixture
+(346× over cap) with the assertions still green. It then pinned the test's repository reads to a
+fixture, which removed *that* test's exposure.
+
+So the error shape survived the explanation. Two independent sightings, months apart in repo terms,
+on the same journey test, non-reproducible on demand — that is not a stale story, it is an
+intermittent path that nothing currently observes. The unguarded `$intent.kind` at
+`crates/flux-flow/assets/agent-loop.flux:9` is where it surfaces; **what leaves a stage result
+non-JSON is still unknown**, and this story cannot be closed by fixing only the error message.
+
+⚠ Whoever picks this up: the first useful artifact is a captured transcript of a failing run, not a
+code read. Both sightings were lost because the run was not preserved. Consider running the journey
+test in a loop under `--no-fail-fast` with the flow's stage results dumped, rather than reasoning
+from the source.
