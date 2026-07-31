@@ -22,7 +22,7 @@ optional arguments are in `[brackets]`.
 | `read` | `path[, limit, offset]` | Low | Read one file (string path), a list of files (JSON array), or a glob pattern (string with `*`/`?`). Single-file: line-numbered view, paging via `offset`/`limit`. Multi-file/glob: sections headed `==> path <==`. Guidance returned for over-cap files. |
 | `grep` | `pattern[, glob, literal, max_results, path]` | Low | Search by regex (supports `\b`, lookaheads); use `literal: true` for plain substring |
 | `glob` | `pattern[, path]` | Low | List files matching a glob pattern (`*` crosses `/`) |
-| `search` | `query[, limit]` | Low | Search the indexed datasource |
+| `search` | `query[, source, entity, harness, limit]` | Low | Search the indexed datasource. `harness` appears only where the host opted into local coding-harness history, and restricts to one of them |
 | `sources` | | Low | Enumerate the datasources in the index: per source, its entity types and record count |
 | `get` | `source, entity, id` | Low | Fetch one datasource record in full by its address |
 | `list` | `source[, entity, offset, limit]` | Low | List one source's records (optionally one entity type), paged |

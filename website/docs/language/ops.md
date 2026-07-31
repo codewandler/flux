@@ -36,7 +36,7 @@ policy.
 | `patch` | `path, edits` | medium, approval | Several line-anchored edits in one call |
 | `append` | `path, content` | low, approval | Append to a file, creating it if absent |
 | `sources` | | low | Enumerate the [datasource](../agent/datasources.md)'s sources: entity types + record count per source |
-| `search` | `query[, source, entity, limit]` | low | Keyword search over the indexed [datasource](../agent/datasources.md) |
+| `search` | `query[, source, entity, harness, limit]` | low | Keyword search over the indexed [datasource](../agent/datasources.md); `harness` restricts to one local coding harness's history, and is advertised only where the host opted that in |
 | `get` | `source, entity, id` | low | Fetch one datasource record in full by its address |
 | `list` | `source[, entity, offset, limit]` | low | Enumerate a datasource source's records, paged |
 | `relation` | `source, entity, id[, rel]` | low | Follow a datasource record's typed links |

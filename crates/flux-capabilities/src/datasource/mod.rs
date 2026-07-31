@@ -19,12 +19,20 @@
 //! subjects — never `*`, never empty (AGENTS.md:98). Items move through a closed state machine and
 //! an illegal edge is an error, not a write. [`MemoryBoard`] is the offline double.
 //!
+//! [`HarnessHistory`] is the **contained** ingest of another coding harness's conversation history
+//! (C-215). It is the one source whose input is outside the workspace jail, secret-bearing by
+//! construction, and verbatim adversarial text — so it ships **off by default**, every body is
+//! redacted and `<knowledge-base>`-escaped *at ingest* rather than at render, and `search` carries
+//! per-harness `datasource:harness.<id>` permission subjects. See `harness_history` for the
+//! reasoning; `crate::harness` is the acquisition layer beneath it.
+//!
 //! The record/retrieval contracts and pure live row, filter, page, and weak-reference types live in
 //! the L0 `flux-datasource` crate, as do the board's item and state-machine contracts. Real IO
 //! remains host-owned and guarded; no contract here gives the model a credential, connection, or
 //! live handle.
 
 mod board;
+mod harness_history;
 mod host_caps;
 mod ingest;
 mod live;
@@ -50,6 +58,10 @@ pub use board::{
     try_register_work_board, validate_board_contract, work_board_tools, BoardLedger, WorkBoard,
     WorkBoardSurface,
 };
+pub use harness_history::{
+    ingest_harness_history, HarnessHistory, HarnessIngestReport, HarnessSelector,
+    HARNESS_MESSAGE_ENTITY, HARNESS_SESSION_ENTITY, HARNESS_SESSION_REL, HARNESS_SOURCE,
+};
 pub use host_caps::DatasourceHostCaps;
 pub use ingest::{
     chunk_text, freshness, ingest_markdown, ingest_openapi, ingest_text, reindex, ChunkOptions,
@@ -61,7 +73,10 @@ pub use live::{
 pub use markdown_board::MarkdownBoard;
 pub use memory::MemoryBackend;
 pub use memory_board::MemoryBoard;
-pub use ops::{datasource_tools, register_datasource_ops, try_register_datasource_ops};
+pub use ops::{
+    datasource_tools, datasource_tools_with_history, register_datasource_ops,
+    try_register_datasource_ops, try_register_datasource_ops_with_history,
+};
 pub use semantic::SemanticIndex;
 pub use sqlite::SqliteBackend;
 

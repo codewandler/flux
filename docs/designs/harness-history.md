@@ -136,3 +136,49 @@ case, and the skip count is reported rather than swallowed.
 Done looks like: `search(query: …, harness: "opencode")` returning a redacted, escaped, addressable
 message from a real opencode database, with a test that a disabled datasource performs **zero** reads
 outside the workspace.
+
+## What C-215 settled (the seams C-216 tests)
+
+**The datasource seam, not a new builtin.** `search` already exists as a datasource-pack op
+(`flux-capabilities/src/datasource/ops.rs`) and the ask is a *filter on it*, so the change is a field
+on that op rather than a second retrieval verb the model has to learn. `LiveDatasource` was the other
+candidate and is the wrong shape: it is the async system-of-record contract for a backend flux queries
+live and never snapshots, whereas harness history is exactly the indexed, ingest-once case
+`DatasourceBackend` is for — and ingest is where redaction has to happen. Nothing was registered in
+`register_builtins`, so the builtin catalog is unchanged; the two ops-reference mirrors are updated
+because `search`'s signature gained a field.
+
+**Off is a different declaration, not a runtime branch.** `HarnessHistory::disabled()` is the default
+and `datasource_tools` *is* the disabled case, so a host that never opted in gets a `search` whose
+schema and permission subjects are byte-identical to the pre-C-215 op. There is no code path where an
+un-opted-in flux advertises a `harness` field or demands a harness subject.
+
+**The opt-out is observable, not inferred.** `ingest_harness_history` returns before resolving a
+single path when disabled, and reports `HarnessIngestReport::roots_opened()` when enabled. Recording a
+root and opening it are the same call (`open_root`), which is what makes "no candidate root was
+opened" an assertion about behaviour rather than about an empty result set. **This is the seam C-216's
+opt-out audit extends** to every discovery branch, the env-override paths included.
+
+**Containment is one function.** `contain()` is the only place harness text becomes stored text:
+`Redactor::redact` first, then `flux_core::escape_knowledge_base_body` — A-21's own escaper, exported
+rather than reimplemented, so the two cannot drift. The order matters: the redactor tokenizes on
+delimiters that include `<` and `>`, so it must see the text as written. Containment is idempotent, so
+re-rendering an already-contained body through `render_knowledge_blocks` is a no-op.
+
+**Subjects: omitted means all.** An omitted `harness` demands *every* enabled harness's subject, so a
+policy denying `datasource:harness.opencode` cannot be bypassed by leaving the field out. Only
+`HarnessKind::id` values ever become subjects, so no `*` can be injected through the field; an
+unresolvable value errors rather than widening to an all-harness search.
+
+**Known gaps, deliberately left to their own stories.**
+
+- **The flux-native adapter is not here** — it is C-302. Enabling `HarnessKind::Flux` opens no root and
+  is reported in `HarnessIngestReport::unsupported()` rather than looking like an empty history.
+- **The `harness` filter is a post-filter with a bounded over-fetch.** The index backends filter
+  natively on `source`/`entity` only, and `harness` is a within-source distinction by construction (a
+  `source` cannot select within itself — the reason the field exists). A filtered search pins
+  `source: "harness"` natively and over-fetches 8× to cover the ≤4-way within-source dilution. Pushing
+  a `meta` predicate into `DatasourceBackend` would remove the over-fetch and touches all four
+  backends; it is not this story's blast radius.
+- **The redactor's under-match is not yet measured.** That is C-216's third acceptance item, and its
+  answer belongs in this document.
