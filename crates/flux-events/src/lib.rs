@@ -32,6 +32,7 @@ pub mod memory;
 #[cfg(feature = "otel")]
 pub mod otel;
 mod projection;
+pub mod retention;
 mod session_log;
 mod shape;
 mod store;
@@ -43,6 +44,9 @@ pub use projection::{
     conversation, cost_summary, efficiency_summary, memory_entries, observations, pending_wakeups,
     render_run_diff, run_diff, run_trace, stmt_rows, stmt_texts, turns, DiffLineKind, DiffRow,
     EfficiencySummary, ModelCost, PendingWakeup, PlanAttempt, RunDiff, StmtRow, TurnSummary,
+};
+pub use retention::{
+    is_retained_from_adhoc_prune, AdhocRetention, AdhocStreamFamily, ADHOC_STREAM_FAMILIES,
 };
 pub use session_log::{LogError, SessionLog, Tail};
 pub use shape::{AssistantMessage, ShapeError, ValidHistory};

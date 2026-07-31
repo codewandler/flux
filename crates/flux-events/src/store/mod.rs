@@ -331,6 +331,11 @@ trait EventBackend: Send + Sync {
     /// removed. The horizon is per-stream, not per-event (`HAVING MAX(ts) < cutoff`), so a
     /// still-active ad-hoc stream keeps its FULL history. The ad-hoc complement of
     /// [`prune_older_than`](Self::prune_older_than), which covers only registry-listed sessions.
+    ///
+    /// C-231: every implementation must filter its candidates through
+    /// [`is_retained_from_adhoc_prune`](crate::retention::is_retained_from_adhoc_prune) — a family
+    /// marked `Retained` in [`ADHOC_STREAM_FAMILIES`](crate::retention::ADHOC_STREAM_FAMILIES) is
+    /// never deleted, at any age.
     fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize>;
     /// Atomic counterpart to minting a destination session via `create_session_with_context` and
     /// then repeatedly appending events one at a time (D-185): creates the session and appends
@@ -733,6 +738,16 @@ impl EventStore {
     /// one covers ONLY unregistered streams (there is no registry row to age-check or delete — the
     /// events themselves are the whole footprint). Together they make a scheduled retention horizon
     /// actually cover the whole store.
+    ///
+    /// **Not every unregistered stream is disposable (C-231).** "No registry row" is a structural
+    /// fact, not a statement that the data is transient: A-107's cross-session memory lives on
+    /// `memory:<scope-key>` streams, which have exactly this shape, and sweeping them would delete
+    /// the agent's evidence-pinned knowledge with no error and nothing left to reconstruct it from.
+    /// So a family listed as `Retained` in
+    /// [`ADHOC_STREAM_FAMILIES`](crate::retention::ADHOC_STREAM_FAMILIES) is skipped here at **any**
+    /// age, and the returned count reflects only what was actually removed. A caller scheduling this
+    /// against its own retention policy should read `retention`'s module docs: memory is deliberately
+    /// exempt, and removing a memory entry is `forget_memory`'s job, not a horizon's.
     pub fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize> {
         self.backend().prune_adhoc_older_than(cutoff_ms)
     }
@@ -2910,6 +2925,91 @@ mod tests {
         assert_eq!(store.prune_adhoc_older_than(cutoff).unwrap(), 0);
     }
 
+    /// C-231: `memory:<scope-key>` streams (A-107) have exactly the shape
+    /// `prune_adhoc_older_than` targets — no `streams` registry row — so an unguarded ad-hoc sweep
+    /// would delete cross-session memory silently and unrecoverably. The prune must skip every
+    /// family [`crate::retention::ADHOC_STREAM_FAMILIES`] marks `Retained`, *at any age*, while
+    /// still doing its job on an ordinary aged ad-hoc stream in the same sweep.
+    fn prune_adhoc_older_than_never_deletes_cross_session_memory(store: &EventStore) {
+        let sid = store.create_session("m").unwrap();
+        let (cited, turn_id) = cited_event(store, &sid);
+        let global = MemoryScope::Global;
+        let project = MemoryScope::Project {
+            key: "flux".to_string(),
+        };
+        let g = store
+            .remember(
+                &global,
+                note_citing("prefers terse answers", &cited, Some(turn_id)),
+            )
+            .unwrap();
+        let p = store
+            .remember(
+                &project,
+                note_citing(
+                    "the auth middleware is in src/mw/auth.rs",
+                    &cited,
+                    Some(turn_id),
+                ),
+            )
+            .unwrap();
+        // An ordinary ad-hoc stream alongside them, so the sweep is proved to still work rather
+        // than to have been neutered into a no-op.
+        store
+            .append(
+                "audit-old",
+                NewEvent::new(EventKind::Custom {
+                    name: "audit.fact".to_string(),
+                    payload: serde_json::json!({ "n": 1 }),
+                }),
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let cutoff = now_ms(); // both memory streams are now strictly older than the horizon
+        std::thread::sleep(std::time::Duration::from_millis(3));
+
+        assert_eq!(
+            store.prune_adhoc_older_than(cutoff).unwrap(),
+            1,
+            "the aged ordinary ad-hoc stream ages out; the aged memory streams are not candidates"
+        );
+        assert!(
+            store.load_stream("audit-old", None).unwrap().is_empty(),
+            "the ordinary ad-hoc stream still prunes — the guard is scoped, not a blanket opt-out"
+        );
+
+        // Every scope survives: the read model, and the append-only history behind it.
+        assert_eq!(
+            store
+                .memories(&global)
+                .unwrap()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            vec![g.id.clone()],
+            "global memory must survive an ad-hoc prune whose cutoff is past it"
+        );
+        assert_eq!(
+            store
+                .memories(&project)
+                .unwrap()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            vec![p.id.clone()],
+            "a project scope is a second memory stream and must survive on the same grounds"
+        );
+        assert_eq!(store.memory_history(&global).unwrap().len(), 1);
+        assert_eq!(store.memory_history(&project).unwrap().len(), 1);
+        assert_eq!(store.load_stream(&global.stream(), None).unwrap().len(), 1);
+
+        // Idempotent, and a repeat sweep still does not reach memory.
+        assert_eq!(store.prune_adhoc_older_than(cutoff).unwrap(), 0);
+        assert_eq!(store.memories(&global).unwrap().len(), 1);
+        assert_eq!(store.memories(&project).unwrap().len(), 1);
+    }
+
     // --- D-174: copy_session_to (event-export) ------------------------------
 
     /// `copy_session_to` must reproduce every projection byte-for-byte: `conversation`, `turns`
@@ -3618,6 +3718,7 @@ mod tests {
         ephemeral_case!(custom_events_append_and_read_back_scoped_by_account);
         ephemeral_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
         ephemeral_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
+        ephemeral_case!(prune_adhoc_older_than_never_deletes_cross_session_memory);
         ephemeral_case!(wakeup_schedule_cancel_and_fire_fold_into_pending_correctly);
         ephemeral_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
         ephemeral_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);
@@ -3791,6 +3892,7 @@ mod tests {
         sqlite_case!(custom_events_append_and_read_back_scoped_by_account);
         sqlite_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
         sqlite_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
+        sqlite_case!(prune_adhoc_older_than_never_deletes_cross_session_memory);
         sqlite_case!(wakeup_schedule_cancel_and_fire_fold_into_pending_correctly);
         sqlite_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
         sqlite_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);
@@ -4305,6 +4407,7 @@ mod tests {
         pg_case!(custom_events_append_and_read_back_scoped_by_account);
         pg_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
         pg_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
+        pg_case!(prune_adhoc_older_than_never_deletes_cross_session_memory);
         pg_case!(wakeup_schedule_cancel_and_fire_fold_into_pending_correctly);
         pg_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
         pg_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);

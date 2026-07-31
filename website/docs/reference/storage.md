@@ -105,6 +105,13 @@ at construction time.
 `prune_adhoc_older_than`, `prune_inactive`) is available to embedders via the `EventStore` API on
 both backends.
 
+**Cross-session memory is exempt from time-based retention.** Memory entries live on their own
+`memory:<scope-key>` streams, which carry no session-registry row and would otherwise look like
+ordinary ad-hoc streams to `prune_adhoc_older_than`. They are skipped at any age: for a memory,
+"no activity in months" means the knowledge settled, not that it is disposable, and the store is
+its only copy. Removing a memory entry is a deliberate act — `flux memory forget`, which appends a
+tombstone and keeps the history — never a side effect of a retention sweep.
+
 ## Datasource records
 
 The datasource layer (the agent's retrieval/RAG store) has the same split: the built-in backends

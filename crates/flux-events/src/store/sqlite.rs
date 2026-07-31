@@ -23,6 +23,7 @@ use super::{
 };
 use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
+use crate::retention::is_retained_from_adhoc_prune;
 
 fn map_sql<E: std::fmt::Display>(e: E) -> Error {
     Error::Other(format!("event store: {e}"))
@@ -882,9 +883,14 @@ impl EventBackend for SqliteEvents {
         // registry-enumerating prunes structurally cannot reach. Per-stream horizon on the NEWEST
         // event (`HAVING MAX(ts) < cutoff`), so a still-active ad-hoc stream keeps its FULL
         // history. Same transaction shape as the other prunes; no registry rows to delete.
+        //
+        // C-231: the retained families are filtered out in Rust, through the shared
+        // `is_retained_from_adhoc_prune`, rather than as extra `NOT LIKE` clauses here — one
+        // classifier over one table, so this backend cannot drift from the other two, and the
+        // decision stays readable in `retention.rs` instead of inside a SQL string.
         let conn = self.conn.lock().unwrap();
         let tx = begin_write(&conn, self.contention_warn_threshold)?;
-        let expired: Vec<String> = {
+        let mut expired: Vec<String> = {
             let mut stmt = tx
                 .prepare(
                     "SELECT stream FROM events \
@@ -898,6 +904,7 @@ impl EventBackend for SqliteEvents {
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(map_sql)?
         };
+        expired.retain(|stream| !is_retained_from_adhoc_prune(stream));
         for stream in &expired {
             tx.execute("DELETE FROM events WHERE stream = ?1", [stream])
                 .map_err(map_sql)?;
