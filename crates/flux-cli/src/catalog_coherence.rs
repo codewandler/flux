@@ -691,7 +691,13 @@ fn registration_source(expr: &syn::Expr) -> String {
         syn::Expr::MethodCall(expr) if expr.method == "clone" && expr.args.is_empty() => {
             registration_source(&expr.receiver)
         }
-        syn::Expr::MethodCall(expr) => registration_source(&expr.receiver),
+        // Any other method call carries a *decision*, not a handle, so the method is part of what
+        // is being rendered: `surface_sink.is_some()` and `surface_sink.is_none()` name the same
+        // receiver and mean opposite things, and rendering only the receiver let the inverted one
+        // through — it would advertise `pane.*` in every headless catalog (C-305).
+        syn::Expr::MethodCall(expr) => {
+            format!("{}.{}()", registration_source(&expr.receiver), expr.method)
+        }
         syn::Expr::Call(expr) => match expr.func.as_ref() {
             syn::Expr::Path(function) => function
                 .path
@@ -986,8 +992,11 @@ fn every_registration_seam_in_the_cli_assembly_is_classified() {
 /// leaves the whole vocabulary inert with **every** existing test still green (verified by doing
 /// it), and hard-coding `true` puts `pane.*` in every headless `flux run`, `flux-server` and SDK
 /// catalog — the exact failure C-223's fail-closed seam exists to prevent. `registration_source`
-/// renders a literal as `<non-string literal>` and `surface_sink.is_some()` as its receiver, so
-/// both mutations are caught.
+/// renders a literal as `<non-string literal>`, so both mutations are caught.
+///
+/// The rendered argument keeps the **method**, not just its receiver, and that is load-bearing: an
+/// inverted `surface_sink.is_none()` has the same receiver as the correct call and the opposite
+/// meaning, and it is the mutation that fails *open*.
 #[test]
 fn the_pane_surfacing_decision_comes_from_the_assembling_surfaces_own_sink() {
     let (_, calls) = cli_registration_calls().expect("the CLI source tree parses");
@@ -1010,7 +1019,7 @@ fn the_pane_surfacing_decision_comes_from_the_assembling_surfaces_own_sink() {
     );
     assert_eq!(
         site.arguments.get(1).map(String::as_str),
-        Some("surface_sink"),
+        Some("surface_sink.is_some()"),
         "`try_register_surface_ops` must be told whether THIS assembly minted a `SurfaceSink` \
          (`surface_sink.is_some()`); it is currently passed {:?}, which either leaves the pane \
          vocabulary inert or advertises it to every headless catalog",

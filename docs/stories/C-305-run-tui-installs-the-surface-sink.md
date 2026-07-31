@@ -58,8 +58,11 @@ opens a pane" — not a crash.**
 - [x] An end-to-end check that a `pane.open` call from a model actually reaches `flux-tui`'s pane
       state, rather than only that the op is advertised.
       → `a_model_pane_open_reaches_the_tui_pane_state`: a scripted model calls `pane.open` inside a
-      real turn, and the pane is read back out of `ChatState::open_panes`. **Not** an assertion that
-      a sink object was installed — see Progress for what that distinction cost.
+      real turn; the surface side then goes through `flux_tui::session_state` and the production
+      event loop (`drive_event_loop_headless`), and the pane is read back out of
+      `ChatState::open_panes` **and** off the frame that was drawn. **Not** an assertion that a sink
+      object was installed — see Progress for what that distinction cost, and for the round-two
+      finding that the last two links were reconstructed rather than invoked.
 - [x] Full gate green.
 
 ## Progress
@@ -92,11 +95,39 @@ opens a pane" — not a crash.**
 - **Public catalog is unchanged** — no new ops, so both reference mirrors stay as C-223 left them.
   `flux_spec::metadata_violations` re-verified over the assembled TUI catalog, and
   `permission_subjects` still returns the pane id (`the_tui_pane_catalog_declares_honest_metadata_and_names_its_subjects`).
-- **Not covered, and stated rather than implied:** the `flux-tui` event loop itself is untested in
-  this crate (it needs a real terminal and a live `crossterm::EventStream`), so the single
-  `state.apply_pending_panes();` call inside `event_loop` is verified by reading, not by test.
-  Everything on both sides of it is covered. This is pre-existing crate posture — no `event_loop`
-  test exists — but it is the one line of this change no test observes.
+- **Round two: the last two links were reconstructed, not invoked — now they are pinned.** Review
+  found that deleting *both* `state.apply_pending_panes()` (in `event_loop`) and the
+  `options.pane_queue` → `with_pane_queue` install (in `run_with_options`) left the whole flux-tui +
+  flux-cli surface green, because the end-to-end test rebuilt those two links by hand. The fix is a
+  seam rather than a stronger assertion:
+  - `run_with_options` no longer builds the `ChatState` inline. `session_state(&agent, &session_id,
+    &options)` does, and it holds the install. It is callable without a TTY.
+  - `event_loop` is generic over `B: Backend` and takes its event stream as a parameter. It touched
+    the concrete terminal in exactly one place (`terminal.draw`) and crossterm in exactly one
+    (`input.next()`), so this is a two-signature change with one production call site.
+    `drive_event_loop_headless` runs it over a `TestBackend` and an **empty** event script — the
+    stream's immediate `None` is the loop's own end-of-input exit, so it draws one frame and stops.
+  Both are `#[doc(hidden)] pub` for one reason: `flux-cli` is the only crate that can assemble a
+  `FlowEngine` to hand them, because `flux-tui` does not depend on `flux-system` and adding that
+  dependency was out of scope.
+- **Each of the two is now pinned by a test that reds for it alone** (`pane_surface_wiring.rs`):
+  `the_state_the_tui_assembles_carries_the_pane_channel_the_agent_writes_to` reds only on the
+  install, `the_event_loop_drains_the_agents_pane_channel_into_the_frame_it_draws` reds only on the
+  drain, and `a_model_pane_open_reaches_the_tui_pane_state` — now running the whole chain through
+  the production path — reds on either. Verified by applying each deletion to the shipped line and
+  reverting.
+- **The census guard now pins the *sense* of the decision, not only its receiver.**
+  `registration_source` rendered `surface_sink.is_some()` as `"surface_sink"`, so inverting it to
+  `.is_none()` — the mutation that fails *open*, advertising `pane.*` in every headless `flux run`,
+  `flux-server` and SDK catalog — left
+  `the_pane_surfacing_decision_comes_from_the_assembling_surfaces_own_sink` green. Non-`clone`
+  method calls now render as `receiver.method()`.
+- **Still not covered, stated rather than implied:** the queue's overflow path
+  (`panes.rs`'s `MAX_PENDING_COMMANDS`) drops the newest command and returns ok, with no evidence
+  that it happened — against `surface.rs`'s posture that the sibling failure is "a clear op failure
+  (never a silent success)". Drop-newest is the right choice of the two; the missing piece is the
+  observation, and it is a UX decision (a transcript notice? an op failure?) rather than a
+  mechanical gap, so it is left for its own story.
 
 ## Notes
 

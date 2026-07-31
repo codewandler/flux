@@ -30,7 +30,10 @@ use flux_flow::agent_sink::AgentSink;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
 use flux_provider::{ChunkStream, Provider, Request};
-use flux_runtime::{AllowApprover, Executor, PermissionManager, ToolContext, ToolRegistry};
+use flux_runtime::{
+    AllowApprover, Executor, PaneCommand, PaneData, PaneLifetime, PaneSlot, PaneSpec,
+    PermissionManager, SurfaceSink, ToolContext, ToolRegistry,
+};
 use flux_system::{System, Workspace};
 
 static SCRATCH: AtomicU64 = AtomicU64::new(0);
@@ -210,21 +213,27 @@ struct SilentSink;
 impl AgentSink for SilentSink {}
 
 /// **Acceptance 5 — the one that matters.** A `pane.open` the *model* calls, dispatched through the
-/// real envelope inside a real turn, ends up in `flux-tui`'s pane store.
+/// real envelope inside a real turn, ends up drawn on a terminal.
 ///
-/// Every link is the production one: `try_register_surface_ops` puts the op in the catalog, the
-/// engine carries the minted sink into the turn's `RuntimeTurnContext`, `ToolContext::surface`
-/// hands the op a redacting `SurfaceReporter`, and the TUI's queue is drained into the same
-/// `ChatState` the renderer draws from. Before C-305 this failed at the *second* link: the op was
-/// never registered, and even with it registered the turn context carried no sink, so `pane.open`
-/// would have failed with "no surface is attached".
+/// Every link is the production one, and after the C-305 rework that now includes the last two:
+/// `try_register_surface_ops` puts the op in the catalog, the engine carries the minted sink into
+/// the turn's `RuntimeTurnContext`, `ToolContext::surface` hands the op a redacting
+/// `SurfaceReporter`, `flux_tui::session_state` attaches the queue to the state the loop draws
+/// from, and the loop itself drains it. This test used to *reconstruct* those last two by building
+/// its own `ChatState::for_session(..).with_pane_queue(..)` and calling `apply_pending_panes()`
+/// — which meant deleting both production lines left it green while no pane could ever reach a
+/// terminal. It now calls them.
+///
+/// Before C-305 this failed at the *second* link: the op was never registered, and even with it
+/// registered the turn context carried no sink, so `pane.open` would have failed with "no surface
+/// is attached".
 #[tokio::test]
 async fn a_model_pane_open_reaches_the_tui_pane_state() {
     let panes = flux_tui::PaneQueue::new();
     let model = Arc::new(PaneOpeningModel::default());
     let (engine, events) = assemble_for_surface(
         "tui",
-        Some(panes.clone() as Arc<dyn flux_runtime::SurfaceSink>),
+        Some(panes.clone() as Arc<dyn SurfaceSink>),
         model.clone(),
     );
 
@@ -244,24 +253,135 @@ async fn a_model_pane_open_reaches_the_tui_pane_state() {
         "the planner was never offered `pane.open`; it saw {offered:?}"
     );
 
-    // The surface side, connected exactly as `run_with_options` connects it: the same queue handle
-    // that was minted before the agent, attached to the state the event loop draws from.
-    let mut state = flux_tui::ChatState::for_session("scripted/test-model".into(), session)
-        .with_pane_queue(panes);
-    let applied = state.apply_pending_panes();
-    assert_eq!(
-        applied, 1,
-        "the model's `pane.open` never reached the surface queue — the vocabulary is still inert"
-    );
+    // The surface side, through the production path: the options carry the handle minted before the
+    // agent, `session_state` installs it on the state the loop draws from, and the loop drains it.
+    let mut options = flux_tui::TuiRunOptions::new(false, None);
+    options.pane_queue = Some(panes);
+    let mut state = flux_tui::session_state(&engine, &session, &options)
+        .expect("the TUI assembles its session state");
+    let screen = flux_tui::drive_event_loop_headless(engine, &mut state, Vec::new())
+        .await
+        .expect("the headless loop draws one frame and exits on end-of-input");
 
     let open = state.open_panes();
-    assert_eq!(open.len(), 1, "expected exactly one pane, got {open:?}");
+    assert_eq!(
+        open.len(),
+        1,
+        "the model's `pane.open` never reached the surface — the vocabulary is still inert; got \
+         {open:?}"
+    );
     assert_eq!(open[0].id, PANE_ID);
     assert_eq!(open[0].title, PANE_TITLE);
     assert!(
         !open[0].host_owned,
         "a model-authored pane must never be labelled host-owned — that mark is the trust chrome"
     );
+    assert!(
+        screen.contains(PANE_TITLE),
+        "the pane never made it onto a frame:\n{screen}"
+    );
+}
+
+/// **The install, on its own.** The state the TUI assembles for a session carries the very pane
+/// channel the caller minted before the agent.
+///
+/// Deliberately blind to the *drain*: it asserts on what `flux_tui::session_state` returns, so
+/// deleting `state.apply_pending_panes()` from the event loop leaves it green and only deleting the
+/// `options.pane_queue` → `with_pane_queue` install reds it. That is what makes the pair above and
+/// below independent proofs rather than one proof counted twice.
+///
+/// The production function is *called*, not reimagined: a test that built its own
+/// `ChatState::for_session(..).with_pane_queue(..)` would pass with the install gone, which is
+/// exactly how this link stayed unpinned through the first round.
+#[tokio::test]
+async fn the_state_the_tui_assembles_carries_the_pane_channel_the_agent_writes_to() {
+    let panes = flux_tui::PaneQueue::new();
+    let (engine, events) = assemble_for_surface(
+        "session-state",
+        Some(panes.clone() as Arc<dyn SurfaceSink>),
+        Arc::new(PaneOpeningModel::default()),
+    );
+    let session = events.create_session("scripted/test-model").unwrap();
+
+    let mut options = flux_tui::TuiRunOptions::new(false, None);
+    options.pane_queue = Some(panes.clone());
+    // Emitted exactly as a `pane.*` op's `SurfaceReporter` emits it, on the agent's half of the
+    // channel.
+    (panes as Arc<dyn SurfaceSink>).emit(PaneCommand::Open(open_spec()));
+
+    let mut state = flux_tui::session_state(&engine, &session, &options)
+        .expect("the TUI assembles its session state");
+    assert_eq!(
+        state.apply_pending_panes(),
+        1,
+        "the assembled state drains a different channel than the agent writes to — the `pane.*` \
+         ops enqueue into a queue nobody reads and the surface stays silent"
+    );
+    assert_eq!(
+        state
+            .open_panes()
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![PANE_ID]
+    );
+}
+
+/// **The drain, on its own.** The event loop applies the agent's queued pane commands into the
+/// state it draws, every frame.
+///
+/// Deliberately blind to the *install*: the queue is attached to the state by the test, so deleting
+/// `session_state`'s install leaves this green and only deleting `state.apply_pending_panes()` at
+/// the top of the loop reds it. Before this test existed, deleting that line left the whole
+/// flux-tui + flux-cli surface green while no model pane could ever reach a terminal — the "first
+/// symptom is silence" failure this story is named for.
+///
+/// The loop is the production one. It touches the concrete terminal in exactly one place
+/// (`terminal.draw`) and the crossterm event source in exactly one (`input.next()`), which is why
+/// both are parameters; `flux_tui::drive_event_loop_headless` supplies a `TestBackend` and an empty
+/// event script, so the loop runs one frame and then takes its own end-of-input exit.
+#[tokio::test]
+async fn the_event_loop_drains_the_agents_pane_channel_into_the_frame_it_draws() {
+    let panes = flux_tui::PaneQueue::new();
+    let (engine, events) = assemble_for_surface(
+        "event-loop",
+        Some(panes.clone() as Arc<dyn SurfaceSink>),
+        Arc::new(PaneOpeningModel::default()),
+    );
+    let session = events.create_session("scripted/test-model").unwrap();
+
+    // Queued before the loop starts, exactly as a `pane.open` executed inside a turn leaves it.
+    (panes.clone() as Arc<dyn SurfaceSink>).emit(PaneCommand::Open(open_spec()));
+    let mut state = flux_tui::ChatState::for_session("scripted/test-model".into(), session)
+        .with_pane_queue(panes);
+
+    let screen = flux_tui::drive_event_loop_headless(engine, &mut state, Vec::new())
+        .await
+        .expect("the headless loop draws one frame and exits on end-of-input");
+
+    assert_eq!(
+        state.open_panes().len(),
+        1,
+        "the event loop never drained the pane channel — a model pane cannot reach a terminal"
+    );
+    assert!(
+        screen.contains(PANE_TITLE),
+        "the drained pane was never drawn:\n{screen}"
+    );
+}
+
+/// The `pane.open` the scripted model makes, as a already-decoded command — same id/title/payload,
+/// so the two single-link tests assert against the same pane the end-to-end one does.
+fn open_spec() -> PaneSpec {
+    PaneSpec::new(
+        PANE_ID,
+        PANE_TITLE,
+        PaneSlot::Right,
+        PaneLifetime::Session,
+        PaneData::Log {
+            lines: vec!["compiling flux-cli".into()],
+        },
+    )
 }
 
 /// **Acceptance 3 — the fail-closed half.** A headless assembly advertises no `pane.*` op at all,
