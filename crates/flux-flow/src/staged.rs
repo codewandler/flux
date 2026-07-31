@@ -28,6 +28,9 @@ const SIGNAL_CAPABILITIES: &str = "signal_capabilities";
 const RETURN_STAGE_RESULT: &str = "return_stage_result";
 const MAX_INTENT_ATTEMPTS: usize = 2;
 const MAX_FAMILIES: usize = 4;
+const MAX_INTENT_LIST_ITEMS: usize = 8;
+const MAX_INTENT_LIST_ITEM_CHARS: usize = 256;
+const MAX_DELIVERABLE_CHARS: usize = 512;
 const MAX_NATIVE_TOOLS: usize = 64;
 const MAX_NATIVE_SCHEMA_CHARS: usize = 128_000;
 /// Reserved physical group for host-owned channel facilities that must remain available after
@@ -181,9 +184,19 @@ struct Family {
     routing_signals: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct IntentDeclaration {
     intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deliverable: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    uncertainties: Vec<String>,
     families: Vec<String>,
 }
 
@@ -433,6 +446,7 @@ pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Va
     let declaration = IntentDeclaration {
         intent: goal.to_string(),
         families: families.keys().cloned().collect(),
+        ..Default::default()
     };
     let selected = selected_specs(&declaration, &families, &ambient)?;
     let selected_names = selected
@@ -457,6 +471,11 @@ pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Va
         &state,
         json!({
             "intent": declaration.intent,
+            "task_kind": declaration.task_kind,
+            "effect_mode": declaration.effect_mode,
+            "deliverable": declaration.deliverable,
+            "constraints": declaration.constraints,
+            "uncertainties": declaration.uncertainties,
             "families": declaration.families,
             "operations": selected_names,
         }),
@@ -500,6 +519,7 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
             declaration: IntentDeclaration {
                 intent: intent.clone(),
                 families: Vec::new(),
+                ..Default::default()
             },
             selected: ambient.iter().map(|spec| spec.name.clone()).collect(),
             messages: ctx.conversation.clone(),
@@ -557,6 +577,11 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
         "turn.intent",
         json!({
             "intent": declaration.intent,
+            "task_kind": declaration.task_kind,
+            "effect_mode": declaration.effect_mode,
+            "deliverable": declaration.deliverable,
+            "constraints": declaration.constraints,
+            "uncertainties": declaration.uncertainties,
             "families": declaration.families,
             "operations": selected_names,
         }),
@@ -578,6 +603,11 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
     Ok(json!({
         "kind": "intent",
         "intent": declaration.intent,
+        "task_kind": declaration.task_kind,
+        "effect_mode": declaration.effect_mode,
+        "deliverable": declaration.deliverable,
+        "constraints": declaration.constraints,
+        "uncertainties": declaration.uncertainties,
         "families": declaration.families,
         "operations": selected_names,
         "state": state,
@@ -1593,13 +1623,40 @@ fn intent_tool(families: &BTreeMap<String, Family>) -> ToolDef {
     let names: Vec<Value> = families.keys().cloned().map(Value::String).collect();
     ToolDef {
         name: DECLARE_INTENT.into(),
-        description: "Declare what the user is asking for and the smallest registered capability families needed. This signal narrows visibility; it grants no authority.".into(),
+        description: "Declare the user's task contract and the smallest registered capability families needed. This signal guides planning and narrows visibility; it grants no authority.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "intent": {
                     "type": "string",
                     "description": "A concise description of the request in capability-neutral language."
+                },
+                "task_kind": {
+                    "type": "string",
+                    "enum": ["conversation", "answer", "investigate", "review", "change", "operate", "mixed"],
+                    "description": "The request's top-level task shape."
+                },
+                "effect_mode": {
+                    "type": "string",
+                    "enum": ["none", "read_only", "propose_only", "apply_changes", "perform_operation"],
+                    "description": "The effects the user asked Flux to perform. Descriptive only; never authority."
+                },
+                "deliverable": {
+                    "type": "string",
+                    "maxLength": MAX_DELIVERABLE_CHARS,
+                    "description": "What the final response or completed work must deliver."
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": MAX_INTENT_LIST_ITEM_CHARS},
+                    "maxItems": MAX_INTENT_LIST_ITEMS,
+                    "description": "Explicit user constraints; empty when none."
+                },
+                "uncertainties": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": MAX_INTENT_LIST_ITEM_CHARS},
+                    "maxItems": MAX_INTENT_LIST_ITEMS,
+                    "description": "Material ambiguities requiring evidence or a user decision; empty when none."
                 },
                 "capability_families": {
                     "type": "array",
@@ -1608,7 +1665,10 @@ fn intent_tool(families: &BTreeMap<String, Family>) -> ToolDef {
                     "description": "The smallest set of registered families needed; empty for pure conversation."
                 }
             },
-            "required": ["intent", "capability_families"],
+            "required": [
+                "intent", "task_kind", "effect_mode", "deliverable", "constraints",
+                "uncertainties", "capability_families"
+            ],
             "additionalProperties": false
         }),
     }
@@ -1709,21 +1769,67 @@ fn parse_intent(
     let obj = input
         .as_object()
         .ok_or_else(|| "input must be an object".to_string())?;
+    let known = [
+        "intent",
+        "task_kind",
+        "effect_mode",
+        "deliverable",
+        "constraints",
+        "uncertainties",
+        "capability_families",
+    ];
     let unknown = obj
         .keys()
-        .filter(|k| k.as_str() != "intent" && k.as_str() != "capability_families")
+        .filter(|key| !known.contains(&key.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
         return Err(format!("unknown field(s): {}", unknown.join(", ")));
     }
-    let intent = obj
-        .get("intent")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "`intent` must be a non-empty string".to_string())?
-        .to_string();
+    let intent = required_intent_string(obj, "intent", None)?;
+    let task_kind = match obj.get("task_kind") {
+        Some(_) => required_intent_enum(
+            obj,
+            "task_kind",
+            &[
+                "conversation",
+                "answer",
+                "investigate",
+                "review",
+                "change",
+                "operate",
+                "mixed",
+            ],
+        )?,
+        None => "mixed".into(),
+    };
+    let effect_mode = match obj.get("effect_mode") {
+        Some(_) => required_intent_enum(
+            obj,
+            "effect_mode",
+            &[
+                "none",
+                "read_only",
+                "propose_only",
+                "apply_changes",
+                "perform_operation",
+            ],
+        )?,
+        None => "read_only".into(),
+    };
+    let deliverable = match obj.get("deliverable") {
+        Some(_) => required_intent_string(obj, "deliverable", Some(MAX_DELIVERABLE_CHARS))?,
+        None => intent.clone(),
+    };
+    let constraints = match obj.get("constraints") {
+        Some(_) => required_intent_list(obj, "constraints")?,
+        None => Vec::new(),
+    };
+    let uncertainties = match obj.get("uncertainties") {
+        Some(_) => required_intent_list(obj, "uncertainties")?,
+        None => Vec::new(),
+    };
+
     let raw = obj
         .get("capability_families")
         .and_then(Value::as_array)
@@ -1748,8 +1854,80 @@ fn parse_intent(
     }
     Ok(IntentDeclaration {
         intent,
+        task_kind: Some(task_kind),
+        effect_mode: Some(effect_mode),
+        deliverable: Some(deliverable),
+        constraints,
+        uncertainties,
         families: selected,
     })
+}
+
+fn required_intent_string(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+    max_chars: Option<usize>,
+) -> std::result::Result<String, String> {
+    let value = obj
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("`{field}` must be a non-empty string"))?;
+    if max_chars.is_some_and(|max| value.chars().count() > max) {
+        return Err(format!(
+            "`{field}` exceeds the {}-character maximum",
+            max_chars.expect("checked as some")
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn required_intent_enum(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+    allowed: &[&str],
+) -> std::result::Result<String, String> {
+    let value = obj
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("`{field}` must be a string"))?;
+    if !allowed.contains(&value) {
+        return Err(format!("`{field}` must be one of: {}", allowed.join(", ")));
+    }
+    Ok(value.to_string())
+}
+
+fn required_intent_list(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let values = obj
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("`{field}` must be an array"))?;
+    if values.len() > MAX_INTENT_LIST_ITEMS {
+        return Err(format!(
+            "`{field}` has {} items; the maximum is {MAX_INTENT_LIST_ITEMS}",
+            values.len()
+        ));
+    }
+    values
+        .iter()
+        .map(|value| {
+            let value = value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("every `{field}` item must be a non-empty string"))?;
+            if value.chars().count() > MAX_INTENT_LIST_ITEM_CHARS {
+                return Err(format!(
+                    "a `{field}` item exceeds the {MAX_INTENT_LIST_ITEM_CHARS}-character maximum"
+                ));
+            }
+            Ok(value.to_string())
+        })
+        .collect()
 }
 
 fn selected_specs(
@@ -2105,6 +2283,7 @@ fn apply_capability_signal(
     let declaration = IntentDeclaration {
         intent: format!("{}; additional signal: {reason}", state.declaration.intent),
         families: new_families,
+        ..state.declaration.clone()
     };
     let selected = selected_specs(&declaration, families, ambient)?;
     let prior = state.selected.iter().cloned().collect::<HashSet<_>>();
@@ -2359,6 +2538,18 @@ fn intent_segments(ctx: &StagedContext, index: String) -> Vec<SystemSegment> {
     segments
 }
 
+fn intent_contract_json(declaration: &IntentDeclaration) -> Value {
+    json!({
+        "intent": declaration.intent,
+        "task_kind": declaration.task_kind,
+        "effect_mode": declaration.effect_mode,
+        "deliverable": declaration.deliverable,
+        "constraints": declaration.constraints,
+        "uncertainties": declaration.uncertainties,
+        "families": declaration.families,
+    })
+}
+
 fn explore_segments(ctx: &StagedContext, declaration: &IntentDeclaration) -> Vec<SystemSegment> {
     let mut segments = vec![SystemSegment {
         text: EXPLORE_SYSTEM.into(),
@@ -2372,8 +2563,8 @@ fn explore_segments(ctx: &StagedContext, declaration: &IntentDeclaration) -> Vec
     }
     segments.push(SystemSegment {
         text: format!(
-            "Accepted intent: {}\nSelected capability families: {}",
-            declaration.intent,
+            "Accepted intent contract: {}\nSelected capability families: {}",
+            intent_contract_json(declaration),
             if declaration.families.is_empty() {
                 "(none)".into()
             } else {
@@ -3108,6 +3299,7 @@ mod tests {
             declaration: IntentDeclaration {
                 intent: "inspect the database".into(),
                 families: vec!["db".into()],
+                ..Default::default()
             },
             selected: vec!["db.query".into()],
             messages: Vec::new(),
@@ -3158,6 +3350,7 @@ mod tests {
         let declaration = IntentDeclaration {
             intent: "look at the database".into(),
             families: vec!["db".into()],
+            ..Default::default()
         };
 
         let render = || {
@@ -3199,6 +3392,7 @@ mod tests {
             declaration: IntentDeclaration {
                 intent: "inspect the database".into(),
                 families: vec!["db".into()],
+                ..Default::default()
             },
             selected: vec!["db.query".into()],
             messages: Vec::new(),
@@ -3455,6 +3649,7 @@ mod tests {
         let declaration = IntentDeclaration {
             intent: "read reporting data".into(),
             families: vec!["reporting".into()],
+            ..Default::default()
         };
         let error = selected_specs(&declaration, &families, &ambient)
             .unwrap_err()
@@ -3978,6 +4173,7 @@ mod tests {
             declaration: IntentDeclaration {
                 intent: "inspect stale evidence".into(),
                 families: vec!["workspace.read".into()],
+                ..Default::default()
             },
             selected: vec!["inspect".into(), "removed.inspect".into()],
             messages: vec![Message::user_text("inspect")],
@@ -4115,6 +4311,7 @@ mod tests {
             declaration: IntentDeclaration {
                 intent: "inspect four fixture families".into(),
                 families: initial_families.clone(),
+                ..Default::default()
             },
             selected: initial_selected.clone(),
             messages: vec![Message::user_text("inspect the fixtures")],
