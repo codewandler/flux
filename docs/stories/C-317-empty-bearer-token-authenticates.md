@@ -2,10 +2,9 @@
 id: C-317
 title: "An empty bearer token authenticates every request on a webhook channel's public port"
 pillar: Core
-status: in-progress
-priority: 1
+status: done
 areas: [flux-channels]
-note: "LIVE ON MAIN — found by D-216's review in the new connector arm, where it is being fixed; the identical hole is pre-existing in the webhook adapter. `constant_time_eq(b\"\", b\"\")` is true, and the non-loopback guard only tests is_none(), so a request with no Authorization header at all authenticates"
+note: "FIXED — found by D-216's review in the new connector arm; the identical hole was pre-existing in the webhook adapter. `constant_time_eq(b\"\", b\"\")` is true and the guard only tested is_none(), so a request with no Authorization header at all authenticated. Refused now at load AND at the comparison. The sweep that closed this found a THIRD instance in flux-server → C-321"
 ---
 
 # An empty bearer token authenticates every request

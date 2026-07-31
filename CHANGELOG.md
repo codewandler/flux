@@ -116,6 +116,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **⚠ Security: an empty bearer token on a webhook channel authenticated every request, including
+  one carrying no `Authorization` header at all** (C-317). `constant_time_eq(b"", b"")` is true, and
+  the only guard tested `is_none()` — so `token secret "K"` with `K` exported empty produced a
+  channel the operator believed was authenticated and which in fact admitted anyone. This is the
+  same hole D-216 closed in the connector adapter, found by grepping every `constant_time_eq` call
+  site rather than by waiting for it to recur.
+
+  **Refused in two independent places**, mirroring the connector arm so the two adapters cannot
+  drift: at `from_decl` as a load error — **including on a loopback bind**, because normalising to
+  "no token" is silent there and leaves the operator one `addr` edit away from a public port — and
+  inside `authorized()`, which returns false on an empty expected token *before* comparing.
+  Whitespace-only tokens count as empty (`trim().is_empty()`).
+
+  Each half is observed by its own test, and attribution probes confirm neither carries the other:
+  disabling only the comparison guard reds the request test while the bind tests stay green, and
+  disabling only the load-time refusal does the reverse.
+
+  **Behavioural break at load:** a webhook channel currently configured with an empty or
+  whitespace-only token now fails to start where it previously ran. That is the intended refusal —
+  it was an open port — but it is a hard failure at startup, not a warning.
+
 - **`flux app run` ignored the operator's `[limits]` table, and its review sub-agents ran with no
   ceiling at all** (C-307). C-299 wired `[limits]` through `build_agent_with`, which covers
   `run`/`plan`/`tui`/`serve`, but `flux app run` assembled its own `ExecutionEnvironment` and never

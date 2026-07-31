@@ -54,6 +54,19 @@
 
 ### Fixed
 
+- **Security: a webhook channel whose token was empty let everyone in — including callers who sent
+  no credentials at all.** If you set a token on a webhook channel and the value came out empty —
+  most easily by pointing it at an environment variable that was exported empty or never given a
+  value — the channel accepted every request that reached it, whether or not it carried any
+  credential. It looked authenticated and was not.
+  flux now refuses to start such a channel and tells you which channel and what is wrong, rather
+  than opening the port. It refuses even when the channel only listens on your own machine, because
+  otherwise the mistake stays invisible until the day you expose it. A token that is only spaces
+  counts as empty.
+  **You may need to act:** if a webhook channel of yours currently has an empty or blank token, it
+  will now fail to start instead of running. That is deliberate — it was an open door — but it is a
+  startup failure, so set a real token before you upgrade.
+
 - **The limits you configure now actually apply when you run an app, and to the helpers it spawns.**
   If you had set ceilings on how much work flux may do at once, two paths quietly ignored them:
   running an app, and the reviewer helpers that an app's strict review starts. Those helpers ran with
