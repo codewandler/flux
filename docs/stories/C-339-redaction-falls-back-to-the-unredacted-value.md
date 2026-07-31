@@ -2,6 +2,7 @@
 id: C-339
 title: "When redacted text stops parsing, `redact_and_hash_request` returns the *unredacted* value"
 pillar: Core
+epic: road-to-stable
 status: ready
 priority: 3
 areas: [flux-sdk, flux-events]

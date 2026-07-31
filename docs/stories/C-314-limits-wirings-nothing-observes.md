@@ -2,6 +2,7 @@
 id: C-314
 title: "Two `[limits]` wirings nothing observes, and an occupancy test that guards less than its prose"
 pillar: Core
+epic: road-to-stable
 status: ready
 priority: 10
 areas: [flux-cli]

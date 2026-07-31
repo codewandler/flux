@@ -2,6 +2,7 @@
 id: C-340
 title: "The tree-sitter grammar cannot parse 7 of 15 canonical examples — 166 ERROR nodes on constructs it never supported"
 pillar: Language
+epic: road-to-stable
 status: ready
 priority: 1
 areas: [flux-lang]

@@ -2,6 +2,7 @@
 id: C-332
 title: "53 of 73 `HOME`-reading tests have no injection seam and no story"
 pillar: Core
+epic: road-to-stable
 status: ready
 priority: 4
 areas: [flux-runtime, flux-tools, flux-cli]

@@ -2,6 +2,7 @@
 id: C-336
 title: "A named-argument value highlights as punctuation, and swallows the comma after it"
 pillar: Language
+epic: road-to-stable
 status: ready
 priority: 6
 areas: [flux-lang, flux-lsp]

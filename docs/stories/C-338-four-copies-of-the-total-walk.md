@@ -2,6 +2,7 @@
 id: C-338
 title: "Four copies of the same total-walk redaction logic, which is how the node-kind hole recurred"
 pillar: Core
+epic: road-to-stable
 status: ready
 priority: 8
 areas: [flux-web, flux-flow, flux-orchestrate, flux-secret]

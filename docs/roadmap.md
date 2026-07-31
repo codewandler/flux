@@ -85,6 +85,53 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
 > the itemized history.
 
+### The road to stable — what must be true before flux is measured rather than built (epic) — 🔄 **PROPOSED (C-342; ~16 of 110 open stories block it, 9 owned + 6 cross-referenced)**
+
+flux has 663 done stories and ~110 open, and the open set is not a queue of equal work: roughly 16
+stories block a credible claim that flux is stable, and the other ~94 are capability that stability
+does not depend on. This epic names those 16 so the distinction stops being re-derived, and so the
+switch to **harness-driven** development (`flux-bench` runs driving improvement, regressions read off
+benchmarks rather than found by reading code) happens on evidence rather than on feel.
+
+The 2026-07-31 backlog analysis found the moment is close but not here. The backlog has flipped from
+planning-driven to discovery-driven — 54% of stories C-301…340 originate from a review or an
+implementor report, against ~1% for C-1…200, and **zero of the 20 newest stories are new capability**.
+Defects are tractable and clustered: 17 of 85 non-epic open stories describe something a user can hit,
+grouped in webhook delivery, the Flux-Lang grammar and its editor mirrors, and the redaction path —
+where two stories fail *open*.
+
+**"Done" is not a bug count.** The architecture is settled ([C-337](../designs/architectural-simplification.md)
+says "preserve, do not redesign"), but the published API surface is not: C-337 records a scheduled
+breaking window for `AgentSpec`, compatibility doors slated for deletion, and 37 crates with no
+ownership audit — while carrying zero implementation stories. Benchmarking against an API with a
+deliberate break still queued makes regressions indistinguishable from intended churn. So this epic
+closes when the defect clusters close, C-337 is decomposed and its window scheduled, **and**
+[C-255](../designs/adversarial-review-remediation-2026-07-30.md)'s final bullet is ticked — three
+fresh independent reviews finding no reproducible High-severity containment defect. That bullet is the
+repo's own definition of stable, and its first closure pass found twelve defects after every child was
+marked done.
+
+Design: [`docs/designs/road-to-stable.md`](designs/road-to-stable.md).
+
+### Architectural simplification — fewer assembly paths, smaller modules, less compatibility debt (epic) — 🔄 **PROPOSED (C-337; implementation stories not yet filed)**
+
+The L0–L6 architecture and guarded execution envelope are the part to preserve; the review found
+complexity accumulating *inside* them. `ExecutionEnvironment` centralizes executor construction, but
+surface assembly still grows positional inputs and optional invariant-bearing chains; deprecated
+agent/runtime/app compatibility doors remain long after their stated removal release; and eight
+implementation files now range from 3,014 to 9,789 lines. The workspace also grew from the 31 crates
+recorded after the last consolidation to 37 members, without a current ownership/consumer audit.
+
+The sequence is deliberately conservative: make execution-environment assembly typed and omission-
+resistant; remove the expired compatibility paths in one planned minor release; split
+`flux-runtime` and `flux-codegate` into internal modules before tackling the remaining large files;
+re-audit crate ownership under the existing same-layer/published-boundary rules; design an `AgentSpec`
+settings migration only for a deliberate breaking window; then archive delivered roadmap history.
+No new crate is introduced to make a file look smaller, no published or deliberate L0 boundary is
+merged merely to lower the count, and no module move changes behavior. Design:
+[architectural-simplification.md](designs/architectural-simplification.md); tracker:
+[C-337](stories/C-337-architectural-simplification-epic.md).
+
 ### Meeting rooms — a multi-party channel where humans and agents meet (epic) — 🔄 **PROPOSED (D-203; D-204…D-213 filed, none started; feasibility PROVEN live)**
 
 Every channel flux has is 1:1 or fire-and-forget — `schedule`/`webhook`/`slack`/`a2a` wake a journey and
