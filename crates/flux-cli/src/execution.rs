@@ -2688,7 +2688,7 @@ mod fleet_and_board_wiring {
 }
 
 #[cfg(test)]
-mod cli_resource_ceiling_wiring {
+pub(crate) mod cli_resource_ceiling_wiring {
     //! C-299: a configured `[limits]` table must bind for the **shipped binary**, not only for an
     //! embedding host that calls `ResourceLimits::from_config` itself.
     //!
@@ -2708,11 +2708,14 @@ mod cli_resource_ceiling_wiring {
     use flux_runtime::{Tool, ToolContext, ToolResult};
     use serde_json::{json, Value};
 
-    const BLOCKER: &str = "c299_blocker";
+    /// Shared with C-307's `app run` occupancy tests (`app_cmd.rs`), which observe the same thing on
+    /// the surface that assembled its own environment — one harness, so the two stories cannot drift
+    /// into measuring "in flight" differently.
+    pub(crate) const BLOCKER: &str = "c299_blocker";
 
     /// Live and peak occupancy of `Tool::execute`, sampled by [`Blocker`] itself.
     #[derive(Default)]
-    struct Meter {
+    pub(crate) struct Meter {
         in_flight: AtomicUsize,
         peak: AtomicUsize,
     }
@@ -2727,20 +2730,20 @@ mod cli_resource_ceiling_wiring {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
 
-        fn in_flight(&self) -> usize {
+        pub(crate) fn in_flight(&self) -> usize {
             self.in_flight.load(Ordering::SeqCst)
         }
 
-        fn peak(&self) -> usize {
+        pub(crate) fn peak(&self) -> usize {
             self.peak.load(Ordering::SeqCst)
         }
     }
 
     /// A read-only op that parks inside `execute` until the test hands out a release permit, so
     /// "in flight" means "inside `Tool::execute`" and not "recently returned".
-    struct Blocker {
-        meter: Arc<Meter>,
-        release: Arc<tokio::sync::Semaphore>,
+    pub(crate) struct Blocker {
+        pub(crate) meter: Arc<Meter>,
+        pub(crate) release: Arc<tokio::sync::Semaphore>,
     }
 
     #[async_trait]

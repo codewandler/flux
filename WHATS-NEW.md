@@ -15,6 +15,77 @@
 
 ## [Unreleased]
 
+### New
+
+- **flux can now take deliveries from a connector you have installed, by naming it.** Point a channel
+  at an installed connector and the binding you want, and flux reads that connector's own description
+  of itself and sets the channel up from it — you do not restate the vendor's details by hand.
+  The part worth knowing is what happens when something in that description is wrong or has been
+  edited since it was published: flux refuses to start the channel and tells you which rule failed
+  and where, instead of starting a channel that looks healthy and quietly does nothing. That was a
+  real failure mode — a description that narrowed which events it wanted would previously have opened
+  a port, accepted deliveries, and never acted on any of them.
+  Two limits today. Connectors that sign their deliveries are not usable yet, and flux refuses them
+  outright rather than accepting the delivery unverified — so you cannot end up believing a channel
+  checks signatures when it does not. And if you expose the channel beyond your own machine, it must
+  have a token; an empty one is now rejected when you set it up, because an empty token would have let
+  anyone through.
+
+- **Web requests can now take query parameters as a proper list, instead of you gluing them onto the
+  address yourself.** Give the request a set of named values and flux assembles the address for you,
+  escaping each value correctly. This matters for more than tidiness: previously, a value that
+  happened to contain a character like `&` or `=` — a search phrase, a customer's name, anything the
+  agent picked up along the way — could silently turn into *extra* parameters and change what the
+  request actually asked for. That can no longer happen.
+  Values behave the way you would expect: leaving one empty means "don't send it", while `false` and
+  `0` are sent as real values, and naming the same parameter twice is reported as a mistake rather
+  than one quietly overwriting the other. A stored credential can be used as a query value and stays
+  hidden in logs and in anything the model can see, exactly as it does in a request header.
+
+- **A web request now hands back its answer in parts you can pick from, instead of one block of
+  text.** You get the status, the response headers and the body separately, so a flow can reach
+  straight into the body for the piece it wants — an id, a status field, an item from a list. Before
+  this, everything arrived glued into a single blob and asking for a field inside it simply gave you
+  nothing back, with no error to tell you the ask had not worked.
+  Bodies that are not JSON are handled the way you would hope: an HTML error page, an empty reply or
+  a cut-off response still come back with the status and headers intact, and the body as plain text.
+  A `404` is an answer, not a crash. What a person sees in the log is unchanged, and credentials that
+  an API echoes back to you — in a header or in the body — are still hidden.
+
+### Fixed
+
+- **Security: a webhook channel whose token was empty let everyone in — including callers who sent
+  no credentials at all.** If you set a token on a webhook channel and the value came out empty —
+  most easily by pointing it at an environment variable that was exported empty or never given a
+  value — the channel accepted every request that reached it, whether or not it carried any
+  credential. It looked authenticated and was not.
+  flux now refuses to start such a channel and tells you which channel and what is wrong, rather
+  than opening the port. It refuses even when the channel only listens on your own machine, because
+  otherwise the mistake stays invisible until the day you expose it. A token that is only spaces
+  counts as empty.
+  **You may need to act:** if a webhook channel of yours currently has an empty or blank token, it
+  will now fail to start instead of running. That is deliberate — it was an open door — but it is a
+  startup failure, so set a real token before you upgrade.
+
+- **The limits you configure now actually apply when you run an app, and to the helpers it spawns.**
+  If you had set ceilings on how much work flux may do at once, two paths quietly ignored them:
+  running an app, and the reviewer helpers that an app's strict review starts. Those helpers ran with
+  no ceiling at all. Both now respect your settings, as do `flux review` and `flux record`. Each
+  helper gets its own budget rather than competing for a shared one, so a busy helper cannot starve
+  the others.
+  One deliberate exception: replaying a recorded test still ignores your limits. A replay is meant to
+  give the same answer on every machine, and letting local settings affect it would make the same
+  test pass on one computer and fail on another.
+
+### Action needed
+
+- **If a flow of yours uses the result of a web request as text, it needs updating.** The result is
+  now made of parts rather than one block, so somewhere you were using the whole answer as a string,
+  use `.body` for the content, `.status` for the code and `.headers` for the headers.
+  One rough edge to know about: most header names contain a hyphen — `content-type`, `x-request-id` —
+  and you cannot yet write `.headers.content-type`. Until that is fixed, reach those with
+  `pick({items: $resp.headers, keys: ["content-type"]})`.
+
 ## [0.42.0] - 2026-07-31
 
 ### New

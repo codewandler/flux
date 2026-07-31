@@ -1431,18 +1431,9 @@ pub async fn codex_exchange_and_store_at(
     )
 }
 
-/// Minimal percent-encoding for query values (alnum and `-._~` pass through).
+/// Percent-encoding for query values — the shared RFC 3986 encoder (C-303), not a local copy.
 fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+    flux_core::percent_encode_component(s)
 }
 
 // ---------------------------------------------------------------------------

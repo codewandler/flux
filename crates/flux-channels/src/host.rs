@@ -39,6 +39,23 @@ pub async fn serve(
         a2a_channels.push(Box::new(A2aChannel::from_decl_and_app(decl, &app).await?));
     }
 
+    // The one refusal `build_channels` structurally cannot make: whether a *tool* exists is a
+    // question about this App's registry, not about a declaration. A connector binding's reply
+    // operation is the case (D-216) — a channel that accepts deliveries and then cannot answer them
+    // is a channel that fails on its first real event, in production, at the vendor's timing. So it
+    // is asserted here, before any channel task is spawned and therefore before any port is bound.
+    for ch in channels.iter().chain(a2a_channels.iter()) {
+        if let Some(tool) = ch.required_tool() {
+            if app.registry().get(tool).is_none() {
+                anyhow::bail!(
+                    "channel `{}` needs the tool `{tool}` for its reply operation, and this host \
+                     has no such tool registered",
+                    ch.name()
+                );
+            }
+        }
+    }
+
     let deliverer: Arc<dyn Deliverer> = Arc::new(AppDeliverer::new(app));
 
     // Fire the one-shot startup event before any channel events, so `{on:"startup"}` triggers run first.

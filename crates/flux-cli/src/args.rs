@@ -937,6 +937,26 @@ pub(super) enum PluginAction {
         #[arg(long)]
         password: bool,
     },
+    /// Re-fetch a plugin's manifest and re-project its operations: `refresh <name>` (C-310).
+    ///
+    /// A plugin answers `manifest` over its live connection, so a plugin fronting a remote
+    /// deployment can advertise a different op set once the operator authenticates a provider
+    /// there (`flux auth login <name>`). This runs that second fetch against the same open
+    /// subprocess the load used and reports the catalog delta — which operations appeared, which
+    /// were withdrawn — so the operator can see the new surface before opening a session on it.
+    ///
+    /// A refresh changes the **operation set, never the grant**: the refreshed manifest may add and
+    /// remove operations freely, but the capabilities the operator granted at load stay in force in
+    /// both directions — a manifest asking for more is refused, and one asking for less is not
+    /// adopted (surrendering a capability in the declaration must not strip the authority an
+    /// operation is gated by while the capability is still granted). An operation that keeps its
+    /// name may not shed the scope it was gated under either. A refusal leaves the catalog exactly
+    /// as it was — so this doubles as the drift check on a plugin whose manifest is not stable
+    /// across two fetches.
+    Refresh {
+        /// Installed plugin name.
+        name: String,
+    },
     /// Inspect installed plugins — liveness + declared surface: `status [<name>]`.
     /// With no argument it summarizes every installed plugin; `ls` stays the terse default.
     Status {

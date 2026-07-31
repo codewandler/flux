@@ -1936,11 +1936,15 @@ fn host_matches(patterns: &[String], host: &str) -> bool {
 }
 
 mod loading;
+mod refresh;
 
 pub(crate) use loading::invalid_plugin_name;
 pub use loading::*;
 #[cfg(test)]
 use loading::{op_coherence_warnings, plugin_tool_spec, semantic_effect_tags};
+pub use refresh::CatalogRefresh;
+#[cfg(test)]
+use refresh::{capability_widenings, op_scope_weakenings};
 
 #[cfg(test)]
 mod tests {
@@ -2419,6 +2423,59 @@ mod tests {
         }
     }
 
+    /// C-309: the effect-less `[Process, Network]` default and `flux-runtime`'s authority contract
+    /// are two safety mechanisms that must not compose into an unsatisfiable requirement. The
+    /// contract refuses any tool declaring an effect it holds no matching access for, so before
+    /// this fix every effect-less op of a plugin without a `process` capability was **impossible to
+    /// load** — which is how `flux-sdk`'s fixture plugin sat red behind a feature no gate compiled.
+    ///
+    /// The fix is on the ACCESS side, and the direction matters: authority requirements derive from
+    /// `access`, not `effects` (`authority_requirements_from_declaration`), so relaxing the effects
+    /// default instead would have projected an op with neither — carrying no requirement at all and
+    /// skipping the authorization floor. Pin both halves here.
+    #[test]
+    fn every_plugin_op_projects_a_loadable_and_gated_authority_contract() {
+        let op = OperationSpec {
+            name: "pure".into(),
+            description: "declares no effects".into(),
+            ..Default::default()
+        };
+        let cases = [
+            ("nothing granted", PluginCapabilities::default()),
+            (
+                "http only",
+                PluginCapabilities {
+                    http: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "process only",
+                PluginCapabilities {
+                    process: vec!["kubectl".into()],
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (label, caps) in cases {
+            let (_, spec) = plugin_tool_spec("acme", &op, &caps);
+            let requirements =
+                flux_runtime::authority_requirements_from_declaration(&spec, &caps.process, &[])
+                    .unwrap_or_else(|err| {
+                        panic!("`{label}` must project a loadable authority contract: {err}")
+                    });
+            // Loadable is only half of it — an op that loads while requiring nothing would slip the
+            // floor, which is the failure mode the effects-side fix would have introduced.
+            assert!(
+                requirements
+                    .iter()
+                    .any(|req| req.action.0 == "process.exec"),
+                "`{label}` must still be gated on dispatching to its subprocess: {requirements:?}",
+            );
+        }
+    }
+
     /// C-191: a plugin's `effects` / `risk` / `idempotency` are authored outside this repo and are
     /// then trusted verbatim by every approval gate. A manifest that declares a mutating operation
     /// while keeping the read-only risk class is named at load.
@@ -2457,9 +2514,9 @@ mod tests {
     }
 
     /// The projection is what gets checked, not the raw manifest — `access` comes from the
-    /// *plugin's* capabilities and an op that declares no effects is defaulted to
-    /// `[Process, Network]`. Both are properties of `plugin_tool_spec`, so this pins that the
-    /// coherence pass sees them (C-191).
+    /// *plugin's* capabilities plus the unconditional `Process` every plugin op carries (C-309),
+    /// and an op that declares no effects is defaulted to `[Process, Network]`. Both are
+    /// properties of `plugin_tool_spec`, so this pins that the coherence pass sees them (C-191).
     #[test]
     fn plugin_coherence_reads_the_projected_spec_not_the_raw_declaration() {
         // Declares nothing: `plugin_tool_spec` defaults it to `[Process, Network]`, which is
@@ -2519,6 +2576,250 @@ mod tests {
             ..Default::default()
         };
         assert!(op_coherence_warnings(&manifest).is_empty());
+    }
+
+    // --- C-310 refresh guards ---------------------------------------------------------------
+
+    /// The load-time grant every `capability_widenings` case below is measured against — one
+    /// non-empty entry in each family so a widening is expressible everywhere.
+    fn granted_capabilities() -> PluginCapabilities {
+        PluginCapabilities {
+            process: vec!["kubectl get".into()],
+            secrets: vec!["API_TOKEN".into()],
+            http: true,
+            http_hosts: vec!["api.example.com".into()],
+            private_hosts: vec!["internal.example.com".into()],
+            conn: vec!["tcp:db.example.com:5432".into()],
+            fs: vec![flux_plugin_protocol::FsReadScope {
+                path: "~/.aws/config".into(),
+                secret: false,
+            }],
+            ..PluginCapabilities::default()
+        }
+    }
+
+    /// A refresh that restates the grant verbatim is not a widening — the common case, where only
+    /// the op set moved.
+    #[test]
+    fn an_unchanged_capability_set_is_not_a_widening() {
+        assert!(capability_widenings(&granted_capabilities(), &granted_capabilities()).is_empty());
+    }
+
+    /// Every capability family the plugin host gates on, widened one at a time. Each must be caught
+    /// and each must name itself — an unnamed refusal is one an operator cannot act on.
+    ///
+    /// The cases below are built with `..granted.clone()`, which would keep compiling if an
+    /// eleventh field were added to [`PluginCapabilities`], so the destructure at the end of this
+    /// test is what actually reds the build — deliberately mirroring the one in
+    /// `capability_widenings` itself.
+    #[test]
+    fn every_capability_family_is_checked_for_widening() {
+        let granted = granted_capabilities();
+        let cases: Vec<(&str, PluginCapabilities)> = vec![
+            (
+                "process",
+                PluginCapabilities {
+                    // Broadening the argv prefix: `kubectl` admits `kubectl delete …`.
+                    process: vec!["kubectl".into()],
+                    ..granted.clone()
+                },
+            ),
+            (
+                "secrets",
+                PluginCapabilities {
+                    secrets: vec!["API_TOKEN".into(), "DEPLOY_KEY".into()],
+                    ..granted.clone()
+                },
+            ),
+            (
+                "http_hosts",
+                PluginCapabilities {
+                    http_hosts: vec!["api.example.com".into(), "*.attacker.test".into()],
+                    ..granted.clone()
+                },
+            ),
+            (
+                "private_hosts",
+                PluginCapabilities {
+                    private_hosts: vec!["10.0.0.1".into()],
+                    ..granted.clone()
+                },
+            ),
+            (
+                "conn",
+                PluginCapabilities {
+                    conn: vec!["tcp:*:5432".into()],
+                    ..granted.clone()
+                },
+            ),
+            (
+                "fs",
+                PluginCapabilities {
+                    fs: vec![flux_plugin_protocol::FsReadScope {
+                        path: "~/.ssh/**".into(),
+                        secret: false,
+                    }],
+                    ..granted.clone()
+                },
+            ),
+            (
+                "blob",
+                PluginCapabilities {
+                    blob: true,
+                    ..granted.clone()
+                },
+            ),
+            (
+                "discover",
+                PluginCapabilities {
+                    discover: true,
+                    ..granted.clone()
+                },
+            ),
+            (
+                "credential",
+                PluginCapabilities {
+                    credential: true,
+                    ..granted.clone()
+                },
+            ),
+        ];
+        for (family, refreshed) in cases {
+            let widenings = capability_widenings(&granted, &refreshed);
+            assert!(
+                widenings.iter().any(|w| w.contains(family)),
+                "widening `{family}` must be refused and named; got {widenings:?}"
+            );
+        }
+        // `http` is already granted here, so prove the false→true flip separately.
+        let http_off = PluginCapabilities {
+            http: false,
+            ..granted.clone()
+        };
+        assert!(capability_widenings(&http_off, &granted)
+            .iter()
+            .any(|w| w.contains("http")));
+
+        // The exhaustiveness anchor. Adding a field to `PluginCapabilities` reds HERE, which is the
+        // prompt to add a case to `cases` above — the `..granted.clone()` spread would otherwise
+        // absorb a new authority family in silence.
+        let PluginCapabilities {
+            process: _,
+            secrets: _,
+            http: _,
+            http_hosts: _,
+            private_hosts: _,
+            conn: _,
+            blob: _,
+            discover: _,
+            credential: _,
+            fs: _,
+        } = granted;
+    }
+
+    /// Turning a granted `fs` scope's `secret` flag off would stop its contents being registered
+    /// with the Redactor — a widening of what can leak, not a narrowing.
+    #[test]
+    fn dropping_an_fs_scopes_secret_flag_is_a_widening() {
+        let granted = PluginCapabilities {
+            fs: vec![flux_plugin_protocol::FsReadScope {
+                path: "~/.aws/sso/cache/**".into(),
+                secret: true,
+            }],
+            ..PluginCapabilities::default()
+        };
+        let refreshed = PluginCapabilities {
+            fs: vec![flux_plugin_protocol::FsReadScope {
+                path: "~/.aws/sso/cache/**".into(),
+                secret: false,
+            }],
+            ..PluginCapabilities::default()
+        };
+        assert!(!capability_widenings(&granted, &refreshed).is_empty());
+    }
+
+    /// Giving a capability *back* is always allowed — the refusal is one-directional.
+    #[test]
+    fn surrendering_capabilities_is_never_a_widening() {
+        assert!(
+            capability_widenings(&granted_capabilities(), &PluginCapabilities::default())
+                .is_empty()
+        );
+    }
+
+    /// An operation keeping its name may not shed the scope it was gated under. Each of these is
+    /// a way the same `permission_subjects` string would come to mean something laxer.
+    #[test]
+    fn a_retained_op_may_not_weaken_its_gating_scope() {
+        let caps = granted_capabilities();
+        let granted_op = OperationSpec {
+            name: "deploy".into(),
+            description: "roll out".into(),
+            effects: vec![Effect::Write, Effect::Process],
+            risk: Some(Risk::Destructive),
+            secret_purposes: vec!["api_token".into()],
+            process: vec!["kubectl get".into()],
+            ..Default::default()
+        };
+
+        let weaker = |op: OperationSpec| op_scope_weakenings("acme", &caps, &granted_op, &op);
+
+        assert!(
+            weaker(OperationSpec {
+                risk: Some(Risk::Low),
+                ..granted_op.clone()
+            })
+            .iter()
+            .any(|w| w.contains("risk")),
+            "a risk downgrade under a stable name"
+        );
+        assert!(
+            weaker(OperationSpec {
+                effects: vec![Effect::Read],
+                ..granted_op.clone()
+            })
+            .iter()
+            .any(|w| w.contains("effect")),
+            "shedding a declared effect"
+        );
+        assert!(
+            weaker(OperationSpec {
+                secret_purposes: Vec::new(),
+                ..granted_op.clone()
+            })
+            .iter()
+            .any(|w| w.contains("secret purpose")),
+            "shedding a declared secret purpose"
+        );
+        assert!(
+            weaker(OperationSpec {
+                process: Vec::new(),
+                ..granted_op.clone()
+            })
+            .iter()
+            .any(|w| w.contains("process")),
+            "dropping the per-op process narrowing widens it to the manifest grant"
+        );
+        assert!(
+            weaker(OperationSpec {
+                public_name: Some("acme.deploy".into()),
+                name: "deploy_v2".into(),
+                ..granted_op.clone()
+            })
+            .iter()
+            .any(|w| w.contains("dispatches to")),
+            "re-pointing the dispatch identity behind a stable public name"
+        );
+
+        // The identity case, and the two legitimate directions: tightening the tier, and narrowing
+        // the per-op process grant further.
+        assert!(weaker(granted_op.clone()).is_empty());
+        assert!(weaker(OperationSpec {
+            process: vec!["kubectl get".into()],
+            risk: Some(Risk::Destructive),
+            ..granted_op.clone()
+        })
+        .is_empty());
     }
 
     #[test]
