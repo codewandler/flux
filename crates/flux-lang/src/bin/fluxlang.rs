@@ -299,7 +299,13 @@ mod tests {
     fn rail_reports_the_existing_parser_diagnostics() {
         // Malformed source must fail with the same diagnostic `compile` reports — one parse entry,
         // one error vocabulary.
-        let bad = "flow x\n  confirm \"y\", risk: high\n";
+        //
+        // The fixture is malformed **lexically** (an unterminated string literal), deliberately: the
+        // previous one spelled a statement the parser rejected at the time (`confirm "y", risk:
+        // high`), and L-96 then made that exact spelling canonical — so the fixture quietly became
+        // valid and this test's `expect_err` started panicking (C-308). A vocabulary the language
+        // can never grow into keeps the fixture malformed across syntax work.
+        let bad = "flow x\n  confirm \"y\n";
         let rail = rail_src(bad)
             .expect_err("malformed flux must not render")
             .to_string();

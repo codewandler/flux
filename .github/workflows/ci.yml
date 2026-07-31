@@ -71,6 +71,15 @@ jobs:
       - name: Architecture layering + test sandbox-posture lints
         run: cargo test -p flux-codegate
 
+      # C-308: `cargo test --workspace` above builds every member with its DEFAULT features, so a
+      # target behind a non-default one is invisible to it — and a test no gate exercises is a test
+      # that does not exist. `codewandler-flux-lang/cli`'s `fluxlang` tests were red on main for as
+      # long as it took someone to run that crate's documented dev loop by hand, while this job
+      # reported green. The script runs those legs AND fails when a newly-declared feature (in either
+      # workspace) has no stated disposition, so the hole cannot silently reopen.
+      - name: Feature-gated test targets the default workspace build never compiles
+        run: ./scripts/check-feature-gated-tests.sh
+
       # Hermetic drift guard for the live smoke gate (C-39): re-runs steps 1-5's invocation *shapes*
       # from scripts/smoke-live.sh against the offline `mock` provider — no credentials, no live
       # spend — so a future CLI-surface change (renamed subcommand, dropped flag) fails here instead

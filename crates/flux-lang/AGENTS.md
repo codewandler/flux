@@ -58,6 +58,18 @@ cargo fmt --all
 The `fluxlang` binary is gated behind the `cli` feature (so library consumers don't pull `clap`); build
 or test it with `--features cli`.
 
+⚠ **`cargo test --workspace` does not reach the `--features cli` line above** — no workspace member
+enables the feature, so the whole `fluxlang` test target is invisible to the default gate. That is
+how C-308 happened: L-96 made `confirm "y", risk: high` canonical, a `fluxlang` test using it as
+*malformed* input started panicking, and every gate stayed green for days. Since C-308 the CI `check`
+job runs `scripts/check-feature-gated-tests.sh`, which owns this leg (and the other feature-gated
+targets in both workspaces) — so a break here reds CI now. Keep the `--features cli` line in your
+local loop anyway: it is the fast feedback, CI is the backstop.
+
+**Fixtures that must stay malformed must be malformed *lexically*.** The vocabulary of valid
+statements grows; an unterminated string literal never becomes valid. A fixture that is only "a
+spelling the parser happens to reject today" is a fixture the next syntax story silently invalidates.
+
 ## Design & planning docs
 
 The full map of flux-lang design / spec / plan docs — read the relevant one before changing behaviour,
