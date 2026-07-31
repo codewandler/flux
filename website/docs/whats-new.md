@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.41.1] - 2026-07-31
+
 ### Fixed
 
 - **The Zendesk example's setup instructions no longer describe software that does not exist.** The

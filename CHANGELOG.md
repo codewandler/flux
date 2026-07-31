@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-07-31
+
 ### Changed
 
 - **The Zendesk reference flow is served by the flux-connectors Tool pack, and its operation set is now
