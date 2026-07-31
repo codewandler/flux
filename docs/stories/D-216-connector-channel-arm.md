@@ -2,7 +2,7 @@
 id: D-216
 title: "`build_channels` gains one `connector` arm — a manifest binding, with every rule a load error"
 pillar: Agent
-status: backlog
+status: blocked
 epic: connector-channels
 note: "the arm itself: resolve ~/.flux/connectors/<name>.connector.toml through flux_system, load the named binding, and refuse EVERYTHING refusable before a port is bound — a manifest is a published artifact and a published artifact can be edited after publication"
 ---
@@ -78,7 +78,33 @@ This is the foundation of the epic. D-217 … D-220 all layer on the channel thi
 
 ## Progress
 
-- (not started)
+- **Blocked on a dependency edge, not on the design.** `~/.flux/connectors/<name>.connector.toml` is
+  TOML (confirmed against the producing repository's emitter,
+  `../flux-connectors/crates/connector-cli/src/seam.rs` → `fn manifest`, and against the one shipped
+  manifest that carries bindings, `../flux-connectors/connectors/slack.connector.toml`). `toml` is a
+  **workspace** dependency already (root `Cargo.toml:152`, `toml = "1.1"`; used by flux-credentials,
+  flux-config, flux-secret, flux-capabilities, flux-eval, flux-cli, flux-plugin, flux-sdk) but is
+  **not** a dependency of `flux-channels` (`cargo tree -p flux-channels -e normal --depth 1`), and
+  nothing already in that crate's graph re-exports it (`grep -rn "pub use toml"` → no hits;
+  `flux_system` has no TOML reader). So the arm cannot parse the manifest without adding
+  `toml.workspace = true` to `crates/flux-channels/Cargo.toml`, which also rewrites `Cargo.lock`.
+  Both are shared-ledger files. **The unblock is that one line** — this story must run solo, or
+  behind a dependency-only change that lands first.
+- **The failing-first test is landed and red by construction**:
+  `crates/flux-channels/tests/connector_channel.rs::unverified_webhook_binding_is_refused_at_load`,
+  with its fixture at `crates/flux-channels/tests/fixtures/connectors/acme-unverified.connector.toml`
+  (a webhook binding with the `[channels.verification]` table deliberately deleted — the shape the
+  producing repository cannot emit, and therefore exactly the post-publication edit this arm exists
+  to refuse). At `5c75873` it fails with
+  `unknown channel kind \`connector\` for channel \`support\``. **This branch's gate is red on that
+  one test until the arm lands**; nothing else was implemented.
+- Not attempted, and deliberately so: a hand-rolled TOML subset parser. The whole load-bearing
+  requirement here is that the manifest is untrusted input; meeting it with a bespoke parser written
+  to dodge a dependency edge would trade the refusal this story adds for a parser bug.
+- Re-verified `## Context` against the tree at `5c75873`: the closed `match` is now
+  `crates/flux-channels/src/adapters/mod.rs:48` (was `:46`), the unknown-kind bail `:66` (was `:63`),
+  the `a2a` comment `:63-65` (was `:62`), the secret refusal `:41-47` (was `:39-45`) and its test
+  `:78` (was `:75`). Symbols are unchanged; only line numbers moved.
 
 ## Notes
 
