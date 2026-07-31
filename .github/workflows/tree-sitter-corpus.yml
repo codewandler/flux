@@ -1,0 +1,78 @@
+name: tree-sitter-corpus
+
+# C-334: the grammar revision `.helix/languages.toml` PINS must parse every canonical `examples/*.flux`
+# with no ERROR and no MISSING node. `AGENTS.md` concedes that editor-tooling mirrors are manual and
+# that only ONE of the four is guarded — and the guarded one (the website's Prism grammar) is the only
+# one that CANNOT break parsing. This is the first check on any of the three that can.
+#
+# WHY ITS OWN WORKFLOW RATHER THAN A JOB IN `ci.yml`. The check fetches the grammar from GitHub and
+# downloads the tree-sitter CLI from a release asset, so it cannot be a PR gate: a network hiccup
+# would block unrelated work. `ci.yml` triggers on `push`+`pull_request` and nothing else, so making
+# this nightly from inside it would mean adding `schedule:` to `ci.yml`'s own `on:` block — which
+# re-triggers all NINE of its jobs every night. A job-level `if:` can stop this job running on a PR;
+# it cannot un-trigger the other eight at 03:17. Declaring the trigger here says "not a PR gate" in
+# the one place a reader looks for it, and matches what `adversarial-assurance.yml` already does for
+# its weekly lane.
+#
+# Deliberately NOT triggered on version tags either, and that is not caution — this lane is RED THE
+# DAY IT LANDS, and a red release-tag trigger would fail a cut over a defect in a different
+# repository that no cut can fix.
+#
+# ⚠ WHY IT IS RED, and why that is the finding rather than a reason to weaken it. At the pin this
+# lands with (`9ea9890`), 7 of the 15 canonical examples do not parse. The C-301 duration fix and the
+# L-96 / `permissions` improvements DID arrive with this pin — `zendesk.triage.flux` is clean now and
+# was not at `29cff6c` — but the grammar has never supported several constructs the corpus has used
+# all along: bare-identifier binds (`src = grep(...)`, not just `$src = ...`), typed binds
+# (`need: Need = ...`), `ctx` blocks, `+=`, and a `goal "..."` line at column 0 under a `flow` header
+# (which alone cascades to 73 defects in `release.flux`).
+#
+# Nobody knew, and the reason is exactly the one C-334 forbids repeating: the grammar repo has its
+# OWN 3-file `examples/` corpus, and its CI parses that one. Measured at this same rev, that corpus
+# is 100% clean while flux's is 47% broken. A second corpus did not merely permit the drift — it
+# certified it. So the fix is upstream in `codewandler/flux-tree-sitter`, followed by moving the pin;
+# an allowlist here would silence half the corpus and re-create the blind spot in a new place.
+#
+# Nightly-only means a standing red blocks nobody's push, PR or cut while that work is owed.
+#
+# `timeout-minutes` is set. No job in `ci.yml` sets one — the check clones a repo and runs `npm
+# install`, both of which hang rather than fail when a network path goes bad, and an unbounded
+# scheduled job burns a runner for six hours before anyone notices.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  corpus:
+    name: the pinned tree-sitter rev parses every canonical example
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # `node`/`npm` ship with the runner image; the script exits 2 (skip) if they are missing, and a
+      # skip in the ONE lane that runs this check would be a silent hole. Assert them here so their
+      # absence is a loud failure in this workflow instead of a quiet pass.
+      - name: The runner has the toolchain this check needs
+        run: |
+          node --version
+          npm --version
+          cc --version | head -1
+
+      - name: The pinned grammar parses examples/*.flux with no ERROR or MISSING nodes
+        run: |
+          # Live GitHub + npm state, not this tree's — see the script header for why exit 2 (the
+          # grammar or the CLI could not be obtained) is a logged skip rather than a failure.
+          set +e
+          ./scripts/check-tree-sitter-corpus.sh --self-test && ./scripts/check-tree-sitter-corpus.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::tree-sitter corpus check skipped — the pinned grammar or the tree-sitter CLI was unobtainable"
+            exit 0
+          fi
+          exit "$status"
