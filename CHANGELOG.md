@@ -8,6 +8,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The `pane.*` ops — an agent can open, update and close its own panes (C-223, partial).**
+  `pane.open`/`pane.update`/`pane.close` land in `flux-tools`, surfaced by **sink presence at assembly
+  time** rather than by a signal-gated `ToolGroup` — there is no `project.signal` for "a human is
+  watching a terminal", and the evidence for a pane channel is the channel itself. The seam is
+  `try_register_surface_ops(registry, surface_sink_installed)` and it is **fail-closed**: with no
+  `SurfaceSink` it registers nothing, so a headless `flux run`, `flux-server` or SDK embedding never
+  advertises a pane op. They are deliberately kept out of the built-in pack, because a registered op
+  with no group is advertised unconditionally — which would surface them everywhere.
+  **Partial, and honestly so.** `pane.list` is not shipped: `SurfaceSink` is send-only by design and
+  the tool may not hold pane state, so a listing would confidently report panes the surface had
+  already dropped. That needs a contract decision, now tracked as C-306. And the vocabulary is
+  **inert** until `run_tui` installs the TUI's sink — a build-order change tracked as C-305. Nothing
+  advertises these ops yet.
+
 - **Harness transcripts yield messages, not just token counts (C-214).** All three external usage
   parsers already descended to the object holding the message body and took only `usage` and `model`
   out of it — the text they walked past is what a cross-harness history search needs. `HarnessMessage`

@@ -2,7 +2,7 @@
 id: C-223
 title: The pane.* ops — open, update, close, list, surfaced by sink presence at assembly time
 pillar: Core
-status: in-progress
+status: blocked
 priority: 14
 epic: agent-authored-surface
 design: docs/designs/agent-authored-surface.md
@@ -100,3 +100,25 @@ story that makes the surface reachable — and it lands only after the contract 
   prompt.
 - **Do not add a `surface` `ToolGroup`.** It reads like the obvious mechanism and it is the wrong one
   — see the note field and the design's *Surfacing, not gating*.
+
+- 2026-07-31 — **integrated as PARTIAL and parked on one contract question.** Three of four ops
+  (`pane.open`/`update`/`close`) are merged with the gate green, and both catalog-mirror guards were
+  proven to bite by deleting the rows and watching them fail. What landed is the *fail-closed
+  surfacing seam*: `try_register_surface_ops(registry, surface_sink_installed)` — `false` registers
+  nothing, so a headless `flux run`, `flux-server` or SDK embedding never advertises a `pane.*` op.
+  **The one deviation worth reviewing:** the ops are deliberately **not** in `try_register_builtins`.
+  A registered op with no `group` is advertised unconditionally, so putting them in the built-in pack
+  would surface them in every headless catalog — exactly what Acceptance item 3 forbids. Conditional
+  registration at assembly is the only seam that fails closed.
+  **Two items are split out rather than left implied:**
+  - `pane.list` is **not** shipped, and is not a shortfall. `SurfaceSink` is send-only by design
+    (C-220) and the tool may not hold pane state, so a listing would report panes the surface has
+    already dropped (turn expiry, `/resume`, the `MAX_PANES` cap). That needs a change to C-220's
+    contract — a design decision, now owned by **[C-306](C-306-pane-read-back-contract.md)**. This
+    story stays `blocked` on it.
+  - The vocabulary is **inert** until `run_tui` installs the TUI's sink, which is a build-order change
+    rather than an extra argument and was outside this story's fence. Owned by
+    **[C-305](C-305-run-tui-installs-the-surface-sink.md)**, which is `ready` and not blocked.
+  ⚠ `Conditional` idempotency is load-bearing: flipping it to `Idempotent` puts these ops in the
+  dispatcher's op cache, and a cached hit returns *without executing*, so the surface would silently
+  never see a repeated update.
