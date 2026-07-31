@@ -2,8 +2,7 @@
 id: C-319
 title: "`strict_review.rs` reds when the working tree is dirty, and it looks exactly like a real regression"
 pillar: Core
-status: in-progress
-priority: 7
+status: done
 areas: [flux-sdk]
 note: "found by C-304's implementor, which lost real time chasing it — examples/strict_review.flux interpolates the live `git status` and `git diff` into a sub-agent prompt, so past some diff size detect_intent's result truncates into invalid JSON and the loop dies on a field access error"
 ---

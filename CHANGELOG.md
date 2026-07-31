@@ -176,6 +176,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **`strict_review.rs` no longer reds because the developer's working tree is dirty** (C-319). It
+  drove a flow that interpolated the **live** `git status` and `git diff` of whatever checkout it ran
+  in into a reviewer sub-agent's prompt, so its verdict depended on the tree around it. It passed
+  against a clean tree and passed the committed gate — and fired for an implementor running the gate
+  with a large uncommitted diff, which is exactly when the cost is highest, because the error named a
+  flux-lang field access and read like a real regression in their own story. It cost at least two
+  implementors real time before it was filed.
+
+  **The story's stated cause was wrong, and the implementor refuted it rather than implementing
+  against it.** There is no truncation threshold: `trim_tool_output` is the only truncator in the
+  tree and applies solely to the *transcript view*, never to the canonical value `$intent` binds, and
+  `detect_intent` returns a JSON object even when its stage fails. Confirmed independently at
+  `FLUX_TOOL_OUTPUT_CAP=100` against a 34 609-char fixture — 346× over cap — with the verbatim prompt
+  assertions still green. So the test owned the defect, not the runtime.
+
+  Repository reads are pinned at the op seam, and the pinned diff deliberately stays larger than the
+  output cap so every run still exercises the over-cap path. `examples/strict_review.flux` is
+  unchanged: reading the live tree is precisely what `flux review` is *for*. The census this required
+  turned up two further live-state hazards, filed as C-326 and C-327, and one that could not be
+  generalised here — `flux-app`'s `strict_review_journey` has the same defect and no seam to pin it.
+
 - **⚠ Security: an empty shared secret was functionally `Open`, and bound a public listener**
   (C-321). The third and worst instance of the bypass D-216 and C-317 each closed in their own
   adapter — the only one that ends at a public port rather than a single channel.
