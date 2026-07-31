@@ -41,10 +41,18 @@ change and the flow structure is not**. This is that change.
       `tenants/<tenant>/<authority>/<credential>` address to resolve and the pack answers
       `NoCredentialAddress` at `execute` — only 7 shipped connectors declare one (C-37);
       (2) `base_url` is `https://{subdomain}.zendesk.com` and the pack does not resolve config, so
-      the built URL carries the placeholder verbatim (C-86/C-68; confirmed by that repo's
-      `tests/request.rs`, which asserts exactly that URL). Both **refuse** rather than sending a
-      broken request, so the failure is diagnosable. The header was therefore *rewritten to name
-      these two gaps* rather than removed.
+      the built URL carries the placeholder verbatim (confirmed by that repo's `tests/request.rs`,
+      which asserts exactly that URL). Both **refuse** rather than sending a broken request, so the
+      failure is diagnosable. The header was therefore *rewritten to name these two gaps* rather than
+      removed.
+      **Correction, 2026-07-31 (audit):** this bullet first attributed (2) to C-86/C-68. That was
+      wrong. The `[[config]]` binding is **already declared** (`providers/zendesk.toml`, `subdomain`
+      → `endpoint.subdomain`) and C-86's relevant acceptance is `[x]`. The live chain is **C-87**,
+      which publishes `[[config]]` into `catalog.json` — the pack's only input, which today carries no
+      `config` key — followed by a pack that applies it at install, which **no story in either repo
+      owns**. Counts also corrected: 7 of **41** providers declare an `authority` (not "2 of 19"), and
+      **43 of 232** operations carry a templated host (not "27 of 105"); the pack's own module docs at
+      `crates/connector-pack/src/lib.rs:98-108` are ~2× stale and were the source of the bad figures.
 - [x] **The flow's structure is unchanged** — and so are the names. The premise that "the op names
       are the part expected to change" turned out **false**: the pack projects `zendesk-test` to
       `zendesk.test` and `zendesk-ticket-comment-list` to `zendesk.ticket.comment.list`, which is

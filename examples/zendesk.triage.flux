@@ -20,10 +20,14 @@
 # neither of which is a missing credential:
 #   1. `providers/zendesk.toml` declares no `authority`, so the pack has no address to look a
 #      credential up at and refuses with `NoCredentialAddress` rather than sending an
-#      unauthenticated request. Only 7 of the shipped connectors declare one (flux-connectors C-37).
+#      unauthenticated request. Only 7 of the 41 shipped connectors declare one (flux-connectors
+#      C-92, under C-37's addressing scheme).
 #   2. Zendesk's `base_url` is `https://{subdomain}.zendesk.com` and the pack does not yet resolve
 #      config, so the request URL carries `{subdomain}` verbatim — a host that does not resolve
-#      (flux-connectors C-86/C-68). 27 of 105 shipped operations share this.
+#      43 of 232 shipped operations share this. The binding itself is already DECLARED in
+#      `providers/zendesk.toml` ([[config]] `subdomain` -> `endpoint.subdomain`); what is missing is
+#      publishing it into the catalogue the pack reads (flux-connectors C-87) and then a pack that
+#      applies it, which no story yet owns.
 # Every entrypoint therefore still fails at its first call, but it now fails in a named, fixable
 # place instead of at an operation nothing serves.
 #

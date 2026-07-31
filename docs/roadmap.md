@@ -199,7 +199,7 @@ are evidence snapshots, not acceptance criteria. Bus factor and an external comm
 recorded as residual **governance** risks rather than fictional code stories.
 Design: [adversarial-review-remediation-2026-07-30.md](designs/adversarial-review-remediation-2026-07-30.md).
 
-### Zendesk automation — deterministic support workflows with bounded AI (epic) — 🔄 **IN PROGRESS (D-199; L-92 + A-136 shipped, plugin WITHDRAWN — D-200/D-201/D-202 await the flux-connectors interop)**
+### Zendesk automation — deterministic support workflows with bounded AI (epic) — 🔄 **IN PROGRESS (D-199; L-92 + A-136 + D-214 shipped, plugin WITHDRAWN, D-200/D-201/D-202 CLOSED as superseded — one bullet open, owned by another repository)**
 
 The first complete reference for deterministic third-party automation in Flux-Lang, and a deliberate
 demonstration of the vision's hard line: **the model reads evidence and never writes**.
