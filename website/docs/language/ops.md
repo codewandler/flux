@@ -44,7 +44,7 @@ policy.
 | `web.fetch` | `url[, raw]` | medium | Read a URL as a document: HTML becomes condensed Markdown, PDFs become extracted text; `raw` preserves the body |
 | `web.crawl` | `url[, max_pages, max_depth, max_total_bytes]` | medium | Crawl a small site or section: from a seed, follow same-host links breadth-first (bounded by `max_pages`/`max_depth`, and optionally a total-content `max_total_bytes` budget that stops the crawl early), returning each page as condensed Markdown |
 | `html_to_markdown` | `html` | low | Pure conversion of an HTML string to condensed Markdown; no network access |
-| `http.request` | `url[, method, headers, body, timeout]` | medium, approval | Arbitrary HTTP request with capped response body; non-2xx remains a result |
+| `http.request` | `url[, method, query, headers, body, timeout]` | medium, approval | Arbitrary HTTP request with capped response body; non-2xx remains a result. Pass parameters as the `query` record — each value is percent-encoded, so a value carrying `&` or `=` cannot add a parameter |
 | `browser.open` | `[url]` | medium, approval | Start a headless-Chromium session and return a non-visual page digest |
 | `browser.goto` | `session, url` | medium, approval | Navigate an existing browser session and return a delta |
 | `browser.snapshot` | `session[, view]` | low | Re-observe a session (`full`, `actions`, or `content`) |

