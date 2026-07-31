@@ -2,7 +2,7 @@
 id: C-317
 title: "An empty bearer token authenticates every request on a webhook channel's public port"
 pillar: Core
-status: ready
+status: in-progress
 priority: 1
 areas: [flux-channels]
 note: "LIVE ON MAIN — found by D-216's review in the new connector arm, where it is being fixed; the identical hole is pre-existing in the webhook adapter. `constant_time_eq(b\"\", b\"\")` is true, and the non-loopback guard only tests is_none(), so a request with no Authorization header at all authenticates"
@@ -37,20 +37,20 @@ bind. The webhook adapter has neither half.
 
 ## Acceptance
 
-- [ ] **Failing-first, two tests, and they must be separate.** One proves a request with no
+- [x] **Failing-first, two tests, and they must be separate.** One proves a request with no
       `Authorization` header is rejected by a channel configured with an empty token. One proves the
       channel with an empty token **refuses to bind** on a non-loopback address in the first place.
       Both halves exist in `flux-server`'s precedent and both are needed: the comparison fix alone
       still leaves an operator believing an empty token is a token.
-- [ ] The set-but-empty environment variable path is covered — `token secret "K"` with `K=""` — not
+- [x] The set-but-empty environment variable path is covered — `token secret "K"` with `K=""` — not
       only the literal `token ""`. That is the spelling an operator reaches by accident.
-- [ ] Decide whether an empty token is a **load error** or is normalised to `None` and then refused
+- [x] Decide whether an empty token is a **load error** or is normalised to `None` and then refused
       by the existing no-token rule. Either is defensible; say which and why. A load error is more in
       keeping with the channels' "refuse everything refusable before a port is bound" thesis.
-- [ ] Grep every other `constant_time_eq` / bearer comparison in the tree and account for each one.
+- [x] Grep every other `constant_time_eq` / bearer comparison in the tree and account for each one.
       This story exists because the same mistake was made twice independently; a third instance is
       more likely than not.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
 
 ## Notes
 
@@ -64,3 +64,34 @@ bind. The webhook adapter has neither half.
 - `constant_time_eq` itself is **not** at fault and should not be changed: it is a correct pure
   comparison with a length pre-check. Two empty strings genuinely are equal. The defect is that an
   empty expected-token was ever allowed to reach it.
+
+## Progress
+
+Fixed in `crates/flux-channels/src/adapters/webhook.rs`, mirroring D-216's landed connector fix.
+
+**Load error, not normalisation to `None`.** An empty token is refused in `from_decl` — and refused
+on a **loopback** bind too. Normalising to `None` would be silent: on loopback it is not even an
+error, so the operator ships a channel they believe is authenticated, one `addr` edit away from
+being public. Refusing says the thing that is wrong, at the moment it is fixable. This matches the
+connector arm exactly (`connector.rs:647-655`), so the two adapters do not drift. `trim().is_empty()`,
+so `" "` and `"\t\n"` count as empty.
+
+**Two halves, independently attributable.** The comparison moved into a standalone
+`fn authorized(expected: Option<&str>, headers: &HeaderMap) -> bool` that returns `false` on an
+empty expected token *before* comparing. Extraction is what makes the halves testable apart: once
+the constructor makes `Some("")` unreachable, a test routed through `from_decl` can only cover one
+of them. Verified by disabling each condition alone — with only `authorized`'s empty check disabled
+the request test reds and the bind tests stay green; with only the load-time refusal disabled the
+bind tests red and the request test stays green.
+
+`constant_time_eq` was left untouched, as the story directs.
+
+**A third instance exists and is NOT fixed here** (out of this story's fence — it is in
+`flux-server`, not `flux-channels`, and warrants its own story + review):
+`crates/flux-channels/src/adapters/a2a.rs:92` passes the `[a2a]` channel's `token` straight into
+`flux_server::ServerAuth::shared_secret` with **no empty filter**, unlike the two CLI producers
+(`flux-cli/src/app_cmd.rs:486-488` and `:671-673`, which both spell `.filter(|t| !t.is_empty())`).
+`ServerAuth::shared_secret` (`flux-server/src/lib.rs:89-95`) is a bare `match`, so `Some("")` becomes
+`SharedSecret { secret: "" }`; the compare at `flux-server/src/lib.rs:1155` has no empty guard; and
+`guard_open_bind` (`:520`) keys on `ServerAuth::Open` only, so `SharedSecret { secret: "" }` binds
+`0.0.0.0` unchallenged. Same bypass, same auto-approving daemon.
