@@ -2,7 +2,7 @@
 id: D-204
 title: A Room port — presence, occupants and attributed text as a channel kind
 pillar: Agent
-status: in-progress
+status: done
 priority: 24
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md

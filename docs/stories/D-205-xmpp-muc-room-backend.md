@@ -39,6 +39,26 @@ backend and the one CI runs; D-206 layers vendor token acquisition on top of the
   "Feasibility" section for the exact frames)
 
 ## Notes
+
+- ⚠ **Two latent defects in D-204's port become REACHABLE the moment this story lands a real backend.**
+  Both were found by D-204's independent review, are unreachable today only because `MockRoom` is
+  infallible and is the sole registered backend, and are therefore this story's to handle:
+  1. **A failed send leaves the room un-left and tears the host down.**
+     `crates/flux-channels/src/rooms/driver.rs` does `self.room.say(&line).await?` / `whisper(...)?`,
+     which returns early and skips `self.room.leave()`. Combined with `flux-channels/src/host.rs`
+     ("until a channel *errors* (fatal)"), one failed send on a real backend is fatal to the host —
+     the opposite posture from the deliberately non-fatal delivery error in `adapters/room.rs`. Decide
+     the posture explicitly and test it.
+  2. **Self-echo suppression rests entirely on your backend.** `driver.rs` trusts `Occupant.is_self`,
+     and `Occupant::new` defaults it to `false` — so a backend built through `Occupant::new` rather
+     than a struct literal is *not* forced to decide. The driver holds `identity.nick` and never
+     cross-checks. A backend that omits `is_self` makes the agent answer its own messages in an
+     unbounded loop, which costs real provider money. MUC self-presence necessarily precedes our own
+     echo, so ordering is safe — the risk is omission, not timing. **Pin it with a test**; nothing in
+     the port forces it today.
+- `RoomSettings` fields are all `pub` and the type is re-exported, so adding credential fields here is
+  source-breaking for external literal construction. `flux-channels` is unpublished, so no released API
+  is affected — but consider `#[non_exhaustive]` as part of this story rather than later.
 - Proven live 2026-07-30: `<open/>` → SASL `ANONYMOUS` → `<open/>` → bind → MUC presence → `groupchat`.
   Only `ANONYMOUS` is offered on JaaS; `PLAIN` with the JWT as password is refused `<invalid-mechanism/>`.
 - Prefer an existing Rust XMPP crate over hand-rolling the parser, but keep the surface to what `Room`

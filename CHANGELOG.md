@@ -6,6 +6,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A `Room` port — flux can be one participant among several, not just one end of a 1:1 (D-204).** Every
+  channel flux had was 1:1 or fire-and-forget: `schedule`/`webhook`/`slack`/`a2a` wake a journey and
+  return, and the voice path assumed exactly one caller. `crates/flux-channels/src/rooms/` adds `Room`
+  (`join`/`occupants`/`say`/`whisper`/`leave`), a `RoomEvent` stream (`Joined`/`Left`/`Message`/`Ended`),
+  `MockRoom`, and `RoomTurnDriver` bridging a room to the L3 turn seam — admitted as channel kind `room`
+  through the ordinary `build_channels` path, where an unknown backend is an error like any other
+  kind→adapter mismatch. No new crate, so no `layer()` change; text-only, no media.
+  **Every inbound event carries an `OccupantId`**, which is the whole point: attribution is the
+  precondition for addressing, not a feature layered on top. A room-sourced turn dispatches through the
+  ordinary `Executor` and approver — asserted differentially rather than assumed, and the independent
+  review confirmed that test is non-vacuous by proving the approver is the *only* difference between its
+  two arms, so a bypass would fail it.
+  Deliberately **not** in scope: `address_rule` is carried in settings and documented as unenforced in
+  four places (D-207 owns that vocabulary, and half a rule is worse than none), so today every inbound
+  room message produces a turn. No backend but `mock` is registered, so no real room is reachable yet.
+  D-205 (XMPP MUC) and D-206 (JaaS) are next, and D-204's review handed each of them a named latent
+  defect to close — a failed send currently skips `leave()` and is fatal to the host, and self-echo
+  suppression rests on a backend setting `is_self`, which `Occupant::new` does not force.
+
+### Changed
+
+- **BREAKING: `flux_flow::voice::VoiceTurnHandler::turn` carries a `Speaker` (D-204).** It was
+  `turn(&self, user_text: &str)` and is now `turn(&self, speaker: &Speaker, user_text: &str)`. `Speaker`
+  is a surface-owned id plus an optional display name; the realtime driver passes `Speaker::sole()`, so a
+  phone line's single caller is now *named* rather than absent and voice behaviour is unchanged.
+  `codewandler-flux-flow` is published, which is why this release is a **minor** rather than a patch. The
+  blast radius is exactly the voice seam — the trait, one call site, two impls — verified rather than
+  asserted; `flux-channels` is not in the publish closure.
+
 ## [0.41.1] - 2026-07-31
 
 ### Changed

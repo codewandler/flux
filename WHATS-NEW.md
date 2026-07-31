@@ -15,6 +15,26 @@
 
 ## [Unreleased]
 
+### New
+
+- **Rooms: flux can now sit in a conversation with several people at once.** Until now every way of
+  talking to flux was one-to-one — a phone call with a single caller, a webhook, a chat message that
+  wakes it and gets a reply. A new `room` channel type lets flux be *one participant among several*: it
+  can see who is present, watch people join and leave, speak to the room, and send a private message to
+  one person. Crucially, every message it receives now says **who** said it, which is the thing that was
+  missing before.
+  This is the groundwork rather than the finished feature. There is no real room backend yet — only an
+  in-process test double — so you cannot point it at a live meeting today; that comes next. And for now
+  the agent replies to **every** message in a room rather than only when addressed, so the "answer only
+  when spoken to" rule is not in place yet either.
+
+### Action needed
+
+- **If you have written your own voice handler, its `turn` method now takes a speaker.** Anything
+  implementing the voice turn interface needs to accept a speaker argument alongside the text. If you
+  only use flux's built-in phone/voice support, nothing changes — the single caller on a line is simply
+  named now instead of anonymous.
+
 ## [0.41.1] - 2026-07-31
 
 ### Fixed

@@ -8,8 +8,10 @@
 
 Every channel flux has is either **1:1** or **fire-and-forget**. `flux-channels` (D-04, D-09) carries
 `schedule` / `webhook` / `slack` / `a2a` — each an event that wakes a journey or an agent and returns.
-The voice path (D-06, D-132) is richer but assumes **exactly one caller**: `VoiceTurnHandler::turn(&self,
-user_text: &str)` has no notion of *who* spoke, because on a phone line there is only one candidate.
+The voice path (D-06, D-132) is richer but assumed **exactly one caller**: before D-204,
+`VoiceTurnHandler::turn(&self, user_text: &str)` had no notion of *who* spoke, because on a phone line
+there is only one candidate. D-204 changed that signature to carry a `Speaker`; the paragraphs below
+describe the problem as it stood, and the "As landed" block records what shipped.
 
 There is no channel where flux is **one participant among several** — where two humans and one or more
 agents are co-present, the agent hears everything but is addressed by only some of it, and the agent can
@@ -156,7 +158,10 @@ pub enum RoomEvent {
 }
 ```
 
-**As landed (D-204), with four deliberate departures from the sketch above** —
+**As landed (D-204)** — four deliberate departures from the sketch as originally drafted. Note that two
+of them (`#[non_exhaustive]`, `scope: MessageScope`) were folded back **into** the sketch above in the
+same commit, so the sketch no longer visibly departs; they are still listed here because they are
+decisions a D-205/D-206 implementor needs, not accidents. Source: —
 `crates/flux-channels/src/rooms/`:
 
 - **`Message` carries a `MessageScope`** (`Groupchat` | `Private`). Without it a whisper is
@@ -186,8 +191,8 @@ tests. A room is a new `ChannelDecl` `kind` — `room`, with
 `settings { backend, room, nick, address_rule }` — so it enters through `build_channels` and needs no new
 host, exactly as D-04 established.
 
-**Every inbound event carries an `OccupantId`.** That is the one change the existing turn seams need: a
-room has N speakers and `VoiceTurnHandler::turn` currently takes only text. Attribution is not a feature,
+**Every inbound event carries an `OccupantId`.** That is the one change the existing turn seams needed: a
+room has N speakers, and before D-204 `VoiceTurnHandler::turn` took only text. Attribution is not a feature,
 it is the precondition for the address rule below. The one exception is `Ended` — the room's own
 lifecycle terminator, which no participant causes; `RoomEvent::occupant()` returns `None` only there,
 and a consumer that requires `Some` for everything else is holding the port to its contract.

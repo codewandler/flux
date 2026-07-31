@@ -88,8 +88,9 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ### Meeting rooms — a multi-party channel where humans and agents meet (epic) — 🔄 **PROPOSED (D-203; D-204…D-213 filed, none started; feasibility PROVEN live)**
 
 Every channel flux has is 1:1 or fire-and-forget — `schedule`/`webhook`/`slack`/`a2a` wake a journey and
-return, and the voice path assumes exactly one caller (`VoiceTurnHandler::turn` has no speaker parameter,
-because on a phone line there is only one candidate). There is no channel where flux is **one participant
+return, and the voice path assumed exactly one caller (before D-204, `VoiceTurnHandler::turn` had no
+speaker parameter, because on a phone line there is only one candidate; it now carries a `Speaker`).
+Until D-204 there was no channel where flux is **one participant
 among several**: humans and agents co-present, the agent hearing everything but addressed by only some of
 it, able to **show** something instead of only saying it. A meeting room is that shape, and — the framing
 that motivated the epic — it is the *root* substrate in which **agents can meet**, which makes it fleet
