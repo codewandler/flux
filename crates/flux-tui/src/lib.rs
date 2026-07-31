@@ -127,6 +127,39 @@ enum CtrlCQuit {
     Quit,
 }
 
+/// Direction requested by the failed-tool-card navigation chord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureNavigation {
+    Next,
+    Previous,
+}
+
+/// Decode the two failed-card navigation chords across crossterm's case representations.
+///
+/// Depending on the terminal keyboard protocol, Ctrl-Shift-G can arrive as either lowercase `g`
+/// plus [`KeyModifiers::SHIFT`] or uppercase `G` with shift normalized into the character. Ignore
+/// lock-key state, but reject unrelated extra modifiers so the binding remains exactly Ctrl-G.
+fn failure_navigation_key(key: crossterm::event::KeyEvent) -> Option<FailureNavigation> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    if key.kind != KeyEventKind::Press
+        || !key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.intersects(
+            KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+        )
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('G') => Some(FailureNavigation::Previous),
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(FailureNavigation::Previous)
+        }
+        KeyCode::Char('g') => Some(FailureNavigation::Next),
+        _ => None,
+    }
+}
+
 /// Whether the terminal advertises 24-bit color and color isn't disabled — gates the
 /// truecolor footer effects (`Color::Rgb` would emit raw truecolor SGR regardless).
 fn terminal_truecolor() -> bool {
@@ -291,7 +324,10 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl-F", "transcript search · n/N step matches"),
     ("PgUp/PgDn / wheel", "scroll transcript"),
-    ("Ctrl-End", "jump to latest"),
+    (
+        "Ctrl-End / Ctrl-G / Ctrl-Shift-G",
+        "latest / next/previous failed card",
+    ),
     ("Ctrl-E", "expand/collapse tool details (all cards)"),
     (
         "Shift-↑/↓",
@@ -326,8 +362,12 @@ fn file_command_prompt(
 /// One item in the transcript. Each renders to one or more styled [`Line`]s at a given width.
 #[derive(Debug)]
 enum Entry {
-    /// A user message (may contain newlines once the input is multiline).
-    User(String),
+    /// A user message, optionally preceded by a compact prior-turn boundary.
+    User {
+        text: String,
+        prior_elapsed: Option<Duration>,
+        show_separator: bool,
+    },
     /// An assistant reply — plain while streaming, Markdown once done (cached per width).
     Assistant(Assistant),
     /// Live extended-thinking tokens streamed during a model-backed stage, rendered as Markdown
@@ -387,6 +427,7 @@ struct ToolEntry {
 #[derive(Debug)]
 struct ToolOutcome {
     is_error: bool,
+    cancelled: bool,
     content: String,
     /// A one-line summary (e.g. `3 matches`) when [`toolview::format_result`] has one.
     summary: Option<String>,
@@ -428,6 +469,7 @@ impl ToolEntry {
             timing: None,
             result: Some(ToolOutcome {
                 is_error,
+                cancelled: false,
                 content,
                 summary,
                 elapsed,
@@ -458,6 +500,7 @@ impl ToolEntry {
             timing: None,
             result: Some(ToolOutcome {
                 is_error,
+                cancelled: false,
                 content,
                 summary,
                 elapsed,
@@ -765,6 +808,9 @@ fn tool_has_detail(tool: &ToolEntry) -> bool {
     let Some(o) = &tool.result else {
         return false;
     };
+    if o.cancelled {
+        return false;
+    }
     if !o.is_error {
         if let Some(diff) = toolview::format_diff(&tool.name, &tool.input) {
             return !diff.is_empty();
@@ -790,7 +836,7 @@ const GUTTER_COLS: u16 = 2;
 /// `Theme::MONO`.
 fn gutter_style(entry: &Entry, t: &Theme) -> Style {
     match entry {
-        Entry::User(_) => t.user_style(),
+        Entry::User { .. } => t.user_style(),
         _ => t.muted_style(),
     }
 }
@@ -803,6 +849,32 @@ fn prepend_gutter(mut lines: Vec<Line<'static>>, style: Style) -> Vec<Line<'stat
         line.spans.insert(0, Span::styled(GUTTER, style));
     }
     lines
+}
+
+/// A compact, glyph-based boundary that fits in one transcript row. Whole seconds omit the
+/// shared latency formatter's decimal (`12s`, not `12.0s`) because this is orientation metadata,
+/// not a precision readout. When the duration cannot fit, the rule remains and the label sheds.
+fn turn_separator_line(
+    elapsed: Option<Duration>,
+    content_width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let width = usize::from(content_width);
+    let duration = elapsed.map(|elapsed| {
+        let compact = fmt_elapsed(elapsed);
+        compact
+            .strip_suffix(".0s")
+            .map_or(compact.clone(), |seconds| format!("{seconds}s"))
+    });
+    let label = duration.map(|duration| format!("── {duration} ──"));
+    let text = match label {
+        Some(label) if UnicodeWidthStr::width(label.as_str()) <= width => {
+            let pad = width - UnicodeWidthStr::width(label.as_str());
+            format!("{}{label}", " ".repeat(pad))
+        }
+        _ => "─".repeat(width.min(8)),
+    };
+    Line::styled(text, theme.muted_style())
 }
 
 /// Max text size accepted for an OSC 52 clipboard write (C-111). Terminals commonly cap the
@@ -1037,6 +1109,7 @@ impl ChatState {
             session_picker: None,
             session_sel: 0,
             session_query: String::new(),
+            previous_sessions: 0,
             scroll: 0,
             follow: true,
             last_max_scroll: Cell::new(0),
@@ -1362,10 +1435,22 @@ impl ChatState {
             self.queue_sel = to;
         }
     }
-
-    /// Append a user message.
+    /// Append a user message, with a compact rule after the preceding turn has completed.
     fn push_user(&mut self, text: impl Into<String>) {
-        self.push(Entry::User(text.into()));
+        let previous_user = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::User { .. }));
+        let show_separator = previous_user.is_some_and(|user| {
+            self.entries[user + 1..]
+                .iter()
+                .any(|entry| matches!(entry, Entry::Assistant(assistant) if assistant.done))
+        });
+        self.push(Entry::User {
+            text: text.into(),
+            prior_elapsed: show_separator.then_some(self.last_elapsed).flatten(),
+            show_separator,
+        });
     }
 
     /// Open a fresh thinking entry for the upcoming planning call (called on `Planning(true)`).
@@ -1484,7 +1569,6 @@ impl ChatState {
         }
         self.assistant_open = false;
     }
-
     /// Visual rows the input box wants (content lines, clamped 1..=6), excluding borders.
     fn input_rows(&self) -> u16 {
         (self.input.lines().len() as u16).clamp(1, 6)
@@ -1711,11 +1795,21 @@ impl ChatState {
             }
         }
     }
-
     fn finish_tool(&mut self, name: &str, content: String, is_error: bool) {
         let summary = toolview::format_result(name, &content, is_error);
         for entry in self.entries.iter_mut().rev() {
             if let Entry::Tool(tool) = entry {
+                // Cancellation is terminal. A tool can finish concurrently with Ctrl-C and its
+                // already-queued result may arrive before the turn's `Finished` marker; keep the
+                // interrupted card cancelled instead of surfacing that late result as a notice.
+                if tool.name == name
+                    && tool
+                        .result
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.cancelled)
+                {
+                    return;
+                }
                 if tool.result.is_none() && tool.name == name {
                     let elapsed = tool
                         .timing
@@ -1728,24 +1822,46 @@ impl ChatState {
                         .map(Duration::from_micros);
                     tool.result = Some(ToolOutcome {
                         is_error,
+                        cancelled: false,
                         elapsed,
                         approval_wait,
                         summary,
                         content,
                     });
-                    // C-158: the live tail was a stand-in for the result; the real summary and
-                    // detail supersede it, so drop it rather than render both.
                     tool.partial.clear();
                     self.mark_transcript_dirty();
                     return;
                 }
             }
         }
-        // No matching call (shouldn't happen) — surface it as a notice so nothing is lost.
         self.push(Entry::Notice {
             text: content,
             sev: if is_error { Sev::Err } else { Sev::Info },
         });
+    }
+
+    /// Seal every in-flight tool card when the operator interrupts the turn.
+    fn cancel_running_tools(&mut self) {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if let Entry::Tool(tool) = entry {
+                if tool.result.is_none() {
+                    tool.result = Some(ToolOutcome {
+                        is_error: false,
+                        cancelled: true,
+                        content: String::new(),
+                        summary: None,
+                        elapsed: tool.started.elapsed(),
+                        approval_wait: None,
+                    });
+                    tool.partial.clear();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.mark_transcript_dirty();
+        }
     }
 
     fn time_tool(&mut self, name: &str, timing: flux_core::OperationTiming) {
@@ -1772,107 +1888,124 @@ impl ChatState {
         let t = &self.theme;
         let content_width = width.saturating_sub(GUTTER_COLS);
         let mut out: Vec<Line> = Vec::new();
-        {
-            match entry {
-                Entry::User(text) => {
-                    for (j, raw) in text.split('\n').enumerate() {
-                        let prefix = if j == 0 { "› " } else { "  " };
-                        out.push(Line::from(vec![
-                            Span::styled(prefix, t.user_style()),
-                            Span::styled(raw.to_string(), t.user_style()),
-                        ]));
-                    }
+        match entry {
+            Entry::User {
+                text,
+                prior_elapsed,
+                show_separator,
+            } => {
+                if *show_separator {
+                    out.push(turn_separator_line(*prior_elapsed, content_width, t));
                 }
-                Entry::Assistant(a) => out.extend(a.lines(content_width, t)),
-                Entry::Thinking { body, call } => {
-                    if !body.text.is_empty() {
-                        let count = body.text.lines().count().max(1);
-                        out.push(Line::styled(
-                            if body.done {
-                                format!(
-                                    "thinking · {count} line{} · Ctrl-E details",
-                                    if count == 1 { "" } else { "s" }
-                                )
-                            } else {
-                                "thinking…".to_string()
-                            },
-                            t.muted_style(),
-                        ));
-                        if self.expand_tools {
-                            out.extend(body.lines(content_width, t).into_iter().map(|mut l| {
-                                for span in &mut l.spans {
-                                    span.style = span.style.patch(t.muted_style());
-                                }
-                                l
-                            }));
-                        }
-                    }
-                    // C-180: what this round actually cost in wall clock. Rendered even with no
-                    // thinking text — a stage without extended thinking still made the user wait.
-                    if let Some(call) = call {
-                        out.push(Line::from(model_call_spans(call, t)));
-                    }
-                }
-                Entry::Tool(tool) => out.extend(self.tool_lines(tool, content_width)),
-                Entry::Notice { text, sev } => {
-                    let style = match sev {
-                        Sev::Info => t.muted_style(),
-                        Sev::Warn => t.warn_style(),
-                        Sev::Err => t.err_style(),
-                    };
-                    for raw in text.split('\n') {
-                        out.push(Line::styled(raw.to_string(), style));
-                    }
-                }
-                Entry::Intent(intent) => {
-                    let intent_cap = usize::from(content_width).saturating_sub(12).clamp(24, 160);
+                for (j, raw) in text.split('\n').enumerate() {
+                    let prefix = if j == 0 { "› " } else { "  " };
                     out.push(Line::from(vec![
-                        Span::styled("◆ ", t.accent_style()),
-                        Span::styled("intent: ", t.accent_style().add_modifier(Modifier::BOLD)),
-                        Span::raw(truncate(&intent.intent, intent_cap)),
+                        Span::styled(prefix, t.user_style()),
+                        Span::styled(raw.to_string(), t.user_style()),
                     ]));
-                    let capabilities = if intent.families.is_empty() {
-                        "none".to_string()
-                    } else {
-                        intent.families.join(", ")
-                    };
-                    let plural = if intent.operations.len() == 1 {
-                        "operation"
-                    } else {
-                        "operations"
-                    };
+                }
+            }
+            Entry::Assistant(a) => out.extend(a.lines(content_width, t)),
+            Entry::Thinking { body, call } => {
+                if !body.text.is_empty() {
+                    let count = body.text.lines().count().max(1);
                     out.push(Line::styled(
-                        format!(
-                            "  capabilities: {capabilities} · {} {plural}",
-                            intent.operations.len()
-                        ),
+                        if body.done {
+                            format!(
+                                "thinking · {count} line{} · Ctrl-E details",
+                                if count == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            "thinking…".to_string()
+                        },
                         t.muted_style(),
                     ));
-                    if self.verbose && !intent.operations.is_empty() {
-                        out.push(Line::styled(
-                            format!("  operations: {}", intent.operations.join(", ")),
-                            t.muted_style(),
-                        ));
+                    if self.expand_tools {
+                        out.extend(body.lines(content_width, t).into_iter().map(|mut l| {
+                            for span in &mut l.spans {
+                                span.style = span.style.patch(t.muted_style());
+                            }
+                            l
+                        }));
                     }
                 }
-                Entry::Plan(data) => out.extend(plan::render(data, t)),
-                Entry::Brief { goal, needs } => {
-                    out.push(Line::from(vec![
-                        Span::styled("◆ ", t.accent_style()),
-                        Span::styled("goal: ", t.accent_style().add_modifier(Modifier::BOLD)),
-                        Span::raw(goal.clone()),
-                    ]));
-                    if !needs.is_empty() {
-                        out.push(Line::styled(
-                            format!("  needs: {}", needs.join(", ")),
-                            t.muted_style(),
-                        ));
-                    }
+                // C-180: what this round actually cost in wall clock. Rendered even with no
+                // thinking text — a stage without extended thinking still made the user wait.
+                if let Some(call) = call {
+                    out.push(Line::from(model_call_spans(call, t)));
                 }
-                Entry::GatherPlan(data) => out.extend(plan::render_compact(data, t)),
+            }
+            Entry::Tool(tool) => out.extend(self.tool_lines(tool, content_width)),
+            Entry::Notice { text, sev } => {
+                let style = match sev {
+                    Sev::Info => t.muted_style(),
+                    Sev::Warn => t.warn_style(),
+                    Sev::Err => t.err_style(),
+                };
+                for raw in text.split('\n') {
+                    out.push(Line::styled(raw.to_string(), style));
+                }
+            }
+            Entry::Intent(intent) => {
+                let intent_cap = usize::from(content_width).saturating_sub(12).clamp(24, 160);
+                out.push(Line::from(vec![
+                    Span::styled("◆ ", t.accent_style()),
+                    Span::styled("intent: ", t.accent_style().add_modifier(Modifier::BOLD)),
+                    Span::raw(truncate(&intent.intent, intent_cap)),
+                ]));
+                let capabilities = if intent.families.is_empty() {
+                    "none".to_string()
+                } else {
+                    intent.families.join(", ")
+                };
+                let plural = if intent.operations.len() == 1 {
+                    "operation"
+                } else {
+                    "operations"
+                };
+                out.push(Line::styled(
+                    format!(
+                        "  capabilities: {capabilities} · {} {plural}",
+                        intent.operations.len()
+                    ),
+                    t.muted_style(),
+                ));
+                if self.verbose && !intent.operations.is_empty() {
+                    out.push(Line::styled(
+                        format!("  operations: {}", intent.operations.join(", ")),
+                        t.muted_style(),
+                    ));
+                }
+            }
+            Entry::Plan(data) => out.extend(plan::render(data, t)),
+            Entry::Brief { goal, needs } => {
+                out.push(Line::from(vec![
+                    Span::styled("◆ ", t.accent_style()),
+                    Span::styled("goal: ", t.accent_style().add_modifier(Modifier::BOLD)),
+                    Span::raw(goal.clone()),
+                ]));
+                if !needs.is_empty() {
+                    out.push(Line::styled(
+                        format!("  needs: {}", needs.join(", ")),
+                        t.muted_style(),
+                    ));
+                }
+            }
+            Entry::GatherPlan(data) => out.extend(plan::render_compact(data, t)),
+        }
+        let mut out = prepend_gutter(out, gutter_style(entry, t));
+        if matches!(
+            entry,
+            Entry::User {
+                show_separator: true,
+                ..
+            }
+        ) {
+            if let Some(gutter) = out.first_mut().and_then(|line| line.spans.first_mut()) {
+                gutter.style = t.muted_style();
             }
         }
-        prepend_gutter(out, gutter_style(entry, t))
+        out
     }
 
     fn ensure_transcript_layout(&self, width: u16) {
@@ -2105,6 +2238,45 @@ impl ChatState {
         self.center_focused_entry();
     }
 
+    /// Cycle failed tool cards, wrapping at either end, and center the selected card.
+    fn jump_failure(&mut self, forward: bool) -> bool {
+        let failures: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                Entry::Tool(tool)
+                    if tool.result.as_ref().is_some_and(|outcome| outcome.is_error) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect();
+        let Some(next) = (if forward {
+            failures
+                .iter()
+                .copied()
+                .find(|index| self.focused.is_none_or(|current| *index > current))
+                .or_else(|| failures.first().copied())
+        } else {
+            failures
+                .iter()
+                .rev()
+                .copied()
+                .find(|index| self.focused.is_none_or(|current| *index < current))
+                .or_else(|| failures.last().copied())
+        }) else {
+            return false;
+        };
+        self.focused = Some(next);
+        self.follow = false;
+        self.unread = 0;
+        self.mark_transcript_dirty();
+        self.center_focused_entry();
+        true
+    }
+
     fn focus_clear(&mut self) {
         if self.focused.take().is_some() {
             self.mark_transcript_dirty();
@@ -2152,7 +2324,7 @@ impl ChatState {
     fn focused_entry_text(&self) -> Option<String> {
         let entry = self.entries.get(self.focused?)?;
         Some(match entry {
-            Entry::User(text) => text.clone(),
+            Entry::User { text, .. } => text.clone(),
             Entry::Assistant(a) => a.text.clone(),
             Entry::Thinking { body, .. } => body.text.clone(),
             Entry::Tool(tool) => {
@@ -2192,11 +2364,10 @@ impl ChatState {
         let t = &self.theme;
         let mut out: Vec<Line> = Vec::new();
 
-        // Badge (right-aligned, fixed idea of width): running is static, done shows ✓/✗ + elapsed.
+        // Badge (right-aligned, fixed idea of width): running is static, terminal states are distinct.
         let (badge, badge_style) = match &tool.result {
-            // The in-flight badge is static IN THE CACHE; the viewport patches it with a live
-            // spinner + elapsed per tick (C-109), so cached rows stay untouched across frames.
             None => (RUNNING_BADGE.to_string(), t.warn_style()),
+            Some(o) if o.cancelled => ("⊘ cancelled".to_string(), t.muted_style()),
             Some(o) if o.is_error => (format!("✗ {}", fmt_tool_timing(o)), t.err_style()),
             Some(o) => (format!("✓ {}", fmt_tool_timing(o)), t.ok_style()),
         };
@@ -2234,81 +2405,104 @@ impl ChatState {
             }
         }
 
-        // One-line summary (always, once the result is in).
+        // Completed results keep their one-line summary. Cancellation is fully represented by its
+        // terminal header badge and deliberately has no result/detail row to expand.
         if let Some(o) = &tool.result {
-            let summary = o
-                .summary
-                .clone()
-                .or_else(|| o.content.trim().lines().next().map(str::to_string))
-                .unwrap_or_else(|| "done".into());
-            let style = if o.is_error {
-                t.err_style()
-            } else {
-                t.muted_style()
-            };
-            out.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(truncate(&summary, width.saturating_sub(2) as usize), style),
-            ]));
-
-            // Full detail, when expanded. Verbose (`-v`/`FLUX_VERBOSE`) lifts the line cap —
-            // "tool output in full (no truncation)" is the flag's promise. C-111: a per-card
-            // override (Enter on the focused card) beats the global Ctrl-E state.
-            if effective_expanded {
-                // C-115: edit/write get a real hunk view (headers, line-number gutter, word-level
-                // intraline emphasis); everything else keeps the flat classified detail.
-                let diff = if o.is_error {
-                    None
+            if !o.cancelled {
+                let summary = o
+                    .summary
+                    .clone()
+                    .or_else(|| o.content.trim().lines().next().map(str::to_string))
+                    .unwrap_or_else(|| "done".into());
+                let style = if o.is_error {
+                    t.err_style()
                 } else {
-                    toolview::format_diff(&tool.name, &tool.input)
+                    t.muted_style()
                 };
-                if let Some(rows) = diff {
-                    let cap = if self.verbose { rows.len() } else { MAX_DETAIL };
-                    let shown = rows.len().min(cap);
-                    for row in rows.iter().take(cap) {
-                        out.push(diff_row_line(t, row, "   "));
-                    }
-                    if rows.len() > shown {
-                        out.push(Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(
-                                format!("… {} more lines", rows.len() - shown),
-                                t.muted_style(),
-                            ),
-                        ]));
-                    }
-                } else {
-                    let detail =
-                        toolview::format_detail(&tool.name, &tool.input, &o.content, o.is_error);
-                    let cap = if self.verbose {
-                        detail.len()
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(truncate(&summary, width.saturating_sub(2) as usize), style),
+                ]));
+
+                // Full detail, when expanded. Verbose (`-v`/`FLUX_VERBOSE`) lifts the line cap —
+                // "tool output in full (no truncation)" is the flag's promise. C-111: a per-card
+                // override (Enter on the focused card) beats the global Ctrl-E state.
+                if effective_expanded {
+                    // C-115: edit/write get a real hunk view (headers, line-number gutter, word-level
+                    // intraline emphasis); everything else keeps the flat classified detail.
+                    let diff = if o.is_error {
+                        None
                     } else {
-                        MAX_DETAIL
+                        toolview::format_diff(&tool.name, &tool.input)
                     };
-                    let shown = detail.len().min(cap);
-                    for (kind, text) in detail.iter().take(cap) {
-                        let style = match kind {
-                            toolview::DetailKind::Add => t.ok_style(),
-                            toolview::DetailKind::Del => t.err_style(),
-                            toolview::DetailKind::Meta | toolview::DetailKind::Hunk => {
-                                t.accent_style()
-                            }
-                            toolview::DetailKind::Plain => t.muted_style(),
+                    if let Some(rows) = diff {
+                        let cap = if self.verbose { rows.len() } else { MAX_DETAIL };
+                        let shown = rows.len().min(cap);
+                        for row in rows.iter().take(cap) {
+                            out.push(diff_row_line(t, row, "   "));
+                        }
+                        if rows.len() > shown {
+                            out.push(Line::from(vec![
+                                Span::raw("   "),
+                                Span::styled(
+                                    format!("… {} more lines", rows.len() - shown),
+                                    t.muted_style(),
+                                ),
+                            ]));
+                        }
+                    } else {
+                        let detail = toolview::format_detail(
+                            &tool.name,
+                            &tool.input,
+                            &o.content,
+                            o.is_error,
+                        );
+                        let cap = if self.verbose {
+                            detail.len()
+                        } else {
+                            MAX_DETAIL
                         };
-                        out.push(Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(text.clone(), style),
-                        ]));
+                        let shown = detail.len().min(cap);
+                        for (kind, text) in detail.iter().take(cap) {
+                            let style = match kind {
+                                toolview::DetailKind::Add => t.ok_style(),
+                                toolview::DetailKind::Del => t.err_style(),
+                                toolview::DetailKind::Meta | toolview::DetailKind::Hunk => {
+                                    t.accent_style()
+                                }
+                                toolview::DetailKind::Plain => t.muted_style(),
+                            };
+                            out.push(Line::from(vec![
+                                Span::raw("   "),
+                                Span::styled(text.clone(), style),
+                            ]));
+                        }
+                        if detail.len() > shown {
+                            out.push(Line::from(vec![
+                                Span::raw("   "),
+                                Span::styled(
+                                    format!("… {} more lines", detail.len() - shown),
+                                    t.muted_style(),
+                                ),
+                            ]));
+                        }
                     }
-                    if detail.len() > shown {
-                        out.push(Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(
-                                format!("… {} more lines", detail.len() - shown),
-                                t.muted_style(),
-                            ),
-                        ]));
-                    }
+                }
+            }
+        }
+        // Light palettes need a quiet boundary between completed tool output and prose. Paint
+        // only the existing summary/detail rows: headers, in-flight partial output and the
+        // transcript gutter remain unchanged, and this adds no layout rows.
+        if t.is_light()
+            && tool
+                .result
+                .as_ref()
+                .is_some_and(|outcome| !outcome.cancelled)
+        {
+            for line in out.iter_mut().skip(1) {
+                line.style = line.style.bg(t.panel_bg);
+                for span in &mut line.spans {
+                    span.style = span.style.bg(t.panel_bg);
                 }
             }
         }
@@ -2529,14 +2723,19 @@ impl ChatState {
         }
         if let Some(e) = self.last_elapsed {
             let plural = if self.steps == 1 { "" } else { "s" };
-            // C-180: split the wall clock. Omitted entirely for a turn that made no model call
-            // (a `/`-command, a resumed transcript) rather than rendering a misleading `llm 0s`.
             let llm = match self.last_llm_wait {
                 Some(wait) => format!(" · llm {}", fmt_elapsed(wait)),
                 None => String::new(),
             };
             right.push(vec![Span::styled(
                 format!("{} step{plural} · {}{llm}", self.steps, fmt_elapsed(e)),
+                t.muted_style(),
+            )]);
+        }
+        let queued = self.queue.len();
+        if self.running() && queued > 0 {
+            right.push(vec![Span::styled(
+                format!("+{queued} queued"),
                 t.muted_style(),
             )]);
         }
@@ -2587,6 +2786,9 @@ impl ChatState {
 
         let mut entries = Vec::new();
         let mut starts: HashMap<String, (String, i64)> = HashMap::new();
+        let mut turn_starts: HashMap<i64, i64> = HashMap::new();
+        let mut prior_turn_elapsed = None;
+        let mut prior_user_completed = false;
         let mut turn_usage = Vec::new();
         let mut call_usage: Vec<(String, Usage)> = Vec::new();
         let mut proposed_plan_recorded = false;
@@ -2599,11 +2801,18 @@ impl ChatState {
                         continue;
                     }
                     match message.role {
-                        flux_core::Role::User => entries.push(Entry::User(text)),
+                        flux_core::Role::User => {
+                            entries.push(Entry::User {
+                                text,
+                                prior_elapsed: prior_user_completed
+                                    .then_some(prior_turn_elapsed)
+                                    .flatten(),
+                                show_separator: prior_user_completed,
+                            });
+                            prior_user_completed = false;
+                            prior_turn_elapsed = None;
+                        }
                         flux_core::Role::Assistant => {
-                            // `plan_turn` stores "Proposed plan: …" as provider context after the
-                            // accepted attempt. The attempt itself is the richer durable UI entry;
-                            // do not render the same tree twice on resume.
                             if proposed_plan_recorded && text.starts_with("Proposed plan:\n") {
                                 proposed_plan_recorded = false;
                                 continue;
@@ -2614,6 +2823,7 @@ impl ChatState {
                                 done: true,
                                 cache: RefCell::new(None),
                             }));
+                            prior_user_completed = true;
                         }
                         _ => {}
                     }
@@ -2622,6 +2832,9 @@ impl ChatState {
                     text: "◇ context compacted".into(),
                     sev: Sev::Info,
                 }),
+                EventKind::TurnStarted { .. } => {
+                    turn_starts.insert(event.global_seq, event.ts_ms);
+                }
                 EventKind::PlanAttempted {
                     outcome,
                     error,
@@ -2725,9 +2938,17 @@ impl ChatState {
                     text: format!("model switched to {model}"),
                     sev: Sev::Info,
                 }),
-                EventKind::TurnEnded {
-                    usage: Some(usage), ..
-                } => turn_usage.push(usage),
+                EventKind::TurnEnded { usage, .. } => {
+                    if let Some(usage) = usage {
+                        turn_usage.push(usage);
+                    }
+                    prior_turn_elapsed = event
+                        .turn_id
+                        .and_then(|turn_id| turn_starts.remove(&turn_id))
+                        .map(|started| {
+                            Duration::from_millis(event.ts_ms.saturating_sub(started).max(0) as u64)
+                        });
+                }
                 EventKind::CallUsage { model, usage } => call_usage.push((model, usage)),
                 _ => {}
             }
@@ -3134,8 +3355,24 @@ pub fn session_state(
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
     state.project_session(&agent.events, session_id)?;
+    state.previous_sessions = previous_session_count(&agent.events, session_id)?;
     state.history = load_history(&agent.events);
     Ok(state)
+}
+
+/// Count durable transcripts that the active session can resume through `/sessions`.
+///
+/// Empty sessions have no transcript to resume, and the active session is never a previous one.
+fn previous_session_count(
+    events: &flux_events::EventStore,
+    active_session_id: &str,
+) -> flux_core::Result<usize> {
+    const UNBOUNDED: usize = i64::MAX as usize;
+    Ok(events
+        .list(UNBOUNDED)?
+        .into_iter()
+        .filter(|session| session.id != active_session_id && session.messages > 0)
+        .count())
 }
 
 /// C-305: drive the production [`event_loop`] against an in-memory backend over a scripted event
@@ -3213,6 +3450,9 @@ where
     // A message typed while a turn was running, started as soon as the turn finishes.
     let mut pending_ui: Option<UiEvent> = None;
     let mut exit_after_finish = false;
+    // The action whose cancellation token the operator triggered. Keep this until `Finished` so
+    // tool-call events already in flight behind the keypress are sealed too.
+    let mut interrupted_action_id = None;
 
     loop {
         // C-305: the agent's pane commands, applied BEFORE this iteration's UI events on purpose —
@@ -3329,6 +3569,7 @@ where
                     }
                 }
                 UiEvent::Finished => {
+                    seal_interrupted_action(state, &mut interrupted_action_id);
                     if let Some((_tool, reply)) = pending_reply.take() {
                         let _ = reply.send(ApprovalChoice::Deny);
                     }
@@ -3585,10 +3826,10 @@ where
                     }
                     continue;
                 }
-
-                // Paging the transcript works whether or not a turn is running. Home/End are left
-                // for the input editor (line start/end); PgDn reattaches follow when it reaches the
-                // bottom, so a dedicated jump-to-bottom isn't needed.
+                // Paging and failed-card navigation work whether or not a turn is running.
+                if handle_failure_navigation_key(state, key) {
+                    continue;
+                }
                 match key.code {
                     KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         state.follow = true;
@@ -3897,9 +4138,8 @@ where
                     }
                     KeyCode::Char('c') if ctrl => {
                         if running {
-                            // Cancel the running turn (input stays live so you can keep typing).
                             state.clear_ctrl_c_arm();
-                            cancel.cancel();
+                            interrupt_active_action(state, &cancel, &mut interrupted_action_id);
                             state.push(Entry::Notice {
                                 text: "(interrupting…)".into(),
                                 sev: Sev::Info,
@@ -3988,7 +4228,11 @@ where
                             if wants_quit {
                                 state.queue.clear();
                                 if running {
-                                    cancel.cancel();
+                                    interrupt_active_action(
+                                        state,
+                                        &cancel,
+                                        &mut interrupted_action_id,
+                                    );
                                     exit_after_finish = true;
                                 } else {
                                     break;
@@ -4019,6 +4263,29 @@ where
         }
     }
     Ok(())
+}
+
+/// Interrupt the current action and immediately make every visible in-flight tool terminal.
+///
+/// The action id is retained until its `Finished` event so a tool call that was already queued
+/// behind the keypress cannot reintroduce a running card after this immediate seal.
+fn interrupt_active_action(
+    state: &mut ChatState,
+    cancel: &CancellationToken,
+    interrupted_action_id: &mut Option<u64>,
+) {
+    *interrupted_action_id = state.active_action_id;
+    state.cancel_running_tools();
+    cancel.cancel();
+}
+
+/// Seal tool calls that reached the UI channel after the interrupt keypress, then consume the
+/// cancellation marker for this action. Normal action completion is a no-op.
+fn seal_interrupted_action(state: &mut ChatState, interrupted_action_id: &mut Option<u64>) {
+    if interrupted_action_id.is_some() && *interrupted_action_id == state.active_action_id {
+        state.cancel_running_tools();
+        *interrupted_action_id = None;
+    }
 }
 
 async fn handle_command(
@@ -4413,8 +4680,6 @@ fn start_turn(
     state.phase = Phase::Thinking;
     state.turn_start = Some(Instant::now());
     state.steps = 0;
-    // C-180: the model-wait split is per turn, alongside `steps`/`turn_start` — a `/compact` or
-    // other maintenance action must not inherit or erase the last turn's figure.
     state.turn_llm_wait = Duration::ZERO;
     state.last_llm_wait = None;
     state.plan_phase = None;
@@ -4483,6 +4748,21 @@ fn scroll_down(state: &mut ChatState, n: u16) {
     if state.follow {
         state.unread = 0;
     }
+}
+
+/// Apply a failed-card navigation key, returning whether this binding consumed the event.
+fn handle_failure_navigation_key(state: &mut ChatState, key: crossterm::event::KeyEvent) -> bool {
+    let Some(direction) = failure_navigation_key(key) else {
+        return false;
+    };
+    let forward = direction == FailureNavigation::Next;
+    if !state.jump_failure(forward) {
+        state.push(Entry::Notice {
+            text: "no failed tool cards".into(),
+            sev: Sev::Info,
+        });
+    }
+    true
 }
 
 #[cfg(test)]
@@ -4837,12 +5117,76 @@ mod tests {
             .find(|c| c.symbol() == "d")
             .expect("draft cell");
         assert_eq!(draft.bg, state.theme.composer_bg);
-        assert_eq!(buffer.cell((0, 8)).expect("composer origin").symbol(), "d");
+        assert_eq!(buffer.cell((0, 8)).expect("composer origin").symbol(), "▍");
+        assert_eq!(buffer.cell((1, 8)).expect("composer text").symbol(), "d");
         assert!((0..48).all(|x| {
             buffer
                 .cell((x, 8))
                 .is_some_and(|cell| cell.bg == state.theme.composer_bg)
         }));
+    }
+
+    #[test]
+    fn composer_accent_bar_tracks_run_state_without_layout_churn() {
+        for (name, theme) in [
+            ("dark", Theme::DARK),
+            ("light", Theme::LIGHT),
+            ("mono", Theme::MONO),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
+            let mut state = ChatState::new("mock".into());
+            state.theme = theme;
+            state.theme_name = name.into();
+            state.push_user("hi");
+            state.set_input("draft");
+
+            terminal.draw(|f| render(f, &state)).unwrap();
+            let idle = terminal.backend().buffer();
+            let idle_bar = idle.cell((0, 8)).expect("idle composer accent bar");
+            assert_eq!(idle_bar.symbol(), "▍", "{name} idle bar glyph");
+            assert_eq!(idle_bar.fg, theme.accent, "{name} idle bar color");
+            assert_eq!(idle_bar.bg, theme.composer_bg, "{name} idle bar surface");
+            assert_eq!(idle.cell((1, 8)).expect("idle composer text").symbol(), "d");
+            let idle_symbols: Vec<String> = (0..48)
+                .map(|x| {
+                    idle.cell((x, 8))
+                        .expect("idle composer cell")
+                        .symbol()
+                        .into()
+                })
+                .collect();
+
+            state.begin_action();
+            terminal.draw(|f| render(f, &state)).unwrap();
+            let running = terminal.backend().buffer();
+            let running_bar = running.cell((0, 8)).expect("running composer accent bar");
+            assert_eq!(running_bar.symbol(), "▍", "{name} running bar glyph");
+            assert_eq!(running_bar.fg, theme.muted, "{name} running bar color");
+            assert_eq!(
+                running_bar.bg, theme.composer_bg,
+                "{name} running bar surface"
+            );
+            assert_eq!(
+                running
+                    .cell((1, 8))
+                    .expect("running composer text")
+                    .symbol(),
+                "d"
+            );
+            let running_symbols: Vec<String> = (0..48)
+                .map(|x| {
+                    running
+                        .cell((x, 8))
+                        .expect("running composer cell")
+                        .symbol()
+                        .into()
+                })
+                .collect();
+            assert_eq!(
+                running_symbols, idle_symbols,
+                "{name} composer geometry changed between idle and running"
+            );
+        }
     }
 
     #[test]
@@ -5269,18 +5613,41 @@ mod tests {
         assert!(screen(&terminal).contains("Ctrl-C again to quit"));
     }
 
-    /// C-106: detaching from follow mode shows a scrollbar on the transcript's right column and
-    /// a percent segment in the footer; follow mode shows neither.
+    /// C-341: overflow keeps an overlaid scrollbar on the transcript's right column in both
+    /// follow and detached modes. Only the detached thumb is accented; its percent footer remains
+    /// a manual-scroll affordance.
     #[test]
-    fn scroll_indicator_appears_only_while_detached() {
+    fn overflow_scrollbar_persists_and_accents_only_while_detached() {
         let mut state = ChatState::new("mock".into());
         for i in 0..40 {
             state.push_user(format!("message number {i}"));
         }
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        // Following: no indicator.
+
+        // Follow mode keeps the track and a muted thumb visible, but not the manual-scroll footer.
         terminal.draw(|f| render(f, &state)).unwrap();
-        assert!(!screen(&terminal).contains('%'));
+        let content = screen(&terminal);
+        assert!(!content.contains('%'), "{content}");
+        assert!(state.last_max_scroll.get() > 0);
+        assert_eq!(
+            state
+                .transcript_layout
+                .borrow()
+                .as_ref()
+                .expect("overflow laid out")
+                .width,
+            60,
+            "the overlaid scrollbar must not consume transcript width"
+        );
+        let buffer = terminal.backend().buffer();
+        let follow_thumb = (1..10)
+            .filter_map(|y| buffer.cell((59, y)))
+            .find(|cell| cell.symbol() == "█")
+            .expect("follow-mode scrollbar thumb");
+        assert_eq!(follow_thumb.fg, state.theme.muted);
+        assert!((1..10)
+            .filter_map(|y| buffer.cell((59, y)))
+            .any(|cell| { cell.symbol() == "║" && cell.fg == state.theme.muted }));
 
         scroll_up(&mut state, 5);
         assert!(!state.follow);
@@ -5288,27 +5655,27 @@ mod tests {
         let content = screen(&terminal);
         assert!(content.contains("⤓") && content.contains('%'), "{content}");
         let buffer = terminal.backend().buffer();
-        let transcript_rows = 1..(12 - 2);
-        let bar_col = 59;
-        let has_bar_glyph = transcript_rows
-            .map(|y| {
-                buffer
-                    .cell((bar_col, y))
-                    .expect("cell")
-                    .symbol()
-                    .to_string()
-            })
-            .any(|s| s != " ");
-        assert!(
-            has_bar_glyph,
-            "scrollbar glyphs expected in the last column"
-        );
+        let detached_thumb = (1..10)
+            .filter_map(|y| buffer.cell((59, y)))
+            .find(|cell| cell.symbol() == "█")
+            .expect("detached scrollbar thumb");
+        assert_eq!(detached_thumb.fg, state.theme.accent);
+        assert!((1..10)
+            .filter_map(|y| buffer.cell((59, y)))
+            .any(|cell| { cell.symbol() == "║" && cell.fg == state.theme.muted }));
 
-        // Reattach: indicator gone.
+        // Reattaching removes only the manual-scroll footer; the muted scrollbar persists.
         state.follow = true;
         state.scroll = state.last_max_scroll.get();
         terminal.draw(|f| render(f, &state)).unwrap();
-        assert!(!screen(&terminal).contains('%'));
+        let content = screen(&terminal);
+        assert!(!content.contains('%'), "{content}");
+        let buffer = terminal.backend().buffer();
+        let follow_thumb = (1..10)
+            .filter_map(|y| buffer.cell((59, y)))
+            .find(|cell| cell.symbol() == "█")
+            .expect("reattached scrollbar thumb");
+        assert_eq!(follow_thumb.fg, state.theme.muted);
     }
 
     /// C-110: the help overlay lists keys and every slash command from the merged table, and
@@ -5326,6 +5693,7 @@ mod tests {
         assert!(content.contains("help · Esc close"), "{content}");
         assert!(content.contains("Ctrl-J"), "{content}");
         assert!(content.contains("Ctrl-R"), "{content}");
+        assert!(content.contains("Ctrl-G"), "{content}");
         assert!(content.contains("Ctrl-T"), "{content}");
         for c in all_slash_commands(&state.file_commands) {
             assert!(
@@ -5722,7 +6090,11 @@ mod tests {
     #[test]
     fn transcript_gutter_marks_user_and_assistant_entries() {
         let mut state = ChatState::new("mock".into());
-        state.push(Entry::User("hello there".into()));
+        state.push(Entry::User {
+            text: "hello there".into(),
+            prior_elapsed: None,
+            show_separator: false,
+        });
         state.stream_text("hi back");
         state.end_stream();
 
@@ -5779,6 +6151,129 @@ mod tests {
             Some(sel_bg),
             "rail span must carry the focus background too"
         );
+    }
+
+    #[test]
+    fn turn_separator_marks_only_a_completed_turn_boundary() {
+        let mut incomplete = ChatState::new("mock".into());
+        incomplete.push_user("first turn");
+        incomplete.push_user("not a completed boundary");
+        assert!(incomplete
+            .transcript_lines(80)
+            .iter()
+            .all(|line| !line.spans.iter().any(|span| span.content.contains('─'))));
+
+        let mut state = ChatState::new("mock".into());
+        state.push_user("first turn");
+        state.push(Entry::Tool(ToolEntry::new(
+            "read".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("read", "done".into(), false);
+        state.stream_text("first answer");
+        state.end_stream();
+        state.last_elapsed = Some(Duration::from_secs(12));
+        state.push_user("second turn");
+        state.push(Entry::Tool(ToolEntry::new(
+            "write".into(),
+            serde_json::json!({}),
+        )));
+
+        let lines = state.transcript_lines(80);
+        let boundaries: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("── 12s ──"))
+            })
+            .collect();
+        assert_eq!(boundaries.len(), 1, "one rule between the two user turns");
+        let boundary = boundaries[0];
+        assert_eq!(boundary.spans[0].content.as_ref(), GUTTER);
+        assert_eq!(boundary.spans[0].style, state.theme.muted_style());
+        assert_eq!(boundary.style, state.theme.muted_style());
+        assert!(
+            boundary
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .ends_with("── 12s ──"),
+            "the compact label is right-aligned: {boundary:?}"
+        );
+
+        let cached_again = state.transcript_lines(80);
+        assert_eq!(
+            lines, cached_again,
+            "the boundary is stable in the layout cache"
+        );
+        assert_eq!(
+            state
+                .transcript_layout
+                .borrow()
+                .as_ref()
+                .and_then(|layout| layout.entry_rows.iter().find(|(index, _, _)| *index == 3))
+                .map(|(_, _, count)| *count),
+            Some(2),
+            "the rule and prompt remain one cached entry"
+        );
+    }
+
+    #[test]
+    fn resumed_turn_separator_uses_the_durable_prior_duration() {
+        use flux_events::{AssistantMessage, EventStore, SessionLog};
+
+        let events = EventStore::in_memory().unwrap();
+        let sid = events.create_session("mock").unwrap();
+        let mut log = SessionLog::open(&events, &sid).unwrap();
+
+        log.open_turn(flux_core::Message::user_text("first turn"))
+            .unwrap();
+        let first_turn = events.begin_turn(&sid, "first turn", "mock").unwrap();
+        events
+            .end_turn(&sid, first_turn, "done", 1, "first answer", None)
+            .unwrap();
+        log.close_turn(AssistantMessage::text("first answer").unwrap())
+            .unwrap();
+
+        log.open_turn(flux_core::Message::user_text("second turn"))
+            .unwrap();
+        let second_turn = events.begin_turn(&sid, "second turn", "mock").unwrap();
+        events
+            .end_turn(&sid, second_turn, "done", 1, "second answer", None)
+            .unwrap();
+        log.close_turn(AssistantMessage::text("second answer").unwrap())
+            .unwrap();
+
+        let first = events
+            .turns(&sid)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("first durable turn");
+        let expected = Duration::from_millis(
+            first
+                .ended_at_ms
+                .expect("completed turn")
+                .saturating_sub(first.started_at_ms) as u64,
+        );
+
+        let mut state = ChatState::for_session("mock".into(), sid.clone());
+        state.project_session(&events, &sid).unwrap();
+        let second = state
+            .entries
+            .iter()
+            .find(|entry| matches!(entry, Entry::User { text, .. } if text == "second turn"))
+            .expect("second projected user turn");
+        assert!(matches!(
+            second,
+            Entry::User {
+                prior_elapsed: Some(elapsed),
+                show_separator: true,
+                ..
+            } if *elapsed == expected
+        ));
     }
 
     /// C-149: `Theme::MONO` zeroes every color field, so the rail must still read via a
@@ -7209,6 +7704,61 @@ mod tests {
         assert!(content.contains("3 steps")); // last-turn metrics in the footer
     }
 
+    #[test]
+    fn queued_footer_count_requires_a_running_action_and_a_nonempty_queue() {
+        let footer_text = |state: &ChatState| -> String {
+            state
+                .footer_line(120)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let mut state = ChatState::new("mock".into());
+
+        state.enqueue("first".into());
+        assert!(
+            !footer_text(&state).contains("queued"),
+            "an idle queue belongs in the preview, not the running footer"
+        );
+
+        state.begin_action();
+        assert!(footer_text(&state).contains("+1 queued"));
+
+        state.queue.drain();
+        assert!(
+            !footer_text(&state).contains("queued"),
+            "a running action with an empty queue must not retain a stale count"
+        );
+    }
+
+    #[test]
+    fn queued_footer_count_sheds_before_completed_turn_timing() {
+        let footer_text = |state: &ChatState, width| -> String {
+            state
+                .footer_line(width)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let mut state = ChatState::new("mock".into());
+        state.steps = 4;
+        state.last_elapsed = Some(Duration::from_secs(12));
+        state.enqueue("follow up".into());
+        state.begin_action();
+
+        let wide = footer_text(&state, 120);
+        assert!(wide.contains("4 steps · 12.0s"), "{wide}");
+        assert!(wide.contains("· +1 queued"), "{wide}");
+
+        let narrow = (24..120)
+            .map(|width| footer_text(&state, width))
+            .find(|text| text.contains("4 steps · 12.0s") && !text.contains("queued"))
+            .expect("a narrow width must shed the queue count while preserving turn timing");
+        assert!(!narrow.contains("queued"), "{narrow}");
+    }
+
     /// C-102 graceful narrow-width bars: `bar_line` drops right-side segments one at a time from
     /// the end (least-precious last) instead of clearing the whole right side at once.
     #[test]
@@ -8275,6 +8825,586 @@ mod tests {
         for off in ["", "0", "false", "no", "off", "2", "verbose"] {
             assert!(!flag_on(off), "{off:?} must be OFF");
         }
+    }
+
+    #[test]
+    fn monochrome_queue_and_session_selection_use_a_bold_marker() {
+        fn assert_selected_row(terminal: &Terminal<TestBackend>, content_marker: &str) {
+            let buffer = terminal.backend().buffer();
+            let selected_y = (0..buffer.area.height)
+                .find(|&y| {
+                    (0..buffer.area.width).any(|x| {
+                        buffer
+                            .cell((x, y))
+                            .is_some_and(|cell| cell.symbol() == content_marker)
+                    })
+                })
+                .expect("selected row content");
+            let marker = (0..buffer.area.width)
+                .find_map(|x| {
+                    buffer
+                        .cell((x, selected_y))
+                        .filter(|cell| cell.symbol() == "▸")
+                })
+                .expect("selected row marker");
+            let content = (0..buffer.area.width)
+                .find_map(|x| {
+                    buffer
+                        .cell((x, selected_y))
+                        .filter(|cell| cell.symbol() == content_marker)
+                })
+                .expect("selected row content cell");
+
+            assert!(marker.modifier.contains(Modifier::BOLD));
+            assert!(content.modifier.contains(Modifier::BOLD));
+            assert_eq!(
+                buffer
+                    .content
+                    .iter()
+                    .filter(|cell| cell.symbol() == "▸")
+                    .count(),
+                1,
+                "only the selected row carries the marker"
+            );
+        }
+
+        let mut queue = ChatState::new("mock".into());
+        queue.theme = Theme::MONO;
+        queue.enqueue("first queued prompt".into());
+        queue.enqueue("β selected queue prompt".into());
+        queue.queue_sel = 1;
+        queue.queue_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &queue)).unwrap();
+        assert_selected_row(&terminal, "β");
+
+        let mut sessions = ChatState::for_session("mock".into(), "active".into());
+        sessions.theme = Theme::MONO;
+        sessions.session_picker = Some(vec![
+            flux_events::SessionSummary {
+                id: "other".into(),
+                model: "mock".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                messages: 1,
+                context: Default::default(),
+            },
+            flux_events::SessionSummary {
+                id: "β-session".into(),
+                model: "mock".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                messages: 1,
+                context: Default::default(),
+            },
+        ]);
+        sessions.session_sel = 1;
+        terminal.draw(|frame| render(frame, &sessions)).unwrap();
+        assert_selected_row(&terminal, "β");
+    }
+
+    #[test]
+    fn ui_polish_behaviors_are_structurally_visible() {
+        // The composer keeps its glyph boundary in mono and changes only its semantic color by state.
+        let mut composer = ChatState::new("mock".into());
+        composer.theme = Theme::MONO;
+        composer.push_user("hello");
+        composer.set_input("draft");
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| render(f, &composer)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 18)).unwrap().symbol(),
+            "▍"
+        );
+
+        // A running turn advertises queued work in the footer.
+        composer.begin_action();
+        composer.enqueue("follow up".into());
+        terminal.draw(|f| render(f, &composer)).unwrap();
+        assert!(screen(&terminal).contains("+1 queued"));
+    }
+
+    #[test]
+    fn queued_previews_and_slash_descriptions_drop_only_below_sixty_columns() {
+        let file_commands = vec![test_command_file("review", "Review a PR", "<pr-number>")];
+        let mut state = ChatState::new("mock".into()).with_file_commands(file_commands);
+        state.push_user("transcript stays visible");
+        state.enqueue("queued preview boundary".into());
+        state.set_input("/rev");
+
+        let mut wide = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        wide.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&wide);
+        assert!(content.contains("queued preview boundary"), "{content}");
+        assert!(content.contains("Review a PR"), "{content}");
+
+        let mut narrow = Terminal::new(TestBackend::new(59, 16)).unwrap();
+        narrow.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&narrow);
+        assert!(content.contains("transcript stays visible"), "{content}");
+        assert!(content.contains("/review"), "{content}");
+        assert!(!content.contains("queued preview boundary"), "{content}");
+        assert!(!content.contains("Review a PR"), "{content}");
+    }
+
+    #[test]
+    fn multiline_composer_collapses_only_below_forty_columns() {
+        let composer_rows = |width| {
+            let mut state = ChatState::new("mock".into());
+            state.push_user("transcript");
+            state.set_input("line one\nline two\nline three");
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal.draw(|f| render(f, &state)).unwrap();
+            let rows = (0..terminal.backend().buffer().area.height)
+                .filter(|&y| {
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((1, y))
+                        .is_some_and(|cell| cell.bg == state.theme.composer_bg)
+                })
+                .count();
+            (rows, screen(&terminal))
+        };
+
+        let (rows, content) = composer_rows(40);
+        assert_eq!(
+            rows, 3,
+            "40 columns retain the multiline composer: {content}"
+        );
+        assert!(content.contains("line one"), "{content}");
+        assert!(content.contains("line three"), "{content}");
+
+        let (rows, content) = composer_rows(39);
+        assert_eq!(rows, 1, "39 columns force one composer row: {content}");
+        assert!(
+            content.contains("line three"),
+            "the cursor line remains usable: {content}"
+        );
+        assert!(
+            !content.contains("line one"),
+            "off-screen lines stay in the editor: {content}"
+        );
+    }
+
+    #[test]
+    fn fifty_column_layout_keeps_transcript_composer_and_footer_usable() {
+        fn row(terminal: &Terminal<TestBackend>, y: u16) -> String {
+            (0..terminal.backend().buffer().area.width)
+                .filter_map(|x| terminal.backend().buffer().cell((x, y)))
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+
+        let mut state = ChatState::new("mock".into());
+        state.push_user("transcript marker");
+        state.set_input("composer draft");
+        let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+
+        let content = screen(&terminal);
+        assert!(content.contains("transcript marker"), "{content}");
+        assert!(content.contains("composer draft"), "{content}");
+        assert!(
+            row(&terminal, 9).contains("Enter send"),
+            "{}",
+            row(&terminal, 9)
+        );
+    }
+
+    #[test]
+    fn minimum_supported_terminal_survives_overcommitted_popups() {
+        let mut state = ChatState::new("mock".into());
+        state.push_user("transcript");
+        state.enqueue("queued follow-up".into());
+        state.queue_open = true;
+        state.set_input("/");
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, 24, 6));
+    }
+
+    #[test]
+    fn interruption_seals_only_in_flight_tools_and_is_terminal() {
+        fn outcome(state: &ChatState, index: usize) -> &ToolOutcome {
+            match &state.entries[index] {
+                Entry::Tool(tool) => tool.result.as_ref().expect("terminal tool outcome"),
+                _ => panic!("expected tool entry"),
+            }
+        }
+
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "read".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("read", "loaded".into(), false);
+        let succeeded = state.entries.len() - 1;
+        state.push(Entry::Tool(ToolEntry::new(
+            "write".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("write", "denied".into(), true);
+        let failed = state.entries.len() - 1;
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({}),
+        )));
+        state.progress_tool("bash", "halfway".into());
+        let interrupted = state.entries.len() - 1;
+
+        let action_id = state.begin_action();
+        let cancel = CancellationToken::new();
+        let mut interrupted_action_id = None;
+        interrupt_active_action(&mut state, &cancel, &mut interrupted_action_id);
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(interrupted_action_id, Some(action_id));
+        assert!(!outcome(&state, succeeded).is_error && !outcome(&state, succeeded).cancelled);
+        assert!(outcome(&state, failed).is_error && !outcome(&state, failed).cancelled);
+        assert!(!outcome(&state, interrupted).is_error && outcome(&state, interrupted).cancelled);
+        assert!(match &state.entries[interrupted] {
+            Entry::Tool(tool) => tool.partial.is_empty() && state.tool_lines(tool, 80).len() == 1,
+            _ => false,
+        });
+
+        // A call already queued behind Ctrl-C is still part of the interrupted action. Its final
+        // seal happens when that action's `Finished` marker is handled.
+        state.push(Entry::Tool(ToolEntry::new(
+            "grep".into(),
+            serde_json::json!({}),
+        )));
+        let raced = state.entries.len() - 1;
+        seal_interrupted_action(&mut state, &mut interrupted_action_id);
+        assert!(outcome(&state, raced).cancelled);
+        assert_eq!(interrupted_action_id, None);
+
+        // A late result must neither replace the cancelled state nor escape as a stray notice.
+        let entry_count = state.entries.len();
+        state.finish_tool("grep", "late success".into(), false);
+        assert_eq!(state.entries.len(), entry_count);
+        assert!(outcome(&state, raced).cancelled);
+
+        let transcript: String = state
+            .transcript_lines(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(transcript.contains("✓"), "{transcript}");
+        assert!(transcript.contains("✗"), "{transcript}");
+        assert!(transcript.contains("⊘ cancelled"), "{transcript}");
+        assert!(!transcript.contains(RUNNING_BADGE), "{transcript}");
+    }
+
+    #[test]
+    fn failure_navigation_key_accepts_crossterm_shift_representations() {
+        use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        assert_eq!(
+            failure_navigation_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL,)),
+            Some(FailureNavigation::Next)
+        );
+        assert_eq!(
+            failure_navigation_key(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Some(FailureNavigation::Previous),
+            "CSI-u can preserve shift as a modifier on a lowercase character"
+        );
+        assert_eq!(
+            failure_navigation_key(KeyEvent::new_with_kind_and_state(
+                KeyCode::Char('G'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+                KeyEventState::NUM_LOCK,
+            )),
+            Some(FailureNavigation::Previous),
+            "crossterm can normalize shift into the uppercase character"
+        );
+        assert_eq!(
+            failure_navigation_key(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            None,
+            "an unrelated modified chord must remain available"
+        );
+        assert_eq!(
+            failure_navigation_key(KeyEvent::new_with_kind(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )),
+            None
+        );
+        assert_eq!(
+            failure_navigation_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT,)),
+            None
+        );
+    }
+
+    #[test]
+    fn failure_navigation_handler_cycles_centers_and_notices_when_empty() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        let next = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let previous = KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let mut state = ChatState::new("mock".into());
+        for i in 0..8 {
+            state.push_user(format!("lead-in {i}"));
+        }
+        state.push(Entry::Tool(ToolEntry::new(
+            "read".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("read", "first failure".into(), true);
+        let first = state.entries.len() - 1;
+        for i in 0..8 {
+            state.push_user(format!("between {i}"));
+        }
+        state.push(Entry::Tool(ToolEntry::new(
+            "write".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("write", "second failure".into(), true);
+        let second = state.entries.len() - 1;
+        state.push_user("tail");
+
+        let _ = state.transcript_viewport(80, 5);
+        state.unread = 3;
+        assert!(handle_failure_navigation_key(&mut state, next));
+        assert_eq!(state.focused, Some(first));
+        assert!(!state.follow);
+        assert_eq!(state.unread, 0);
+        let expected_scroll = {
+            let layout = state.transcript_layout.borrow();
+            let (_, start, count) = layout
+                .as_ref()
+                .unwrap()
+                .entry_rows
+                .iter()
+                .find(|(index, _, _)| *index == first)
+                .copied()
+                .unwrap();
+            start
+                .saturating_add(count / 2)
+                .saturating_sub(state.last_page.get() / 2)
+                .min(state.last_max_scroll.get())
+        };
+        assert_eq!(
+            state.scroll, expected_scroll,
+            "the selected card is centered"
+        );
+
+        assert!(handle_failure_navigation_key(&mut state, next));
+        assert_eq!(state.focused, Some(second));
+        assert!(handle_failure_navigation_key(&mut state, next));
+        assert_eq!(state.focused, Some(first), "next wraps at the end");
+        assert!(handle_failure_navigation_key(&mut state, previous));
+        assert_eq!(state.focused, Some(second), "previous wraps at the start");
+
+        let mut empty = ChatState::new("mock".into());
+        assert!(handle_failure_navigation_key(&mut empty, next));
+        assert!(matches!(
+            empty.entries.last(),
+            Some(Entry::Notice { text, sev: Sev::Info }) if text == "no failed tool cards"
+        ));
+        assert!(!handle_failure_navigation_key(
+            &mut empty,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        ));
+    }
+
+    #[test]
+    fn failure_navigation_cancelled_badge_and_turn_rules() {
+        let mut state = ChatState::new("mock".into());
+        state.push_user("first turn");
+        state.push(Entry::Tool(ToolEntry::new(
+            "read".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("read", "first failure".into(), true);
+        let first = state.entries.len() - 1;
+        state.push(Entry::Tool(ToolEntry::new(
+            "grep".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("grep", "ok".into(), false);
+        state.push(Entry::Tool(ToolEntry::new(
+            "write".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool("write", "second failure".into(), true);
+        let second = state.entries.len() - 1;
+        assert!(state.jump_failure(true));
+        assert_eq!(state.focused, Some(first));
+        assert!(state.jump_failure(true));
+        assert_eq!(state.focused, Some(second));
+        assert!(state.jump_failure(false));
+        assert_eq!(state.focused, Some(first));
+
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({}),
+        )));
+        state.cancel_running_tools();
+        let transcript: String = state
+            .transcript_lines(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(transcript.contains("⊘ cancelled"), "{transcript}");
+        assert!(!transcript.contains(RUNNING_BADGE), "{transcript}");
+    }
+
+    /// Accepted UI item 9: completed tool summary/detail rows get the existing panel surface in
+    /// both resolved light palettes. Headers and transcript gutters remain bare, and dark/mono
+    /// palettes keep the exact unsurfaced row shape.
+    #[test]
+    fn completed_tool_rows_use_a_surface_only_in_light_palettes() {
+        fn card(theme: Theme, is_error: bool) -> Vec<Line<'static>> {
+            let mut state = ChatState::new("mock".into());
+            state.theme = theme;
+            state.expand_tools = true;
+            state.push(Entry::Tool(ToolEntry::new(
+                "bash".into(),
+                serde_json::json!({"command": "printf 'alpha\\nbeta\\n'"}),
+            )));
+            state.finish_tool("bash", "alpha\nbeta".into(), is_error);
+            state.transcript_lines(72)
+        }
+
+        let dark = card(Theme::DARK, false);
+        let dark_rgb = card(Theme::DARK_RGB, false);
+        let mono = card(Theme::MONO, false);
+        let light = card(Theme::LIGHT, false);
+        let light_rgb = card(Theme::LIGHT_RGB, false);
+        let failed_light = card(Theme::LIGHT, true);
+
+        assert!(
+            light.len() > 2,
+            "expanded card should include summary and detail"
+        );
+        assert_eq!(light.len(), dark.len(), "surface must not add card rows");
+        assert_eq!(
+            light_rgb.len(),
+            dark_rgb.len(),
+            "surface must not add card rows"
+        );
+
+        for (theme, lines) in [
+            (Theme::LIGHT, light),
+            (Theme::LIGHT_RGB, light_rgb),
+            (Theme::LIGHT, failed_light),
+        ] {
+            let header = &lines[0];
+            assert_eq!(header.style.bg, None, "header row stays unsurfaced");
+            assert!(
+                header.spans.iter().all(|span| span.style.bg.is_none()),
+                "header and its gutter stay unsurfaced"
+            );
+            for row in &lines[1..] {
+                assert_eq!(row.style.bg, Some(theme.panel_bg));
+                assert_eq!(row.spans[0].content.as_ref(), GUTTER);
+                assert_eq!(row.spans[0].style.bg, None, "gutter stays outside the card");
+                assert!(
+                    row.spans[1..]
+                        .iter()
+                        .all(|span| span.style.bg == Some(theme.panel_bg)),
+                    "every summary/detail span gets the card surface"
+                );
+            }
+        }
+
+        for lines in [dark, dark_rgb, mono] {
+            assert!(lines.iter().all(|row| {
+                row.style.bg.is_none() && row.spans.iter().all(|span| span.style.bg.is_none())
+            }));
+        }
+
+        let mut light_state = ChatState::new("mock".into());
+        light_state.theme = Theme::LIGHT;
+        let notice = light_state.entry_lines(
+            &Entry::Notice {
+                text: "ordinary transcript entry".into(),
+                sev: Sev::Info,
+            },
+            72,
+        );
+        assert!(notice.iter().all(|row| {
+            row.style.bg.is_none() && row.spans.iter().all(|span| span.style.bg.is_none())
+        }));
+    }
+
+    #[test]
+    fn previous_session_count_includes_only_other_non_empty_sessions() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let resumable = events.create_session("mock").unwrap();
+        let abandoned = events.create_session("mock").unwrap();
+        let active = events.create_session("mock").unwrap();
+
+        flux_events::SessionLog::open(&events, &resumable)
+            .unwrap()
+            .open_turn(flux_core::Message::user_text("keep this transcript"))
+            .unwrap();
+
+        assert_eq!(previous_session_count(&events, &active).unwrap(), 1);
+        assert_eq!(previous_session_count(&events, &abandoned).unwrap(), 1);
+
+        flux_events::SessionLog::open(&events, &active)
+            .unwrap()
+            .open_turn(flux_core::Message::user_text("active transcript"))
+            .unwrap();
+        assert_eq!(
+            previous_session_count(&events, &active).unwrap(),
+            1,
+            "the active session is not advertised as resumable"
+        );
+    }
+
+    #[test]
+    fn resumable_session_hint_pluralizes_and_only_renders_for_an_empty_transcript() {
+        let mut state = ChatState::new("mock".into());
+        state.previous_sessions = 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("1 previous session · /sessions to resume"));
+        assert!(!content.contains("1 previous sessions"));
+
+        state.previous_sessions = 3;
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        assert!(screen(&terminal).contains("3 previous sessions · /sessions to resume"));
+
+        state.push_user("this session is no longer empty");
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        assert!(!screen(&terminal).contains("/sessions to resume"));
+    }
+
+    #[test]
+    fn overflow_scrollbar_and_resumable_empty_state_are_visible_while_following() {
+        let mut state = ChatState::new("mock".into());
+        for i in 0..30 {
+            state.push_user(format!("message {i}"));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((1..10).any(|y| buffer
+            .cell((59, y))
+            .is_some_and(|cell| cell.symbol() != " ")));
+
+        let mut empty = ChatState::new("mock".into());
+        empty.previous_sessions = 3;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| render(f, &empty)).unwrap();
+        assert!(screen(&terminal).contains("3 previous sessions"));
+        assert!(screen(&terminal).contains("/sessions to resume"));
     }
 
     #[test]

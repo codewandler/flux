@@ -12,6 +12,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **The terminal interface is easier to read and navigate in long sessions.** Selection remains visible
+  without color, narrow panes hide nonessential previews before they crowd out the conversation, and
+  the composer, scrollbar, queued-message count, turn separators, and cancelled actions all have clear
+  visual cues. You can jump between failed actions with Ctrl-G, and a new empty session tells you when
+  older sessions are available to resume.
+
 ## [0.44.0] - 2026-07-31
 
 ## [0.43.0] - 2026-07-31

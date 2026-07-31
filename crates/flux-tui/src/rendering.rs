@@ -85,7 +85,7 @@ fn render_empty_state_card(frame: &mut Frame, state: &ChatState, area: Rect) {
         format!("{model}  ·  {}", state.workspace_root)
     };
     let card_width = area.width.min(60);
-    let lines = vec![
+    let mut lines = vec![
         Line::styled("flux", t.accent_style().add_modifier(Modifier::BOLD))
             .alignment(Alignment::Center),
         Line::styled(
@@ -96,6 +96,23 @@ fn render_empty_state_card(frame: &mut Frame, state: &ChatState, area: Rect) {
         Line::styled("/help commands  ·  / commands  ·  @ files", t.muted_style())
             .alignment(Alignment::Center),
     ];
+    if state.previous_sessions > 0 {
+        lines.push(
+            Line::styled(
+                format!(
+                    "{} previous session{} · /sessions to resume",
+                    state.previous_sessions,
+                    if state.previous_sessions == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                t.muted_style(),
+            )
+            .alignment(Alignment::Center),
+        );
+    }
     let card = centered(area, card_width, lines.len() as u16);
     frame.render_widget(Paragraph::new(lines), card);
 }
@@ -154,7 +171,8 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     let menu_h = menu_len.min(6) as u16 + if menu_len > 6 { 1 } else { 0 };
     // A point-in-time copy: the engine may drain the shared steering queue mid-render (A-94).
     let queued = state.queue_texts();
-    let queue_h = if queued.is_empty() {
+    let narrow = frame.area().width < 60;
+    let queue_h = if queued.is_empty() || narrow {
         0
     } else {
         queued.len().min(3) as u16
@@ -172,7 +190,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     constraints.extend([
         Constraint::Length(queue_h),
         Constraint::Length(menu_h),
-        Constraint::Length(input_h),
+        Constraint::Length(if frame.area().width < 40 { 1 } else { input_h }),
         Constraint::Length(1),
     ]);
     let chunks = Layout::vertical(constraints).split(frame.area());
@@ -205,18 +223,26 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         let visible = state.transcript_viewport(transcript_area.width, transcript_area.height);
         frame.render_widget(Paragraph::new(visible), transcript_area);
 
-        // C-106: a scroll position indicator while detached from follow mode. It overlays the last
-        // column only while detached — the transcript width never changes, so the layout cache stays
-        // keyed the same across attach/detach.
-        if !state.follow && state.last_max_scroll.get() > 0 {
+        // Keep the overlaid track visible whenever content exists above the viewport. Follow mode
+        // uses a muted thumb; manual scrolling promotes it to the accent.
+        if state.last_max_scroll.get() > 0 {
             use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
             let mut bar_state = ScrollbarState::new(state.last_max_scroll.get() as usize)
-                .position(state.scroll as usize)
+                .position(if state.follow {
+                    state.last_max_scroll.get() as usize
+                } else {
+                    state.scroll as usize
+                })
                 .viewport_content_length(transcript_area.height as usize);
+            let thumb = if state.follow {
+                state.theme.muted_style()
+            } else {
+                state.theme.accent_style()
+            };
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .style(state.theme.muted_style())
-                    .thumb_style(state.theme.accent_style()),
+                    .thumb_style(thumb),
                 transcript_area,
                 &mut bar_state,
             );
@@ -237,7 +263,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     // `crate::trust`.
     panes::render_panes(frame, state, &pane_areas, bottom_area);
 
-    if !queued.is_empty() {
+    if !queued.is_empty() && !narrow {
         let mut rows: Vec<Line> = queued
             .iter()
             .take(3)
@@ -277,11 +303,14 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 } else {
                     theme.muted_style()
                 };
-                Line::from(vec![
+                let mut spans = vec![
                     Span::styled(if absolute == sel { " ▸ " } else { "   " }, style),
                     Span::styled(format!("/{}", c.name), style.add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("   {}", c.desc), style),
-                ])
+                ];
+                if !narrow {
+                    spans.push(Span::styled(format!("   {}", c.desc), style));
+                }
+                Line::from(spans)
             })
             .collect();
         // C-153: a rendered counter, matching the queue/session overlays' overflow signal.
@@ -325,9 +354,19 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         frame.render_widget(Paragraph::new(rows), menu_area);
     }
 
+    let composer =
+        Layout::horizontal([Constraint::Length(1), Constraint::Min(1)]).split(input_area);
+    frame.render_widget(
+        Paragraph::new("▍").style(if state.running() {
+            state.theme.muted_style().bg(state.theme.composer_bg)
+        } else {
+            state.theme.accent_style().bg(state.theme.composer_bg)
+        }),
+        composer[0],
+    );
     frame.render_widget(
         Block::default().style(state.theme.composer_style()),
-        input_area,
+        composer[1],
     );
     let mut input = state.input.clone();
     input.set_style(state.theme.composer_style());
@@ -338,7 +377,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             .composer_style()
             .add_modifier(Modifier::REVERSED),
     );
-    frame.render_widget(&input, input_area);
+    frame.render_widget(&input, composer[1]);
 
     frame.render_widget(
         Paragraph::new(state.footer_line(footer_area.width)),
@@ -361,16 +400,19 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             .enumerate()
             .map(|(offset, prompt)| {
                 let index = start + offset;
-                let style = if index == selected {
+                let selected_row = index == selected;
+                let style = if selected_row {
                     Style::default()
                         .fg(state.theme.accent)
                         .bg(state.theme.sel_bg)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     state.theme.panel_style()
                 };
                 Line::styled(
                     format!(
-                        " {}  {}",
+                        " {} {}  {}",
+                        if selected_row { "▸" } else { " " },
                         index + 1,
                         truncate(&prompt.replace('\n', " "), 68)
                     ),
@@ -420,6 +462,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             .enumerate()
             .map(|(offset, session)| {
                 let index = start + offset;
+                let selected_row = index == selected;
                 let marker = if session.id == state.session_id {
                     "●"
                 } else {
@@ -427,13 +470,17 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 };
                 let age = fmt_age(now_ms, session.updated_at_ms);
                 let label = format!(
-                    " {marker} {}  · {} msg · {} · {age}",
-                    session.id, session.messages, session.model
+                    " {} {marker} {}  · {} msg · {} · {age}",
+                    if selected_row { "▸" } else { " " },
+                    session.id,
+                    session.messages,
+                    session.model
                 );
-                let style = if index == selected {
+                let style = if selected_row {
                     Style::default()
                         .fg(state.theme.accent)
                         .bg(state.theme.sel_bg)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     state.theme.panel_style()
                 };

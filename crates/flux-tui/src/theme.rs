@@ -289,6 +289,15 @@ impl Theme {
         }
     }
 
+    /// Whether this palette uses the built-in light surface treatment.
+    ///
+    /// Key this off the resolved palette rather than the configured name: `NO_COLOR` can resolve
+    /// a requested light theme to [`Theme::MONO`], while both ANSI and truecolor light variants
+    /// should behave alike.
+    pub(crate) fn is_light(&self) -> bool {
+        self.base_bg == Self::LIGHT.base_bg || self.base_bg == Self::LIGHT_RGB.base_bg
+    }
+
     pub fn user_style(&self) -> Style {
         Style::default().fg(self.user).add_modifier(Modifier::BOLD)
     }

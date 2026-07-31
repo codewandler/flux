@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Improved
+
+- **The terminal UI now stays readable in monochrome, narrow panes, and long-running sessions**
+  (C-341). Selected queue and session rows have a visible marker, the composer has a focus rail,
+  overflow keeps its scrollbar, and intermediate widths deliberately shed previews and descriptions.
+  The footer exposes queued follow-ups, Ctrl-G navigates failed tool cards, interrupted operations seal
+  as cancelled, turns have compact separators, light themes give tool cards a quiet surface, and an
+  empty session points to resumable history.
+
 ## [Unreleased]
 
 ### Fixed
