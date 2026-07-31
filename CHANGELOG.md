@@ -98,6 +98,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Nine feature-gated test configurations ran under no gate at all, and one of them was already red
+  (C-308).** A test using `confirm "y", risk: high` as its *malformed* input started passing its own
+  parse step when L-96 made that spelling canonical — so `rail_reports_the_existing_parser_diagnostics`
+  failed. Nothing noticed, because nothing in the workspace enables `flux-lang`'s `cli` feature:
+  `cargo test --workspace` stayed green while the dev loop documented in that crate's own `AGENTS.md`
+  was red. It surfaced only because an unrelated implementor happened to run the documented command.
+  **The fix is the audit, not the one-line fixture change.** Enumerating every `(package, feature)`
+  pair across both workspaces — mechanically, via `comm -23` of `--list` output rather than from
+  memory — found **nine** configurations hiding tests from every gate, 43 tests in total. Eight now run
+  in CI's `check` job through `scripts/check-feature-gated-tests.sh`, which carries a ledger requiring
+  every feature to declare a disposition and **fails when one has none**, so the next feature added
+  without a gate is a named failure rather than silent decay. The nested `plugins/` workspace was
+  checked too and has no feature-gated targets; the script asserts that stays true.
+  The ninth is quarantined and visible: `flux-sdk --features plugins` is **red on an
+  authority-contract violation** — a fixture plugin declaring a process effect without process access —
+  which is pre-existing, sits on the safety envelope, and is filed as C-309 rather than fixed under
+  cover of this story. The replacement fixture is an unterminated string literal, deliberately: a
+  lexical impossibility cannot later become valid syntax the way a rejected-today *statement* can.
+
 - **The ad-hoc stream prune would have silently deleted cross-session memory (C-231).** `memory:*`
   streams carry no `streams` registry row, which is exactly what `prune_adhoc_older_than` targets —
   so an aged memory was indistinguishable from an aged scratch stream and would have been swept.

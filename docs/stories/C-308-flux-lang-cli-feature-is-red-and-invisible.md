@@ -2,7 +2,7 @@
 id: C-308
 title: "A red test hides from the workspace gate: `flux-lang --features cli` fails on main"
 pillar: Core
-status: in-progress
+status: done
 priority: 6
 areas: [flux-lang, ci]
 note: "L-96 made `confirm \"y\", risk: high` VALID canonical syntax, so a test using it as malformed input now parses and its expect_err panics. Nothing in the workspace enables flux-lang's `cli` feature, so `cargo test --workspace` is green while the dev loop documented in crates/flux-lang/AGENTS.md is red"
