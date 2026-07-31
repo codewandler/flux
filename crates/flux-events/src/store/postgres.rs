@@ -45,6 +45,7 @@ use super::{
 };
 use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
+use crate::retention::is_retained_from_adhoc_prune;
 
 /// Map any sqlx error into the shared flux error type (mirrors `sqlite.rs`'s `map_sql`).
 fn map_sql<E: std::fmt::Display>(e: E) -> Error {
@@ -679,10 +680,15 @@ impl EventBackend for PgEvents {
         // event (`HAVING MAX(ts) < cutoff`), so a still-active ad-hoc stream keeps its FULL
         // history. Select + delete in one transaction; the delete batches by stream TEXT id
         // (mirroring `delete_streams`' `= ANY($1)` shape — there are no registry rows to delete).
+        //
+        // C-231: the retained families are filtered out in Rust, through the shared
+        // `is_retained_from_adhoc_prune`, rather than as extra `NOT LIKE` clauses here — one
+        // classifier over one table, so this backend cannot drift from the other two, and the
+        // decision stays readable in `retention.rs` instead of inside a SQL string.
         let pool = self.handle.pool().clone();
         self.handle.block_on(async move {
             let mut tx = pool.begin().await.map_err(map_sql)?;
-            let expired: Vec<String> = sqlx::query_scalar(
+            let mut expired: Vec<String> = sqlx::query_scalar(
                 "SELECT stream FROM events \
                  WHERE stream NOT IN (SELECT 's_' || n FROM streams) \
                  GROUP BY stream HAVING MAX(ts) < $1",
@@ -691,6 +697,7 @@ impl EventBackend for PgEvents {
             .fetch_all(&mut *tx)
             .await
             .map_err(map_sql)?;
+            expired.retain(|stream| !is_retained_from_adhoc_prune(stream));
             if expired.is_empty() {
                 return Ok(0);
             }

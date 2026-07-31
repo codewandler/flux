@@ -36,6 +36,7 @@ use super::{
 };
 use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
+use crate::retention::is_retained_from_adhoc_prune;
 
 /// One registry row — the `streams` table's columns.
 #[derive(Clone)]
@@ -475,10 +476,13 @@ impl EventBackend for EphemeralEvents {
         // D-77: ad-hoc streams only — the ones with no registry row, which the registry-enumerating
         // prunes structurally cannot reach. The horizon is per-stream on the NEWEST event, so a
         // still-active ad-hoc stream keeps its FULL history.
+        //
+        // C-231: candidates go through the same shared `is_retained_from_adhoc_prune` the SQL
+        // backends use, so all three agree on which ad-hoc families are off limits.
         let registered: HashSet<String> = inner.streams.keys().map(|n| format!("s_{n}")).collect();
         let mut newest: HashMap<&str, i64> = HashMap::new();
         for ev in &inner.events {
-            if registered.contains(&ev.stream) {
+            if registered.contains(&ev.stream) || is_retained_from_adhoc_prune(&ev.stream) {
                 continue;
             }
             let slot = newest.entry(ev.stream.as_str()).or_insert(i64::MIN);
