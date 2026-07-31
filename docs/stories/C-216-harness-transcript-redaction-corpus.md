@@ -2,7 +2,7 @@
 id: C-216
 title: "Prove the containment — a redaction corpus over real transcript shapes, and an opt-out audit"
 pillar: Core
-status: in-progress
+status: done
 priority: 13
 epic: harness-history
 design: docs/designs/harness-history.md

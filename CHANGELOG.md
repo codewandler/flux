@@ -26,6 +26,31 @@ All notable changes to this project are documented in this file. The format is b
   distinct from the form encoder: a space is `%20`, never `+`. One private copy remains in
   `flux-plugin` and the design doc's claim to the contrary is tracked by C-313.
 
+### Changed
+
+- **The harness-history containment is now proven over the shapes transcripts actually take, not
+  only the happy path** (C-216). A corpus of six shapes across three harnesses — multi-part content
+  arrays with a credential in the *last* block, `tool_result` bodies carrying `env` output, base64
+  and PEM blobs, heredoc'd `.env` files, and prompt-injection-shaped text with three
+  `</knowledge-base>` breakout spellings — asserts four distinct properties per case: redacted,
+  escaped, dropped, and **deliberately preserved**. That last one is the anti-censorship guard: a
+  redactor that simply censored everything would fail this corpus.
+
+  The failing-first proof mutates the **shipped** redactor rather than a mirror — emptying
+  `SECRET_PREFIXES` reds three tests — and the mirrored seam the corpus needs is itself pinned two
+  ways against the real ingest path, so it cannot drift into a straw man. The opt-out audit covers
+  nine discovery branches against booby-trapped roots, so a pass is a positive filesystem
+  observation rather than an absence of error, and it fails if a fifth `HarnessEnv` key is added
+  without extending the matrix.
+
+  **No production code changed: the containment held.** What the corpus did surface is what it does
+  *not* catch — six credential shapes, now measured and recorded in both directions in
+  `docs/designs/harness-history.md`, tracked as C-315. The two sharp ones are Stripe's `sk_live_`
+  (the prefix list carries `sk-`, with a hyphen) and PEM private-key bodies (unprefixed base64), and
+  they co-occur precisely where an agent writes production config. It also found that ingest's
+  envelope retention is bounded by the *harness schema* rather than by the code — C-215's memory
+  class again — tracked as C-316.
+
 ### Fixed
 
 - **`flux app run` ignored the operator's `[limits]` table, and its review sub-agents ran with no
