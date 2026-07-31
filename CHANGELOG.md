@@ -6,6 +6,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Harness transcripts yield messages, not just token counts (C-214).** All three external usage
+  parsers already descended to the object holding the message body and took only `usage` and `model`
+  out of it — the text they walked past is what a cross-harness history search needs. `HarnessMessage`
+  (`{harness, session_id, index, role, text, model, workspace, ts_ms, path}`) now comes back from
+  **codex**, **claude-code** and **opencode**, with `role` normalised through one shared mapping
+  rather than passed through raw per adapter.
+  The engineering weight was never the parse — it is that a message record is per-message and carries
+  full text where a usage record is per-turn and carries eight integers, against directories holding
+  years of history. So the scan is bounded by **bodies**, not just files: a total extracted-bytes
+  ceiling, a per-message ceiling, and skip counts that are reported rather than swallowed, with
+  oversize and unreadable kept as separate buckets. Malformed input is skipped and counted, never
+  aborting a scan — except a database that stops yielding rows, which now propagates rather than
+  silently returning a short scan that looks complete.
+  The flux-native fourth adapter is **split out as C-302**; it needs a `flux-events` dependency and so
+  runs solo. Nothing in the tree calls this API yet, which is deliberate: it extracts, it does not
+  sanitise, and redaction-at-ingest lands with the datasource (C-215/C-216).
+
 ### Fixed
 
 - **The ad-hoc stream prune would have silently deleted cross-session memory (C-231).** `memory:*`

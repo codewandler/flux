@@ -46,6 +46,16 @@ story.
       L2, `flux-capabilities` L5 in `flux-codegate`'s `layer()` map), so no reclassification is
       needed — but run `cargo test -p flux-codegate` to prove it rather than trusting this sentence.
 - [ ] Full gate green in both workspaces.
+- [ ] **Drive-by, inherited from C-214's review:** `push_part` in
+      `crates/flux-capabilities/src/harness/message.rs` computes
+      `cap.saturating_sub(out.len()) + 1`, which **overflows when a caller sets
+      `max_message_bytes: usize::MAX`** — a plausible spelling of "no cap" on a `pub` struct with
+      `pub` fields. Debug builds panic; release wraps to 0. `saturating_add(1)` closes it. While
+      there, correct the adjoining doc: the measured clamp overshoot is **+2 ASCII / +4 for a 3-byte
+      char / +5 for a 4-byte char** (the extra byte is the `'\n'` separator when a preceding part
+      lands exactly on `cap`), not the "+1 / +4" the comment claims. The clamp itself is correct —
+      it rounds *up* to a char boundary deliberately, so a clamped body is always `> cap` and is
+      therefore always skipped rather than silently truncated.
 
 ## Notes
 

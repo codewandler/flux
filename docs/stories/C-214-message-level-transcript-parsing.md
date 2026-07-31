@@ -2,7 +2,7 @@
 id: C-214
 title: "Message-shaped extraction — keep the transcript text the usage parsers walk past"
 pillar: Core
-status: in-progress
+status: done
 priority: 11
 epic: harness-history
 design: docs/designs/harness-history.md
@@ -27,7 +27,11 @@ three orders of magnitude more output, against user directories that hold years 
 - [ ] A `HarnessMessage { harness, session_id, index, role, text, model, workspace, ts_ms, path }`
       produced by all four adapters, with `role` normalized across the harnesses' differing
       vocabularies rather than passed through raw.
-      *Three of four: codex, claude-code and opencode. The flux adapter is not here — see Progress.*
+      *Three of four: codex, claude-code and opencode. The flux-native adapter is **split out as
+      [C-302](C-302-flux-native-message-adapter.md)**, which runs solo because it needs a
+      `flux-events` dependency in `flux-capabilities` (legal — L5 → L2 — but a manifest + lockfile
+      change). This story is closed on the three EXTERNAL harnesses, which is what its Goal is
+      actually about: the text the usage parsers walk past.*
 - [x] **Failing-first, per harness**: a fixture transcript in each of the three external shapes
       (codex JSONL, claude-code JSONL, opencode SQLite) whose message text is asserted to come back
       intact — including a multi-part / structured-content message, which is where a naive
