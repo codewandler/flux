@@ -64,7 +64,8 @@ pub struct ConnectorSettings {
     pub manifest: Option<String>,
     /// Credential name (as the binding spells it, e.g. `slack.signing_secret`) → this deployment's
     /// value. Host-resolved before this struct deserializes, so write
-    /// `credentials { "slack.signing_secret" = secret "SLACK_SIGNING_SECRET" }` in the program.
+    /// `credentials { "slack.signing_secret": secret "SLACK_SIGNING_SECRET" }` in the program — a
+    /// record separates key from value with `:`, the same grammar `{ "a": 1 }` takes anywhere else.
     #[serde(default)]
     pub credentials: BTreeMap<String, String>,
 

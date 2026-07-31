@@ -408,6 +408,50 @@ verified = true
     );
 }
 
+/// `kind` and `verified` are one value the emitter writes twice, so a file where they disagree is a
+/// file someone edited. `kind = "none"` with `verified = true` is the dangerous direction: it tells
+/// anything reading the boolean alone that this endpoint is authenticated, while declaring nothing
+/// that would authenticate it.
+#[test]
+fn an_incoherent_verification_pair_is_refused() {
+    for (kind, verified) in [("none", "true"), ("connection", "false")] {
+        let (_scratch, path) = Scratch::manifest(&manifest_with(&format!(
+            r#"[[channels]]
+name = "events-api"
+transport = "webhook"
+
+[channels.verification]
+kind = "{kind}"
+verified = {verified}
+"#
+        )));
+        let text = refusal(decl(json!({ "manifest": path })));
+        assert_refused_for(&text, "cannot have been emitted");
+        assert!(
+            text.contains(&format!("verified = {verified}")),
+            "the refusal quotes the pair it refuses: {text}"
+        );
+    }
+}
+
+/// …and a coherent pair is not disturbed: the fixtures every other test in this file loads state
+/// `kind = "none", verified = false`, and an absent `verified` is "not stated" rather than `false`.
+#[test]
+fn an_unstated_verified_flag_is_not_an_assertion() {
+    let (_scratch, path) = Scratch::manifest(&manifest_with(
+        r#"[[channels]]
+name = "events-api"
+transport = "webhook"
+events = ["mention"]
+
+[channels.verification]
+kind = "none"
+"#,
+    ));
+    build_channels(&[decl(json!({ "manifest": path }))])
+        .expect("an omitted `verified` states nothing, so there is nothing to contradict");
+}
+
 /// The HMAC parameters name a credential; without this deployment's mapping the signature check
 /// would fail open on the first delivery.
 #[test]
@@ -786,6 +830,36 @@ fn a_non_loopback_bind_without_a_token_is_refused() {
     );
 }
 
+/// **An empty `token` is refused before a port is bound — on loopback too.**
+///
+/// It is not an absent token, it is a *worse* one. The bearer check compares the presented token
+/// (which is `""` when the request carries no `Authorization` header at all) against the expected
+/// one, and two empty byte strings are equal — so `Some("")` would authenticate every anonymous
+/// caller while the channel reads, everywhere it is printed, as token-protected. `token secret "K"`
+/// with `K` exported empty is the same value by a longer route: `flux_app::resolve_secrets` goes
+/// through `std::env::var`, which does not filter an empty result.
+///
+/// The refusal is asserted on **both** binds deliberately. The non-loopback case is the exposure;
+/// the loopback case is the one that would otherwise ship an operator a channel they believe is
+/// authenticated, and be promoted to a public bind later by an `addr` edit.
+#[test]
+fn an_empty_token_is_refused_before_a_port_is_bound() {
+    for token in ["", " ", "\t\n"] {
+        for addr in ["127.0.0.1:0", "0.0.0.0:8790"] {
+            let text = refusal(decl(json!({
+                "manifest": fixture("acme.connector.toml"),
+                "addr": addr,
+                "token": token,
+            })));
+            assert_refused_for(&text, "set but empty");
+            assert!(
+                text.contains("no `Authorization` header at all"),
+                "the refusal says exactly what an empty token would admit: {text}"
+            );
+        }
+    }
+}
+
 /// …and the token is what lifts that refusal, so the rule is a requirement rather than a ban on
 /// public binds.
 #[test]
@@ -840,6 +914,63 @@ journey noop
     let text = refusal_from_program(&without);
     assert_refused_for(&text, "acme.signing_secret");
     assert!(text.contains("does not map"), "{text}");
+}
+
+/// **The remediation the refusal prints must itself parse.**
+///
+/// The credential refusal hands the operator a `credentials { … }` line to paste. A Flux record
+/// separates key from value with `:`, so an `=` there is a parse error delivered at the exact moment
+/// the operator has just been told what to write — the worst possible place for a typo, and one no
+/// test of the *adapter* would ever catch.
+///
+/// So the snippet is lifted out of the error message itself and parsed, rather than restated here.
+/// A restatement would drift; this cannot.
+#[test]
+fn the_remediation_the_credential_refusal_prints_is_parseable_flux() {
+    let (_scratch, path) = Scratch::manifest(&manifest_with(&hmac_binding(
+        r#"signed = "v0:{body}"
+"#,
+    )));
+    let text = refusal(decl(json!({ "manifest": path })));
+
+    let start = text
+        .find("credentials {")
+        .unwrap_or_else(|| panic!("the refusal offers a remediation: {text}"));
+    let end = start
+        + text[start..]
+            .find('}')
+            .unwrap_or_else(|| panic!("the remediation is closed: {text}"))
+        + 1;
+    let snippet = &text[start..end];
+    assert!(
+        snippet.contains(r#"secret "KEY""#),
+        "the remediation reaches for a secret, never a literal: {snippet}"
+    );
+
+    let program = format!(
+        r#"channel support
+  kind "connector"
+  connector "acme"
+  binding "events-api"
+  addr "127.0.0.1:0"
+  {snippet}
+
+journey noop
+  flow
+    return ""
+"#
+    );
+    let module = Module::parse_str(&program)
+        .unwrap_or_else(|e| panic!("the remediation must parse: {e}\n  {snippet}"));
+    let Module::Program(program) = module else {
+        unreachable!("a program")
+    };
+    // …and it lands where the adapter reads it, as a secret marker under the credential's own name.
+    assert_eq!(
+        program.channels[0].settings["credentials"]["acme.signing_secret"],
+        json!({ "$secret": "KEY" }),
+        "the pasted remediation produces the record `ConnectorSettings::credentials` reads"
+    );
 }
 
 /// Credentials carry `secret "KEY"` references, which the host resolves before any adapter

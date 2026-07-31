@@ -78,6 +78,11 @@ const MAX_NAME_LEN: usize = 64;
 /// `description`, `base_url`, `api_version` and `module` are carried by the file and are not this
 /// adapter's business. Modelling only what is validated or used keeps "unread field" and "unenforced
 /// rule" the same thing, so a rule cannot quietly go missing behind a field nobody looks at.
+///
+/// The rule that follows from that, and the reason [`ManifestVerification::verified`] and
+/// [`ManifestEvent::when`] are modelled at all: **a field that carries a rule is read even when
+/// nothing acts on it.** `verified` is checked against `kind`; `when` is refused. Both are here
+/// because leaving a rule-carrying field unread is how an edited manifest loads without comment.
 #[derive(Debug, Deserialize)]
 struct Manifest {
     /// The connector id, checked against the `connector` setting — the file you opened must be the
@@ -104,11 +109,15 @@ struct ManifestEvent {
     /// Field equalities that narrow one coarse vendor event into this one — GitHub's single `issues`
     /// event with an `action` field becoming `issues.opened`.
     ///
-    /// Modelled **only in order to refuse it.** Matching a narrowing is v1 scope this build does not
-    /// implement, and ignoring one is not a harmless omission: the discriminator carries the *coarse*
-    /// vendor value, which is not a member of the closed event set, so every delivery of a narrowed
-    /// event would be a silent no-op that looks exactly like a vendor sending something nobody
-    /// subscribed to. A load error says so once, at startup, instead.
+    /// Modelled **only in order to refuse it** (D-222). Ignoring a narrowing is not a harmless
+    /// omission: the discriminator carries the *coarse* vendor value, which is not a member of the
+    /// closed event set, so every delivery of a narrowed event would be a silent no-op that looks
+    /// exactly like a vendor sending something nobody subscribed to. A load error says so once, at
+    /// startup, instead.
+    ///
+    /// Not a deferral: the producing repository deliberately does not emit `when` into a manifest
+    /// (`connector-cli/src/seam.rs` — *"`schema` and `when` are vendor JSON Schemas, and TOML has no
+    /// `null`"*), and no shipped manifest carries the key. There is nothing here to match.
     #[serde(default)]
     when: BTreeMap<String, toml::Value>,
 }
@@ -140,6 +149,21 @@ struct ManifestChannel {
 struct ManifestVerification {
     /// `hmac` | `none` | `connection` — the producing repository's own stable machine token.
     kind: String,
+    /// The **derived** half of the pair `connector-cli` emits (`crates/connector-cli/src/seam.rs`,
+    /// `struct ManifestVerification`: *"`kind` and `verified` are the pair `crate::inbound`
+    /// documents: a consumer reads one boolean and does not have to learn the vocabulary"*).
+    ///
+    /// Read here **only to check it against `kind`.** Because the emitter derives it, the two can
+    /// never disagree in a published file — so a file where they do disagree has been edited since
+    /// publication, which is the entire class of defect this arm exists to catch. `kind = "none"`
+    /// with `verified = true` is the dangerous direction: a manifest that says, to anything reading
+    /// the boolean alone, that this endpoint is authenticated when it declares nothing that would
+    /// authenticate it.
+    ///
+    /// `Option`, not `bool`: an absent key is "not stated", and this arm refuses an incoherent
+    /// *statement* rather than inventing a requirement that the key be present.
+    #[serde(default)]
+    verified: Option<bool>,
     #[serde(default)]
     hmac: Option<ManifestHmac>,
 }
@@ -448,6 +472,26 @@ impl ConnectorChannel {
                 s.binding
             )
         })?;
+        // `kind` and `verified` are one value emitted twice, so a file where they disagree is a file
+        // someone edited. Checked before the `kind` match so an *unknown* kind still reports itself
+        // (there is no coherent boolean to hold an unknown token to).
+        let derived = match verification.kind.as_str() {
+            "none" => Some(false),
+            "hmac" | "connection" => Some(true),
+            _ => None,
+        };
+        if let (Some(derived), Some(stated)) = (derived, verification.verified) {
+            if derived != stated {
+                anyhow::bail!(
+                    "channel `{name}`: binding `{}` states `verification.kind = \"{}\"` with \
+                     `verified = {stated}`, but a published manifest derives one from the other — \
+                     so this pair cannot have been emitted, and the file has been edited since it \
+                     was published",
+                    s.binding,
+                    verification.kind
+                );
+            }
+        }
         match verification.kind.as_str() {
             // Explicitly unverifiable: the vendor publishes no signature. Servable, and said loudly.
             "none" => {}
@@ -587,10 +631,32 @@ impl ConnectorChannel {
         })?;
         let addr = SocketAddr::from_str(addr)
             .map_err(|e| anyhow::anyhow!("channel `{name}`: bad addr `{addr}`: {e}"))?;
+        // **An empty token is not a token, and it is worse than none.**
+        //
+        // `token ""` — or `token secret "K"` where `K` is exported empty, because
+        // `flux_app::resolve_secrets` resolves through `std::env::var`, which does not filter an
+        // empty value — would otherwise arrive here as `Some("")`. The bearer check compares the
+        // *presented* token, which is `""` when the request carries no `Authorization` header at
+        // all, against the expected one; two empty byte strings are equal, so every anonymous
+        // request would authenticate. On a host that auto-approves tools that is an open
+        // remote-trigger surface presented as an authenticated one.
+        //
+        // [`authorized`] refuses an empty expected token as well, so neither half depends on the
+        // other being right. This one is the half that runs **before a port is bound**, which is
+        // the only half that can prevent the exposure rather than survive it.
+        let token = match s.token.as_deref() {
+            Some(token) if token.trim().is_empty() => anyhow::bail!(
+                "channel `{name}`: `token` is set but empty, which would authenticate every \
+                 request — including one carrying no `Authorization` header at all. Give it a \
+                 value, or remove it (a loopback bind needs none). A `secret \"KEY\"` reference \
+                 resolves to an empty string when `KEY` is exported empty."
+            ),
+            other => other.map(str::to_string),
+        };
         // The host auto-approves tools, so an open non-loopback listener is a remote-trigger
         // surface. The binding states it cannot be verified, so a bearer token is the only thing
         // left that can attribute a delivery — mirroring `WebhookChannel`'s rule exactly.
-        if !addr.ip().is_loopback() && s.token.is_none() {
+        if !addr.ip().is_loopback() && token.is_none() {
             anyhow::bail!(
                 "channel `{name}`: refusing to bind non-loopback {addr} for binding `{}`, whose \
                  verification is `none`, without a `token` (set `token secret \"KEY\"`)",
@@ -607,7 +673,7 @@ impl ConnectorChannel {
             name: decl.name.clone(),
             addr,
             path,
-            token: s.token,
+            token,
             events,
             discriminator,
             delivery_id,
@@ -813,7 +879,7 @@ fn require_credential(
         anyhow::bail!(
             "channel `{channel}`: binding `{}` names credential `{credential}`, which this \
              channel's `credentials` record does not map — add \
-             `credentials {{ \"{credential}\" = secret \"KEY\" }}`",
+             `credentials {{ \"{credential}\": secret \"KEY\" }}`",
             s.binding
         );
     }
@@ -880,6 +946,64 @@ fn validate_path(channel: &str, binding: &str, what: &str, path: &str) -> anyhow
 // The request path
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
+/// Whether a request may be delivered, given the channel's expected bearer token.
+///
+/// Two rules, and the second is the one that is easy to get wrong:
+///
+/// - **No expected token** → nothing to check. Only reachable on a loopback bind; a non-loopback one
+///   without a token is refused at load.
+/// - **An empty expected token authenticates nothing.** A request with no `Authorization` header
+///   presents `""`, and a constant-time compare of two empty byte strings is `true` — so an empty
+///   expected token would admit every anonymous caller while reading, everywhere it is printed or
+///   logged, as "this channel is token-protected". `from_decl` already refuses one before a port is
+///   bound; this is the same rule stated where the comparison happens, so a future path that reaches
+///   the handler without that constructor cannot reopen the hole.
+fn authorized(expected: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if expected.is_empty() {
+        return false;
+    }
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
+/// A bounded, char-boundary-safe, escaped rendering of a **vendor-controlled** string for a log line.
+///
+/// Three things at once, all of them required because the value comes off the wire: bounded, so a
+/// megabyte header cannot become a megabyte of log; clipped on a `char` boundary, never a byte
+/// offset, so a multi-byte value cannot panic the formatter; and rendered through `{:?}`, so an
+/// embedded newline or terminal escape cannot forge a second log line.
+fn clip(value: &str) -> String {
+    const MAX: usize = 64;
+    let mut clipped: String = value.chars().take(MAX).collect();
+    if clipped.chars().count() < value.chars().count() {
+        clipped.push('…');
+    }
+    format!("{clipped:?}")
+}
+
+/// The line a dropped delivery logs. Rendered by a free function so the claim "a logged no-op" is
+/// itself testable, without a test having to capture stderr.
+fn drop_note(channel: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!(
+            "connector channel `{channel}`: ignoring a delivery whose event {} is not one this \
+             binding declares — no trigger fired",
+            clip(value)
+        ),
+        None => format!(
+            "connector channel `{channel}`: ignoring a delivery that carries no event \
+             discriminator — no trigger fired"
+        ),
+    }
+}
+
 struct BindingState {
     name: String,
     deliverer: Arc<dyn Deliverer>,
@@ -891,21 +1015,29 @@ struct BindingState {
 }
 
 impl BindingState {
-    /// The bus label a delivery fires under.
+    /// The bus label a delivery fires under, or the log line saying why there is none.
     ///
     /// `"<channel>.<event>"` when the discriminator resolves to a **declared** event, `"<channel>"`
-    /// when the binding declares no discriminator. A value outside the closed event set returns
-    /// `None` — a logged no-op, never a label of its own and never a fallback to the bare channel
-    /// name. Without that narrowing a vendor would get to name this host's trigger labels, and
-    /// sanitising the characters does not stop that.
-    fn label(&self, headers: &HeaderMap, body: &Value) -> Option<String> {
+    /// when the binding declares no discriminator. A value outside the closed event set is an `Err`
+    /// — a *logged* no-op, never a label of its own and never a fallback to the bare channel name.
+    /// Without that narrowing a vendor would get to name this host's trigger labels, and sanitising
+    /// the characters does not stop that.
+    ///
+    /// The reason comes back as the rendered line rather than as a unit, so the drop is observable:
+    /// a silently dropped delivery and a delivery nobody sent are the same thing from outside, and
+    /// an operator debugging "my trigger never fires" has to be able to tell them apart.
+    fn label(&self, headers: &HeaderMap, body: &Value) -> Result<String, String> {
         let Some(discriminator) = &self.discriminator else {
-            return Some(self.name.clone());
+            return Ok(self.name.clone());
         };
-        let value = discriminator.read(headers, body)?;
-        self.events
-            .contains(&value)
-            .then(|| format!("{}.{value}", self.name))
+        let Some(value) = discriminator.read(headers, body) else {
+            return Err(drop_note(&self.name, None));
+        };
+        if self.events.contains(&value) {
+            Ok(format!("{}.{value}", self.name))
+        } else {
+            Err(drop_note(&self.name, Some(&value)))
+        }
     }
 
     /// The delivery payload: the binding's declared symbols, resolved against the vendor envelope.
@@ -934,21 +1066,20 @@ async fn handle(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Some(expected) = &state.token {
-        let presented = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
+    if !authorized(state.token.as_deref(), &headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
-    let Some(label) = state.label(&headers, &body) else {
-        // An event nobody declared, or one nobody subscribed to. Vendors send event types nobody
-        // asked for, and a 500 teaches them to retry forever.
-        return StatusCode::NO_CONTENT.into_response();
+    let label = match state.label(&headers, &body) {
+        Ok(label) => label,
+        Err(note) => {
+            // An event nobody declared, or one nobody subscribed to. Vendors send event types nobody
+            // asked for, and a 500 teaches them to retry forever — so it is a 204. It is still
+            // *logged*, because from the outside a dropped delivery and a delivery nobody sent look
+            // identical, and that is the difference between debugging a binding and guessing at one.
+            eprintln!("{note}");
+            return StatusCode::NO_CONTENT.into_response();
+        }
     };
     let payload = state.payload(&headers, &body);
 
@@ -989,6 +1120,74 @@ impl Channel for ConnectorChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An empty expected token authenticates nothing — least of all a request with no header.**
+    ///
+    /// The failure this pins is not a typo, it is an identity: the presented token is `""` when the
+    /// `Authorization` header is absent, so a naive `constant_time_eq(b"", b"")` returns `true`,
+    /// equal lengths and an empty loop. A channel that reads as token-protected everywhere it is
+    /// printed would then admit every anonymous caller on a host that auto-approves tools.
+    #[test]
+    fn an_empty_expected_token_authenticates_nothing() {
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ".parse().expect("a header value"),
+        );
+
+        for headers in [&HeaderMap::new(), &bearer] {
+            assert!(
+                !authorized(Some(""), headers),
+                "an empty expected token must never authorize"
+            );
+        }
+
+        // The rules either side of it, so the fix cannot have been "refuse everything".
+        assert!(
+            authorized(None, &HeaderMap::new()),
+            "no expected token is a loopback channel with nothing to check"
+        );
+        assert!(!authorized(Some("t0ken"), &HeaderMap::new()));
+        let mut good = HeaderMap::new();
+        good.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer t0ken".parse().expect("a header value"),
+        );
+        assert!(authorized(Some("t0ken"), &good));
+    }
+
+    /// The drop really is *logged*, and the line it logs is safe to log: a vendor controls the value,
+    /// so it is bounded, clipped on a `char` boundary, and escaped so it cannot forge a second line.
+    #[test]
+    fn a_dropped_delivery_logs_a_bounded_escaped_note() {
+        let note = drop_note("support", Some("not_an_event"));
+        assert!(note.contains("support"), "{note}");
+        assert!(note.contains("not_an_event"), "{note}");
+        assert!(note.contains("no trigger fired"), "{note}");
+
+        assert!(drop_note("support", None).contains("no event discriminator"));
+
+        // Multi-byte, over-long, and carrying a newline: clipped on a char boundary, and the newline
+        // escaped rather than emitted.
+        let hostile = format!("{}\nfake log line", "é".repeat(500));
+        let note = drop_note("support", Some(&hostile));
+        assert!(
+            note.len() < 300,
+            "the note is bounded: {} bytes",
+            note.len()
+        );
+        assert!(!note.contains('\n'), "no forged second line: {note}");
+        assert!(note.contains('…'), "the clip is marked: {note}");
+    }
+
+    #[test]
+    fn clip_never_splits_a_char_and_never_marks_a_short_value() {
+        assert_eq!(clip("short"), "\"short\"");
+        let long = "é".repeat(100);
+        let clipped = clip(&long);
+        assert!(clipped.ends_with("…\""), "{clipped}");
+        assert!(clipped.chars().filter(|c| *c == 'é').count() == 64);
+    }
 
     #[test]
     fn a_name_may_not_address_a_directory() {
