@@ -27,4 +27,10 @@ language-servers = ["flux-lsp"]
 [[grammar]]
 name = "flux"
 # Immutable revision containing the tested parser, queries, and Helix installer.
-source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "29cff6c992b706a4a18009f4335e81101416671a" }
+# Moving this pin is what actually reaches editors: the grammar repo had TWO landed improvements
+# (L-96 named-option headers, `permissions` declarations) that never reached anyone because the pin
+# stayed at 29cff6c. C-301's duration-suffix fix is the third.
+# Since C-334 this rev is verified against the canonical corpus: `scripts/check-tree-sitter-corpus.sh`
+# fetches exactly the rev below and parses every `examples/*.flux`, nightly. Move the pin and that
+# check moves with it — it reads this line, not the grammar repo's default branch.
+source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "2dbec53a34a840a56d0c07899a4fd4c17225f51f" }

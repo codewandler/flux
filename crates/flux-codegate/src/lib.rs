@@ -534,6 +534,9 @@ impl ImportAliases {
                     ["std", "os", "unix", "net"] => &["UnixStream", "UnixListener"],
                     ["reqwest"] => &["Client", "get"],
                     ["rusqlite"] => &["Connection"],
+                    // The SDK client roots [`pin_seams`] anchors on — a `use flux_sdk::*;` must not
+                    // make a shipped builder chain invisible to the pin census.
+                    ["flux_sdk"] => &["Client", "FlowClient"],
                     _ => &[],
                 };
                 for leaf in leaves {
@@ -625,9 +628,12 @@ fn classify_direct_io(segments: &[String]) -> Option<DirectIoApi> {
     None
 }
 
-struct DirectIoAliasCollector<'a>(&'a mut ImportAliases);
+/// Collect a production file's import, module, rename and type aliases into [`ImportAliases`].
+/// Shared by every scanner that resolves a path to its canonical spelling — nothing here is
+/// I/O-specific — so a renamed import cannot be visible to one gate and invisible to the next.
+struct ImportAliasCollector<'a>(&'a mut ImportAliases);
 
-impl<'ast> Visit<'ast> for DirectIoAliasCollector<'_> {
+impl<'ast> Visit<'ast> for ImportAliasCollector<'_> {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if !has_cfg_test(&item.attrs) {
             syn::visit::visit_item_mod(self, item);
@@ -790,7 +796,7 @@ impl<'ast> Visit<'ast> for DirectIoVisitor<'_> {
 pub fn raw_direct_io_calls(src: &str) -> syn::Result<Vec<DirectIoCall>> {
     let file = syn::parse_file(src)?;
     let mut aliases = ImportAliases::default();
-    DirectIoAliasCollector(&mut aliases).visit_file(&file);
+    ImportAliasCollector(&mut aliases).visit_file(&file);
     aliases.resolve_type_aliases();
     let mut visitor = DirectIoVisitor {
         aliases: &aliases,
@@ -1721,6 +1727,266 @@ pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
     Ok(arms.arms)
 }
 
+// ---------------------------------------------------------------------------------------------
+// The pin census (C-328). A wiring line declares, in-source, the test that dies without it.
+// ---------------------------------------------------------------------------------------------
+
+/// The builder roots a [`Seam`] may hang off: the two SDK client builders a shipped surface
+/// assembles its safety envelope through. Canonical spellings — [`ImportAliases`] resolves a
+/// renamed or glob import to these before the match.
+const PINNED_BUILDER_ROOTS: &[&[&str]] = &[
+    &["flux_sdk", "Client", "builder"],
+    &["flux_sdk", "FlowClient", "builder"],
+];
+
+/// Which wiring a [`Seam`] carries into the built client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SeamKind {
+    /// `.resource_limits(..)` — the operator's `[limits]` ceilings (C-307/C-314).
+    ResourceLimits,
+}
+
+/// The builder methods the census requires a test for, and the kind each records.
+///
+/// **Deliberately one entry.** The census is a coverage floor for wiring whose deletion has already
+/// been observed to change nothing (C-314), not a general "every builder call needs a test" rule: a
+/// predicate wide enough to cover `.model(..)` would flag twelve call sites whose observation is
+/// already implied by any end-to-end test of the surface, and a census that mostly reports noise is
+/// a census nobody reads. C-330 widens it deliberately, seam family by seam family.
+fn pinned_setter(method: &str) -> Option<SeamKind> {
+    match method {
+        "resource_limits" => Some(SeamKind::ResourceLimits),
+        _ => None,
+    }
+}
+
+/// One production wiring call site that a test is required to observe.
+///
+/// The span is a **byte range over the source that produced it**, not a line: C-329's runner
+/// excises the call to prove the pinned test actually dies, and a builder chain link can span
+/// several lines (`.resource_limits(\n    limits,\n)`). `line` is kept only so the waiver reader
+/// ([`allow_reason`](fn@crate::layer)'s sibling in the test module) can find the comment block
+/// immediately above, and so a violation reads like every other gate's.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Seam {
+    /// 1-based line of the `.method` token.
+    pub line: usize,
+    /// Byte offset of the leading `.`, inclusive.
+    pub span_start: usize,
+    /// Byte offset just past the call's closing `)`.
+    pub span_end: usize,
+    pub kind: SeamKind,
+    /// The resolved builder root the receiver chain bottoms out at, e.g. `flux_sdk::Client::builder`.
+    pub builder: String,
+    /// Nearest containing function/method, or `<module>` for a module-level initializer.
+    pub function: String,
+}
+
+impl Seam {
+    /// The seam's byte range, ready to slice out of the source it was scanned from.
+    pub fn span(&self) -> std::ops::Range<usize> {
+        self.span_start..self.span_end
+    }
+}
+
+struct PinSeamVisitor<'a> {
+    aliases: &'a ImportAliases,
+    /// Local ident → the builder root a binding holds, so a chain split across statements
+    /// (`let b = Client::builder(); b.resource_limits(..)`) is still anchored.
+    bindings: HashMap<String, String>,
+    functions: Vec<String>,
+    seams: Vec<Seam>,
+}
+
+impl PinSeamVisitor<'_> {
+    /// The builder root this chain root names: a pinned `::builder()` construction, or a local
+    /// already bound to one.
+    fn builder_root(&self, expr: &syn::Expr) -> Option<String> {
+        if let syn::Expr::Call(call) = expr {
+            let path = transparent_expr_path(&call.func)?;
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            let resolved = self.aliases.resolve(&segments);
+            let parts = resolved.iter().map(String::as_str).collect::<Vec<_>>();
+            return PINNED_BUILDER_ROOTS
+                .contains(&parts.as_slice())
+                .then(|| resolved.join("::"));
+        }
+        let syn::Expr::Path(path) = expr else {
+            return None;
+        };
+        let ident = path.path.get_ident()?.to_string();
+        self.bindings.get(&ident).cloned()
+    }
+
+    /// Walk a method-call chain from the outside in, recording every pinned setter called on a
+    /// chain whose root is an SDK client builder. Returns that root, so a `let` can bind its ident.
+    fn chain(&mut self, expr: &syn::Expr) -> Option<String> {
+        let mut calls = Vec::new();
+        let mut cursor = expr;
+        let root = loop {
+            match cursor {
+                syn::Expr::MethodCall(call) => {
+                    calls.push(call);
+                    cursor = &call.receiver;
+                }
+                syn::Expr::Reference(reference) => cursor = &reference.expr,
+                syn::Expr::Paren(paren) => cursor = &paren.expr,
+                syn::Expr::Group(group) => cursor = &group.expr,
+                syn::Expr::Try(inner) => cursor = &inner.expr,
+                other => break other,
+            }
+        };
+        let builder = self.builder_root(root)?;
+        for call in &calls {
+            let Some(kind) = pinned_setter(&call.method.to_string()) else {
+                continue;
+            };
+            self.seams.push(Seam {
+                line: start_line(call.method.span()),
+                span_start: call.dot_token.span().byte_range().start,
+                span_end: call.paren_token.span.close().byte_range().end,
+                kind,
+                builder: builder.clone(),
+                function: self
+                    .functions
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "<module>".into()),
+            });
+        }
+        // The chain itself is consumed here, so recurse only into the arguments — a nested builder
+        // inside one of them must still be seen.
+        for call in calls {
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+        }
+        if let syn::Expr::Call(call) = root {
+            for arg in &call.args {
+                self.visit_expr(arg);
+            }
+        }
+        Some(builder)
+    }
+}
+
+impl<'ast> Visit<'ast> for PinSeamVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        let Some(init) = &local.init else {
+            return;
+        };
+        let ident = simple_binding_ident(&local.pat);
+        let root = self.chain(&init.expr);
+        if root.is_none() {
+            self.visit_expr(&init.expr);
+        }
+        if let (Some(ident), Some(root)) = (ident, root) {
+            self.bindings.insert(ident, root);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if matches!(expr, syn::Expr::MethodCall(_) | syn::Expr::Call(_))
+            && self.chain(expr).is_some()
+        {
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+}
+
+/// Resolve every wiring seam in one **production** Rust source: a [`pinned_setter`] called on a
+/// method chain rooted at an SDK client builder. Imports, renamed imports, glob imports, module and
+/// type aliases, local bindings, and multiline chains are followed; `#[cfg(test)]` items, comments
+/// and strings are excluded structurally by `syn`.
+pub fn pin_seams(src: &str) -> syn::Result<Vec<Seam>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = ImportAliases::default();
+    ImportAliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_type_aliases();
+    let mut visitor = PinSeamVisitor {
+        aliases: &aliases,
+        bindings: HashMap::new(),
+        functions: Vec::new(),
+        seams: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.seams.sort();
+    Ok(visitor.seams)
+}
+
+/// Every test function name declared in one Rust source: any `fn` carrying an attribute whose last
+/// path segment is `test` (`#[test]`, `#[tokio::test(..)]`, `#[test_log::test]`).
+///
+/// Unlike the production scanners this walks **into** `#[cfg(test)]` modules — that is where most of
+/// the repo's tests live, and a pin that resolves to nothing is the drift this exists to catch.
+pub fn test_function_names(src: &str) -> syn::Result<Vec<String>> {
+    #[derive(Default)]
+    struct Tests {
+        names: Vec<String>,
+    }
+
+    fn is_test_attr(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path()
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "test")
+        })
+    }
+
+    impl<'ast> Visit<'ast> for Tests {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if is_test_attr(&item.attrs) {
+                self.names.push(item.sig.ident.to_string());
+            }
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if is_test_attr(&item.attrs) {
+                self.names.push(item.sig.ident.to_string());
+            }
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+    }
+
+    let file = syn::parse_file(src)?;
+    let mut tests = Tests::default();
+    tests.visit_file(&file);
+    tests.names.sort();
+    tests.names.dedup();
+    Ok(tests.names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1742,6 +2008,17 @@ mod tests {
         "flux-app",
     ];
     const EXTERNAL_CFG_TEST_MODULES: &[&str] = &["crates/flux-flow/src/voice/tests.rs"];
+
+    /// C-328. `// flux-pin: <test_name> [prose]` — the wiring line names the test that dies without
+    /// it. The first whitespace-delimited token is the test function name and must resolve.
+    const PIN_MARKER: &str = "flux-pin:";
+    /// `// flux-pin-exempt: <why>` — a seam deliberately left unobserved. The `flux test` replay
+    /// client is the shape this exists for: see `lab_cmd.rs`'s `offline_client` doc comment.
+    const PIN_EXEMPT_MARKER: &str = "flux-pin-exempt:";
+    /// The standing exemption budget. Zero today; one is the room a genuinely-unobservable seam may
+    /// take. A story that needs a second is a story that must widen this number in the same diff,
+    /// under review — which is the only way "exempt" stays a decision rather than a habit.
+    const MAX_PIN_EXEMPTIONS: usize = 1;
 
     /// The non-empty reason of a `// <marker> <reason>` waiver in the comment block immediately above
     /// `line`. A bare marker with no reason is not a waiver.
@@ -2991,6 +3268,306 @@ fn t() {
             "FLAGLESS_UNATTENDED_SUBCOMMANDS has drifted from `unattended_sandbox_surface`: a \
              subcommand that is unattended with no flag at all cannot be recognized in a test's \
              argv unless it is listed there"
+        );
+    }
+
+    /// A fixture with both builder roots, a renamed import, a local-binding split, a `#[cfg(test)]`
+    /// decoy and a look-alike builder from another crate — the shape
+    /// `direct_io_scanner_resolves_imports_aliases_and_all_io_families` already uses.
+    const PIN_FIXTURE: &str = r#"
+use flux_sdk::Client as C;
+use flux_sdk::FlowClient;
+
+fn record() -> C {
+    C::builder()
+        .model("m")
+        .resource_limits(limits())
+        .build(provider, ".")
+}
+
+fn review() -> FlowClient {
+    FlowClient::builder().resource_limits(limits()).build(p, ".")
+}
+
+fn split() -> FlowClient {
+    let b = flux_sdk::FlowClient::builder();
+    b.resource_limits(limits()).build(p, ".")
+}
+
+fn not_the_sdk() -> reqwest::Client {
+    reqwest::Client::builder().resource_limits(limits()).build()
+}
+
+#[cfg(test)]
+mod tests {
+    fn decoy() {
+        flux_sdk::Client::builder().resource_limits(limits());
+    }
+}
+"#;
+
+    #[test]
+    fn pin_seam_scanner_resolves_aliases_bindings_and_skips_test_items() {
+        let seams = pin_seams(PIN_FIXTURE).unwrap();
+        assert_eq!(seams.len(), 3, "{seams:?}");
+        assert_eq!(
+            seams
+                .iter()
+                .map(|s| s.function.as_str())
+                .collect::<Vec<_>>(),
+            ["record", "review", "split"],
+            "{seams:?}"
+        );
+        assert_eq!(
+            seams.iter().map(|s| s.builder.as_str()).collect::<Vec<_>>(),
+            [
+                "flux_sdk::Client::builder",
+                "flux_sdk::FlowClient::builder",
+                "flux_sdk::FlowClient::builder"
+            ],
+            "{seams:?}"
+        );
+        assert!(seams.iter().all(|s| s.kind == SeamKind::ResourceLimits));
+    }
+
+    /// C-329's runner excises the span, so it must cover the whole chain link — dot to closing
+    /// paren, receiver excluded — even when the call is spread over several lines.
+    #[test]
+    fn pin_seam_span_is_the_excisable_byte_range_of_the_whole_call() {
+        for seam in pin_seams(PIN_FIXTURE).unwrap() {
+            assert_eq!(&PIN_FIXTURE[seam.span()], ".resource_limits(limits())");
+        }
+
+        let multiline = "fn f() {\n    flux_sdk::Client::builder()\n        .resource_limits(\n            cli_limits(&cfg),\n        )\n        .build(p, \".\")\n}\n";
+        let seam = pin_seams(multiline).unwrap().pop().unwrap();
+        assert_eq!(
+            &multiline[seam.span()],
+            ".resource_limits(\n            cli_limits(&cfg),\n        )"
+        );
+        // A byte span, not a line: excising it leaves a chain that still parses.
+        let mut excised = multiline.to_string();
+        excised.replace_range(seam.span(), "");
+        assert!(syn::parse_file(&excised).is_ok(), "{excised}");
+    }
+
+    /// Mirrors `direct_io_allowance_requires_a_real_reason_immediately_above_the_call`: the waiver
+    /// reader is `allow_reason`, and a bare marker with nothing after it is not a pin.
+    #[test]
+    fn a_pin_requires_a_named_test_and_a_bare_marker_is_not_one() {
+        let pinned = "fn f() {\n    flux_sdk::Client::builder()\n        // flux-pin: a_test_name and why\n        .resource_limits(l)\n}\n";
+        let seam = pin_seams(pinned).unwrap().pop().unwrap();
+        assert_eq!(
+            pinned_test_name(pinned, seam.line).as_deref(),
+            Some("a_test_name")
+        );
+
+        let bare = pinned.replace("// flux-pin: a_test_name and why", "// flux-pin:");
+        let seam = pin_seams(&bare).unwrap().pop().unwrap();
+        assert!(pinned_test_name(&bare, seam.line).is_none());
+        assert!(allow_reason(&bare, seam.line, PIN_EXEMPT_MARKER).is_none());
+    }
+
+    /// The anti-drift half: a pin only counts when the test it names actually exists.
+    #[test]
+    fn test_name_resolution_sees_cfg_test_modules_and_attribute_forms() {
+        let source = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_plain_test() {}
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_async_test() {}
+
+    fn a_helper() {}
+}
+"#;
+        assert_eq!(
+            test_function_names(source).unwrap(),
+            ["a_plain_test", "an_async_test"]
+        );
+
+        // A pin naming something outside that universe does not resolve — the whole point.
+        let universe: BTreeSet<String> = test_function_names(source).unwrap().into_iter().collect();
+        assert!(universe.contains("a_plain_test"));
+        assert!(!universe.contains("a_test_that_was_renamed_away"));
+    }
+
+    /// The first whitespace-delimited token of a `flux-pin:` reason: the test that must die when
+    /// the seam is excised. Anything after it is prose for the reader.
+    fn pinned_test_name(source: &str, line: usize) -> Option<String> {
+        let reason = allow_reason(source, line, PIN_MARKER)?;
+        reason.split_whitespace().next().map(str::to_string)
+    }
+
+    /// What the census decides about one seam.
+    #[derive(Debug, PartialEq, Eq)]
+    enum PinVerdict {
+        /// Pinned to a test that resolves.
+        Pinned(String),
+        /// Pinned to a name no test in either workspace declares — the pin has drifted.
+        Drifted(String),
+        /// Deliberately unobserved, with a reason.
+        Exempt(String),
+        /// No marker at all: deleting the line would change nothing.
+        Unpinned,
+    }
+
+    /// The per-seam decision, factored out so [`pin_verdicts_distinguish_pinned_drifted_and_exempt`]
+    /// exercises the same code the workspace walk does rather than a fixture-shaped restatement of
+    /// it — the failure mode `guards tested against their own assumptions` names.
+    fn pin_verdict(source: &str, seam: &Seam, test_names: &BTreeSet<String>) -> PinVerdict {
+        if let Some(name) = pinned_test_name(source, seam.line) {
+            return if test_names.contains(&name) {
+                PinVerdict::Pinned(name)
+            } else {
+                PinVerdict::Drifted(name)
+            };
+        }
+        match allow_reason(source, seam.line, PIN_EXEMPT_MARKER) {
+            Some(why) => PinVerdict::Exempt(why),
+            None => PinVerdict::Unpinned,
+        }
+    }
+
+    /// The anti-drift half, on fixtures: a pin only counts when the test it names exists, an
+    /// exemption needs a reason, and neither marker means unpinned.
+    #[test]
+    fn pin_verdicts_distinguish_pinned_drifted_and_exempt() {
+        let universe: BTreeSet<String> = ["a_live_test".to_string()].into_iter().collect();
+        let site = |marker: &str| {
+            format!("fn f() {{\n    flux_sdk::Client::builder()\n        {marker}\n        .resource_limits(l)\n}}\n")
+        };
+        let verdict = |source: &str| {
+            let seam = pin_seams(source).unwrap().pop().unwrap();
+            pin_verdict(source, &seam, &universe)
+        };
+
+        assert_eq!(
+            verdict(&site("// flux-pin: a_live_test")),
+            PinVerdict::Pinned("a_live_test".into())
+        );
+        assert_eq!(
+            verdict(&site("// flux-pin: a_test_that_was_renamed_away")),
+            PinVerdict::Drifted("a_test_that_was_renamed_away".into())
+        );
+        assert_eq!(
+            verdict(&site(
+                "// flux-pin-exempt: replays are hermetic by contract"
+            )),
+            PinVerdict::Exempt("replays are hermetic by contract".into())
+        );
+        // A bare marker of either kind is not a declaration.
+        assert_eq!(verdict(&site("// flux-pin:")), PinVerdict::Unpinned);
+        assert_eq!(verdict(&site("// flux-pin-exempt:")), PinVerdict::Unpinned);
+        assert_eq!(verdict(&site("// just a comment")), PinVerdict::Unpinned);
+    }
+
+    /// **The pin census (C-328).** Every wiring seam a shipped surface assembles through an SDK
+    /// client builder names, in-source, a test that observes it — and that test resolves.
+    ///
+    /// This exists because nineteen stories found production wiring whose deletion changed nothing:
+    /// C-305 deleted two `flux-tui` lines and left 474 tests green; C-314 deleted both `[limits]`
+    /// wirings and left the whole `flux-cli` suite green. Each was answered by authoring a new
+    /// bespoke guard. This is the one mechanism that replaces guard #11.
+    ///
+    /// It is a **coverage floor, not a proof**: a pin asserts a named test exists, not that the test
+    /// dies for the right reason. C-329's runner excises each [`Seam::span`] and proves the named
+    /// test actually reds; until then the reviewer still reads the test.
+    #[test]
+    fn every_sdk_client_wiring_seam_pins_a_test_that_observes_it() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        let relative = |file: &Path| {
+            file.strip_prefix(repo_root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+
+        // The universe a pin resolves against: the integration-test sources of both workspaces plus
+        // every `#[cfg(test)]` module the production walk sees.
+        let mut test_names = BTreeSet::new();
+        let mut test_files_scanned = 0usize;
+        for file in workspace_test_files(repo_root)
+            .into_iter()
+            .chain(workspace_source_files(repo_root))
+        {
+            let source = std::fs::read_to_string(&file).unwrap();
+            test_files_scanned += 1;
+            for name in test_function_names(&source).unwrap_or_else(|error| {
+                panic!("parse {} for the pin census: {error}", relative(&file))
+            }) {
+                test_names.insert(name);
+            }
+        }
+
+        let mut violations = Vec::new();
+        let mut exemptions = Vec::new();
+        let mut scanned = 0usize;
+        let mut seams_found = 0usize;
+        for file in workspace_source_files(repo_root) {
+            let path = relative(&file);
+            let source = std::fs::read_to_string(&file).unwrap();
+            scanned += 1;
+            for seam in pin_seams(&source)
+                .unwrap_or_else(|error| panic!("parse {path} for the pin census: {error}"))
+            {
+                seams_found += 1;
+                let site = format!("{path}:{} in {}", seam.line, seam.function);
+                match pin_verdict(&source, &seam, &test_names) {
+                    PinVerdict::Pinned(_) => {}
+                    PinVerdict::Drifted(name) => violations.push(format!(
+                        "{site}: pins `{name}`, which is not a test anywhere in either workspace \
+                         — the pin has drifted from the test it names"
+                    )),
+                    PinVerdict::Exempt(why) => exemptions.push(format!("{site}: {why}")),
+                    PinVerdict::Unpinned => violations.push(format!(
+                        "{site}: `.{}(..)` on `{}` names no test — deleting this line would \
+                         change nothing",
+                        match seam.kind {
+                            SeamKind::ResourceLimits => "resource_limits",
+                        },
+                        seam.builder
+                    )),
+                }
+            }
+        }
+
+        // Anti-vacuity, in the idiom of `architecture_source_walk_covers_both_workspaces`: a census
+        // that scanned nothing, or that stopped resolving the builder roots, passes silently.
+        assert!(scanned > 300, "the pin census scanned only {scanned} files");
+        assert!(
+            test_files_scanned > 300,
+            "the pin-resolution universe scanned only {test_files_scanned} files"
+        );
+        assert!(
+            test_names.len() > 500,
+            "the pin-resolution universe found only {} test names — the collector has stopped \
+             seeing `#[cfg(test)]` modules and every pin would resolve to nothing",
+            test_names.len()
+        );
+        assert!(
+            seams_found >= 2,
+            "the pin census found {seams_found} seams — the SDK client builders have moved, been \
+             renamed, or stopped resolving, and this gate is now inert"
+        );
+        assert!(
+            exemptions.len() <= MAX_PIN_EXEMPTIONS,
+            "{} `flux-pin-exempt` seams exceed the standing budget of {MAX_PIN_EXEMPTIONS}. \
+             Exemptions are not a maintenance mode — raise the budget in the same diff, with the \
+             reason, or pin the seam:\n  {}",
+            exemptions.len(),
+            exemptions.join("\n  ")
+        );
+
+        assert!(
+            violations.is_empty(),
+            "wiring that no test observes — deleting the line would change nothing (C-314). \
+             Declare the test that dies without it with a reasoned `// flux-pin: <test_name> …` \
+             comment directly above the call, or waive it with `// flux-pin-exempt: <why>`:\n  {}",
+            violations.join("\n  ")
         );
     }
 
