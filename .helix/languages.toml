@@ -33,4 +33,4 @@ name = "flux"
 # Since C-334 this rev is verified against the canonical corpus: `scripts/check-tree-sitter-corpus.sh`
 # fetches exactly the rev below and parses every `examples/*.flux`, nightly. Move the pin and that
 # check moves with it — it reads this line, not the grammar repo's default branch.
-source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "9ea98905ef9787c30319e69fb100327c47f8eaee" }
+source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "2dbec53a34a840a56d0c07899a4fd4c17225f51f" }

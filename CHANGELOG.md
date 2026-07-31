@@ -6,6 +6,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Fixed
+
+- **The tree-sitter grammar now parses every canonical example — 166 `ERROR` nodes to zero** (C-340).
+  C-334's check had just established that the shipped grammar failed on **7 of 15** canonical
+  `.flux` files, on six construct families it never supported: bare-identifier binds
+  (`src = grep(...)`), typed bare binds, `ctx` packs, compound assignment, a column-0 `goal`
+  directive, and bare field access. Every editor that grammar backs — Helix, Neovim, Zed — showed
+  idiomatic Flux as a syntax error.
+
+  Seven commits, one per construct family, each written failing-first and re-confirmed red against a
+  reverted grammar: 166 → 76 → 74 → 73 → 72 → 12 → **0**. Verified independently by C-334's check,
+  which was written by a different author and self-tests to report 166 at the old rev.
+
+  **The `goal` directive was exactly inverted.** flux-lang treats `goal` as a declaration keyword and
+  accepts it at column 0, at module level, and after a flow body — while *rejecting* the indented
+  form, which was the only spelling the grammar accepted. Established by testing all four spellings
+  against flux-lang rather than by reading the story's assumption. That single family accounted for
+  73 of the 166 defects.
+
+  **A seventh family nobody had named:** a JSON payload inside a `"""…"""` prompt. The triple-string
+  rule admitted `"` only when a non-brace followed, so a quote against a brace errored the whole
+  string — the last 12 defects.
+
+  **The structural half matters more than the count.** The grammar repo's own three-file corpus was
+  100% clean at the identical rev while flux's was 47% broken — a second corpus that did not merely
+  permit the drift but *certified* it. That corpus is now demoted to a smoke set, and the grammar
+  repo's CI parses **flux's** corpus with no allowlist. The pin moved to `2dbec53`, which is the step
+  that reaches editors.
+
 ## [0.44.0] - 2026-07-31
 
 ## [0.43.0] - 2026-07-31
