@@ -53,8 +53,15 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings   # must be clean
 cargo fmt --all                                          # then commit the result
-cargo test -p flux-codegate                              # architecture + test-posture lints
+cargo test -p flux-codegate                              # architecture + test-posture + pin census
 ```
+
+**The pin census (C-328) is the one that catches wiring no test observes.** If you added a
+`.resource_limits(..)` to an SDK client-builder chain, it must carry a
+`// flux-pin: <test_name>` comment naming the test that dies when the line is deleted — nineteen
+stories found correct wiring whose removal changed nothing. `docs/designs/unobserved-wiring.md`
+records the predicate, what it deliberately does not cover, and why a pin is a coverage floor rather
+than a proof.
 
 CI enforces all of these. Docs-only changes may use a narrower check — say explicitly in the final
 report what was and was not run. `cargo fmt --check` must also be clean in the **nested `plugins/`
@@ -167,9 +174,10 @@ decide *before* running it:
 `flux-lang` (L0) is the **language + reference interpreter**; `flux-flow` (L3) is the **engine** and
 re-exports it as a facade. Docs map: [`crates/flux-lang/AGENTS.md`](crates/flux-lang/AGENTS.md).
 
-- **Node-kind and prelude tables are auto-generated — never hand-edit.** They flow from `Node`/`prelude` doc-comments through `schema::node_kind_catalog()`/`prelude_type_catalog()` into the reference, the flux-lang skill, and the website. Regenerate: `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` and `--test website_in_sync`.
+- **Node-kind and prelude tables are auto-generated — never hand-edit.** They flow from `Node`/`prelude` doc-comments through `schema::node_kind_catalog()`/`prelude_type_catalog()` into the reference, the flux-lang skill, and the website. Regenerate: `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync` and `--test website_in_sync`.
+- ⚠ **A regenerating run is RED on purpose, and only the exact value `1` arms it** (C-326). Every checked-in-golden guard — the two above plus `crates/flux-plugin-protocol/tests/wire_contract.rs` — reads `FLUX_UPDATE_GOLDEN`, writes its file, then **fails** with `REGENERATED <path>`: a run that wrote a golden verified nothing and must not be reportable as a passing check. Review the diff, then re-run with the variable unset to actually verify. The old spelling was `UPDATE` gated on *presence*, so an ambient `UPDATE=0` — or an empty `UPDATE=` — silently rewrote all three goldens and printed `ok`. Never gate test behaviour on `env::var(..).is_ok()`; match on the value.
 - **Still manual in the same commit:** a **new node kind** needs a hand-written section in `crates/flux-lang/docs/reference.md`; **changed semantics** need the prose + Key invariants updated.
-- ⚠ **Editor-tooling mirrors are manual, and only ONE of the four is guarded** — a new keyword or spelling change must be propagated by hand to the website Prism grammar (`website/src/theme/prism-include-languages.js`), [`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) (Helix/Neovim/Zed; also `.helix/languages.toml`), and the TextMate/IntelliJ grammars in [`codewandler/flux-editors`](https://github.com/codewandler/flux-editors). Since C-300, `crates/flux-lang/tests/named_option_headers.rs` fails when a **canonical header-option label** (`risk`, `max`, `wait`, …) is missing from the *Prism* grammar — that is the only mechanical check, and it covers neither the other three grammars nor any other kind of vocabulary. **Grep the other three after syntax work** — nothing else will tell you.
+- ⚠ **Editor-tooling mirrors are manual, and only TWO of the four are guarded** — a new keyword or spelling change must be propagated by hand to the website Prism grammar (`website/src/theme/prism-include-languages.js`), [`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) (Helix/Neovim/Zed; also `.helix/languages.toml`), and the TextMate/IntelliJ grammars in [`codewandler/flux-editors`](https://github.com/codewandler/flux-editors). Since C-300, `crates/flux-lang/tests/named_option_headers.rs` fails when a **canonical header-option label** (`risk`, `max`, `wait`, …) is missing from the *Prism* grammar — narrow, and Prism is the one mirror that can only mis-colour. Since C-334, `scripts/check-tree-sitter-corpus.sh` (nightly, `tree-sitter-corpus.yml`) fetches the rev **pinned in `.helix/languages.toml`** and fails on any `ERROR`/`MISSING` node in `examples/*.flux` — so both "nobody mirrored the change" and "the pin does not reflect the mirror" are now caught for the tree-sitter grammar. **Grep the TextMate and IntelliJ grammars after syntax work** — nothing else will tell you.
 
 ---
 

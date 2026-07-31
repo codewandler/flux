@@ -3,8 +3,17 @@
 //!  - `docs/reference.md` carries a generated `node-kinds` block (`node_kind_catalog()`).
 //!
 //! Both derive from the `Node` doc-comments via `flux_lang::schema`, so they can never drift from the
-//! types. Regenerate with: `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`
+//! types.
+//!
+//! Regenerate with:
+//! `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync`
+//! — which writes the goldens and then **fails on purpose**, so a rewrite can never be mistaken for
+//! a verified check (C-326). Re-run with the variable unset to verify.
 
+#[path = "support/golden_mode.rs"]
+mod golden_mode;
+
+use golden_mode::Mode;
 use std::path::PathBuf;
 
 const BEGIN: &str = "<!-- BEGIN generated:node-kinds -->";
@@ -16,34 +25,30 @@ fn crate_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
-fn update() -> bool {
-    std::env::var("UPDATE").is_ok()
-}
-
 #[test]
 fn skill_artifact_is_in_sync() {
     let path = crate_path("skill/SKILL.md");
     let expected = flux_lang::skill::render();
 
-    if update() {
+    if golden_mode::mode() == Mode::Rewrite {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
         }
         std::fs::write(&path, &expected)
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        return;
+        golden_mode::rewrote(&path);
     }
 
     let actual = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "read {}: {e}\nrun `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` to generate it",
+            "read {}: {e}\nrun `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync` to generate it",
             path.display()
         )
     });
     assert_eq!(
         actual, expected,
         "skill/SKILL.md is out of date — regenerate with \
-         `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
+         `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
     );
 }
 
@@ -63,15 +68,15 @@ fn reference_node_kinds_block_is_in_sync() {
     let end = content[start..].find(END).expect("END marker after BEGIN") + start + END.len();
     let expected = format!("{}{}{}", &content[..start], block, &content[end..]);
 
-    if update() {
+    if golden_mode::mode() == Mode::Rewrite {
         std::fs::write(&path, &expected)
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        return;
+        golden_mode::rewrote(&path);
     }
     assert_eq!(
         content, expected,
         "docs/reference.md node-kinds block is out of date — regenerate with \
-         `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
+         `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
     );
 }
 
@@ -98,14 +103,14 @@ fn reference_prelude_types_block_is_in_sync() {
         + END_PRELUDE.len();
     let expected = format!("{}{}{}", &content[..start], block, &content[end..]);
 
-    if update() {
+    if golden_mode::mode() == Mode::Rewrite {
         std::fs::write(&path, &expected)
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        return;
+        golden_mode::rewrote(&path);
     }
     assert_eq!(
         content, expected,
         "docs/reference.md prelude-types block is out of date — regenerate with \
-         `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
+         `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync`"
     );
 }

@@ -67,8 +67,11 @@ jobs:
       # layers. Run explicitly too so a layering regression is an obvious, named failure. Since C-266
       # this crate also owns the sandbox-posture lint on test spawns — the named check that turns "a
       # new auto-approved spawn forgot to declare its posture" into a local failure with a file:line,
-      # instead of a red CI run three pushes later.
-      - name: Architecture layering + test sandbox-posture lints
+      # instead of a red CI run three pushes later. Since C-328 it also owns the **pin census**: a
+      # wiring line on an SDK client-builder chain must name, in-source, the test that dies when it
+      # is deleted. `cargo test --workspace` above cannot catch that class by construction — the
+      # whole point is that the suite stays green when the line goes.
+      - name: Architecture layering, test sandbox-posture, and pin-census lints
         run: cargo test -p flux-codegate
 
       # C-308: `cargo test --workspace` above builds every member with its DEFAULT features, so a

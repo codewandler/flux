@@ -37,9 +37,16 @@ The `Node` enum's **doc-comments** in `src/ast.rs` are the canonical one-line no
 changing a `Node` variant or its doc-comment, regenerate:
 
 ```bash
-UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync          # language skill + docs/reference.md
-UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync        # public website tables
+FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync          # language skill + docs/reference.md
+FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync        # public website tables
 ```
+
+**Both of those runs fail on purpose.** They print `REGENERATED <path>` and exit non-zero: a run that
+wrote a golden verified nothing, so it must not be able to report `ok` (C-326 — the previous gate was
+`env::var("UPDATE").is_ok()`, which armed on *presence*, so an ambient `UPDATE=0` rewrote every golden
+and passed). Review the diff, then re-run the same command **without** `FLUX_UPDATE_GOLDEN` to verify.
+Only the exact value `1` arms it; anything else is refused rather than guessed at. The arming rule
+lives in `tests/support/golden_mode.rs` and is pinned by `tests/golden_arming.rs`.
 
 Hand-written prose (the detailed per-node sections in `docs/reference.md`, the examples in `skill.rs`)
 still needs manual updates in the same commit.
