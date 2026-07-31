@@ -2456,14 +2456,11 @@ mod tests {
 
         for (label, caps) in cases {
             let (_, spec) = plugin_tool_spec("acme", &op, &caps);
-            let requirements = flux_runtime::authority_requirements_from_declaration(
-                &spec,
-                &caps.process,
-                &[],
-            )
-            .unwrap_or_else(|err| {
-                panic!("`{label}` must project a loadable authority contract: {err}")
-            });
+            let requirements =
+                flux_runtime::authority_requirements_from_declaration(&spec, &caps.process, &[])
+                    .unwrap_or_else(|err| {
+                        panic!("`{label}` must project a loadable authority contract: {err}")
+                    });
             // Loadable is only half of it — an op that loads while requiring nothing would slip the
             // floor, which is the failure mode the effects-side fix would have introduced.
             assert!(
