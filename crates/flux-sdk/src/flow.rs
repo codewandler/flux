@@ -394,10 +394,14 @@ impl FlowClient {
         if sub_agents.limits.wall_clock.is_none() {
             sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
         }
-        sub_agents = sub_agents.with_authorization_cell(
-            self.authorization.policy().clone(),
-            self.authorization.identity(),
-        );
+        sub_agents = sub_agents
+            .with_authorization_cell(
+                self.authorization.policy().clone(),
+                self.authorization.identity(),
+            )
+            // C-299: children inherit this client's ceilings, per agent (own concurrency budget) —
+            // see `ClientBuilder::resource_limits`.
+            .with_resource_limits(self.resource_limits.clone());
         self.registry.try_register_from(
             "sdk FlowClient sub-agent task operation",
             Arc::new(TaskTool),
@@ -429,10 +433,13 @@ impl FlowClient {
         if sub_agents.limits.wall_clock.is_none() {
             sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
         }
-        sub_agents = sub_agents.with_authorization_cell(
-            self.authorization.policy().clone(),
-            self.authorization.identity(),
-        );
+        sub_agents = sub_agents
+            .with_authorization_cell(
+                self.authorization.policy().clone(),
+                self.authorization.identity(),
+            )
+            // C-299: as in `try_with_sub_agents` — children inherit this client's ceilings.
+            .with_resource_limits(self.resource_limits.clone());
         self.registry.try_register_from(
             "sdk FlowClient sub-agent task operation",
             Arc::new(TaskTool),

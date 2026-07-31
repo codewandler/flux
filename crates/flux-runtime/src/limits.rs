@@ -108,6 +108,14 @@ tokio::task_local! {
 /// is a shared handle, so every executor derived from one configured environment counts against the
 /// **same** budget rather than getting a private copy of it.
 ///
+/// **Scope of that sharing (C-299).** Clones share the budget *within one agent* — including the
+/// fresh executor a surface mints per run, which is what keeps `FlowClient::build_executor` from
+/// escaping the ceiling. A **sub-agent** is different: it gets an
+/// [`independent_copy`](Self::independent_copy), so the ceiling is **per agent**, not one budget for
+/// the whole process. That is a deliberate, safety-driven choice, not an oversight — see
+/// [`independent_copy`](Self::independent_copy) for the deadlock that sharing across the `task`
+/// boundary produces.
+///
 /// Everything is off by default — an unconfigured runtime behaves exactly as it did before C-290.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceLimits {
@@ -222,6 +230,57 @@ impl ResourceLimits {
         self.max_concurrent_tool_calls.is_none()
             && self.max_retained_result_bytes.is_none()
             && self.max_evidence_payload_bytes.is_none()
+    }
+
+    /// The same ceilings, with a **fresh concurrency budget** — the shape a sub-agent inherits
+    /// (C-299).
+    ///
+    /// Every configured value is carried over, but the semaphore is new, so the child's tool calls
+    /// are bounded by `max_concurrent_tool_calls` *independently of the parent's*. The byte ceilings
+    /// are copied for the same reason they are per-executor anyway: each agent owns its own op cache
+    /// and evidence log.
+    ///
+    /// # Why not one shared budget
+    ///
+    /// A single semaphore across parent and children is the stronger guarantee — it would bound total
+    /// process concurrency instead of per-agent concurrency — and it **deadlocks**.
+    ///
+    /// On the conversational path the outermost agent-loop op holds the permit: `execute_batch` is a
+    /// registered tool dispatched through [`Executor::dispatch`](crate::Executor::dispatch), so it
+    /// takes a slot and keeps it for the whole batch — including the `task` call inside it, and that
+    /// child's entire turn. (`task` itself takes no *additional* permit: it runs on the same Tokio
+    /// task, so the identity-keyed [`HELD_SLOTS`] exemption above gives it an inert slot. Exactly one
+    /// permit is held, not two — but one is enough.) The child, by contrast, is reached through
+    /// `SpawnTaskSupervisor::spawn`, and `HELD_SLOTS` is a task-local that does not cross
+    /// `tokio::spawn`, so the child cannot inherit that exemption: it queues behind the very call
+    /// waiting for it. At a ceiling of 1 nothing runs; in general every delegated child stalls until
+    /// the queue timeout refuses it.
+    ///
+    /// Marking the delegating op as non-occupying does not close this — and for a sharper reason than
+    /// "the op set is open-ended": the permit is not held by `task` at all, it is held by
+    /// `execute_batch`. Exempting `task` changes nothing. One would have to exempt every op that can
+    /// transitively await a sub-agent (`execute_batch`, `explore`, `ai_segment`, `flow_run`, any
+    /// authored model stage), which is the whole nested-program family and is open-ended: any future
+    /// op that runs an authored flow can contain a `task`. That invariant is unenforceable, and a
+    /// regression would surface only under saturation *and* delegation. A shared budget therefore
+    /// needs a structural mechanism (ancestry-keyed permits, or releasing a slot across any nested
+    /// dispatch), which is a design and not a wiring change.
+    ///
+    /// The honest consequence, which every doc site states: `max_concurrent_tool_calls = N` bounds
+    /// **each agent** at N, so k live sub-agents may run up to N×(k+1) tool calls at once.
+    pub fn independent_copy(&self) -> Self {
+        let mut copy = Self {
+            max_concurrent_tool_calls: self.max_concurrent_tool_calls,
+            queue_timeout: self.queue_timeout,
+            max_retained_result_bytes: self.max_retained_result_bytes,
+            max_evidence_payload_bytes: self.max_evidence_payload_bytes,
+            slots: None,
+        };
+        if let Some(n) = self.max_concurrent_tool_calls {
+            // A fresh semaphore of the same size: same ceiling, separate budget.
+            copy.slots = Some(Arc::new(Semaphore::new(n)));
+        }
+        copy
     }
 
     /// Take a concurrency slot for one tool execution, or refuse.
@@ -475,6 +534,48 @@ mod tests {
         );
         drop(held);
         assert!(clone.acquire_execution_slot().await.is_ok());
+    }
+
+    /// C-299: the shape a sub-agent inherits. `independent_copy` keeps every configured value but
+    /// mints a **fresh** semaphore, so a child never queues behind its parent — that is what makes
+    /// descending the ceiling deadlock-free, given that the agent-loop op driving the delegation
+    /// (`execute_batch`) holds a permit for the child's whole turn.
+    #[tokio::test]
+    async fn an_independent_copy_keeps_the_ceiling_but_not_the_budget() {
+        let parent = ResourceLimits::new()
+            .with_max_concurrent_tool_calls(1)
+            .with_tool_call_queue_timeout(Duration::from_millis(20))
+            .with_max_retained_result_bytes(4_096)
+            .with_max_evidence_payload_bytes(2_048);
+        let child = parent.independent_copy();
+
+        // Same ceilings, value for value.
+        assert_eq!(child.max_concurrent_tool_calls(), Some(1));
+        assert_eq!(child.tool_call_queue_timeout(), Duration::from_millis(20));
+        assert_eq!(child.max_retained_result_bytes(), Some(4_096));
+        assert_eq!(child.max_evidence_payload_bytes(), Some(2_048));
+
+        // Different budget: the parent saturated must not refuse the child.
+        let _parent_held = parent.acquire_execution_slot().await.expect("parent slot");
+        assert!(
+            parent.acquire_execution_slot().await.is_err(),
+            "the parent's own ceiling must still bind for itself"
+        );
+        assert!(
+            child.acquire_execution_slot().await.is_ok(),
+            "a child must not queue behind the parent that is waiting for it — that is the deadlock"
+        );
+    }
+
+    /// And an independent copy of an unbounded parent stays unbounded rather than inventing a
+    /// ceiling of one.
+    #[tokio::test]
+    async fn an_independent_copy_of_an_unbounded_runtime_is_unbounded() {
+        let child = ResourceLimits::new().independent_copy();
+        assert!(child.is_unbounded());
+        assert_eq!(child.max_concurrent_tool_calls(), None);
+        assert!(child.acquire_execution_slot().await.is_ok());
+        assert!(child.acquire_execution_slot().await.is_ok());
     }
 
     /// A nested dispatch inside a running tool must not queue behind the execution it belongs to.

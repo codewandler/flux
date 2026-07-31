@@ -36,8 +36,8 @@ use flux_provider::{Effort, Provider};
 use flux_runtime::{
     active_runtime_turn_context, scope_runtime_turn, ApprovalChoice, Approver,
     AuthorityRequirement, ExecutionAuthorization, Executor, IdentityCell, PermissionManager,
-    SpawnActivity, SpawnActivityEvent, SpawnActivitySink, SpawnOutcome, SpawnRequest, Spawner,
-    Tool, ToolContext, ToolRegistry, ToolResult, SPAWN_CLEANUP_GRACE,
+    ResourceLimits, SpawnActivity, SpawnActivityEvent, SpawnActivitySink, SpawnOutcome,
+    SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult, SPAWN_CLEANUP_GRACE,
 };
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
@@ -148,6 +148,10 @@ pub struct LocalSpawner {
     /// When set, child runs persist into this shared (tenant) event store instead of a throwaway
     /// in-memory one, so a sub-agent's inner tool calls land in the audit log the parent reads.
     audit: Option<Arc<EventStore>>,
+    /// C-299: the parent's resource ceilings, installed on every child executor as an
+    /// [`ResourceLimits::independent_copy`] (same numbers, own concurrency budget — a shared one
+    /// deadlocks). Default (unconfigured) leaves children unbounded, exactly as before.
+    resource_limits: ResourceLimits,
     /// Current delegation depth (0 = a top-level agent's direct child). A child is a leaf when
     /// `depth + 1 >= max_depth`. The default `max_depth = 1` keeps every sub-agent a leaf.
     depth: usize,
@@ -176,9 +180,26 @@ impl LocalSpawner {
             approver: None,
             auth: None,
             audit: None,
+            resource_limits: ResourceLimits::new(),
             depth: 0,
             max_depth: 1,
         }
+    }
+
+    /// Give every sub-agent the parent runtime's resource ceilings (C-299) — before this, a
+    /// `task`-delegated child ran on a fresh, **unbounded** executor.
+    ///
+    /// The ceiling is **per agent, not one shared budget**: each child gets a
+    /// [`ResourceLimits::independent_copy`] with the same numbers and its own concurrency semaphore.
+    /// So `max_concurrent_tool_calls = N` bounds each agent at N, and k live children may run up to
+    /// N×(k+1) tool calls at once. Sharing one semaphore across the `task` boundary deadlocks — the
+    /// agent-loop op driving the delegation (`execute_batch`) holds a permit for the child's whole
+    /// turn, and the task-local exemption that covers the nested `task` does not cross the spawn the
+    /// child is reached through. That reasoning, and why marking delegating ops does not fix it, is on
+    /// [`ResourceLimits::independent_copy`].
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
     }
 
     /// Bound spawned sub-agents by an authorization policy + resolved identity (inherited from the
@@ -274,6 +295,9 @@ impl LocalSpawner {
             approver: self.approver.clone(),
             auth: self.auth.clone(),
             audit: self.audit.clone(),
+            // C-299: the ceiling descends through nested delegation too — a grandchild counts
+            // against the same budget as the agent that started the chain.
+            resource_limits: self.resource_limits.clone(),
             depth,
             max_depth: self.max_depth,
         }
@@ -396,13 +420,24 @@ impl Spawner for LocalSpawner {
         } else {
             ExecutionAuthorization::local()
         };
+        // C-299: the child runs under the parent's ceilings instead of the unbounded default it got
+        // before. `independent_copy` — NOT `clone` — is load-bearing: a clone would share the
+        // parent's semaphore, and the agent-loop op driving this delegation (`execute_batch`, and
+        // equally `explore` / `flow_run` / a model stage) is holding a permit for this child's whole
+        // turn. The nested `task` adds no second permit — same Tokio task, so `HELD_SLOTS` exempts
+        // it — but one held permit is enough. The CHILD is reached across
+        // `SpawnTaskSupervisor::spawn`, which that task-local does not cross, so a shared semaphore
+        // would make the child queue behind the very call awaiting it: a deadlock bounded only by
+        // the queue timeout. Hence per agent — same numbers, own budget.
+        // See `ResourceLimits::independent_copy`.
         let executor = Executor::new_with_authorization(
             registry,
             PermissionManager::new(),
             approver,
             ctx,
             authorization,
-        );
+        )
+        .with_resource_limits(self.resource_limits.independent_copy());
 
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
@@ -576,6 +611,10 @@ pub struct SubAgents {
     /// Max delegation depth (default `1` = children are leaves). `> 1` is a bounded opt-in for nested
     /// delegation; see [`LocalSpawner::with_max_depth`].
     pub max_depth: usize,
+    /// C-299: the resource ceilings every sub-agent inherits (per agent, own budget). Set it with
+    /// [`with_resource_limits`](Self::with_resource_limits) — the SDK's client builders and the CLI
+    /// fill it in from what the host/operator configured, so a delegating host does not have to.
+    pub resource_limits: ResourceLimits,
 }
 
 impl SubAgents {
@@ -601,7 +640,15 @@ impl SubAgents {
             auth: None,
             audit: None,
             max_depth: 1,
+            resource_limits: ResourceLimits::new(),
         }
+    }
+
+    /// Give every sub-agent the parent runtime's resource ceilings (C-299) — **per agent**, see
+    /// [`LocalSpawner::with_resource_limits`].
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
     }
 
     /// Inherit an authorization policy + resolved identity (the parent's floor) for every sub-agent.
@@ -685,7 +732,10 @@ impl SubAgents {
         .with_reasoning(self.default_thinking, self.default_effort)
         .with_adaptive_policy(adaptive_policy)
         .with_limits(limits)
-        .with_max_depth(self.max_depth);
+        .with_max_depth(self.max_depth)
+        // C-299: carry the parent's ceilings down. Unset is `ResourceLimits::new()` (unbounded),
+        // so a host that configured nothing sees no behaviour change.
+        .with_resource_limits(self.resource_limits);
         if let Some(approver) = self.approver {
             spawner = spawner.with_approver(approver);
         }

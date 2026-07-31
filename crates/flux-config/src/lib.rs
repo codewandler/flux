@@ -831,10 +831,17 @@ pub struct Limits {
     /// per-principal and not server-side — it binds inside the safety envelope, so it applies to an
     /// embedded runtime too. `0` is read as `1`.
     ///
-    /// This whole group is consumed by an embedding host through
-    /// `flux_runtime::ResourceLimits::from_config`, which it hands to
-    /// `ClientBuilder::resource_limits`. The `flux` binary does **not** apply it yet — that wiring
-    /// is a separate change in `flux-cli`.
+    /// **Per agent, including sub-agents (C-299):** every `task`-delegated sub-agent now inherits
+    /// this ceiling too (it previously ran unbounded), but with its **own** budget rather than a
+    /// share of one — so with k live children the process may run up to N×(k+1) tool calls at once.
+    /// A single shared budget would be the stronger guarantee and deadlocks: the agent-loop op
+    /// driving the delegation (`execute_batch`) holds a permit for the child's whole turn, and the
+    /// task-local exemption that covers the nested `task` does not survive the spawn the child is
+    /// reached through. See `flux_runtime::ResourceLimits::independent_copy`.
+    ///
+    /// Applied by the `flux` binary (`flux-cli` reads this table at executor assembly) and by an
+    /// embedding host through `flux_runtime::ResourceLimits::from_config` →
+    /// `ClientBuilder::resource_limits`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_tool_calls: Option<usize>,
     /// C-290: how long a tool call waits for a concurrency slot before it is refused with an

@@ -756,10 +756,26 @@ impl ClientBuilder {
     /// defaults to 30s and is *not* clamped, so a host that sets an absurd value gets an absurd
     /// wait. Unbounded by default.
     ///
-    /// **Scope:** these ceilings cover the ops *this client's own executors* run. They do **not**
-    /// descend into sub-agents — `task`-delegated work is spawned with a fresh, unbounded executor,
-    /// so it runs in the same process without counting against this budget (C-290, recorded as
-    /// owed).
+    /// **Scope: these ceilings are PER AGENT (C-299).** They now descend into sub-agents — a
+    /// `task`-delegated child is built with them installed, at every delegation depth, where before
+    /// it ran on a fresh **unbounded** executor. But each agent gets its **own budget**, not a share
+    /// of one:
+    ///
+    /// * [`with_max_concurrent_tool_calls`](ResourceLimits::with_max_concurrent_tool_calls)`(N)`
+    ///   bounds **each agent** at N simultaneous tool calls. It is *not* a process-wide bound: with k
+    ///   live sub-agents this client's tree may be running up to N×(k+1) tool calls at once. Size it
+    ///   with the delegation fan-out in mind. One shared semaphore would be the stronger guarantee
+    ///   and it deadlocks — see [`ResourceLimits::independent_copy`] for exactly why, and why marking
+    ///   delegating ops does not rescue it.
+    /// * The byte ceilings are per agent for the plainer reason that each executor owns its own op
+    ///   cache and evidence log, so there is nothing shared to bound.
+    ///
+    /// Within one agent the ceiling *is* shared across every executor derived from it, including the
+    /// fresh one a surface mints per run — so `FlowClient::build_executor` cannot escape it.
+    ///
+    /// What is still **not** bounded is the *number* of live sub-agents; that is
+    /// [`SubAgents::max_depth`](flux_orchestrate::SubAgents::max_depth) plus whatever fan-out the
+    /// caller or model produces.
     ///
     /// A file-configured host builds the same value from `[limits]` with
     /// [`ResourceLimits::from_config`].
@@ -897,7 +913,12 @@ impl ClientBuilder {
         if let Some(sub_agents) = self.sub_agents {
             let sub_agents = sub_agents
                 .with_reasoning(spec.thinking, spec.effort)
-                .with_authorization_cell(authorization.policy().clone(), authorization.identity());
+                .with_authorization_cell(authorization.policy().clone(), authorization.identity())
+                // C-299: the ceilings descend into `task`-delegated work, which ran unbounded
+                // before. Each child receives an independent copy (same numbers, own concurrency
+                // budget) — `LocalSpawner::spawn` does that, because sharing one semaphore across
+                // the delegation boundary deadlocks.
+                .with_resource_limits(resource_limits.clone());
             let spawner = match self.sub_agent_adaptive_policy {
                 Some(policy) => {
                     sub_agents.into_spawner_with_adaptive_policy(system.clone(), policy)
