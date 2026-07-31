@@ -2,8 +2,7 @@
 id: C-310
 title: "Catalog refresh — re-project a plugin's ops without restarting flux"
 pillar: Core
-status: in-progress
-priority: 7
+status: done
 epic: connector-platform
 areas: [flux-plugin, flux-cli]
 note: "the behavior the connectors seam is built on: an op set that changes when the operator authenticates a provider. PluginProcess::manifest() is already re-callable on an open process — nothing calls it twice and nothing re-projects the registry"

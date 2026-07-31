@@ -39,6 +39,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   than one quietly overwriting the other. A stored credential can be used as a query value and stays
   hidden in logs and in anything the model can see, exactly as it does in a request header.
 
+- **You can pick up a plugin's updated set of actions without restarting flux.** Run
+  `flux plugin refresh <name>` and flux re-reads what that plugin offers and updates what your agent
+  can call. Every check that runs when a plugin is first installed runs again here — this is not a
+  shortcut around them.
+  The part worth knowing is what it will *not* do. A refresh can only ever narrow what a plugin is
+  allowed to reach, never widen it: if the updated description asks for anything beyond what you
+  granted at install, flux refuses the whole refresh and leaves the plugin exactly as it was. It also
+  refuses if the update would take over the name of an action belonging to a different plugin. In
+  both cases nothing is half-applied — you get the old state back, intact, and a message saying which
+  rule stopped it.
+  One limit today: a session that is already running keeps the set of actions it started with. The
+  refresh takes effect for the next one.
+
 - **A web request now hands back its answer in parts you can pick from, instead of one block of
   text.** You get the status, the response headers and the body separately, so a flow can reach
   straight into the body for the piece it wants — an id, a status field, an item from a list. Before

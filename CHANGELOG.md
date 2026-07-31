@@ -8,6 +8,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A plugin's catalog can be re-projected without restarting flux, and a refresh can only ever
+  narrow authority** (C-310). `flux plugin refresh <name>` re-fetches a plugin's manifest and
+  re-projects its operations into the registry, re-running every load-time check. Any *widening* of
+  the granted capabilities is refused outright.
+
+  **The refusal rule is literal on purpose**: a refreshed capability entry must appear verbatim in
+  the list granted at install. A permissive check there is a privilege escalation; a strict one is a
+  refusal that a reinstall resolves, and "must already be in the list" cannot drift as grant grammars
+  gain wildcards.
+
+  Two authority bugs were found by review and fixed at the root rather than at the symptom. First, a
+  capability **surrender**: a refreshed manifest that simply *dropped* a declaration stripped the
+  op's `access` and `AuthorityRequirement`s while the pinned host capabilities still enforced the
+  original grant — so the projection and the enforcement disagreed, in the direction that under-
+  declares. `pin_granted_authority` now pins `capabilities`, `auth`, `endpoints` and `config`, and
+  adopts only `operations`. Second, `ToolRegistry::remove` was name-keyed and **source-blind**, so a
+  refresh could evict another pack's identically-named operation — a privilege swap by collision.
+  Removal is now scoped by source, and a foreign-owned name collides and refuses the whole refresh
+  with the registry left untouched (clone-then-swap, so it fails closed in both directions).
+
+  **A running session does not yet see the result** — `Executor` owns its `ToolRegistry` by value,
+  and `execution.rs` cites A-95 prompt-cache stability as the reason the surfaced tool set must not
+  churn mid-turn. Wiring the refresh into a live session is C-318; this story delivers the mechanism
+  and the operator surface.
+
 - **`build_channels` gains a `connector` arm — a manifest binding, with every rule a load error**
   (D-216). A channel of kind `connector` resolves
   `~/.flux/connectors/<connector>.connector.toml` through `flux_system::System`, loads the named

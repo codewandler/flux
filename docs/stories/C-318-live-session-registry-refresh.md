@@ -57,6 +57,16 @@ one.
   refreshed capability entry must appear verbatim in the granted list — is strict on purpose: a
   permissive error there is a privilege escalation, a strict one is a refusal a restart resolves, and
   "must already be in the list" cannot drift as grant grammars gain wildcards.
+- ⚠ **`discovers` travels across a refresh, and this story is where that becomes a hazard.** C-310's
+  re-reviewer traced it: a refreshed manifest's `discovers` field is adopted, and today it reaches
+  nothing authority-bearing, because `ProviderEntry` snapshots `Arc<PluginManifest>` at load
+  (`crates/flux-cli/src/app_cmd.rs:240-246`) and refresh never updates it — so
+  `PluginRegistry::providers_for` (`crates/flux-capabilities/src/endpoint/broker.rs:129-138`) still
+  routes on the load-time value. **The moment this story re-registers the `ProviderEntry`, an adopted
+  `discovers` would let a plugin enlist itself as a discovery provider for a product it never claimed
+  at install.** Decide explicitly whether `discovers` joins the pinned set in `pin_granted_authority`
+  before wiring anything.
+
 - Two smaller gaps C-310 also recorded, neither belonging here: a retained op's `idempotency` and
   `group` are not covered by the weakening check (an idempotency downgrade is caught by C-191's I3 as
   a *warning* only; a group move changes surfacing breadth, not authority), and
