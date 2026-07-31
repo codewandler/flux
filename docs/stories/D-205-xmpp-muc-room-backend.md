@@ -2,7 +2,7 @@
 id: D-205
 title: XMPP MUC room backend — the portable room, no vendor and no browser
 pillar: Agent
-status: in-progress
+status: done
 priority: 4
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -117,3 +117,24 @@ settings, the failure posture, and the stale "rooms are not a channel yet" known
   Only `ANONYMOUS` is offered on JaaS; `PLAIN` with the JWT as password is refused `<invalid-mechanism/>`.
 - Prefer an existing Rust XMPP crate over hand-rolling the parser, but keep the surface to what `Room`
   needs — flux does not want a general XMPP client in its dependency tree.
+
+- 2026-07-31 — integrated, reviewed `PASS`. The review verified the two claims that mattered rather
+  than accepting them: **egress** has exactly one dial site and the dialled URL is rebuilt from the
+  guard's own normalized answer, so the vetted authority and the dialled authority cannot diverge;
+  and the **dependency** claim was checked against `Cargo.lock`, not the manifest — `quick-xml` is the
+  only new `[[package]]`, and `native-tls`/`openssl`/`rustls` hunks are absent, so no second TLS stack
+  was linked. `cargo deny --offline check licenses` passes.
+  ⚠ **Four things carried forward, none blocking, two of which the next room story should fix:**
+  - **Outbound text is escaped for the five XML metacharacters but not filtered for codepoints XML 1.0
+    forbids outright** (e.g. `\u{1}`). A control character in a model reply produces a frame a real
+    server rejects — the same "one bad frame kills the stream" class the spike already paid for once —
+    and there is no test. This is the highest-value follow-up here.
+  - `quick-xml = "0.41"` is declared **bare** in `crates/flux-channels/Cargo.toml`, the only normal
+    dependency in any workspace crate not declared `workspace = true`. A second crate wanting it will
+    drift.
+  - The endpoint URL is rendered verbatim into two error strings and into `XmppConfig`'s `Debug`, while
+    `password`/`muc_password` are redacted beside it. Harmless for a generic MUC; **D-206 mints tokens
+    that ride the endpoint URL**, so that asymmetry needs a decision no later than that story.
+  - The egress guard is not connection-pinned, so DNS rebinding stays open. Consistent with
+    `flux-web/src/browser.rs`'s precedent and unreachable from model output today — `RoomSettings`
+    comes from a parse-time literal in the program, with only `secret "KEY"` resolution in between.

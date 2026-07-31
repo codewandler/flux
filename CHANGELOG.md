@@ -8,6 +8,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **An XMPP MUC room backend — flux can sit in a real multi-party room, with no browser and no vendor
+  SDK (D-205).** `XmppMucRoom` implements D-204's `Room` port over an RFC 7395 WebSocket: SASL,
+  resource bind, MUC presence join, occupant tracking from presence, `groupchat` and private messages,
+  leave. Registered as `backend = "xmpp"`, so any standards-compliant server (prosody, ejabberd, a JaaS
+  tenant) works.
+  **The dependency choice is a safety decision, not a preference.** `tokio-xmpp` was rejected because
+  it opens its own TCP socket and resolves its own DNS — its egress could not be routed through
+  `flux_system::net::guard_url_scoped`, which would have meant either a bypass or a second URL guard,
+  and the invariant forbids both. What landed instead is `quick-xml`, a *parser*, with the protocol
+  written here as ~200 lines of element tree. It is the only new package in the lockfile; no second TLS
+  stack was linked.
+  Two RFC 7395 traps from the live spike are now regression tests asserted against the **raw frames the
+  server reads**: every stanza is `jabber:client`-qualified (prosody answers `<unsupported-stanza-type/>`
+  and kills the stream otherwise), and the keepalive is an XMPP ping IQ, never a whitespace frame (`" "`
+  is closed with `1007`). The room JID case comes from the server, because JaaS lowercases the room
+  while the JWT keeps the original case.
+  It also closes the two latent defects D-204's review handed it, both unreachable while `MockRoom` was
+  the only backend: `leave()` now runs on **every** path out including a failed send, and a join failure
+  is distinguished from a post-join session failure so one dead room no longer tears down every other
+  channel. Self-echo is suppressed by two independent signals and re-checked in the driver, pinned by a
+  backend that deliberately forgets to set `is_self` — an agent answering its own messages in a room is
+  an unbounded cost loop.
+  ⚠ **`address_rule` is still carried and unenforced (D-207), so the agent answers every line said in
+  the room.** That was theoretical under `MockRoom` and is a live cost now.
+
 - **Flux Glyph — an indented opcode projection of a Flux AST, for agents (L-97).** A DraftAst renders
   as a compact indented notation with a fourteen-opcode vocabulary and an `@{…}` escape for anything
   outside it, reachable via `flux_lang::glyph` and the `fluxlang glyph` / `unglyph` subcommands.
