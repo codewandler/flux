@@ -239,7 +239,7 @@ fn is_safe_for_multiline_spelling(s: &str) -> bool {
 /// enabled, the string contains a newline, and it is safe to spell that way (see
 /// [`is_safe_for_multiline_spelling`]); the standard escaped JSON string otherwise. Deterministic —
 /// the string's own content is the only input to the choice, never configuration.
-fn compact_str(s: &str, multiline: bool) -> String {
+pub(crate) fn compact_str(s: &str, multiline: bool) -> String {
     if multiline && s.contains('\n') && is_safe_for_multiline_spelling(s) {
         format!("\"\"\"{s}\"\"\"")
     } else {
@@ -288,7 +288,7 @@ fn fmt_string_list(items: &[String]) -> String {
 /// names (a non-identifier `$var`, an invalid op name, an op literally named `fmt` whose paren form
 /// would reparse as the `Fmt` node) also fall back to `@json`. `multiline` enables the `"""…"""`
 /// string spelling (L-39) inside any `Lit`/`Fmt`/template string leaf.
-fn fmt_expr(node: &Node, multiline: bool) -> String {
+pub(crate) fn fmt_expr(node: &Node, multiline: bool) -> String {
     match node {
         Node::Var { name } if name.is_identifier() => fmt_symbol(name),
         Node::Lit { value } => compact_value(value, multiline),
@@ -449,7 +449,7 @@ fn node_is_dynamic(node: &Node) -> bool {
 
 /// Whether a string is a single bare word (no whitespace) — used to decide whether `retry`'s free-form
 /// `backoff` field can be spelled natively (else the whole node falls through to `@json`).
-fn is_word_token(s: &str) -> bool {
+pub(crate) fn is_word_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -470,7 +470,7 @@ fn all_idents(syms: &[SymbolName]) -> bool {
 /// [`TypeRef`]. A `Named` label that collides with a builtin (`Any`/`Bool`/`Number`/`String`) or
 /// leaves the decl-name charset (spaces, `=`, `<`, `#`, …) would reparse as something else — the
 /// node carrying it falls back to `@json` instead.
-fn is_spellable_type(ty: &TypeRef) -> bool {
+pub(crate) fn is_spellable_type(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::Any | TypeRef::Bool | TypeRef::Number | TypeRef::String => true,
         TypeRef::List(inner) => is_spellable_type(inner),
@@ -656,7 +656,7 @@ fn selector_word_value(s: &crate::ast::Selector) -> (&'static str, &String) {
     }
 }
 
-fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut String) {
+pub(crate) fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut String) {
     let ind = indent_of(level, indent);
     match node {
         Node::Bind {

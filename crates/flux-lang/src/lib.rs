@@ -9,6 +9,8 @@
 //! - [`render`] — the AST pretty-printer (human-auditable projections).
 //! - [`format`] / [`parse`] — the canonical compact **text syntax** (the round-trippable `.flux`
 //!   surface): `parse(&format(&ast)) == ast` for every `DraftAst`. Distinct from `render` (one-way).
+//! - [`glyph`] — **Flux Glyph**, the compact indented opcode *projection* of the same AST, selected
+//!   explicitly (never sniffed) and round-trippable in its own right.
 //! - [`analyze`] — the validator, working against an abstract [`opspec::OpCatalog`] (no knowledge of
 //!   any concrete tool registry).
 //! - [`opspec`] — the typed operation spec/signature and the [`opspec::OpCatalog`] seam.
@@ -37,6 +39,7 @@ pub mod error;
 pub mod expr;
 pub mod format;
 pub mod format_cst;
+pub mod glyph;
 pub mod highlight;
 pub mod host;
 pub mod lexer;
