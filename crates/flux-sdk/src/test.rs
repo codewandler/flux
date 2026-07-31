@@ -154,6 +154,34 @@ pub(crate) fn canonical_request(req: &Request) -> serde_json::Value {
 /// differ only in a secret value that redacts to the same placeholder still match. Returns the
 /// redacted value (safe to persist) and its hash. `pub(crate)`: shared with D-176's
 /// `ServingProvider`.
+///
+/// **The re-parse fails closed (C-339).** Redaction here is a substitution over the *serialized*
+/// canonical request, so it can desynchronize the document it rewrites: a registered all-digit
+/// credential (`216216`) that occurs inside a longer JSON number (`1216216789`) splices
+/// `[redacted]` into the middle of a numeric literal and the result no longer parses. This used to
+/// end in `.unwrap_or(canonical)` — which returned the **original, unredacted** request, so the
+/// worse the mangling the more certain the leak, and the value went straight to disk in
+/// `model.jsonl`/`judge.jsonl`. A redactor that cannot produce a safe value must refuse, not shrug.
+///
+/// "Closed" here is the whole value collapsing to [`REDACTION_MARKER`], and the two alternatives
+/// were rejected for concrete reasons:
+///
+/// - **`Err`** — loud, and safe, but it destroys a live recording *after* the model call has been
+///   paid for, at a point the caller cannot act on (the credential is in the request they
+///   authored). `record()` would fail wholesale over one node.
+/// - **An empty body** (`Value::Null`, `{}`) — indistinguishable from a request that genuinely had
+///   nothing there, which is the same ambiguity C-323 rejected sentinel numbers and `null` for on
+///   the response side.
+///
+/// The marker keeps `record()`/`judge()` working and keeps the fixture *replayable*: `hash` is
+/// computed over the redacted text either way, and `ServingProvider` recomputes exactly the same
+/// text for the same request, so a `check()` re-drive still matches. What is lost is the record's
+/// human-inspectable `request` — for precisely those records whose only other content would have
+/// been a credential.
+///
+/// The durable fix is to redact the parsed `serde_json::Value` node-by-node (C-323's shape) so the
+/// document can never desynchronize at all; that needs the shared total-walk C-338 owns, which is
+/// why this is a fail-closed boundary rather than a fifth hand-rolled walker.
 pub(crate) fn redact_and_hash_request(
     req: &Request,
     redactor: &Redactor,
@@ -162,8 +190,8 @@ pub(crate) fn redact_and_hash_request(
     let canonical_str = serde_json::to_string(&canonical)?;
     let redacted_str = redactor.redact(&canonical_str);
     let hash = flux_lang::runtime::sha256_hex(&redacted_str);
-    let redacted_value: serde_json::Value =
-        serde_json::from_str(&redacted_str).unwrap_or(canonical);
+    let redacted_value: serde_json::Value = serde_json::from_str(&redacted_str)
+        .unwrap_or_else(|_| serde_json::Value::String(REDACTION_MARKER.to_string()));
     Ok((redacted_value, hash))
 }
 
@@ -1244,6 +1272,76 @@ pub(crate) fn plain_diff_lines(diff: &RunDiff, texts: &HashMap<String, String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request carrying `secret` as an all-digit value inside a prior tool call's JSON input —
+    /// C-323's shape, and the one credential spelling that registration is the *only* recourse for
+    /// (no vendor prefix marks it, and the contextual `NAME=VALUE` rule requires a letter).
+    ///
+    /// The digits land in a `serde_json` **number**, so a text-level substitution over the
+    /// serialized canonical request splices `[redacted]` into the middle of a numeric literal and
+    /// the document stops parsing. That is the reachable route into `redact_and_hash_request`'s
+    /// failure path.
+    fn request_with_a_numeric_credential(secret: i64) -> Request {
+        use flux_core::Message;
+
+        let mut req = Request::new("test-model", "look up my account");
+        req.messages
+            .push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "billing.lookup".to_string(),
+                input: serde_json::json!({ "account_id": secret }),
+            }]));
+        req
+    }
+
+    /// C-339: redaction that cannot produce a parseable document must not hand back the input.
+    ///
+    /// Before the fix `redact_and_hash_request` did `serde_json::from_str(&redacted_str)
+    /// .unwrap_or(canonical)` — so the worse the text-level substitution mangled the JSON, the more
+    /// certain it was to return the ORIGINAL request with the credential intact, and that value is
+    /// what `record()`/`judge()` write to `model.jsonl`/`judge.jsonl`.
+    #[test]
+    fn a_redaction_that_stops_parsing_never_returns_the_unredacted_request() {
+        let redactor = Redactor::new();
+        // 216216 registered, 1216216789 in the document: the substitution lands mid-number.
+        redactor.try_add_secret("216216").expect("above the floor");
+        let req = request_with_a_numeric_credential(1_216_216_789);
+
+        let (redacted, _hash) = redact_and_hash_request(&req, &redactor).expect("canonicalizes");
+        let rendered = serde_json::to_string(&redacted).expect("re-serializes");
+
+        assert!(
+            !rendered.contains("216216"),
+            "the redactor's registered value survived into the persisted record: {rendered}"
+        );
+        assert!(
+            !rendered.contains("1216216789"),
+            "the unredacted account id survived into the persisted record: {rendered}"
+        );
+    }
+
+    /// The other half of the contract: failing closed must not cost every *ordinary* request its
+    /// inspectable canonical shape. A request whose redaction leaves the document parseable (the
+    /// overwhelmingly common case, including one where a string leaf really was redacted) keeps its
+    /// full object form and its hash.
+    #[test]
+    fn a_redaction_that_still_parses_keeps_the_canonical_object() {
+        let redactor = Redactor::new();
+        redactor
+            .try_add_secret("topsecretvalue")
+            .expect("above the floor");
+        let req = Request::new("test-model", "the key is topsecretvalue, use it");
+
+        let (redacted, _hash) = redact_and_hash_request(&req, &redactor).expect("canonicalizes");
+
+        assert!(
+            redacted.is_object(),
+            "an uncorrupted redaction must keep the canonical object: {redacted}"
+        );
+        let rendered = serde_json::to_string(&redacted).expect("re-serializes");
+        assert!(!rendered.contains("topsecretvalue"), "{rendered}");
+        assert!(rendered.contains(REDACTION_MARKER), "{rendered}");
+    }
 
     /// D-184: a plain unit fixture for `Report`, isolated from the async engine plumbing —
     /// constructing every field directly (this module, unlike a downstream crate, isn't blocked by
