@@ -19,11 +19,17 @@
 //! collector, or a collector with a plaintext HTTP receiver (the common `4318` default). A TLS or
 //! gRPC transport is future work, not silently promised here.
 //!
-//! Every free-text value that lands in a span/metric attribute is passed through the caller's
+//! Every free-text value that lands in a **span** attribute is passed through the caller's
 //! [`Redactor`] first — the same scrub every other observation surface applies before content
 //! leaves the process (C-164's precedent). This exporter never reads the raw conversation; it only
 //! reads what other subsystems already redacted before persisting it, plus a handful of
 //! provider/model/outcome strings that are redacted again here as defense in depth.
+//!
+//! ⚠ **The metrics half does not do this** (C-344). [`build_metrics`] takes no [`Redactor`] at all,
+//! so its `model` attribute ships verbatim — the one value the trace side scrubs and the metrics
+//! side does not. This paragraph used to claim "span/metric"; the claim was never true, and C-339's
+//! audit narrowed it rather than leave the module asserting a guarantee it does not provide.
+//! Closing the gap changes a published `pub fn`'s signature, which is why it is its own story.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -98,6 +104,32 @@ fn span_id_for(stream: &str, seq: i64, qualifier: &str) -> String {
     hex[..16].to_string()
 }
 
+/// Scrub a **free-form** span attribute — one whose content originates with the model, the provider
+/// or a tool, and can therefore carry credential material. The other **span** attributes are
+/// deliberately not routed through here, and C-339 audited why:
+///
+/// Scope, stated because the audit's boundary is load-bearing: this covers [`build_trace`] only.
+/// [`build_metrics`] takes no [`Redactor`] and is **not** audited clean — see C-344 and the ⚠ in
+/// the module header.
+///
+/// - **Numeric attributes are not the C-323 hole.** C-323's defect was a walker over *arbitrary*
+///   vendor JSON that narrowed by node kind, so an all-digit credential the vendor happened to send
+///   as a number escaped. Nothing here walks arbitrary JSON: every [`AttrValue::Int`] this module
+///   emits is read as an `i64` from a *named* key of flux's own schema — `turn.id`,
+///   `turn.iterations`, `plan.step`, `call.duration_us`, `call.retries`, `call.oauth_refreshes`,
+///   `call.transport_fallbacks`, `call.ttft_us`, `call.input_tokens`, `call.output_tokens`. Each is
+///   a counter, a duration or an internal id that flux computed; none is a value a caller, a model
+///   or a vendor chose the *type* of. A number is a number here because the schema says so, which
+///   is exactly the property C-323's walker could not rely on. Routing them through the redactor
+///   would also cost the OTLP int type on every ordinary counter, breaking collector-side
+///   aggregation for no reachable gain.
+/// - **Structured identifiers stay verbatim**: `session.id`, `account`, `agent.id`, `op.name`,
+///   `call.stage`, `turn.outcome`. These are operator- and flux-assigned labels, and they exist so a
+///   collector can correlate a trace (C-129). Redacting them would trade the feature for nothing —
+///   they carry no vendor content — and over-redaction of identifiers is the failure mode C-315
+///   chose its mechanisms to avoid.
+///
+/// The free-form set is pinned by `no_exported_span_attribute_carries_a_registered_secret`.
 fn redact_attr(redactor: &Redactor, value: &str) -> AttrValue {
     AttrValue::Str(redactor.redact(value))
 }
@@ -1138,6 +1170,105 @@ mod tests {
             }
             other => panic!("expected a redacted error string, got {other:?}"),
         }
+    }
+
+    /// C-339: the exporter's free-form attributes — the turn's model, a call's provider/model, and
+    /// a failed op's error text — are the ones that can carry vendor/model/tool content, so a
+    /// registered secret planted in **every** one of them must reach no exported attribute, in any
+    /// spelling.
+    ///
+    /// The secret is all digits on purpose: that is the one credential shape with no heuristic
+    /// protection (C-323), so this fails the moment an attribute sourced from these fields skips
+    /// [`redact_attr`]. The assertion sweeps every attribute of every span rather than naming the
+    /// three keys, so a *new* attribute fed from the same fields is covered without editing the
+    /// test.
+    ///
+    /// The guard rests on the per-attribute secret assertion, which fires independently for each of
+    /// the three fields. `saw_marker` is only a fixture-liveness check — it catches a fixture that
+    /// stopped reaching any free-form attribute at all, so the sweep cannot pass vacuously.
+    ///
+    /// ⚠ **Spans only.** This asserts over [`build_trace`]; [`build_metrics`] is a separate
+    /// projection with no [`Redactor`], and its `model` attribute does carry a registered secret
+    /// today (C-344). Extending this sweep to metrics is that story's job.
+    #[test]
+    fn no_exported_span_attribute_carries_a_registered_secret() {
+        const SECRET: &str = "216216789";
+
+        let store = EventStore::in_memory().unwrap();
+        let session = store.create_session(SECRET).unwrap();
+        let turn_id = store.begin_turn(&session, "go", SECRET).unwrap();
+        store
+            .record_observation(
+                &session,
+                turn_id,
+                &flux_evidence::Observation::new(
+                    "model.call",
+                    flux_evidence::Phase::Turn,
+                    json!({
+                        "stage": "execute",
+                        "provider": SECRET,
+                        "model": SECRET,
+                        "ok": false,
+                        "duration_us": 1_000,
+                    }),
+                ),
+            )
+            .unwrap();
+        store
+            .record_run_event(
+                &session,
+                &RunEvent::StepStarted {
+                    step: StepId::from("s1"),
+                    op: "bash".into(),
+                    input_hash: "h".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record_run_event(
+                &session,
+                &RunEvent::StepFailed {
+                    step: StepId::from("s1"),
+                    error: format!("auth rejected account {SECRET}"),
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&session, turn_id, "error", 1, "", None)
+            .unwrap();
+
+        let events = store.load_stream(&session, None).unwrap();
+        let redactor = Redactor::new();
+        redactor.try_add_secret(SECRET).expect("above the floor");
+        let spans = build_trace(&session, &events, &redactor);
+
+        assert!(!spans.is_empty(), "the fixture must produce spans to check");
+        let mut saw_marker = false;
+        for span in &spans {
+            for (key, value) in &span.attributes {
+                // `session.id` is the stream handle the caller passed in, not an exported secret;
+                // it is the correlation key the whole trace hangs off (C-129).
+                if key == "session.id" {
+                    continue;
+                }
+                let rendered = match value {
+                    AttrValue::Str(s) => s.clone(),
+                    AttrValue::Int(i) => i.to_string(),
+                    AttrValue::Double(d) => d.to_string(),
+                    AttrValue::Bool(b) => b.to_string(),
+                };
+                assert!(
+                    !rendered.contains(SECRET),
+                    "registered secret exported in span {:?} attribute {key}: {rendered}",
+                    span.name
+                );
+                saw_marker |= rendered.contains("[redacted]");
+            }
+        }
+        assert!(
+            saw_marker,
+            "no attribute was redacted at all — the fixture no longer reaches a free-form attribute"
+        );
     }
 
     #[test]
