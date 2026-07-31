@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Flux Glyph — an indented opcode projection of a Flux AST, for agents (L-97).** A DraftAst renders
+  as a compact indented notation with a fourteen-opcode vocabulary and an `@{…}` escape for anything
+  outside it, reachable via `flux_lang::glyph` and the `fluxlang glyph` / `unglyph` subcommands.
+  **`.flux` and the runtime are entirely unchanged** — Glyph is never sniffed from or into canonical
+  Flux, it is an explicitly-selected source kind, and it adds no node kind and no input syntax (so no
+  editor grammar is owed).
+  The round-trip is proven as a **property**, not by examples: `parse(format(ast)) == ast` across all
+  43 catalogue node kinds in three nesting positions each, plus 400 seeded random ASTs with
+  adversarial name and string pools. Diagnostics are located and never guess — twelve tests, one per
+  failure class (odd indent, over-indent, tab as indentation, unknown opcode, arm outside an
+  arm-taking construct, duplicate or misplaced default arm, malformed escape, body on a leaf).
+  Known limitation, measured rather than assumed: a container outside the core vocabulary collapses
+  its **whole subtree** into one escape line, so `agent-loop.flux` renders its head and then swallows
+  the entire `repeat` block. The round-trip stays exact, but compression is weak on real production
+  flows — L-98 and L-99 will decide between widening the core and giving the escape a header.
+
 - **The `pane.*` ops — an agent can open, update and close its own panes (C-223, partial).**
   `pane.open`/`pane.update`/`pane.close` land in `flux-tools`, surfaced by **sink presence at assembly
   time** rather than by a signal-gated `ToolGroup` — there is no `project.signal` for "a human is

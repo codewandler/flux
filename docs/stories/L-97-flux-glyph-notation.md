@@ -2,7 +2,7 @@
 id: L-97
 title: "Flux Glyph — an indented opcode projection for agents"
 pillar: Language
-status: in-progress
+status: done
 priority: 20
 epic: flux-notation-workbench
 design: docs/designs/flux-notation-workbench.md
@@ -53,3 +53,15 @@ spec in `crates/flux-lang/docs/glyph.md`, CLI `fluxlang glyph` / `fluxlang ungly
 - Adjacent, **not** fixed: `fluxlang`'s pre-existing `rail_reports_the_existing_parser_diagnostics`
   test fails at the merge base — it uses `confirm "y", risk: high` as malformed input, which L-96
   made valid. It is invisible to `cargo test --workspace` (it needs `--features cli`).
+
+- 2026-07-31 — integrated. **No node kind and no new input syntax**, so the editor-grammar mirror
+  obligation does not apply: Glyph is a projection of the existing `DraftAst` with its own sigils, no
+  file extension and no editor integration, and both `UPDATE=1` regenerations produced an empty diff.
+  ⚠ **A follow-up worth taking seriously before L-98/L-99:** a non-core container swallows its whole
+  subtree into one escape line. `fluxlang glyph crates/flux-flow/assets/agent-loop.flux` renders the
+  head of the loop and then collapses the entire `repeat` block — the bulk of the file, including core
+  `match`/`when` nodes nested inside it — into a single multi-kilobyte `@{…}` line. That is *correct*
+  per this story's contract (`repeat`/`each`/`try`/`saga` are outside the fourteen opcodes) and the
+  round-trip is exact, but it means Glyph's compression is weak on exactly the real production flows
+  it exists to compress. L-98 and L-99 should decide between widening the core and letting the escape
+  carry a header with a native body instead of being all-or-nothing.
