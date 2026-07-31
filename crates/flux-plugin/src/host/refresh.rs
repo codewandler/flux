@@ -15,22 +15,35 @@
 //! floor, the callback gates — is scoped by it. A second `manifest` answer is therefore an attempt
 //! to restate that decision, and a plugin must not be able to win authority by restating it.
 //!
-//! Two independent mechanisms enforce that, because either alone would be a single point of
-//! failure:
+//! Three mechanisms enforce that. The first two are a matched pair — the authority a plugin's ops
+//! *declare* and the authority the host *enforces* must be one thing, and each direction of
+//! disagreement is dangerous in its own way:
 //!
-//! 1. **The capabilities are pinned, not re-derived.** A refresh reuses the `Arc<dyn HostCapabilities>`
-//!    built at load and never calls `make_caps` again. Whatever the refreshed manifest claims, the
-//!    callback gates keep enforcing the grant the operator's session started with.
-//! 2. **A widened declaration is refused outright** ([`capability_widenings`]). Pinning alone would
-//!    leave the *declaration* and the *enforcement* disagreeing — the projected `ToolSpec` and the
-//!    approval preview would describe programs, secret keys, HTTP hosts or dial targets the host
-//!    would then refuse. Disclosure that overstates enforcement teaches an operator to grant policy
-//!    they do not need, so the refresh stops instead.
+//! 1. **The enforced capabilities are pinned, not re-derived.** A refresh reuses the
+//!    `Arc<dyn HostCapabilities>` built at load and never calls `make_caps` again. Whatever the
+//!    refreshed manifest claims, the callback gates keep enforcing the grant the operator's session
+//!    started with.
+//! 2. **The declared capabilities are pinned too** ([`LoadedPlugin::pin_granted_authority`]).
+//!    Pinning only the enforcement is not enough, because an op's `access` — and through it every
+//!    `AuthorityRequirement` the authorization floor reads — is derived from the *manifest's own*
+//!    capability declaration. Leaving that half mutable lets the two disagree, and the **narrowing**
+//!    direction is the worse one: a manifest that surrenders `secrets`/`http`/`conn` projects an op
+//!    requiring no authority at all while the pinned caps still hand it the raw secret. Pinning both
+//!    halves to one value makes the disagreement unrepresentable rather than merely checked.
+//! 3. **A widened declaration is refused outright** ([`capability_widenings`]). Pinning silently
+//!    ignores a widening, which would leave the operator's approval preview describing less
+//!    authority than the plugin asked for; refusing says so instead. It is also the check that
+//!    keeps a surrender safe to ignore — because the pinned grant is, by then, known to be a
+//!    superset of what the plugin last asked for.
 //!
 //! On top of those, an op that keeps its **name** across a refresh may not quietly become a
 //! differently-scoped op ([`op_scope_weakenings`]): permission subjects, policy rules and session
 //! grants all key on the op name, so silently re-pointing or de-tiering that name would reuse a
 //! decision the operator made about something else.
+//!
+//! The net rule: **a refresh changes the operation set, never the grant.** Ops may appear and
+//! disappear and their schemas may change; the capability declaration and the capability
+//! enforcement both stay at the load-time grant until a restart makes it again.
 //!
 //! Everything else about the catalog is free to change — that is the point. Ops may appear and
 //! disappear, and their schemas and descriptions may change.
@@ -102,7 +115,13 @@ impl CatalogRefresh {
         // must not leave the caller with half a catalog.
         let mut assembled = registry.clone();
         for name in self.removed.iter().chain(self.retained.iter()) {
-            assembled.remove(name);
+            // Withdraw only what this plugin's own source registered. `ToolRegistry::remove` is
+            // name-keyed and source-blind, so an unguarded removal would let a refresh silently
+            // evict an identically named op belonging to another pack — a privilege swap by
+            // collision. Leaving it in place turns that case into the duplicate error below.
+            if assembled.source(name) == Some(source) {
+                assembled.remove(name);
+            }
         }
         assembled.try_register_all_from(source, self.tools.iter().cloned())?;
         *registry = assembled;
@@ -111,37 +130,65 @@ impl CatalogRefresh {
 }
 
 impl LoadedPlugin {
-    /// Re-fetch this plugin's manifest over the open subprocess connection and re-project its
-    /// operations, without restarting flux or respawning the plugin.
+    /// Re-fetch this plugin's manifest over the open subprocess connection, re-project its
+    /// operations, and install them into `registry` — without restarting flux or respawning the
+    /// plugin. **The entry point to prefer**: the registry and the plugin move together or not at
+    /// all.
+    ///
+    /// The registry is written first, because it is the fallible half (a refreshed op can collide
+    /// with a name another source already registered). Only once it has been swapped is the
+    /// plugin's own catalog committed, so a rejected `apply` can never leave the plugin believing
+    /// it published ops the registry never took — a divergence that would strand those names
+    /// forever, since the next refresh would diff against the newer manifest and never withdraw
+    /// them.
+    pub async fn refresh_into(
+        &mut self,
+        registry: &mut ToolRegistry,
+        source: &str,
+    ) -> Result<CatalogRefresh> {
+        let prepared = self.prepare_refresh().await?;
+        prepared.apply(registry, source)?;
+        Ok(self.commit(prepared))
+    }
+
+    /// Re-fetch and re-project without a registry, committing the result to this plugin.
+    ///
+    /// For a caller that holds no [`ToolRegistry`] (or holds several). If you do hold one, prefer
+    /// [`LoadedPlugin::refresh_into`] — pairing this with a separate [`CatalogRefresh::apply`]
+    /// commits the plugin before the registry, so a failed `apply` diverges the two.
+    pub async fn refresh(&mut self) -> Result<CatalogRefresh> {
+        let prepared = self.prepare_refresh().await?;
+        Ok(self.commit(prepared))
+    }
+
+    /// Fetch, validate, and project — with **no mutation of `self`**, so every refusal below is
+    /// automatically all-or-nothing.
     ///
     /// Every load-time check runs again — [`validate_manifest_operations`], the capability
-    /// projection, the authority contract and the coherence warnings — plus the two checks that
-    /// exist only because a refresh is a *re-grant*: the refreshed manifest may not widen the
-    /// granted capabilities, and a retained op may not weaken its gating scope. See the module
-    /// docs for why both are needed.
-    ///
-    /// On success the plugin's own `tools`, `manifest` and `coherence_warnings` are updated, so a
-    /// later refresh diffs against this catalog rather than against the load. On failure nothing
-    /// is mutated and the error names what was refused.
-    pub async fn refresh(&mut self) -> Result<CatalogRefresh> {
+    /// projection, the authority contract and the coherence warnings — plus the two that exist
+    /// only because a refresh is a *re-grant*: the refreshed manifest may not widen the granted
+    /// capabilities, and a retained op may not weaken its gating scope.
+    async fn prepare_refresh(&self) -> Result<CatalogRefresh> {
         let plugin = self.manifest.name.clone();
-        let manifest = {
+        let fetched = {
             let mut host = self.host.lock().await;
             host.manifest().await?
         };
 
         // A plugin renaming itself would move every projected op into another plugin's namespace
         // under grants that were never made for it.
-        if manifest.name != plugin {
+        if fetched.name != plugin {
             return Err(Error::Other(format!(
                 "plugin `{plugin}`: refusing the refreshed catalog — the manifest now names itself \
                  `{}`; a plugin cannot rename itself across a refresh",
-                manifest.name
+                fetched.name
             )));
         }
-        validate_manifest_operations(&manifest).map_err(Error::Other)?;
+        // Validated as the plugin actually answered it, exactly as at load — so an authoring error
+        // in the refreshed declaration reads the same either way.
+        validate_manifest_operations(&fetched).map_err(Error::Other)?;
 
-        let widenings = capability_widenings(&self.manifest.capabilities, &manifest.capabilities);
+        let widenings = capability_widenings(&self.manifest.capabilities, &fetched.capabilities);
         if !widenings.is_empty() {
             return Err(Error::Other(format!(
                 "plugin `{plugin}`: refusing the refreshed catalog — it requests more authority \
@@ -150,6 +197,12 @@ impl LoadedPlugin {
                 widenings.join("; ")
             )));
         }
+
+        let manifest = self.pin_granted_authority(fetched);
+        // Cheap re-run against the manifest actually installed. Literal containment makes the grant
+        // matchers monotone, so this cannot fail where the check above passed — it is here so that
+        // stays true by test rather than by argument.
+        validate_manifest_operations(&manifest).map_err(Error::Other)?;
 
         let weakenings = retained_op_weakenings(&plugin, &self.manifest, &manifest);
         if !weakenings.is_empty() {
@@ -163,8 +216,8 @@ impl LoadedPlugin {
         }
 
         let coherence_warnings = op_coherence_warnings(&manifest);
-        // Projected against the LOAD-TIME caps (`self.caps`), never a freshly derived set — see the
-        // module docs. `make_caps` is deliberately not re-run.
+        // Projected from the pinned manifest against the LOAD-TIME caps (`self.caps`) — the same
+        // authority declaration on both sides. `make_caps` is deliberately never re-run.
         let tools: Vec<Arc<dyn Tool>> = visible_ops(&manifest)
             .map(|op| {
                 Arc::new(PluginTool::new(
@@ -177,7 +230,7 @@ impl LoadedPlugin {
             .collect();
         // The authority contract, checked before anything is swapped so an invalid projection is a
         // refusal rather than a half-applied catalog. `ToolRegistry::try_register_from` runs the
-        // same check; running it here keeps a registry-less caller (the CLI) equally honest.
+        // same check; running it here keeps a registry-less caller equally honest.
         for tool in &tools {
             let input = json!({});
             let subjects = tool.permission_subjects(&input);
@@ -209,10 +262,6 @@ impl LoadedPlugin {
             .cloned()
             .collect();
 
-        // Every check has passed — only now is anything mutated.
-        self.tools = tools.clone();
-        self.manifest = manifest.clone();
-        self.coherence_warnings = coherence_warnings.clone();
         Ok(CatalogRefresh {
             manifest,
             tools,
@@ -221,6 +270,52 @@ impl LoadedPlugin {
             retained,
             coherence_warnings,
         })
+    }
+
+    /// Carry the operator's grant across the refresh: replace every manifest field the host
+    /// capability layer was built from with the load-time one, keeping only the operations (and the
+    /// descriptive surface) the plugin just sent.
+    ///
+    /// # Why the declaration is pinned, not just the enforcement
+    ///
+    /// `self.caps` is fixed at load, but a plugin's `ToolSpec` — its `access`, and through it every
+    /// [`AuthorityRequirement`] the authorization floor reads — is *derived from the manifest's own
+    /// capability declaration* (`plugin_tool_spec`). Projecting a refreshed declaration against
+    /// pinned enforcement lets the two disagree, and the dangerous direction is a **surrender**: a
+    /// manifest that drops `secrets`/`http`/`conn` projects an op that requires **no** authority at
+    /// all while the pinned caps still hand it the raw secret, still reach the declared host, and
+    /// still run the granted program. That is the failure `plugin_tool_spec` already warns about
+    /// for a different reason — an op with neither effects nor access "would carry NO requirement
+    /// at all and skip the authorization floor entirely" — and it is worse than the widening this
+    /// module's second mechanism catches: overstating teaches an operator to over-grant, while
+    /// understating removes the requirement to grant at all.
+    ///
+    /// Pinning the declaration makes the disagreement unrepresentable rather than merely checked:
+    /// the spec the registry installs and the capabilities the host enforces are computed from one
+    /// value. A surrender is therefore accepted and ignored — the grant of record stands until a
+    /// restart makes it again.
+    ///
+    /// The pinned fields are exactly the ones [`SystemHostCaps::with_manifest`] reads:
+    /// `capabilities`, `auth`, `endpoints` and `config`. `endpoints` matters for the same reason —
+    /// the host admits a plugin's declared endpoint hosts alongside `http_hosts`, so leaving it
+    /// mutable would let the stored manifest advertise egress the pinned caps do not back.
+    fn pin_granted_authority(&self, fetched: PluginManifest) -> PluginManifest {
+        PluginManifest {
+            capabilities: self.manifest.capabilities.clone(),
+            auth: self.manifest.auth.clone(),
+            endpoints: self.manifest.endpoints.clone(),
+            config: self.manifest.config.clone(),
+            ..fetched
+        }
+    }
+
+    /// Adopt a prepared refresh. Infallible by construction — every check ran in
+    /// [`LoadedPlugin::prepare_refresh`] — so callers can order it after the registry write.
+    fn commit(&mut self, refresh: CatalogRefresh) -> CatalogRefresh {
+        self.tools = refresh.tools.clone();
+        self.manifest = refresh.manifest.clone();
+        self.coherence_warnings = refresh.coherence_warnings.clone();
+        refresh
     }
 }
 
@@ -259,46 +354,69 @@ pub(super) fn capability_widenings(
         (refreshed && !granted).then(|| format!("`{field}` turns on"))
     }
 
+    // Destructured, not field-accessed, on purpose: `PluginCapabilities` is the deny-by-default
+    // authority surface, and an eleventh field must not be able to land unchecked. Adding one reds
+    // this function until it is classified here.
+    let PluginCapabilities {
+        process,
+        secrets,
+        http,
+        http_hosts,
+        private_hosts,
+        conn,
+        blob,
+        discover,
+        credential,
+        fs,
+    } = refreshed;
+
     let mut widenings = Vec::new();
-    widenings.extend(gained("process", &granted.process, &refreshed.process));
-    widenings.extend(gained("secrets", &granted.secrets, &refreshed.secrets));
-    widenings.extend(gained(
-        "http_hosts",
-        &granted.http_hosts,
-        &refreshed.http_hosts,
-    ));
+    widenings.extend(gained("process", &granted.process, process));
+    widenings.extend(gained("secrets", &granted.secrets, secrets));
+    widenings.extend(gained("http_hosts", &granted.http_hosts, http_hosts));
     widenings.extend(gained(
         "private_hosts",
         &granted.private_hosts,
-        &refreshed.private_hosts,
+        private_hosts,
     ));
-    widenings.extend(gained("conn", &granted.conn, &refreshed.conn));
+    widenings.extend(gained("conn", &granted.conn, conn));
     // `FsReadScope` is compared whole, so flipping a scope's `secret` flag off — which would stop
     // its contents being registered with the Redactor — counts as a widening too.
     widenings.extend(
-        refreshed
-            .fs
-            .iter()
+        fs.iter()
             .filter(|scope| !granted.fs.contains(scope))
             .map(|scope| format!("`fs` gains `{}` (secret: {})", scope.path, scope.secret)),
     );
-    widenings.extend(turned_on("http", granted.http, refreshed.http));
-    widenings.extend(turned_on("blob", granted.blob, refreshed.blob));
-    widenings.extend(turned_on("discover", granted.discover, refreshed.discover));
-    widenings.extend(turned_on(
-        "credential",
-        granted.credential,
-        refreshed.credential,
-    ));
+    widenings.extend(turned_on("http", granted.http, *http));
+    widenings.extend(turned_on("blob", granted.blob, *blob));
+    widenings.extend(turned_on("discover", granted.discover, *discover));
+    widenings.extend(turned_on("credential", granted.credential, *credential));
     widenings
 }
 
 /// Every retained operation whose gating scope weakened, prefixed with the op's projected name.
+///
+/// `refreshed` must already be the **pinned** manifest ([`LoadedPlugin::pin_granted_authority`]),
+/// so its `capabilities` are `granted`'s: both sides are then projected against the very
+/// declaration the installed tools carry, and a difference can only come from the operation's own
+/// fields. Comparing against a manifest whose capabilities had not been pinned would make this
+/// check blind to exactly the capability drift the projection introduced.
 fn retained_op_weakenings(
     plugin: &str,
     granted: &PluginManifest,
     refreshed: &PluginManifest,
 ) -> Vec<String> {
+    // Two-way containment is equality under the literal rule `capability_widenings` applies, and it
+    // needs no `PartialEq` on the wire struct (which lives on the independently versioned protocol
+    // line and is not worth a derive for an assertion).
+    // Two-way containment is equality under the literal rule `capability_widenings` applies, and it
+    // needs no `PartialEq` on the wire struct (which lives on the independently versioned protocol
+    // line and is not worth a derive for an assertion).
+    debug_assert!(
+        capability_widenings(&granted.capabilities, &refreshed.capabilities).is_empty()
+            && capability_widenings(&refreshed.capabilities, &granted.capabilities).is_empty(),
+        "retained-op comparison requires the pinned manifest"
+    );
     let mut all = Vec::new();
     for new_op in visible_ops(refreshed) {
         let name = new_op.projected_name(plugin);
@@ -314,9 +432,9 @@ fn retained_op_weakenings(
 
 /// Every way the retained op `new` gates less than `old` did, one phrase each.
 ///
-/// Both are projected against the **granted** capabilities — which the caller has already proved
-/// the refreshed manifest does not exceed — so any difference here comes from the operation's own
-/// declaration rather than from a capability change.
+/// Both are projected against `granted` — which, because the refreshed manifest's authority fields
+/// are pinned to it before this runs, is also the declaration the *installed* tool carries. So the
+/// comparison describes the specs the registry actually gets, not a hypothetical pair.
 pub(super) fn op_scope_weakenings(
     plugin: &str,
     granted: &PluginCapabilities,

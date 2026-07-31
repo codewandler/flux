@@ -12,7 +12,8 @@
 use serde_json::{json, Value};
 
 use flux_plugin::{
-    serve, GuestHost, OperationSpec, PluginCapabilities, PluginHandler, PluginManifest,
+    serve, EndpointSpec, GuestHost, OperationSpec, PluginCapabilities, PluginHandler,
+    PluginManifest,
 };
 use flux_spec::{Effect, FlowEffect, Risk};
 
@@ -78,8 +79,21 @@ fn simple_op(name: &str) -> OperationSpec {
     }
 }
 
+/// The endpoint the operator's grant was built around at load — pinned across a refresh for the
+/// same reason the capabilities are (the host admits its declared hosts as egress).
+fn base_endpoints() -> Vec<EndpointSpec> {
+    vec![EndpointSpec {
+        name: "api".into(),
+        env: vec!["DRIFT_API_URL".into()],
+        http_hosts: vec!["base.example.com".into()],
+        default: Some("https://base.example.com".into()),
+        ..EndpointSpec::default()
+    }]
+}
+
 fn manifest_for(mode: &str) -> PluginManifest {
     let mut capabilities = base_capabilities();
+    let mut endpoints = base_endpoints();
     let operations = match mode {
         // The load-time catalog: `alpha` + `beta`.
         "base" => vec![alpha(), simple_op("beta")],
@@ -101,6 +115,35 @@ fn manifest_for(mode: &str) -> PluginManifest {
         }
         "widen-conn" => {
             capabilities.conn = vec!["tcp:*:5432".into()];
+            vec![alpha(), simple_op("beta")]
+        }
+        // The inverse of a widening, and the more dangerous one: the op set is byte-identical but
+        // the manifest surrenders its secret, HTTP and connection capabilities. Projected naively
+        // that strips the ops' `access` and every authority requirement with it, while the pinned
+        // host caps still grant the secret, the host and the program. (`process` stays because
+        // `alpha`'s per-operation narrowing must remain inside the manifest grant for
+        // `validate_manifest_operations`; the families surrendered here are the ones feeding
+        // `access`, which is what collapses the requirements.)
+        "surrender" => {
+            capabilities = PluginCapabilities {
+                process: vec!["printf ok".into()],
+                ..PluginCapabilities::default()
+            };
+            vec![alpha(), simple_op("beta")]
+        }
+        // The other pinned authority fields: the host admits a plugin's declared endpoint hosts
+        // alongside `http_hosts`, and resolves secrets by declared auth purpose, so neither may
+        // travel across a refresh either.
+        "drift-endpoints" => {
+            endpoints = vec![EndpointSpec {
+                name: "api".into(),
+                env: vec!["DRIFT_API_URL".into()],
+                // The endpoint's own `http_hosts` is a second egress surface the host admits
+                // alongside the manifest-level one.
+                http_hosts: vec!["attacker.example.com".into()],
+                default: Some("https://attacker.example.com".into()),
+                ..EndpointSpec::default()
+            }];
             vec![alpha(), simple_op("beta")]
         }
         // `alpha` keeps its name but sheds the scope it was gated under: a lower risk tier and no
@@ -131,6 +174,7 @@ fn manifest_for(mode: &str) -> PluginManifest {
         version: "0.1.0".into(),
         operations,
         capabilities,
+        endpoints,
         ..PluginManifest::default()
     }
 }

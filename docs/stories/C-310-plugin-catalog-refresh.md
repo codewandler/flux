@@ -56,12 +56,18 @@ already open. A restart-to-see-new-ops loop makes the whole seam unusable intera
       as the initial load does. Name the test that proves a refresh cannot escalate.
       → **`a_refresh_cannot_widen_the_granted_capabilities`** is the anti-escalation test
       (`catalog_refresh.rs`), with `every_capability_family_is_checked_for_widening` and
-      `dropping_an_fs_scopes_secret_flag_is_a_widening` (`host.rs`) covering all nine families.
+      `dropping_an_fs_scopes_secret_flag_is_a_widening` (`host.rs`) covering all **ten** families
+      (`process`, `secrets`, `http`, `http_hosts`, `private_hosts`, `conn`, `blob`, `discover`,
+      `credential`, `fs`) — `capability_widenings` destructures `PluginCapabilities` exhaustively,
+      so an eleventh field reds the build rather than landing unchecked.
+      **`a_surrendered_capability_declaration_cannot_strip_an_ops_authority`** is the other
+      direction, and the more dangerous one: a refreshed manifest that *gives up* capabilities must
+      not thereby strip its ops' `access` and authority requirements while the pinned host caps
+      still grant them. `a_refresh_cannot_move_the_other_pinned_authority_fields` covers the same
+      for `endpoints`/`auth`/`config`.
       `a_refresh_cannot_weaken_a_retained_ops_gating_scope` +
       `a_retained_op_may_not_weaken_its_gating_scope` cover the same-name re-scope;
       `a_refresh_re_runs_manifest_validation` covers `validate_manifest_operations`.
-      Structurally, the refresh reuses the **load-time** `Arc<dyn HostCapabilities>` and never
-      re-runs `make_caps`, so enforcement cannot follow a widened declaration even if a check missed.
 - [x] Removed ops are actually withdrawn from the catalog, not merely shadowed — an op the plugin no
       longer advertises must stop being callable.
       → `a_withdrawn_op_is_removed_while_an_in_flight_call_completes_under_its_old_spec`
@@ -73,7 +79,13 @@ already open. A restart-to-see-new-ops loop makes the whole seam unusable intera
       → `a_refresh_against_a_dead_subprocess_leaves_the_catalog_intact` and
       `a_refresh_with_an_oversized_manifest_frame_leaves_the_catalog_intact`. Both, plus the
       protocol-decode case, surface as an `Err` out of `PluginHost::manifest` before anything is
-      mutated; `CatalogRefresh::apply` is clone-then-swap.
+      mutated; `prepare_refresh` takes `&self` so no refusal can mutate, and
+      `CatalogRefresh::apply` is clone-then-swap.
+      `a_refused_registry_write_keeps_the_plugin_and_the_registry_in_step` covers the remaining
+      ordering hazard: `refresh_into` writes the registry *before* committing the plugin, so a
+      rejected `apply` cannot leave the plugin believing it published ops the registry never took
+      (which would strand those names — the next refresh would diff against the newer manifest and
+      never withdraw them).
 - [x] Op coherence warnings (`op_coherence_warnings`, C-191) are emitted for the refreshed manifest
       the same way they are at load.
       → `a_refresh_reports_coherence_warnings_without_refusing_the_catalog` — warned, not fatal,
@@ -85,13 +97,27 @@ already open. A restart-to-see-new-ops loop makes the whole seam unusable intera
 - 2026-07-31 — implemented. `LoadedPlugin::refresh()` + `CatalogRefresh::apply()` in the new
   `crates/flux-plugin/src/host/refresh.rs`; `flux plugin refresh <name>` on the CLI; operator docs
   in `website/docs/plugins/using-plugins.md`.
-- The design decision worth carrying forward: **a refresh may change the op set freely but never the
-  capability set.** Capability containment is checked *literally* (a refreshed entry must appear
-  verbatim in the granted list), which is deliberately stricter than the runtime grant matchers — a
-  genuine narrowing such as `"kubectl get"` under a granted `"kubectl"` is also refused. The
-  asymmetry is intentional: a permissive error here is a privilege escalation, a strict one is a
-  refusal the operator resolves with a restart, and "must already be in the list" cannot drift as
-  grant grammars gain wildcards.
+- The design decision worth carrying forward: **a refresh changes the operation set, never the
+  grant.** Both halves of the grant are pinned to the load-time manifest — the enforced
+  capabilities (`self.caps`, `make_caps` is never re-run) *and* the declared ones
+  (`pin_granted_authority`, covering `capabilities`/`auth`/`endpoints`/`config`, exactly the fields
+  `SystemHostCaps::with_manifest` reads). Capability containment is checked *literally* (a refreshed
+  entry must appear verbatim in the granted list), deliberately stricter than the runtime grant
+  matchers — a genuine narrowing such as `"kubectl get"` under a granted `"kubectl"` is also
+  refused. A permissive error here is a privilege escalation, a strict one is a refusal the operator
+  resolves with a restart, and "must already be in the list" cannot drift as grant grammars gain
+  wildcards.
+- **Rework round 1 fixed a blocking hole in the first cut, and it is the reason the declaration is
+  pinned rather than merely checked.** The first cut pinned only enforcement and projected the specs
+  from the *refreshed* declaration. A manifest that **surrendered** capabilities therefore produced
+  ops with no `access` and zero `AuthorityRequirement`s — sailing past the authorization floor —
+  while the pinned caps still handed them the secret, the host and the program. Overstating
+  authority teaches an operator to over-grant; understating it removes the requirement to grant at
+  all, so this direction was the worse one. Computing both halves from a single value makes the
+  disagreement unrepresentable instead of checked.
+- `CatalogRefresh::apply` withdraws only names its own `source` registered. `ToolRegistry::remove`
+  is name-keyed and source-blind, so an unguarded withdrawal let a refresh silently evict another
+  pack's identically named op — a privilege swap by collision. Found by the divergence test below.
 - Not covered, deliberately: **the live in-session registry is still frozen.** `Executor` owns its
   `ToolRegistry` by value behind `Arc<Executor>` with no `registry_mut`, and
   `crates/flux-cli/src/execution.rs:1703-1708` cites A-95 prompt-cache stability as the reason the

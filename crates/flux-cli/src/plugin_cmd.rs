@@ -830,24 +830,21 @@ async fn refresh_plugin_catalog(dir: &std::path::Path, name: &str) -> Result<()>
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    // The refresh itself. A refusal must not read as a crash: the catalog the plugin loaded with is
-    // still intact, and saying so is the actionable half of the message.
-    let refreshed = loaded.refresh().await;
-    let report = match refreshed {
-        Ok(refresh) => {
-            refresh
-                .apply(&mut registry, &source)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(format_refresh_report(
+    // The refresh itself, through the entry point that moves the registry and the plugin together.
+    // A refusal must not read as a crash: the catalog the plugin loaded with is still intact, and
+    // saying so is the actionable half of the message.
+    let report = loaded
+        .refresh_into(&mut registry, &source)
+        .await
+        .map(|refresh| {
+            format_refresh_report(
                 name,
                 &refresh.added,
                 &refresh.removed,
                 &refresh.retained,
                 &refresh.coherence_warnings,
-            ))
-        }
-        Err(e) => Err(e),
-    };
+            )
+        });
 
     // Release the tools' shared host references before shutting the subprocess down.
     let flux_plugin::LoadedPlugin { tools, host, .. } = loaded;

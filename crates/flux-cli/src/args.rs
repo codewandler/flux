@@ -945,12 +945,14 @@ pub(super) enum PluginAction {
     /// subprocess the load used and reports the catalog delta — which operations appeared, which
     /// were withdrawn — so the operator can see the new surface before opening a session on it.
     ///
-    /// A refresh is a **re-grant**, and it is bounded by the original one: the refreshed manifest
-    /// may add and remove operations freely, but it may not widen the capabilities the operator
-    /// granted at load (programs, secret keys, HTTP hosts, dial targets), and an operation that
-    /// keeps its name may not shed the scope it was gated under. Either is refused with the
-    /// catalog left exactly as it was — so this doubles as the drift check on a plugin whose
-    /// manifest is not stable across two fetches.
+    /// A refresh changes the **operation set, never the grant**: the refreshed manifest may add and
+    /// remove operations freely, but the capabilities the operator granted at load stay in force in
+    /// both directions — a manifest asking for more is refused, and one asking for less is not
+    /// adopted (surrendering a capability in the declaration must not strip the authority an
+    /// operation is gated by while the capability is still granted). An operation that keeps its
+    /// name may not shed the scope it was gated under either. A refusal leaves the catalog exactly
+    /// as it was — so this doubles as the drift check on a plugin whose manifest is not stable
+    /// across two fetches.
     Refresh {
         /// Installed plugin name.
         name: String,

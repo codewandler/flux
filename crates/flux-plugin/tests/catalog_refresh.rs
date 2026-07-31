@@ -51,6 +51,8 @@ struct Fixture {
     mode_file: std::path::PathBuf,
     loaded: LoadedPlugin,
     registry: ToolRegistry,
+    /// The whole load-time manifest, kept so a test can assert what a refresh must not move.
+    granted: flux_plugin::PluginManifest,
 }
 
 impl Fixture {
@@ -85,6 +87,7 @@ impl Fixture {
         Self {
             _dir: dir,
             mode_file,
+            granted: loaded.manifest.clone(),
             loaded,
             registry,
         }
@@ -94,12 +97,56 @@ impl Fixture {
         std::fs::write(&self.mode_file, mode).unwrap();
     }
 
-    /// Refresh and apply in one step — the shape a caller uses when it holds the registry.
+    /// Refresh and install into the registry in one step — the entry point production callers use.
     async fn refresh_into_registry(&mut self) {
-        let refresh = self.loaded.refresh().await.expect("refresh is accepted");
-        refresh
-            .apply(&mut self.registry, "plugin:drift")
-            .expect("the refreshed catalog applies");
+        self.loaded
+            .refresh_into(&mut self.registry, "plugin:drift")
+            .await
+            .expect("refresh is accepted");
+    }
+
+    /// The invariant every accepted refresh must preserve: the authority *declaration* the plugin
+    /// carries is still the operator's load-time grant, so the specs the registry installs and the
+    /// capabilities the pinned host caps enforce are computed from one value and cannot disagree.
+    fn assert_grant_is_pinned(&self) {
+        // Compared as JSON: none of these wire structs derive `PartialEq`, and they all serialize.
+        assert_eq!(
+            serde_json::to_value(&self.loaded.manifest.capabilities).unwrap(),
+            serde_json::to_value(&self.granted.capabilities).unwrap(),
+            "a refresh must never move the granted capabilities"
+        );
+        assert_eq!(
+            serde_json::to_value(&self.loaded.manifest.endpoints).unwrap(),
+            serde_json::to_value(&self.granted.endpoints).unwrap(),
+            "a refresh must never move the declared endpoints (a second egress surface)"
+        );
+        assert_eq!(
+            serde_json::to_value(&self.loaded.manifest.auth).unwrap(),
+            serde_json::to_value(&self.granted.auth).unwrap(),
+            "a refresh must never move the declared auth purposes"
+        );
+        assert_eq!(
+            serde_json::to_value(&self.loaded.manifest.config).unwrap(),
+            serde_json::to_value(&self.granted.config).unwrap(),
+            "a refresh must never move the declared config surface"
+        );
+    }
+
+    /// The full authority footprint of one registered op — what the authorization floor reads.
+    fn authority_of(&self, name: &str) -> (Vec<flux_spec::AccessKind>, Vec<String>) {
+        let tool = self
+            .registry
+            .get(name)
+            .unwrap_or_else(|| panic!("`{name}` is registered"));
+        let subjects = tool.permission_subjects(&json!({}));
+        let mut requirements: Vec<String> = tool
+            .authority_requirements(&json!({}), &subjects)
+            .expect("authority contract is valid")
+            .iter()
+            .map(|r| format!("{}:{}", r.action.0, r.resource.id))
+            .collect();
+        requirements.sort();
+        (tool.spec().access, requirements)
     }
 
     async fn shutdown(self) {
@@ -150,6 +197,63 @@ async fn refresh_reprojects_a_changed_catalog_into_the_registry() {
             .collect::<Vec<_>>(),
         vec!["drift.alpha".to_string(), "drift.gamma".to_string()],
     );
+    // What a refresh must never move, even on the happy path.
+    fixture.assert_grant_is_pinned();
+    fixture.shutdown().await;
+}
+
+/// A failed registry write must not leave the plugin believing it published a catalog the registry
+/// never took. `refresh_into` writes the registry first precisely so this cannot happen: if the two
+/// diverged, the next refresh would diff against the newer manifest and the stale names could never
+/// be withdrawn.
+#[tokio::test]
+async fn a_refused_registry_write_keeps_the_plugin_and_the_registry_in_step() {
+    let mut fixture = Fixture::load("divergence").await;
+
+    // Another source already owns the name the refreshed catalog is about to claim, so `apply`
+    // fails on a duplicate.
+    let squatter = fixture
+        .registry
+        .get("drift.alpha")
+        .expect("alpha is registered at load");
+    let mut colliding = ToolRegistry::new();
+    colliding
+        .try_register_from("some-other-pack", squatter)
+        .unwrap();
+
+    fixture.set_mode("grown");
+    let error = fixture
+        .loaded
+        .refresh_into(&mut colliding, "plugin:drift")
+        .await
+        .expect_err("the colliding registry write must fail")
+        .to_string();
+    assert!(error.contains("duplicate operation"), "{error}");
+
+    // Neither side moved: the foreign registry still holds only its own entry, still owned by the
+    // pack that registered it — a refresh withdraws only what its own source put there, so it can
+    // never evict another pack's identically named op.
+    assert_eq!(colliding.names(), vec!["drift.alpha".to_string()]);
+    assert_eq!(colliding.source("drift.alpha"), Some("some-other-pack"));
+    assert_eq!(
+        fixture
+            .loaded
+            .tools
+            .iter()
+            .map(|t| t.spec().name)
+            .collect::<Vec<_>>(),
+        vec!["drift.alpha".to_string(), "drift.beta".to_string()],
+        "a rejected apply must not commit the plugin's catalog"
+    );
+
+    // And because it did not move, a later refresh against the real registry still diffs from the
+    // load — so `drift.beta` is still withdrawable rather than stranded.
+    fixture.refresh_into_registry().await;
+    assert_eq!(
+        fixture.registry.names(),
+        vec!["drift.alpha".to_string(), "drift.gamma".to_string()],
+    );
+    drop(colliding);
     fixture.shutdown().await;
 }
 
@@ -201,6 +305,73 @@ async fn a_withdrawn_op_is_removed_while_an_in_flight_call_completes_under_its_o
     );
 
     drop(in_flight);
+    fixture.shutdown().await;
+}
+
+/// The **surrender** direction, and the more dangerous one. A refreshed manifest that gives up
+/// capabilities must not thereby strip its ops' declared authority, because the host capabilities
+/// are pinned and still grant the secret / host / program. If `access` and the
+/// `AuthorityRequirement`s were derived from the surrendered declaration, the op would sail past
+/// the authorization floor requiring nothing at all while every capability stayed live — the exact
+/// shape `plugin_tool_spec` warns about ("would carry NO requirement at all and skip the
+/// authorization floor entirely").
+#[tokio::test]
+async fn a_surrendered_capability_declaration_cannot_strip_an_ops_authority() {
+    let mut fixture = Fixture::load("surrender").await;
+
+    // The authority `drift.alpha` was granted and gated with at load.
+    let (access_at_load, requirements_at_load) = fixture.authority_of("drift.alpha");
+    assert!(
+        access_at_load.contains(&flux_spec::AccessKind::Secret)
+            && access_at_load.contains(&flux_spec::AccessKind::Network)
+            && access_at_load.contains(&flux_spec::AccessKind::Connection),
+        "the load-time op must actually hold the authority under test: {access_at_load:?}"
+    );
+    assert!(
+        !requirements_at_load.is_empty(),
+        "the load-time op must require authority"
+    );
+
+    // The plugin now answers `manifest` with the same operations and an emptied capability set.
+    fixture.set_mode("surrender");
+    fixture.refresh_into_registry().await;
+
+    let (access_after, requirements_after) = fixture.authority_of("drift.alpha");
+    assert_eq!(
+        access_after, access_at_load,
+        "a surrender must not strip the op's declared access — the pinned host caps still grant it"
+    );
+    assert_eq!(
+        requirements_after, requirements_at_load,
+        "a surrender must not strip the op's authority requirements"
+    );
+    // The root cause, asserted directly: one value feeds both the projection and the enforcement.
+    fixture.assert_grant_is_pinned();
+    fixture.shutdown().await;
+}
+
+/// The other authority-bearing manifest fields `SystemHostCaps::with_manifest` reads — `endpoints`,
+/// `auth`, `config` — are pinned for the same reason. A plugin's declared endpoint hosts are
+/// admitted as egress alongside `http_hosts`, so letting them travel across a refresh would let the
+/// stored manifest advertise reach the pinned caps do not back.
+#[tokio::test]
+async fn a_refresh_cannot_move_the_other_pinned_authority_fields() {
+    let mut fixture = Fixture::load("endpoints").await;
+    assert_eq!(
+        fixture.granted.endpoints.len(),
+        1,
+        "the load-time manifest must declare the endpoint under test"
+    );
+
+    fixture.set_mode("drift-endpoints");
+    fixture.refresh_into_registry().await;
+
+    fixture.assert_grant_is_pinned();
+    assert!(
+        !format!("{:?}", fixture.loaded.manifest.endpoints).contains("attacker.example.com"),
+        "the refreshed endpoint declaration must not be adopted: {:?}",
+        fixture.loaded.manifest.endpoints
+    );
     fixture.shutdown().await;
 }
 

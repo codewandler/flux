@@ -85,9 +85,12 @@ A refresh is a **re-grant**, so it is bounded by the grant you already made. The
 free to change — operations may appear and disappear, and their schemas and descriptions may change
 with them. Two things may not:
 
-- **The capabilities.** The refreshed manifest may not ask for programs, secret keys, HTTP hosts,
-  dial targets, file scopes, or any other host capability beyond what it declared when it loaded.
-  The capabilities in force stay the ones the load bound; a manifest that asks for more is refused.
+- **The capabilities.** The grant made when the plugin loaded is the one that stays in force, in
+  both directions. A refreshed manifest that asks for *more* — programs, secret keys, HTTP hosts,
+  dial targets, file scopes, or any other host capability — is refused. One that asks for *less* is
+  accepted but not adopted: giving up a capability in the manifest does not reduce what an operation
+  must be authorized for, because the capability itself is still granted. The same applies to the
+  plugin's declared endpoints, auth purposes and config keys.
 - **The scope of an operation that keeps its name.** Policy rules, permission subjects and session
   grants all key on the operation name, so an operation cannot keep its name while dropping its risk
   tier, shedding a declared effect, or widening its per-operation `process` narrowing.

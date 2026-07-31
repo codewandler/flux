@@ -2607,6 +2607,11 @@ mod tests {
 
     /// Every capability family the plugin host gates on, widened one at a time. Each must be caught
     /// and each must name itself — an unnamed refusal is one an operator cannot act on.
+    ///
+    /// The cases below are built with `..granted.clone()`, which would keep compiling if an
+    /// eleventh field were added to [`PluginCapabilities`], so the destructure at the end of this
+    /// test is what actually reds the build — deliberately mirroring the one in
+    /// `capability_widenings` itself.
     #[test]
     fn every_capability_family_is_checked_for_widening() {
         let granted = granted_capabilities();
@@ -2694,6 +2699,22 @@ mod tests {
         assert!(capability_widenings(&http_off, &granted)
             .iter()
             .any(|w| w.contains("http")));
+
+        // The exhaustiveness anchor. Adding a field to `PluginCapabilities` reds HERE, which is the
+        // prompt to add a case to `cases` above — the `..granted.clone()` spread would otherwise
+        // absorb a new authority family in silence.
+        let PluginCapabilities {
+            process: _,
+            secrets: _,
+            http: _,
+            http_hosts: _,
+            private_hosts: _,
+            conn: _,
+            blob: _,
+            discover: _,
+            credential: _,
+            fs: _,
+        } = granted;
     }
 
     /// Turning a granted `fs` scope's `secret` flag off would stop its contents being registered
