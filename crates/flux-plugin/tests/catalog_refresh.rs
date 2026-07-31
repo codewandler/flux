@@ -130,6 +130,11 @@ impl Fixture {
             serde_json::to_value(&self.granted.config).unwrap(),
             "a refresh must never move the declared config surface"
         );
+        assert_eq!(
+            serde_json::to_value(&self.loaded.manifest.discovers).unwrap(),
+            serde_json::to_value(&self.granted.discovers).unwrap(),
+            "a refresh must never move the discoverable product set (C-322)"
+        );
     }
 
     /// The full authority footprint of one registered op — what the authorization floor reads.
@@ -373,6 +378,72 @@ async fn a_refresh_cannot_move_the_other_pinned_authority_fields() {
         fixture.loaded.manifest.endpoints
     );
     fixture.shutdown().await;
+}
+
+/// C-322: `discovers` is pinned too. It is the *provider* side of endpoint discovery (D-26):
+/// `PluginRegistry::providers_for` routes a consumer's query for product X to every plugin whose
+/// manifest `discovers` X, and the broker commits what that provider answers into the shared
+/// `EndpointRegistry` other components then resolve against. Enlisting for a product across a
+/// refresh is therefore a plugin granting itself the authority to say where `postgres` lives —
+/// authority the operator reviewed at approval (`plugin list` discloses `discovers` in the surface
+/// line) and never gave for the new product.
+///
+/// It is inert *today* only by accident of wiring: `ProviderEntry` snapshots the manifest in an
+/// `Arc` at load and refresh never re-registers it, so the broker still routes on the load-time
+/// value. C-318 wires refresh into a live session and removes that accident. Pinning now means the
+/// escalation cannot appear when it does.
+#[tokio::test]
+async fn a_refresh_cannot_move_the_discoverable_product_set() {
+    let mut fixture = Fixture::load("discovers").await;
+    assert_eq!(
+        fixture.granted.discovers,
+        vec!["prometheus".to_string()],
+        "the load-time manifest must enlist for exactly the product under test"
+    );
+
+    fixture.set_mode("drift-discovers");
+    fixture.refresh_into_registry().await;
+
+    fixture.assert_grant_is_pinned();
+    assert!(
+        !fixture
+            .loaded
+            .manifest
+            .discovers
+            .iter()
+            .any(|p| p == "postgres"),
+        "a refresh must not enlist the plugin as a discovery provider for a product the operator \
+         never approved it for: {:?}",
+        fixture.loaded.manifest.discovers
+    );
+    fixture.shutdown().await;
+}
+
+/// **The exhaustiveness anchor** (C-322), the twin of the one `capability_widenings` carries for
+/// `PluginCapabilities`. Adding a field to [`flux_plugin::PluginManifest`] reds *here* and in
+/// `LoadedPlugin::pin_granted_authority`, which is the prompt to classify it — the `..fetched`
+/// struct-update this replaced would otherwise adopt an authority-bearing field from the plugin's
+/// *second* answer in total silence, which is C-310's round-1 surrender bug on a new surface.
+///
+/// The classification of record lives on `pin_granted_authority`; it is restated here so the two
+/// cannot drift apart without one of them failing to compile.
+#[test]
+fn every_manifest_field_is_classified_pinned_or_adopted() {
+    let m = flux_plugin::PluginManifest::default();
+    let flux_plugin::PluginManifest {
+        // PINNED — the operator's load-time grant, re-stated by `pin_granted_authority`.
+        capabilities: _, // read by `SystemHostCaps::with_manifest` as the grant itself
+        auth: _,         // read by `with_manifest`; resolves secrets by purpose
+        endpoints: _,    // read by `with_manifest`; a second egress surface beside `http_hosts`
+        config: _,       // read by `with_manifest`; the gated `config` capability's surface
+        discovers: _,    // routes the D-26 discovery fan-out — see the test above
+        // ADOPTED — the point of a refresh, or descriptive only.
+        name: _,        // cannot change at all: refused before pinning runs (`refresh.rs`)
+        operations: _, // *the* thing a refresh changes; re-validated against the PINNED capabilities
+        version: _,    // descriptive
+        groups: _,     // tool organisation, consumed once at load; no authority
+        datasources: _, // display-only at its consumers; no authority
+    } = &m;
 }
 
 /// The escalation guard. A refresh may change the *op set* freely, but it may not widen the

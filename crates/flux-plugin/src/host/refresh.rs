@@ -295,17 +295,78 @@ impl LoadedPlugin {
     /// value. A surrender is therefore accepted and ignored — the grant of record stands until a
     /// restart makes it again.
     ///
-    /// The pinned fields are exactly the ones [`SystemHostCaps::with_manifest`] reads:
-    /// `capabilities`, `auth`, `endpoints` and `config`. `endpoints` matters for the same reason —
-    /// the host admits a plugin's declared endpoint hosts alongside `http_hosts`, so leaving it
-    /// mutable would let the stored manifest advertise egress the pinned caps do not back.
+    /// # The classification of every manifest field (C-322)
+    ///
+    /// **PINNED** — the operator's load-time grant, re-stated here so the refreshed answer cannot
+    /// move it:
+    ///
+    /// - `capabilities` — the grant itself; [`SystemHostCaps::with_manifest`] installs it verbatim.
+    /// - `auth` — read by `with_manifest`; the host resolves secrets *by declared purpose*, so a
+    ///   refreshed purpose list would redirect which secret an op is handed.
+    /// - `endpoints` — read by `with_manifest`, and a second egress surface: the host admits a
+    ///   plugin's declared endpoint hosts alongside `http_hosts`, so leaving it mutable would let
+    ///   the stored manifest advertise reach the pinned caps do not back.
+    /// - `config` — read by `with_manifest`; the surface the gated `config` capability exposes
+    ///   (D-32), and the substitution source for endpoint templates.
+    /// - `discovers` — *not* read by `with_manifest`, and pinned anyway. It is the provider side of
+    ///   the D-26 discovery fan-out: `PluginRegistry::providers_for` routes a consumer's query for
+    ///   product X to every plugin whose manifest `discovers` X, and the broker commits what that
+    ///   provider answers into the shared `EndpointRegistry` other components resolve against.
+    ///   Enlisting for a new product across a refresh is a plugin appointing itself the authority on
+    ///   where that product lives — and `plugin list` discloses `discovers` in the approval surface,
+    ///   so it is something the operator reviewed and granted for a specific set. It is inert today
+    ///   only because `ProviderEntry` snapshots the manifest at load and refresh never re-registers
+    ///   it; [C-318] wires refresh into a live session and removes that accident.
+    ///
+    /// **ADOPTED** — the point of a refresh, or descriptive only:
+    ///
+    /// - `operations` — *the* thing a refresh exists to change. Safe because retained names are
+    ///   guarded by [`retained_op_weakenings`] and new ops are re-validated against the **pinned**
+    ///   capabilities by the second [`validate_manifest_operations`] call in
+    ///   [`LoadedPlugin::prepare_refresh`].
+    /// - `name` — cannot change at all: a rename is a hard refusal earlier in `prepare_refresh`,
+    ///   before this runs, so `fetched.name` is already `self.manifest.name`. Adopted rather than
+    ///   pinned so that the refusal stays the single place a rename is handled; pinning here would
+    ///   silently *accept* a rename this function was never meant to adjudicate.
+    /// - `version` — descriptive; nothing reads it for a decision.
+    /// - `groups` — tool organisation only, and consumed once at load when the assembly is built;
+    ///   no authority attaches to a group.
+    /// - `datasources` — display-only at both of its consumers.
+    ///
+    /// The destructure below is exhaustive **on purpose**, exactly as [`capability_widenings`] is
+    /// for `PluginCapabilities`: a `..fetched` struct-update would adopt a newly added field from
+    /// the plugin's *second* answer in silence, which is how this module's round-1 defect would come
+    /// back on a new surface. Adding a field to `PluginManifest` reds here and at its test anchor
+    /// (`every_manifest_field_is_classified_pinned_or_adopted`) until someone classifies it above.
+    ///
+    /// [C-318]: https://github.com/codewandler/flux/blob/main/docs/stories/C-318-live-session-registry-refresh.md
     fn pin_granted_authority(&self, fetched: PluginManifest) -> PluginManifest {
+        let PluginManifest {
+            name,
+            version,
+            operations,
+            datasources,
+            groups,
+            // Pinned: bound and dropped, so a reader sees at a glance that the refreshed value is
+            // deliberately discarded rather than merely forgotten.
+            auth: _,
+            endpoints: _,
+            config: _,
+            discovers: _,
+            capabilities: _,
+        } = fetched;
+
         PluginManifest {
-            capabilities: self.manifest.capabilities.clone(),
+            name,
+            version,
+            operations,
+            datasources,
+            groups,
             auth: self.manifest.auth.clone(),
             endpoints: self.manifest.endpoints.clone(),
             config: self.manifest.config.clone(),
-            ..fetched
+            discovers: self.manifest.discovers.clone(),
+            capabilities: self.manifest.capabilities.clone(),
         }
     }
 

@@ -91,9 +91,16 @@ fn base_endpoints() -> Vec<EndpointSpec> {
     }]
 }
 
+/// The products this plugin was enlisted as a discovery provider for at load. The fan-out broker
+/// routes a consumer's discovery query by this set, so it is pinned across a refresh (C-322).
+fn base_discovers() -> Vec<String> {
+    vec!["prometheus".into()]
+}
+
 fn manifest_for(mode: &str) -> PluginManifest {
     let mut capabilities = base_capabilities();
     let mut endpoints = base_endpoints();
+    let mut discovers = base_discovers();
     let operations = match mode {
         // The load-time catalog: `alpha` + `beta`.
         "base" => vec![alpha(), simple_op("beta")],
@@ -146,6 +153,14 @@ fn manifest_for(mode: &str) -> PluginManifest {
             }];
             vec![alpha(), simple_op("beta")]
         }
+        // The provider side of endpoint discovery (D-26): the refreshed manifest enlists the plugin
+        // for a product nobody approved it for. `PluginRegistry::providers_for` routes by this set
+        // and the broker commits whatever the provider answers into the shared `EndpointRegistry`,
+        // so adopting it would let a plugin's second answer name itself the authority on `postgres`.
+        "drift-discovers" => {
+            discovers = vec!["prometheus".into(), "postgres".into()];
+            vec![alpha(), simple_op("beta")]
+        }
         // `alpha` keeps its name but sheds the scope it was gated under: a lower risk tier and no
         // per-operation `process` narrowing.
         "weaken-op" => vec![
@@ -175,6 +190,7 @@ fn manifest_for(mode: &str) -> PluginManifest {
         operations,
         capabilities,
         endpoints,
+        discovers,
         ..PluginManifest::default()
     }
 }
