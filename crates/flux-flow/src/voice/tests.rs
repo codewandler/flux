@@ -19,8 +19,8 @@ use flux_spec::{Effect, Risk, ToolSpec};
 use flux_system::{System, Workspace};
 
 use super::{
-    tool_defs_from_registry, EngineVoiceHandler, UsageRecording, VoiceReply, VoiceSessionDriver,
-    VoiceSink, VoiceTurnHandler,
+    tool_defs_from_registry, EngineVoiceHandler, Speaker, UsageRecording, VoiceReply,
+    VoiceSessionDriver, VoiceSink, VoiceTurnHandler, SOLE_SPEAKER_ID,
 };
 use crate::ast::{DraftAst, Node, SymbolName};
 use crate::engine::FlowEngine;
@@ -377,15 +377,28 @@ async fn denied_tool_is_gated() {
 
 // --- Phase 2: engine-owned turns -----------------------------------------------------------------
 
-/// Stands in for a `FlowEngine`-backed handler: advances a scripted flow one reply per turn.
+/// Stands in for a `FlowEngine`-backed handler: advances a scripted flow one reply per turn, and
+/// records who the driver attributed each turn to (D-204).
 struct ScriptHandler {
     replies: Vec<String>,
     n: AtomicUsize,
+    speakers: Mutex<Vec<Speaker>>,
+}
+
+impl ScriptHandler {
+    fn new(replies: Vec<String>) -> Self {
+        Self {
+            replies,
+            n: AtomicUsize::new(0),
+            speakers: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 #[async_trait]
 impl VoiceTurnHandler for ScriptHandler {
-    async fn turn(&self, _user_text: &str) -> VoiceReply {
+    async fn turn(&self, speaker: &Speaker, _user_text: &str) -> VoiceReply {
+        self.speakers.lock().unwrap().push(speaker.clone());
         let i = self.n.fetch_add(1, Ordering::SeqCst);
         VoiceReply::Continue(self.replies.get(i).cloned().unwrap_or_default())
     }
@@ -401,10 +414,7 @@ async fn flow_owns_two_voice_turns() {
         RealtimeEvent::InputTranscriptDone("book a table".into()),
         RealtimeEvent::InputTranscriptDone("friday".into()),
     ]);
-    let handler = ScriptHandler {
-        replies: vec!["what day?".into(), "booked for friday".into()],
-        n: AtomicUsize::new(0),
-    };
+    let handler = ScriptHandler::new(vec!["what day?".into(), "booked for friday".into()]);
     let session: Arc<dyn RealtimeSession> = Arc::new(MockSession { log: log.clone() });
     let conn = RealtimeConnection { session, events };
     let cancel = CancellationToken::new();
@@ -428,6 +438,14 @@ async fn flow_owns_two_voice_turns() {
     assert_eq!(
         log.lock().unwrap().spoken,
         vec!["what day?".to_string(), "booked for friday".to_string()]
+    );
+    // A realtime call is 1:1, so both turns are attributed to the sole caller (D-204) — the seam now
+    // always names a speaker, and this surface's answer is "the only one there is".
+    let speakers = handler.speakers.lock().unwrap();
+    assert_eq!(speakers.len(), 2);
+    assert!(
+        speakers.iter().all(|s| s.id() == SOLE_SPEAKER_ID),
+        "a phone line attributes every turn to the sole caller: {speakers:?}"
     );
 }
 

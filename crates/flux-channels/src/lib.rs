@@ -7,10 +7,15 @@
 //! declared agent over the HTTP/A2A API (sessions + SSE + A2A + agent-card) by mounting
 //! [`flux_server::router`] onto that agent's engine — the surface the old `flux serve` command provided.
 //!
+//! One more is different again: a **`room`** ([`RoomChannel`], the [`rooms`] port) is the only
+//! *many-party* channel — flux is one participant among several, so every event it delivers names the
+//! occupant who caused it.
+//!
 //! Channels are declared in the `.flux` program as ordinary
-//! [`ChannelDecl`](flux_lang::program::ChannelDecl)s (a `kind` of `schedule`/`webhook`/`slack`/`a2a`
-//! plus a `settings` bag); the app runner ([`crate::serve`]) starts them and — for event sources —
-//! routes each event into the program's event bus via [`flux_app::App::deliver`].
+//! [`ChannelDecl`](flux_lang::program::ChannelDecl)s (a `kind` of
+//! `schedule`/`webhook`/`slack`/`a2a`/`room` plus a `settings` bag); the app runner
+//! ([`crate::serve`]) starts them and — for event sources — routes each event into the program's
+//! event bus via [`flux_app::App::deliver`].
 //!
 //! flux-app already owns the bus → triggers → journeys machinery; this crate only adds the external I/O
 //! adapters (which carry the heavy deps — axum, a cron crate, a feature-gated Slack SDK) and a small host
@@ -42,10 +47,12 @@ mod channel;
 mod config;
 mod deliver;
 mod host;
+pub mod rooms;
 
 #[cfg(feature = "slack")]
 pub use adapters::SlackChannel;
-pub use adapters::{build_channels, A2aChannel, ScheduleChannel, WebhookChannel};
+pub use adapters::{build_channels, A2aChannel, RoomChannel, ScheduleChannel, WebhookChannel};
 pub use channel::Channel;
+pub use config::{RoomSettings, DEFAULT_ROOM_NICK};
 pub use deliver::{AppDeliverer, Deliverer};
 pub use host::serve;

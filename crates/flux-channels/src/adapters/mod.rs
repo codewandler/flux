@@ -1,12 +1,14 @@
 //! Channel adapters (one per `kind`) and the [`build_channels`] dispatcher.
 
 mod a2a;
+mod room;
 mod schedule;
 #[cfg(feature = "slack")]
 mod slack;
 mod webhook;
 
 pub use a2a::A2aChannel;
+pub use room::RoomChannel;
 pub use schedule::ScheduleChannel;
 #[cfg(feature = "slack")]
 pub use slack::SlackChannel;
@@ -46,6 +48,7 @@ pub fn build_channels(decls: &[ChannelDecl]) -> anyhow::Result<Vec<Box<dyn Chann
         match d.kind.as_str() {
             "schedule" | "cron" => out.push(Box::new(ScheduleChannel::from_decl(d)?)),
             "webhook" | "http" => out.push(Box::new(WebhookChannel::from_decl(d)?)),
+            "room" => out.push(Box::new(RoomChannel::from_decl(d)?)),
             "slack" => {
                 #[cfg(feature = "slack")]
                 out.push(Box::new(SlackChannel::from_decl(d)?));

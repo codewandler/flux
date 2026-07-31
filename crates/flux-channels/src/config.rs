@@ -87,6 +87,33 @@ pub struct A2aSettings {
 // `{"$secret":…}` marker) are resolved from the environment once at load by `flux_app::resolve_secrets`,
 // before any adapter deserializes these settings. So the token fields above are already plain values.
 
+/// `kind = "room"` settings — a many-party meeting room flux is one participant in (D-204).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoomSettings {
+    /// Which [`Room`](crate::rooms::Room) backend to join with. `"mock"` is the in-process one;
+    /// `"xmpp"` (D-205) and `"jaas"` (D-206) follow. An unrecognized backend is a load error, exactly
+    /// like an unrecognized channel `kind`.
+    pub backend: String,
+    /// The room address, as the server spells it (an XMPP MUC JID).
+    pub room: String,
+    /// The nick to join under. Defaults to [`DEFAULT_ROOM_NICK`].
+    #[serde(default)]
+    pub nick: Option<String>,
+    /// When the agent should treat a turn as addressed to it — nick mention, private whisper, or a
+    /// wake phrase.
+    ///
+    /// **Carried, not yet enforced.** D-207 owns the rule's vocabulary and its enforcement; the field
+    /// lives here so the declaration shape is stable and a program written for D-207 loads today. The
+    /// value is passed through unvalidated on purpose: validating it now would fix a vocabulary that
+    /// story has not chosen yet.
+    #[serde(default)]
+    pub address_rule: Option<String>,
+}
+
+/// The nick flux joins a room under when the declaration does not say. A room containing humans is
+/// owed an honest answer about what just joined it.
+pub const DEFAULT_ROOM_NICK: &str = "flux";
+
 /// `kind = "slack"` settings (compiled in by default; gated only for `--no-default-features` builds).
 #[cfg(feature = "slack")]
 #[derive(Debug, Clone, Deserialize)]
