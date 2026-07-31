@@ -2,7 +2,7 @@
 id: C-303
 title: "`http.request` has no structured query map, so a model-supplied value can inject request parameters"
 pillar: Core
-status: ready
+status: in-progress
 priority: 7
 areas: [flux-web, flux-lang, security]
 note: "security · authored Flux can only build a query by interpolating into a URL string, and nothing percent-encodes it — a value carrying & or = rewrites the request. flux-connectors C-30 is blocked on this and will not emit affected operations until it lands"

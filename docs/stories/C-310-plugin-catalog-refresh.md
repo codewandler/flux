@@ -2,7 +2,7 @@
 id: C-310
 title: "Catalog refresh — re-project a plugin's ops without restarting flux"
 pillar: Core
-status: ready
+status: in-progress
 priority: 7
 epic: connector-platform
 areas: [flux-plugin, flux-cli]
