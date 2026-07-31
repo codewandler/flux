@@ -2,8 +2,7 @@
 id: C-315
 title: "The redactor misses six credential shapes, and two of them are the ones an agent writes production config with"
 pillar: Core
-status: in-progress
-priority: 6
+status: done
 areas: [flux-secret]
 note: "measured by C-216's corpus, not guessed — SECRET_PREFIXES has `sk-` but not Stripe's `sk_live_`, and PEM private-key bodies are unprefixed base64; below 6 characters `add_secret` silently no-ops, so short credentials have no recourse at all"
 ---

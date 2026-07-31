@@ -67,6 +67,20 @@
 
 ### Fixed
 
+- **Security: several kinds of credential that flux used to let through are now hidden.** flux hides
+  secrets from logs, from what the model can see, and from saved transcripts. A measurement found six
+  kinds it was missing — among them AWS secret keys, passwords embedded in database connection
+  addresses, Stripe live keys, and private keys pasted in full. All six are now caught.
+  Two of those matter more than the rest because of *where* they show up: Stripe live keys and private
+  keys turn up exactly where an agent writes production configuration.
+  flux deliberately still errs on the side of showing too much rather than too little. Blanking out
+  anything that merely looks secret would eat your own configuration, commit hashes and screenshots —
+  so the new rules only fire on strong evidence. What is still not caught is written down rather than
+  glossed over.
+  **One change you may notice:** if you declare a secret whose value is too short to protect, flux now
+  refuses to run instead of quietly continuing without protecting it. A promise it cannot keep is now
+  an error you can see.
+
 - **Security: a webhook channel whose token was empty let everyone in — including callers who sent
   no credentials at all.** If you set a token on a webhook channel and the value came out empty —
   most easily by pointing it at an environment variable that was exported empty or never given a

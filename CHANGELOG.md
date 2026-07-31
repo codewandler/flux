@@ -141,6 +141,32 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **⚠ Security: the redactor now catches six credential shapes it measurably missed** (C-315). C-216
+  measured them; this closes them. They do not share a defect, so they could not share a fix: three
+  are genuinely missing prefixes (`sk_live_`, `hf_`, `glpat-`), and three are not prefix problems at
+  all — an AWS secret access key is 40 characters of unmarked base64, a connection-URL password is
+  bounded by `:` and `@`, and PEM material is unprefixed base64 framed by prose.
+
+  **Entropy scoring was rejected**, and the reasoning matters more than the mechanism: it cannot
+  distinguish 40 characters of AWS secret from a git SHA, a checksum, a UUID or the base64 PNG that
+  C-216's corpus asserts must survive verbatim. `Redactor` is the shared path for stream-json,
+  whatif cassettes, the approval sheet, evidence flush and harness ingest, so one false positive
+  destroys information on all of them at once. The four mechanisms shipped instead — per-prefix
+  length floors, a PEM private-key block pass, a structurally exact URL-credential pass, and a
+  contextual `NAME=VALUE` rule — fail toward false *negatives*, which is the right direction when the
+  alternative is censoring the operator's own diff back at them.
+
+  **`add_secret`'s silent sub-6-character no-op is now visible**: `try_add_secret` returns the
+  declined registration, and every production call site acts on it. `flux-app`'s `resolve_secrets`
+  and `flux-web`'s `$secret` path now *refuse* rather than proceed — a `secret "NAME"` declaration is
+  a promise, and if the value cannot be protected the promise cannot be kept quietly. `add_secret`
+  survives as the infallible form for callers that have already checked length, so
+  `codewandler-flux-secret` moves 1.0.1 → 1.1.0 additively rather than forcing a major.
+
+  Known and deliberately recorded rather than asserted away: a secret-named value below the 16-char
+  opaque floor, a bare token nothing names, the `key: value` spelling, and an all-digit credential
+  (registration-only by construction — tracked as C-323).
+
 - **⚠ Security: an empty bearer token on a webhook channel authenticated every request, including
   one carrying no `Authorization` header at all** (C-317). `constant_time_eq(b"", b"")` is true, and
   the only guard tested `is_none()` — so `token secret "K"` with `K` exported empty produced a
