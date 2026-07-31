@@ -2,7 +2,7 @@
 id: C-205
 title: "Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore"
 pillar: Core
-status: blocked
+status: ready
 priority: 5
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -68,3 +68,32 @@ exception.
 - Verify which crate pulls `lru` (`cargo tree -i lru`) before bumping — if a direct dependency caps
   the major, the bump may need that dependency updated too, which widens the change.
 - Source: [C-188](C-188-dependency-advisory-scanning.md) ADJACENT finding; advisory RUSTSEC-2026-0002.
+
+- 2026-08-01 — **UNBLOCKED: the premise of the 2026-07-29 block is stale.** That note said the hold
+  lifts "once codewandler/markdown moves to ratatui 0.30". **It has.** Measured:
+
+  | | rev | `crates/markdown-ratatui` requires |
+  |---|---|---|
+  | what flux pins (`crates/flux-markdown/Cargo.toml:28`) | `35c6db54` | `ratatui = "0.29"` |
+  | that repo's `main` | `ad16fe5` | **`ratatui = "0.30"`** |
+
+  Four commits apart, including two releases (0.2.0, 0.2.1). We own that repository
+  (`~/projects/markdown`), so nothing here waits on a third party.
+
+  **Status changed `blocked` → `ready`.** It is no longer blocked; it is *unstarted*, and the two are
+  not the same thing on a board.
+
+  The chain to actually land it, in order — this is a dependency-upgrade story, not a lockfile nudge:
+
+  1. Move `markdown-stream`'s git pin `35c6db54` → `ad16fe5` (`crates/flux-markdown/Cargo.toml:28`).
+  2. Lift the hold at root `Cargo.toml:149-150`: `ratatui = ">=0.29, <0.30"` → `0.30`. **Read the
+     comment above it first** — it names all three crates that must move together.
+  3. `crossterm` must match ratatui's backend (`>=0.28, <0.29` today).
+  4. `flux-tui`'s `ansi-to-tui 7` tracks ratatui 0.29 and needs the version that tracks 0.30.
+  5. Only then does `lru` become bumpable — it enters solely via ratatui, so nothing in this
+     workspace names it directly and `cargo update -p lru --precise` cannot work until ratatui moves.
+
+  ⚠ **Runs solo.** It changes manifests and both lockfiles, so by the disjointness rule it cannot
+  share a wave. ⚠ And it touches the TUI's rendering stack across a ratatui major — expect real
+  breakage in `flux-tui`, not just a version bump. A concurrent session was editing
+  `crates/flux-tui/**` on 2026-08-01; check for dirty paths there before starting.

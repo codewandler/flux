@@ -2,6 +2,7 @@
 id: C-313
 title: "The fifth encoder copy, and the query key nothing pins"
 pillar: Core
+epic: road-to-stable
 status: ready
 priority: 14
 areas: [flux-web]

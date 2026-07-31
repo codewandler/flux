@@ -135,8 +135,16 @@ fi
 
 # 3c) WHATS-NEW.md is the source of truth for the public website mirror. Regenerate it before the
 #     gate so `website_in_sync` validates the just-rolled release rather than the previous file.
-UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync \
-  website_customer_changelog_is_in_sync >/dev/null
+#
+#     The armed run FAILS ON PURPOSE (C-326): a run that rewrote a golden verified nothing, so it is
+#     not allowed to report `ok`. Its exit status therefore carries no information and is discarded —
+#     the unarmed re-run on the next line is what actually says whether the mirror is now in sync,
+#     and it is a hard error because a silently-unwritten mirror used to reach the release commit.
+FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync \
+  website_customer_changelog_is_in_sync >/dev/null 2>&1 || true
+cargo test -p codewandler-flux-lang --test website_in_sync \
+  website_customer_changelog_is_in_sync >/dev/null 2>&1 \
+  || { echo "!! website customer changelog did not regenerate — see website_in_sync" >&2; exit 1; }
 echo "   regenerated website customer changelog"
 
 # 3d) restamp the roadmap's status line so the release version is not hand-maintained (C-147).
