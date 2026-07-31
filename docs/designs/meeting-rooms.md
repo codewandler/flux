@@ -144,16 +144,41 @@ pub trait Room: Send + Sync {
     async fn leave(&self) -> Result<()>;
 }
 
+#[non_exhaustive]
 pub enum RoomEvent {
     Joined { occupant: Occupant },
     Left { occupant: OccupantId },
-    Message { from: OccupantId, text: String },
+    Message { from: OccupantId, text: String, scope: MessageScope },
     /// sidecar-only, feature-gated
     Audio { from: OccupantId, frame: AudioFrame },
     SpeechStarted { from: OccupantId },
     Ended,
 }
 ```
+
+**As landed (D-204), with four deliberate departures from the sketch above** —
+`crates/flux-channels/src/rooms/`:
+
+- **`Message` carries a `MessageScope`** (`Groupchat` | `Private`). Without it a whisper is
+  indistinguishable from public text, which breaks *both* consumers downstream: D-207 treats a whisper
+  as a stronger addressing signal than public text, and a reply has to go back the way it came. Adding
+  the field later would have been a breaking change to the port D-205/D-206 implement.
+- **`RoomEvent` is `#[non_exhaustive]`**, so the feature-gated media variants (D-208…D-211) are
+  additive for downstream consumers. Inside `flux-channels` the driver still matches exhaustively on
+  purpose: a new variant must fail to compile rather than be dropped on the floor.
+- **`RoomStream` is an owned bounded receiver, not a `Stream`.** A backend's protocol loop is a task
+  feeding a channel — that is literally what the XMPP WebSocket read loop is — and the consumer is a
+  `select!` against a cancellation token. Bounded so a busy room backpressures its own socket instead
+  of queueing unheard chatter. It also keeps `futures` out of this crate's dependency list.
+- **`Occupant` carries `kind: OccupantKind` and `is_self`.** `kind` is what lets D-207 refuse to
+  ping-pong with another agent's plain text and lets a driver ignore a MUC's own service occupants
+  (Jitsi's `focus`); `is_self` is not cosmetic — a MUC echoes our groupchat messages back to us, so a
+  consumer that cannot recognize itself answers itself forever.
+
+**The L3 turn seam changed with it (breaking):** `VoiceTurnHandler::turn` is now
+`turn(&self, speaker: &Speaker, user_text: &str)`. `flux_flow::voice::Speaker` is a surface-owned id
+plus an optional display name; a 1:1 surface passes `Speaker::sole()`, which is how a phone line's
+single caller becomes *named* rather than absent.
 
 Backends: **`XmppMucRoom`** (generic prosody/ejabberd MUC — the portable one), **`JaasRoom`** (Brave Talk
 and any own-tenant JaaS: the guest-JWT + conference-request handshake above), and **`MockRoom`** for
@@ -163,7 +188,9 @@ host, exactly as D-04 established.
 
 **Every inbound event carries an `OccupantId`.** That is the one change the existing turn seams need: a
 room has N speakers and `VoiceTurnHandler::turn` currently takes only text. Attribution is not a feature,
-it is the precondition for the address rule below.
+it is the precondition for the address rule below. The one exception is `Ended` — the room's own
+lifecycle terminator, which no participant causes; `RoomEvent::occupant()` returns `None` only there,
+and a consumer that requires `Some` for everything else is holding the port to its contract.
 
 ## Multi-party is the design problem; the plumbing is the easy half
 

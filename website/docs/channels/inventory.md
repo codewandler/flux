@@ -1,11 +1,11 @@
 ---
 title: Channel inventory and capabilities
-description: "Every channel kind flux ships — cli, schedule, webhook, a2a, slack — with its settings, payload, reply path, auth model, and limits."
+description: "Every channel kind flux ships — cli, schedule, webhook, a2a, slack, room — with its settings, payload, reply path, auth model, and limits."
 ---
 
 # Channel inventory and capabilities
 
-Five channel kinds ship in the stock `flux` binary. This page is the reference for what each one can
+Six channel kinds ship in the stock `flux` binary. This page is the reference for what each one can
 actually do. For the model behind them — how a channel wakes a program and why deliveries are ordered
 — read [what a channel is](./overview.md) first.
 
@@ -21,6 +21,7 @@ recognize refuses to start.
 | [`webhook`](#webhook) | `http` | any HTTP caller | the HTTP response | yes, if remote | optional bearer (**required** off-loopback) | always |
 | [`a2a`](#a2a) | — | an agent or API client | response + SSE stream | yes, if remote | bearer, or per-request principal (RFC 7662) | always |
 | [`slack`](#slack) | — | a Slack user | posted into the thread | **no** — outbound socket | Slack bot + app tokens | default feature |
+| [`room`](#room) | — | any occupant of the room | said back into the room | **no** — outbound socket | the backend's (see below) | always |
 
 Every kind's `settings` may carry `secret "ENV_VAR"` references instead of literals; the host resolves
 them once at load, before any adapter reads its settings.
@@ -135,6 +136,48 @@ channel slack
 Compiled into the stock binary; only a `--no-default-features` build omits it, and such a build fails
 loudly on a `slack` channel rather than silently ignoring it. Setup walkthrough:
 [Slack channel setup](../agent/slack-channel.md).
+
+## `room`
+
+A **many-party meeting room** — the only channel kind where flux is one participant among several
+rather than the other end of a 1:1 exchange. It joins the room, hears everything said in it, and
+delivers each message as a turn that names **who** said it.
+
+```flux
+channel standup
+  kind "room"
+  backend "mock"
+  room "standup@conference.example.org"
+  nick "flux"
+```
+
+- `backend` — which room implementation to join with. **`mock`** is the in-process one (the same role
+  the `mock` model provider plays: no network, no vendor, fully scriptable). An unrecognized backend is
+  a load error.
+- `room` — the room address as the **server** spells it. Take it from the server rather than assembling
+  it: some hosts lowercase the room in its address while other identifiers keep the original case.
+- `nick` — the name flux joins under. Defaults to `flux`.
+- `address_rule` — when the agent should treat a turn as aimed at it. **Accepted but not yet enforced:**
+  today every inbound message produces a turn, so a room with two people talking to each other will
+  wake the program on every line.
+
+**Payload:** `{ "room", "text", "speaker", "nick", "name" }`. `speaker` is the occupant's stable,
+room-scoped address and `nick` their display name — two occupants can share a nick, so key anything
+per-person on `speaker`.
+
+**Reply:** non-empty run results are said back into the room, publicly for a public message and
+privately for a private one. Our own echoed messages never become turns.
+
+**No media.** Presence and text only — no audio and no screenshare. A delivery that fails (including
+an op the approver denied) is logged and the room keeps running: people are still in it, and one
+message going wrong is not a reason to walk out.
+
+:::warning A room is untrusted multi-party input
+Anyone who can reach the room can type into it, and on many hosts anyone holding the link can join with
+no account at all. **Being in a room grants an occupant no authority over flux:** a room-sourced turn
+goes through exactly the same approval envelope as a prompt you typed yourself, so an operation that
+needs approval is denied unless it is approved.
+:::
 
 ## Adjacent surfaces
 

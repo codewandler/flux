@@ -92,6 +92,12 @@ executor — the same envelope as a text turn — and barge-in is unchanged.
 `VoiceReply::Continue(text)` for the old behavior. The new `start()` (speak first) and
 `VoiceSink::session_ended` hooks have defaults, so existing implementations only adjust `turn`.
 
+**Breaking again:** `turn` now takes the speaker as well —
+`turn(&self, speaker: &Speaker, user_text: &str)`. A phone line has exactly one candidate, so the
+realtime driver passes `Speaker::sole()` and behavior is unchanged; the parameter exists because a
+[many-party room](../channels/inventory.md#room) has N speakers and a handler cannot decide whether it
+was addressed without knowing who spoke. An existing implementation adds the parameter and ignores it.
+
 ## Status and limits
 
 - **Experimental.** The traits and event shapes are pre-1.0 and have already changed in breaking

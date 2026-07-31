@@ -7,6 +7,7 @@
 
 mod driver;
 mod sink;
+mod speaker;
 #[cfg(test)]
 mod tests;
 mod transcript;
@@ -15,6 +16,7 @@ pub use driver::{
     EngineVoiceHandler, UsageRecording, VoiceReply, VoiceSessionDriver, VoiceTurnHandler,
 };
 pub use sink::VoiceSink;
+pub use speaker::{Speaker, SOLE_SPEAKER_ID};
 pub use transcript::TranscriptAccumulator;
 
 use flux_provider::ToolDef;

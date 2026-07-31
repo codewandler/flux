@@ -14,6 +14,7 @@ use flux_provider::{RealtimeConnection, RealtimeEvent};
 use flux_runtime::{scope_runtime_turn, Executor, RuntimeTurnContext, ToolResult};
 
 use super::sink::VoiceSink;
+use super::speaker::Speaker;
 use crate::ast::DraftAst;
 use crate::engine::FlowEngine;
 use crate::AgentSink;
@@ -56,9 +57,14 @@ pub trait VoiceTurnHandler: Send + Sync {
     async fn start(&self) -> Option<VoiceReply> {
         None
     }
-    /// Handle one completed user turn (their transcript); return what the agent should say next and
-    /// whether the session continues.
-    async fn turn(&self, user_text: &str) -> VoiceReply;
+    /// Handle one completed user turn: **who** spoke it and what they said; return what the agent
+    /// should say next and whether the session continues.
+    ///
+    /// A 1:1 surface (a phone line) passes [`Speaker::sole`] — there is only one candidate. A
+    /// many-party surface (a meeting room, D-204) passes the attributed occupant, which is what lets
+    /// a handler decide whether it was addressed at all instead of answering every sentence in the
+    /// room.
+    async fn turn(&self, speaker: &Speaker, user_text: &str) -> VoiceReply;
 }
 
 /// Drives a realtime voice session: forwards audio/transcripts to a [`VoiceSink`] and routes the
@@ -270,8 +276,9 @@ impl VoiceSessionDriver {
                         RealtimeEvent::InputTranscriptDone(t) => {
                             sink.input_transcript(&t);
                             // The flow advances one turn (resumes its suspension) and decides the
-                            // reply; speak it, and end the session if the flow completed.
-                            let reply = handler.turn(&t).await;
+                            // reply; speak it, and end the session if the flow completed. A realtime
+                            // call is 1:1, so every turn is the sole caller's (D-204).
+                            let reply = handler.turn(&Speaker::sole(), &t).await;
                             if speak_reply(session.as_ref(), sink, reply).await {
                                 break;
                             }
@@ -369,7 +376,11 @@ impl VoiceTurnHandler for EngineVoiceHandler {
         Some(self.classify(cap.text))
     }
 
-    async fn turn(&self, user_text: &str) -> VoiceReply {
+    /// The speaker is carried but not yet threaded into the flow's own input: `run_turn` has a single
+    /// text slot, and giving the flow attributed context is D-207's job (addressing and the
+    /// per-speaker transcript). A room handler that needs the speaker today implements this trait
+    /// directly.
+    async fn turn(&self, _speaker: &Speaker, user_text: &str) -> VoiceReply {
         let mut cap = PromptCapture::default();
         let _ = self
             .engine
