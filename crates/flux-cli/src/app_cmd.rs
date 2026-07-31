@@ -308,6 +308,40 @@ pub(super) fn app_provider_for(spec: &str) -> (Option<std::sync::Arc<dyn Provide
     }
 }
 
+/// Assemble the `flux app run` execution environment (C-307).
+///
+/// Program mode used to build its own [`ExecutionEnvironment`] inline, and that inline assembly was
+/// the one that never called `with_resource_limits` — so a configured `[limits]` table was silently
+/// inert for the whole `app run` surface while `run`/`plan`/`tui`/`serve` honoured it (C-299).
+/// Routing through [`assemble_cli_execution_environment`] instead of re-deriving the envelope keeps
+/// **one** place where the CLI turns resolved ceilings into an environment, and `resource_limits` is
+/// a required parameter there — so a surface can no longer end up unbounded by simply not mentioning
+/// it. The workspace handle (C-122) is layered on afterwards: it is the only thing the app path needs
+/// that the shared seam does not take.
+pub(super) fn assemble_app_execution_environment(
+    system: Arc<System>,
+    registry: ToolRegistry,
+    approver: Arc<dyn Approver>,
+    workspace: flux_runtime::WorkspaceContext,
+    redactor: flux_secret::Redactor,
+    resource_limits: flux_runtime::ResourceLimits,
+) -> ExecutionEnvironment {
+    assemble_cli_execution_environment(
+        system,
+        registry,
+        PermissionManager::new(),
+        approver,
+        ExecutionAuthorization::local(),
+        redactor,
+        // The app installs its sub-agent spawner through `App`'s own `sub_agents` bundle, and
+        // declares no pre-tool hooks.
+        None,
+        Vec::new(),
+        resource_limits,
+    )
+    .with_workspace(workspace)
+}
+
 pub(super) async fn run_app(
     path: Option<&str>,
     flags: &AgentFlags,
@@ -490,6 +524,11 @@ pub(super) async fn run_app(
     // paths, which already load the config with `?`. (The sandbox posture itself was already
     // resolved and exported at startup, so the `resolved_sandbox()` on the `System` above reflects it.)
     let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
+    // C-307: the operator's `[limits]` ceilings for the whole `app run` surface, resolved ONCE here
+    // and handed to both the reviewer sub-agents and the app's execution environment below.
+    // Resolved once deliberately: a second `cli_resource_limits` call would mint a second semaphore,
+    // so the app's own executors would silently stop sharing one budget (C-299's recorded risk).
+    let resource_limits = cli_resource_limits(&cfg);
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops read.
@@ -537,8 +576,19 @@ pub(super) async fn run_app(
     // The built-in `strict-review` program's `review_code` journey calls `strict_review`, which fans
     // out to reviewer sub-agents via `task` — the same `build_review_sub_agents` helper `flux review`
     // uses, so the two surfaces delegate through the identical envelope, never a re-derived one.
+    //
+    // C-307: those reviewer children carry the operator's ceilings too. Before this they were
+    // handed a bare `SubAgents::new`, so `flux app run strict-review` — the path that fans out
+    // hardest — ran its whole reviewer fan-out on unbounded executors.
     let sub_agents = is_builtin_strict_review
-        .then(|| build_review_sub_agents(&spec, model.clone(), flags.max_tokens))
+        .then(|| {
+            build_review_sub_agents(
+                &spec,
+                model.clone(),
+                flags.max_tokens,
+                resource_limits.clone(),
+            )
+        })
         .transpose()?;
     let mut integration_registry = ToolRegistry::new();
     for (source, tool) in extra_tools {
@@ -578,15 +628,14 @@ pub(super) async fn run_app(
     } else {
         Arc::new(flux_runtime::DenyApprover)
     };
-    let environment = ExecutionEnvironment::new(
+    let environment = assemble_app_execution_environment(
         system,
         integration_registry,
-        PermissionManager::new(),
         approver,
-        ExecutionAuthorization::local(),
-    )
-    .with_workspace(app_workspace)
-    .with_redactor(redactor);
+        app_workspace,
+        redactor,
+        resource_limits,
+    );
     // C-183: same `[tools] disable` config C-162 wires into the interactive path — the raw
     // patterns are handed through so `flux_app::Engine` can resolve them (via
     // `ToolRegistry::resolve_disabled`, C-162's one implementation) once against its own
@@ -739,4 +788,196 @@ pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {
     let result = flux_tui::run_with_options(agent, session_id, options).await;
     persist_new_rules(&initial_rules, &executor.allow_rules());
     result
+}
+
+#[cfg(test)]
+mod app_run_resource_ceiling_wiring {
+    //! C-307: a configured `[limits]` table must bind for **`flux app run`** too — the one shipped
+    //! surface that assembled its own `ExecutionEnvironment` instead of routing through
+    //! `build_agent_with`, and therefore the one C-299's wiring never reached.
+    //!
+    //! Both assertions here are on **observed occupancy** — how many ops are inside `Tool::execute`
+    //! at once — not on what the assembled runtime reports it was configured with. C-299's own
+    //! review is why: it caught a sub-agent "wiring" whose line could be deleted without a single
+    //! test name changing colour, because nothing downstream of the configuration was ever observed.
+    //!
+    //! The occupancy harness (`Meter`/`Blocker`) is C-299's, imported rather than copied, so the two
+    //! stories cannot drift into measuring "in flight" differently.
+
+    use super::*;
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::execution::cli_resource_ceiling_wiring::{Blocker, Meter, BLOCKER};
+    use serde_json::json;
+
+    /// A `[limits]` table with a ceiling of one and a queue window long enough that a blocked call
+    /// waits rather than being refused — the shape both tests measure against.
+    fn ceiling_of_one() -> flux_runtime::ResourceLimits {
+        let cfg: flux_config::Config = toml::from_str(
+            "[limits]\nmax_concurrent_tool_calls = 1\ntool_call_queue_timeout_ms = 30000\n",
+        )
+        .expect("the `[limits]` concurrency keys must parse");
+        cli_resource_limits(&cfg)
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "flux-c307-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&root).expect("create the test workspace root");
+        root
+    }
+
+    /// One registry holding a [`Blocker`] that reports into `meter` and parks on `release`.
+    fn blocking_registry(
+        meter: &Arc<Meter>,
+        release: &Arc<tokio::sync::Semaphore>,
+    ) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Blocker {
+            meter: meter.clone(),
+            release: release.clone(),
+        }));
+        registry
+    }
+
+    /// **C-307 Acceptance 1.** `[limits] max_concurrent_tool_calls = 1` bounds the executor
+    /// `flux app run` assembles: three concurrent dispatches, one execution in flight.
+    ///
+    /// Before this story `run_app` built `ExecutionEnvironment::new(..).with_workspace(..)
+    /// .with_redactor(..)` inline and never called `with_resource_limits`, so all three ran at once
+    /// and a configured ceiling was inert for the whole `app run` surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_configured_limits_table_binds_for_the_app_run_executor() {
+        let root = temp_root("app-run");
+        let meter = Arc::new(Meter::default());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let system = Arc::new(System::new(Workspace::new(&root).unwrap()));
+        let executor = Arc::new(
+            assemble_app_execution_environment(
+                system.clone(),
+                blocking_registry(&meter, &release),
+                // `flux app run --yes`: the auto-approving posture, so the dispatches under test
+                // reach `Tool::execute` rather than stalling at an approval prompt.
+                Arc::new(AllowApprover),
+                flux_runtime::WorkspaceContext::new(system),
+                flux_secret::Redactor::new(),
+                // The one C-307 seam: the app path turns `[limits]` into runtime ceilings here.
+                ceiling_of_one(),
+            )
+            .into_executor(),
+        );
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let executor = executor.clone();
+                tokio::spawn(async move { executor.dispatch(BLOCKER, json!({})).await })
+            })
+            .collect();
+        // Long enough for all three to have reached the envelope; only one may be inside `execute`.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            meter.in_flight(),
+            1,
+            "`[limits] max_concurrent_tool_calls = 1` did not bind for the `flux app run` \
+             executor: {} tool calls were in flight at once",
+            meter.in_flight()
+        );
+
+        release.add_permits(3);
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(!result.is_error, "dispatch failed: {}", result.content);
+        }
+        assert_eq!(
+            meter.peak(),
+            1,
+            "peak occupancy must equal the configured ceiling"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **C-307 Acceptance 2.** `flux app run strict-review`'s reviewer children inherit the
+    /// configured ceiling — and inherit it *per child*.
+    ///
+    /// Until C-307 `build_review_sub_agents` returned a bare `SubAgents::new`, so every reviewer in
+    /// the widest fan-out flux ships ran on an unbounded executor. What is measured here is the
+    /// ceiling a child is actually built with: `bundle.resource_limits.independent_copy()` is
+    /// verbatim the transformation `LocalSpawner::spawn` applies to this bundle, so the executor
+    /// below is the one a reviewer child gets.
+    ///
+    /// The parent blocker parked alongside it is the C-299 per-child guard (Acceptance 4). With a
+    /// ceiling of one, `in_flight == 2` means parent and child each hold their own permit. It would
+    /// read `1` if this story had been "fixed" by handing children the parent's shared budget — the
+    /// shape that reproduced a real deadlock — and `4` if the reviewer children were unbounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn app_run_strict_review_reviewers_inherit_the_configured_ceiling() {
+        let root = temp_root("strict-review");
+        let meter = Arc::new(Meter::default());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let ceilings = ceiling_of_one();
+
+        let bundle = build_review_sub_agents("mock", "mock", 1024, ceilings.clone())
+            .expect("the strict-review sub-agent bundle must assemble");
+
+        let system = Arc::new(System::new(Workspace::new(&root).unwrap()));
+        let parent = Arc::new(
+            assemble_app_execution_environment(
+                system.clone(),
+                blocking_registry(&meter, &release),
+                Arc::new(AllowApprover),
+                flux_runtime::WorkspaceContext::new(system.clone()),
+                flux_secret::Redactor::new(),
+                ceilings,
+            )
+            .into_executor(),
+        );
+        let child = Arc::new(
+            assemble_app_execution_environment(
+                system.clone(),
+                blocking_registry(&meter, &release),
+                Arc::new(AllowApprover),
+                flux_runtime::WorkspaceContext::new(system),
+                flux_secret::Redactor::new(),
+                bundle.resource_limits.independent_copy(),
+            )
+            .into_executor(),
+        );
+
+        let mut handles = vec![{
+            let parent = parent.clone();
+            tokio::spawn(async move { parent.dispatch(BLOCKER, json!({})).await })
+        }];
+        handles.extend((0..3).map(|_| {
+            let child = child.clone();
+            tokio::spawn(async move { child.dispatch(BLOCKER, json!({})).await })
+        }));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            meter.in_flight(),
+            2,
+            "expected the parent and exactly ONE reviewer child in flight, saw {} — more means \
+             `build_review_sub_agents` handed its children no ceiling, fewer means they were given \
+             the parent's shared budget instead of a `ResourceLimits::independent_copy`",
+            meter.in_flight()
+        );
+
+        release.add_permits(4);
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(!result.is_error, "dispatch failed: {}", result.content);
+        }
+        assert_eq!(
+            meter.peak(),
+            2,
+            "peak occupancy must be one permit per agent, not one shared budget"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
