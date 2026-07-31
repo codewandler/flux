@@ -860,7 +860,10 @@ impl AgentSink for TextCollector {
             .or_default()
             .push(call_id);
         let mut input = input.clone();
-        redact_spawn_json(&self.redactor, &mut input);
+        // Every node kind, keys included — the tree's one total walk (C-323, consolidated in
+        // C-338). A registered all-digit credential has no other protection, so a skipped `Number`
+        // node is a hole in `add_secret`'s guarantee rather than an optimization.
+        flux_core::redact_json_total(&mut input, &|text| self.redactor.redact(text));
         self.emit(SpawnActivityEvent::ToolCall {
             call_id,
             name: name.to_string(),
@@ -904,7 +907,7 @@ impl AgentSink for TextCollector {
             self.cancelled = true;
         }
         let mut observation = observation.clone();
-        redact_spawn_json(&self.redactor, &mut observation.data);
+        flux_core::redact_json_total(&mut observation.data, &|text| self.redactor.redact(text));
         self.emit(SpawnActivityEvent::Observation { observation });
     }
 
@@ -912,42 +915,6 @@ impl AgentSink for TextCollector {
         // Cache engine usage, but defer the terminal event until `LocalSpawner::spawn` knows
         // whether the overall operation succeeded (a timeout may occur after engine finalization).
         self.terminal_usage = usage;
-    }
-}
-
-/// Scrub a sub-agent's tool input / observation data before it crosses the live reporter —
-/// **every node kind** (C-323).
-///
-/// Keys were already covered; numbers were not, and a registered all-digit credential has no other
-/// protection (no prefix marks it, and the contextual `NAME=VALUE` rule requires a letter so
-/// `secret_ttl=3600` survives), so a skipped `Number` node is a hole in `add_secret`'s guarantee
-/// rather than an optimization. A non-string scalar is redacted by its JSON literal spelling and
-/// retyped to a string **only when redaction actually fired**, so an ordinary port/count/id crosses
-/// with its value and its type intact.
-fn redact_spawn_json(redactor: &flux_secret::Redactor, value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => *text = redactor.redact(text),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_spawn_json(redactor, item);
-            }
-        }
-        serde_json::Value::Object(fields) => {
-            // JSON keys can contain credentials too (for example a model-generated header map).
-            // Rebuild the map so both keys and values cross the live reporter scrubbed.
-            let original = std::mem::take(fields);
-            for (key, mut value) in original {
-                redact_spawn_json(redactor, &mut value);
-                fields.insert(redactor.redact(&key), value);
-            }
-        }
-        scalar => {
-            let literal = scalar.to_string();
-            let redacted = redactor.redact(&literal);
-            if redacted != literal {
-                *scalar = serde_json::Value::String(redacted);
-            }
-        }
     }
 }
 
@@ -1349,7 +1316,7 @@ mod tests {
             "nested": [{ SECRET: format!("prefix-{SECRET}-suffix") }],
         });
 
-        redact_spawn_json(&redactor, &mut value);
+        flux_core::redact_json_total(&mut value, &|text| redactor.redact(text));
 
         let encoded = value.to_string();
         assert!(
@@ -1383,7 +1350,7 @@ mod tests {
             "none": null,
         });
 
-        redact_spawn_json(&redactor, &mut value);
+        flux_core::redact_json_total(&mut value, &|text| redactor.redact(text));
 
         let encoded = value.to_string();
         assert!(

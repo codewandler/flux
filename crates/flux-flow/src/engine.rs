@@ -1730,59 +1730,18 @@ fn flush_tail(
 /// Return a redacted copy of `obs` — its `data` scrubbed of any registered/credential-shaped
 /// secret (C-22). The JSON's *structure* is preserved (same containers in the same places) so the
 /// persisted observation still folds through `projection::observations` unchanged in shape, but no
-/// node is exempt from the scrub itself: see [`redact_json_in_place`].
+/// node is exempt from the scrub itself.
+///
+/// This is the evidence-flush seam, where a miss lands **durably** in the event store, so the walk
+/// is the tree's one total one — [`flux_core::redact_json_total`]: every node kind, keys included
+/// (C-323, consolidated in C-338).
 pub(crate) fn redact_observation(
     redactor: &flux_secret::Redactor,
     obs: &flux_evidence::Observation,
 ) -> flux_evidence::Observation {
     let mut out = obs.clone();
-    redact_json_in_place(redactor, &mut out.data);
+    flux_core::redact_json_total(&mut out.data, &|text| redactor.redact(text));
     out
-}
-
-/// Recursively rewrite `value` through the redactor, in place — **every node kind, keys included**
-/// (C-323).
-///
-/// This walker used to visit string leaves only, on the assumption that a secret is always a
-/// string. That assumption fails for the one credential shape with no other protection: an all-digit
-/// credential is outside every redaction heuristic *by construction* (no prefix marks it, and the
-/// contextual `NAME=VALUE` rule requires a letter so `secret_ttl=3600` survives), so **registration
-/// is its only recourse** — and this is the evidence-flush seam, where a miss lands durably in the
-/// event store. Skipping keys had the same effect for a model-generated header map.
-///
-/// A non-string scalar is redacted by its JSON literal spelling and **only retyped to a string when
-/// redaction actually fired** — `[redacted]` is not a number, and a sentinel number would be
-/// indistinguishable from real data. Every untouched number keeps its type, so a projection reading
-/// a numeric field is unaffected unless that field carried a registered secret.
-pub(crate) fn redact_json_in_place(
-    redactor: &flux_secret::Redactor,
-    value: &mut serde_json::Value,
-) {
-    match value {
-        serde_json::Value::String(s) => *s = redactor.redact(s),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_json_in_place(redactor, item);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            // Rebuild rather than `values_mut`: a key can carry a credential just as a value can
-            // (a model-generated header map is the live case), and a key cannot be rewritten in
-            // place.
-            let original = std::mem::take(map);
-            for (key, mut v) in original {
-                redact_json_in_place(redactor, &mut v);
-                map.insert(redactor.redact(&key), v);
-            }
-        }
-        scalar => {
-            let literal = scalar.to_string();
-            let redacted = redactor.redact(&literal);
-            if redacted != literal {
-                *scalar = serde_json::Value::String(redacted);
-            }
-        }
-    }
 }
 
 /// The location disclosed to the model for a skill's supporting files (D-190). A `SKILL.md`-backed

@@ -328,78 +328,18 @@ fn response_schema() -> Value {
 /// - The pattern redactor replaces a credential-shaped run between delimiters, and a `"` is one of
 ///   its delimiters — run over JSON text it can eat the quote's neighbourhood and leave a payload
 ///   that no longer parses. Redacting leaves cannot corrupt the structure.
+///
+/// The walk itself is [`flux_core::redact_json_total`] — **no node kind is exempt**, keys included
+/// (C-323), and since C-338 that guarantee is defined once for the whole tree rather than
+/// re-implemented here. It is reached through the `redact` closure this function already took, so
+/// flux-web still needs no dependency on `flux-secret`.
 fn parse_body(body: String, redact: impl Fn(&str) -> String) -> Value {
     match serde_json::from_str::<Value>(&body) {
-        Ok(parsed) if parsed.is_object() || parsed.is_array() => redact_json(parsed, &redact),
+        Ok(mut parsed) if parsed.is_object() || parsed.is_array() => {
+            flux_core::redact_json_total(&mut parsed, &redact);
+            parsed
+        }
         _ => Value::String(redact(&body)),
-    }
-}
-
-/// Redact every node of a parsed body — **no node kind is exempt** (C-323). Keys are covered too,
-/// because a vendor that echoes a request record back can echo a credential into a key as easily as
-/// into a value.
-///
-/// The earlier version visited only strings, on the reasoning that "numbers cannot carry a secret".
-/// That is false for the one credential shape that has no other protection: an all-digit credential
-/// is outside every heuristic *by construction* — no prefix marks it, and the contextual
-/// `NAME=VALUE` rule requires a letter precisely so `secret_ttl=3600` survives — so **registration
-/// is its only recourse**, and a walker that narrows by node kind makes that recourse conditional on
-/// the vendor's choice of JSON type. `add_secret`'s guarantee is total or it is not a guarantee.
-///
-/// Non-string scalars go through [`redact_scalar`], which changes the node **only when redaction
-/// actually fired**; see there for why that is the right shape.
-fn redact_json(value: Value, redact: &impl Fn(&str) -> String) -> Value {
-    match value {
-        Value::String(text) => Value::String(redact(&text)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| redact_json(item, redact))
-                .collect(),
-        ),
-        Value::Object(fields) => Value::Object(
-            fields
-                .into_iter()
-                .map(|(key, value)| (redact(&key), redact_json(value, redact)))
-                .collect(),
-        ),
-        scalar => redact_scalar(scalar, redact),
-    }
-}
-
-/// Redact a non-string scalar (`Number`, `Bool`, `Null`) by its JSON literal spelling — the text a
-/// reader of the encoded record actually sees.
-///
-/// **What a redacted number becomes, and why.** `[redacted]` is not a number, so a node that
-/// carried a registered secret cannot stay one. Three representations were available:
-///
-/// - A sentinel number (`0`, `-1`). Rejected outright: it is indistinguishable from data the vendor
-///   really sent, so a caller silently computes on a lie. Redaction has to be *visible*.
-/// - `null`. Same ambiguity in weaker form — `null` is a value an API legitimately sends, so the
-///   caller cannot tell "removed" from "absent".
-/// - The string `"[redacted]"`. Chosen. It is already what every other redacted node in this record
-///   looks like — a header value, a string leaf, an object key, the `view` — so there is one marker
-///   and one type for "a credential was here", and `.body.account_id` reads exactly as it would had
-///   the vendor sent the id as a string in the first place.
-///
-/// **The shape change is deliberately scoped to nodes redaction actually touched**, which is why
-/// this compares before and after rather than switching on the node kind. C-304 made the record's
-/// shape something a caller selects from, so retyping a number is a real cost — but it is only paid
-/// by a node whose value the caller could not have used anyway (using it means using the
-/// credential). Every ordinary number keeps its type, so `.body.page == 2` and a `.status`
-/// comparison are untouched.
-///
-/// `Bool` and `Null` cannot in practice be affected — `true`/`false`/`null` are all under the
-/// redactor's 6-character registration floor, and no shape heuristic fires on them. They go through
-/// here anyway so that *no node kind is exempt by construction*: the guarantee holds because the
-/// walker visits everything, not because someone re-derived which kinds are currently safe.
-fn redact_scalar(scalar: Value, redact: &impl Fn(&str) -> String) -> Value {
-    let literal = scalar.to_string();
-    let redacted = redact(&literal);
-    if redacted == literal {
-        scalar
-    } else {
-        Value::String(redacted)
     }
 }
 
