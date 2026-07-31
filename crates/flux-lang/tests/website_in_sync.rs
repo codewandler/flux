@@ -14,8 +14,15 @@
 //! treats an unescaped `|` inside a cell as a new column boundary (unlike the plain-markdown crate
 //! docs and skills, which tolerate it), so cell content is escaped with `\|` for this consumer only.
 //!
-//! Regenerate with: `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`
+//! Regenerate with:
+//! `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync`
+//! — which writes the mirrors and then **fails on purpose**, so a rewrite can never be mistaken for
+//! a verified check (C-326). Re-run with the variable unset to verify.
 
+#[path = "support/golden_mode.rs"]
+mod golden_mode;
+
+use golden_mode::Mode;
 use std::path::PathBuf;
 
 const BEGIN: &str = "<!-- BEGIN generated:node-kinds -->";
@@ -30,10 +37,6 @@ fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(rel)
-}
-
-fn update() -> bool {
-    std::env::var("UPDATE").is_ok()
 }
 
 /// Escape literal `|` characters in a cell's content — required by Docusaurus's markdown table
@@ -91,15 +94,15 @@ fn website_node_reference_node_kinds_block_is_in_sync() {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let expected = splice(&content, BEGIN, END, &block);
 
-    if update() {
+    if golden_mode::mode() == Mode::Rewrite {
         std::fs::write(&path, &expected)
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        return;
+        golden_mode::rewrote(&path);
     }
     assert_eq!(
         content, expected,
         "website/docs/language/node-reference.md node-kinds block is out of date — regenerate \
-         with `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`"
+         with `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync`"
     );
 }
 
@@ -115,15 +118,16 @@ fn website_types_and_effects_prelude_types_block_is_in_sync() {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let expected = splice(&content, BEGIN_PRELUDE, END_PRELUDE, &block);
 
-    if update() {
+    if golden_mode::mode() == Mode::Rewrite {
         std::fs::write(&path, &expected)
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        return;
+        golden_mode::rewrote(&path);
     }
     assert_eq!(
         content, expected,
         "website/docs/language/types-and-effects.md prelude-types block is out of date — \
-         regenerate with `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`"
+         regenerate with `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test \
+         website_in_sync`"
     );
 }
 
@@ -138,14 +142,14 @@ fn website_customer_changelog_is_in_sync() {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let expected = splice(&content, BEGIN_WHATS_NEW, END_WHATS_NEW, &block);
 
-    if update() {
+    if golden_mode::mode() == Mode::Rewrite {
         std::fs::write(&path, &expected)
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        return;
+        golden_mode::rewrote(&path);
     }
     assert_eq!(
         content, expected,
-        "website/docs/whats-new.md is out of date — regenerate with `UPDATE=1 cargo test -p \
-         codewandler-flux-lang --test website_in_sync`"
+        "website/docs/whats-new.md is out of date — regenerate with `FLUX_UPDATE_GOLDEN=1 cargo \
+         test -p codewandler-flux-lang --test website_in_sync`"
     );
 }
