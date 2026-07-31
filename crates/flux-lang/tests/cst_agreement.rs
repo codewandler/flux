@@ -84,6 +84,7 @@ const LEGACY_FIXTURES: &[LegacyFixture] = &[
 const POST_CUTOVER_FIXTURES: &[&str] = &[
     "examples/bitcoin-price.flux",
     "examples/cognition-research.flux",
+    "examples/commit.flux",
     "examples/eval-smoke.flux",
     "examples/eval-synthetic.flux",
     "examples/improve-multi.flux",
@@ -366,7 +367,7 @@ fn shipped_flux_corpus_agreement() {
     scanned.sort();
     accepted.sort();
     post_cutover.sort();
-    assert_eq!(scanned.len(), 18, "the shipped Flux fixture census changed");
+    assert_eq!(scanned.len(), 19, "the shipped Flux fixture census changed");
     assert_eq!(
         post_cutover.len(),
         POST_CUTOVER_FIXTURES.len(),
