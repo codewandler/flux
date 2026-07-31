@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-07-31
+
 ### Added
 
 - **`flux run --tui` installs the TUI's surface sink, so a model's `pane.open` reaches a terminal**
