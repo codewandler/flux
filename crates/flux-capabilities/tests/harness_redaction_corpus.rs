@@ -77,7 +77,8 @@ AWS_ACCESS_KEY_ID=AKIAC216CORPUSTOOL01
 AWS_SECRET_ACCESS_KEY=wJalrc216corpusToolNotARealSecret000000a
 SLACK_BOT_TOKEN=xoxb-000000000000-000000000000-c216corpustool
 DATABASE_URL=postgres://flux:c216corpustoolpassword@db.internal:5432/app
-REDIS_PASSWORD=c216corpusPw";
+REDIS_PASSWORD=c216corpusPw
+ACCOUNT_SECRET_ID=216216216216216218";
 
 /// The same class of content pasted by the human instead of captured from a tool.
 ///
@@ -311,7 +312,7 @@ const CASES: &[Case] = &[
             "postgres://flux:",
             "@db.internal:5432/app",
         ],
-        under_match: &["c216corpusPw"],
+        under_match: &["c216corpusPw", "216216216216216218"],
         surfaced_by: CLAUDE_ONLY,
     },
     // ---------------------------------------------------------------------------------------
@@ -898,7 +899,12 @@ fn no_adapter_but_claude_code_surfaces_tool_output() {
 /// blob, as the marker's own base64 encoding (`c216corpus` inside a JSON string encodes to
 /// `…MyMTZjb3JwdXM…`). Case-insensitive because one shape (`AKIA…`) is upper-cased by convention.
 fn is_marked_synthetic(literal: &str) -> bool {
-    literal.to_ascii_lowercase().contains("c216corpus") || literal.contains("MyMTZjb3JwdXM")
+    literal.to_ascii_lowercase().contains("c216corpus")
+        || literal.contains("MyMTZjb3JwdXM")
+        // C-315's numeric shape: an all-digit credential cannot carry an alphabetic marker at all,
+        // so it carries the corpus's own number instead, repeated far past the point where it could
+        // be a real account id someone pasted.
+        || (literal.bytes().all(|b| b.is_ascii_digit()) && literal.contains("216216216"))
 }
 
 #[test]
@@ -1443,6 +1449,14 @@ const UNCAUGHT: &[(&str, &str)] = &[
         "a secret-named binding in `key: value` form rather than `key=value`",
         "password: wJalrc216corpusColonFormSecret0000a",
     ),
+    // The seventh shape, and the one that is a *promise* rather than a heuristic gap: an all-digit
+    // credential. No prefix can mark it and the contextual rule requires a letter, so registration
+    // is its only recourse — which makes any redaction path that skips numeric values a hole in
+    // `add_secret`'s guarantee rather than an optimization. See `harness-history.md`.
+    (
+        "an all-digit credential — outside every heuristic, registration-only",
+        "ACCOUNT_SECRET_ID=216216216216216218",
+    ),
 ];
 
 const CAUGHT: &[(&str, &str)] = &[
@@ -1511,20 +1525,38 @@ fn the_measured_under_match_is_exactly_the_list_the_design_records() {
     }
 
     // The operator's first recourse: registering the value catches every one of the shapes the
-    // prefix list misses. This is what makes the gap a decision the operator can act on.
+    // heuristics miss. This is what makes the gap a decision the operator can act on.
     for (shape, sample) in UNCAUGHT {
         let registered = Redactor::new();
-        registered.add_secret(*sample);
+        registered
+            .try_add_secret(*sample)
+            .expect("every measured under-match is long enough to register");
         assert!(
             !registered.redact(sample).contains(sample),
-            "`add_secret` must be a working recourse for {shape}"
+            "`try_add_secret` must be a working recourse for {shape}"
         );
     }
 
-    // …and the limit of that recourse, also written down: a value under the 6-character floor is
-    // silently not registered, so short credentials have no recourse but leaving the source off.
+    // The all-digit shape, stated on its own because it is the one whose *only* recourse is
+    // registration — no prefix can mark it and the contextual rule requires a letter, by design.
+    // Anything that narrows what registration reaches (a redaction path that skips numeric JSON
+    // values, say) is therefore not an optimization but a hole in this guarantee (C-315).
+    let numeric = Redactor::new();
+    numeric.try_add_secret("216216216216216218").unwrap();
+    assert_eq!(
+        numeric.redact("ACCOUNT_SECRET_ID=216216216216216218 (216216216216216218)"),
+        "ACCOUNT_SECRET_ID=[redacted] ([redacted])",
+        "registration is the whole recourse for a numeric credential, so it must be total"
+    );
+
+    // …and the limit of recourse, also written down: a value under the 6-character floor is not
+    // registered at all. Since C-315 the caller is *told* — the floor is still a real limit, but a
+    // security-registration call no longer reports success for something it did not do.
     let short = Redactor::new();
-    short.add_secret("hunt3");
+    assert!(
+        short.try_add_secret("hunt3").is_err(),
+        "a declined registration must be visible to the caller, not a silent no-op"
+    );
     assert_eq!(
         short.redact("password=hunt3"),
         "password=hunt3",

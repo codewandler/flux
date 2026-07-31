@@ -182,9 +182,13 @@ impl Tool for HttpRequestTool {
                     let encoded = percent_encode_component(&secret);
                     // `resolve_secret_env` already refused anything the redactor would decline, so
                     // both spellings register; the encoded form is never shorter than the raw one.
-                    ctx.redactor.try_add_secret(secret.clone()).map_err(too_short_to_protect(&name))?;
+                    ctx.redactor
+                        .try_add_secret(secret.clone())
+                        .map_err(too_short_to_protect(&name))?;
                     if encoded != secret {
-                        ctx.redactor.try_add_secret(encoded).map_err(too_short_to_protect(&name))?;
+                        ctx.redactor
+                            .try_add_secret(encoded)
+                            .map_err(too_short_to_protect(&name))?;
                     }
                     secret
                 }

@@ -270,9 +270,7 @@ impl Redactor {
         let v = value.into();
         let trimmed = v.trim();
         if trimmed.len() < MIN_REGISTERED_SECRET_LEN {
-            return Err(Unregistered::TooShort {
-                len: trimmed.len(),
-            });
+            return Err(Unregistered::TooShort { len: trimmed.len() });
         }
         self.values.lock().unwrap().push(trimmed.to_string());
         Ok(())
@@ -689,12 +687,12 @@ mod tests {
     fn a_secret_named_assignment_leaves_ordinary_config_alone() {
         let r = Redactor::new();
         for line in [
-            "TOKEN_PATH=/etc/flux/credentials",       // no digit — a path, not material
-            "SECRET_NAME=my-app-production-config",   // no digit
-            "AWS_SECRET_ACCESS_KEY=${AWS_SECRET}",    // template reference
+            "TOKEN_PATH=/etc/flux/credentials", // no digit — a path, not material
+            "SECRET_NAME=my-app-production-config", // no digit
+            "AWS_SECRET_ACCESS_KEY=${AWS_SECRET}", // template reference
             "API_TOKEN_URL=https://auth.example.com", // punctuation outside the alphabet
-            "password=hunter2",                       // below the opaque-material floor
-            "secret_ttl=3600",                        // no letters
+            "password=hunter2",                 // below the opaque-material floor
+            "secret_ttl=3600",                  // no letters
         ] {
             assert_eq!(r.redact(line), line, "over-redacted: {line}");
         }
@@ -769,6 +767,27 @@ mod tests {
         ] {
             assert_eq!(r.redact(benign), benign, "over-redacted: {benign}");
         }
+    }
+
+    /// An all-digit credential is outside every heuristic here — no prefix can mark it, and
+    /// [`is_opaque_material`] requires a letter precisely so `secret_ttl=3600` survives. That makes
+    /// registration its *only* recourse, so registration has to be total: anything that narrows
+    /// where a registered value is matched is a hole in this guarantee, not an optimization.
+    #[test]
+    fn an_all_digit_credential_is_registration_only_and_registration_is_total() {
+        let r = Redactor::new();
+        let numeric = "216216216216216218";
+        // Not caught by shape, even named by an assignment that says "secret".
+        assert_eq!(
+            r.redact(&format!("ACCOUNT_SECRET_ID={numeric}")),
+            format!("ACCOUNT_SECRET_ID={numeric}")
+        );
+        // Caught once registered, in every position it can occupy.
+        r.try_add_secret(numeric).unwrap();
+        assert_eq!(
+            r.redact(&format!("id={numeric} ({numeric}) [{numeric}]")),
+            "id=[redacted] ([redacted]) [[redacted]]"
+        );
     }
 
     /// C-315 — the registration floor is a real decision, and a caller now learns when it applies.
