@@ -62,6 +62,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **⚠ BREAKING: `http.request` returns a `{status, headers, body}` record instead of one flat
+  string** (C-304). Every caller could previously reach a response only as
+  `HTTP <status>\n<headers>\n<body>`, so selecting `.data.id` got nothing — and got it *silently*,
+  which is the worst version of this failure. A flow can now select a field from the response.
+
+  **The body is carried as canonical JSON in `content` with a human-readable `view` beside it**, the
+  precedent C-10 established; `ToolResult` was **not** widened. The split already does this job —
+  `execute_call` binds `content` into scope so `$resp.body.data.id` resolves, while the sink and the
+  model are shown `view`. Keeping `view` byte-identical to the old rendering is what makes the
+  human-facing regression zero: the model's experience of this op did not move.
+
+  `body` is parsed only when it is a JSON object or array, and is raw text otherwise — the
+  interpreter's own rule (`jq_parse_input`), not a `content-type` sniff, because plenty of APIs
+  answer JSON under `text/plain`. An HTML error page, an empty body, a truncated payload and a bare
+  JSON scalar all take the text arm, so the record always survives with its status and headers
+  intact. A `404` stays a *result*, not an error.
+
+  **Redaction moved into the op and now runs after the parse**, over decoded leaves and keys. The
+  dispatcher's redaction of `content` is no longer sufficient alone: by then a registered secret
+  containing `"`, `\` or a newline is JSON-escaped, so a literal match misses it — and the pattern
+  redactor, whose token boundaries include `"`, can rewrite JSON text into something that no longer
+  parses. Proven by a test whose token carries both a quote and a backslash on purpose.
+
+  This replaces the string return rather than keeping it alongside the record, so it is breaking for
+  `codewandler-flux-web`. **A header name containing `-` — i.e. most of them — is not reachable
+  through the `$resp.headers.content-type` sugar**; the working idiom is
+  `pick({items: $resp.headers, keys: ["content-type"]})`, documented in the op's `output_schema` and
+  both catalog files. Making the sugar reach a quoted key is a flux-lang change, tracked as C-320.
+
 - **The harness-history containment is now proven over the shapes transcripts actually take, not
   only the happy path** (C-216). A corpus of six shapes across three harnesses — multi-part content
   arrays with a credential in the *last* block, `tool_result` bodies carrying `env` output, base64

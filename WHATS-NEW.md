@@ -42,6 +42,16 @@
   than one quietly overwriting the other. A stored credential can be used as a query value and stays
   hidden in logs and in anything the model can see, exactly as it does in a request header.
 
+- **A web request now hands back its answer in parts you can pick from, instead of one block of
+  text.** You get the status, the response headers and the body separately, so a flow can reach
+  straight into the body for the piece it wants — an id, a status field, an item from a list. Before
+  this, everything arrived glued into a single blob and asking for a field inside it simply gave you
+  nothing back, with no error to tell you the ask had not worked.
+  Bodies that are not JSON are handled the way you would hope: an HTML error page, an empty reply or
+  a cut-off response still come back with the status and headers intact, and the body as plain text.
+  A `404` is an answer, not a crash. What a person sees in the log is unchanged, and credentials that
+  an API echoes back to you — in a header or in the body — are still hidden.
+
 ### Fixed
 
 - **The limits you configure now actually apply when you run an app, and to the helpers it spawns.**
@@ -53,6 +63,15 @@
   One deliberate exception: replaying a recorded test still ignores your limits. A replay is meant to
   give the same answer on every machine, and letting local settings affect it would make the same
   test pass on one computer and fail on another.
+
+### Action needed
+
+- **If a flow of yours uses the result of a web request as text, it needs updating.** The result is
+  now made of parts rather than one block, so somewhere you were using the whole answer as a string,
+  use `.body` for the content, `.status` for the code and `.headers` for the headers.
+  One rough edge to know about: most header names contain a hyphen — `content-type`, `x-request-id` —
+  and you cannot yet write `.headers.content-type`. Until that is fixed, reach those with
+  `pick({items: $resp.headers, keys: ["content-type"]})`.
 
 ## [0.42.0] - 2026-07-31
 

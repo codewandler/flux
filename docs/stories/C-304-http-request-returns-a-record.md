@@ -2,8 +2,7 @@
 id: C-304
 title: "`http.request` returns one flat string, so no caller can select a field from a response"
 pillar: Core
-status: in-progress
-priority: 12
+status: done
 areas: [flux-web, flux-runtime]
 note: "the connector pack's source claims this is 'a seam story on flux, filed rather than faked' — the audit found it was never filed. Blocks flux-connectors C-127 and every connector caller that wants .data.id"
 ---
