@@ -178,6 +178,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **⚠ Security: no JSON node kind is exempt from a registered secret** (C-323). C-315 established
+  that an all-digit credential is outside every redaction heuristic **by construction** — no prefix
+  marks it, and the contextual `NAME=VALUE` rule deliberately requires a letter so `secret_ttl=3600`
+  survives. Registration is therefore its *only* protection, which reclassifies a walker that skips
+  `Value::Number` from an optimization into a hole in `add_secret`'s guarantee.
+
+  The audit found the problem was wider than the story described: **four** redaction walkers narrowed
+  by node kind, not one — and the two that feed **durable stores** (the evidence flush into the event
+  store, and the cassette's `input_view`) also skipped object **keys**. All four are fixed, and each
+  is independently mutation-pinned: disabling any one of them reds a named test.
+
+  A redacted non-string scalar becomes `"[redacted]"`, retyped **only when redaction actually
+  fired** — decided by comparing the JSON literal before and after, never by switching on node kind.
+  That distinction is itself pinned: mutating it to retype unconditionally reds two named tests. A
+  sentinel number was rejected as indistinguishable from real data, and `null` as ambiguous with a
+  legitimately-null field.
+
+  The whatif cassette keeps two paths deliberately. Naive re-serialization sorts keys — `serde_json`
+  is built without `preserve_order`, so `Map` is a `BTreeMap` — which changed the capped view's head;
+  and textual substitution of a *numeric* credential can splice a quoted string into the middle of a
+  number, leaving `input_view` unparseable, which matters because the TUI re-parses it. Both branches
+  were verified load-bearing by forcing each unconditionally.
+
+  ⚠ **Behaviour change on the published `codewandler-flux-web`:** `http.request`'s `body` can now
+  yield a string where it yielded a number, for a node holding a registered secret.
+  `scripts/check-crate-versions.sh` is structurally blind to this — `has_own_version()` scopes it to
+  crates that opted *out* of the workspace version sweep — so its PASS is not evidence. This is
+  priced by hand as the reason this release carries a **minor** rather than a patch.
+
 - **A wiring line now declares the test that observes it — the pin census** (C-328). Nineteen
   stories have found production wiring that is *correct* and that no test observes: deleting the line
   changes nothing. C-305 was the sharpest — two `flux-tui` lines whose removal left **474 tests

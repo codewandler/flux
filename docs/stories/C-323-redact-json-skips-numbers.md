@@ -2,8 +2,7 @@
 id: C-323
 title: "`redact_json` skips `Value::Number`, and an all-digit credential has no recourse but registration"
 pillar: Core
-status: in-progress
-priority: 5
+status: done
 areas: [flux-web, flux-secret]
 note: "found by C-315 — an all-digit credential is outside every redaction heuristic by construction (no prefix marks it; the contextual rule requires a letter so `secret_ttl=3600` survives), so registration is its ONLY protection; any walker that narrows which nodes it visits is therefore a hole in add_secret's guarantee, not an optimization"
 ---

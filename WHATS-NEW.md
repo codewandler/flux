@@ -74,6 +74,18 @@
 
 ### Fixed
 
+- **Security: a credential made only of digits is now hidden everywhere, including where it was
+  slipping through.** flux hides credentials you have registered wherever they appear. But a
+  credential that is only digits — an account id, a numeric key — cannot be recognised by any of the
+  clues flux uses for the others, so registering it is its *only* protection. Four places that scan
+  saved data for credentials were skipping over plain numbers, and two of them were also skipping the
+  *names* of fields — and both of those write to storage that persists. All four now look everywhere.
+  Ordinary numbers are untouched: ports, timeouts, counts and ids are only affected if you registered
+  that exact value as a secret.
+  **You may need to act:** if a web response contains a registered credential as a number, that one
+  field now comes back as the text `[redacted]` instead of a number. Only that field changes, and its
+  real value was never usable to you anyway.
+
 - **Flux files stop showing false syntax errors in Helix, Neovim and Zed.** If you write a duration
   the normal way — `500ms`, `10s`, `1m` — your editor was marking it as a mistake, even though it is
   correct and is the spelling flux itself recommends. Writing the same value as a plain number
