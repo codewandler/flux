@@ -2,8 +2,7 @@
 id: C-305
 title: "`run_tui` installs the TUI's SurfaceSink, so the pane.* vocabulary stops being inert"
 pillar: Core
-status: in-progress
-priority: 8
+status: done
 epic: agent-authored-surface
 design: docs/designs/agent-authored-surface.md
 areas: [flux-cli, flux-tui, flux-flow]

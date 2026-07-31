@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`flux run --tui` installs the TUI's surface sink, so a model's `pane.open` reaches a terminal**
+  (C-305). The `pane.*` ops were registered but nothing carried their commands to the frame, and the
+  first symptom of that is *silence* — no error, just a pane that never appears.
+
+  The engine re-attaches the sink at `begin_turn`, which is the non-obvious half:
+  `runtime_turn_context` treats an active lexical scope as authoritative *including its absent
+  fields*, so a sink installed on the executor was invisible from inside a real turn. Installing it
+  is not enough; it has to be re-attached where the turn can see it.
+
+  **Both remaining links of the delivery chain are now pinned independently.** Review found that
+  deleting *both* production wiring lines left 474 tests green while no pane could ever reach a
+  terminal — this repo's recurring defect, a ticked acceptance box no test observes. Closing it took
+  two seams rather than one: `event_loop` generalised over `B: Backend` with an injected event
+  stream, and `session_state` extracted to hold the queue install. One combined test would have red
+  on both mutations and proved neither alone; now each line reds its own test and leaves the other
+  green.
+
 - **A plugin's catalog can be re-projected without restarting flux, and a refresh can only ever
   narrow authority** (C-310). `flux plugin refresh <name>` re-fetches a plugin's manifest and
   re-projects its operations into the registry, re-running every load-time check. Any *widening* of

@@ -39,6 +39,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   than one quietly overwriting the other. A stored credential can be used as a query value and stays
   hidden in logs and in anything the model can see, exactly as it does in a request header.
 
+- **Panes the agent opens now actually appear in the terminal UI.** When a flow asks flux to open a
+  side pane — to show a file, a diff, a result alongside the conversation — that pane reaches your
+  screen. Previously the request was accepted and then went nowhere, and the only symptom was
+  silence: no error, no pane, nothing to suggest anything had gone wrong.
+
 - **You can pick up a plugin's updated set of actions without restarting flux.** Run
   `flux plugin refresh <name>` and flux re-reads what that plugin offers and updates what your agent
   can call. Every check that runs when a plugin is first installed runs again here — this is not a
