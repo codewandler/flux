@@ -178,6 +178,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Canonical Flux no longer renders as a syntax error in Helix, Neovim and Zed** (C-301). The
+  tree-sitter grammar's number lexer accepted only digits and an optional fraction, so `500ms`,
+  `10s` and `1m` produced `ERROR` nodes while the same header spelled `60_000` parsed cleanly.
+  Since 0.39.0's compact syntax made duration suffixes the *canonical* spelling, idiomatic source has
+  been showing errors in every editor that grammar backs, for multiple releases.
+
+  Fixed in `codewandler/flux-tree-sitter` (`a197393`), with a corpus guard per duration-carrying
+  canonical header (`7fcc64c`) — five of six verified to go **red** against the pre-fix rule, because
+  the gap survived precisely by the corpus only ever using bare numbers.
+
+  **The pin in `.helix/languages.toml` moved `29cff6c` → `9ea9890`, and that is the part that
+  reaches users.** Landing the fix was necessary and not sufficient: that repo already held *two*
+  improvements — L-96's named-option headers and `permissions` declarations — which reached nobody
+  because the pin never moved after they landed. Nothing verified that the pinned rev parses the
+  canonical corpus; C-334 now owns that.
+
+  flux's own CST highlighter and `flux-lsp` were never affected, confirmed rather than assumed: no
+  flux crate links tree-sitter, and duration positions are captured verbatim rather than lexed as one
+  token.
+
 - **`strict_review.rs` no longer reds because the developer's working tree is dirty** (C-319). It
   drove a flow that interpolated the **live** `git status` and `git diff` of whatever checkout it ran
   in into a reviewer sub-agent's prompt, so its verdict depended on the tree around it. It passed

@@ -71,6 +71,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **Flux files stop showing false syntax errors in Helix, Neovim and Zed.** If you write a duration
+  the normal way — `500ms`, `10s`, `1m` — your editor was marking it as a mistake, even though it is
+  correct and is the spelling flux itself recommends. Writing the same value as a plain number
+  (`60000`) looked fine, which made it seem like the shorter form was wrong. It was not; the editor
+  support was.
+  To pick this up you need to update the Flux grammar your editor uses — re-run
+  `scripts/install-helix.sh` from the flux-tree-sitter repository, or re-install the parser in
+  Neovim/Zed. Doing so also gets you two earlier improvements that had been finished but never
+  reached anyone.
+
 - **Security: an agent-to-agent channel with a blank token opened a door to the whole machine.** If
   you set up an `a2a` channel and its token resolved to nothing — most easily by pointing it at an
   environment variable that was exported empty — flux would open that channel **to the network** and
