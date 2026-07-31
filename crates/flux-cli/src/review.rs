@@ -131,6 +131,37 @@ pub(super) fn build_review_sub_agents(
     )
 }
 
+/// Assemble `flux review`'s flow client from already-resolved surface decisions.
+///
+/// A named seam rather than an inline chain in [`run_review`] (C-328): `run_review` resolves a
+/// provider, loads config and prints a report, so nothing could reach the builder below to check
+/// what it wires. That is exactly how C-314 happened — the `.resource_limits(..)` line could be
+/// deleted with the whole `flux-cli` suite staying green. The client this returns is the one
+/// `flux review` runs on, so `review_flow_client_bounds_tool_calls_at_the_configured_ceiling`
+/// observes the shipped envelope and not a re-assembled copy of it.
+fn review_flow_client(
+    provider: Arc<dyn Provider>,
+    model: String,
+    cwd: std::path::PathBuf,
+    resource_limits: flux_runtime::ResourceLimits,
+) -> Result<flux_sdk::FlowClient> {
+    // `strict_review`'s core is read-only by construction (git_status/git_diff/read_many + `task`
+    // against immutable embedded `tools: []` reviewer roles — see the design's security
+    // considerations); auto-approving
+    // this specific, fixed flow's own ops is not the same authority `--yes` grants an arbitrary
+    // prompt-compiled plan, so `review` doesn't offer `--yes` at all (see [`ReviewFlags`]).
+    flux_sdk::FlowClient::builder()
+        .model(model)
+        .auto_approve(true)
+        // C-307: `flux review` is the other shipped surface that fans out to reviewer children, and
+        // it assembles its envelope through the SDK rather than `build_agent_with` — so it needs the
+        // same ceilings wired explicitly.
+        // flux-pin: review_flow_client_bounds_tool_calls_at_the_configured_ceiling
+        .resource_limits(resource_limits)
+        .build(provider, cwd)
+        .context("build flow client")
+}
+
 /// `flux review --files <path>… [--format md|json] [--fail-on <severity>]` — run the strict-review
 /// protocol (flux L-13; `docs/designs/strict-review-flows.md` "Phase 4") over `files` and print the
 /// resulting `ReviewReport`. Runs the SAME embedded `strict_review` flow text
@@ -174,17 +205,7 @@ pub(super) async fn run_review(
         resource_limits.clone(),
     )?;
 
-    // `strict_review`'s core is read-only by construction (git_status/git_diff/read_many + `task`
-    // against immutable embedded `tools: []` reviewer roles — see the design's security
-    // considerations); auto-approving
-    // this specific, fixed flow's own ops is not the same authority `--yes` grants an arbitrary
-    // prompt-compiled plan, so `review` doesn't offer `--yes` at all (see [`ReviewFlags`]).
-    let mut client = flux_sdk::FlowClient::builder()
-        .model(model)
-        .auto_approve(true)
-        .resource_limits(resource_limits)
-        .build(provider, cwd)
-        .context("build flow client")?;
+    let mut client = review_flow_client(provider, model, cwd, resource_limits)?;
     client.with_sub_agents(sub_agents);
 
     let mut inputs = serde_json::Map::new();
@@ -283,4 +304,100 @@ pub(super) fn should_fail(
         .findings
         .iter()
         .any(|f| ReviewSeverity::from_finding_str(&f.severity) >= threshold)
+}
+
+#[cfg(test)]
+mod review_flow_client_ceiling_wiring {
+    //! C-314/C-328: the operator's `[limits]` ceilings must bind for the flow client `flux review`
+    //! runs `strict_review` on.
+    //!
+    //! This test is deliberately **attributable to one line**: it observes only
+    //! [`review_flow_client`]'s `.resource_limits(..)`, so deleting `flux record`'s wiring leaves it
+    //! green and deleting this one reds it alone. C-305's first round was sent back for the opposite
+    //! — a single test that covered both sites and could not say which had regressed.
+    //!
+    //! The assertion is on **observed occupancy** — how many ops are inside `Tool::execute` at once
+    //! — not on what the built client reports it was configured with, following C-299's reasoning
+    //! that a wiring story is only done when the wire carries current. The occupancy harness
+    //! (`Meter`/`Blocker`) is C-299's, imported rather than copied.
+
+    use super::*;
+
+    use std::time::Duration;
+
+    use crate::execution::cli_resource_ceiling_wiring::{Blocker, Meter, BLOCKER};
+
+    /// Three independent branches, each calling the parked probe: the concurrency a `parallel` block
+    /// actually produces, and the shape `strict_review`'s reviewer fan-out has.
+    const PARALLEL_PROBE: &str = "flow c314_probe() -> String\n  parallel\n    branch $a\n      $a = c299_blocker({})\n    branch $b\n      $b = c299_blocker({})\n    branch $c\n      $c = c299_blocker({})\n  return \"done\"\n";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn review_flow_client_bounds_tool_calls_at_the_configured_ceiling() {
+        assert_eq!(
+            BLOCKER, "c299_blocker",
+            "the probe op name in PARALLEL_PROBE"
+        );
+
+        let cfg: flux_config::Config = toml::from_str(
+            "[limits]\nmax_concurrent_tool_calls = 1\ntool_call_queue_timeout_ms = 30000\n",
+        )
+        .expect("the `[limits]` concurrency keys must parse");
+
+        let root = std::env::temp_dir().join(format!(
+            "flux-c314-review-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&root).expect("create the test workspace root");
+
+        let meter = Arc::new(Meter::default());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let mut client = review_flow_client(
+            Arc::new(MockCliProvider::default()),
+            "mock".to_string(),
+            root.clone(),
+            // The one C-314 seam on this surface: `flux review` turns `[limits]` into ceilings here.
+            cli_resource_limits(&cfg),
+        )
+        .expect("build the review flow client");
+        client
+            .try_register_op(Arc::new(Blocker {
+                meter: meter.clone(),
+                release: release.clone(),
+            }))
+            .expect("register the occupancy probe");
+
+        let ast = client.parse(PARALLEL_PROBE).expect("parse the probe flow");
+
+        // Sample occupancy while the branches are parked, then let them all finish. Spawned so the
+        // flow itself runs on this task: `execute` drives the parallel branches.
+        let sampler = {
+            let meter = meter.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let observed = meter.in_flight();
+                release.add_permits(3);
+                observed
+            })
+        };
+
+        let result = client.execute(&ast).await.expect("run the probe flow");
+        let observed = sampler.await.expect("occupancy sampler");
+
+        assert_eq!(
+            observed, 1,
+            "`[limits] max_concurrent_tool_calls = 1` did not bind for the `flux review` flow \
+             client: {observed} tool calls were in flight at once"
+        );
+        assert_eq!(
+            meter.peak(),
+            1,
+            "peak occupancy must equal the configured ceiling"
+        );
+        assert!(!result.result.is_empty(), "the probe flow returned nothing");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
