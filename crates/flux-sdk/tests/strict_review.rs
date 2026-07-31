@@ -9,16 +9,28 @@
 //! the native `review.aggregate` op: reviewers no longer emit `fingerprint`/`rank` (the aggregator
 //! computes both), a malformed entry is quarantined into `gaps` instead of silently dropped, and
 //! ranking is severity -> confidence -> agreement.
+//!
+//! C-319: the flow under test opens with `git_status()` / `git_diff()` / `read_many()`, so driven
+//! against the developer's own checkout its reviewer prompts carried whatever happened to be
+//! uncommitted at the moment `cargo test` ran — the verdict depended on the machine, not on a
+//! fixture. This test therefore **pins the repository reads**: the built-in `git_status`/`git_diff`
+//! ops are replaced by [`PinnedRepositoryRead`] over the checked-in
+//! `tests/fixtures/strict_review/{status.txt,diff.patch}`, and the reviewed file is the checked-in
+//! `tests/fixtures/strict_review/subject.rs` rather than a live crate source. Same principle C-307
+//! established for `flux test`'s offline client: a regression gate's verdict must depend only on its
+//! own fixture. The example flow itself is unchanged — reading the live tree is exactly what
+//! `flux review` is for; it is the *test* that had no business doing it.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use flux_core::{Chunk, ContentBlock, Result, StopReason};
+use flux_core::{Chunk, ContentBlock, Result, Role, StopReason};
 use flux_orchestrate::{RoleRegistry, SubAgents};
 use flux_provider::{ChunkStream, Provider, Request};
-use flux_runtime::ToolRegistry;
+use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_sdk::FlowClient;
+use flux_spec::ToolSpec;
 use serde_json::{json, Map, Value};
 
 /// The repo root, resolved from this crate's manifest dir (`crates/flux-sdk` -> repo root).
@@ -33,6 +45,74 @@ fn read_flow() -> String {
         .expect("examples/strict_review.flux must exist")
 }
 
+/// The pinned `git status` the flow's `$status` binds to. Trimmed exactly like the real
+/// `GitStatusTool`, which trims its subprocess output before returning it.
+fn pinned_status() -> &'static str {
+    include_str!("fixtures/strict_review/status.txt").trim_end()
+}
+
+/// The pinned `git diff` the flow's `$diff` binds to.
+///
+/// Deliberately ~34k chars — well past `flux_runtime::tool_output_cap()`'s 20 000-char default — so
+/// the over-cap transcript path is exercised on every run rather than only on the machine of
+/// whoever happens to have a large uncommitted diff.
+fn pinned_diff() -> &'static str {
+    include_str!("fixtures/strict_review/diff.patch").trim_end()
+}
+
+/// The repo-relative path of the file the reviewers are pointed at. A checked-in fixture, so
+/// `read_many`'s contribution to the prompt is pinned too.
+const SUBJECT_PATH: &str = "crates/flux-sdk/tests/fixtures/strict_review/subject.rs";
+
+/// A pinned stand-in for one of the flow's read-only repository ops (`git_status` / `git_diff`).
+///
+/// Replaces the built-in, which shells out to git against whatever checkout the test process runs
+/// in. Same op name, same read-only contract, fixed body.
+struct PinnedRepositoryRead {
+    name: &'static str,
+    body: &'static str,
+}
+
+#[async_trait]
+impl Tool for PinnedRepositoryRead {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            self.name,
+            "Pinned fixture stand-in for a live repository read (C-319)",
+            flux_spec::empty_schema(),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        Ok(ToolResult::ok(self.body.to_string()))
+    }
+}
+
+/// Swap the two live-repository ops the flow calls for their pinned fixtures. `replace_from` (not
+/// `register_from`) is the seam: the built-ins are already assembled, and a same-name registration
+/// would be a collision rather than a substitution.
+fn pin_repository_reads(client: &mut FlowClient) {
+    client
+        .try_register_pack(|registry| {
+            registry.replace_from(
+                "strict_review test pinned repository reads (C-319)",
+                Arc::new(PinnedRepositoryRead {
+                    name: "git_status",
+                    body: pinned_status(),
+                }) as Arc<dyn Tool>,
+            )?;
+            registry.replace_from(
+                "strict_review test pinned repository reads (C-319)",
+                Arc::new(PinnedRepositoryRead {
+                    name: "git_diff",
+                    body: pinned_diff(),
+                }) as Arc<dyn Tool>,
+            )?;
+            Ok(())
+        })
+        .expect("pinning the repository reads must succeed");
+}
+
 /// A provider that returns different canned reviewer JSON depending on which role's system prompt it
 /// is asked to drive. Every reply is a single JSON array of findings — the exact shape a reviewer role
 /// is instructed to emit (no `fingerprint`/`rank` — the aggregator computes both now).
@@ -44,7 +124,23 @@ fn read_flow() -> String {
 /// - the maintainability reviewer's array contains one MALFORMED entry (a bare string, not an object)
 ///   alongside a well-formed finding — it must land in `gaps`, not crash the pipeline and not be
 ///   surfaced as a finding.
-struct ReviewerMockProvider;
+struct ReviewerMockProvider {
+    /// When set, the user text of each reviewer's FIRST sub-agent request (the intent stage) is
+    /// recorded here — i.e. the reviewer prompt the flow actually built. C-319 asserts on it.
+    prompts: Option<Arc<Mutex<Vec<String>>>>,
+}
+
+impl ReviewerMockProvider {
+    fn new() -> Self {
+        Self { prompts: None }
+    }
+
+    fn capturing(prompts: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            prompts: Some(prompts),
+        }
+    }
+}
 
 #[async_trait]
 impl Provider for ReviewerMockProvider {
@@ -54,6 +150,17 @@ impl Provider for ReviewerMockProvider {
 
     async fn stream(&self, req: Request) -> Result<ChunkStream> {
         if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+            if let Some(sink) = &self.prompts {
+                // The intent stage runs exactly once per reviewer, so one entry per `task` call.
+                let user_text = req
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .map(|m| m.text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                sink.lock().unwrap().push(user_text);
+            }
             let chunks = vec![
                 Chunk::Block(ContentBlock::ToolUse {
                     id: "intent".into(),
@@ -168,6 +275,11 @@ impl Provider for UnusedTopLevelProvider {
 }
 
 fn build_client() -> FlowClient {
+    build_client_with(None)
+}
+
+/// The client, with the reviewer prompts each `task` call builds recorded into `prompts` when given.
+fn build_client_with(prompts: Option<Arc<Mutex<Vec<String>>>>) -> FlowClient {
     // Load the REAL checked-in reviewer role files, exercising the actual restricted role
     // definitions (frontmatter `tools: []`) the story ships.
     let system = flux_system::System::new(flux_system::Workspace::new(repo_root()).unwrap());
@@ -187,7 +299,12 @@ fn build_client() -> FlowClient {
     // Each restricted role declares `tools: []`; the child_base being empty too makes the
     // "no filesystem/shell tools" restriction doubly explicit at the harness level.
     let child_base = ToolRegistry::new();
-    let factory = Arc::new(|| Ok(Box::new(ReviewerMockProvider) as Box<dyn Provider>));
+    let factory = Arc::new(move || {
+        Ok(Box::new(match &prompts {
+            Some(sink) => ReviewerMockProvider::capturing(sink.clone()),
+            None => ReviewerMockProvider::new(),
+        }) as Box<dyn Provider>)
+    });
     let sub_agents = SubAgents::new(roles, child_base, factory, "mock", 4096);
 
     let mut client = FlowClient::builder()
@@ -195,13 +312,15 @@ fn build_client() -> FlowClient {
         .auto_approve(true)
         .build(Arc::new(UnusedTopLevelProvider), repo_root())
         .expect("build FlowClient");
+    // C-319: the flow's `git_status`/`git_diff` read a fixture, never the checkout under test.
+    pin_repository_reads(&mut client);
     client.with_sub_agents(sub_agents);
     client
 }
 
 fn seed_files() -> Map<String, Value> {
     let mut inputs = Map::new();
-    inputs.insert("files".to_string(), json!(["crates/flux-lang/src/ast.rs"]));
+    inputs.insert("files".to_string(), json!([SUBJECT_PATH]));
     inputs
 }
 
@@ -378,4 +497,72 @@ async fn strict_review_is_stable_across_repeated_runs() {
         out1.result, out2.result,
         "strict_review must produce identical ordering for the same inputs across runs"
     );
+}
+
+/// Extract the text the flow interpolated between two of its own prompt headers.
+fn section<'a>(prompt: &'a str, after: &str, before: &str) -> &'a str {
+    let start = prompt
+        .find(after)
+        .unwrap_or_else(|| panic!("reviewer prompt has no `{after}` header:\n{prompt}"))
+        + after.len();
+    let rest = &prompt[start..];
+    let end = rest
+        .find(before)
+        .unwrap_or_else(|| panic!("reviewer prompt has no `{before}` header:\n{prompt}"));
+    &rest[..end]
+}
+
+/// C-319. The reviewer prompts this flow builds must come from the test's own fixture and from
+/// nothing else — not from the `git status` / `git diff` of whichever checkout `cargo test` happens
+/// to run in.
+///
+/// This is the regression that made the suite ambush implementors: driven against the repo root, the
+/// prompts carried the developer's live uncommitted work, so the input to a sub-agent turn was
+/// different on every machine and after every edit — and any failure downstream of that read as a
+/// defect in whatever story was being implemented. Same rule C-307 fixed for `flux test`'s offline
+/// client: a regression gate's verdict may depend on its fixture and on nothing else.
+///
+/// Deliberately an equality check per section, not a "contains" smoke test: `contains` would still
+/// pass if the live diff were appended alongside the fixture.
+#[tokio::test]
+async fn strict_review_reviewer_prompts_come_from_the_fixture_not_the_live_checkout() {
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let client = build_client_with(Some(prompts.clone()));
+    let text = read_flow();
+
+    client
+        .run_flow(&text, seed_files())
+        .await
+        .expect("strict_review should execute end-to-end");
+
+    let captured = prompts.lock().unwrap().clone();
+    assert_eq!(
+        captured.len(),
+        3,
+        "expected one captured prompt per reviewer role, got {}",
+        captured.len()
+    );
+
+    for prompt in &captured {
+        assert_eq!(
+            section(prompt, "Git status:\n", "\n\nGit diff:\n"),
+            pinned_status(),
+            "the reviewer prompt's git-status section must be the pinned fixture verbatim"
+        );
+        assert_eq!(
+            section(prompt, "Git diff:\n", "\n\nFile contents:\n"),
+            pinned_diff(),
+            "the reviewer prompt's git-diff section must be the pinned fixture verbatim"
+        );
+        // The fixture is deliberately larger than `flux_runtime::tool_output_cap()`; nothing on the
+        // canonical value path may trim it, or the flow would hand its reviewers a partial diff.
+        assert!(
+            pinned_diff().chars().count() > flux_runtime::tool_output_cap(),
+            "the pinned diff must stay larger than the tool-output cap to keep exercising it"
+        );
+        assert!(
+            prompt.contains("C-319-FIXTURE-DIFF-SENTINEL"),
+            "the pinned diff's sentinel must survive into the reviewer prompt"
+        );
+    }
 }

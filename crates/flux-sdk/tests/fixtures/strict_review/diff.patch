@@ -1,0 +1,855 @@
+diff --git a/src/ticket.rs b/src/ticket.rs
+index 1111111..2222222 100644
+--- a/src/ticket.rs
++++ b/src/ticket.rs
+@@ -1,4 +1,5 @@
+ // C-319-FIXTURE-DIFF-SENTINEL: this line proves the reviewer prompt carries the PINNED diff.
+ use crate::router::Route;
+-pub fn parse_ticket_id(raw: &str) -> Option<u32> { raw.parse().ok() }
++pub fn parse_ticket_id(raw: &str) -> Option<u32> {
++    raw.trim().strip_prefix("TICKET-").and_then(|d| d.parse().ok())
++}
+diff --git a/src/router.rs b/src/router.rs
+index 3333333..4444444 100644
+--- a/src/router.rs
++++ b/src/router.rs
+@@ -1,6 +1,7 @@ impl Route {
+     fn resolve_000(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 000: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -9,6 +9,7 @@ impl Route {
+     fn resolve_001(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 001: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -17,6 +17,7 @@ impl Route {
+     fn resolve_002(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 002: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -25,6 +25,7 @@ impl Route {
+     fn resolve_003(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 003: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -33,6 +33,7 @@ impl Route {
+     fn resolve_004(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 004: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -41,6 +41,7 @@ impl Route {
+     fn resolve_005(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 005: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -49,6 +49,7 @@ impl Route {
+     fn resolve_006(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 006: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -57,6 +57,7 @@ impl Route {
+     fn resolve_007(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 007: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -65,6 +65,7 @@ impl Route {
+     fn resolve_008(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 008: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -73,6 +73,7 @@ impl Route {
+     fn resolve_009(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 009: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -81,6 +81,7 @@ impl Route {
+     fn resolve_010(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 010: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -89,6 +89,7 @@ impl Route {
+     fn resolve_011(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 011: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -97,6 +97,7 @@ impl Route {
+     fn resolve_012(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 012: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -105,6 +105,7 @@ impl Route {
+     fn resolve_013(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 013: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -113,6 +113,7 @@ impl Route {
+     fn resolve_014(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 014: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -121,6 +121,7 @@ impl Route {
+     fn resolve_015(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 015: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -129,6 +129,7 @@ impl Route {
+     fn resolve_016(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 016: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -137,6 +137,7 @@ impl Route {
+     fn resolve_017(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 017: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -145,6 +145,7 @@ impl Route {
+     fn resolve_018(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 018: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -153,6 +153,7 @@ impl Route {
+     fn resolve_019(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 019: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -161,6 +161,7 @@ impl Route {
+     fn resolve_020(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 020: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -169,6 +169,7 @@ impl Route {
+     fn resolve_021(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 021: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -177,6 +177,7 @@ impl Route {
+     fn resolve_022(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 022: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -185,6 +185,7 @@ impl Route {
+     fn resolve_023(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 023: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -193,6 +193,7 @@ impl Route {
+     fn resolve_024(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 024: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -201,6 +201,7 @@ impl Route {
+     fn resolve_025(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 025: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -209,6 +209,7 @@ impl Route {
+     fn resolve_026(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 026: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -217,6 +217,7 @@ impl Route {
+     fn resolve_027(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 027: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -225,6 +225,7 @@ impl Route {
+     fn resolve_028(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 028: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -233,6 +233,7 @@ impl Route {
+     fn resolve_029(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 029: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -241,6 +241,7 @@ impl Route {
+     fn resolve_030(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 030: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -249,6 +249,7 @@ impl Route {
+     fn resolve_031(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 031: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -257,6 +257,7 @@ impl Route {
+     fn resolve_032(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 032: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -265,6 +265,7 @@ impl Route {
+     fn resolve_033(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 033: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -273,6 +273,7 @@ impl Route {
+     fn resolve_034(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 034: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -281,6 +281,7 @@ impl Route {
+     fn resolve_035(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 035: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -289,6 +289,7 @@ impl Route {
+     fn resolve_036(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 036: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -297,6 +297,7 @@ impl Route {
+     fn resolve_037(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 037: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -305,6 +305,7 @@ impl Route {
+     fn resolve_038(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 038: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -313,6 +313,7 @@ impl Route {
+     fn resolve_039(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 039: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -321,6 +321,7 @@ impl Route {
+     fn resolve_040(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 040: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -329,6 +329,7 @@ impl Route {
+     fn resolve_041(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 041: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -337,6 +337,7 @@ impl Route {
+     fn resolve_042(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 042: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -345,6 +345,7 @@ impl Route {
+     fn resolve_043(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 043: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -353,6 +353,7 @@ impl Route {
+     fn resolve_044(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 044: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -361,6 +361,7 @@ impl Route {
+     fn resolve_045(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 045: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -369,6 +369,7 @@ impl Route {
+     fn resolve_046(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 046: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -377,6 +377,7 @@ impl Route {
+     fn resolve_047(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 047: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -385,6 +385,7 @@ impl Route {
+     fn resolve_048(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 048: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -393,6 +393,7 @@ impl Route {
+     fn resolve_049(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 049: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -401,6 +401,7 @@ impl Route {
+     fn resolve_050(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 050: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -409,6 +409,7 @@ impl Route {
+     fn resolve_051(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 051: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -417,6 +417,7 @@ impl Route {
+     fn resolve_052(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 052: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -425,6 +425,7 @@ impl Route {
+     fn resolve_053(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 053: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -433,6 +433,7 @@ impl Route {
+     fn resolve_054(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 054: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -441,6 +441,7 @@ impl Route {
+     fn resolve_055(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 055: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -449,6 +449,7 @@ impl Route {
+     fn resolve_056(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 056: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -457,6 +457,7 @@ impl Route {
+     fn resolve_057(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 057: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -465,6 +465,7 @@ impl Route {
+     fn resolve_058(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 058: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -473,6 +473,7 @@ impl Route {
+     fn resolve_059(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 059: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -481,6 +481,7 @@ impl Route {
+     fn resolve_060(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 060: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -489,6 +489,7 @@ impl Route {
+     fn resolve_061(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 061: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -497,6 +497,7 @@ impl Route {
+     fn resolve_062(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 062: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -505,6 +505,7 @@ impl Route {
+     fn resolve_063(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 063: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -513,6 +513,7 @@ impl Route {
+     fn resolve_064(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 064: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -521,6 +521,7 @@ impl Route {
+     fn resolve_065(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 065: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -529,6 +529,7 @@ impl Route {
+     fn resolve_066(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 066: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -537,6 +537,7 @@ impl Route {
+     fn resolve_067(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 067: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -545,6 +545,7 @@ impl Route {
+     fn resolve_068(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 068: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -553,6 +553,7 @@ impl Route {
+     fn resolve_069(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 069: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -561,6 +561,7 @@ impl Route {
+     fn resolve_070(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 070: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -569,6 +569,7 @@ impl Route {
+     fn resolve_071(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 071: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -577,6 +577,7 @@ impl Route {
+     fn resolve_072(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 072: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -585,6 +585,7 @@ impl Route {
+     fn resolve_073(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 073: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -593,6 +593,7 @@ impl Route {
+     fn resolve_074(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 074: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -601,6 +601,7 @@ impl Route {
+     fn resolve_075(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 075: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -609,6 +609,7 @@ impl Route {
+     fn resolve_076(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 076: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -617,6 +617,7 @@ impl Route {
+     fn resolve_077(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 077: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -625,6 +625,7 @@ impl Route {
+     fn resolve_078(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 078: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -633,6 +633,7 @@ impl Route {
+     fn resolve_079(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 079: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -641,6 +641,7 @@ impl Route {
+     fn resolve_080(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 080: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -649,6 +649,7 @@ impl Route {
+     fn resolve_081(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 081: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -657,6 +657,7 @@ impl Route {
+     fn resolve_082(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 082: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -665,6 +665,7 @@ impl Route {
+     fn resolve_083(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 083: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -673,6 +673,7 @@ impl Route {
+     fn resolve_084(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 084: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -681,6 +681,7 @@ impl Route {
+     fn resolve_085(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 085: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -689,6 +689,7 @@ impl Route {
+     fn resolve_086(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 086: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -697,6 +697,7 @@ impl Route {
+     fn resolve_087(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 087: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -705,6 +705,7 @@ impl Route {
+     fn resolve_088(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 088: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -713,6 +713,7 @@ impl Route {
+     fn resolve_089(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 089: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -721,6 +721,7 @@ impl Route {
+     fn resolve_090(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 090: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -729,6 +729,7 @@ impl Route {
+     fn resolve_091(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 091: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -737,6 +737,7 @@ impl Route {
+     fn resolve_092(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 092: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -745,6 +745,7 @@ impl Route {
+     fn resolve_093(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 093: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -753,6 +753,7 @@ impl Route {
+     fn resolve_094(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 094: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -761,6 +761,7 @@ impl Route {
+     fn resolve_095(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 095: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -769,6 +769,7 @@ impl Route {
+     fn resolve_096(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 096: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -777,6 +777,7 @@ impl Route {
+     fn resolve_097(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 097: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -785,6 +785,7 @@ impl Route {
+     fn resolve_098(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 098: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -793,6 +793,7 @@ impl Route {
+     fn resolve_099(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 099: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -801,6 +801,7 @@ impl Route {
+     fn resolve_100(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 100: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -809,6 +809,7 @@ impl Route {
+     fn resolve_101(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 101: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -817,6 +817,7 @@ impl Route {
+     fn resolve_102(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 102: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -825,6 +825,7 @@ impl Route {
+     fn resolve_103(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 103: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -833,6 +833,7 @@ impl Route {
+     fn resolve_104(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 104: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -841,6 +841,7 @@ impl Route {
+     fn resolve_105(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 105: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -849,6 +849,7 @@ impl Route {
+     fn resolve_106(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 106: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -857,6 +857,7 @@ impl Route {
+     fn resolve_107(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 107: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -865,6 +865,7 @@ impl Route {
+     fn resolve_108(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 108: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -873,6 +873,7 @@ impl Route {
+     fn resolve_109(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 109: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -881,6 +881,7 @@ impl Route {
+     fn resolve_110(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 110: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -889,6 +889,7 @@ impl Route {
+     fn resolve_111(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 111: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -897,6 +897,7 @@ impl Route {
+     fn resolve_112(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 112: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -905,6 +905,7 @@ impl Route {
+     fn resolve_113(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 113: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -913,6 +913,7 @@ impl Route {
+     fn resolve_114(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 114: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -921,6 +921,7 @@ impl Route {
+     fn resolve_115(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 115: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -929,6 +929,7 @@ impl Route {
+     fn resolve_116(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 116: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -937,6 +937,7 @@ impl Route {
+     fn resolve_117(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 117: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -945,6 +945,7 @@ impl Route {
+     fn resolve_118(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 118: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
+@@ -953,6 +953,7 @@ impl Route {
+     fn resolve_119(&self, key: &str) -> Option<&Handler> {
+-        self.table.get(key)
++        // widened lookup 119: fall back to the normalized key before giving up
++        self.table.get(key).or_else(|| self.table.get(&normalize(key)))
+     }
+
