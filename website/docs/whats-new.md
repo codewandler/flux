@@ -12,6 +12,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.44.0] - 2026-07-31
+
+## [0.43.0] - 2026-07-31
+
 ### New
 
 - **flux can now take deliveries from a connector you have installed, by naming it.** Point a channel
@@ -68,6 +72,28 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   an API echoes back to you — in a header or in the body — are still hidden.
 
 ### Fixed
+
+- **Security: a credential made only of digits is now hidden everywhere, including where it was
+  slipping through.** flux hides credentials you have registered wherever they appear. But a
+  credential that is only digits — an account id, a numeric key — cannot be recognised by any of the
+  clues flux uses for the others, so registering it is its *only* protection. Four places that scan
+  saved data for credentials were skipping over plain numbers, and two of them were also skipping the
+  *names* of fields — and both of those write to storage that persists. All four now look everywhere.
+  Ordinary numbers are untouched: ports, timeouts, counts and ids are only affected if you registered
+  that exact value as a secret.
+  **You may need to act:** if a web response contains a registered credential as a number, that one
+  field now comes back as the text `[redacted]` instead of a number. Only that field changes, and its
+  real value was never usable to you anyway.
+
+- **Flux files stop showing false syntax errors in Helix, Neovim and Zed.** If you write a duration
+  the normal way — `500ms`, `10s`, `1m` — your editor was marking it as a mistake, even though it is
+  correct and is the spelling flux itself recommends. Writing the same value as a plain number
+  (`60000`) looked fine, which made it seem like the shorter form was wrong. It was not; the editor
+  support was.
+  To pick this up you need to update the Flux grammar your editor uses — re-run
+  `scripts/install-helix.sh` from the flux-tree-sitter repository, or re-install the parser in
+  Neovim/Zed. Doing so also gets you two earlier improvements that had been finished but never
+  reached anyone.
 
 - **Security: an agent-to-agent channel with a blank token opened a door to the whole machine.** If
   you set up an `a2a` channel and its token resolved to nothing — most easily by pointing it at an

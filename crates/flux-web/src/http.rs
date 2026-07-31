@@ -335,9 +335,19 @@ fn parse_body(body: String, redact: impl Fn(&str) -> String) -> Value {
     }
 }
 
-/// Redact every string leaf (and object key) of a parsed body. Numbers and booleans cannot carry a
-/// secret; keys are covered because a vendor that echoes a request record back can echo a
-/// credential into a key as easily as into a value.
+/// Redact every node of a parsed body — **no node kind is exempt** (C-323). Keys are covered too,
+/// because a vendor that echoes a request record back can echo a credential into a key as easily as
+/// into a value.
+///
+/// The earlier version visited only strings, on the reasoning that "numbers cannot carry a secret".
+/// That is false for the one credential shape that has no other protection: an all-digit credential
+/// is outside every heuristic *by construction* — no prefix marks it, and the contextual
+/// `NAME=VALUE` rule requires a letter precisely so `secret_ttl=3600` survives — so **registration
+/// is its only recourse**, and a walker that narrows by node kind makes that recourse conditional on
+/// the vendor's choice of JSON type. `add_secret`'s guarantee is total or it is not a guarantee.
+///
+/// Non-string scalars go through [`redact_scalar`], which changes the node **only when redaction
+/// actually fired**; see there for why that is the right shape.
 fn redact_json(value: Value, redact: &impl Fn(&str) -> String) -> Value {
     match value {
         Value::String(text) => Value::String(redact(&text)),
@@ -353,7 +363,43 @@ fn redact_json(value: Value, redact: &impl Fn(&str) -> String) -> Value {
                 .map(|(key, value)| (redact(&key), redact_json(value, redact)))
                 .collect(),
         ),
-        other => other,
+        scalar => redact_scalar(scalar, redact),
+    }
+}
+
+/// Redact a non-string scalar (`Number`, `Bool`, `Null`) by its JSON literal spelling — the text a
+/// reader of the encoded record actually sees.
+///
+/// **What a redacted number becomes, and why.** `[redacted]` is not a number, so a node that
+/// carried a registered secret cannot stay one. Three representations were available:
+///
+/// - A sentinel number (`0`, `-1`). Rejected outright: it is indistinguishable from data the vendor
+///   really sent, so a caller silently computes on a lie. Redaction has to be *visible*.
+/// - `null`. Same ambiguity in weaker form — `null` is a value an API legitimately sends, so the
+///   caller cannot tell "removed" from "absent".
+/// - The string `"[redacted]"`. Chosen. It is already what every other redacted node in this record
+///   looks like — a header value, a string leaf, an object key, the `view` — so there is one marker
+///   and one type for "a credential was here", and `.body.account_id` reads exactly as it would had
+///   the vendor sent the id as a string in the first place.
+///
+/// **The shape change is deliberately scoped to nodes redaction actually touched**, which is why
+/// this compares before and after rather than switching on the node kind. C-304 made the record's
+/// shape something a caller selects from, so retyping a number is a real cost — but it is only paid
+/// by a node whose value the caller could not have used anyway (using it means using the
+/// credential). Every ordinary number keeps its type, so `.body.page == 2` and a `.status`
+/// comparison are untouched.
+///
+/// `Bool` and `Null` cannot in practice be affected — `true`/`false`/`null` are all under the
+/// redactor's 6-character registration floor, and no shape heuristic fires on them. They go through
+/// here anyway so that *no node kind is exempt by construction*: the guarantee holds because the
+/// walker visits everything, not because someone re-derived which kinds are currently safe.
+fn redact_scalar(scalar: Value, redact: &impl Fn(&str) -> String) -> Value {
+    let literal = scalar.to_string();
+    let redacted = redact(&literal);
+    if redacted == literal {
+        scalar
+    } else {
+        Value::String(redacted)
     }
 }
 
@@ -1457,6 +1503,72 @@ mod tests {
         let record = record(&r);
         assert_eq!(record["headers"]["set-cookie"], "session=[redacted]");
         assert_eq!(record["body"]["echoed"], "[redacted]");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // C-323 — no node kind is exempt from registration
+    // -----------------------------------------------------------------------------------------
+
+    /// **The C-323 hole.** An all-digit credential is outside every redaction heuristic *by
+    /// construction*: no prefix can mark it, and the contextual `NAME=VALUE` rule requires a letter
+    /// precisely so `secret_ttl=3600` survives (pinned in flux-secret by
+    /// `an_all_digit_credential_is_registration_only_and_registration_is_total`). Registration is
+    /// therefore its only recourse — so a walker that skips `Value::Number` makes that recourse
+    /// conditional on the vendor's choice of JSON type: the same credential is protected in
+    /// `"account_id":"216…"` and exposed in `"account_id":216…`.
+    ///
+    /// The second half is the anti-censorship posture: only *registered* values are affected, so an
+    /// ordinary port/count/id keeps both its value **and its number type** — a caller comparing
+    /// `.body.port == 8080` must not start comparing against a string.
+    #[tokio::test]
+    async fn a_registered_numeric_credential_echoed_back_as_a_json_number_is_still_redacted() {
+        // The same all-digit literal flux-secret's boundary test uses, extended so it is unique.
+        const NUMERIC: &str = "216216216216216218";
+        std::env::set_var("FLUX_WEB_TEST_NUMERIC_TOKEN", NUMERIC);
+        let base = one_shot_with_headers(
+            "200 OK",
+            vec!["content-type: application/json".into()],
+            format!(
+                r#"{{"account_id":{NUMERIC},"nested":[{NUMERIC}],"port":8080,"page":2,"ratio":1.5,"ok":true,"none":null}}"#
+            ),
+        )
+        .await;
+        let t = tool_allowing(PrivateNetAllow::Any, &["FLUX_WEB_TEST_NUMERIC_TOKEN"]);
+        let r = t
+            .execute(
+                &ctx(),
+                json!({
+                    "url": base,
+                    "headers": { "authorization": { "$secret": "FLUX_WEB_TEST_NUMERIC_TOKEN" } }
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !r.content.contains(NUMERIC),
+            "the registered credential must not survive in the record: {}",
+            r.content
+        );
+        assert!(
+            !r.view.as_deref().unwrap_or_default().contains(NUMERIC),
+            "nor in the view a person and the model are shown: {:?}",
+            r.view
+        );
+        let record = record(&r);
+        assert_eq!(record["body"]["account_id"], "[redacted]");
+        assert_eq!(record["body"]["nested"][0], "[redacted]");
+        // Anti-censorship: every other scalar is byte-identical AND type-identical.
+        assert_eq!(record["body"]["port"], 8080);
+        assert!(
+            record["body"]["port"].is_number(),
+            "an ordinary number keeps its type: {record}"
+        );
+        assert_eq!(record["body"]["page"], 2);
+        assert_eq!(record["body"]["ratio"], 1.5);
+        assert_eq!(record["body"]["ok"], true);
+        assert!(record["body"]["none"].is_null());
+        assert_eq!(record["status"], 200);
+        assert!(record["status"].is_number());
     }
 
     /// The record changed what a caller *reads*; it must not change what the envelope is *told*.

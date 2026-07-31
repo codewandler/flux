@@ -16,7 +16,11 @@
 //! 3. **Marker enforcement.** [`check_protocol`] accepts its own marker and rejects everything
 //!    else with a message naming both sides.
 
+#[path = "support/golden_mode.rs"]
+mod golden_mode;
+
 use flux_plugin_protocol::*;
+use golden_mode::Mode;
 use serde_json::{json, Value};
 
 fn golden(name: &str) -> Value {
@@ -28,17 +32,18 @@ fn golden(name: &str) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse golden {}: {e}", path.display()))
 }
 
-/// Set `UPDATE=1` to rewrite a golden after a *deliberate* wire change.
+/// Set `FLUX_UPDATE_GOLDEN=1` to rewrite a golden after a *deliberate* wire change. That run writes
+/// the file and then fails on purpose (C-326) — re-run with the variable unset to verify.
 fn assert_golden(name: &str, actual: &Value) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
         .join(name);
-    if std::env::var("UPDATE").is_ok() {
+    if golden_mode::mode() == Mode::Rewrite {
         let mut text = serde_json::to_string_pretty(actual).unwrap();
         text.push('\n');
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, text).unwrap();
-        return;
+        golden_mode::rewrote(&path);
     }
     let expected = golden(name);
     assert_eq!(
@@ -46,8 +51,8 @@ fn assert_golden(name: &str, actual: &Value) {
         &expected,
         "the plugin wire surface changed ({name}).\n\
          Every plugin binary in the wild was built against the old shape, so decide deliberately:\n\
-           - additive + `serde` default/skip => compatible; re-record with `UPDATE=1` and bump the \
-             MINOR of codewandler-flux-plugin-protocol\n\
+           - additive + `serde` default/skip => compatible; re-record with `FLUX_UPDATE_GOLDEN=1` \
+             and bump the MINOR of codewandler-flux-plugin-protocol\n\
            - a rename, a removal, or a changed meaning => breaking; bump `PROTOCOL` and the crate's \
              MAJOR, and expect to reship the plugin pack\n\
          See docs/designs/plugin-protocol-decoupling.md."
