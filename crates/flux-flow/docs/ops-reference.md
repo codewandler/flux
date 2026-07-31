@@ -269,6 +269,35 @@ These are registered **only by the `flux-app` runtime host** (`flux run app.flux
 All four are Medium-risk / non-idempotent (`emit`/`spawn` fan out to other journeys, gated separately at
 their own dispatch). See [`flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md) §6.
 
+## Surface ops (agent-authored panes)
+
+Registered by `flux_tools::try_register_surface_ops`, and **surfaced by the presence of a
+`SurfaceSink` at assembly time** (C-223) — not by a group and not by a signal. A host that installed a
+pane channel registers the vocabulary once, for the life of the catalog; a host without one (headless
+`flux run`, `flux-server`, an SDK embedding) never advertises these ops at all, and a call that
+reaches a dispatch context with no sink fails with that reason rather than silently drawing nothing.
+
+A pane is a *durable container* for status or results the user should keep seeing — not a place to put
+the answer, which still belongs in the reply. The model proposes `slot` and `lifetime`; the surface
+owns geometry, colour, ordering, bounds and the mark that says a region is agent-authored, and there
+is no payload field that reaches a `Style` (C-220/C-222).
+
+`data` is one object with exactly one key naming the shape: `rows` (`header`, `rows`), `kv` (`pairs`),
+`log` (`lines`), `progress` (`label`, `done`, `total`), `tree` (`roots`) or `markdown` (`text`).
+`lifetime` is `turn` or `session`; `project` is refused until a story builds the on-disk pane store.
+
+| op | signature | risk | description |
+|---|---|---|---|
+| `pane.open` | `id, title, data[, slot, kind, lifetime]` | Low | Open a pane under `id` (your handle for later calls). `slot` defaults to `right`, `lifetime` to `session`; `kind` is derived from `data` and only checked if you also state it. Re-opening a live `id` replaces that pane in place rather than adding a second one; `host:*` ids belong to the surface's own panes and are refused |
+| `pane.update` | `id, data` | Low | Replace an open pane's content — the whole payload, not a delta, and a payload of another shape re-renders the pane in that shape. An `id` that is not open (never opened, closed, or `turn`-scoped after the turn ended) is dropped by the surface |
+| `pane.close` | `id` | Low | Close the pane opened under `id`. Closing an `id` that is not open is not an error and changes nothing; `turn`-scoped panes close themselves at the end of the turn, and no pane outlives the session |
+
+All three declare no filesystem, process or network effect — a pane reaches none — and carry the
+`human_visible` semantic effect. `permission_subjects` is the pane id, so a rule may scope a pane by
+name (`pane.update:build`). They are `Conditional` rather than `Idempotent` on purpose: repeating a
+pane command is safe, but `Idempotent` would let the op cache answer without the surface ever seeing
+the repeat. Design: [`agent-authored-surface.md`](../../../docs/designs/agent-authored-surface.md).
+
 ## Eval & self-improvement ops (group `eval`)
 
 Registered by `flux_eval::try_register_eval_ops`, wired into the production catalog by
