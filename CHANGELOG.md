@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The ad-hoc stream prune would have silently deleted cross-session memory (C-231).** `memory:*`
+  streams carry no `streams` registry row, which is exactly what `prune_adhoc_older_than` targets —
+  so an aged memory was indistinguishable from an aged scratch stream and would have been swept.
+  Caught before it could bite: the primitive has **no caller in the tree**, so this closes a trap
+  rather than fixing an incident.
+  The exclusion is deliberately **not** a `!starts_with("memory:")` buried in a query. It is an
+  explicit `ADHOC_STREAM_FAMILIES` table where every row carries a `Prunable`/`Retained` verdict with
+  no `Default` and a required reason, plus a source-scanning guard so a future ad-hoc family has to
+  make the same decision consciously instead of inheriting deletion. Whether memory should ever be
+  prunable is now answered **in writing** in the design rather than left implicit — it is not
+  prunable by age, and `forget` remains the deliberate path.
+  Proven on all three backends: SQLite, ephemeral and — via a container the reviewer stood up —
+  Postgres, which the implementor could only compile-check.
+
 ### Added
 
 - **A `Room` port — flux can be one participant among several, not just one end of a 1:1 (D-204).** Every

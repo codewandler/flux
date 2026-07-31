@@ -109,7 +109,7 @@ both backends.
 `memory:<scope-key>` streams, which carry no session-registry row and would otherwise look like
 ordinary ad-hoc streams to `prune_adhoc_older_than`. They are skipped at any age: for a memory,
 "no activity in months" means the knowledge settled, not that it is disposable, and the store is
-its only copy. Removing a memory entry is a deliberate act — `flux memory forget`, which appends a
+its only copy. Removing a memory entry is a deliberate act — `EventStore::forget_memory`, which appends a
 tombstone and keeps the history — never a side effect of a retention sweep.
 
 ## Datasource records

@@ -2,7 +2,7 @@
 id: C-231
 title: "Ad-hoc stream pruning would silently delete cross-session memory"
 pillar: Core
-status: in-progress
+status: done
 priority: 21
 epic: evidence-pinned-memory
 design: docs/designs/evidence-pinned-memory.md
@@ -77,3 +77,23 @@ whose author has no reason to think about memory at all.
   because the evidence was the thing deleted.
 - Cheap to implement, and its value is entirely in the test — the guard is what stops a future
   author reintroducing the deletion while refactoring the prune.
+
+- 2026-07-31 — integrated. The independent review **closed the one gap the implementor could not**:
+  it stood up a `postgres:16-alpine` container and executed
+  `postgres_tests::prune_adhoc_older_than_never_deletes_cross_session_memory` (`ok`, 47 passed), so
+  all three backends are now proven by execution rather than two by execution and one by inspection.
+  It also confirmed the three arms agree on count semantics — all mean "streams actually removed".
+  **Two limitations are recorded rather than fixed, both non-blocking and both in the volunteered
+  extra rather than in the acceptance bar:**
+  - The forcing scanner `declared_stream_prefixes` is narrower than its own doc claims. The reviewer
+    ran a copy of it over adversarial fixtures: it silently misses a rustfmt-wrapped
+    `pub const STREAM_PREFIX: &'static str =` with the literal on the next line, and
+    `pub static STREAM_PREFIX: &str = "…";` — the filter requires `const ` and the literal on the
+    same line. `concat!("built", ":")` fires but reports the wrong prefix. Acceptance item 2's stated
+    bar is the explicit `ADHOC_STREAM_FAMILIES` table with per-row reasoning, which is delivered; the
+    scanner is a bonus whose self-check makes *total* blindness fail loudly. Worth widening when
+    someone next touches the file.
+  - Prefix **nesting** is unguarded: `is_retained_from_adhoc_prune` is `any(Retained && starts_with)`,
+    so a future `memory:` (`Retained`) + `memory:tmp:` (`Prunable`) pair leaves the child retained.
+    The error direction is **over-retention only** — the classifier can never cause a deletion a row
+    forbids — so it is not a data-loss risk, but neither the code nor the test notes it.
