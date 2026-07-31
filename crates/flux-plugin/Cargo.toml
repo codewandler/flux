@@ -9,7 +9,8 @@ description = "flux subprocess plugin protocol + host + SDK: any-language plugin
 [lib]
 name = "flux_plugin"
 
-# The `echo_plugin` / `caps_plugin` binaries are protocol test fixtures, not shippable artifacts.
+# The `echo_plugin` / `caps_plugin` / `drift_plugin` binaries are protocol test fixtures, not
+# shippable artifacts.
 [package.metadata.dist]
 dist = false
 
@@ -90,3 +91,7 @@ path = "src/bin/echo_plugin.rs"
 [[bin]]
 name = "caps_plugin"
 path = "src/bin/caps_plugin.rs"
+
+[[bin]]
+name = "drift_plugin"
+path = "src/bin/drift_plugin.rs"
