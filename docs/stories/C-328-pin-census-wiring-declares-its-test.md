@@ -2,8 +2,7 @@
 id: C-328
 title: "A wiring line declares the test that observes it — the pin census"
 pillar: Core
-status: in-progress
-priority: 2
+status: done
 areas: [flux-codegate, flux-cli]
 design: docs/designs/unobserved-wiring.md
 note: "the keystone for this repo's #1 recurring defect — 19 stories have found production wiring that no test observes, and each was answered by hand-building a NEW bespoke guard. Ships RED on main with C-314's two known-unpinned sites as the proof, and closes C-314 in the same story"

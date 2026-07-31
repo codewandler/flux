@@ -178,6 +178,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A wiring line now declares the test that observes it — the pin census** (C-328). Nineteen
+  stories have found production wiring that is *correct* and that no test observes: deleting the line
+  changes nothing. C-305 was the sharpest — two `flux-tui` lines whose removal left **474 tests
+  green** while no model pane could reach a terminal. C-314 was live: deleting **both** `[limits]`
+  wirings left the entire `flux-cli` suite green.
+
+  **The debt was never the bug; it was that each instance was answered by hand-building a new
+  guard.** There are ~10 now, each with its own mechanism and its own anti-vacuity proof. This is one
+  mechanism instead: a `syn` census requiring every configuration-bearing call on a production
+  assembly builder to name, in source, the test that dies without it — reusing the existing
+  `allow_reason` waiver reader rather than writing a second one, and verifying every named test
+  actually resolves, so a pin cannot drift from a renamed test.
+
+  It shipped having been **red on main**, reporting exactly the two known-unpinned sites. C-314's
+  first acceptance item is closed here with two *independently attributable* tests: deleting one
+  wiring line reds its own test and leaves the other green, verified in both directions by an
+  independent reviewer.
+
+  **`cargo-mutants` was rejected on its operator set before its cost.** It replaces function bodies
+  and swaps binary operators; it does not delete statements or drop a call from a builder chain. Both
+  C-314 sites sit in functions returning non-`Default` types, so the only available mutant is
+  unviable and discarded — it could not have caught C-314 at any price. Recorded in
+  `docs/designs/unobserved-wiring.md` so it is not re-litigated.
+
+  **No existing guard is subsumed**, and two of them must not be: `capability_widenings` and
+  `pin_granted_authority` fail at *compile time*, which is strictly stronger than anything
+  test-based. The design pressure runs the other way — prefer an exhaustive destructure whenever the
+  invariant is "a field set is classified". This census is a **coverage floor, not a proof**: it
+  verifies a declaration exists and resolves, not that the named test dies for the right reason.
+  C-329 adds the runner that checks the pin is honest.
+
 - **⚠ Three golden guards could rewrite their goldens and report success having compared nothing**
   (C-326). `skill_in_sync`, `website_in_sync` and `wire_contract` all gated regeneration on
   `env::var("UPDATE").is_ok()` — **presence, not value** — and each took its `write(); return;`
