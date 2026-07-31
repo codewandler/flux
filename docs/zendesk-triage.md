@@ -23,7 +23,7 @@ let http = Egress::new(Arc::new(flux_web::http::HttpRequestTool::new(&web_option
 let credentials = Credentials::new(host_secret_store, &tenant)?;
 
 let client = flux_sdk::Client::builder()
-    .try_register_pack(connector_pack::pack(&["zendesk"], http, credentials))
+    .try_register_pack(connector_pack::pack(&["zendesk"], http, credentials, configuration))
     .build()?;
 ```
 
@@ -53,22 +53,24 @@ request** — which is why neither shows up as a confusing vendor `401`:
 
 1. **No credential address.** `providers/zendesk.toml` declares no `authority`, so there is no
    `tenants/<tenant>/<authority>/<credential>` path to resolve and the pack answers
-   `NoCredentialAddress`. Only **7 of the 41** shipped connectors declare an authority today
-   (flux-connectors C-92, under C-37's addressing scheme). Storing a token does not work around this:
-   the address, not the value, is what is missing.
-2. **No config resolution.** Zendesk's `base_url` is `https://{subdomain}.zendesk.com` — every
-   account lives on its own subdomain, so there is no tenant-independent URL. The pack does not yet
-   resolve the `[[config]]` field that binds `{subdomain}`, so a built request URL carries the
-   placeholder verbatim and names a host that does not resolve. This affects **43 of 232** shipped
-   operations across 7 providers, not just Zendesk.
-   Be precise about where this is blocked, because it is easy to misattribute: the binding is
-   **already declared** (`providers/zendesk.toml`, `[[config]] subdomain` → `endpoint.subdomain`) and
-   the configuration-surface work that declares it is done. The live chain is flux-connectors **C-87**,
-   which publishes `[[config]]` into the catalogue — the pack's only input, and it currently has no
-   `config` key at all — and then a pack that *applies* it at install, which **no story yet owns**.
+   `NoCredentialAddress`. Only **7 of the 44** shipped connectors declare an authority today
+   (flux-connectors **C-92**, `ready`, under C-37's addressing scheme). Storing a token does not work
+   around this: the address, not the value, is what is missing. **This is now the only blocker.**
+2. ~~**No config resolution.**~~ **CLOSED, 2026-07-31.** Zendesk's `base_url` is
+   `https://{subdomain}.zendesk.com` — every account lives on its own subdomain, so there is no
+   tenant-independent URL — and the pack used to emit that placeholder verbatim. flux-connectors has
+   since added a `Configuration` port: `pack()` takes it as a **fourth argument**
+   (`pack(&["zendesk"], http, credentials, configuration)`) and substitution is **total or refused**,
+   so one unbound variable is `MissingConfig` naming it rather than a request to a host that does not
+   resolve.
 
-Until both close, every entrypoint fails at its first call. The difference from the plugin's
-withdrawal is that it now fails in a named, fixable place rather than at an operation nothing serves.
+Until the authority lands, every entrypoint fails at its first call. The difference from the plugin's
+withdrawal is that it now fails in one named, fixable place rather than at an operation nothing serves.
+
+> ⚠ **This page's blocker list is point-in-time and has already moved twice in a day.** Both the crate
+> names (now `codewandler-connector-*`) and the config gap changed under an audit that was hours old.
+> Re-derive from flux-connectors' `providers/*.toml` and its story board rather than trusting the
+> counts or the story IDs quoted here.
 
 ## Run one entrypoint
 

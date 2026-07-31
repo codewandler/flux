@@ -58,7 +58,7 @@ flux app run examples/channels-app.flux
 
 There is no plugin to build or register: the `zendesk` plugin was removed before its first release,
 and these operations are now served by flux-connectors' `connector-pack`, which a **host** installs
-when it builds its client — `try_register_pack(connector_pack::pack(&["zendesk"], http, credentials))`.
+when it builds its client — `try_register_pack(connector_pack::pack(&["zendesk"], http, credentials, configuration))`.
 Each operation becomes an ordinary dotted tool that delegates to flux's own `http.request`, so flux
 keeps every byte of egress and gates each operation individually. The names did not change: the pack
 projects `zendesk-test` to `zendesk.test`, which is what this flow already called.

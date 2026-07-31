@@ -16,20 +16,26 @@
 # operation set is pinned here by `flux-cli`'s `zendesk_reference_calls_exactly_the_connector_pack_
 # read_operations`, and by the pack's own `projection.rs` at the other end.
 #
-# STILL NOT RUNNABLE AGAINST A LIVE ACCOUNT, for two reasons that are both connector-side and
-# neither of which is a missing credential:
-#   1. `providers/zendesk.toml` declares no `authority`, so the pack has no address to look a
-#      credential up at and refuses with `NoCredentialAddress` rather than sending an
-#      unauthenticated request. Only 7 of the 41 shipped connectors declare one (flux-connectors
-#      C-92, under C-37's addressing scheme).
-#   2. Zendesk's `base_url` is `https://{subdomain}.zendesk.com` and the pack does not yet resolve
-#      config, so the request URL carries `{subdomain}` verbatim — a host that does not resolve
-#      43 of 232 shipped operations share this. The binding itself is already DECLARED in
-#      `providers/zendesk.toml` ([[config]] `subdomain` -> `endpoint.subdomain`); what is missing is
-#      publishing it into the catalogue the pack reads (flux-connectors C-87) and then a pack that
-#      applies it, which no story yet owns.
-# Every entrypoint therefore still fails at its first call, but it now fails in a named, fixable
-# place instead of at an operation nothing serves.
+# STILL NOT RUNNABLE AGAINST A LIVE ACCOUNT — but for ONE connector-side reason, not two, and it is
+# not a missing credential:
+#
+#   `providers/zendesk.toml` declares no `authority`, so the pack has no address to look a credential
+#   up at and refuses with `NoCredentialAddress` rather than sending an unauthenticated request. Only
+#   7 of the 44 shipped connectors declare one. Owned by flux-connectors C-92 (`ready`), under
+#   C-37's addressing scheme. Storing a token does not work around it: the address is what is
+#   missing, not the value.
+#
+# A SECOND blocker was recorded here and is now CLOSED (2026-07-31). Zendesk's `base_url` is
+# `https://{subdomain}.zendesk.com`, and the pack used to emit that placeholder verbatim. It now
+# takes a `Configuration` port as a fourth argument to `pack()` and substitutes template variables
+# **totally or refuses** — one unbound variable is `MissingConfig`, naming it. A built URL no longer
+# carries a placeholder.
+#
+# So every entrypoint still fails at its first call, but it fails in one named, fixable place rather
+# than at an operation nothing serves.
+#
+# ⚠ Counts and blockers here are point-in-time and have already moved twice. Re-derive from
+# flux-connectors' `providers/*.toml` and its board rather than trusting this comment.
 #
 # The flow structure is unchanged and is the point: four read-only entrypoints, retry with
 # exponential backoff, bounded contexts with explicit budgets, model timeouts, and a deterministic

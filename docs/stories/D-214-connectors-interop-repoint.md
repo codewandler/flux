@@ -24,10 +24,11 @@ change and the flow structure is not**. This is that change.
 
 - [x] A host can register connector operations with
       ~~`ClientBuilder::try_register_pack(connector_pack::pack(&["zendesk"]))`~~ →
-      **corrected:** `pack` takes three arguments, not one —
-      `pack(&["zendesk"], http, credentials)`. The credential port is required rather than
-      `Option`, deliberately: a pack buildable without one would let a host install connectors that
-      send every request unauthenticated. The four operations the flow calls resolve —
+      **corrected twice.** First: `pack` takes more than one argument. Second, as of 2026-07-31,
+      it takes **four** — `pack(&["zendesk"], http, credentials, configuration)`. The credential port
+      is required rather than `Option`, deliberately: a pack buildable without one would let a host
+      install connectors that send every request unauthenticated. The four operations the flow calls
+      resolve —
       `zendesk.test`, `zendesk.ticket.show`, `zendesk.ticket.search`,
       `zendesk.ticket.comment.list` — proven by flux-connectors'
       `crates/connector-pack/tests/projection.rs`, which installs the pack and looks them up by
@@ -45,14 +46,18 @@ change and the flow structure is not**. This is that change.
       which asserts exactly that URL). Both **refuse** rather than sending a broken request, so the
       failure is diagnosable. The header was therefore *rewritten to name these two gaps* rather than
       removed.
-      **Correction, 2026-07-31 (audit):** this bullet first attributed (2) to C-86/C-68. That was
-      wrong. The `[[config]]` binding is **already declared** (`providers/zendesk.toml`, `subdomain`
-      → `endpoint.subdomain`) and C-86's relevant acceptance is `[x]`. The live chain is **C-87**,
-      which publishes `[[config]]` into `catalog.json` — the pack's only input, which today carries no
-      `config` key — followed by a pack that applies it at install, which **no story in either repo
-      owns**. Counts also corrected: 7 of **41** providers declare an `authority` (not "2 of 19"), and
-      **43 of 232** operations carry a templated host (not "27 of 105"); the pack's own module docs at
-      `crates/connector-pack/src/lib.rs:98-108` are ~2× stale and were the source of the bad figures.
+      **Correction 1, 2026-07-31 (audit):** this bullet first attributed (2) to C-86/C-68. That was
+      wrong — the `[[config]]` binding was already declared and C-86's relevant acceptance was `[x]`.
+      **Correction 2, same day, and it supersedes the bullet: gap (2) IS CLOSED.** flux-connectors
+      landed a `Configuration` port; `pack()` now takes it as a fourth argument and substitutes
+      template variables **totally or refuses** — one unbound variable is `Error::MissingConfig`,
+      naming it. That repo's `tests/request.rs` now records the old `https://{subdomain}.zendesk.com/…`
+      URLs as "the bug". So a built URL no longer carries a placeholder.
+      **What remains for a live Zendesk run is gap (1) alone:** `providers/zendesk.toml` still declares
+      no `authority` (7 of **44** providers do), owned by that repo's **C-92**, which is `ready`.
+      ⚠ Counts in this story are point-in-time and have already moved twice. The pack's own module
+      docs were ~2× stale and were the source of the original bad figures; re-derive from
+      `providers/*.toml` rather than quoting any of them.
 - [x] **The flow's structure is unchanged** — and so are the names. The premise that "the op names
       are the part expected to change" turned out **false**: the pack projects `zendesk-test` to
       `zendesk.test` and `zendesk-ticket-comment-list` to `zendesk.ticket.comment.list`, which is
