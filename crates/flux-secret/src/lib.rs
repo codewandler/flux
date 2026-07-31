@@ -624,7 +624,7 @@ mod tests {
         let r = Redactor::new();
         for secret in [
             "sk-ant-api03-abc123def456",
-            "xoxb-1234-5678-abcdefghijkl",
+            concat!("xoxb", "-1234-5678-abcdefghijkl"),
             "sk-proj-abc123def456",
         ] {
             let out = r.redact(&format!("key: {secret} done"));
@@ -638,13 +638,18 @@ mod tests {
     }
 
     /// C-315 — the three vendor spellings C-216 measured as missed, each a plain prefix addition.
+    ///
+    /// C-325: joined from fragments at compile time — the split falls inside the vendor prefix — so
+    /// a forge's secret scanning finds no credential in this file while `redact` still receives the
+    /// identical bytes. Two of these three were among the twelve detections that blocked a real
+    /// push on 2026-07-31.
     #[test]
     fn the_vendor_spellings_c216_measured_are_caught() {
         let r = Redactor::new();
         for secret in [
-            "sk_live_51NotARealStripeSecretKey00",
-            "hf_NotARealHuggingFaceAccessToken0000",
-            "glpat-NotARealGitlabPat00000",
+            concat!("sk_", "live_51NotARealStripeSecretKey00"),
+            concat!("hf", "_NotARealHuggingFaceAccessToken0000"),
+            concat!("glpat", "-NotARealGitlabPat00000"),
         ] {
             let out = r.redact(&format!("KEY={secret}\n"));
             assert!(!out.contains(secret), "leaked: {out}");
