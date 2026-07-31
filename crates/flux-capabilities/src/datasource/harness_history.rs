@@ -63,8 +63,13 @@ pub const HARNESS_SESSION_REL: &str = "session";
 
 /// How many records are held before being handed to the backend.
 ///
-/// Extraction streams (C-214) precisely so a multi-year history is never materialized; ingest must
-/// not undo that by collecting every projected record and upserting once at the end.
+/// Extraction streams (C-214) precisely so a multi-year history is never materialized, and ingest
+/// must not undo that by collecting every projected record and upserting once at the end. The drain
+/// therefore lives **inside the sink** (`ingest_harness_history`'s `emit`), not after the adapter
+/// returns: a flush placed after the adapter call runs only once the whole harness has been
+/// projected, which is precisely the shape the scan budget alone permits to reach
+/// [`MAX_MESSAGES`](crate::harness::MAX_MESSAGES) records first. Peak retention is this many message
+/// records; pinned by `ingest_never_holds_more_than_one_batch_of_records`.
 const UPSERT_BATCH: usize = 512;
 
 // -------------------------------------------------------------------------------------------
@@ -165,8 +170,11 @@ pub struct HarnessIngestReport {
 }
 
 impl HarnessIngestReport {
-    /// Every candidate root this ingest resolved *and opened*, in scan order. Empty for a disabled
-    /// ingest — and empty is the whole claim.
+    /// Every candidate root this ingest resolved and went to look at, in scan order. Empty for a
+    /// disabled ingest — and empty is the whole claim.
+    ///
+    /// A path appears here once it has been *probed*, whether or not it turned out to exist, since
+    /// a stat of `~/.claude/projects` is exactly the touch an opted-out flux must not make.
     pub fn roots_opened(&self) -> &[PathBuf] {
         &self.roots_opened
     }
@@ -212,48 +220,101 @@ pub fn ingest_harness_history(
         return Ok(report);
     }
 
+    // Session envelopes are the one thing held across a whole scan, and deliberately: there are
+    // three to five orders of magnitude fewer sessions than messages, and an envelope is a handful
+    // of scalars rather than a body. Message records are never accumulated — see `emit` below.
     let mut sessions: BTreeMap<String, SessionEnvelope> = BTreeMap::new();
     let mut batch: Vec<Record> = Vec::new();
+    let mut upserted = 0usize;
 
     for kind in history.harnesses() {
         let Some(root) = open_root(*kind, &history.env, &mut report) else {
             continue;
         };
-        let mut emit = |message: HarnessMessage| {
-            let record = project_message(&message, redactor);
-            sessions
-                .entry(session_id(&message))
-                .or_insert_with(|| SessionEnvelope::new(&message, redactor))
-                .observe(&message);
-            batch.push(record);
+        // An upsert failure inside the sink: adapters hand messages to a `FnMut` with no error
+        // channel, so the first failure is parked here, the sink goes quiet, and the scan is
+        // unwound at the call below rather than after the whole harness has been read.
+        let mut failed: Option<Error> = None;
+        let scan = {
+            let mut emit = |message: HarnessMessage| {
+                if failed.is_some() {
+                    return;
+                }
+                sessions
+                    .entry(session_id(&message, redactor))
+                    .or_insert_with(|| SessionEnvelope::new(&message, redactor))
+                    .observe(&message);
+                batch.push(project_message(&message, redactor));
+                // The drain that makes this streaming rather than collecting. It has to happen
+                // *here*, inside the sink: a flush after the adapter returns runs only once the
+                // whole harness has been projected, which is the shape the scan budget alone would
+                // allow to reach `MAX_MESSAGES` (5 000 000) records before the first upsert.
+                if batch.len() >= UPSERT_BATCH {
+                    match backend.upsert(&batch) {
+                        Ok(()) => {
+                            upserted += batch.len();
+                            batch.clear();
+                        }
+                        Err(error) => failed = Some(error),
+                    }
+                }
+            };
+            extract(*kind, &root, history.budget, &mut emit)
         };
-        let stats = match kind {
-            HarnessKind::Claude => claude_messages(&root, history.budget, &mut emit)?,
-            HarnessKind::Codex => codex_messages(&root, history.budget, &mut emit)?,
-            HarnessKind::Opencode => opencode_messages(&root, history.budget, &mut emit)?,
-            // C-302 adds the flux-native adapter over the event store. Until it lands, an enabled
-            // `flux` reads nothing — and says so, rather than looking like an empty history.
-            HarnessKind::Flux => unreachable!("flux is filtered out by open_root"),
-        };
-        merge_stats(&mut report.stats, &stats);
-        // Flush between harnesses as well as at the batch size, so peak held records stay bounded
-        // by `UPSERT_BATCH` rather than by one harness's whole history.
-        flush(backend, &mut batch, UPSERT_BATCH, &mut report.records)?;
+        // The sink's failure outranks the scan's: it is the earlier one, and the scan result of an
+        // aborted sink describes a scan that was not finished.
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        merge_stats(&mut report.stats, &scan?);
+        // The tail of this harness, so a batch is never carried across roots.
+        flush(backend, &mut batch, &mut upserted)?;
     }
 
-    flush(backend, &mut batch, 0, &mut report.records)?;
+    flush(backend, &mut batch, &mut upserted)?;
+    report.records = upserted;
 
-    let session_records: Vec<Record> = sessions.values().map(SessionEnvelope::project).collect();
-    report.sessions = session_records.len();
-    for chunk in session_records.chunks(UPSERT_BATCH.max(1)) {
-        backend.upsert(chunk)?;
+    report.sessions = sessions.len();
+    let mut envelopes: Vec<Record> = Vec::with_capacity(UPSERT_BATCH.min(sessions.len()));
+    for envelope in sessions.values() {
+        envelopes.push(envelope.project());
+        if envelopes.len() >= UPSERT_BATCH {
+            backend.upsert(&envelopes)?;
+            envelopes.clear();
+        }
+    }
+    if !envelopes.is_empty() {
+        backend.upsert(&envelopes)?;
     }
     Ok(report)
 }
 
-/// Resolve one harness's state path and record the open — **the only way this module reaches a
-/// harness root**. Recording and opening are the same call, so a read this report does not name is
-/// not a mistake that can be made by forgetting to log one.
+/// Run one harness's adapter. Split out so the dispatch is total — an enabled harness with no
+/// adapter yields an empty scan rather than a panic in library code.
+fn extract(
+    kind: HarnessKind,
+    root: &Path,
+    budget: ScanBudget,
+    emit: &mut dyn FnMut(HarnessMessage),
+) -> Result<MessageStats> {
+    match kind {
+        HarnessKind::Claude => claude_messages(root, budget, emit),
+        HarnessKind::Codex => codex_messages(root, budget, emit),
+        HarnessKind::Opencode => opencode_messages(root, budget, emit),
+        // C-302 adds the flux-native adapter over the event store. `open_root` already declines to
+        // resolve a flux root, so this arm is the belt to that braces — and an empty scan rather
+        // than an `unreachable!`, because a panic is not how a library reports a missing adapter.
+        HarnessKind::Flux => Ok(MessageStats::default()),
+    }
+}
+
+/// Resolve one harness's state path and record that this ingest went looking — **the only way this
+/// module reaches a harness root**.
+///
+/// Recording and probing are the same call, which is what makes
+/// [`HarnessIngestReport::roots_opened`] evidence rather than bookkeeping. The path is recorded
+/// *before* the existence check, so a candidate root that was stat'd and found absent still appears:
+/// the claim the opt-out rests on is "nothing was touched", and a stat is a touch.
 fn open_root(
     kind: HarnessKind,
     env: &HarnessEnv,
@@ -263,18 +324,18 @@ fn open_root(
         report.unsupported.push(kind);
         return None;
     }
-    let root = kind.locate(env).found()?.to_path_buf();
-    report.roots_opened.push(root.clone());
-    Some(root)
+    let candidate = kind.state_path(env)?;
+    report.roots_opened.push(candidate.clone());
+    candidate.exists().then_some(candidate)
 }
 
+/// Hand whatever is buffered to the backend and empty the buffer.
 fn flush(
     backend: &dyn DatasourceBackend,
     batch: &mut Vec<Record>,
-    threshold: usize,
     upserted: &mut usize,
 ) -> Result<()> {
-    if batch.len() < threshold || batch.is_empty() {
+    if batch.is_empty() {
         return Ok(());
     }
     backend.upsert(batch)?;
@@ -315,12 +376,28 @@ fn contain(text: &str, redactor: &Redactor) -> String {
 // The projection
 // -------------------------------------------------------------------------------------------
 
-fn session_id(message: &HarnessMessage) -> String {
-    format!("{}/{}", message.harness.id(), message.session_id)
+/// `<harness>/<session-id>` — the session half of every id, **contained**.
+///
+/// A record id is not internal: `render_match` and `render_record` both print it, so it is as
+/// model-visible as the title and the body, and `session_id` is arbitrary transcript text (the
+/// fixtures carry a `</knowledge-base>` one). Containing it here is what keeps the id, the link
+/// target and `meta.session_id` the same string rather than three spellings of it.
+///
+/// The trade this accepts: two sessions whose ids differ only inside a redacted span collapse to one
+/// id and overwrite each other. That needs a session identifier that contains a credential, and the
+/// alternative — a model-visible id that carries one — is the worse of the two failures.
+fn session_id(message: &HarnessMessage, redactor: &Redactor) -> String {
+    format!(
+        "{}/{}",
+        message.harness.id(),
+        contain(&message.session_id, redactor)
+    )
 }
 
-fn message_id(message: &HarnessMessage) -> String {
-    format!("{}/{}", session_id(message), message.index)
+/// `<harness>/<session-id>/<index>`, stable across re-scans because every part of it is a function
+/// of the message alone.
+fn message_id(message: &HarnessMessage, redactor: &Redactor) -> String {
+    format!("{}/{}", session_id(message, redactor), message.index)
 }
 
 /// `<harness> · <workspace> · <timestamp>` — enough address to judge a hit without opening it.
@@ -346,7 +423,7 @@ fn message_meta(message: &HarnessMessage, redactor: &Redactor) -> Value {
     meta.insert("harness".into(), json!(message.harness.id()));
     meta.insert(
         "session_id".into(),
-        json!(redactor.redact(&message.session_id)),
+        json!(contain(&message.session_id, redactor)),
     );
     meta.insert("role".into(), json!(message.role.id()));
     meta.insert(
@@ -376,14 +453,14 @@ fn path_string(path: &Path, redactor: &Redactor) -> String {
 fn project_message(message: &HarnessMessage, redactor: &Redactor) -> Record {
     Record {
         entity: HARNESS_MESSAGE_ENTITY.to_string(),
-        id: message_id(message),
+        id: message_id(message, redactor),
         source: Source::new(HARNESS_SOURCE),
         title: message_title(message, redactor),
         body: contain(&message.text, redactor),
         links: vec![Link {
             rel: HARNESS_SESSION_REL.to_string(),
             target_entity: HARNESS_SESSION_ENTITY.to_string(),
-            target_id: session_id(message),
+            target_id: session_id(message, redactor),
         }],
         meta: message_meta(message, redactor),
     }
@@ -409,8 +486,8 @@ impl SessionEnvelope {
     fn new(message: &HarnessMessage, redactor: &Redactor) -> Self {
         Self {
             harness: message.harness,
-            id: session_id(message),
-            session_id: redactor.redact(&message.session_id),
+            id: session_id(message, redactor),
+            session_id: contain(&message.session_id, redactor),
             workspace: message.workspace.as_ref().map(|w| redactor.redact(w)),
             model: message.model.as_ref().map(|m| redactor.redact(m)),
             path: path_string(&message.path, redactor),

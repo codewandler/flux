@@ -17,13 +17,25 @@ use flux_spec::{AccessKind, ToolSpec};
 use super::harness_history::{record_is_from, HarnessSelector, HARNESS_SOURCE};
 use super::{DatasourceBackend, HarnessHistory};
 
+/// The result cap `search` assumes when the caller passes none. Matches what every backend applies
+/// on its own (`MemoryBackend`, `SqliteBackend`, `SemanticIndex`) and what the input schema
+/// advertises; it is named here because the harness filter has to widen a *resolved* limit.
+const DEFAULT_SEARCH_LIMIT: usize = 5;
+
 /// How far `search` over-fetches when a `harness` selector has to be applied after the backend.
 ///
 /// The backend filters natively on `source` and `entity` only, and `harness` is a *within-source*
 /// distinction (that is precisely why the design gives it its own field rather than reusing
-/// `source:`). So a filtered search asks for more than it needs and truncates. The factor is small
-/// because the query is already pinned to the `harness` source, leaving at most one dilution factor
-/// per enabled harness rather than per indexed record.
+/// `source:`). So a filtered search asks for more than it needs and truncates.
+///
+/// **This is a heuristic, not a bound, and it has a known failure mode.** It covers the case where
+/// hits are spread across the enabled harnesses roughly evenly — at most a four-way split, hence a
+/// factor comfortably above it. It does *not* cover rank skew: if one harness's history holds more
+/// than `HARNESS_OVERFETCH × limit` better-scoring hits than the selected one, the selected
+/// harness's rows are still ranked out before the filter sees them, and the op under-returns rather
+/// than erroring. Removing the failure mode entirely means pushing a `meta` predicate down into
+/// `DatasourceBackend`, which touches all four backends; C-215 recorded that as deliberately out of
+/// its blast radius.
 const HARNESS_OVERFETCH: usize = 8;
 
 /// The six datasource retrieval ops over `backend`, as a tool vec (the form a surface registers into
@@ -198,21 +210,24 @@ impl Tool for SearchOp {
             None => None,
         };
         let mut input: SearchInput = parse("search", params)?;
-        let limit = input.limit;
+        // Resolve the default *before* widening it. `limit` is optional and the backends each
+        // default it to `DEFAULT_SEARCH_LIMIT`, so widening only when the caller passed one widens
+        // in exactly the case that needed it least — the natural
+        // `search(query: …, harness: "opencode")` would fetch five rows across all harnesses and
+        // post-filter them all away. Same order as `SemanticIndex::search`.
+        let limit = input.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
         if kind.is_some() {
             // Pin the source natively (free and exact) and over-fetch only to cover the
             // within-source dilution the backend cannot filter on.
             input
                 .source
                 .get_or_insert_with(|| HARNESS_SOURCE.to_string());
-            input.limit = limit.map(|n| n.saturating_mul(HARNESS_OVERFETCH));
+            input.limit = Some(limit.saturating_mul(HARNESS_OVERFETCH));
         }
         let mut hits = self.backend.search(&input)?;
         if let Some(kind) = kind {
             hits.retain(|hit| record_is_from(&hit.record, kind));
-            if let Some(limit) = limit {
-                hits.truncate(limit);
-            }
+            hits.truncate(limit);
         }
         if hits.is_empty() {
             return Ok(ToolResult::ok("no matches"));

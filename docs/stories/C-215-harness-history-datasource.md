@@ -79,6 +79,29 @@ attacker can pre-load once and have retrieved forever. Those three properties al
   is now public as `escape_knowledge_base_body` (purely additive). Reimplementing it here was the
   alternative and was rejected — a second escaping scheme that can drift from A-21's is exactly what
   this story is supposed to prevent.
+- 2026-07-31 — **rework after review, two correctness defects, both real and both now pinned.**
+  1. *Ingest materialized a whole harness history in RAM* — the only drain ran after the adapter had
+     already returned, so peak retention was the scan budget (`MAX_MESSAGES` = 5 000 000,
+     `MAX_MESSAGE_TOTAL_BYTES` = 2 GiB), i.e. an OOM on exactly the multi-year history this story
+     exists to read. Worse, two comments asserted the opposite. The drain now lives *inside* the
+     sink; `ingest_never_holds_more_than_one_batch_of_records` pins **peak retention** (largest
+     batch handed to the backend) rather than flush count, because a flush count passes on both
+     shapes — it observed `[1300, 1]` before the fix.
+  2. *The over-fetch was inert in the default call shape* — `limit.map(…)` is `None` for `None`, so
+     the natural `search(query: …, harness: "opencode")` fetched 5 rows across all harnesses and
+     post-filtered them all away, answering "no matches" with the record in the index. The limit is
+     now resolved to the backend default *before* widening, matching `SemanticIndex::search`;
+     `a_harness_search_without_an_explicit_limit_still_finds_the_selected_harness` covers it. The
+     over-fetch is now documented as a **heuristic with a known rank-skew failure mode**, in both
+     the const doc and the design doc — it was previously stated as settled fact.
+  Also fixed from the same review: record `id`/`links.target_id`/`meta.session_id` now all carry the
+  *contained* session id (they were the last transcript-derived fields passing through neither
+  redactor nor escaper, and ids are model-visible via `render_match`); `roots_opened` records a
+  candidate *before* the existence check, so a stat'd-but-absent root is reported too; the
+  `HarnessKind::Flux` dispatch is total instead of an `unreachable!` panic, and is now tested; and
+  the ingest/advertisement pairing obligation is pinned by
+  `the_pack_must_be_registered_with_the_same_history_that_was_ingested` and written into the design
+  doc, since the op cannot detect a mismatch itself.
 
 ## Notes
 - **Why containment is in this story and not deferred.** Splitting "ship it" from "make it safe"

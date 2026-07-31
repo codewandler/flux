@@ -174,11 +174,26 @@ unresolvable value errors rather than widening to an all-harness search.
 
 - **The flux-native adapter is not here** — it is C-302. Enabling `HarnessKind::Flux` opens no root and
   is reported in `HarnessIngestReport::unsupported()` rather than looking like an empty history.
-- **The `harness` filter is a post-filter with a bounded over-fetch.** The index backends filter
-  natively on `source`/`entity` only, and `harness` is a within-source distinction by construction (a
-  `source` cannot select within itself — the reason the field exists). A filtered search pins
-  `source: "harness"` natively and over-fetches 8× to cover the ≤4-way within-source dilution. Pushing
-  a `meta` predicate into `DatasourceBackend` would remove the over-fetch and touches all four
-  backends; it is not this story's blast radius.
+- **The `harness` filter is a post-filter, and its over-fetch is a heuristic with a known failure
+  mode — not a bound.** The index backends filter natively on `source`/`entity` only, and `harness`
+  is a within-source distinction by construction (a `source` cannot select within itself — the reason
+  the field exists). A filtered search pins `source: "harness"` natively, resolves the caller's
+  `limit` (defaulting to 5 *before* widening, or the common no-`limit` call widens by nothing), and
+  over-fetches 8×.
+
+  That covers hits spread roughly evenly across the ≤4 enabled harnesses. **It does not cover rank
+  skew**: if one harness holds more than `8 × limit` better-scoring hits than the selected one, the
+  selected harness's rows are ranked out before the filter sees them and the op under-returns
+  silently. Nothing enforces an even distribution. Removing the failure mode means pushing a `meta`
+  predicate down into `DatasourceBackend`, which touches all four backends; C-215 recorded that as
+  deliberately out of its blast radius, not as solved.
+
+- **Ingest and advertisement are separately configured.** `ingest_harness_history` and
+  `datasource_tools_with_history` each take their own `&HarnessHistory`. A host that ingests enabled
+  but registers the pack disabled puts harness records in an index whose `search`/`list`/`get` demand
+  only `datasource:*/*`, bypassing the per-harness subject. The op cannot detect this — it never sees
+  the index's provenance — so **pairing them is a host-wiring obligation**, pinned by
+  `the_pack_must_be_registered_with_the_same_history_that_was_ingested`. There is no in-tree host
+  wiring yet; the first one should take a single `HarnessHistory` and do both.
 - **The redactor's under-match is not yet measured.** That is C-216's third acceptance item, and its
   answer belongs in this document.

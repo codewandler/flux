@@ -29,7 +29,9 @@ use codewandler_flux_capabilities::datasource::{
     HarnessHistory, MemoryBackend, HARNESS_MESSAGE_ENTITY, HARNESS_SESSION_ENTITY, HARNESS_SOURCE,
 };
 use codewandler_flux_capabilities::harness::{HarnessEnv, HarnessKind};
-use flux_datasource::{GetInput, ListInput, SearchInput};
+use flux_datasource::{
+    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput, SourceSummary,
+};
 use flux_runtime::{Tool, ToolContext};
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
@@ -357,6 +359,134 @@ fn a_session_envelope_is_escaped_even_though_it_carries_no_transcript_text() {
         assert!(field.contains("&lt;/knowledge-base>"), "{field}");
     }
 
+    // The id is model-visible too — `render_match`/`render_record` both print it — so the same
+    // containment applies to it and to the link that addresses it.
+    let messages = backend
+        .list(&ListInput {
+            source: HARNESS_SOURCE.to_string(),
+            entity: Some(HARNESS_MESSAGE_ENTITY.to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    for addressed in [
+        messages[0].id.clone(),
+        messages[0].links[0].target_id.clone(),
+        sessions[0].id.clone(),
+        messages[0].meta["session_id"].as_str().unwrap().to_string(),
+    ] {
+        assert!(
+            !addressed.contains("</knowledge-base>"),
+            "an id is as model-visible as a body: {addressed}"
+        );
+    }
+    // The id's session component and `meta.session_id` are the same string, not two spellings.
+    assert_eq!(
+        messages[0].id,
+        format!("{}/{}", sessions[0].id, 0),
+        "the message id is `<session-id>/<index>`: {}",
+        messages[0].id
+    );
+    assert!(sessions[0]
+        .id
+        .ends_with(messages[0].meta["session_id"].as_str().unwrap()));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A harness with no extraction adapter is reported, not silently empty — and it opens nothing.
+///
+/// `flux` is C-302. Until it lands, enabling it must be distinguishable from enabling it and having
+/// no history, and it must not panic: the dispatch is total rather than an `unreachable!`.
+#[test]
+fn an_enabled_harness_with_no_adapter_is_reported_rather_than_silently_empty() {
+    let home = scratch("unsupported");
+    fs::create_dir_all(home.join(".flux")).unwrap();
+    fs::write(home.join(".flux").join("events.db"), "not really a db").unwrap();
+
+    let env = HarnessEnv::empty().with("HOME", &home);
+    let backend = Arc::new(MemoryBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    let report = ingest_harness_history(
+        &*dynamic,
+        &HarnessHistory::enabled_for([HarnessKind::Flux]).with_env(env),
+        &Redactor::new(),
+    )
+    .unwrap();
+
+    assert_eq!(report.unsupported(), &[HarnessKind::Flux]);
+    assert!(
+        report.roots_opened().is_empty(),
+        "and it does not probe a root it cannot read: {:?}",
+        report.roots_opened()
+    );
+    assert_eq!(report.records(), 0);
+    assert_eq!(backend.len(), 0);
+
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A candidate root that resolves but does not exist is still reported as probed.
+///
+/// `roots_opened` is the evidence the opt-out rests on, so it has to mean "this ingest went and
+/// looked", not "this ingest found something". A stat of `~/.claude/projects` is a touch.
+#[test]
+fn a_resolved_but_absent_root_is_still_reported_as_probed() {
+    let home = scratch("absent");
+    let env = HarnessEnv::empty().with("HOME", &home);
+    let backend: Arc<dyn DatasourceBackend> = Arc::new(MemoryBackend::new());
+    let report = ingest_harness_history(
+        &*backend,
+        &HarnessHistory::enabled_for([HarnessKind::Claude]).with_env(env),
+        &Redactor::new(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.roots_opened().len(),
+        1,
+        "{:?}",
+        report.roots_opened()
+    );
+    assert!(report.roots_opened()[0].ends_with("projects"));
+    assert_eq!(report.records(), 0, "nothing was there to read");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Ingesting harness records into an index whose `search` was registered *without* harness history
+/// would leave them reachable under `datasource:*/*`, bypassing the per-harness subject entirely.
+///
+/// Nothing structurally prevents a host from passing two different `HarnessHistory` values to
+/// `ingest_harness_history` and `datasource_tools_with_history`. This pins the pairing that makes
+/// the subject meaningful, so a future host wiring is measured against it.
+#[test]
+fn the_pack_must_be_registered_with_the_same_history_that_was_ingested() {
+    let (home, env) = fixture_home("pairing");
+    let backend = ingested(&env);
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+
+    // The pairing the host owes: ingested-with is registered-with, so every invocation demands a
+    // harness subject.
+    let paired = search_op(dynamic.clone(), &enabled_history(&env));
+    let subjects = paired.permission_subjects(&json!({"query": "retry"}));
+    for kind in [HarnessKind::Claude, HarnessKind::Opencode] {
+        assert!(
+            subjects.contains(&format!("datasource:harness.{}", kind.id())),
+            "{subjects:?}"
+        );
+    }
+
+    // The mismatch, stated so its cost is legible: the same records under a pack registered
+    // disabled demand only the generic subject. This is a host-wiring obligation, not something the
+    // op can detect — the op never sees the index's provenance.
+    let unpaired = search_op(dynamic, &HarnessHistory::disabled());
+    assert_eq!(
+        unpaired.permission_subjects(&json!({"query": "retry"})),
+        vec!["datasource:*/*".to_string()],
+        "documenting the gap: registering disabled over an ingested index drops the harness subject"
+    );
+
     let _ = fs::remove_dir_all(home);
 }
 
@@ -587,5 +717,185 @@ fn every_message_record_carries_the_harness_it_came_from() {
         );
         assert!(record.id.starts_with(harness.unwrap()), "{}", record.id);
     }
+    let _ = fs::remove_dir_all(home);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Streaming — ingest must not materialize a harness's whole history
+// ---------------------------------------------------------------------------------------------
+
+/// A backend that records the **size of every batch it is handed**, so a test can pin peak
+/// retention rather than flush count.
+///
+/// Counting flushes is what would let this class of bug survive a test: "collect everything, upsert
+/// once at the end" and "drain every `UPSERT_BATCH`" both produce a non-zero flush count. The
+/// largest batch is the number that distinguishes them, because it *is* the peak number of records
+/// held at one time.
+struct RecordingBackend {
+    inner: MemoryBackend,
+    batches: std::sync::Mutex<Vec<usize>>,
+}
+
+impl RecordingBackend {
+    fn new() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            batches: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn largest_batch(&self) -> usize {
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn batches(&self) -> Vec<usize> {
+        self.batches.lock().unwrap().clone()
+    }
+}
+
+impl DatasourceBackend for RecordingBackend {
+    fn upsert(&self, records: &[Record]) -> flux_core::Result<()> {
+        self.batches.lock().unwrap().push(records.len());
+        self.inner.upsert(records)
+    }
+    fn search(&self, input: &SearchInput) -> flux_core::Result<Vec<Match>> {
+        self.inner.search(input)
+    }
+    fn get(&self, input: &GetInput) -> flux_core::Result<Option<Record>> {
+        self.inner.get(input)
+    }
+    fn list(&self, input: &ListInput) -> flux_core::Result<Vec<Record>> {
+        self.inner.list(input)
+    }
+    fn relation(&self, input: &RelationInput) -> flux_core::Result<Vec<Record>> {
+        self.inner.relation(input)
+    }
+    fn batch_get(&self, input: &BatchGetInput) -> flux_core::Result<Vec<Record>> {
+        self.inner.batch_get(input)
+    }
+    fn sources(&self) -> flux_core::Result<Vec<SourceSummary>> {
+        self.inner.sources()
+    }
+    fn clear(&self) -> flux_core::Result<()> {
+        self.inner.clear()
+    }
+    fn delete_source(&self, source: &str) -> flux_core::Result<usize> {
+        self.inner.delete_source(source)
+    }
+    fn delete(&self, source: &str, entity: &str, ids: &[String]) -> flux_core::Result<usize> {
+        self.inner.delete(source, entity, ids)
+    }
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+/// A claude-code transcript of `count` messages, all in one session.
+fn bulk_claude_transcript(count: usize) -> String {
+    (0..count)
+        .map(|i| {
+            format!(
+                r#"{{"type":"user","sessionId":"bulk","cwd":"/work/bulk","timestamp":"2026-01-02T03:04:05.000Z","message":{{"role":"user","content":"message {i} about the retry wrapper"}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Peak retention is bounded by the batch size, not by the harness's history.
+///
+/// The scan budget alone permits `MAX_MESSAGES` (5 000 000) bodies totalling
+/// `MAX_MESSAGE_TOTAL_BYTES` (2 GiB), so "collect the projected records and upsert at the end" is an
+/// OOM on exactly the multi-year history this story exists to read. Extraction streams (C-214);
+/// ingest must not undo that.
+#[test]
+fn ingest_never_holds_more_than_one_batch_of_records() {
+    let home = scratch("streaming");
+    let project = home.join(".claude").join("projects").join("-work-bulk");
+    fs::create_dir_all(&project).unwrap();
+    const MESSAGES: usize = 1300;
+    const BATCH: usize = 512;
+    fs::write(project.join("bulk.jsonl"), bulk_claude_transcript(MESSAGES)).unwrap();
+
+    let env = HarnessEnv::empty().with("HOME", &home);
+    let backend = Arc::new(RecordingBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    let report = ingest_harness_history(
+        &*dynamic,
+        &HarnessHistory::enabled_for([HarnessKind::Claude]).with_env(env),
+        &Redactor::new(),
+    )
+    .unwrap();
+
+    assert_eq!(report.records(), MESSAGES, "every message was ingested");
+    // The load-bearing assertion: no single hand-off exceeded the batch size. A build that collects
+    // the whole history and upserts once shows a batch of 1300 here.
+    assert!(
+        backend.largest_batch() <= BATCH,
+        "peak held records must be bounded by the batch size, not by the history: {:?}",
+        backend.batches()
+    );
+    // And it drained *during* the scan rather than in several chunks afterwards.
+    assert!(
+        backend.batches().len() >= MESSAGES / BATCH,
+        "{:?}",
+        backend.batches()
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The selector in the shape a caller actually writes
+// ---------------------------------------------------------------------------------------------
+
+/// The default call shape — **no `limit`** — must still find the selected harness's messages.
+///
+/// `limit` is optional and every backend defaults it to 5, so a filtered search that widens only
+/// when the caller passed a limit widens in exactly the case that needed it least. Here nine
+/// claude-code messages outrank the one opencode message on id order alone, so an un-widened
+/// backend query returns five claude rows, the harness filter drops all five, and the op answers
+/// "no matches" while the record sits in the index.
+#[tokio::test]
+async fn a_harness_search_without_an_explicit_limit_still_finds_the_selected_harness() {
+    let home = scratch("default-limit");
+
+    // Nine claude-code messages, all matching the query.
+    let project = home.join(".claude").join("projects").join("-work-repo");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("s-1.jsonl"), bulk_claude_transcript(9)).unwrap();
+
+    // One opencode message, matching the same query.
+    let opencode = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode).unwrap();
+    seed_opencode(&opencode.join("opencode.db"));
+
+    let env = HarnessEnv::empty().with("HOME", &home);
+    let backend = Arc::new(MemoryBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    let history = enabled_history(&env);
+    ingest_harness_history(&*dynamic, &history, &Redactor::new()).unwrap();
+
+    let search = search_op(dynamic, &history);
+    let hit = search
+        .execute(
+            &ctx(),
+            json!({"query": "retry wrapper", "harness": "opencode"}),
+        )
+        .await
+        .unwrap();
+    assert!(!hit.is_error, "{}", hit.content);
+    assert!(
+        hit.content.contains("opencode/o-1/0"),
+        "the opencode message is reachable without passing an explicit limit: {}",
+        hit.content
+    );
+
     let _ = fs::remove_dir_all(home);
 }
