@@ -17,6 +17,20 @@
 
 ### New
 
+- **flux can now take deliveries from a connector you have installed, by naming it.** Point a channel
+  at an installed connector and the binding you want, and flux reads that connector's own description
+  of itself and sets the channel up from it — you do not restate the vendor's details by hand.
+  The part worth knowing is what happens when something in that description is wrong or has been
+  edited since it was published: flux refuses to start the channel and tells you which rule failed
+  and where, instead of starting a channel that looks healthy and quietly does nothing. That was a
+  real failure mode — a description that narrowed which events it wanted would previously have opened
+  a port, accepted deliveries, and never acted on any of them.
+  Two limits today. Connectors that sign their deliveries are not usable yet, and flux refuses them
+  outright rather than accepting the delivery unverified — so you cannot end up believing a channel
+  checks signatures when it does not. And if you expose the channel beyond your own machine, it must
+  have a token; an empty one is now rejected when you set it up, because an empty token would have let
+  anyone through.
+
 - **Web requests can now take query parameters as a proper list, instead of you gluing them onto the
   address yourself.** Give the request a set of named values and flux assembles the address for you,
   escaping each value correctly. This matters for more than tidiness: previously, a value that
