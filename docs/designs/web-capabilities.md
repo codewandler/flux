@@ -94,6 +94,16 @@ A native op in `flux-web::http`: method, URL, headers, body, timeout → status,
 plan approval sees it (D-91 lesson). Ungated (`group: None`, always advertised) — it's one op, and
 it's table-stakes.
 
+**The query is structured, not interpolated (C-303).** A `query` record of scalars is
+percent-encoded per RFC 3986 and appended, because the only alternative — formatting values into
+the URL with `fmt` — escapes nothing, so a value carrying `&` or `=` adds a parameter the author
+never wrote. This is the query half of the gap [L-101](../stories/L-101-form-urlencoded-body.md)
+closed for bodies, and it shares L-101's scalar rules (`null` omitted, `false`/`0` sent, nested
+refused). The encoder is `flux_core::percent_encode_component` — one encoder for the whole tree,
+since a percent-encoder that gets copied drifts on exactly the byte an attacker supplies.
+`permission_subjects` and the `NetworkFetch` intent report the *encoded* URL, minus any
+query-placed credential: they cannot fail, so they cannot consult a redactor.
+
 ### Tier 2 — `web.fetch` readable markdown — D-120
 
 The everyday capability — "read this page" — stops returning markup. The condenser lives in
