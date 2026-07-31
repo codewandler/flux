@@ -9,7 +9,7 @@ date: 2026-07-31
 **0.42.0 is a minor release**, which pre-1.0 is how this project signals a breaking change. Two of
 them: `VoiceTurnHandler::turn` now carries a `Speaker`, and `SubAgents` gained a public field. If you
 implement a voice handler or build `SubAgents` with a struct literal, read the [action-needed
-section](#action-needed) before upgrading.
+section](/blog/flux-0-42-0-rooms-and-history#action-needed) before upgrading.
 
 The headline is that flux can now sit in a room with several people. The subtler half is that three
 of the nine stories in this cut are **foundations whose consumers are not wired yet** — and saying so
