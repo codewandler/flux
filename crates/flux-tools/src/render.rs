@@ -479,6 +479,26 @@ mod tests {
     }
 
     #[test]
+    fn a_named_argument_value_renders_as_an_identifier_and_keeps_the_comma_separate() {
+        // C-336, as reported: `schema: CallerSlots` rendered `<tspan fill="#828997">CallerSlots,
+        // </tspan>` — the punctuation colour, with the following `,` swallowed into the same run
+        // because `source_lines` coalesces adjacent same-coloured chars.
+        let svg = render_flux_svg(
+            "flow main\n  $x = ai.extract({ from: $doc, schema: CallerSlots, ask: \"q\" })\n",
+            View::Source,
+        )
+        .unwrap();
+        assert!(
+            svg.contains(&format!("<tspan fill=\"{OP}\">CallerSlots</tspan>")),
+            "the value is an identifier, and the run ends at it: {svg}"
+        );
+        assert!(
+            !svg.contains("CallerSlots,"),
+            "the `,` must not be absorbed into the identifier's run: {svg}"
+        );
+    }
+
+    #[test]
     fn tree_view_colors_connectors() {
         let svg = render_flux_svg("flow f\n  $x = 1\n  return $x\n", View::Tree).unwrap();
         assert!(svg.starts_with("<svg"), "got: {svg}");

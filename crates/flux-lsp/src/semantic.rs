@@ -328,6 +328,25 @@ mod tests {
     }
 
     #[test]
+    fn a_named_argument_value_still_reaches_the_editor() {
+        // C-336: the misclassification is worse here than in `flux render`. `Punct` maps to `None`,
+        // so a named-argument value did not merely take the wrong colour — it produced no semantic
+        // token at all and the identifier vanished from the editor's token stream.
+        let src = "flow main\n  $x = ai.extract({ from: $doc, schema: CallerSlots, ask: \"q\" })\n";
+        let decoded = decode(src, &tokens_for(src, None));
+        let (_, ty, modifiers) = decoded
+            .iter()
+            .find(|(text, _, _)| text == "CallerSlots")
+            .unwrap_or_else(|| panic!("no token for the named-argument value in {decoded:?}"));
+        assert_eq!(*ty, TOK_FUNCTION, "a bare name reference, like any other");
+        assert_eq!(
+            modifiers & MOD_DEFAULT_LIBRARY,
+            0,
+            "not a registry-known op"
+        );
+    }
+
+    #[test]
     fn semantic_tokens_distinguish_known_op_from_unknown_and_bind_from_use() {
         let src =
             "flow f\n  # a note\n  $x = read(\"a.txt\")\n  $y = made_up(\"z\")\n  return $x\n";

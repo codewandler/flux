@@ -96,9 +96,15 @@ fn classify_ident(tok: &SyntaxToken) -> HighlightClass {
     }
     match pk {
         K::NAME => name_class(&parent),
-        K::PARAM => C::Var,               // the `name` in `name: Type`
-        K::FLOW_HEADER => C::Op,          // the flow's own name (kebab-case segments included)
-        K::FIELD_EXPR => C::Var,          // `$sym.path` — the path reads as part of the variable
+        K::PARAM => C::Var,      // the `name` in `name: Type`
+        K::FLOW_HEADER => C::Op, // the flow's own name (kebab-case segments included)
+        K::FIELD_EXPR => C::Var, // `$sym.path` — the path reads as part of the variable
+        // A *sigil-less* ident in expression position: the parser wraps it in a `VAR_EXPR` and the
+        // lowerer decodes it to `Node::Var`, so it is a bare name reference and reads like every
+        // other reference. (`$sym` never reaches here — a `VAR` token classifies before this.)
+        // C-336: without this arm it fell through to `Punct`, which mis-coloured every
+        // `schema: CallerSlots` and, in flux-lsp, dropped the token from the stream entirely.
+        K::VAR_EXPR => C::Op,
         K::EFFECT_ANNOT => C::Annotation, // the tag in `@effect(tag)`
         K::THING_EXPR => thing_class(tok, &parent),
         // `, risk: medium` — the label of a canonical header option reads as a keyword of the
@@ -352,6 +358,89 @@ mod tests {
         assert_eq!(class_of(src, "backoff"), HighlightClass::Keyword);
         assert_eq!(class_of(src, "exponential"), HighlightClass::Punct);
         assert_total(src);
+    }
+
+    #[test]
+    fn a_bare_identifier_in_value_position_is_a_name_reference_not_punctuation() {
+        // C-336: `schema: CallerSlots` classified `CallerSlots` as punctuation. A sigil-less
+        // identifier in expression position is a bare *name reference* — the parser wraps it in a
+        // `VAR_EXPR` and the lowerer decodes it to `Node::Var` — so it reads like every other
+        // reference (`C::Op`), never as punctuation. Both named-argument spellings, and the plain
+        // expression positions that share the shape.
+        let obj = "flow main\n  $x = ai.extract({ from: $doc, schema: CallerSlots, ask: \"q\" })\n";
+        assert_eq!(class_of(obj, "CallerSlots"), HighlightClass::Op);
+        let named = "flow main\n  $x = ai.extract(schema: CallerSlots, ask: \"q\")\n";
+        assert_eq!(class_of(named, "CallerSlots"), HighlightClass::Op);
+        let bare = "flow f\n  $x = CallerSlots\n  return $x\n";
+        assert_eq!(class_of(bare, "CallerSlots"), HighlightClass::Op);
+        let positional = "flow f\n  $x = extract(CallerSlots, 2)\n  return $x\n";
+        assert_eq!(class_of(positional, "CallerSlots"), HighlightClass::Op);
+        // The label half is unchanged: a named-argument key is still a label, not a reference.
+        assert_eq!(class_of(named, "schema"), HighlightClass::Punct);
+        assert_total(obj);
+        assert_total(named);
+    }
+
+    #[test]
+    fn a_named_argument_value_does_not_absorb_the_following_comma() {
+        // C-336, the diagnostic half. `highlight` always emitted two spans here, but both were
+        // `Punct`, so every consumer that groups by class — the SVG writer coalesces adjacent
+        // same-coloured chars into one `<tspan>` — merged them into `CallerSlots,`. Asserting the
+        // boundary means asserting the two spans are adjacent *and* classify differently.
+        let src = "flow main\n  $x = ai.extract({ from: $doc, schema: CallerSlots, ask: \"q\" })\n";
+        let spans = highlight(src);
+        let i = spans
+            .iter()
+            .position(|(r, _)| &src[*r] == "CallerSlots")
+            .expect("the value span");
+        let (value, comma) = (spans[i], spans[i + 1]);
+        assert_eq!(&src[comma.0], ",", "the separator is the very next span");
+        assert_eq!(value.0.end(), comma.0.start(), "the two spans are adjacent");
+        assert_eq!(comma.1, HighlightClass::Punct);
+        assert_ne!(
+            value.1, comma.1,
+            "the identifier and the separator must classify differently, or a consumer that \
+             groups adjacent spans by class renders them as one run"
+        );
+    }
+
+    #[test]
+    fn only_expression_valued_header_options_shared_the_named_value_defect() {
+        // C-336: `until` and `when` are the only option labels the parser parses as a full
+        // expression (`header_options(&["until"])` / `&["when"]`), so a bare ident there lands in a
+        // `VAR_EXPR` and shared the misclassification. Every other option value is captured
+        // verbatim as raw tokens inside the `HEADER_OPTION`, where `option_class` calls it `Punct`
+        // — deliberately, as the space-keyword spelling it replaces did (L-96), and unchanged here.
+        let until = "flow f\n  repeat 3, until: done\n    do work\n";
+        assert_eq!(class_of(until, "until"), HighlightClass::Keyword);
+        assert_eq!(class_of(until, "done"), HighlightClass::Op);
+        let when = "flow f\n  await $a = \"src\", when: ready\n  return 1\n";
+        assert_eq!(class_of(when, "when"), HighlightClass::Keyword);
+        assert_eq!(class_of(when, "ready"), HighlightClass::Op);
+        for (src, value) in [
+            ("flow f\n  throttle 5, per: minute\n    do work\n", "minute"),
+            (
+                "flow f\n  retry 2, backoff: exponential\n    do w\n",
+                "exponential",
+            ),
+            ("flow f\n  retry 2, max: cap\n    do work\n", "cap"),
+            ("flow f\n  retry 2, wait: slow\n    do work\n", "slow"),
+            ("flow f\n  loop every 5, until: done\n    do w\n", "done"),
+        ] {
+            let class = class_of(src, value);
+            let scalar = value != "done"; // `until:` is the expression-valued one in that pair
+            assert_eq!(
+                class,
+                if scalar {
+                    HighlightClass::Punct
+                } else {
+                    HighlightClass::Op
+                },
+                "scalar option values stay Punct, expression-valued ones read as references: \
+                 {value:?} in {src:?}"
+            );
+            assert_total(src);
+        }
     }
 
     #[test]
