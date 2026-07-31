@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-07-31
+
+### Fixed
+
+- **`flux-runtime` could not compile for a consumer holding an older lockfile.** The workspace
+  declared `flux-evidence = "1"`, but `flux-runtime` calls
+  `EvidenceLog::{set_max_payload_bytes, retained_payload_bytes, compaction_notice}`, which exist only
+  from 1.1.0. A consumer resolving evidence 1.0.0 therefore hit
+  `error[E0599]: no method named 'set_max_payload_bytes'` **inside flux's own published source**.
+
+  It could not reproduce in this workspace (the path dependency is 1.1.0) nor on a fresh resolve
+  (which picks the newest 1.x) — it bit exactly the trees that already held a lockfile pinning 1.0.0,
+  which is every existing downstream host. Present in 0.41.0 and 0.42.0; the requirement is now
+  `1.1`. Found by flux-connectors' C-192 while moving its own pin from 0.39 to 0.41.
+
 ## [0.42.0] - 2026-07-31
 
 ### Added
