@@ -25,13 +25,16 @@ pub mod endpoint;
 pub mod harness;
 
 pub use datasource::{
-    chunk_text, datasource_tools, freshness, ingest_markdown, ingest_openapi, ingest_text,
-    live_datasource_tools, records_to_context_blocks, register_datasource_ops, reindex,
-    try_register_datasource_ops, try_register_live_datasource, try_register_work_board,
-    validate_board_contract, validate_live_contract, work_board_tools, BoardLedger, ChunkOptions,
-    DatasourceBackend, DatasourceHostCaps, Embedder, EmbeddingUsage, LiveAccess, LiveDatasource,
+    chunk_text, datasource_tools, datasource_tools_with_history, freshness, ingest_harness_history,
+    ingest_markdown, ingest_openapi, ingest_text, live_datasource_tools, records_to_context_blocks,
+    register_datasource_ops, reindex, try_register_datasource_ops,
+    try_register_datasource_ops_with_history, try_register_live_datasource,
+    try_register_work_board, validate_board_contract, validate_live_contract, work_board_tools,
+    BoardLedger, ChunkOptions, DatasourceBackend, DatasourceHostCaps, Embedder, EmbeddingUsage,
+    HarnessHistory, HarnessIngestReport, HarnessSelector, LiveAccess, LiveDatasource,
     LiveDatasourceSurface, MarkdownBoard, MemoryBackend, MemoryBoard, MemoryVectorStore,
-    SemanticIndex, SqliteBackend, VectorStore, WorkBoard, WorkBoardSurface,
+    SemanticIndex, SqliteBackend, VectorStore, WorkBoard, WorkBoardSurface, HARNESS_MESSAGE_ENTITY,
+    HARNESS_SESSION_ENTITY, HARNESS_SESSION_REL, HARNESS_SOURCE,
 };
 pub use endpoint::{
     endpoint_tools, register_endpoint_ops, try_register_endpoint_ops, CredentialReader,

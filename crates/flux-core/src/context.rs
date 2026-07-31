@@ -73,6 +73,17 @@ const TRUNC_MARKER: &str = "\n… [truncated]";
 /// `&lt;` — which the model still reads cleanly but no longer parses as a tag boundary. Matching is
 /// case-insensitive and whitespace-tolerant (`< / knowledge-base` too); an incidental `<` elsewhere
 /// is left untouched so ordinary prose renders unchanged.
+///
+/// [`render_knowledge_blocks`] applies this to every body it renders, so a caller that only renders
+/// need not think about it. It is public for the **ingest** case (C-215): a source whose text is
+/// untrusted, secret-bearing and retrievable forever — harness transcripts — escapes once as the
+/// record is stored, so no later consumer can reintroduce a breakout by rendering a different way.
+/// Applying it at both ends is safe: the escape removes the `<` that begins the sequence, so a
+/// second pass finds nothing left to neutralize.
+pub fn escape_knowledge_base_body(body: &str) -> String {
+    neutralize_tag_breakout(body)
+}
+
 fn neutralize_tag_breakout(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());

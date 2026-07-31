@@ -14,13 +14,61 @@ use flux_datasource::{
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, ToolSpec};
 
-use super::DatasourceBackend;
+use super::harness_history::{record_is_from, HarnessSelector, HARNESS_SOURCE};
+use super::{DatasourceBackend, HarnessHistory};
+
+/// The result cap `search` assumes when the caller passes none. Matches what every backend applies
+/// on its own (`MemoryBackend`, `SqliteBackend`, `SemanticIndex`) and what the input schema
+/// advertises; it is named here because the harness filter has to widen a *resolved* limit.
+const DEFAULT_SEARCH_LIMIT: usize = 5;
+
+/// How far `search` over-fetches when a `harness` selector has to be applied after the backend.
+///
+/// The backend filters natively on `source` and `entity` only, and `harness` is a *within-source*
+/// distinction (that is precisely why the design gives it its own field rather than reusing
+/// `source:`). So a filtered search asks for more than it needs and truncates.
+///
+/// **This is a heuristic, not a bound, and it has a known failure mode.** It covers the case where
+/// hits are spread across the enabled harnesses roughly evenly — at most a four-way split, hence a
+/// factor comfortably above it. It does *not* cover rank skew: if one harness's history holds more
+/// than `HARNESS_OVERFETCH × limit` better-scoring hits than the selected one, the selected
+/// harness's rows are still ranked out before the filter sees them, and the op under-returns rather
+/// than erroring. Removing the failure mode entirely means pushing a `meta` predicate down into
+/// `DatasourceBackend`, which touches all four backends; C-215 recorded that as deliberately out of
+/// its blast radius.
+const HARNESS_OVERFETCH: usize = 8;
 
 /// The six datasource retrieval ops over `backend`, as a tool vec (the form a surface registers into
 /// an agent/app registry — e.g. `App::with_tools`).
+///
+/// Harness history is **off**: this is [`datasource_tools_with_history`] under
+/// [`HarnessHistory::disabled`], not a parallel code path, so "the default advertises no `harness`
+/// field" is true by construction rather than by two declarations being kept in step.
 pub fn datasource_tools(backend: Arc<dyn DatasourceBackend>) -> Vec<Arc<dyn Tool>> {
+    datasource_tools_with_history(backend, &HarnessHistory::disabled())
+}
+
+/// The six datasource retrieval ops, with `search` carrying a `harness` selector for the harnesses
+/// `history` enables (C-215).
+///
+/// When `history` is disabled the returned `search` is identical to [`datasource_tools`]': no
+/// `harness` property in its schema, and its permission subjects unchanged. When it is enabled,
+/// `search` advertises the selector and every invocation carries per-harness
+/// `datasource:harness.<id>` subjects so a policy can allow `flux` and deny the rest.
+///
+/// Registering these ops does **not** read a transcript. Ingest is the separate, host-called
+/// [`ingest_harness_history`](super::ingest_harness_history); this pack only searches whatever is
+/// already in the index, which is why `search` keeps its read-only, `Datasource`-access declaration.
+pub fn datasource_tools_with_history(
+    backend: Arc<dyn DatasourceBackend>,
+    history: &HarnessHistory,
+) -> Vec<Arc<dyn Tool>> {
+    let selector = history.is_enabled().then(|| history.selector());
     vec![
-        Arc::new(SearchOp(backend.clone())) as Arc<dyn Tool>,
+        Arc::new(SearchOp {
+            backend: backend.clone(),
+            harness: selector,
+        }) as Arc<dyn Tool>,
         Arc::new(GetOp(backend.clone())),
         Arc::new(ListOp(backend.clone())),
         Arc::new(RelationOp(backend.clone())),
@@ -40,9 +88,18 @@ pub fn try_register_datasource_ops(
     registry: &mut ToolRegistry,
     backend: Arc<dyn DatasourceBackend>,
 ) -> Result<()> {
+    try_register_datasource_ops_with_history(registry, backend, &HarnessHistory::disabled())
+}
+
+/// Fallibly register the datasource pack with harness history enabled per `history` (C-215).
+pub fn try_register_datasource_ops_with_history(
+    registry: &mut ToolRegistry,
+    backend: Arc<dyn DatasourceBackend>,
+    history: &HarnessHistory,
+) -> Result<()> {
     registry.try_register_all_from(
         "flux-capabilities datasource pack",
-        datasource_tools(backend),
+        datasource_tools_with_history(backend, history),
     )
 }
 
@@ -97,22 +154,39 @@ fn datasource_subjects(params: &Value) -> Vec<String> {
 }
 
 /// `search` — keyword search over the indexed datasource.
-struct SearchOp(Arc<dyn DatasourceBackend>);
+///
+/// `harness` is `Some` only when the host opted into harness history (C-215); it is what makes the
+/// `harness` selector, and its per-harness permission subjects, part of this op's declaration at all.
+struct SearchOp {
+    backend: Arc<dyn DatasourceBackend>,
+    harness: Option<HarnessSelector>,
+}
 
 #[async_trait]
 impl Tool for SearchOp {
     fn spec(&self) -> ToolSpec {
+        let mut properties = json!({
+            "query": {"type": "string"},
+            "source": {"type": "string", "description": "Restrict to one source (e.g. \"local\", \"gitlab\")"},
+            "entity": {"type": "string", "description": "Restrict to one entity type (e.g. \"file.document\")"},
+            "limit": {"type": "integer", "description": "Max results (default 5)"}
+        });
+        let mut description = "Search the indexed knowledge datasource (local docs + integration \
+             records) by keyword."
+            .to_string();
+        if let Some(selector) = &self.harness {
+            properties["harness"] = selector.schema_property();
+            description.push_str(
+                " Also indexes local coding-harness conversation history; pass `harness` to \
+                 restrict to one of them.",
+            );
+        }
         ToolSpec::read_only(
             "search",
-            "Search the indexed knowledge datasource (local docs + integration records) by keyword.",
+            description,
             json!({
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "source": {"type": "string", "description": "Restrict to one source (e.g. \"local\", \"gitlab\")"},
-                    "entity": {"type": "string", "description": "Restrict to one entity type (e.g. \"file.document\")"},
-                    "limit": {"type": "integer", "description": "Max results (default 5)"}
-                },
+                "properties": properties,
                 "required": ["query"]
             }),
         )
@@ -120,12 +194,41 @@ impl Tool for SearchOp {
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        datasource_subjects(params)
+        let Some(selector) = &self.harness else {
+            return datasource_subjects(params);
+        };
+        let mut subjects = datasource_subjects(params);
+        subjects.extend(selector.subjects(params));
+        subjects
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let input: SearchInput = parse("search", params)?;
-        let hits = self.0.search(&input)?;
+        // Resolve the selector *before* parsing: `SearchInput` ignores unknown fields, so a typo'd
+        // or not-enabled harness would otherwise be dropped into an unfiltered all-harness search.
+        let kind = match &self.harness {
+            Some(selector) => selector.resolve(&params)?,
+            None => None,
+        };
+        let mut input: SearchInput = parse("search", params)?;
+        // Resolve the default *before* widening it. `limit` is optional and the backends each
+        // default it to `DEFAULT_SEARCH_LIMIT`, so widening only when the caller passed one widens
+        // in exactly the case that needed it least — the natural
+        // `search(query: …, harness: "opencode")` would fetch five rows across all harnesses and
+        // post-filter them all away. Same order as `SemanticIndex::search`.
+        let limit = input.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        if kind.is_some() {
+            // Pin the source natively (free and exact) and over-fetch only to cover the
+            // within-source dilution the backend cannot filter on.
+            input
+                .source
+                .get_or_insert_with(|| HARNESS_SOURCE.to_string());
+            input.limit = Some(limit.saturating_mul(HARNESS_OVERFETCH));
+        }
+        let mut hits = self.backend.search(&input)?;
+        if let Some(kind) = kind {
+            hits.retain(|hit| record_is_from(&hit.record, kind));
+            hits.truncate(limit);
+        }
         if hits.is_empty() {
             return Ok(ToolResult::ok("no matches"));
         }
@@ -375,7 +478,10 @@ mod tests {
     #[tokio::test]
     async fn search_op_returns_hits_and_get_round_trips() {
         let b = backend();
-        let search = SearchOp(b.clone());
+        let search = SearchOp {
+            backend: b.clone(),
+            harness: None,
+        };
         let r = search
             .execute(&ctx(), json!({"query": "warm transfer", "limit": 3}))
             .await
