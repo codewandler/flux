@@ -114,8 +114,13 @@ pub struct MessageStats {
     pub skipped_unreadable: usize,
     /// Records that were read but did not parse, or did not carry a role this layer recognizes.
     pub skipped_malformed: usize,
-    /// Records passed over for being individually too big: a line over
-    /// [`ScanBudget::max_line_bytes`], or a body over [`ScanBudget::max_message_bytes`].
+    /// Records passed over for being individually too big: a file over
+    /// [`ScanBudget::max_file_bytes`], a line over [`ScanBudget::max_line_bytes`], or a body over
+    /// [`ScanBudget::max_message_bytes`] — which for a body assembled from parts means the parts
+    /// retained to build it, not the flattened text they produce.
+    ///
+    /// Distinct from [`skipped_unreadable`](Self::skipped_unreadable) on purpose: this bucket is a
+    /// budget decision about input that was perfectly readable.
     pub skipped_oversize: usize,
     /// Records passed over because a whole-scan ceiling had already been reached.
     pub skipped_over_budget: usize,
@@ -228,9 +233,19 @@ impl<'a> MessageSink<'a> {
 /// - a tool result yields its own content, flattened, because that text was in the conversation;
 /// - anything else yields `[<type>]`.
 ///
-/// Appending stops once the result passes `cap`, which the caller sets to
-/// [`ScanBudget::max_message_bytes`]: the over-cap result is then skipped and counted by
-/// [`MessageSink::offer`], so an enormous body costs the cap rather than its own size.
+/// **What `cap` bounds, exactly.** The caller passes [`ScanBudget::max_message_bytes`], and the
+/// result is bounded by `cap` plus the few bytes of overshoot that reveal it: appending stops once
+/// the result passes `cap`, and a single part larger than the room left is clamped to just past it
+/// (rounded *up* to a char boundary, so a multi-byte character is never split). The overshoot is
+/// load-bearing rather than sloppy — it is how [`MessageSink::offer`] recognizes an over-cap body and
+/// skips it, where a result clamped to exactly `cap` would be emitted silently truncated instead.
+///
+/// So an enormous body costs the cap rather than its own size **here**. That is not the same as the
+/// per-message memory bound of a scan: the JSONL adapters parse a whole record into a [`Value`]
+/// before flattening it, so their real per-message ceiling is
+/// [`ScanBudget::max_line_bytes`](ScanBudget::max_line_bytes) (8 MiB by default), not
+/// `max_message_bytes` (1 MiB). The opencode adapter is the one that never materializes more than
+/// `max_message_bytes` of a message, because it assembles bodies from separately capped part rows.
 pub(crate) fn flatten_content(value: &Value, cap: usize) -> String {
     let mut out = String::new();
     append_content(value, cap, &mut out);
@@ -242,7 +257,7 @@ fn append_content(value: &Value, cap: usize, out: &mut String) {
         return;
     }
     match value {
-        Value::String(s) => push_part(s, out),
+        Value::String(s) => push_part(s, cap, out),
         Value::Array(items) => {
             for item in items {
                 append_content(item, cap, out);
@@ -268,7 +283,7 @@ fn append_block(block: &Value, cap: usize, out: &mut String) {
                 .or_else(|| block.get("tool"))
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            push_part(&format!("[tool_use: {name}]"), out);
+            push_part(&format!("[tool_use: {name}]"), cap, out);
         }
         "tool_result" | "function_call_output" => {
             let before = out.len();
@@ -280,7 +295,7 @@ fn append_block(block: &Value, cap: usize, out: &mut String) {
                     return;
                 }
             }
-            push_part("[tool_result]", out);
+            push_part("[tool_result]", cap, out);
         }
         _ => {
             // `thinking` blocks carry their text under their own name; everything else that carries
@@ -292,26 +307,43 @@ fn append_block(block: &Value, cap: usize, out: &mut String) {
             for key in ["text", "thinking", "reasoning", "summary"] {
                 if let Some(text) = block.get(key).and_then(Value::as_str) {
                     if !text.is_empty() {
-                        push_part(text, out);
+                        push_part(text, cap, out);
                         return;
                     }
                 }
             }
             if !kind.is_empty() {
-                push_part(&format!("[{kind}]"), out);
+                push_part(&format!("[{kind}]"), cap, out);
             }
         }
     }
 }
 
-fn push_part(part: &str, out: &mut String) {
+/// Append one part, copying at most enough of it to land just past `cap`.
+///
+/// The clamp is the difference between "costs the cap" and "costs its own size": callers check `cap`
+/// *before* recursing, so without it a single 200 KB body is materialized in full and only then
+/// dropped by [`MessageSink::offer`]. The result deliberately overshoots `cap` by one byte — rounded
+/// up to the next char boundary, never splitting a multi-byte character — because that overshoot is
+/// what `offer` recognizes as over-cap. Clamping to exactly `cap` would silently emit a truncated
+/// body in place of a reported skip.
+fn push_part(part: &str, cap: usize, out: &mut String) {
     if part.is_empty() {
         return;
     }
     if !out.is_empty() {
         out.push('\n');
     }
-    out.push_str(part);
+    let room = cap.saturating_sub(out.len()) + 1;
+    if part.len() <= room {
+        out.push_str(part);
+        return;
+    }
+    let mut end = room;
+    while end < part.len() && !part.is_char_boundary(end) {
+        end += 1;
+    }
+    out.push_str(&part[..end]);
 }
 
 /// The session identifier a file falls back to when the records inside it name none.
@@ -531,6 +563,31 @@ mod tests {
             "bounded by the cap plus one part: {}",
             flat.len()
         );
+    }
+
+    #[test]
+    fn one_part_larger_than_the_cap_costs_the_cap_rather_than_its_own_size() {
+        // The case the array walk above cannot cover: a *single* part over the cap. The cap is
+        // checked before appending, so without a clamp inside the append the whole 200 KB body is
+        // copied and only then dropped by `MessageSink::offer`.
+        let huge = "x".repeat(200_000);
+        for body in [json!(huge.clone()), json!([{"type": "text", "text": huge}])] {
+            let flat = flatten_content(&body, 1024);
+            assert_eq!(
+                flat.len(),
+                1025,
+                "an enormous body costs the cap plus the one byte that reveals it"
+            );
+        }
+        // A multi-byte character straddling the clamp must not be split mid-encoding — so the clamp
+        // rounds *up* to the next boundary, and stays over the cap where `offer` can see it.
+        let flat = flatten_content(&json!("€".repeat(200_000)), 1024);
+        assert!(
+            flat.len() > 1024 && flat.len() <= 1024 + 4,
+            "over the cap, and within one character of it: {}",
+            flat.len()
+        );
+        assert!(flat.chars().all(|c| c == '€'), "clamped on a char boundary");
     }
 
     #[test]

@@ -16,7 +16,7 @@ use flux_core::Result;
 use serde_json::Value;
 
 use super::message::{file_stem, flatten_content, json_epoch_ms_at, HarnessMessage, MessageRole};
-use super::scan::{jsonl_files, open_jsonl, JsonlLine, ScanBudget};
+use super::scan::{jsonl_files, open_jsonl, JsonlLine, ScanBudget, SkipReason};
 use super::{HarnessKind, MessageSink, MessageStats};
 
 /// Extract every message under a claude-code `projects` root.
@@ -38,9 +38,19 @@ pub fn claude_messages(
 
     for file in scan.files() {
         sink.scanned();
-        let Ok(lines) = open_jsonl(file, budget) else {
-            sink.skip_unreadable(1);
-            continue;
+        // The two skip reasons are not interchangeable: a file over the file cap is a budget
+        // decision (`skipped_oversize`), one that would not open is a broken environment
+        // (`skipped_unreadable`), and a caller reads them differently.
+        let lines = match open_jsonl(file, budget) {
+            Ok(lines) => lines,
+            Err(SkipReason::TooLarge) => {
+                sink.skip_oversize();
+                continue;
+            }
+            Err(SkipReason::Unreadable) => {
+                sink.skip_unreadable(1);
+                continue;
+            }
         };
         let fallback_session = file_stem(file);
         for line in lines {

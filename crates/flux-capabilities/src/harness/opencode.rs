@@ -25,7 +25,9 @@ use super::{HarnessKind, MessageSink, MessageStats};
 
 /// Extract every message from an opencode database.
 ///
-/// The database is opened **read-only**; only failing to open it is an error.
+/// The database is opened **read-only**. A bad row, an unexpected schema and an over-budget body are
+/// all skipped and counted; the only errors are the database itself failing — failing to open, or a
+/// row step that fails mid-walk and so leaves the scan truncated rather than complete.
 pub fn opencode_messages(
     db: &Path,
     budget: ScanBudget,
@@ -58,11 +60,13 @@ pub fn opencode_messages(
         let row = match rows.next() {
             Ok(Some(row)) => row,
             Ok(None) => break,
-            Err(_) => {
-                // A row that will not decode is one skipped record, not a failed scan.
-                sink.skip_malformed();
-                break;
-            }
+            // A failed step is the *database* failing, not one record being unreadable: there is no
+            // next row to advance to, so counting a skip and breaking would report a complete scan
+            // of a transcript that was in fact cut off — the one failure mode a caller cannot see
+            // in `MessageStats`. `flux usage` propagates the same failure (`usage.rs`'s
+            // `while let Some(row) = query.next()?`), and this is the only thing here that is not a
+            // skip.
+            Err(e) => return Err(flux_core::Error::Other(e.to_string())),
         };
         let Ok(id) = row.get::<_, String>(0) else {
             sink.skip_malformed();
@@ -116,13 +120,20 @@ pub fn opencode_messages(
                 continue;
             }
             if let Some(part) = part {
+                // The ceiling is charged the *retained part, whole* — not the text it happens to
+                // expose under a `text` key. opencode's dominant part shape is a `tool` part whose
+                // output sits under `state`, which costs every byte of the memory this accumulator
+                // exists to bound while contributing nothing to a text-keyed one; the flattened
+                // body of such a message is only `[tool_use: …]` markers, so it stays small while
+                // the assembled parts grow. Charging the part's own JSON is also what bounds their
+                // *number*: the query caps one part, and nothing caps how many arrive.
+                let part_bytes = part.len();
                 match serde_json::from_str::<Value>(&part) {
                     Ok(part) => {
                         if is_structural(&part) {
                             continue;
                         }
-                        pending.bytes +=
-                            part.get("text").and_then(Value::as_str).map_or(0, str::len);
+                        pending.bytes += part_bytes;
                         if pending.bytes > budget.max_message_bytes {
                             pending.oversize = true;
                             pending.parts.clear();
@@ -167,6 +178,9 @@ struct Pending {
     created: Option<i64>,
     data: Value,
     parts: Vec<Value>,
+    /// Bytes of part JSON retained in `parts`, which is what [`ScanBudget::max_message_bytes`]
+    /// bounds here: the assembled message *is* the memory, and it is not the same quantity as the
+    /// flattened body a text-keyed count would see.
     bytes: usize,
     oversize: bool,
     poisoned: bool,

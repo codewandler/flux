@@ -20,7 +20,7 @@ use flux_core::Result;
 use serde_json::Value;
 
 use super::message::{file_stem, flatten_content, json_epoch_ms_at, HarnessMessage, MessageRole};
-use super::scan::{jsonl_files, open_jsonl, JsonlLine, ScanBudget};
+use super::scan::{jsonl_files, open_jsonl, JsonlLine, ScanBudget, SkipReason};
 use super::{HarnessKind, MessageSink, MessageStats};
 
 /// Extract every message under a codex `sessions` root.
@@ -39,9 +39,18 @@ pub fn codex_messages(
 
     for file in scan.files() {
         sink.scanned();
-        let Ok(lines) = open_jsonl(file, budget) else {
-            sink.skip_unreadable(1);
-            continue;
+        // Over the file cap is a budget decision, unopenable is a broken environment — see the same
+        // split in `claude.rs`. Folding them together loses the distinction `MessageStats` draws.
+        let lines = match open_jsonl(file, budget) {
+            Ok(lines) => lines,
+            Err(SkipReason::TooLarge) => {
+                sink.skip_oversize();
+                continue;
+            }
+            Err(SkipReason::Unreadable) => {
+                sink.skip_unreadable(1);
+                continue;
+            }
         };
         // A rollout is one session, but the id and workspace only arrive with `session_meta`, and
         // the model can change mid-file — so these are per-file state, folded forward as it reads.

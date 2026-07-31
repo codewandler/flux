@@ -291,6 +291,91 @@ fn opencode_messages_come_back_whole_including_multi_part_bodies() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A database whose parts keep their payload somewhere other than `text` — opencode's own dominant
+/// shape, where a `tool` part carries its output inside `state`.
+///
+/// `m-1` is the pathological message: eight parts, each individually *under* the per-part cap the
+/// query applies, together far over the per-message ceiling. `m-2` is an ordinary small message that
+/// must still come back, because one over-budget message may not cost the rest of the history.
+fn seed_opencode_fat_tool_parts(db: &Path, parts: usize, payload: usize) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch(
+        "create table message (id text primary key, session_id text, time_created integer,
+                               data text not null);
+         create table part (id text primary key, message_id text, time_created integer,
+                            data text not null);",
+    )
+    .unwrap();
+    for (id, ts, data) in [
+        (
+            "m-1",
+            1_767_323_045_000i64,
+            r#"{"role":"assistant","modelID":"claude-sonnet-4"}"#,
+        ),
+        ("m-2", 1_767_323_047_000, r#"{"role":"user"}"#),
+    ] {
+        conn.execute(
+            "insert into message values (?1, 'o-1', ?2, ?3)",
+            rusqlite::params![id, ts, data],
+        )
+        .unwrap();
+    }
+    for i in 0..parts {
+        // The payload lives under `state`, so nothing about this part's size is visible in `text`.
+        let data = format!(
+            r#"{{"type":"tool","tool":"bash","state":{{"output":"{}"}}}}"#,
+            "x".repeat(payload)
+        );
+        conn.execute(
+            "insert into part values (?1, 'm-1', ?2, ?3)",
+            rusqlite::params![format!("p-1-{i:03}"), i as i64, data],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        r#"insert into part values ('p-2-000', 'm-2', 0, '{"type":"text","text":"and this one is small"}')"#,
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_opencode_message_is_bounded_by_the_body_ceiling_however_its_parts_carry_their_payload() {
+    let root = scratch("opencode-fat-parts");
+    let db = root.join("opencode.db");
+    // Eight parts of ~450 bytes: each one is under the 512-byte ceiling, so the per-part cap the
+    // query applies never fires, and their sum is seven times over it. The assembled body is what
+    // has to be bounded — the flattened *text* is only eight `[tool_use: bash]` markers, so a
+    // ceiling that watches the text alone reports a small message and holds a large one.
+    seed_opencode_fat_tool_parts(&db, 8, 400);
+
+    let budget = ScanBudget {
+        max_message_bytes: 512,
+        ..ScanBudget::for_messages()
+    };
+    let mut stats = None;
+    let msgs = collect(|emit| stats = Some(opencode_messages(&db, budget, emit).unwrap()));
+    let stats = stats.unwrap();
+
+    assert_eq!(
+        stats.skipped_oversize, 1,
+        "the message whose parts overflow the ceiling is skipped and counted: {stats:?}"
+    );
+    assert_eq!(
+        msgs.len(),
+        1,
+        "only the small message survives, and it does survive: {msgs:#?}"
+    );
+    assert_eq!(msgs[0].text, "and this one is small");
+    assert_eq!(stats.emitted, 1, "{stats:?}");
+    assert!(
+        stats.body_bytes < 512,
+        "no body over the ceiling was accounted: {stats:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The budget — the part the inherited file/count caps do not cover
 // ---------------------------------------------------------------------------------------------
@@ -319,7 +404,7 @@ fn one_enormous_message_is_skipped_and_counted_rather_than_extracted() {
     let msgs = collect(|emit| stats = Some(claude_messages(&root, budget, emit).unwrap()));
     let stats = stats.unwrap();
 
-    assert_eq!(msgs.len(), 1, "the oversized body never materialized");
+    assert_eq!(msgs.len(), 1, "only the message under the cap is emitted");
     assert_eq!(msgs[0].text, "small");
     assert_eq!(stats.skipped_oversize, 1, "{stats:?}");
     assert!(
@@ -395,7 +480,7 @@ fn the_total_extracted_bytes_ceiling_stops_the_scan_and_reports_it() {
 }
 
 #[test]
-fn a_file_over_the_file_budget_is_skipped_and_counted() {
+fn a_file_over_the_file_budget_is_counted_as_oversize_not_as_unreadable() {
     let root = scratch("huge-file");
     let project = root.join("p");
     fs::create_dir_all(&project).unwrap();
@@ -410,16 +495,30 @@ fn a_file_over_the_file_budget_is_skipped_and_counted() {
         max_file_bytes: 4,
         ..ScanBudget::for_messages()
     };
-    let mut stats = None;
-    let msgs = collect(|emit| stats = Some(claude_messages(&root, budget, emit).unwrap()));
-    let stats = stats.unwrap();
+    // Asserted per bucket rather than on the sum: the two reasons mean different things to a caller
+    // — "this file is bigger than I will read" is a budget decision, "I could not open this file" is
+    // a broken environment — and a sum cannot tell them apart. Both JSONL adapters answer for it.
+    for harness in ["claude-code", "codex"] {
+        let mut stats = None;
+        let msgs = collect(|emit| {
+            let scanned = match harness {
+                "codex" => codex_messages(&root, budget, emit),
+                _ => claude_messages(&root, budget, emit),
+            };
+            stats = Some(scanned.unwrap());
+        });
+        let stats = stats.unwrap();
 
-    assert!(msgs.is_empty());
-    assert_eq!(
-        stats.skipped_unreadable + stats.skipped_oversize,
-        1,
-        "{stats:?}"
-    );
+        assert!(msgs.is_empty(), "{harness}: {msgs:#?}");
+        assert_eq!(
+            stats.skipped_oversize, 1,
+            "{harness}: a file over the file cap is oversize: {stats:?}"
+        );
+        assert_eq!(
+            stats.skipped_unreadable, 0,
+            "{harness}: and it was perfectly readable: {stats:?}"
+        );
+    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -468,8 +567,10 @@ fn index_addresses_the_same_message_on_a_re_scan_and_survives_an_append() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// An unreadable root propagates; everything *below* a readable root degrades to a counted skip. The
+/// other propagating case is a database that fails mid-walk — see the row-step test below.
 #[test]
-fn an_unreadable_root_is_the_only_failure_that_propagates() {
+fn an_unreadable_root_propagates_where_everything_below_it_would_be_skipped() {
     let root = scratch("absent");
     let missing = root.join("nope");
     let mut sink = |_: HarnessMessage| {};
@@ -481,6 +582,57 @@ fn an_unreadable_root_is_the_only_failure_that_propagates() {
         &mut sink
     )
     .is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_opencode_row_step_failure_is_reported_rather_than_truncating_the_scan_silently() {
+    let root = scratch("corrupt-db");
+    let db = root.join("opencode.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "create table message (id text primary key, session_id text, time_created integer,
+                               data text not null);
+         create table part (id text primary key, message_id text, time_created integer,
+                            data text not null);",
+    )
+    .unwrap();
+    // Enough rows that the `message` b-tree spans well past the pages left intact below.
+    for i in 0..600 {
+        conn.execute(
+            "insert into message values (?1, 'o-1', ?2, ?3)",
+            rusqlite::params![
+                format!("m-{i:04}"),
+                i as i64,
+                format!(r#"{{"role":"user","filler":"{}"}}"#, "z".repeat(700))
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    // Zero every page after the schema, leaving a database that opens and probes cleanly and then
+    // fails *mid-walk*. This is the case a caller cannot otherwise see: rows stop arriving, and a
+    // scan that read a tenth of the history is indistinguishable from one that read all of it.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new().write(true).open(&db).unwrap();
+        let len = file.metadata().unwrap().len();
+        let keep = 4096 * 3;
+        assert!(len > keep, "fixture must span more than the kept pages");
+        file.seek(SeekFrom::Start(keep)).unwrap();
+        file.write_all(&vec![0u8; (len - keep) as usize]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let mut sink = |_: HarnessMessage| {};
+    let scanned = opencode_messages(&db, ScanBudget::for_messages(), &mut sink);
+    assert!(
+        scanned.is_err(),
+        "a database that stops yielding rows is a failed scan, not a short one: {:?}",
+        scanned.map(|s| format!("{s:?}"))
+    );
+
     let _ = fs::remove_dir_all(root);
 }
 

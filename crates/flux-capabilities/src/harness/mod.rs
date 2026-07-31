@@ -12,7 +12,9 @@
 //! - **Read-only, always.** No adapter may write another harness's state — [`open_sqlite_read_only`]
 //!   is the only database entry point here, and it passes `SQLITE_OPEN_READ_ONLY`.
 //! - **The scan budget degrades, it does not fail.** Over-budget input is skipped *and counted*
-//!   (see [`ScanBudget`]); only an unreadable root propagates as an error.
+//!   (see [`ScanBudget`]); the state itself failing is what propagates as an error — an unreadable
+//!   root, or a database that stops yielding rows mid-walk and would otherwise leave a truncated
+//!   scan indistinguishable from a complete one.
 //! - **Messages stream.** Message extraction never returns a collection: a message record carries
 //!   full text where a usage record carries eight integers, so materializing a multi-year history
 //!   is not a thing this layer is allowed to do. Adapters push into a [`MessageSink`].
