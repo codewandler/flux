@@ -6,6 +6,201 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A plugin's catalog can be re-projected without restarting flux, and a refresh can only ever
+  narrow authority** (C-310). `flux plugin refresh <name>` re-fetches a plugin's manifest and
+  re-projects its operations into the registry, re-running every load-time check. Any *widening* of
+  the granted capabilities is refused outright.
+
+  **The refusal rule is literal on purpose**: a refreshed capability entry must appear verbatim in
+  the list granted at install. A permissive check there is a privilege escalation; a strict one is a
+  refusal that a reinstall resolves, and "must already be in the list" cannot drift as grant grammars
+  gain wildcards.
+
+  Two authority bugs were found by review and fixed at the root rather than at the symptom. First, a
+  capability **surrender**: a refreshed manifest that simply *dropped* a declaration stripped the
+  op's `access` and `AuthorityRequirement`s while the pinned host capabilities still enforced the
+  original grant — so the projection and the enforcement disagreed, in the direction that under-
+  declares. `pin_granted_authority` now pins `capabilities`, `auth`, `endpoints` and `config`, and
+  adopts only `operations`. Second, `ToolRegistry::remove` was name-keyed and **source-blind**, so a
+  refresh could evict another pack's identically-named operation — a privilege swap by collision.
+  Removal is now scoped by source, and a foreign-owned name collides and refuses the whole refresh
+  with the registry left untouched (clone-then-swap, so it fails closed in both directions).
+
+  **A running session does not yet see the result** — `Executor` owns its `ToolRegistry` by value,
+  and `execution.rs` cites A-95 prompt-cache stability as the reason the surfaced tool set must not
+  churn mid-turn. Wiring the refresh into a live session is C-318; this story delivers the mechanism
+  and the operator surface.
+
+- **`build_channels` gains a `connector` arm — a manifest binding, with every rule a load error**
+  (D-216). A channel of kind `connector` resolves
+  `~/.flux/connectors/<connector>.connector.toml` through `flux_system::System`, loads the named
+  binding, and refuses everything refusable **before a port is bound**. That ordering is the story:
+  a connector manifest is a published artifact, and a published artifact can be edited after
+  publication, so every rule it carries is re-enforced here rather than trusted.
+
+  Twenty-odd refusals, each with its own test and each naming the channel: an uninstalled connector,
+  an unknown binding (naming what does exist), poll/socket/unknown transports, an unverified webhook
+  binding, an unknown verification kind, a credential the binding names with no entry, a timestamped
+  signature without tolerance, a body-sourced timestamp, a signed template without `{body}` or with
+  an unknown placeholder, a reply binding an undeclared symbol or an unpublished operation, a payload
+  path failing the grammar, a delivery id colliding with a payload symbol, an undeclared event, a
+  selector naming an unparseable header, and a manifest for the wrong connector or service.
+
+  Two of those closed **silent** failures found in the recovered implementation, both of which read
+  as working: an event narrowed by a `when` condition loaded and then no-opped on every delivery,
+  because the discriminator carries the coarse value that narrowing removes from the closed event
+  set; and a header name that is not a parseable HTTP header resolved to nothing on every delivery —
+  a discriminator that never fires, or a signature check that **fails open**.
+
+  `hmac` bindings and `when`-narrowed events are hard load errors naming the stories that would lift
+  them (C-291/C-292 and D-222), placed after every structural check so a defective spec still reports
+  its own defect. Nothing degrades silently to unverified. In practice the arm today serves
+  `verification.kind = "none"` webhooks only.
+
+  An **empty bearer token is refused at load**, on loopback binds too. `token ""` — or
+  `token secret "K"` where `K` is exported empty, since secret resolution goes through
+  `std::env::var`, which does not filter an empty value — would otherwise reach the handler as
+  `Some("")`, and a constant-time compare of two empty byte strings is `true`, so every anonymous
+  request would have authenticated. The comparison refuses an empty expected token independently, so
+  neither half depends on the other being right. **The identical hole is pre-existing in the webhook
+  adapter and is tracked as C-317, not fixed here.**
+
+- **`http.request` accepts a structured `query` map, and percent-encodes every value per RFC 3986**
+  (C-303). Authored Flux could previously only build a query by interpolating into the URL string,
+  and nothing encoded the result — so a model-supplied value carrying `&` or `=` rewrote the request
+  into parameters the author never wrote. The map is resolved and appended *before*
+  `guard_url_scoped_pinned`, so the egress guard, the pinning and the redirect re-guard all observe
+  the wire URL; there is no second, unguarded URL. A `null` value is omitted (an unsupplied optional
+  field), `false` and `0` are sent, and a duplicate key is an error rather than a silent last-wins.
+  `permission_subjects` and the `NetworkFetch` intent report the encoded URL.
+
+  A `$secret` placed in a query routes through the same C-76 allowlist as one placed in a header,
+  and **both** its raw and percent-encoded spellings are seeded into the redactor — a token that only
+  ever appears on the wire as `sk-live%2F99` would otherwise survive redaction.
+
+  The encoder is now shared (`flux_core::urlencode`), with `flux-credentials` and `flux-providers`
+  converted onto it. It emits upper-case hex because SigV4 requires it, and it is deliberately
+  distinct from the form encoder: a space is `%20`, never `+`. One private copy remains in
+  `flux-plugin` and the design doc's claim to the contrary is tracked by C-313.
+
+### Changed
+
+- **⚠ BREAKING: `http.request` returns a `{status, headers, body}` record instead of one flat
+  string** (C-304). Every caller could previously reach a response only as
+  `HTTP <status>\n<headers>\n<body>`, so selecting `.data.id` got nothing — and got it *silently*,
+  which is the worst version of this failure. A flow can now select a field from the response.
+
+  **The body is carried as canonical JSON in `content` with a human-readable `view` beside it**, the
+  precedent C-10 established; `ToolResult` was **not** widened. The split already does this job —
+  `execute_call` binds `content` into scope so `$resp.body.data.id` resolves, while the sink and the
+  model are shown `view`. Keeping `view` byte-identical to the old rendering is what makes the
+  human-facing regression zero: the model's experience of this op did not move.
+
+  `body` is parsed only when it is a JSON object or array, and is raw text otherwise — the
+  interpreter's own rule (`jq_parse_input`), not a `content-type` sniff, because plenty of APIs
+  answer JSON under `text/plain`. An HTML error page, an empty body, a truncated payload and a bare
+  JSON scalar all take the text arm, so the record always survives with its status and headers
+  intact. A `404` stays a *result*, not an error.
+
+  **Redaction moved into the op and now runs after the parse**, over decoded leaves and keys. The
+  dispatcher's redaction of `content` is no longer sufficient alone: by then a registered secret
+  containing `"`, `\` or a newline is JSON-escaped, so a literal match misses it — and the pattern
+  redactor, whose token boundaries include `"`, can rewrite JSON text into something that no longer
+  parses. Proven by a test whose token carries both a quote and a backslash on purpose.
+
+  This replaces the string return rather than keeping it alongside the record, so it is breaking for
+  `codewandler-flux-web`. **A header name containing `-` — i.e. most of them — is not reachable
+  through the `$resp.headers.content-type` sugar**; the working idiom is
+  `pick({items: $resp.headers, keys: ["content-type"]})`, documented in the op's `output_schema` and
+  both catalog files. Making the sugar reach a quoted key is a flux-lang change, tracked as C-320.
+
+- **The harness-history containment is now proven over the shapes transcripts actually take, not
+  only the happy path** (C-216). A corpus of six shapes across three harnesses — multi-part content
+  arrays with a credential in the *last* block, `tool_result` bodies carrying `env` output, base64
+  and PEM blobs, heredoc'd `.env` files, and prompt-injection-shaped text with three
+  `</knowledge-base>` breakout spellings — asserts four distinct properties per case: redacted,
+  escaped, dropped, and **deliberately preserved**. That last one is the anti-censorship guard: a
+  redactor that simply censored everything would fail this corpus.
+
+  The failing-first proof mutates the **shipped** redactor rather than a mirror — emptying
+  `SECRET_PREFIXES` reds three tests — and the mirrored seam the corpus needs is itself pinned two
+  ways against the real ingest path, so it cannot drift into a straw man. The opt-out audit covers
+  nine discovery branches against booby-trapped roots, so a pass is a positive filesystem
+  observation rather than an absence of error, and it fails if a fifth `HarnessEnv` key is added
+  without extending the matrix.
+
+  **No production code changed: the containment held.** What the corpus did surface is what it does
+  *not* catch — six credential shapes, now measured and recorded in both directions in
+  `docs/designs/harness-history.md`, tracked as C-315. The two sharp ones are Stripe's `sk_live_`
+  (the prefix list carries `sk-`, with a hyphen) and PEM private-key bodies (unprefixed base64), and
+  they co-occur precisely where an agent writes production config. It also found that ingest's
+  envelope retention is bounded by the *harness schema* rather than by the code — C-215's memory
+  class again — tracked as C-316.
+
+### Fixed
+
+- **⚠ Security: an empty bearer token on a webhook channel authenticated every request, including
+  one carrying no `Authorization` header at all** (C-317). `constant_time_eq(b"", b"")` is true, and
+  the only guard tested `is_none()` — so `token secret "K"` with `K` exported empty produced a
+  channel the operator believed was authenticated and which in fact admitted anyone. This is the
+  same hole D-216 closed in the connector adapter, found by grepping every `constant_time_eq` call
+  site rather than by waiting for it to recur.
+
+  **Refused in two independent places**, mirroring the connector arm so the two adapters cannot
+  drift: at `from_decl` as a load error — **including on a loopback bind**, because normalising to
+  "no token" is silent there and leaves the operator one `addr` edit away from a public port — and
+  inside `authorized()`, which returns false on an empty expected token *before* comparing.
+  Whitespace-only tokens count as empty (`trim().is_empty()`).
+
+  Each half is observed by its own test, and attribution probes confirm neither carries the other:
+  disabling only the comparison guard reds the request test while the bind tests stay green, and
+  disabling only the load-time refusal does the reverse.
+
+  **Behavioural break at load:** a webhook channel currently configured with an empty or
+  whitespace-only token now fails to start where it previously ran. That is the intended refusal —
+  it was an open port — but it is a hard failure at startup, not a warning.
+
+- **`flux app run` ignored the operator's `[limits]` table, and its review sub-agents ran with no
+  ceiling at all** (C-307). C-299 wired `[limits]` through `build_agent_with`, which covers
+  `run`/`plan`/`tui`/`serve`, but `flux app run` assembled its own `ExecutionEnvironment` and never
+  called `with_resource_limits`; `build_review_sub_agents` returned a bare `SubAgents::new`, whose
+  default is unbounded — so `flux app run strict-review`'s reviewer children were uncapped. Both now
+  route through one shared seam that takes `resource_limits` as a **required** parameter, which is
+  the fail-closed shape: a future surface cannot forget it by omission. `flux review` and
+  `flux record` are wired too.
+
+  `flux test`'s offline client is deliberately **exempt**, and the reasoning is recorded on the
+  function rather than here: a replay's whole value is that its verdict depends only on the fixture,
+  and reading the local `[limits]` table would let one machine's config decide it — a saturated
+  `max_concurrent_tool_calls` refuses a queued call with a tool error, which is a fixture mismatch on
+  one developer's box and green on another. A replay drives recorded traffic against a never-called
+  provider, so there is no runaway workload to cap.
+
+  Ceilings remain **per-child**, not a shared pool; the shared-ceiling shape was built first during
+  C-299 and reproduced a real deadlock. Two of the newly wired surfaces are not yet observed by any
+  test — tracked as C-314.
+
+- **A plugin operation that declared no effects could not be loaded at all** unless its plugin also
+  declared a `process` capability (C-309). The projection derived a tool's `access` purely from the
+  manifest's capabilities while defaulting an effect-less operation to `[Process, Network]`, and the
+  authority contract refuses any tool declaring an effect it holds no matching access for — so the two
+  composed into an unsatisfiable requirement. `AccessKind::Process` is now unconditional for every
+  plugin op, which is the honest reading: dispatching one is an interaction with an already-spawned
+  subprocess of arbitrary operator-installed code, whereas `capabilities.process` describes only the
+  *further* programs a plugin may shell out to. Effect-less plugin ops are consequently gated on
+  `process.exec` rather than being unloadable. No shipped plugin loses a gate.
+
+  The fix is deliberately on the access side and not the effects side: authority requirements derive
+  from `access`, not `effects`, so relaxing the effects default would have projected operations
+  carrying no requirement at all — skipping the authorization floor instead of satisfying it.
+
+- **`codewandler-flux-sdk`'s `plugins` feature is compiled and run by CI again.** It was quarantined
+  as `skip` in the feature-gate ledger because the defect above made both of its tests red on `main`
+  while `cargo test --workspace` stayed green. The ledger's remaining `skip` entries are now cost-based
+  rather than defect-based.
+
 ## [0.42.1] - 2026-07-31
 
 ### Fixed

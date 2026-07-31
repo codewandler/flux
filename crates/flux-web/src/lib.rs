@@ -6,7 +6,7 @@
 //!
 //! | Tier | Op(s) | The model sees |
 //! |------|-------|----------------|
-//! | 1 — request | [`http`]`::http.request` | status + headers + capped body (bytes) |
+//! | 1 — request | [`http`]`::http.request` | the record `{status, headers, body}` (C-304) |
 //! | 2 — read    | `web.fetch` (D-120) | readable content as condensed markdown |
 //! | 3 — browse  | `browser.*` (D-121…D-124) | an interface digest + deltas after actions |
 //!

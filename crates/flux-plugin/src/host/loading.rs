@@ -353,15 +353,6 @@ pub(super) fn plugin_tool_spec(
     op: &OperationSpec,
     capabilities: &PluginCapabilities,
 ) -> (String, ToolSpec) {
-    // Project the operation's declared effects so the authorization floor gates it like any
-    // built-in tool. An operation that declares none could still touch the network or run a
-    // process via host capabilities, so default to those — under the default grants that forces
-    // approval rather than letting the op slip the envelope.
-    let effects = if op.effects.is_empty() {
-        vec![Effect::Process, Effect::Network]
-    } else {
-        op.effects.clone()
-    };
     // The model-facing tool name is the operation's fully-qualified name. flux plugin ops are
     // authored already qualified (e.g. `slack.message.send`), and the plugin's own dispatch,
     // `flux plugin call`, and the generated skill docs all use that name — so adopt it verbatim when
@@ -370,15 +361,26 @@ pub(super) fn plugin_tool_spec(
     // an agent's `tools` grant — `slack.message.send` — never matched and every plugin op was
     // silently dropped from the agent surface.)
     let qualified = op.projected_name(plugin);
-    let mut access = Vec::new();
+    // C-309: every plugin op dispatches to a subprocess, so `Process` access is unconditional —
+    // it is not conditioned on `capabilities.process`, which is a narrower thing (the *further*
+    // programs the plugin may shell out to via the host callback). A plugin binary is arbitrary
+    // code the operator installed; invoking one of its ops is a process interaction whether or not
+    // it asked flux to run anything on its behalf.
+    //
+    // Without this the two safety mechanisms were mutually unsatisfiable. `flux-runtime`'s
+    // authority contract refuses any tool declaring an effect it holds no matching access for,
+    // while the effect-less default below declares `[Process, Network]` — so every effect-less op
+    // of a plugin without a `process` capability was **impossible to load**, which is how
+    // `flux-sdk`'s fixture plugin sat red behind a feature no gate compiled. Fixing it on the
+    // effects side instead would have been worse than the bug: authority requirements derive from
+    // `access`, not `effects` (`authority_requirements_from_declaration`), so an op projected with
+    // neither would carry NO requirement at all and skip the authorization floor entirely.
+    let mut access = vec![AccessKind::Process];
     if capabilities.http {
         access.push(AccessKind::Network);
     }
     if !capabilities.conn.is_empty() {
         access.push(AccessKind::Connection);
-    }
-    if !capabilities.process.is_empty() {
-        access.push(AccessKind::Process);
     }
     if !capabilities.secrets.is_empty() || !op.secret_purposes.is_empty() {
         access.push(AccessKind::Secret);
@@ -390,6 +392,15 @@ pub(super) fn plugin_tool_spec(
     {
         access.push(AccessKind::LocalSystem);
     }
+    // Project the operation's declared effects so the authorization floor gates it like any
+    // built-in tool. An operation that declares none could still touch the network or run a
+    // process via host capabilities, so default to those — under the default grants that forces
+    // approval rather than letting the op slip the envelope.
+    let effects = if op.effects.is_empty() {
+        vec![Effect::Process, Effect::Network]
+    } else {
+        op.effects.clone()
+    };
     let spec = ToolSpec {
         name: qualified,
         description: op.description.clone(),

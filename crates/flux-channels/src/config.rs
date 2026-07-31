@@ -1,6 +1,8 @@
 //! Per-kind channel settings, deserialized from a [`ChannelDecl`](flux_lang::program::ChannelDecl)'s
 //! free-form `settings` JSON bag.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 /// `kind = "schedule" | "cron"` settings. Exactly one of `schedule` / `on` must be set.
@@ -33,6 +35,52 @@ pub struct WebhookSettings {
 
 fn default_path() -> String {
     "/".to_string()
+}
+
+/// `kind = "connector"` settings — the operator's half of a channel binding (D-216).
+///
+/// The division of labour is the whole design: the **manifest** carries the semantics (which events,
+/// how a delivery is verified, which fields map to which flow symbols, which operation replies) and
+/// this struct carries everything a published artifact must never know — where flux listens, and
+/// which of *this* deployment's secrets back the credentials the binding names by name.
+///
+/// Deliberately **not** `deny_unknown_fields`: the same bag also carries the future `allow { … }`
+/// block (D-219), and a program written for a later flux must not fail to parse on an older one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectorSettings {
+    /// The connector id — selects the manifest. **Validated against a name grammar before it is
+    /// joined onto the connectors directory**; see `adapters::connector::validate_name`.
+    pub connector: String,
+    /// The `[[channels]]` binding name within that manifest.
+    pub binding: String,
+    /// The connector service, when the connector publishes more than one. Absent selects the
+    /// reserved default service, which the producing repository elides from the manifest.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// An explicit manifest path, overriding `~/.flux/connectors/<connector>.connector.toml`.
+    /// Operator input, never manifest-derived — no field read *out of* a manifest may influence a
+    /// path.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// Credential name (as the binding spells it, e.g. `slack.signing_secret`) → this deployment's
+    /// value. Host-resolved before this struct deserializes, so write
+    /// `credentials { "slack.signing_secret": secret "SLACK_SIGNING_SECRET" }` in the program — a
+    /// record separates key from value with `:`, the same grammar `{ "a": 1 }` takes anywhere else.
+    #[serde(default)]
+    pub credentials: BTreeMap<String, String>,
+
+    // ── the `webhook` transport's own settings ──
+    /// Address to bind, e.g. `"0.0.0.0:8790"`. Required for a `webhook`-transport binding.
+    #[serde(default)]
+    pub addr: Option<String>,
+    /// The POST path, e.g. `"/slack/events"`.
+    #[serde(default = "default_path")]
+    pub path: String,
+    /// Optional bearer token, host-resolved like every other credential here. Required for a
+    /// non-loopback `addr` on a binding whose verification is `none` — see
+    /// [`ConnectorChannel::from_decl`](crate::ConnectorChannel::from_decl).
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// `kind = "a2a"` settings — expose a program agent over the HTTP/A2A API (sessions + SSE + A2A +

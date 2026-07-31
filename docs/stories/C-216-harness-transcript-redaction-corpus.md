@@ -2,7 +2,7 @@
 id: C-216
 title: "Prove the containment — a redaction corpus over real transcript shapes, and an opt-out audit"
 pillar: Core
-status: ready
+status: done
 priority: 13
 epic: harness-history
 design: docs/designs/harness-history.md
@@ -22,26 +22,40 @@ of years of conversation it under-matches in ways worth measuring before the fea
 after.
 
 ## Acceptance
-- [ ] A transcript **corpus fixture** covering the shapes these logs really take, per harness: a
+- [x] A transcript **corpus fixture** covering the shapes these logs really take, per harness: a
       multi-part content array, a `tool_result` carrying command output, a base64 blob, an env-dump
       paste, a heredoc'd config, and a message whose text is itself instruction-shaped. Committed as
       fixtures, never as real user data.
-- [ ] Each corpus case asserts the specific containment property it targets — redacted, escaped, or
+- [x] Each corpus case asserts the specific containment property it targets — redacted, escaped, or
       both — so a regression names which property broke rather than just failing.
-- [ ] **The under-match is measured and written down**, not assumed away: state in the design doc
+- [x] **The under-match is measured and written down**, not assumed away: state in the design doc
       which credential shapes the redactor does *not* catch in this corpus, and what the operator's
       recourse is (`add_secret` registration, or leaving the datasource off). A known, documented gap
       is a decision; an unmeasured one is a claim.
-- [ ] **The opt-out audit**: a test that walks every candidate root for all four harnesses with the
+- [x] **The opt-out audit**: a test that walks every candidate root for all four harnesses with the
       datasource disabled and asserts not one is opened — extending C-215's single-path check to
       every discovery branch, including the env-override paths, since those are the ones a test that
       only sets `HOME` never reaches.
-- [ ] Re-scan idempotence: ingesting the corpus twice produces the same record set with the same ids,
+- [x] Re-scan idempotence: ingesting the corpus twice produces the same record set with the same ids,
       so the index does not silently accumulate duplicates as sessions grow.
-- [ ] Standard gate green in both workspaces.
+- [x] Standard gate green in both workspaces.
 
 ## Progress
 - 2026-07-29 — filed with the epic. Depends on C-215; do not start before it lands.
+- 2026-07-31 — implemented. `crates/flux-capabilities/tests/harness_redaction_corpus.rs` (14 tests):
+  six shapes × three harnesses, each payload written in that harness's own block spelling as its
+  adapter parses it. The corpus is proved to have teeth before it is trusted —
+  `the_corpus_fails_against_a_weakened_redactor` runs the same expectations against three weakenings
+  of `flux-secret`, and `the_weakening_model_is_faithful_before_it_is_weakened` pins the un-weakened
+  model against the shipped redactor so the mutation is not a straw man. The opt-out audit walks all
+  nine `state_path` branches (4 harnesses × {`$OVERRIDE`, `HOME`} + unresolved) against
+  **booby-trapped roots**, so "opened nothing" is an observation about the filesystem rather than
+  about bookkeeping. The measured under-match and three findings the corpus surfaced but did not fix
+  are in `docs/designs/harness-history.md`.
+- **Findings, not fixed here** (all recorded in the design doc): only claude-code surfaces tool
+  output; no adapter surfaces a tool call's *input*; session-envelope retention is bounded by the
+  harness schema rather than by ingest; `meta`'s string values are redacted but not escaped (latent —
+  nothing model-visible renders them today).
 
 ## Notes
 - Seams: the redactor is `flux-secret` (`add_secret`, the prefix list, the 6-character floor); the

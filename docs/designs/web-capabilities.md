@@ -24,7 +24,7 @@ three deliberately separate surfaces, not one op with modes:
 
 | Tier | Capability | The model sees |
 |---|---|---|
-| **1 — request** | `http.request` — raw protocol access, any method/headers/body | status + headers + capped body (bytes) |
+| **1 — request** | `http.request` — raw protocol access, any method/headers/body | the record `{status, headers, body}` (body parsed when JSON, capped) |
 | **2 — read** | `web.fetch` — fetch a page as a *document* | readable content as **condensed markdown**, never markup |
 | **3 — browse** | `browser.*` — operate a page as an *application* | an **interface digest**: condensed content + a resolved **action space** (stable element refs), deltas after actions |
 
@@ -93,6 +93,44 @@ A native op in `flux-web::http`: method, URL, headers, body, timeout → status,
 `endpoint.discover`). Honest metadata: `Effect::Network`, `NetworkFetch` intent, non-flat risk —
 plan approval sees it (D-91 lesson). Ungated (`group: None`, always advertised) — it's one op, and
 it's table-stakes.
+
+**The query is structured, not interpolated (C-303).** A `query` record of scalars is
+percent-encoded per RFC 3986 and appended, because the only alternative — formatting values into
+the URL with `fmt` — escapes nothing, so a value carrying `&` or `=` adds a parameter the author
+never wrote. This is the query half of the gap [L-101](../stories/L-101-form-urlencoded-body.md)
+closed for bodies, and it shares L-101's scalar rules (`null` omitted, `false`/`0` sent, nested
+refused). The encoder is `flux_core::percent_encode_component` — one encoder for the whole tree,
+since a percent-encoder that gets copied drifts on exactly the byte an attacker supplies.
+`permission_subjects` and the `NetworkFetch` intent report the *encoded* URL, minus any
+query-placed credential: they cannot fail, so they cannot consult a redactor.
+
+**The result is a record, not a flat string (C-304).** `http.request` returns
+`{status, headers, body}` under a declared `output_schema`, so an authored flow or a connector
+operation selects `$resp.body.data.id` instead of receiving one opaque blob — the failure it
+replaces was silent, which is the worst version available.
+
+- **How it travels.** `ToolResult.content` is a `String`, so the record is **canonical JSON in
+  `content` with the old rendered `HTTP <status>` block as the human-facing `view`** — the C-10
+  precedent. Widening `ToolResult` itself was the alternative and is strictly wider than this seam
+  needs: the split already exists, every other structured op uses it, and the interpreter binds
+  `content` while the sink and the model are shown `view`, which is exactly the division wanted
+  here. Because the model keeps seeing `view`, the human-facing rendering does not move at all.
+- **`body` is parsed only when it is a JSON object or array**, and is the raw text otherwise. That
+  is the interpreter's own rule (`jq_parse_input`), not a `content-type` sniff — plenty of APIs
+  answer JSON under `text/plain`, so the declared type is not the fact. An HTML error page, an
+  empty body and a truncated payload all fall through to the text arm, so the record survives with
+  its status and headers intact: a `404` is a result, matching the stream-resilience posture that
+  unparseable bytes are counted, never fatal.
+- **Redaction moves inside the op, and runs after the parse.** Response header values are redacted
+  as raw text, and a parsed body is redacted over its decoded leaves and keys. The dispatcher's
+  redaction of `content` still applies but is no longer sufficient on its own: by then a secret
+  containing `"`, `\` or a newline is JSON-*escaped*, so a literal match misses it, and the pattern
+  redactor — whose token boundaries include `"` — can corrupt a payload it rewrites in place. A
+  structured return must not become the one shape in which a token reaches a model-visible surface.
+- **Breaking, deliberately.** The string shape is replaced rather than kept alongside the record.
+  Two returns for one op would leave every caller and every doc having to say which one they meant,
+  which is the compatibility bridge this project does not build. `codewandler-flux-web` is
+  published, so this prices a **minor** bump (pre-1.0, minor is the breaking signal).
 
 ### Tier 2 — `web.fetch` readable markdown — D-120
 
