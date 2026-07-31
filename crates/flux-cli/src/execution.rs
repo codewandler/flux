@@ -658,7 +658,19 @@ pub(super) fn seed_provider_env_secrets(redactor: &flux_secret::Redactor) {
         .chain(["FLUX_SECRET"].iter())
         .map(|k| flux_secret::Ref::env(*k))
         .collect();
-    flux_runtime::SecretResolver::new().seed_redactor(&mut redactor.clone(), &secret_refs);
+    let declined =
+        flux_runtime::SecretResolver::new().seed_redactor(&mut redactor.clone(), &secret_refs);
+    // A provider key too short to register is a live credential the redactor will not scrub by
+    // exact match. Saying so is the whole point of the fallible registration (C-315); the run
+    // continues, because refusing to start over a malformed env var would be worse.
+    for r in declined {
+        eprintln!(
+            "{} `{r}` is set but too short to register with the redactor (under {} characters), so \
+             its value will not be scrubbed from tool output by exact match",
+            style::yellow("warning:"),
+            flux_secret::MIN_REGISTERED_SECRET_LEN,
+        );
+    }
 }
 
 /// L6 binding of the L4 [`flux_plugin::SecretSink`] seam: registers a credential the host materialized
@@ -671,7 +683,15 @@ pub(super) struct RedactorSecretSink {
 
 impl flux_plugin::SecretSink for RedactorSecretSink {
     fn register_secret(&self, value: &str) {
-        self.redactor.add_secret(value);
+        // The seam is infallible, so the redactor's one refusal is surfaced here rather than
+        // swallowed: a credential the host materialized and could not register is about to flow
+        // through tool output unscrubbed (C-315).
+        if let Err(why) = self.redactor.try_add_secret(value) {
+            eprintln!(
+                "{} a plugin-materialized credential was not registered with the redactor: {why}",
+                style::yellow("warning:")
+            );
+        }
     }
 }
 

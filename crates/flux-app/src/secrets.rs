@@ -40,7 +40,15 @@ fn resolve_in(value: &mut Value, redactor: &Redactor) -> Result<()> {
                 "secret env var `{name}` is not set (referenced via `secret \"{name}\"`)"
             ))
         })?;
-        redactor.add_secret(resolved.clone());
+        // A `secret "NAME"` declaration is a promise that the value will not surface. If the
+        // redactor declines it, the promise cannot be kept, and loading the program anyway would
+        // keep that fact from the operator — the exact silence C-315 removed.
+        redactor.try_add_secret(resolved.clone()).map_err(|why| {
+            Error::Config(format!(
+                "secret env var `{name}` cannot be protected: {why}. Referenced via \
+                 `secret \"{name}\"`; either lengthen the value or stop declaring it a secret."
+            ))
+        })?;
         *value = Value::String(resolved);
         return Ok(());
     }
@@ -123,10 +131,34 @@ mod tests {
 
     #[test]
     fn resolves_secrets_nested_in_records() {
-        std::env::set_var("FLUX_TEST_NESTED_SECRET", "deep");
+        // Long enough to register: the subject here is the nested traversal, and since C-315 a value
+        // the redactor would decline fails the load outright (see the test below).
+        std::env::set_var("FLUX_TEST_NESTED_SECRET", "deep-enough-to-register");
         let mut settings =
             json!({ "auth": { "headers": { "x-key": { "$secret": "FLUX_TEST_NESTED_SECRET" } } } });
         resolve_in(&mut settings, &Redactor::new()).unwrap();
-        assert_eq!(settings["auth"]["headers"]["x-key"], json!("deep"));
+        assert_eq!(
+            settings["auth"]["headers"]["x-key"],
+            json!("deep-enough-to-register")
+        );
+    }
+
+    /// C-315 — a `secret "NAME"` declaration is a promise that the value will not surface. When the
+    /// redactor declines it, the promise cannot be kept; loading the program anyway would keep that
+    /// fact from the operator, which is the silence this story removed. The error names the variable
+    /// and the reason, and never the value.
+    #[test]
+    fn a_secret_too_short_to_register_fails_the_load_and_never_prints_the_value() {
+        std::env::set_var("FLUX_TEST_SHORT_SECRET", "pin1");
+        let mut settings = json!({ "token": { "$secret": "FLUX_TEST_SHORT_SECRET" } });
+        let err = resolve_in(&mut settings, &Redactor::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("FLUX_TEST_SHORT_SECRET"),
+            "names the var: {err}"
+        );
+        assert!(err.contains("cannot be protected"), "states why: {err}");
+        assert!(!err.contains("pin1"), "must not echo the value: {err}");
     }
 }

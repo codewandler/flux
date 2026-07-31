@@ -197,49 +197,105 @@ unresolvable value errors rather than widening to an all-harness search.
   wiring yet; the first one should take a single `HarnessHistory` and do both.
 - **The redactor's under-match is measured — see the section below.**
 
-## What C-216 measured (the redactor's under-match, and the recourse)
+## What C-216 measured, and what C-315 closed (the redactor's under-match, and the recourse)
 
-The redactor is a lossy heuristic by design: a fixed prefix list plus registered values matched by
-substring, with a 6-character registration floor. On a log line that is an honest trade. On years of
-conversation it under-matches, and the corpus in
-`crates/flux-capabilities/tests/harness_redaction_corpus.rs` measures by how much rather than
-assuming it away. Every entry below is asserted in both directions by
+The redactor is a lossy heuristic by design. C-216 measured how lossy, over the corpus in
+`crates/flux-capabilities/tests/harness_redaction_corpus.rs`, rather than assuming it away; C-315
+closed the six shapes that measurement named. Every entry below is asserted in both directions by
 `the_measured_under_match_is_exactly_the_list_the_design_records`, so **this table cannot rot in
 either direction** — a widened redactor fails the test just as a narrowed one does.
 
-**Caught** (the prefix list, tokenized on whitespace *and* `" ' \` ( ) [ ] { } , ; = : < >`, with a
-leading `+ - * #` set aside): `sk-ant-…`, `sk-…`, `xoxb/xoxp/xoxe-…`, `ghp_…`, `gho_…`,
-`github_pat_…`, `AKIA…`, `AIza…`, `ya29.…`, and `eyJ…` — which means a JWT *and* any base64 blob
-whose decoded content is JSON, since that is what `eyJ` is. A credential inside a `tool_result`, a
-heredoc or a diff hunk is caught exactly as one in prose is.
+### The mechanisms (C-315)
 
-**Not caught, in this corpus:**
+C-216 measured a *prefix list*. That is now one of four mechanisms, because the shapes it missed do
+not have a common prefix to add:
 
-| shape | why the prefix list misses it |
+1. **Registered values**, matched by substring, longest-first. The operator's recourse.
+2. **PEM private-key blocks** — the body between `-----BEGIN … PRIVATE KEY-----` and its `-----END`
+   collapses to one `[redacted]` line. The **delimiters are kept**: they are not secret, and they
+   are the only thing that makes the redaction legible. Scoped to `PRIVATE KEY`, so a certificate or
+   a public key is untouched. An **unterminated** block is redacted to the end of the input — that
+   is the shape of a key truncated by `flux-system`'s output byte cap, and there is no reading of
+   its remaining bytes under which they are safe to show.
+3. **URL credentials** — the password in a `scheme://user:password@host` authority, bounded by the
+   *last* `@`. This is structural, not heuristic: userinfo containing a colon **is** a credential by
+   the URL grammar, so the false-positive rate is zero by construction. Only the password goes;
+   which database, as whom, is what an operator reads a connection string for.
+4. **The token pass** — a maximal run of non-boundary characters is redacted when either
+   - it starts with a known credential prefix at or above **that prefix's own length floor**, or
+   - it is the **value of an assignment whose name declares it a secret** and its own shape is
+     opaque material.
+
+**Prefixes and their floors.** `sk-ant-` 8, `sk-` 8, `sk_live_` 20, `xoxb/xoxp/xoxe-` 8, `ghp_` 8,
+`gho_` 8, `github_pat_` 12, `glpat-` 20, `hf_` 30, `AKIA` 8, `AIza` 8, `ya29.` 8, `eyJ` 8 — the last
+meaning a JWT *and* any base64 blob whose decoded content is JSON. The floors are per-prefix because
+the prefixes are not equally distinctive: `hf_` is three characters and `hf_hub_download` is an
+ordinary identifier, so its floor sits just under a real 37-character Hugging Face token.
+Deliberately **absent**: `sk_test_` — a Stripe *test* key is not production credential material and
+C-216 did not measure it.
+
+**The contextual rule, and its guard rails.** The name (lower-cased, ≤ 64 chars) must contain one of
+`secret token password passwd apikey api_key access_key private_key credential`; the value must be
+≥ 16 characters, drawn only from `[A-Za-z0-9+/_-]`, and contain **both** a letter and a digit. Each
+condition buys back a class of false positive: excluding `.` and `:` keeps hostnames, URLs, versions
+and paths-with-extensions out; requiring a digit keeps `TOKEN_PATH=/etc/flux/credentials` out;
+requiring a letter keeps `secret_ttl=3600` out; the length floor keeps `SECRET_NAME=my-app-config`
+out. The rule reads `=` only — `key: value` is out, because `:` introduces far more prose than it
+does credentials.
+
+**Entropy scoring was considered and rejected.** It is the only mechanism that would catch a bare
+40-character AWS secret with nothing naming it, and it cannot distinguish that from a git SHA, a
+checksum, a UUID, a base64 PNG or a minified asset — all of which this corpus contains and asserts
+must survive verbatim. `Redactor` is the shared redaction path for the stream-json writer, the
+whatif cassette, the approval sheet, the evidence flush and harness ingest, so a false positive
+silently destroys information on every one of them at once. Context is cheaper than entropy and its
+failures are false *negatives*, which is the direction to fail in when the alternative is censoring
+the operator's own diff.
+
+### Caught, in this corpus
+
+`sk-ant-…`, `xoxb…`, `ghp_…`, `AKIA…`, `AIza…`, `eyJ…` (C-216), plus the six C-216 measured as
+missed and C-315 closed:
+
+| shape | what catches it now |
 | --- | --- |
-| an AWS **secret** access key (`wJalr…`, 40 chars) | no prefix at all — only the *access key id* (`AKIA…`) has one |
-| a password inside a connection URL (`postgres://user:pw@host`) | `:` is a boundary, so the password is its own unprefixed token |
-| a Stripe secret key (`sk_live_…`) | the list has `sk-`, with a hyphen; `sk_` does not match |
-| a Hugging Face token (`hf_…`) | not on the list |
-| a GitLab PAT (`glpat-…`) | not on the list |
-| PEM private-key material | the `-----BEGIN …-----` delimiters are prose and the body is unprefixed base64 |
+| an AWS **secret** access key (`wJalr…`, 40 chars) | the assignment that names it (`AWS_SECRET_ACCESS_KEY=…`) |
+| a password inside a connection URL (`postgres://user:pw@host`) | the URL pass — structural, not heuristic |
+| a Stripe secret key (`sk_live_…`) | prefix, floor 20 |
+| a Hugging Face token (`hf_…`) | prefix, floor 30 |
+| a GitLab PAT (`glpat-…`) | prefix, floor 20 |
+| PEM private-key material | the block pass; body redacted, delimiters kept |
 
-Two of these are worth naming as the sharp edge: **`sk_live_…` and PEM material**, because a
-transcript in which an agent *writes* a production config is exactly where they appear, and the
-heredoc corpus case is that transcript.
+### Not caught, in this corpus — the residual gaps, by decision
 
-**The operator's recourse, in order.**
+| shape | why it is left | 
+| --- | --- |
+| a secret-named assignment below the opaque-material floor (`REDIS_PASSWORD=c216corpusPw`) | ≥ 16 chars is what keeps `SECRET_NAME=my-app-config` intact; a short password is the price |
+| a bare high-entropy token with nothing naming it (`wJalr…` in prose) | only entropy would reach it, and entropy flags hashes, diffs and image blobs |
+| a secret-named binding in `key: value` form | `:` introduces prose far more often than credentials |
+| an all-digit credential (`ACCOUNT_SECRET_ID=216216216216216218`) | no prefix can mark it and the contextual rule requires a letter, so `secret_ttl=3600` survives |
 
-1. **Register the value** — `Redactor::add_secret(value)` catches every shape in the table above
-   (asserted). This is the right answer for a credential the host already holds.
+### The operator's recourse, in order
+
+1. **Register the value** — `Redactor::try_add_secret(value)` catches every shape in the residual
+   table above (asserted). This is the right answer for a credential the host already holds.
 2. **Leave the datasource off.** It is off by default and off means off; see the opt-out audit.
 
-The limit of recourse 1 is also measured: `add_secret` **silently ignores values under 6
-characters**, so a short credential has no recourse but recourse 2.
+The limit of recourse 1 is still measured, and since C-315 it is no longer silent: values under
+`MIN_REGISTERED_SECRET_LEN` (6) are **declined with an error the caller can see**
+(`Unregistered::TooShort`), because a security-registration call that reports success for something
+it did not do is its own defect. The floor itself stays — registered values are matched by plain
+substring, so registering `"abc"` would turn every `abc` in every diff into `[redacted]`.
+`add_secret` remains as the infallible form for callers that have already established the length
+(chiefly tests); `codewandler-flux-secret` is a published 1.x protocol-line crate, so the fallible
+form was added beside it rather than replacing it.
 
-**Widening the redactor is deliberately out of C-216's scope.** `flux-secret` is shared by the
-stream-json writer, the whatif cassette, the approval sheet and the evidence flush; widening its
-matching changes all of them at once, so it needs its own story and its own blast radius.
+**The all-digit shape is where recourse 1 is load-bearing**, and it is the reason to treat
+"registration is total" as an invariant: it is the *only* mechanism that reaches a numeric
+credential. Any redaction path that narrows where a registered value is matched — for example one
+that walks a JSON document and skips `Value::Number` on the reasoning that a number cannot be a
+secret — is a hole in that guarantee rather than an optimization. C-315 measured the shape but did
+not audit the JSON walkers; that is filed separately.
 
 ### What the corpus also found, and did not fix
 
