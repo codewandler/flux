@@ -1,5 +1,5 @@
 ---
-id: C-337
+id: C-339
 title: "When redacted text stops parsing, `redact_and_hash_request` returns the *unredacted* value"
 pillar: Core
 status: ready
