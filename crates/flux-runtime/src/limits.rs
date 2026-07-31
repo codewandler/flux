@@ -243,21 +243,28 @@ impl ResourceLimits {
     /// # Why not one shared budget
     ///
     /// A single semaphore across parent and children is the stronger guarantee — it would bound total
-    /// process concurrency instead of per-agent concurrency — and it **deadlocks**. A `task` call
-    /// sits inside `Tool::execute` for its child's entire turn, and so does the agent-loop op that
-    /// dispatched it (`execute_batch`, and equally `explore` / `ai_segment` / `flow_run` / a model
-    /// stage). Those ancestors hold slots. The child is reached through
-    /// `SpawnTaskSupervisor::spawn`, and [`HELD_SLOTS`] is a Tokio task-local that does not cross
-    /// `tokio::spawn`, so the child cannot inherit their exemption: it queues behind the very calls
-    /// that are waiting for it. At a ceiling of 1 nothing runs; in general every delegated child
-    /// stalls until the queue timeout refuses it.
+    /// process concurrency instead of per-agent concurrency — and it **deadlocks**.
     ///
-    /// Marking the delegating ops as non-occupying does not close this. The set of ops that can
-    /// transitively await a sub-agent is the whole nested-program family and is open-ended — any
-    /// future op that runs an authored flow can contain a `task` — so the invariant would be
-    /// unenforceable and a regression would surface only under saturation *and* delegation. A shared
-    /// budget therefore needs a structural mechanism (ancestry-keyed permits, or releasing a slot
-    /// across any nested dispatch), which is a design and not a wiring change.
+    /// On the conversational path the outermost agent-loop op holds the permit: `execute_batch` is a
+    /// registered tool dispatched through [`Executor::dispatch`](crate::Executor::dispatch), so it
+    /// takes a slot and keeps it for the whole batch — including the `task` call inside it, and that
+    /// child's entire turn. (`task` itself takes no *additional* permit: it runs on the same Tokio
+    /// task, so the identity-keyed [`HELD_SLOTS`] exemption above gives it an inert slot. Exactly one
+    /// permit is held, not two — but one is enough.) The child, by contrast, is reached through
+    /// `SpawnTaskSupervisor::spawn`, and `HELD_SLOTS` is a task-local that does not cross
+    /// `tokio::spawn`, so the child cannot inherit that exemption: it queues behind the very call
+    /// waiting for it. At a ceiling of 1 nothing runs; in general every delegated child stalls until
+    /// the queue timeout refuses it.
+    ///
+    /// Marking the delegating op as non-occupying does not close this — and for a sharper reason than
+    /// "the op set is open-ended": the permit is not held by `task` at all, it is held by
+    /// `execute_batch`. Exempting `task` changes nothing. One would have to exempt every op that can
+    /// transitively await a sub-agent (`execute_batch`, `explore`, `ai_segment`, `flow_run`, any
+    /// authored model stage), which is the whole nested-program family and is open-ended: any future
+    /// op that runs an authored flow can contain a `task`. That invariant is unenforceable, and a
+    /// regression would surface only under saturation *and* delegation. A shared budget therefore
+    /// needs a structural mechanism (ancestry-keyed permits, or releasing a slot across any nested
+    /// dispatch), which is a design and not a wiring change.
     ///
     /// The honest consequence, which every doc site states: `max_concurrent_tool_calls = N` bounds
     /// **each agent** at N, so k live sub-agents may run up to N×(k+1) tool calls at once.
@@ -531,8 +538,8 @@ mod tests {
 
     /// C-299: the shape a sub-agent inherits. `independent_copy` keeps every configured value but
     /// mints a **fresh** semaphore, so a child never queues behind its parent — that is what makes
-    /// descending the ceiling deadlock-free, given that the `task` call and the agent-loop op that
-    /// dispatched it both hold slots for the child's whole turn.
+    /// descending the ceiling deadlock-free, given that the agent-loop op driving the delegation
+    /// (`execute_batch`) holds a permit for the child's whole turn.
     #[tokio::test]
     async fn an_independent_copy_keeps_the_ceiling_but_not_the_budget() {
         let parent = ResourceLimits::new()

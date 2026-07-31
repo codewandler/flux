@@ -193,9 +193,10 @@ impl LocalSpawner {
     /// [`ResourceLimits::independent_copy`] with the same numbers and its own concurrency semaphore.
     /// So `max_concurrent_tool_calls = N` bounds each agent at N, and k live children may run up to
     /// N×(k+1) tool calls at once. Sharing one semaphore across the `task` boundary deadlocks — the
-    /// delegating call and the agent-loop op that dispatched it both hold slots for the child's whole
-    /// turn, and the task-local exemption does not cross the spawn. That reasoning, and why marking
-    /// delegating ops does not fix it, is on [`ResourceLimits::independent_copy`].
+    /// agent-loop op driving the delegation (`execute_batch`) holds a permit for the child's whole
+    /// turn, and the task-local exemption that covers the nested `task` does not cross the spawn the
+    /// child is reached through. That reasoning, and why marking delegating ops does not fix it, is on
+    /// [`ResourceLimits::independent_copy`].
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = limits;
         self
@@ -421,12 +422,14 @@ impl Spawner for LocalSpawner {
         };
         // C-299: the child runs under the parent's ceilings instead of the unbounded default it got
         // before. `independent_copy` — NOT `clone` — is load-bearing: a clone would share the
-        // parent's semaphore, and the `task` call plus the agent-loop op that dispatched it
-        // (`execute_batch`, `explore`, `flow_run`, …) both hold slots for this child's whole turn.
-        // Since `HELD_SLOTS` is a task-local and the child is reached across
-        // `SpawnTaskSupervisor::spawn`, a shared semaphore would make the child queue behind the
-        // very calls awaiting it — a deadlock bounded only by the queue timeout. So the ceiling is
-        // **per agent**: same numbers, own budget. See `ResourceLimits::independent_copy`.
+        // parent's semaphore, and the agent-loop op driving this delegation (`execute_batch`, and
+        // equally `explore` / `flow_run` / a model stage) is holding a permit for this child's whole
+        // turn. The nested `task` adds no second permit — same Tokio task, so `HELD_SLOTS` exempts
+        // it — but one held permit is enough. The CHILD is reached across
+        // `SpawnTaskSupervisor::spawn`, which that task-local does not cross, so a shared semaphore
+        // would make the child queue behind the very call awaiting it: a deadlock bounded only by
+        // the queue timeout. Hence per agent — same numbers, own budget.
+        // See `ResourceLimits::independent_copy`.
         let executor = Executor::new_with_authorization(
             registry,
             PermissionManager::new(),

@@ -834,10 +834,10 @@ pub struct Limits {
     /// **Per agent, including sub-agents (C-299):** every `task`-delegated sub-agent now inherits
     /// this ceiling too (it previously ran unbounded), but with its **own** budget rather than a
     /// share of one — so with k live children the process may run up to N×(k+1) tool calls at once.
-    /// A single shared budget would be the stronger guarantee and deadlocks: the delegating call and
-    /// the agent-loop op that dispatched it both hold slots for the child's whole turn, and the
-    /// task-local exemption does not survive the spawn the child is reached through. See
-    /// `flux_runtime::ResourceLimits::independent_copy`.
+    /// A single shared budget would be the stronger guarantee and deadlocks: the agent-loop op
+    /// driving the delegation (`execute_batch`) holds a permit for the child's whole turn, and the
+    /// task-local exemption that covers the nested `task` does not survive the spawn the child is
+    /// reached through. See `flux_runtime::ResourceLimits::independent_copy`.
     ///
     /// Applied by the `flux` binary (`flux-cli` reads this table at executor assembly) and by an
     /// embedding host through `flux_runtime::ResourceLimits::from_config` →

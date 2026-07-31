@@ -43,6 +43,11 @@ this rather than working around its fence, which was right, but it is real debt.
       — 3 tool calls in flight under a configured ceiling of 1, at the merge base.
 - [x] Sub-agent executors inherit the parent's ceiling. **Decide and state whether the ceiling is
       shared or per-child.**
+      → Failing-first:
+      `crates/flux-sdk/tests/resource_limits.rs::a_sub_agent_is_built_with_the_parents_ceilings`.
+      Deleting `.with_resource_limits(self.resource_limits.independent_copy())` from
+      `LocalSpawner::spawn` turns it red. Observing an inherited ceiling from outside is harder than
+      it looks — see "Why concurrency and the op cache cannot witness this" below.
       → **PER-CHILD, decided deliberately and stated at all five doc sites.** Each child gets
       `ResourceLimits::independent_copy()` — same configured numbers, its own semaphore. A shared
       budget was implemented first, proven to deadlock (below), and abandoned.
@@ -81,31 +86,57 @@ this rather than working around its fence, which was right, but it is real debt.
 
 ## The deadlock boundary is wider than `task`
 
-The story warned that a parent holding a slot while awaiting a child is a deadlock. That is right,
-and it is **not only `task`**. The chain for a delegation on the real conversational path is:
+The story warned that a parent holding a slot while awaiting a child is a deadlock. That is right —
+but the permit is **not held by `task`**. The chain for a delegation on the real conversational path
+is:
 
 ```
-execute_batch   (a dispatched op — HOLDS a slot for the whole batch)
-  └─ task       (a dispatched op — HOLDS a slot for the child's whole turn)
+execute_batch   (a registered tool dispatched through Executor::dispatch — HOLDS the permit
+                 for the whole batch: the nested task, and that child's entire turn)
+  └─ task       (same Tokio task ⇒ identity-keyed HELD_SLOTS exemption ⇒ INERT slot, no 2nd permit)
        └─ SpawnTaskSupervisor::spawn   ← tokio::spawn; HELD_SLOTS does not cross
-            └─ child executor → child's first tool call → asks for a slot
+            └─ child executor → child's first tool call → asks for a permit → queues
 ```
 
-With one shared semaphore the child queues behind **two** ancestors that are both blocked waiting for
-it. At a ceiling of 1 nothing runs at all; in general every delegated child stalls until the queue
-timeout refuses it. Reproduced, not reasoned:
-`a_delegated_child_is_bounded_but_never_starved_by_its_parent` fails with `runs == 0`.
+Exactly **one** permit is held, not two — and one is enough. At a ceiling of 1 nothing runs at all;
+in general every delegated child stalls until the queue timeout refuses it. Reproduced, not reasoned:
+with `clone()` instead of `independent_copy()`,
+`a_delegated_child_is_bounded_but_never_starved_by_its_parent` fails with `runs == 0` at a ceiling of
+1 with a single delegation.
 
-Marking the delegating ops as non-occupying was implemented and **does not close it**. The set of ops
-that can transitively await a sub-agent is the whole nested-program family — `execute_batch`,
-`explore`, `ai_segment`, `flow_run`, any authored model stage, plus `change_implement` — and it is
-open-ended: any future op that runs an authored flow can contain a `task`. The invariant would be
-unenforceable, and a regression would surface only under saturation *and* delegation, which is the
-worst possible failure signature. A shared budget needs a structural mechanism (ancestry-keyed
-permits, or releasing a slot across any nested dispatch), i.e. a design, not this story's wiring.
+Marking the delegating op as non-occupying was implemented and **does not close it** — for a sharper
+reason than "the op set is open-ended": exempting `task` changes nothing, because `task` never held a
+permit. One would have to exempt every op that can transitively await a sub-agent — `execute_batch`,
+`explore`, `ai_segment`, `flow_run`, any authored model stage, plus `change_implement` — which is the
+whole nested-program family and is open-ended: any future op that runs an authored flow can contain a
+`task`. That invariant is unenforceable, and a regression would surface only under saturation *and*
+delegation, the worst possible failure signature. A shared budget needs a structural mechanism
+(ancestry-keyed permits, or releasing a slot across any nested dispatch), i.e. a design, not this
+story's wiring.
 
 Hence per-child. It is the weaker guarantee, it is stated as such everywhere, and it is safe by
 construction: parent and child hold different semaphores, so no ancestor can ever block a descendant.
+
+## Why concurrency and the op cache cannot witness an inherited ceiling
+
+Acceptance 2's failing-first test needs an *observable* difference between a child built with the
+parent's ceilings and one left unbounded. Two obvious routes are both dead ends, and both were
+checked by mutation rather than by reading:
+
+- **Concurrency cannot witness it.** The child batch loop is strictly sequential
+  (`crates/flux-flow/src/loop_host.rs`), so a child's occupancy is 1 whether or not it is bounded.
+  This is why `a_delegated_child_is_bounded_but_never_starved_by_its_parent` discriminates
+  `clone()` vs `independent_copy()` but *not* wired vs unwired.
+- **The op cache cannot witness it.** `LocalSpawner::spawn` builds every child with
+  `PermissionManager::new()` — no allow rules — so a child op with no permission subjects resolves to
+  `PermDecision::Ask`, which sets `approval_sensitive`, which excludes it from the `cacheable`
+  predicate (`crates/flux-runtime/src/lib.rs`) outright. A retained-bytes test therefore counts the
+  same number of executions wired or not. Written, run both ways, confirmed identical, discarded.
+
+The route that works is the **evidence payload ceiling**: it changes the contents of the child's own
+evidence log, `ToolContext::evidence` is public, and `Observation::is_payload_elided()` (C-298) makes
+the elision legible — so a child-side op can read the log its executor was constructed with and
+report the verdict out. That is what the test does.
 
 ## Why the stated failing-first test cannot be written
 

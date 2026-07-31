@@ -475,14 +475,15 @@ async fn the_retained_result_ceiling_bounds_what_the_executor_keeps() {
 // the parent's ceilings — but as an independent copy, so each agent has its own concurrency budget.
 //
 // That choice is forced, and these tests are what forced it. One shared semaphore is the stronger
-// guarantee (a whole-process bound instead of a per-agent one) and it **deadlocks**: a `task` call
-// sits inside `Tool::execute` for the child's entire turn, and so does the agent-loop op that
-// dispatched it (`execute_batch`, and equally `explore` / `ai_segment` / `flow_run` / a model stage).
-// Those ancestors hold slots. The child is reached through `SpawnTaskSupervisor::spawn`, and the
-// re-entrancy exemption is a Tokio task-local that does not cross `tokio::spawn`, so the child cannot
-// inherit it — it queues behind the very calls waiting for it. Verified, not assumed: with a shared
-// semaphore `a_delegated_child_is_bounded_but_never_starved_by_its_parent` fails with `runs == 0`
-// even at a ceiling of 1 with a single delegation.
+// guarantee (a whole-process bound instead of a per-agent one) and it **deadlocks**: `execute_batch`
+// is a registered tool dispatched through `Executor::dispatch`, so it holds a permit for the whole
+// batch — including the nested `task` and that child's entire turn. (`task` adds no second permit:
+// same Tokio task, so the identity-keyed `HELD_SLOTS` exemption makes its slot inert. One permit,
+// not two — and one is enough.) The CHILD is reached through `SpawnTaskSupervisor::spawn`, which
+// that task-local does not cross, so it cannot inherit the exemption and queues behind the very call
+// waiting for it. Verified, not assumed: with a shared semaphore
+// `a_delegated_child_is_bounded_but_never_starved_by_its_parent` fails with `runs == 0` even at a
+// ceiling of 1 with a single delegation.
 //
 // The tests therefore exercise the real engine — real spawn supervisor, real `tokio::spawn` — because
 // that boundary is the whole point. A test on the deterministic `run_flow` path would pass under
@@ -570,6 +571,182 @@ impl Provider for ProbingChildProvider {
     }
 }
 
+/// A child-side op that inspects **its own executor's** evidence log — the one place a sub-agent's
+/// inherited ceilings are observable from inside the child.
+///
+/// It writes several oversized payloads, then reports whether the log elided any of them. Under an
+/// inherited `max_evidence_payload_bytes` the oldest payloads are replaced by C-298's self-describing
+/// marker; on an unbounded log nothing is elided.
+struct EvidenceCeilingProbe {
+    /// Set to `true` iff the child's evidence log applied a payload ceiling.
+    saw_elision: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for EvidenceCeilingProbe {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "probe_ceiling",
+            "reports whether this agent's evidence log is payload-bounded",
+            json!({ "type": "object", "properties": {} }),
+        )
+    }
+
+    async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        // Comfortably more payload than the ceiling the test configures, so an inheriting child must
+        // elide the oldest of these.
+        for i in 0..4 {
+            ctx.evidence
+                .lock()
+                .unwrap()
+                .record(flux_evidence::Observation::new(
+                    "c299_payload_probe",
+                    flux_evidence::Phase::Turn,
+                    json!({ "i": i, "blob": "x".repeat(2_048) }),
+                ));
+        }
+        let elided = ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .all()
+            .iter()
+            .any(|o| o.is_payload_elided());
+        self.saw_elision
+            .store(elided, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolResult::ok(if elided { "bounded" } else { "unbounded" }))
+    }
+}
+
+/// Drives a child through exactly one `probe_ceiling` call, then answers.
+struct CeilingProbingChildProvider {
+    turns: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for CeilingProbingChildProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    async fn stream(&self, request: Request) -> Result<ChunkStream> {
+        if request.tools.iter().any(|t| t.name == "declare_intent") {
+            let chunks = vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: json!({
+                        "intent": "check my own ceilings",
+                        "capability_families": ["core"],
+                    }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+        let chunks = if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
+            vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "probe-ceiling-1".into(),
+                    name: "probe_ceiling".into(),
+                    input: json!({}),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ]
+        } else {
+            vec![
+                Chunk::TextDelta("checked".into()),
+                Chunk::Block(ContentBlock::Text {
+                    text: "checked".into(),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+    }
+}
+
+/// **The C-299 Acceptance-2 failing-first test: a sub-agent really is built with the parent's
+/// ceilings.** Delete `.with_resource_limits(self.resource_limits.independent_copy())` from
+/// `LocalSpawner::spawn` — restoring the base behaviour where a child gets a fresh unbounded
+/// executor — and this test goes red.
+///
+/// Finding the observable took some doing, and the two obvious routes do **not** work:
+///
+/// * *Concurrency* is invisible here. The child batch loop is strictly sequential
+///   (`crates/flux-flow/src/loop_host.rs`), so a child's occupancy is 1 bounded or not.
+/// * *The op cache* is unreachable in a sub-agent. `LocalSpawner::spawn` builds the child with
+///   `PermissionManager::new()` (no allow rules), so every child op resolves to `PermDecision::Ask`,
+///   which makes it `approval_sensitive`, which excludes it from the cache outright
+///   (`crates/flux-runtime/src/lib.rs`, the `cacheable` predicate). A retained-bytes test therefore
+///   passes identically wired or not — verified, not assumed.
+///
+/// What *is* observable is the child's **evidence payload ceiling**: it changes the contents of the
+/// child's own evidence log, and `ToolContext::evidence` is public, so a child-side op can read the
+/// log its executor was constructed with and report back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sub_agent_is_built_with_the_parents_ceilings() {
+    let saw_elision = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let mut roles = RoleRegistry::default();
+    roles.insert(
+        try_parse_role(
+            "---\ntools: [probe_ceiling]\n---\nYou check your own ceilings.",
+            "reader",
+        )
+        .expect("the reader role must parse"),
+    );
+    let mut child_base = ToolRegistry::new();
+    child_base.register(Arc::new(EvidenceCeilingProbe {
+        saw_elision: saw_elision.clone(),
+    }));
+    let factory = Arc::new(|| {
+        Ok(Box::new(CeilingProbingChildProvider {
+            turns: AtomicUsize::new(0),
+        }) as Box<dyn Provider>)
+    });
+    let sub_agents = SubAgents::new(roles, child_base, factory, "mock", 1024);
+
+    let dir = temp_root("inherit-ceilings");
+    let client: Client = Client::builder()
+        .model("mock")
+        .auto_approve(true)
+        // Far smaller than what the child-side probe writes, so an inheriting child must elide.
+        .resource_limits(ResourceLimits::new().with_max_evidence_payload_bytes(512))
+        .with_sub_agents(sub_agents)
+        .build(
+            Box::new(DelegatingParentProvider {
+                calls: AtomicUsize::new(0),
+                role: "reader",
+            }),
+            &dir,
+        )
+        .expect("build Client");
+
+    let out = client
+        .run("delegate the ceiling check")
+        .await
+        .expect("the delegating turn must complete");
+    assert!(
+        out.tool_calls.contains(&"task".to_string()),
+        "the parent turn must actually have delegated, got: {:?}",
+        out.tool_calls
+    );
+    assert!(
+        saw_elision.load(std::sync::atomic::Ordering::SeqCst),
+        "the sub-agent's evidence log was unbounded, so the child was NOT built with the parent's \
+         ceilings — `LocalSpawner::spawn` must install `resource_limits.independent_copy()` on the \
+         child executor instead of leaving it at the unbounded default"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A `FlowClient` whose `worker` role delegates to [`ProbingChildProvider`], carrying `limits`.
 /// Every child inherits these same numbers, each with its own concurrency budget.
 fn delegating_client(
@@ -616,6 +793,8 @@ fn delegating_client(
 /// the geometry the deadlock actually lives in.
 struct DelegatingParentProvider {
     calls: AtomicUsize,
+    /// Which sub-agent role this parent delegates to.
+    role: &'static str,
 }
 
 #[async_trait]
@@ -658,7 +837,7 @@ impl Provider for DelegatingParentProvider {
             0 => native(
                 "task-1",
                 "task",
-                json!({ "role": "worker", "task": "probe it" }),
+                json!({ "role": self.role, "task": "do the delegated work" }),
             ),
             1 => native(
                 "finalize-1",
@@ -686,7 +865,7 @@ impl Provider for DelegatingParentProvider {
 /// queue behind the ancestors awaiting it). This is the test that discriminates between the two
 /// candidate shapes: replace `independent_copy()` with `clone()` in `LocalSpawner::spawn` — i.e. one
 /// shared semaphore — and it fails with `runs == 0` at a ceiling of 1 with a single delegation,
-/// because `execute_batch` and `task` are both holding slots while the child asks for one.
+/// because `execute_batch` is holding the one permit while the child asks for it.
 ///
 /// The queue timeout is deliberately short so that failure is a fast, legible refusal rather than a
 /// 30-second stall that reads like slowness.
@@ -728,6 +907,7 @@ async fn a_delegated_child_is_bounded_but_never_starved_by_its_parent() {
         .build(
             Box::new(DelegatingParentProvider {
                 calls: AtomicUsize::new(0),
+                role: "worker",
             }),
             &dir,
         )
@@ -805,14 +985,15 @@ async fn a_delegated_child_runs_on_the_inline_path_without_starving() {
             serde_json::Map::new(),
         )
         .await
-        .expect("a delegation under a shared ceiling must not fail");
+        .expect("a delegation must not fail under an inherited per-agent ceiling");
     let elapsed = started.elapsed();
 
     assert_eq!(
         runs.load(Ordering::SeqCst),
         1,
-        "the child's tool call never ran — the shared ceiling deadlocked against the `task` \
-         that was waiting for it. Delegation must hold no slot."
+        "the child's tool call never ran — it was starved by a permit its own ancestor was \
+         holding. A sub-agent needs its OWN concurrency budget (`independent_copy`), not a \
+         share of its parent's."
     );
     assert!(
         !out.result.contains("concurrency limit"),
@@ -821,7 +1002,7 @@ async fn a_delegated_child_runs_on_the_inline_path_without_starving() {
     );
     assert!(
         elapsed < Duration::from_secs(10),
-        "the delegation took {elapsed:?} — a shared ceiling must not stall on its own children"
+        "the delegation took {elapsed:?} — an inherited ceiling must not stall on its own children"
     );
     assert_eq!(meter.peak(), 1, "peak occupancy must respect the ceiling");
 }
@@ -849,7 +1030,7 @@ async fn a_fan_out_of_delegations_all_complete_without_starving_each_other() {
     client
         .run_flow(flow, serde_json::Map::new())
         .await
-        .expect("a fan-out of delegations must not be starved by the ceiling it shares");
+        .expect("a fan-out of delegations must not starve on inherited per-agent ceilings");
 
     assert_eq!(
         runs.load(Ordering::SeqCst),
