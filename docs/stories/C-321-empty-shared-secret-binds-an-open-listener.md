@@ -2,8 +2,7 @@
 id: C-321
 title: "An empty shared secret is functionally `Open`, and it walks past the guard that refuses `Open`"
 pillar: Core
-status: in-progress
-priority: 1
+status: done
 areas: [flux-server, flux-channels]
 note: "security · the third live instance of C-317's bypass, found by C-317's implementor and confirmed link-by-link — `Some(\"\")` becomes SharedSecret{secret:\"\"} rather than Open, authenticates every request including one with no header, and guard_open_bind keys on Open ONLY, so it binds 0.0.0.0 unchallenged against the auto-approving daemon"
 ---
@@ -75,9 +74,15 @@ authenticated.
   loopback included) and [C-317](C-317-empty-bearer-token-authenticates.md) (webhook adapter — refused
   at `from_decl` plus an empty guard inside `authorized`). Both refuse in **two** places on purpose,
   so neither half silently carries the other.
-- ⚠ `flux-server` is a **published** crate. Refusing a previously-accepted configuration at
-  construction is a behavioural break at load time and needs to be priced accordingly — the same
-  call C-317 flagged for its own, smaller blast radius.
+- ✅ **Correction (coordinator, at integration).** This story originally asserted that `flux-server`
+  is a **published** crate and that a version decision was therefore owed. That was wrong, and it was
+  my error, not the implementor's — `crates/flux-server/Cargo.toml` is `name = "flux-server"` and
+  neither it nor `flux-channels` appears in `scripts/publish-crates-io.sh`'s `codewandler-flux-*`
+  closure. `scripts/check-crate-versions.sh` reports `PASS 0 changed crate(s)`. The implementor
+  checked rather than taking the claim on trust, reported it, and did not price a bump that was not
+  owed; the reviewer confirmed it independently. The behavioural break is real but **in-tree only**:
+  an `[a2a]` channel with `token ""` now fails at load, and `router()`/`router_multi()` now `Err` for
+  an empty secret on a non-loopback bind.
 - Related: `unauthenticated_bind_allowed` is the other half of link 4 and is worth reading before
   choosing a layer; a fix that makes an empty secret `Open` would route it into that helper's
   loopback allowance rather than into a hard refusal, which may or may not be what you want.

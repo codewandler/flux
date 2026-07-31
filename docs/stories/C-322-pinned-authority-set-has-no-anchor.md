@@ -2,8 +2,7 @@
 id: C-322
 title: "The pinned-authority field set has no anchor, so the next manifest field is adopted silently"
 pillar: Core
-status: in-progress
-priority: 6
+status: done
 areas: [flux-plugin]
 note: "found by C-310's re-review — pin_granted_authority pins four fields and takes the rest via `..fetched`, so a field added to PluginManifest and read by with_manifest is adopted from the REFRESHED manifest with no compile-time or test anchor; that is C-310's round-1 surrender bug reappearing on a new surface"
 ---

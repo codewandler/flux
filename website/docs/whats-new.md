@@ -69,6 +69,17 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **Security: an agent-to-agent channel with a blank token opened a door to the whole machine.** If
+  you set up an `a2a` channel and its token resolved to nothing — most easily by pointing it at an
+  environment variable that was exported empty — flux would open that channel **to the network** and
+  accept every request, including requests carrying no credentials at all. Because flux approves the
+  agent's actions automatically, that amounted to handing control of the machine to anyone who could
+  reach the port. flux was supposed to refuse to open an unauthenticated channel to the network; a
+  blank token slipped past that check because it did not *look* unauthenticated.
+  It is now refused in three independent places: the channel will not start, the port will not open,
+  and no request is accepted. **You may need to act:** an `a2a` channel with a blank token now fails
+  to start with a message naming the channel, instead of running exposed.
+
 - **Security: several kinds of credential that flux used to let through are now hidden.** flux hides
   secrets from logs, from what the model can see, and from saved transcripts. A measurement found six
   kinds it was missing — among them AWS secret keys, passwords embedded in database connection

@@ -25,6 +25,24 @@ All notable changes to this project are documented in this file. The format is b
   on both mutations and proved neither alone; now each line reds its own test and leaves the other
   green.
 
+- **A refresh can no longer adopt a new manifest field by accident, and `discovers` is now pinned**
+  (C-322). `pin_granted_authority` pinned four fields and took the rest via struct-update, so a
+  future authority-bearing field added to `PluginManifest` would have been adopted from the
+  *refreshed* manifest with no compile error and no red test — C-310's capability-surrender bug
+  reappearing on a new surface. An exhaustive destructure now fails the build in two places until
+  someone classifies the field, and the classification lives in the function's doc comment rather
+  than only in a story.
+
+  **`discovers` moved from adopted to pinned.** It is the provider side of the discovery fan-out:
+  `PluginRegistry::providers_for` routes a query for a product to every plugin whose manifest
+  `discovers` it, and the broker commits the answer into the shared `EndpointRegistry`. Enlisting
+  for a new product across a refresh is a plugin appointing itself the authority on where that
+  product lives — authority, not description. It was inert only because `ProviderEntry` snapshots
+  the manifest at load; C-318 removes exactly that accident, so pinning now means the escalation
+  cannot appear when it does. `name` stays adopted on purpose: a rename is refused earlier in
+  `prepare_refresh`, and pinning it here would move that decision out of the one place that
+  adjudicates it.
+
 - **A plugin's catalog can be re-projected without restarting flux, and a refresh can only ever
   narrow authority** (C-310). `flux plugin refresh <name>` re-fetches a plugin's manifest and
   re-projects its operations into the registry, re-running every load-time check. Any *widening* of
@@ -157,6 +175,31 @@ All notable changes to this project are documented in this file. The format is b
   class again — tracked as C-316.
 
 ### Fixed
+
+- **⚠ Security: an empty shared secret was functionally `Open`, and bound a public listener**
+  (C-321). The third and worst instance of the bypass D-216 and C-317 each closed in their own
+  adapter — the only one that ends at a public port rather than a single channel.
+
+  An `[a2a]` channel with an empty `token` produced `SharedSecret { secret: "" }`, which is not
+  `ServerAuth::Open`, so `guard_open_bind` never fired and the router bound a non-loopback address;
+  and because `constant_time_eq` of two empty slices is true, a request carrying **no**
+  `Authorization` header at all authenticated. The doc comment directly above that guard promised
+  RCE protection against the auto-approving daemon with "deliberately no escape hatch". This was the
+  escape hatch.
+
+  **Three refusal sites, one more than the reference fixes**, because this chain crosses a crate
+  boundary: `guard_open_bind` now keys on the *property* (`is_effectively_open`) rather than the
+  variant, so every producer of `ServerAuth` inherits the refusal through the single
+  construction-time enforcement point that `router`, `router_multi` and the `a2a` mount all share;
+  `require_auth` refuses an empty expected secret before comparing, which is the half that holds on
+  a loopback bind; and `a2a_auth_from_settings` refuses at load, which is the only half that
+  produces an actionable config error naming the channel before a port is bound. Each is
+  independently mutation-observed.
+
+  `ServerAuth::shared_secret` was deliberately *not* made fallible: keying the guard on the property
+  buys the same "every producer inherits it" without a signature break, and an infallible
+  constructor could not report the config error that would justify rewriting an operator's value
+  anyway. `flux-server` is not in the crates.io publish closure, so the break is in-tree only.
 
 - **⚠ Security: the redactor now catches six credential shapes it measurably missed** (C-315). C-216
   measured them; this closes them. They do not share a defect, so they could not share a fix: three
