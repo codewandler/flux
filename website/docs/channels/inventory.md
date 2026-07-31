@@ -21,7 +21,7 @@ recognize refuses to start.
 | [`webhook`](#webhook) | `http` | any HTTP caller | the HTTP response | yes, if remote | optional bearer (**required** off-loopback) | always |
 | [`a2a`](#a2a) | — | an agent or API client | response + SSE stream | yes, if remote | bearer, or per-request principal (RFC 7662) | always |
 | [`slack`](#slack) | — | a Slack user | posted into the thread | **no** — outbound socket | Slack bot + app tokens | default feature |
-| [`room`](#room) | — | any occupant of the room | said back into the room | **no** — outbound socket | the backend's (see below) | always |
+| [`room`](#room) | — | any occupant of the room | said back into the room | **no** — outbound WebSocket to the room server | none (`mock`), or SASL + optional room password (`xmpp`) | always |
 
 Every kind's `settings` may carry `secret "ENV_VAR"` references instead of literals; the host resolves
 them once at load, before any adapter reads its settings.
@@ -146,20 +146,41 @@ delivers each message as a turn that names **who** said it.
 ```flux
 channel standup
   kind "room"
-  backend "mock"
+  backend "xmpp"
+  url "wss://example.org/xmpp-websocket"
   room "standup@conference.example.org"
+  domain "example.org"
   nick "flux"
 ```
 
-- `backend` — which room implementation to join with. **`mock`** is the in-process one (the same role
-  the `mock` model provider plays: no network, no vendor, fully scriptable). An unrecognized backend is
-  a load error.
+- `backend` — which room implementation to join with. An unrecognized backend is a load error.
+  - **`xmpp`** — any standards-compliant MUC: prosody, ejabberd, or a hosted Jitsi tenant. Speaks
+    XMPP over a WebSocket (RFC 7395), so it needs **no browser and no vendor SDK**.
+  - **`mock`** — the in-process one (the same role the `mock` model provider plays: no network, no
+    vendor, fully scriptable).
 - `room` — the room address as the **server** spells it. Take it from the server rather than assembling
-  it: some hosts lowercase the room in its address while other identifiers keep the original case.
-- `nick` — the name flux joins under. Defaults to `flux`.
+  it: some hosts lowercase the room in its address while other identifiers keep the original case. Once
+  joined, flux uses the address the server reported and ignores the case you wrote here.
+- `nick` — the name flux joins under. Defaults to `flux`. The server may hand back a different one on
+  a collision, and flux follows it.
 - `address_rule` — when the agent should treat a turn as aimed at it. **Accepted but not yet enforced:**
   today every inbound message produces a turn, so a room with two people talking to each other will
   wake the program on every line.
+
+Settings for `backend "xmpp"`:
+
+- `url` — the WebSocket endpoint, `wss://…` (required). A room address says *which* room, never
+  *where* to connect.
+- `domain` — the XMPP domain to open the stream to. Defaults to the endpoint's host, which is right
+  when the server and the conference component share a host and wrong when they do not (a room on
+  `conference.example.org` usually lives on the server `example.org`).
+- `user` / `password` — SASL `PLAIN` credentials. **Omit both to join anonymously**, which is what
+  hosted Jitsi tenants expect (they authorize on the endpoint URL instead). Write the password as
+  `password secret "KEY"`.
+- `muc_password` — the room's own password, if it has one. Also a `secret` reference.
+- `allow_private_net` — permit an endpoint that resolves to a private or loopback address, e.g. a
+  prosody on your LAN. **Off by default:** flux's egress guard refuses internal addresses unless you
+  say so.
 
 **Payload:** `{ "room", "text", "speaker", "nick", "name" }`. `speaker` is the occupant's stable,
 room-scoped address and `nick` their display name — two occupants can share a nick, so key anything
@@ -170,7 +191,10 @@ privately for a private one. Our own echoed messages never become turns.
 
 **No media.** Presence and text only — no audio and no screenshare. A delivery that fails (including
 an op the approver denied) is logged and the room keeps running: people are still in it, and one
-message going wrong is not a reason to walk out.
+message going wrong is not a reason to walk out. If the *connection* dies mid-meeting, the room ends
+and is logged, but the rest of the program's channels keep serving. A room that could never be joined
+at all — wrong endpoint, refused credential — is a startup failure, because a silently absent agent is
+worse than a loud stop.
 
 :::warning A room is untrusted multi-party input
 Anyone who can reach the room can type into it, and on many hosts anyone holding the link can join with
@@ -207,6 +231,9 @@ Stated plainly, because each one changes how you would deploy a channel:
 4. **Headless means no approver.** Anything that would prompt for approval cannot be confirmed in a
    channel-driven run. Set an explicit `permissions` ceiling; do not rely on `--yes`, which can only
    auto-approve *within* the ceiling and never widens it.
-5. **Multi-party rooms are not a channel yet.** Meeting rooms — many humans and agents co-present,
-   with presence, text, audio and screenshare — are designed but unimplemented (epic D-203 on the
-   internal board). Nothing in the shipped kinds carries multi-participant presence.
+5. **A room agent answers everything.** `room` ships presence and text against real MUC servers, but
+   `address_rule` is carried and not yet enforced — every line said in the room becomes a turn,
+   including two people talking to each other. Put a room agent in a busy room only if you mean to pay
+   for every sentence in it.
+6. **Rooms carry no media.** Audio and screenshare need a WebRTC endpoint and are not implemented; the
+   `room` kind is text and presence only.

@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use flux_app::{App, JourneyRun};
 use flux_channels::rooms::{
-    MessageScope, MockRoom, Occupant, OccupantKind, RoomEvent, RoomIdentity, RoomTurnDriver,
+    room_event_channel, MessageScope, MockRoom, Occupant, OccupantId, OccupantKind, Room,
+    RoomEvent, RoomId, RoomIdentity, RoomStream, RoomTurnDriver,
 };
 use flux_channels::{build_channels, AppDeliverer, Channel, Deliverer, RoomChannel};
 use flux_flow::voice::{Speaker, VoiceReply, VoiceTurnHandler};
@@ -201,6 +202,134 @@ fn room_channel_builds_from_a_decl_and_rejects_an_unknown_backend() {
     let err = build_error(decl(json!({ "backend": "mock" })));
     assert!(err.contains("standup"), "names the channel: {err}");
     assert!(err.contains("room"), "names the missing field: {err}");
+}
+
+#[test]
+fn the_xmpp_backend_builds_from_a_decl_and_needs_an_endpoint() {
+    // D-205's backend registers alongside `mock`. Nothing connects at build time; a missing endpoint
+    // is caught here rather than at join, because a MUC JID says which room and never where.
+    let built = build_channels(&[decl(json!({
+        "backend": "xmpp",
+        "room": "standup@conference.example.org",
+        "url": "wss://example.org/xmpp-websocket",
+        "domain": "example.org",
+        "nick": "flux",
+    }))])
+    .expect("an `xmpp` room channel builds through build_channels");
+    assert_eq!(built.len(), 1);
+
+    let err = build_error(decl(json!({
+        "backend": "xmpp",
+        "room": "standup@conference.example.org",
+    })));
+    assert!(err.contains("standup"), "names the channel: {err}");
+    assert!(err.contains("url"), "names what is missing: {err}");
+
+    // The unknown-backend message stays accurate as backends are added.
+    let err = build_error(decl(json!({ "backend": "telepathy", "room": "r@c" })));
+    assert!(
+        err.contains("mock, xmpp"),
+        "lists the known backends: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_room_that_dies_mid_meeting_ends_its_channel_but_not_the_host() {
+    // The posture D-205 decided, asserted at the seam that implements it: `flux_channels::serve` ends
+    // the process on a channel `Err`, so a socket that died mid-meeting must NOT produce one — while a
+    // join that never succeeded must.
+    struct Rigged {
+        id: RoomId,
+        joinable: bool,
+    }
+    #[async_trait]
+    impl Room for Rigged {
+        fn id(&self) -> &RoomId {
+            &self.id
+        }
+        async fn join(&self, _i: &RoomIdentity) -> flux_core::Result<RoomStream> {
+            if !self.joinable {
+                return Err(flux_core::Error::Other("the endpoint refused us".into()));
+            }
+            let (tx, stream) = room_event_channel();
+            let timo = Occupant::new("standup@rooms.example/timo", "timo", OccupantKind::Human);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(RoomEvent::Joined {
+                        occupant: timo.clone(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(RoomEvent::Message {
+                        from: timo.id.clone(),
+                        text: "morning".into(),
+                        scope: MessageScope::Groupchat,
+                    })
+                    .await;
+            });
+            Ok(stream)
+        }
+        async fn occupants(&self) -> flux_core::Result<Vec<Occupant>> {
+            Ok(Vec::new())
+        }
+        async fn say(&self, _text: &str) -> flux_core::Result<()> {
+            Err(flux_core::Error::Other("the socket is gone".into()))
+        }
+        async fn whisper(&self, _to: &OccupantId, _text: &str) -> flux_core::Result<()> {
+            Ok(())
+        }
+        async fn leave(&self) -> flux_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Answers every delivery with one line, so the channel tries to say something.
+    struct Answering;
+    #[async_trait]
+    impl Deliverer for Answering {
+        async fn deliver(&self, _label: &str, _payload: Value) -> anyhow::Result<Vec<JourneyRun>> {
+            Ok(vec![JourneyRun {
+                journey: "reply".into(),
+                result: "good morning".into(),
+                steps: 1,
+                usage: None,
+                model: "mock/mock".into(),
+            }])
+        }
+    }
+
+    let settings = json!({ "backend": "mock", "room": "standup@rooms.example" });
+    let died = RoomChannel::with_room(
+        &decl(settings.clone()),
+        Arc::new(Rigged {
+            id: RoomId::new("standup@rooms.example"),
+            joinable: true,
+        }),
+    )
+    .unwrap();
+    assert!(
+        died.start(Arc::new(Answering), CancellationToken::new())
+            .await
+            .is_ok(),
+        "a dead socket ends the room, not the host"
+    );
+
+    let never_joined = RoomChannel::with_room(
+        &decl(settings),
+        Arc::new(Rigged {
+            id: RoomId::new("standup@rooms.example"),
+            joinable: false,
+        }),
+    )
+    .unwrap();
+    let err = never_joined
+        .start(Arc::new(Answering), CancellationToken::new())
+        .await
+        .expect_err("a channel that never started is the operator's to fix");
+    assert!(
+        err.to_string().contains("standup"),
+        "names the channel: {err}"
+    );
 }
 
 /// `build_channels`' error for one declaration. `Vec<Box<dyn Channel>>` is not `Debug`, so the `Ok`

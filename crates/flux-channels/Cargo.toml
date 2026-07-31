@@ -12,6 +12,9 @@ flux-credentials.workspace = true
 flux-flow.workspace = true
 flux-server = { workspace = true, features = ["introspect"] }
 flux-lang.workspace = true
+# The one egress guard (`flux_system::net::guard_url_scoped`), applied to the XMPP WebSocket endpoint
+# before it is dialled. There is no second URL guard in this crate.
+flux-system.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
@@ -21,6 +24,22 @@ anyhow.workspace = true
 axum.workspace = true
 cron.workspace = true
 chrono.workspace = true
+# ── the XMPP MUC room backend (D-205) ──
+# The RFC 7395 WebSocket binding, reusing the connector flux already carries for the realtime/codex
+# providers — so no second TLS stack enters the graph (`rustls-tls-webpki-roots`, workspace-pinned).
+tokio-tungstenite.workspace = true
+# `SinkExt`/`StreamExt` for the WebSocket. `RoomStream` itself stays an owned bounded receiver
+# (D-204), so this is confined to the backend's own socket loop.
+futures-util.workspace = true
+# The stanza reader/writer. Deliberately a *parser*, not an XMPP client: `tokio-xmpp` would open its
+# own TCP socket and resolve its own DNS, which cannot be routed through the egress guard above, and
+# would drag a full XEP stack plus a second TLS backend for a surface that needs presence, groupchat
+# and private messages. quick-xml is MIT (flux is MIT OR Apache-2.0), and its only transitive
+# dependency — memchr — is already in the graph.
+quick-xml = "0.41"
+# SASL PLAIN's `\0user\0password` payload, and the guarded endpoint URL.
+base64.workspace = true
+url.workspace = true
 slack-morphism = { workspace = true, optional = true }
 
 [features]
