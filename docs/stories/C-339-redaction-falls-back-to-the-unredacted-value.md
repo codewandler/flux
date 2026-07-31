@@ -46,8 +46,10 @@ refuse, not shrug.
       unredacted.** Same class as C-323 but a different tree (typed OTel attributes, not
       `serde_json::Value`), so C-323 correctly left it alone. Close it here or file it onward with a
       reason — do not let it fall between the two stories.
-      → closed here, as **not a hole**, with the reason recorded on `redact_attr` and pinned by a
-      test; see [The OTel verdict](#the-otel-verdict).
+      → **split.** The *span* half is closed here as not-a-hole, with the reason on `redact_attr`
+      and pinned by a test. The *metrics* half is a real, pre-existing gap and is filed onward as
+      [C-343](C-343-otel-metrics-attributes-skip-the-redactor.md) because closing it changes a
+      published `pub fn`'s signature. See [The OTel verdict](#the-otel-verdict).
 - [x] Full gate green in both workspaces.
 
 ## What "closed" means here
@@ -90,6 +92,7 @@ sanitisation step, taken from the exhaustive list of `Redactor::redact` / `redac
 | `crates/flux-web/src/http.rs` `parse_body` | `_ => Value::String(redact(&body))` on a parse failure | **safe.** The unparseable branch still redacts. This is the shape `redact_and_hash_request` should have had. |
 | `crates/flux-web/src/http.rs` `reported_url` | `append_query(raw, &public).unwrap_or_else(\|_\| raw.to_string())` | **safe.** `public` is the query with `$secret` params dropped; the credential lives in `params`, never in `raw`, so the fallback under-reports the *query* but cannot re-add a secret. Documented on the function. |
 | `crates/flux-cli/src/plugin_cmd.rs` (echo render) | `to_string_pretty(&value).unwrap_or_else(\|_\| value.to_string())` | **safe.** `value` was already through `redact_plugin_echo`; both branches render the same redacted value. |
+| `crates/flux-plugin/src/host/loading.rs` (op result render) | `to_string_pretty(&v).unwrap_or_else(\|_\| v.to_string())` | **safe.** Identical shape to the row above, one line after `redact_secret_fields(&mut v, …)`; both branches render the same already-redacted value. |
 | `crates/flux-plugin-protocol/src/lib.rs` `redact_secret_fields` | — | **no fallback.** In-place walk, total over objects and arrays. |
 | `crates/flux-cli/src/plugin_cmd.rs` `redact_plugin_echo` | — | **no fallback.** Thin manifest lookup over the above. |
 
@@ -125,6 +128,41 @@ op's error text. All three were already redacted; they are now **pinned** by
 secret in every one of them and sweeps *every* attribute of *every* span in both spellings. Verified
 to bite: stubbing `redact_attr` to pass its value through reds it on `turn.model`.
 
+### …and the metrics half, which the first pass of this audit missed
+
+**Everything above is about `build_trace`. `build_metrics` is a separate projection and it is not
+clean.** It takes **no `Redactor` parameter at all** and pushes `("model", AttrValue::Str(…))`
+verbatim. Probe, one registered all-digit secret, one session, both projections:
+
+```
+TRACE   contains secret: false
+METRICS contains secret: true
+METRICS json: …{"key":"model","value":{"stringValue":"216216789"}}…
+```
+
+That contradicts the module header, which claimed every free-text value landing in a
+"span/**metric**" attribute is redacted. Not a regression from this story — pre-existing since
+C-129, whose own Progress note records `build_metrics(stream, events, pricing)` with no redactor and
+describes the scrub as applying "before it becomes a **span** attribute". It was an oversight, not a
+deliberate exclusion.
+
+Gap size, precisely: the metrics attribute set is `session.id`, `model`, `account`, `agent.id`,
+`tier` and `op.name`; of those only `model` is one the trace side scrubs. So it is a
+defense-in-depth asymmetry on exactly one attribute, not a demonstrated live leak — a model id is a
+vendor label, and the probe reaches it only by registering a secret that *is* the model id.
+
+**Filed onward as [C-343](C-343-otel-metrics-attributes-skip-the-redactor.md), not closed here**,
+because `crates/flux-events/src/lib.rs:33` is `pub mod otel;` — `build_metrics` is public API of the
+published `codewandler-flux-events`, so threading a `&Redactor` through it is a breaking signature
+change and a version decision. This story does not sanction that, and the alternative (a second
+`build_metrics_redacted` beside the unredacted one) is a parallel path that leaves the leaking
+function published.
+
+What this story *did* do so the gap cannot hide while C-343 is open: narrowed `redact_attr`'s scope
+claim from "the exporter's other attributes" to "the other **span** attributes", added the scope
+boundary to the guard test, and **corrected the module header** so the tree no longer asserts a
+guarantee it does not provide.
+
 ## Notes
 
 - Found by [C-323](C-323-redact-json-skips-numbers.md)'s walker audit, which fixed the four
@@ -149,6 +187,17 @@ Done (branch `impl/C-339`):
   and does not cover, plus `no_exported_span_attribute_carries_a_registered_secret` to hold the
   free-form set.
 - Census and OTel verdict recorded above.
+
+Rework pass (review finding: the first OTel audit covered `build_trace` only and wrote that
+incompleteness into a permanent doc comment):
+
+- Corrected the module header, which claimed "span/**metric**" redaction that `build_metrics` has
+  never provided; narrowed `redact_attr`'s scope claim to *span* attributes; added the spans-only
+  boundary to the guard test and clarified that `saw_marker` is a fixture-liveness check, not the
+  thing the guard rests on.
+- Filed [C-343](C-343-otel-metrics-attributes-skip-the-redactor.md) with the probe evidence and the
+  published-API cost.
+- Added the missing `flux-plugin/src/host/loading.rs` row to the census.
 
 **The behavioural change to price** (not done here — no crate version was touched): a
 `ModelCallRecord` whose redaction corrupts the canonical JSON now stores `"request": "[redacted]"`

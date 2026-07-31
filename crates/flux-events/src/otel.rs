@@ -19,11 +19,17 @@
 //! collector, or a collector with a plaintext HTTP receiver (the common `4318` default). A TLS or
 //! gRPC transport is future work, not silently promised here.
 //!
-//! Every free-text value that lands in a span/metric attribute is passed through the caller's
+//! Every free-text value that lands in a **span** attribute is passed through the caller's
 //! [`Redactor`] first — the same scrub every other observation surface applies before content
 //! leaves the process (C-164's precedent). This exporter never reads the raw conversation; it only
 //! reads what other subsystems already redacted before persisting it, plus a handful of
 //! provider/model/outcome strings that are redacted again here as defense in depth.
+//!
+//! ⚠ **The metrics half does not do this** (C-343). [`build_metrics`] takes no [`Redactor`] at all,
+//! so its `model` attribute ships verbatim — the one value the trace side scrubs and the metrics
+//! side does not. This paragraph used to claim "span/metric"; the claim was never true, and C-339's
+//! audit narrowed it rather than leave the module asserting a guarantee it does not provide.
+//! Closing the gap changes a published `pub fn`'s signature, which is why it is its own story.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -99,8 +105,12 @@ fn span_id_for(stream: &str, seq: i64, qualifier: &str) -> String {
 }
 
 /// Scrub a **free-form** span attribute — one whose content originates with the model, the provider
-/// or a tool, and can therefore carry credential material. The exporter's other attributes are
+/// or a tool, and can therefore carry credential material. The other **span** attributes are
 /// deliberately not routed through here, and C-339 audited why:
+///
+/// Scope, stated because the audit's boundary is load-bearing: this covers [`build_trace`] only.
+/// [`build_metrics`] takes no [`Redactor`] and is **not** audited clean — see C-343 and the ⚠ in
+/// the module header.
 ///
 /// - **Numeric attributes are not the C-323 hole.** C-323's defect was a walker over *arbitrary*
 ///   vendor JSON that narrowed by node kind, so an all-digit credential the vendor happened to send
@@ -1172,6 +1182,14 @@ mod tests {
     /// [`redact_attr`]. The assertion sweeps every attribute of every span rather than naming the
     /// three keys, so a *new* attribute fed from the same fields is covered without editing the
     /// test.
+    ///
+    /// The guard rests on the per-attribute secret assertion, which fires independently for each of
+    /// the three fields. `saw_marker` is only a fixture-liveness check — it catches a fixture that
+    /// stopped reaching any free-form attribute at all, so the sweep cannot pass vacuously.
+    ///
+    /// ⚠ **Spans only.** This asserts over [`build_trace`]; [`build_metrics`] is a separate
+    /// projection with no [`Redactor`], and its `model` attribute does carry a registered secret
+    /// today (C-343). Extending this sweep to metrics is that story's job.
     #[test]
     fn no_exported_span_attribute_carries_a_registered_secret() {
         const SECRET: &str = "216216789";
