@@ -56,7 +56,9 @@ pub enum ServerAuth {
     /// serving path — including a lower-level caller that mounts the router into its own
     /// `axum::serve` — inherits the refusal rather than being trusted to re-derive it. The
     /// auto-approving daemon behind an open listener is remote code execution off loopback; there
-    /// is no escape hatch (front it with an authenticating proxy instead).
+    /// is no escape hatch (front it with an authenticating proxy instead). The refusal keys on the
+    /// *property* rather than on this variant — see [`ServerAuth::is_effectively_open`], because a
+    /// `SharedSecret` with an empty secret is `Open` under a different name (C-321).
     Open,
     /// One static shared secret for the whole deployment (the pre-D-69 mode): every request
     /// presents `Authorization: Bearer <secret>`, compared in constant time. There is no
@@ -86,6 +88,15 @@ impl ServerAuth {
 
     /// Shared-secret mode with an optional advertised base URL (see [`ServerAuth::SharedSecret`]);
     /// `None` token → [`ServerAuth::Open`].
+    ///
+    /// `Some("")` deliberately still yields `SharedSecret { secret: "" }` rather than being
+    /// normalised to `Open` or rejected here: silently rewriting an operator's configuration is how
+    /// the empty secret stayed invisible in the first place, and an infallible constructor cannot
+    /// report the config error that would justify the rewrite. It is instead refused where it can
+    /// do damage —
+    /// [`guard_open_bind`] will not let it reach a non-loopback bind, and [`require_auth`] will not
+    /// let it authenticate anything. Producers that can report a config error should refuse it at
+    /// load as well (the CLI's `FLUX_SERVER_TOKEN` filter, the `a2a` adapter's).
     pub fn shared_secret(token: Option<String>, external_url: Option<String>) -> Self {
         match token {
             Some(secret) => ServerAuth::SharedSecret {
@@ -93,6 +104,30 @@ impl ServerAuth {
                 external_url,
             },
             None => ServerAuth::Open,
+        }
+    }
+
+    /// **Is this mode unauthenticated in effect, whatever it is called?** `true` for [`Open`], and
+    /// `true` for a [`SharedSecret`] whose secret is empty.
+    ///
+    /// The second case is the whole point (C-321). A request carrying no `Authorization` header
+    /// presents `""`, and `constant_time_eq(b"", b"")` is `true` — so an empty expected secret
+    /// admits every anonymous caller, exactly as `Open` does, while reading everywhere it is printed
+    /// or logged as "shared-secret". A guard that pattern-matches the `Open` *variant* therefore
+    /// does not capture the property it means, and an empty secret walks past it; this predicate is
+    /// that property stated once, so the guard cannot drift from it again.
+    ///
+    /// Emptiness, not blankness: `" "` is a bad secret, but a request must still present it to
+    /// authenticate, so it is not this bypass and is not silently reclassified here. Producers that
+    /// can fail at load reject whitespace-only tokens up front, where a config error is actionable.
+    ///
+    /// [`Open`]: ServerAuth::Open
+    /// [`SharedSecret`]: ServerAuth::SharedSecret
+    fn is_effectively_open(&self) -> bool {
+        match self {
+            ServerAuth::Open => true,
+            ServerAuth::SharedSecret { secret, .. } => secret.is_empty(),
+            ServerAuth::Principal(_) => false,
         }
     }
 
@@ -511,13 +546,36 @@ fn unauthenticated_bind_allowed(addr: SocketAddr) -> bool {
 /// exposed off loopback"* (`AGENTS.md`: *there are no bypass paths — don't add one*). Enforced HERE,
 /// at router build, rather than only inside [`serve_on`]: a lower-level caller that mounts the router
 /// into its own `axum::serve` (the `a2a` channel does exactly this) inherits the refusal by
-/// construction instead of being silently responsible for re-deriving it. [`ServerAuth::Open`] on a
+/// construction instead of being silently responsible for re-deriving it. An unauthenticated
 /// non-loopback bind is remote code execution against the auto-approving daemon, so it is refused
 /// outright — there is deliberately no escape hatch. A deployment that must face the network fronts
 /// the loopback daemon with an authenticating reverse proxy (or configures shared-secret/principal
 /// auth), it does not open the listener itself.
+///
+/// "Unauthenticated" is [`ServerAuth::is_effectively_open`], **not** `matches!(auth, Open)`. That
+/// distinction is C-321: this guard used to key on the variant, and a `SharedSecret` carrying an
+/// empty secret — which authenticates every anonymous request — is not that variant, so it walked
+/// straight past a comment promising no escape hatch and bound `0.0.0.0`. Keying on the property
+/// means a future mode that is open in effect is refused by this guard without anyone having to
+/// remember to extend a `matches!`.
+///
+/// [`require_auth`] independently refuses to authenticate against an empty secret, so neither half
+/// depends on the other being right. This is the half that runs **before a port is served**, which
+/// is the only half that can prevent the exposure rather than survive it.
 fn guard_open_bind(auth: &ServerAuth, addr: SocketAddr) -> anyhow::Result<()> {
-    if matches!(auth, ServerAuth::Open) && !unauthenticated_bind_allowed(addr) {
+    if auth.is_effectively_open() && !unauthenticated_bind_allowed(addr) {
+        // Two different operator mistakes, two different fixes: "you configured nothing" vs "you
+        // configured a token that is the empty string" (`token secret "K"` with `K` exported empty
+        // resolves to exactly that, and `std::env::var` does not filter it).
+        if matches!(auth, ServerAuth::SharedSecret { .. }) {
+            anyhow::bail!(
+                "refusing to build a router for non-loopback bind {addr}: the shared secret is \
+                 empty, which authenticates every request — including one carrying no \
+                 `Authorization` header at all. Give it a value (a `secret \"KEY\"` reference \
+                 resolves to an empty string when `KEY` is exported empty), or bind to \
+                 127.0.0.1/::1"
+            );
+        }
         anyhow::bail!(
             "refusing to build an unauthenticated router for non-loopback bind {addr}; set \
              FLUX_SERVER_TOKEN (shared-secret auth) or bind to 127.0.0.1/::1"
@@ -1133,7 +1191,8 @@ fn router_multi_with_ttl_and_limits(
 ///
 /// - `Open` — pass-through (loopback-only bind enforced in [`serve_on`]).
 /// - `SharedSecret` — constant-time compare of `Authorization: Bearer <secret>` (pre-D-69, plus
-///   the RFC 7235-required `WWW-Authenticate` challenge on 401).
+///   the RFC 7235-required `WWW-Authenticate` challenge on 401). An **empty** expected secret
+///   authenticates nothing at all rather than everything (C-321 — see the inline note).
 /// - `Principal` — resolve the bearer to an [`AuthContext`] via the configured
 ///   [`RequestAuthenticator`] and stash it in request extensions.
 ///
@@ -1148,6 +1207,17 @@ async fn require_auth(
     match auth.as_ref() {
         ServerAuth::Open => next.run(req).await,
         ServerAuth::SharedSecret { secret, .. } => {
+            // **An empty expected secret authenticates nothing** (C-321). A request with no
+            // `Authorization` header presents `""`, and a constant-time compare of two empty byte
+            // strings is `true` — so without this line an empty secret would admit every anonymous
+            // caller. [`guard_open_bind`] already refuses to build such a router for a non-loopback
+            // bind; this is the same rule stated where the comparison happens, so a loopback
+            // deployment (which that guard admits by design) still cannot be mistaken for
+            // authenticated, and a future path reaching this middleware without that guard cannot
+            // reopen the hole.
+            if secret.is_empty() {
+                return unauthorized();
+            }
             let header = match single_auth_header(&req) {
                 Ok(h) => h,
                 Err(resp) => return *resp,
@@ -1718,6 +1788,67 @@ mod tests {
             status(guarded_app(ServerAuth::Open), "/protected", None).await,
             StatusCode::OK
         );
+    }
+
+    /// C-321, the request half. A request with **no** `Authorization` header presents `""`, and
+    /// `constant_time_eq(b"", b"")` is `true` — so an empty expected secret would authenticate every
+    /// anonymous caller while the mode reads, everywhere it is printed or logged, as
+    /// "shared-secret". Constructed as a struct literal on purpose: this half must hold for *any*
+    /// path that reaches [`require_auth`] with an empty secret, not only for the ones that come
+    /// through a constructor which already refuses one.
+    #[tokio::test]
+    async fn an_empty_shared_secret_authenticates_nothing() {
+        let app = || {
+            guarded_app(ServerAuth::SharedSecret {
+                secret: String::new(),
+                external_url: None,
+            })
+        };
+        // The bypass: no header at all.
+        assert_eq!(
+            status(app(), "/protected", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // And its two near neighbours — an empty bearer, and any bearer at all.
+        assert_eq!(
+            status(app(), "/protected", Some("Bearer ")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(app(), "/protected", Some("Bearer anything")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // The exempt routes stay exempt — an empty secret bricks authentication, it does not
+        // change which routes carry the auth layer.
+        assert_eq!(status(app(), "/health", None).await, StatusCode::OK);
+    }
+
+    /// C-321, the bind half, at the guard itself. The integration test
+    /// (`tests/empty_shared_secret_bind.rs`) exercises this through a real socket and the public
+    /// [`router`]; this pins the predicate directly so the guard's own truth table is legible.
+    #[test]
+    fn empty_shared_secret_is_effectively_open() {
+        let public: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let empty = || ServerAuth::shared_secret(Some(String::new()), None);
+        let real = || ServerAuth::shared_secret(Some("s3cr3t".into()), None);
+
+        assert!(
+            guard_open_bind(&empty(), public).is_err(),
+            "an empty shared secret is `Open` in everything but name; it must not bind {public}"
+        );
+        assert!(
+            guard_open_bind(&ServerAuth::Open, public).is_err(),
+            "regression: the original `Open` refusal must survive"
+        );
+        assert!(
+            guard_open_bind(&real(), public).is_ok(),
+            "a real shared secret is authentication; the public bind stays allowed"
+        );
+        // Loopback: `Open` is allowed there by design, and so is the empty secret — the daemon is
+        // not exposed. The *request* half (above) is what makes an empty secret useless there.
+        assert!(guard_open_bind(&empty(), loopback).is_ok());
+        assert!(guard_open_bind(&ServerAuth::Open, loopback).is_ok());
     }
 
     /// A provider that never gets called in the usage-endpoint tests below — the fixture engine

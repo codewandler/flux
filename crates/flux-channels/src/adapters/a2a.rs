@@ -41,6 +41,12 @@ impl A2aChannel {
         // optional bearer token, else open. The served agent has no interactive approver, so an
         // open non-loopback listener is a remote surface — require authentication there, mirroring
         // the webhook channel and `flux --serve`.
+        //
+        // Matching the `Open` variant is sufficient *here* only because `a2a_auth_from_settings`
+        // has already refused an empty `token`, which would otherwise reach this line as a
+        // `SharedSecret` that is `Open` in effect (C-321). `flux_server::router` re-checks the
+        // property rather than the variant, so this check being variant-shaped is a convenience,
+        // not the guarantee.
         let auth = a2a_auth_from_settings(&s, &decl.name)?;
         if matches!(auth, flux_server::ServerAuth::Open) && !addr.ip().is_loopback() {
             anyhow::bail!(
@@ -87,6 +93,32 @@ impl A2aChannel {
 /// value here by the time settings deserialize.
 fn a2a_auth_from_settings(s: &A2aSettings, name: &str) -> anyhow::Result<flux_server::ServerAuth> {
     let Some(endpoint) = s.introspect_url.clone() else {
+        // **An empty token is not a token, and it is worse than none** (C-321, the third instance of
+        // the bypass D-216 and C-317 closed in the connector and webhook adapters).
+        //
+        // `token ""` — or `token secret "K"` where `K` is exported empty, because
+        // `flux_app::resolve_secrets` resolves through `std::env::var`, which does not filter an
+        // empty value — arrives here as `Some("")`. `ServerAuth::shared_secret` maps that to
+        // `SharedSecret { secret: "" }`, *not* `Open`, so the `Open`-keyed non-loopback guard below
+        // does not fire; and the server's bearer check compares the presented token (which is `""`
+        // when the request carries no `Authorization` header at all) against the expected one, and
+        // two empty byte strings are equal. The result is a public listener in front of a daemon
+        // that auto-approves every tool call, presented to its operator as authenticated.
+        //
+        // Refused rather than normalised to `None`, and refused on **loopback** too: normalising is
+        // silent, and would ship an operator a channel they believe is authenticated, one `addr`
+        // edit away from being public. flux-server refuses the same configuration twice more
+        // (`guard_open_bind` will not build a public router for it, `require_auth` will not
+        // authenticate against it), so no half depends on another being right — but this is the
+        // half that turns it into a config error the operator can act on, before a port is bound.
+        if s.token.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            anyhow::bail!(
+                "channel `{name}`: `token` is set but empty, which would authenticate every \
+                 request — including one carrying no `Authorization` header at all. Give it a \
+                 value, or remove it (a loopback bind needs none). A `secret \"KEY\"` reference \
+                 resolves to an empty string when `KEY` is exported empty."
+            );
+        }
         // Shared-secret (or open) mode. Advertise `external_url` on the card when set, so a
         // non-loopback shared-secret channel isn't exposed to Host-poisoning of its card.
         return Ok(flux_server::ServerAuth::shared_secret(
@@ -184,6 +216,29 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(tok, flux_server::ServerAuth::SharedSecret { .. }));
+    }
+
+    /// C-321, the producer half: `token ""` — or `token secret "K"` with `K` exported empty, which
+    /// `flux_app::resolve_secrets` resolves through `std::env::var` without filtering — arrives here
+    /// as `Some("")` and must be refused at load, before a port is bound. Refused on loopback too:
+    /// normalising it to `Open` would be silent, and would ship an operator a channel they believe
+    /// is authenticated, one `addr` edit away from being public.
+    #[test]
+    fn empty_token_is_refused_at_load() {
+        for addr in ["127.0.0.1:0", "0.0.0.0:0"] {
+            for token in ["", "   "] {
+                let err = a2a_auth_from_settings(
+                    &settings(serde_json::json!({ "addr": addr, "token": token })),
+                    "c",
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains("empty"),
+                    "`token = {token:?}` on {addr} must be refused as empty; got: {err}"
+                );
+            }
+        }
     }
 
     #[test]
