@@ -86,6 +86,16 @@ bind tests red and the request test stays green.
 
 `constant_time_eq` was left untouched, as the story directs.
 
+**Base proof** (merge base `819e35d5`, base implementation with both tests grafted on, own target dir):
+`a_request_with_no_authorization_header_is_rejected_by_an_empty_token_channel` reds with
+`left: 200, right: 401` — an anonymous request authenticating is the bypass itself, observed;
+`an_empty_token_is_refused_before_a_port_is_bound` and `a_set_but_empty_secret_env_var_is_refused_too`
+red with "an empty token must be refused" on both the loopback and the `0.0.0.0` bind.
+
+Full gate green in both workspaces: `cargo test --workspace` (187 suites), `clippy --all-targets
+-D warnings`, `fmt --all --check`, `cargo test -p flux-codegate` (26), and `fmt --check` on
+`plugins/Cargo.toml`.
+
 **A third instance exists and is NOT fixed here** (out of this story's fence — it is in
 `flux-server`, not `flux-channels`, and warrants its own story + review):
 `crates/flux-channels/src/adapters/a2a.rs:92` passes the `[a2a]` channel's `token` straight into
