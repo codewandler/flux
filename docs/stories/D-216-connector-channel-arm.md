@@ -2,7 +2,7 @@
 id: D-216
 title: "`build_channels` gains one `connector` arm — a manifest binding, with every rule a load error"
 pillar: Agent
-status: in-progress
+status: done
 epic: connector-channels
 note: "the arm itself: resolve ~/.flux/connectors/<name>.connector.toml through flux_system, load the named binding, and refuse EVERYTHING refusable before a port is bound — a manifest is a published artifact and a published artifact can be edited after publication"
 ---

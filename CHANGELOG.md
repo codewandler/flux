@@ -8,6 +8,40 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`build_channels` gains a `connector` arm — a manifest binding, with every rule a load error**
+  (D-216). A channel of kind `connector` resolves
+  `~/.flux/connectors/<connector>.connector.toml` through `flux_system::System`, loads the named
+  binding, and refuses everything refusable **before a port is bound**. That ordering is the story:
+  a connector manifest is a published artifact, and a published artifact can be edited after
+  publication, so every rule it carries is re-enforced here rather than trusted.
+
+  Twenty-odd refusals, each with its own test and each naming the channel: an uninstalled connector,
+  an unknown binding (naming what does exist), poll/socket/unknown transports, an unverified webhook
+  binding, an unknown verification kind, a credential the binding names with no entry, a timestamped
+  signature without tolerance, a body-sourced timestamp, a signed template without `{body}` or with
+  an unknown placeholder, a reply binding an undeclared symbol or an unpublished operation, a payload
+  path failing the grammar, a delivery id colliding with a payload symbol, an undeclared event, a
+  selector naming an unparseable header, and a manifest for the wrong connector or service.
+
+  Two of those closed **silent** failures found in the recovered implementation, both of which read
+  as working: an event narrowed by a `when` condition loaded and then no-opped on every delivery,
+  because the discriminator carries the coarse value that narrowing removes from the closed event
+  set; and a header name that is not a parseable HTTP header resolved to nothing on every delivery —
+  a discriminator that never fires, or a signature check that **fails open**.
+
+  `hmac` bindings and `when`-narrowed events are hard load errors naming the stories that would lift
+  them (C-291/C-292 and D-222), placed after every structural check so a defective spec still reports
+  its own defect. Nothing degrades silently to unverified. In practice the arm today serves
+  `verification.kind = "none"` webhooks only.
+
+  An **empty bearer token is refused at load**, on loopback binds too. `token ""` — or
+  `token secret "K"` where `K` is exported empty, since secret resolution goes through
+  `std::env::var`, which does not filter an empty value — would otherwise reach the handler as
+  `Some("")`, and a constant-time compare of two empty byte strings is `true`, so every anonymous
+  request would have authenticated. The comparison refuses an empty expected token independently, so
+  neither half depends on the other being right. **The identical hole is pre-existing in the webhook
+  adapter and is tracked as C-317, not fixed here.**
+
 - **`http.request` accepts a structured `query` map, and percent-encodes every value per RFC 3986**
   (C-303). Authored Flux could previously only build a query by interpolating into the URL string,
   and nothing encoded the result — so a model-supplied value carrying `&` or `=` rewrote the request

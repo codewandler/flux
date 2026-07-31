@@ -4,6 +4,13 @@
 //! *result*, not an op failure — a 404 comes back with its status, the op succeeds. This is the
 //! "APIs → tier 1" surface: for reading a page *as a document* the model should reach for
 //! `web.fetch` (tier 2) instead.
+//!
+//! **The result is a record** (C-304): the canonical `content` is the JSON object
+//! `{status, headers, body}`, so an authored flow can select `$resp.body.data.id` instead of
+//! scraping one flat string, and the model-facing `view` keeps the rendered `HTTP …` block a person
+//! reads. That split is the C-10 precedent — `ToolResult.content` is a `String`, so a structured
+//! result travels as canonical JSON with a human `view` beside it, rather than widening
+//! `ToolResult` itself.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +89,10 @@ impl Tool for HttpRequestTool {
         ToolSpec {
             name: "http.request".into(),
             description: "Make an arbitrary HTTP(S) request (any method, headers, and body) and \
-                return the status, response headers, and body. Use this for APIs and raw protocol \
+                return the record `{status, headers, body}` — `status` a number, `headers` a map \
+                keyed by the response header name, `body` the parsed JSON when the response is a \
+                JSON object or array and the raw text otherwise. Select a field directly \
+                (`$resp.body.data.id`). Use this for APIs and raw protocol \
                 access; to read a web page as a readable document prefer `web.fetch`. \
                 Private/loopback addresses are blocked unless the `web` egress scope grants them. \
                 Pass query parameters as the `query` record — each value is percent-encoded, so \
@@ -111,7 +121,7 @@ impl Tool for HttpRequestTool {
                 },
                 "required": ["url"]
             }),
-            output_schema: None,
+            output_schema: Some(response_schema()),
             // Arbitrary HTTP can mutate remote state (POST/PUT/DELETE), so this is not the read-only
             // shape `web.fetch` uses: honest Network effect, Medium risk, non-idempotent.
             effects: vec![Effect::Network],
@@ -238,7 +248,9 @@ impl Tool for HttpRequestTool {
         .await?;
 
         let status = response.status();
-        let headers_text = render_headers(response.headers());
+        // One walk over the response headers produces BOTH the record's map and the rendered block,
+        // under one shared budget — so the two can never disagree about what was kept.
+        let headers = collect_headers(response.headers(), |value| ctx.redactor.redact(value));
         let capped = egress::read_body_capped(response, MAX_BODY_BYTES, "http.request").await?;
         let mut body = cap_str(
             String::from_utf8_lossy(&capped.bytes).into_owned(),
@@ -247,15 +259,142 @@ impl Tool for HttpRequestTool {
         if capped.truncated && !body.ends_with("…[truncated]") {
             body.push_str("\n…[truncated]");
         }
-
-        // A completed request is a successful op: the HTTP status (incl. 4xx/5xx) is *data*, carried
-        // in the first line — never a tool-level error.
-        Ok(ToolResult {
-            content: format!("HTTP {status}\n{headers_text}\n{body}"),
-            view: None,
-            is_error: false,
-        })
+        // A completed request is a successful op: the HTTP status (incl. 4xx/5xx) is *data* in the
+        // record — never a tool-level error.
+        let view = format!(
+            "HTTP {status}\n{}\n{}",
+            headers.rendered,
+            ctx.redactor.redact(&body)
+        );
+        let record = json!({
+            "status": status.as_u16(),
+            "headers": headers.map,
+            "body": parse_body(body, |text| ctx.redactor.redact(text)),
+        });
+        Ok(ToolResult::ok_view(
+            serde_json::to_string(&record)
+                .map_err(|e| Error::Other(format!("http.request: encoding the response: {e}")))?,
+            view,
+        ))
     }
+}
+
+/// The declared shape of the result record. `body` carries no `type`: it is whatever the response
+/// was (see [`parse_body`]), and claiming one would be a lie for half of all responses.
+fn response_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One completed HTTP response. A non-2xx status is a value here, not an error.",
+        "properties": {
+            "status": {
+                "type": "integer",
+                "description": "The HTTP status code, e.g. 200 or 404."
+            },
+            "headers": {
+                "type": "object",
+                "description": "Response headers keyed by name (lowercased, as sent). A header sent more than once is joined with `, `. A name carrying a `-` is not reachable with the `$resp.headers.name` sugar — read it with `pick({items: $resp.headers, keys: [\"content-type\"]})`.",
+                "additionalProperties": {"type": "string"}
+            },
+            "body": {
+                "description": "The parsed body when it is a JSON object or array; otherwise the raw text (HTML, plain text, an empty string, or a truncated/malformed payload)."
+            }
+        },
+        "required": ["status", "headers", "body"]
+    })
+}
+
+/// The response body as it goes into the record: **parsed** when it is a JSON object or array,
+/// otherwise the raw text.
+///
+/// That rule is deliberately the interpreter's own (`flux_lang::runtime::jq_parse_input`) rather
+/// than a `content-type` sniff. Two reasons: plenty of APIs answer JSON under `text/plain`, so the
+/// declared type is not the fact; and a bare JSON scalar (`42`, `"ok"`) reads better as the text it
+/// was than as a retyped value, which is exactly the line the language already draws.
+///
+/// **Nothing here can fail.** An HTML error page, an empty body and a truncated payload all fall
+/// through to the string arm, so the record keeps its status and headers and the call still
+/// succeeds — the stream-resilience posture (unparseable bytes are counted, not fatal) applied to a
+/// response body.
+///
+/// **Redaction runs AFTER the parse, over the decoded leaves** — never over the JSON text. Two
+/// distinct reasons, and both are load-bearing:
+///
+/// - A registered secret containing a `"`, a `\` or a newline is *escaped* in the JSON text, so a
+///   literal match there would miss it. The decoded leaf carries the value as it really is.
+/// - The pattern redactor replaces a credential-shaped run between delimiters, and a `"` is one of
+///   its delimiters — run over JSON text it can eat the quote's neighbourhood and leave a payload
+///   that no longer parses. Redacting leaves cannot corrupt the structure.
+fn parse_body(body: String, redact: impl Fn(&str) -> String) -> Value {
+    match serde_json::from_str::<Value>(&body) {
+        Ok(parsed) if parsed.is_object() || parsed.is_array() => redact_json(parsed, &redact),
+        _ => Value::String(redact(&body)),
+    }
+}
+
+/// Redact every string leaf (and object key) of a parsed body. Numbers and booleans cannot carry a
+/// secret; keys are covered because a vendor that echoes a request record back can echo a
+/// credential into a key as easily as into a value.
+fn redact_json(value: Value, redact: &impl Fn(&str) -> String) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_json(item, redact))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (redact(&key), redact_json(value, redact)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// The response headers, in both shapes the result needs.
+struct ResponseHeaders {
+    /// The record's `headers` map.
+    map: serde_json::Map<String, Value>,
+    /// The `Name: value` block a person reads in the view.
+    rendered: String,
+}
+
+/// Walk the response headers once, producing the record's map and the rendered block together under
+/// one [`MAX_HEADER_BYTES`] budget, so a pathological header set can't blow either and the two can
+/// never disagree about what was kept.
+///
+/// - **Every value is redacted here**, on the raw text, before it is JSON-encoded — a `set-cookie`
+///   (or any header) echoing a registered secret must not reach a model-visible surface through the
+///   structured map (C-304).
+/// - **A header sent more than once is joined with `, `**, the HTTP field-value folding rule. A JSON
+///   object cannot hold a repeated key and dropping either copy would silently change the meaning.
+///
+/// `redact` is passed as a closure rather than the `Redactor` itself so `flux-web` needs no direct
+/// dependency on `flux-secret` for one call.
+fn collect_headers(headers: &HeaderMap, redact: impl Fn(&str) -> String) -> ResponseHeaders {
+    let mut map = serde_json::Map::new();
+    let mut rendered = String::new();
+    for (name, value) in headers {
+        let value = redact(value.to_str().unwrap_or("<binary>"));
+        let line = format!("{name}: {value}\n");
+        if rendered.len() + line.len() > MAX_HEADER_BYTES {
+            rendered.push_str("…[headers truncated]\n");
+            break;
+        }
+        rendered.push_str(&line);
+        match map.get_mut(name.as_str()) {
+            Some(Value::String(existing)) => {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            }
+            _ => {
+                map.insert(name.as_str().to_string(), Value::String(value));
+            }
+        }
+    }
+    ResponseHeaders { map, rendered }
 }
 
 /// A header value: a plain string, or the secret marker `{"$secret": "ENV_NAME"}`.
@@ -502,22 +641,6 @@ fn as_secret_ref(v: &Value) -> Option<&str> {
     obj.get("$secret")?.as_str()
 }
 
-/// Render the response headers as `Name: value` lines, capped so a pathological header set can't
-/// blow the budget.
-fn render_headers(headers: &reqwest::header::HeaderMap) -> String {
-    let mut out = String::new();
-    for (name, value) in headers {
-        let v = value.to_str().unwrap_or("<binary>");
-        let line = format!("{name}: {v}\n");
-        if out.len() + line.len() > MAX_HEADER_BYTES {
-            out.push_str("…[headers truncated]\n");
-            break;
-        }
-        out.push_str(&line);
-    }
-    out
-}
-
 /// Cap a string to `max` bytes, cut on a char boundary (an arbitrary response body is not
 /// guaranteed to split cleanly — `String::truncate` panics off a boundary).
 fn cap_str(mut s: String, max: usize) -> String {
@@ -571,6 +694,42 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A one-shot loopback server whose response carries `extra_headers` verbatim (each already
+    /// `Name: value`, no CRLF) — the seam the record's `headers` map is asserted through.
+    async fn one_shot_with_headers(
+        status_line: &'static str,
+        extra_headers: Vec<String>,
+        body: String,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let extra: String = extra_headers
+                    .iter()
+                    .map(|h| format!("{h}\r\n"))
+                    .collect::<Vec<_>>()
+                    .concat();
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The result record a completed request produces (`content` is canonical JSON since C-304).
+    fn record(result: &ToolResult) -> Value {
+        serde_json::from_str(&result.content).unwrap_or_else(|e| {
+            panic!("`content` must be the JSON record: {e}: {}", result.content)
+        })
     }
 
     /// A one-shot HTTP server that also reports the raw request bytes it received. Returns its
@@ -659,7 +818,7 @@ mod tests {
             .await
             .expect("a 404 must be a successful op, not an Err");
         assert!(!r.is_error, "a 404 is a result, not a tool error");
-        assert!(r.content.contains("404"), "status surfaced: {}", r.content);
+        assert_eq!(record(&r)["status"], 404, "the status is a value: {r:?}");
     }
 
     #[tokio::test]
@@ -707,7 +866,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.content.ends_with("ok"));
+        assert_eq!(record(&result)["body"], "ok");
         let request = seen.await.expect("redirect destination received a request");
         let lower = request.to_ascii_lowercase();
         for name in [
@@ -1096,6 +1255,226 @@ mod tests {
             msg.contains("allowlist") && !msg.contains("exfiltrate-me-too"),
             "refusal names the allowlist and never leaks the value: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // C-304 — the result is a record
+    // -----------------------------------------------------------------------------------------
+
+    /// The shape itself: canonical `content` is the record `{status, headers, body}`, the status is
+    /// a NUMBER (not a substring of a rendered line), the headers are a map, and a JSON body is
+    /// parsed — which is what lets a caller select `.body.data.id` at all.
+    #[tokio::test]
+    async fn the_result_is_a_record_with_a_numeric_status_a_header_map_and_a_parsed_body() {
+        let base = one_shot_with_headers(
+            "200 OK",
+            vec!["content-type: application/json".into(), "x-rate: 7".into()],
+            r#"{"data":{"id":"cus_42"},"page":2}"#.into(),
+        )
+        .await;
+        let r = tool(PrivateNetAllow::Any)
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .unwrap();
+        let record = record(&r);
+        assert_eq!(record["status"], 200);
+        assert!(
+            record["status"].is_number(),
+            "the status is a number a flow can compare: {record}"
+        );
+        assert_eq!(record["headers"]["content-type"], "application/json");
+        assert_eq!(record["headers"]["x-rate"], "7");
+        // The point of the story: a field, not a blob.
+        assert_eq!(record["body"]["data"]["id"], "cus_42");
+        assert_eq!(record["body"]["page"], 2);
+        assert_eq!(
+            record.as_object().map(|o| o.len()),
+            Some(3),
+            "exactly `status`, `headers` and `body`: {record}"
+        );
+    }
+
+    /// The declared `output_schema` — without it a caller has to read the source to learn the shape,
+    /// and the analyzer carries no result type at all.
+    #[test]
+    fn the_spec_declares_the_response_schema() {
+        let schema = tool(PrivateNetAllow::None)
+            .spec()
+            .output_schema
+            .expect("`http.request` declares an output_schema");
+        assert_eq!(schema["type"], "object");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("the schema describes properties");
+        for field in ["status", "headers", "body"] {
+            assert!(properties.contains_key(field), "schema omits `{field}`");
+        }
+        assert_eq!(schema["properties"]["status"]["type"], "integer");
+        assert_eq!(schema["properties"]["headers"]["type"], "object");
+        // `body` is deliberately untyped — see `parse_body`. Declaring `string` or `object` would be
+        // wrong for half of all responses, and a false schema is worse than none.
+        assert!(
+            schema["properties"]["body"].get("type").is_none(),
+            "`body` must not claim one type: {schema}"
+        );
+        assert_eq!(
+            schema["required"],
+            json!(["status", "headers", "body"]),
+            "every field is always present"
+        );
+        // And the spec is coherent by the shared checker, not by eye.
+        assert!(
+            flux_spec::metadata_violations(&tool(PrivateNetAllow::None).spec(), &[]).is_empty(),
+            "the finished spec must satisfy the shared coherence rules"
+        );
+    }
+
+    /// A non-JSON, malformed, or empty body does not fail the call: the record keeps its status and
+    /// headers and the body falls through to the raw text. A `404` serving an HTML error page is a
+    /// *result* — the same posture as "provider bytes never error a chunk stream".
+    #[tokio::test]
+    async fn a_non_json_or_empty_body_still_produces_a_usable_record() {
+        for (status_line, expected_status, body) in [
+            ("404 Not Found", 404, "<html><body>Not Found</body></html>"),
+            ("500 Internal Server Error", 500, ""),
+            // Truncated/malformed JSON — the shape a capped or cut-off response actually arrives in.
+            ("200 OK", 200, r#"{"data":{"id":"cus_4"#),
+            // A bare JSON scalar stays the text it was (the interpreter's own rule).
+            ("200 OK", 200, "42"),
+        ] {
+            let base =
+                one_shot_with_headers(status_line, vec!["x-trace: abc".into()], body.into()).await;
+            let r = tool(PrivateNetAllow::Any)
+                .execute(&ctx(), json!({ "url": base }))
+                .await
+                .unwrap_or_else(|e| panic!("`{status_line}` with {body:?} must not fail: {e}"));
+            assert!(!r.is_error, "a {status_line} is a result, not an error");
+            let record = record(&r);
+            assert_eq!(record["status"], expected_status, "status intact: {record}");
+            assert_eq!(
+                record["headers"]["x-trace"], "abc",
+                "headers intact: {record}"
+            );
+            assert_eq!(
+                record["body"], body,
+                "an unparseable body is carried as its raw text: {record}"
+            );
+        }
+    }
+
+    /// The human-facing rendering does not regress: the `view` is the same `HTTP <status>` block a
+    /// person read before the record existed, and it is the view — not the canonical JSON — that the
+    /// sink and the model are shown.
+    #[tokio::test]
+    async fn the_human_view_keeps_the_pre_record_rendering() {
+        let base = one_shot_with_headers(
+            "404 Not Found",
+            vec!["content-type: text/html".into()],
+            "<h1>nope</h1>".into(),
+        )
+        .await;
+        let r = tool(PrivateNetAllow::Any)
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .unwrap();
+        let view = r.view.as_deref().expect("a record result carries a view");
+        assert!(
+            view.starts_with("HTTP 404 Not Found\n"),
+            "the status line is unchanged: {view}"
+        );
+        assert!(
+            view.contains("content-type: text/html\n"),
+            "the header block is unchanged: {view}"
+        );
+        assert!(view.ends_with("<h1>nope</h1>"), "the body is last: {view}");
+    }
+
+    /// A repeated response header (`set-cookie` is the one that actually repeats) cannot be a
+    /// duplicate key in a JSON object. Both values must survive — dropping either silently changes
+    /// what the response said.
+    #[tokio::test]
+    async fn a_repeated_response_header_keeps_both_values() {
+        let base = one_shot_with_headers(
+            "200 OK",
+            vec!["set-cookie: a=1".into(), "set-cookie: b=2".into()],
+            "ok".into(),
+        )
+        .await;
+        let r = tool(PrivateNetAllow::Any)
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .unwrap();
+        assert_eq!(record(&r)["headers"]["set-cookie"], "a=1, b=2");
+    }
+
+    /// **The security half of C-304.** The response is the one place a request credential can come
+    /// back at you: a vendor that echoes the token into `set-cookie` and into its JSON body.
+    ///
+    /// Redaction must survive the record. The secret here contains a `"` and a `\` on purpose —
+    /// those are ESCAPED by JSON encoding, so a redactor applied only to the finished `content`
+    /// (which is what the dispatcher does) would no longer find the literal value. The structured
+    /// return must not become the one shape in which a token reaches a model-visible surface.
+    #[tokio::test]
+    async fn a_credential_echoed_back_in_a_response_header_or_body_is_still_redacted() {
+        const TOKEN: &str = r#"sk-live"back\slash"#;
+        std::env::set_var("FLUX_WEB_TEST_ECHO_TOKEN", TOKEN);
+        let base = one_shot_with_headers(
+            "200 OK",
+            vec![format!("set-cookie: session={TOKEN}")],
+            format!(
+                r#"{{"echoed":"{}"}}"#,
+                TOKEN.replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+        )
+        .await;
+        let t = tool_allowing(PrivateNetAllow::Any, &["FLUX_WEB_TEST_ECHO_TOKEN"]);
+        let c = ctx();
+        let r = t
+            .execute(
+                &c,
+                json!({
+                    "url": base,
+                    "headers": { "authorization": { "$secret": "FLUX_WEB_TEST_ECHO_TOKEN" } }
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !r.content.contains("sk-live"),
+            "the echoed credential must not survive in the record: {}",
+            r.content
+        );
+        assert!(
+            !r.view.as_deref().unwrap_or_default().contains("sk-live"),
+            "nor in the view a person and the model are shown: {:?}",
+            r.view
+        );
+        // …and it is genuinely gone from the structured fields, not merely absent from a rendering.
+        let record = record(&r);
+        assert_eq!(record["headers"]["set-cookie"], "session=[redacted]");
+        assert_eq!(record["body"]["echoed"], "[redacted]");
+    }
+
+    /// The record changed what a caller *reads*; it must not change what the envelope is *told*.
+    /// `permission_subjects` and the `NetworkFetch` intent still report the encoded request URL —
+    /// a grant is matched against a subject, so a drift here is a security change, not a cosmetic
+    /// one. (The positive form is asserted in
+    /// `permission_subjects_and_the_intent_report_the_encoded_url`; this pins that the response
+    /// shape has no say in it.)
+    #[tokio::test]
+    async fn the_record_does_not_change_what_the_envelope_is_told() {
+        let base = one_shot_with_headers("200 OK", Vec::new(), r#"{"id":1}"#.into()).await;
+        let params = json!({ "url": format!("{base}/v1/x"), "query": { "q": "a&b" } });
+        let t = tool(PrivateNetAllow::Any);
+        let expected = format!("{base}/v1/x?q=a%26b");
+        assert_eq!(t.permission_subjects(&params), vec![expected.clone()]);
+        assert!(matches!(
+            &t.intents(&params).intents[0].target,
+            IntentTarget::Url { url } if *url == expected
+        ));
+        // Executing changes neither: the subject is a function of the request, not the response.
+        t.execute(&ctx(), params.clone()).await.unwrap();
+        assert_eq!(t.permission_subjects(&params), vec![expected]);
     }
 
     #[test]
