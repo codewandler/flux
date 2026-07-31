@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-07-31
+
 ### Added
 
 - **`flux run --tui` installs the TUI's surface sink, so a model's `pane.open` reaches a terminal**
@@ -175,6 +177,83 @@ All notable changes to this project are documented in this file. The format is b
   class again — tracked as C-316.
 
 ### Fixed
+
+- **A wiring line now declares the test that observes it — the pin census** (C-328). Nineteen
+  stories have found production wiring that is *correct* and that no test observes: deleting the line
+  changes nothing. C-305 was the sharpest — two `flux-tui` lines whose removal left **474 tests
+  green** while no model pane could reach a terminal. C-314 was live: deleting **both** `[limits]`
+  wirings left the entire `flux-cli` suite green.
+
+  **The debt was never the bug; it was that each instance was answered by hand-building a new
+  guard.** There are ~10 now, each with its own mechanism and its own anti-vacuity proof. This is one
+  mechanism instead: a `syn` census requiring every configuration-bearing call on a production
+  assembly builder to name, in source, the test that dies without it — reusing the existing
+  `allow_reason` waiver reader rather than writing a second one, and verifying every named test
+  actually resolves, so a pin cannot drift from a renamed test.
+
+  It shipped having been **red on main**, reporting exactly the two known-unpinned sites. C-314's
+  first acceptance item is closed here with two *independently attributable* tests: deleting one
+  wiring line reds its own test and leaves the other green, verified in both directions by an
+  independent reviewer.
+
+  **`cargo-mutants` was rejected on its operator set before its cost.** It replaces function bodies
+  and swaps binary operators; it does not delete statements or drop a call from a builder chain. Both
+  C-314 sites sit in functions returning non-`Default` types, so the only available mutant is
+  unviable and discarded — it could not have caught C-314 at any price. Recorded in
+  `docs/designs/unobserved-wiring.md` so it is not re-litigated.
+
+  **No existing guard is subsumed**, and two of them must not be: `capability_widenings` and
+  `pin_granted_authority` fail at *compile time*, which is strictly stronger than anything
+  test-based. The design pressure runs the other way — prefer an exhaustive destructure whenever the
+  invariant is "a field set is classified". This census is a **coverage floor, not a proof**: it
+  verifies a declaration exists and resolves, not that the named test dies for the right reason.
+  C-329 adds the runner that checks the pin is honest.
+
+- **⚠ Three golden guards could rewrite their goldens and report success having compared nothing**
+  (C-326). `skill_in_sync`, `website_in_sync` and `wire_contract` all gated regeneration on
+  `env::var("UPDATE").is_ok()` — **presence, not value** — and each took its `write(); return;`
+  branch *before* the assertion. So an ambient `UPDATE=0`, or even an empty `UPDATE=`, silently
+  overwrote the golden with whatever the code currently produced and the test printed `ok`.
+
+  This is the *silent* member of the class C-319 belongs to. C-319 failed loudly and misleadingly;
+  this one went green while proving nothing, so a drifted node-kind table, a stale website reference
+  or a broken plugin wire contract would all have been blessed, with the diff showing the golden
+  updating as though someone meant it. Reproduced at the merge base on all three.
+
+  Regeneration is now `FLUX_UPDATE_GOLDEN=1`, matched **exactly**: unset or empty checks, exactly
+  `1` rewrites, and anything else is refused by name rather than guessed at. **A regenerating run
+  now fails**, so a run that wrote is distinguishable from a run that verified — that was the half
+  of the defect the arming question left standing. A `--` test argument was rejected because libtest
+  treats an unknown argument as a name filter, which selects zero tests and prints `ok. 0 passed`:
+  the same vacuous green in a new costume.
+
+  `scripts/cut-release.sh` is the only automated caller; it now discards the armed run's status and
+  re-runs the same check unarmed, which is stricter than before, where a silently-unwritten mirror
+  could reach the release commit.
+
+  `codewandler-flux-plugin-protocol` moves 1.1.0 → **1.1.1**: the crate's published artifact
+  includes its `tests/`, so a test-only change is still a content change under an already-published
+  version. The protocol line is SemVer over the *wire*, which is unchanged — hence a patch.
+
+- **Canonical Flux no longer renders as a syntax error in Helix, Neovim and Zed** (C-301). The
+  tree-sitter grammar's number lexer accepted only digits and an optional fraction, so `500ms`,
+  `10s` and `1m` produced `ERROR` nodes while the same header spelled `60_000` parsed cleanly.
+  Since 0.39.0's compact syntax made duration suffixes the *canonical* spelling, idiomatic source has
+  been showing errors in every editor that grammar backs, for multiple releases.
+
+  Fixed in `codewandler/flux-tree-sitter` (`a197393`), with a corpus guard per duration-carrying
+  canonical header (`7fcc64c`) — five of six verified to go **red** against the pre-fix rule, because
+  the gap survived precisely by the corpus only ever using bare numbers.
+
+  **The pin in `.helix/languages.toml` moved `29cff6c` → `9ea9890`, and that is the part that
+  reaches users.** Landing the fix was necessary and not sufficient: that repo already held *two*
+  improvements — L-96's named-option headers and `permissions` declarations — which reached nobody
+  because the pin never moved after they landed. Nothing verified that the pinned rev parses the
+  canonical corpus; C-334 now owns that.
+
+  flux's own CST highlighter and `flux-lsp` were never affected, confirmed rather than assumed: no
+  flux crate links tree-sitter, and duration positions are captured verbatim rather than lexed as one
+  token.
 
 - **`strict_review.rs` no longer reds because the developer's working tree is dirty** (C-319). It
   drove a flow that interpolated the **live** `git status` and `git diff` of whatever checkout it ran

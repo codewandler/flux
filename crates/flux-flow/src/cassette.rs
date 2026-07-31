@@ -63,61 +63,98 @@ fn truncate_chars(s: &str, cap: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
-/// Redact string leaves after parsing the dispatch input. Redacting the serialized JSON directly
-/// misses registered values whose spelling changes under JSON escaping (quotes, backslashes, and
-/// newlines), which would make `input_view` a recoverable durable secret leak.
+/// Redact the dispatch input **after parsing it**, then re-encode. Redacting the serialized JSON
+/// directly misses registered values whose spelling changes under JSON escaping (quotes,
+/// backslashes, and newlines), which would make `input_view` a recoverable durable secret leak.
+///
+/// The scrub itself is [`crate::engine::redact_json_in_place`] — the same total walker the evidence
+/// flush uses, so no node kind is exempt here either (C-323): a registered all-digit credential
+/// arriving as a JSON *number*, or a credential used as an object *key*, is caught.
+///
+/// **How the rewrite is applied, and why there are two paths.** Patching the original text — which
+/// is what this did before C-323 — preserves the caller's field order and whitespace, and that
+/// matters because the view is capped and a truncated head is what a person actually reads. But
+/// textual substitution is only *safe* for a string leaf: `"…"` is a self-delimiting token, whereas
+/// a bare number literal is not, so replacing `216216` inside `1216216789` would splice a quoted
+/// string into the middle of a number and leave `input_view` unparseable (the TUI re-parses it).
+///
+/// So the order-preserving path is kept for the case it was written for — every redaction landing
+/// on a string leaf — and a tree that needed a *key* or a *non-string scalar* redacted is re-encoded
+/// from the scrubbed value instead. Re-encoding is structurally safe by construction; it costs the
+/// caller's key order, and only for a payload that actually carried a credential in one of those
+/// positions. An input that needed no redaction at all is returned verbatim.
 fn redacted_input_view(redactor: &Redactor, input_json: &str) -> (String, bool) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(input_json) else {
         let redacted = redactor.redact(input_json);
         let changed = redacted != input_json;
         return (redacted, changed);
     };
-    let mut replacements = Vec::new();
-    collect_json_redactions(redactor, &value, &mut replacements);
-    if replacements.is_empty() {
+    let mut scrubbed = value.clone();
+    crate::engine::redact_json_in_place(redactor, &mut scrubbed);
+    if scrubbed == value {
         return (input_json.to_string(), false);
     }
 
-    // Replace complete encoded string tokens in the original serialization. This preserves field
-    // order and whitespace (useful when the bounded view keeps only the head) while still matching
-    // secrets against their decoded spelling.
-    replacements.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
-    replacements.dedup();
-    let mut rendered = input_json.to_string();
-    for (raw, redacted) in replacements {
-        rendered = rendered.replace(&raw, &redacted);
+    // Replace complete encoded string tokens in the original serialization, preserving field order
+    // and whitespace — but only when `string_leaf_replacements` confirms every redaction this tree
+    // needs is a string leaf.
+    let mut replacements = Vec::new();
+    if string_leaf_replacements(redactor, &value, &mut replacements) {
+        replacements.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
+        replacements.dedup();
+        let mut rendered = input_json.to_string();
+        for (raw, redacted) in replacements {
+            rendered = rendered.replace(&raw, &redacted);
+        }
+        return (rendered, true);
     }
-    (rendered, true)
+    match serde_json::to_string(&scrubbed) {
+        Ok(rendered) => (rendered, true),
+        // Unreachable for a tree that just came out of `from_str`, but a view is never worth a
+        // panic — fall back to the whole-text scrub, which is strictly safer than the input.
+        Err(_) => (redactor.redact(input_json), true),
+    }
 }
 
-fn collect_json_redactions(
+/// Collect the encoded string tokens to rewrite, and report whether textual substitution is
+/// **sufficient** for this tree.
+///
+/// Returns `false` — and leaves `replacements` unusable — as soon as a redaction is needed that
+/// textual substitution cannot express safely: an object *key* (rewriting it in the text would have
+/// to move the value with it) or a non-string scalar (no self-delimiting token to replace). The
+/// caller re-encodes the scrubbed tree in that case.
+fn string_leaf_replacements(
     redactor: &Redactor,
     value: &serde_json::Value,
     replacements: &mut Vec<(String, String)>,
-) {
+) -> bool {
     match value {
         serde_json::Value::String(text) => {
             let redacted = redactor.redact(text);
-            if redacted != *text {
-                if let (Ok(raw), Ok(redacted)) = (
-                    serde_json::to_string(text),
-                    serde_json::to_string(&redacted),
-                ) {
+            if redacted == *text {
+                return true;
+            }
+            match (
+                serde_json::to_string(text),
+                serde_json::to_string(&redacted),
+            ) {
+                (Ok(raw), Ok(redacted)) => {
                     replacements.push((raw, redacted));
+                    true
                 }
+                _ => false,
             }
         }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_json_redactions(redactor, item, replacements);
-            }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .all(|item| string_leaf_replacements(redactor, item, replacements)),
+        serde_json::Value::Object(fields) => fields.iter().all(|(key, value)| {
+            redactor.redact(key) == *key && string_leaf_replacements(redactor, value, replacements)
+        }),
+        scalar => {
+            let literal = scalar.to_string();
+            redactor.redact(&literal) == literal
         }
-        serde_json::Value::Object(fields) => {
-            for value in fields.values() {
-                collect_json_redactions(redactor, value, replacements);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -822,6 +859,54 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(input_view).unwrap();
         assert_eq!(decoded["token"], "[redacted]");
         assert!(*redacted, "structured input redaction marks the cell");
+    }
+
+    /// C-323 — `input_view` is durable, so a node kind this walker skipped is a permanent leak. An
+    /// all-digit credential has no protection but registration, so a `Value::Number` it never
+    /// descended into was exactly such a hole; an object *key* was the other.
+    ///
+    /// The view must also stay **parseable** (the TUI re-parses it) and must not over-redact: an
+    /// unregistered number keeps its value and its type.
+    #[test]
+    fn recorded_input_view_redacts_a_registered_numeric_credential_and_keeps_parsing() {
+        const NUMERIC: &str = "216216216216216218";
+        let redactor = Redactor::new();
+        redactor.add_secret(NUMERIC);
+        let input = serde_json::to_string(&serde_json::json!({
+            "account_id": 216_216_216_216_216_218_i64,
+            NUMERIC: "as-a-key",
+            "port": 8080,
+            "ok": true,
+        }))
+        .unwrap();
+
+        let (view, changed) = redacted_input_view(&redactor, &input);
+
+        assert!(changed, "a redacted view marks the cell");
+        assert!(
+            !view.contains(NUMERIC),
+            "a registered numeric credential is durable in the view: {view}"
+        );
+        let decoded: serde_json::Value =
+            serde_json::from_str(&view).expect("the view stays parseable JSON: {view}");
+        assert_eq!(decoded["account_id"], "[redacted]");
+        assert!(decoded.get("[redacted]").is_some(), "key not scrubbed");
+        assert_eq!(decoded["port"], 8080);
+        assert!(decoded["port"].is_number(), "port retyped: {view}");
+        assert_eq!(decoded["ok"], true);
+    }
+
+    /// An input carrying nothing registered is returned **byte-identical** and unflagged — the
+    /// re-encoding path C-323 introduced must not touch a view that needed no redaction.
+    #[test]
+    fn an_unredacted_input_view_is_returned_verbatim() {
+        let redactor = Redactor::new();
+        redactor.add_secret("some-unrelated-secret");
+        let input = r#"{"port":8080,"secret_ttl":3600,"path":"note.txt"}"#;
+        assert_eq!(
+            redacted_input_view(&redactor, input),
+            (input.to_string(), false)
+        );
     }
 
     fn cell(op: &str, input: &str, content: &str) -> Cell {

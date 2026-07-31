@@ -7,7 +7,7 @@ statements and flow-level constructs).
 
 The "Node kinds at a glance" table below is generated from the `Node` doc-comments in
 `crates/flux-lang/src/ast.rs` (via `flux_lang::schema::node_kind_catalog()`) — do not edit it by hand;
-regenerate with `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`. The operations a `call`
+regenerate with `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync`. The operations a `call`
 targets are an engine concern — see [`flux-flow/docs/ops-reference.md`](../../flux-flow/docs/ops-reference.md).
 
 ---
@@ -35,7 +35,7 @@ the runtime executes top-to-bottom.
 Every `kind` and its one-line summary. This table is the single source of truth for the node
 surface: it is generated from the `Node` enum's doc-comments in `flux-lang` (`crates/flux-lang/src/ast.rs`)
 via `flux_lang::schema::node_kind_catalog()` — do not edit it by hand. Regenerate with
-`UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`. The detailed per-node sections that
+`FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync`. The detailed per-node sections that
 follow are hand-written.
 
 > These nodes also have a writable **text form** — see [`syntax.md`](syntax.md) (`format`/`parse`); this
@@ -105,7 +105,7 @@ of these schemas, so an op's `Named("Claim")` input lowers to a `#/$defs/Claim` 
 
 This table is generated from the prelude struct doc-comments via
 `flux_lang::prelude::prelude_type_catalog()` — do not edit it by hand; regenerate with
-`UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync`.
+`FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test skill_in_sync`.
 
 <!-- BEGIN generated:prelude-types -->
 | type | description |

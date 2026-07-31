@@ -915,6 +915,15 @@ impl AgentSink for TextCollector {
     }
 }
 
+/// Scrub a sub-agent's tool input / observation data before it crosses the live reporter —
+/// **every node kind** (C-323).
+///
+/// Keys were already covered; numbers were not, and a registered all-digit credential has no other
+/// protection (no prefix marks it, and the contextual `NAME=VALUE` rule requires a letter so
+/// `secret_ttl=3600` survives), so a skipped `Number` node is a hole in `add_secret`'s guarantee
+/// rather than an optimization. A non-string scalar is redacted by its JSON literal spelling and
+/// retyped to a string **only when redaction actually fired**, so an ordinary port/count/id crosses
+/// with its value and its type intact.
 fn redact_spawn_json(redactor: &flux_secret::Redactor, value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => *text = redactor.redact(text),
@@ -932,7 +941,13 @@ fn redact_spawn_json(redactor: &flux_secret::Redactor, value: &mut serde_json::V
                 fields.insert(redactor.redact(&key), value);
             }
         }
-        _ => {}
+        scalar => {
+            let literal = scalar.to_string();
+            let redacted = redactor.redact(&literal);
+            if redacted != literal {
+                *scalar = serde_json::Value::String(redacted);
+            }
+        }
     }
 }
 
@@ -1350,6 +1365,40 @@ mod tests {
             value["nested"][0].get("[redacted]").is_some(),
             "nested key was not scrubbed"
         );
+    }
+
+    /// C-323 — the same walker skipped `Value::Number`, and an all-digit credential has no recourse
+    /// but registration, so a skipped node kind is a hole in `add_secret`'s guarantee. The second
+    /// half is the anti-censorship posture: an ordinary number keeps its value *and its type*.
+    #[test]
+    fn child_activity_redaction_reaches_a_registered_numeric_credential() {
+        const NUMERIC: &str = "216216216216216218";
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret(NUMERIC);
+        let mut value = json!({
+            "account_id": 216_216_216_216_216_218_i64,
+            "nested": [216_216_216_216_216_218_i64],
+            "port": 8080,
+            "ok": true,
+            "none": null,
+        });
+
+        redact_spawn_json(&redactor, &mut value);
+
+        let encoded = value.to_string();
+        assert!(
+            !encoded.contains(NUMERIC),
+            "a registered numeric credential crossed activity: {encoded}"
+        );
+        assert_eq!(value["account_id"], "[redacted]");
+        assert_eq!(value["nested"][0], "[redacted]");
+        assert_eq!(value["port"], 8080);
+        assert!(
+            value["port"].is_number(),
+            "an unregistered number keeps its type: {encoded}"
+        );
+        assert_eq!(value["ok"], true);
+        assert!(value["none"].is_null());
     }
 
     /// Mock provider: returns a fixed text reply (one canned turn).

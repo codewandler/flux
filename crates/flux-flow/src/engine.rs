@@ -1728,32 +1728,60 @@ fn flush_tail(
 }
 
 /// Return a redacted copy of `obs` — its `data` scrubbed of any registered/credential-shaped
-/// secret (C-22). Only the JSON's string leaves are rewritten; keys and structure are preserved so
-/// the persisted observation still folds through `projection::observations` unchanged in shape.
+/// secret (C-22). The JSON's *structure* is preserved (same containers in the same places) so the
+/// persisted observation still folds through `projection::observations` unchanged in shape, but no
+/// node is exempt from the scrub itself: see [`redact_json_in_place`].
 pub(crate) fn redact_observation(
     redactor: &flux_secret::Redactor,
     obs: &flux_evidence::Observation,
 ) -> flux_evidence::Observation {
     let mut out = obs.clone();
-    redact_json_strings(redactor, &mut out.data);
+    redact_json_in_place(redactor, &mut out.data);
     out
 }
 
-/// Recursively rewrite every string leaf of `value` through the redactor (in place).
-fn redact_json_strings(redactor: &flux_secret::Redactor, value: &mut serde_json::Value) {
+/// Recursively rewrite `value` through the redactor, in place — **every node kind, keys included**
+/// (C-323).
+///
+/// This walker used to visit string leaves only, on the assumption that a secret is always a
+/// string. That assumption fails for the one credential shape with no other protection: an all-digit
+/// credential is outside every redaction heuristic *by construction* (no prefix marks it, and the
+/// contextual `NAME=VALUE` rule requires a letter so `secret_ttl=3600` survives), so **registration
+/// is its only recourse** — and this is the evidence-flush seam, where a miss lands durably in the
+/// event store. Skipping keys had the same effect for a model-generated header map.
+///
+/// A non-string scalar is redacted by its JSON literal spelling and **only retyped to a string when
+/// redaction actually fired** — `[redacted]` is not a number, and a sentinel number would be
+/// indistinguishable from real data. Every untouched number keeps its type, so a projection reading
+/// a numeric field is unaffected unless that field carried a registered secret.
+pub(crate) fn redact_json_in_place(
+    redactor: &flux_secret::Redactor,
+    value: &mut serde_json::Value,
+) {
     match value {
         serde_json::Value::String(s) => *s = redactor.redact(s),
         serde_json::Value::Array(items) => {
             for item in items {
-                redact_json_strings(redactor, item);
+                redact_json_in_place(redactor, item);
             }
         }
         serde_json::Value::Object(map) => {
-            for v in map.values_mut() {
-                redact_json_strings(redactor, v);
+            // Rebuild rather than `values_mut`: a key can carry a credential just as a value can
+            // (a model-generated header map is the live case), and a key cannot be rewritten in
+            // place.
+            let original = std::mem::take(map);
+            for (key, mut v) in original {
+                redact_json_in_place(redactor, &mut v);
+                map.insert(redactor.redact(&key), v);
             }
         }
-        _ => {}
+        scalar => {
+            let literal = scalar.to_string();
+            let redacted = redactor.redact(&literal);
+            if redacted != literal {
+                *scalar = serde_json::Value::String(redacted);
+            }
+        }
     }
 }
 
@@ -2235,6 +2263,53 @@ mod tests {
     use serde_json::{json, Value};
 
     static TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    /// C-323 — the evidence flush is the seam where a miss becomes *durable*, and this walker used
+    /// to visit string leaves only. An all-digit credential is outside every redaction heuristic by
+    /// construction, so registration is its only recourse; a key is the other node kind that was
+    /// skipped here. Both must be scrubbed before the observation reaches the event store.
+    ///
+    /// Anti-censorship half: only *registered* values change, and an untouched number keeps its
+    /// type, so `projection::observations` still reads numeric fields as numbers.
+    #[test]
+    fn observation_redaction_reaches_numbers_and_keys_not_just_string_leaves() {
+        const NUMERIC: &str = "216216216216216218";
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret(NUMERIC);
+        let obs = flux_evidence::Observation::new(
+            "test",
+            flux_evidence::Phase::Turn,
+            json!({
+                "account_id": 216_216_216_216_216_218_i64,
+                "nested": [{ NUMERIC: "fine" }],
+                "attempts": 3,
+                "ratio": 1.5,
+                "ok": true,
+                "none": null,
+            }),
+        );
+
+        let out = redact_observation(&redactor, &obs);
+
+        let encoded = out.data.to_string();
+        assert!(
+            !encoded.contains(NUMERIC),
+            "a registered numeric credential reached the event store: {encoded}"
+        );
+        assert_eq!(out.data["account_id"], "[redacted]");
+        assert!(
+            out.data["nested"][0].get("[redacted]").is_some(),
+            "a credential used as a key was not scrubbed: {encoded}"
+        );
+        assert_eq!(out.data["attempts"], 3);
+        assert!(
+            out.data["attempts"].is_number(),
+            "an unregistered number keeps its type: {encoded}"
+        );
+        assert_eq!(out.data["ratio"], 1.5);
+        assert_eq!(out.data["ok"], true);
+        assert!(out.data["none"].is_null());
+    }
 
     struct ScriptedProvider {
         responses: Mutex<VecDeque<Vec<Chunk>>>,

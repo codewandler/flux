@@ -2,7 +2,7 @@
 id: C-323
 title: "`redact_json` skips `Value::Number`, and an all-digit credential has no recourse but registration"
 pillar: Core
-status: ready
+status: in-progress
 priority: 5
 areas: [flux-web, flux-secret]
 note: "found by C-315 — an all-digit credential is outside every redaction heuristic by construction (no prefix marks it; the contextual rule requires a letter so `secret_ttl=3600` survives), so registration is its ONLY protection; any walker that narrows which nodes it visits is therefore a hole in add_secret's guarantee, not an optimization"
@@ -31,20 +31,20 @@ node kind exempted. `add_secret`'s guarantee is total or it is not a guarantee.
 
 ## Acceptance
 
-- [ ] **Failing-first**: register an all-digit secret, have a response carry it as a JSON *number*,
+- [x] **Failing-first**: register an all-digit secret, have a response carry it as a JSON *number*,
       and show it reaching a model-visible surface today.
-- [ ] `redact_json` visits every node kind. Decide what a redacted number becomes — it cannot stay a
+- [x] `redact_json` visits every node kind. Decide what a redacted number becomes — it cannot stay a
       number and carry `[redacted]` — and say why the chosen representation is right. This is a real
       design question: changing a number to a string changes the shape of the record a caller selects
       from, which is exactly what C-304 made observable.
-- [ ] **Audit the other JSON walkers, which C-315 explicitly did not.** Grep every place the tree
+- [x] **Audit the other JSON walkers, which C-315 explicitly did not.** Grep every place the tree
       walks a `serde_json::Value` for redaction — evidence flush, stream-json, whatif cassettes, the
       approval sheet, harness ingest — and list each with the node kinds it visits. Any other walker
       that narrows by node kind is the same defect. Fix them together or say why one cannot be.
-- [ ] The anti-censorship posture holds: ordinary numeric values (ports, timeouts, counts, ids that
+- [x] The anti-censorship posture holds: ordinary numeric values (ports, timeouts, counts, ids that
       are not secrets) must survive untouched. Only *registered* values are affected — this story
       adds no heuristic.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
 
 ## Notes
 
@@ -60,3 +60,51 @@ node kind exempted. `add_secret`'s guarantee is total or it is not a guarantee.
   parse, over decoded leaves and keys, precisely because the dispatcher's string-level redaction
   misses JSON-escaped values. This story is the same argument one level down: the walker has to
   reach the node before the redactor can act on it.
+
+## Progress
+
+Implemented on `impl/C-323`. Merge base `0df177c2` (main tip, post-0.43.0).
+
+**Failing-first.** `http::tests::a_registered_numeric_credential_echoed_back_as_a_json_number_is_still_redacted`
+(`crates/flux-web/src/http.rs`). At the base the record `content` read
+`{"body":{"account_id":216216216216216218,…}}` — the credential verbatim in the canonical value
+that is bound to a session symbol and spliced into `{{symbol}}` interpolations. The `view` was
+already clean (it redacts the raw body text), so the hole was exactly the structured record C-304
+introduced.
+
+**Representation.** A redacted non-string scalar becomes `Value::String("[redacted]")`, and the node
+is retyped **only when redaction actually fired** (compare the JSON literal before/after) — never by
+switching on the node kind. A sentinel number was rejected as indistinguishable from real data;
+`null` as ambiguous with a legitimately-null field. `"[redacted]"` is already the marker every other
+redacted node in the record carries. The C-304 shape cost is therefore paid only by a node whose
+value the caller could not have used anyway.
+
+**Walker audit** (every `serde_json::Value` tree walk that applies a `Redactor`):
+
+| walker | visited before | fixed? |
+| --- | --- | --- |
+| `flux-web/src/http.rs` `redact_json` | String, Array, Object keys+values | **yes** — `redact_scalar` |
+| `flux-flow/src/engine.rs` `redact_json_strings` (evidence flush → durable event store) | String, Array, Object **values only** | **yes** — now `redact_json_in_place`, keys + scalars |
+| `flux-flow/src/cassette.rs` `collect_json_redactions` (durable `input_view`) | String, Array, Object **values only** | **yes** — reuses `redact_json_in_place`; see below |
+| `flux-orchestrate/src/lib.rs` `redact_spawn_json` (sub-agent live reporter) | String, Array, Object keys+values | **yes** — scalar arm |
+| `flux-plugin-protocol/src/lib.rs` `redact_secret_fields` | replaces a *named* field's value whole, any kind | **not the same defect** — name-based masking, never consults a `Redactor`, does not narrow by node kind |
+
+Not walkers (checked, no change owed): `flux-cli/src/stream_json.rs`, `flux-flow/src/loop_host.rs`
+`approve_batch`, `flux-flow/src/staged.rs`, `flux-sdk/src/test.rs` all redact the **serialized text**,
+which already reaches numbers and keys. The approval sheet (`flux-tui/src/toolview.rs`) renders input
+verbatim by decision (C-195) and has no walker. Harness ingest
+(`flux-capabilities/src/datasource/harness_history.rs`) redacts field-wise on extracted `&str` with
+no tree recursion.
+
+**Cassette has two paths now.** `redacted_input_view` kept its order-preserving textual rewrite for
+the case it was written for — every redaction landing on a string leaf, whose encoded `"…"` token is
+self-delimiting — because the view is capped and a truncated head is what a person reads. A tree
+needing a *key* or a *non-string scalar* redacted is re-encoded from the scrubbed value instead:
+textual substitution of a bare number literal is unsafe (replacing `216216` inside `1216216789`
+splices a quoted string into a number and leaves `input_view` unparseable, and the TUI re-parses it).
+`string_leaf_replacements` is the predicate that chooses.
+
+**Not done, deliberately:** the same total-walk logic now exists in four places. Consolidating it
+would mean either a new `pub` item on the published `codewandler-flux-secret` or a new dependency
+edge from `flux-web` (which takes a redaction *closure* precisely to avoid one) — both outside this
+story's fence. Filed as an ADJACENT finding for the coordinator.
