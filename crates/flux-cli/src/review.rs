@@ -103,10 +103,20 @@ pub(super) fn strict_review_roles() -> RoleRegistry {
 /// Build the `SubAgents` bundle for the strict-review protocol's reviewer fan-out, shared by both
 /// `flux review` ([`run_review`]) and `flux app run strict-review` (the built-in-program branch of
 /// [`run_app`]) so the two call sites cannot drift or regain project-controlled reviewer roles.
+///
+/// `resource_limits` (C-307) is a **required** parameter, resolved once by the caller from its own
+/// `[limits]` table — see [`cli_resource_limits`]. It is not defaulted here on purpose: this helper
+/// returned a bare `SubAgents::new` until C-307, which left every reviewer child of the hardest
+/// fan-out flux ships running with no ceiling at all. A required argument is the seam-level way to
+/// keep a future third caller from re-opening that hole by omission. Each child receives a
+/// `ResourceLimits::independent_copy` of these ceilings (same numbers, own concurrency budget) —
+/// installed by `LocalSpawner::spawn`, and per-child by design: a budget shared across the `task`
+/// boundary deadlocks (C-299).
 pub(super) fn build_review_sub_agents(
     model_spec: &str,
     model: impl Into<String>,
     max_tokens: u32,
+    resource_limits: flux_runtime::ResourceLimits,
 ) -> Result<SubAgents> {
     let roles = strict_review_roles();
     let mut child_base = ToolRegistry::new();
@@ -115,9 +125,10 @@ pub(super) fn build_review_sub_agents(
         let spec = model_spec.to_string();
         Arc::new(move || provider_for(&spec).map_err(|e| flux_core::Error::Other(e.to_string())))
     };
-    Ok(SubAgents::new(
-        roles, child_base, factory, model, max_tokens,
-    ))
+    Ok(
+        SubAgents::new(roles, child_base, factory, model, max_tokens)
+            .with_resource_limits(resource_limits),
+    )
 }
 
 /// `flux review --files <path>… [--format md|json] [--fail-on <severity>]` — run the strict-review
@@ -148,9 +159,20 @@ pub(super) async fn run_review(
             (Arc::new(native), m)
         };
 
+    // C-307: `flux review` is the other shipped surface that fans out to reviewer children, and it
+    // assembles its envelope through the SDK rather than `build_agent_with` — so it needs the same
+    // ceilings wired explicitly. Resolved once and shared by the flow client and the children (each
+    // child copies the numbers into its own budget at spawn).
+    let resource_limits = cli_resource_limits(&cfg);
+
     // Wire roles + sub-agents exactly like `build_agent`: `strict_review`'s bounded 3-role reviewer
     // fan-out (via `task`) delegates through the identical envelope the top-level agent uses.
-    let sub_agents = build_review_sub_agents(&model_spec, model.clone(), flags.max_tokens)?;
+    let sub_agents = build_review_sub_agents(
+        &model_spec,
+        model.clone(),
+        flags.max_tokens,
+        resource_limits.clone(),
+    )?;
 
     // `strict_review`'s core is read-only by construction (git_status/git_diff/read_many + `task`
     // against immutable embedded `tools: []` reviewer roles — see the design's security
@@ -160,6 +182,7 @@ pub(super) async fn run_review(
     let mut client = flux_sdk::FlowClient::builder()
         .model(model)
         .auto_approve(true)
+        .resource_limits(resource_limits)
         .build(provider, cwd)
         .context("build flow client")?;
     client.with_sub_agents(sub_agents);

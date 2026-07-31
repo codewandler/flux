@@ -12,6 +12,31 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Web requests can now take query parameters as a proper list, instead of you gluing them onto the
+  address yourself.** Give the request a set of named values and flux assembles the address for you,
+  escaping each value correctly. This matters for more than tidiness: previously, a value that
+  happened to contain a character like `&` or `=` — a search phrase, a customer's name, anything the
+  agent picked up along the way — could silently turn into *extra* parameters and change what the
+  request actually asked for. That can no longer happen.
+  Values behave the way you would expect: leaving one empty means "don't send it", while `false` and
+  `0` are sent as real values, and naming the same parameter twice is reported as a mistake rather
+  than one quietly overwriting the other. A stored credential can be used as a query value and stays
+  hidden in logs and in anything the model can see, exactly as it does in a request header.
+
+### Fixed
+
+- **The limits you configure now actually apply when you run an app, and to the helpers it spawns.**
+  If you had set ceilings on how much work flux may do at once, two paths quietly ignored them:
+  running an app, and the reviewer helpers that an app's strict review starts. Those helpers ran with
+  no ceiling at all. Both now respect your settings, as do `flux review` and `flux record`. Each
+  helper gets its own budget rather than competing for a shared one, so a busy helper cannot starve
+  the others.
+  One deliberate exception: replaying a recorded test still ignores your limits. A replay is meant to
+  give the same answer on every machine, and letting local settings affect it would make the same
+  test pass on one computer and fail on another.
+
 ## [0.42.0] - 2026-07-31
 
 ### New

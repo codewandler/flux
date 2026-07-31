@@ -1,0 +1,66 @@
+---
+id: C-317
+title: "An empty bearer token authenticates every request on a webhook channel's public port"
+pillar: Core
+status: ready
+priority: 1
+areas: [flux-channels]
+note: "LIVE ON MAIN — found by D-216's review in the new connector arm, where it is being fixed; the identical hole is pre-existing in the webhook adapter. `constant_time_eq(b\"\", b\"\")` is true, and the non-loopback guard only tests is_none(), so a request with no Authorization header at all authenticates"
+---
+
+# An empty bearer token authenticates every request
+
+## Goal
+
+`crates/flux-channels/src/adapters/webhook.rs:40` and `:88-97` carry an authentication bypass that
+is **shipped and live**, not hypothetical.
+
+The chain:
+
+1. The token is an `Option<String>`. `token ""` yields `Some("")` — and so does `token secret "K"`
+   where `K` is exported empty, because `crates/flux-app/src/secrets.rs:37` calls `std::env::var`
+   with no empty filter. An operator does not have to write `""` to get here; an unset-looking
+   environment variable that is actually set-and-empty is enough.
+2. The non-loopback guard tests only `is_none()`. `Some("")` sails through it, so the bind is
+   permitted on a public interface.
+3. The handler reads `headers.get(AUTHORIZATION)…strip_prefix("Bearer ").unwrap_or("")` and compares
+   with `constant_time_eq`. Equal lengths, empty loop, `diff == 0` → **true**.
+
+So a request carrying **no `Authorization` header at all** authenticates. This is an open listener on
+a host that auto-approves tools, which `AGENTS.md:110` names in as many words: "The daemon
+auto-approves tools — an open listener is RCE."
+
+The rest of the codebase already knows the correct shape. `crates/flux-cli/src/app_cmd.rs:486-488`
+and `:671-673` both spell `.ok().filter(|t| !t.is_empty())`, and
+`crates/flux-server/src/lib.rs:519-524` then *refuses* the resulting `Open` auth on a non-loopback
+bind. The webhook adapter has neither half.
+
+## Acceptance
+
+- [ ] **Failing-first, two tests, and they must be separate.** One proves a request with no
+      `Authorization` header is rejected by a channel configured with an empty token. One proves the
+      channel with an empty token **refuses to bind** on a non-loopback address in the first place.
+      Both halves exist in `flux-server`'s precedent and both are needed: the comparison fix alone
+      still leaves an operator believing an empty token is a token.
+- [ ] The set-but-empty environment variable path is covered — `token secret "K"` with `K=""` — not
+      only the literal `token ""`. That is the spelling an operator reaches by accident.
+- [ ] Decide whether an empty token is a **load error** or is normalised to `None` and then refused
+      by the existing no-token rule. Either is defensible; say which and why. A load error is more in
+      keeping with the channels' "refuse everything refusable before a port is bound" thesis.
+- [ ] Grep every other `constant_time_eq` / bearer comparison in the tree and account for each one.
+      This story exists because the same mistake was made twice independently; a third instance is
+      more likely than not.
+- [ ] Full gate green in both workspaces.
+
+## Notes
+
+- Found by the D-216 review (2026-07-31) in the **new** connector arm, where it is blocking and is
+  being fixed under that story. The connector fix is deliberately fenced to that adapter so this one
+  gets its own failing-first test and its own review rather than riding along.
+- Priority 1 because it is live on main and is an authentication bypass on a public port. It is
+  mitigated only by the fact that reaching it requires an operator to configure a webhook channel
+  with an empty token — which the set-but-empty environment path makes more reachable than it sounds.
+- Related: [D-216](D-216-connector-channel-arm.md) is where it was found.
+- `constant_time_eq` itself is **not** at fault and should not be changed: it is a correct pure
+  comparison with a length pre-check. Two empty strings genuinely are equal. The defect is that an
+  empty expected-token was ever allowed to reach it.
