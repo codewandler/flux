@@ -470,6 +470,7 @@ const NON_PUBLIC_ENV: &[&str] = &[
     "FLUX_WEB_STOLEN_QUERY_TOKEN",
     "FLUX_WEB_TEST_TOKEN",
     "FLUX_WEB_TEST_QUERY_KEY",
+    "FLUX_WEB_TEST_ECHO_TOKEN",
     // CI-only deterministic corpus size for the adversarial assurance tests; not shipped behavior.
     "FLUX_ADVERSARIAL_CASES",
     // A `format!` prefix, not a variable: the D-116 endpoint e2e mints a per-process credential
