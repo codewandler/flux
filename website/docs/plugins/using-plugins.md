@@ -59,6 +59,7 @@ of what you actually have installed.
 flux plugin ls                          # list installed plugins (the terse default)
 flux plugin status [<name>]             # liveness + declared surface; omit the name for all
 flux plugin call <name> <op> [json]     # invoke one op directly, no agent (alias: run)
+flux plugin refresh <name>              # re-fetch the manifest and re-project the op catalog
 flux plugin pin <name> <version>        # verified version switch (signed-index + checksum path)
 flux plugin rollback <name>             # flip back to the previous version — offline, instant
 flux plugin uninstall <name>            # remove the descriptor; --purge also deletes its store
@@ -72,6 +73,32 @@ Notes:
 - `pin` records the binary's sha256 and re-checks it at every spawn — drift refuses to run.
 - The versioned store keeps versions side by side, so `rollback` needs no network and a second
   `rollback` flips forward again.
+- `refresh` is for plugins whose operation set depends on remote state. A plugin answers `manifest`
+  over its live connection, not from a file, so one that fronts a remote deployment can advertise
+  new operations once you authenticate a provider there (`flux auth login <name>`). `refresh`
+  re-fetches the manifest and re-projects the catalog, printing which operations appeared and which
+  were withdrawn.
+
+### What a refresh may and may not change
+
+A refresh is a **re-grant**, so it is bounded by the grant you already made. The operation set is
+free to change — operations may appear and disappear, and their schemas and descriptions may change
+with them. Two things may not:
+
+- **The capabilities.** The refreshed manifest may not ask for programs, secret keys, HTTP hosts,
+  dial targets, file scopes, or any other host capability beyond what it declared when it loaded.
+  The capabilities in force stay the ones the load bound; a manifest that asks for more is refused.
+- **The scope of an operation that keeps its name.** Policy rules, permission subjects and session
+  grants all key on the operation name, so an operation cannot keep its name while dropping its risk
+  tier, shedding a declared effect, or widening its per-operation `process` narrowing.
+
+Either refusal leaves the catalog exactly as it was — a refresh never half-applies, and neither does
+a dead subprocess or an unreadable manifest frame. To adopt a genuinely changed capability set,
+restart flux so the grant is made again against the new manifest.
+
+An operation the plugin withdraws stops being callable. A call already running against it finishes
+under the specification it was authorized with; withdrawal governs the next dispatch, not the one in
+flight.
 
 ```bash
 flux plugin call websearch websearch.search '{"query":"warm transfer"}'
