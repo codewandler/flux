@@ -3,7 +3,7 @@ id: C-314
 title: "Two `[limits]` wirings nothing observes, and an occupancy test that guards less than its prose"
 pillar: Core
 epic: road-to-stable
-status: ready
+status: in-progress
 priority: 10
 areas: [flux-cli]
 note: "filed from C-307's review, not from planning — `flux review` and `flux record` newly honour [limits], but deleting BOTH wirings leaves the entire flux-cli suite green; this is the exact rot C-299 and C-307 exist to close, newly planted on two more call sites"
@@ -46,15 +46,15 @@ guards less than its prose implies.
       reds when `lab_cmd.rs:52`'s is. Prove each by making exactly that deletion and showing the test
       name in the failure output. One test observing both is not acceptable — they must be
       independently attributable, the way C-307's two halves are.
-- [ ] `app_cmd.rs`'s per-child assertion observes the transformation `LocalSpawner::spawn` actually
+- [x] `app_cmd.rs`'s per-child assertion observes the transformation `LocalSpawner::spawn` actually
       applies, rather than one the test performs itself — or, if that is not reachable at this level,
       the doc comment is corrected to say what the test really guards and to point at
       `resource_limits.rs:873` as the binding check.
-- [ ] Either a journey-level test pins `run_app`'s end-to-end chain (`run_app` →
+- [x] Either a journey-level test pins `run_app`'s end-to-end chain (`run_app` →
       `App::try_with_execution_environment` → `build_executor` → `into_executor`), or the story
       records why that fixture is not worth its cost. C-307's reviewer traced the chain by reading
       and found it holds; no test pins it.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
 
 ## Notes
 
@@ -93,10 +93,67 @@ resolves a *live* provider before reaching the builder, and `run_review` ends in
 `process::exit`. That unreachability is *how this story happened*, and it is worth remembering when
 items 2 and 3 are picked up.
 
-**Still open:**
+**Items 2 and 3 are now closed too.** No production line changed for either — item 2 is a corrected
+doc comment and assertion message, item 3 is a new test.
 
-- Item 2 — `app_cmd.rs`'s per-child assertion still observes a transformation the test performs
-  itself rather than the one `LocalSpawner::spawn` applies.
-- Item 3 — no journey-level test pins `run_app` → `App::try_with_execution_environment` →
-  `build_executor` → `into_executor`. C-307's reviewer traced it by reading and found it holds; that
-  is still not a test.
+### Item 2 — the real observation is not reachable at this level (the sanctioned second route)
+
+`app_run_strict_review_reviewers_inherit_the_configured_ceiling` keeps its `independent_copy()` call,
+because the alternative was tried and does not exist. What changed is that the test no longer claims
+otherwise: its doc comment now says it binds `build_review_sub_agents`'s
+`.with_resource_limits(resource_limits)` **and nothing on the spawn side**, and names
+`a_delegated_child_is_bounded_but_never_starved_by_its_parent`
+(`crates/flux-sdk/tests/resource_limits.rs:873`) as the binding check for the rest. Both halves were
+verified by mutation rather than asserted:
+
+- delete `.with_resource_limits(..)` from `build_review_sub_agents` → this test reds with `saw 4`;
+- switch `LocalSpawner::spawn` (`crates/flux-orchestrate/src/lib.rs:440`) from `independent_copy()`
+  to `clone()` → this test stays **ok**, and `resource_limits.rs:873` reds with `runs == 0`.
+
+Why the real observation is unreachable, in order of what was tried:
+
+1. The shipped bundle's reviewer roles declare `tools: []`
+   (`builtin_review_roles_ship_the_three_reviewers_toolless`), so nothing can execute inside a real
+   reviewer child. Spawning one observable means replacing the bundle's `roles`, `child_base` **and**
+   `provider_factory` — everything except `resource_limits`.
+2. Even then, occupancy cannot see a child's ceiling at all: `execute_batch`
+   (`crates/flux-flow/src/loop_host.rs:859`) walks a child's actions strictly sequentially, so a
+   child's in-flight count is 1 bounded or not. This is C-299's recorded negative result, re-checked
+   against the current code; C-299 also ruled out the op cache (children get
+   `PermissionManager::new()`, so every child op is approval-sensitive and uncacheable).
+3. The one discriminator left for `independent_copy()`-vs-`clone()` is starvation — an ancestor
+   holding the permit while the child asks for one. That *is* constructible in `flux-cli`, and it was
+   rejected on attribution, not difficulty: it would red only for a `flux-orchestrate` regression and
+   stay green for every `flux-cli` one, i.e. a copy of `resource_limits.rs:873` filed in a crate that
+   owns none of the code under test.
+
+### Item 3 — the journey chain is now pinned
+
+`a_configured_limits_table_binds_for_an_app_journey_executor` (`crates/flux-cli/src/app_cmd.rs`)
+parses a one-journey program whose body is a three-branch `parallel` block over C-299's parked probe,
+assembles the environment through `assemble_app_execution_environment`, builds a real
+`flux_app::App` with `try_with_execution_environment`, and drives it with `App::deliver`. It asserts
+occupancy 1, so it observes the ceiling arriving at the executor a **journey** actually runs on:
+`assemble_app_execution_environment` → `App::try_with_execution_environment` → `Engine::new`'s shared
+`execution` template → `build_executor` → `into_executor`.
+
+It was mutation-tested **in the middle**, not at the endpoint, because both sibling tests already
+call `.into_executor()` themselves and so cover only the first hop:
+
+| mutation (shipped line) | new test | the two sibling tests | rest of `flux-app` |
+|---|---|---|---|
+| `Engine::new` inherits `environment.clone()` with the ceilings stripped | **FAILED, 3 in flight** | ok | 74 passed |
+| `build_executor` derives its journey executor with the ceilings stripped | **FAILED, 3 in flight** | ok | — |
+
+The `3` in both failures is also the proof the fixture is not vacuous: the `parallel` block really
+does put three calls in flight when nothing bounds them.
+
+**One hop short of the story's wording, deliberately.** The test enters at
+`assemble_app_execution_environment`, not at `run_app` — `run_app` resolves a program path, opens an
+event store and ends in `flux_channels::serve`, so no test can reach it, the same unreachability
+C-328 had to extract seams for. The hop it cannot see is `run_app`'s own
+`let resource_limits = cli_resource_limits(&cfg)` being replaced by an unbounded default. That is
+structurally narrowed rather than pinned: `assemble_app_execution_environment` takes
+`resource_limits` as a required parameter, so a caller cannot arrive unbounded by omission — only by
+deliberately passing `ResourceLimits::new()`. Extracting a `run_app` seam wide enough to test was
+judged not worth its cost against that.

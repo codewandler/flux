@@ -987,19 +987,45 @@ mod app_run_resource_ceiling_wiring {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **C-307 Acceptance 2.** `flux app run strict-review`'s reviewer children inherit the
-    /// configured ceiling — and inherit it *per child*.
+    /// **C-307 Acceptance 2.** `build_review_sub_agents` puts the configured ceiling on the bundle
+    /// `flux app run strict-review`'s reviewer children are spawned from.
     ///
-    /// Until C-307 `build_review_sub_agents` returned a bare `SubAgents::new`, so every reviewer in
-    /// the widest fan-out flux ships ran on an unbounded executor. What is measured here is the
-    /// ceiling a child is actually built with: `bundle.resource_limits.independent_copy()` is
-    /// verbatim the transformation `LocalSpawner::spawn` applies to this bundle, so the executor
-    /// below is the one a reviewer child gets.
+    /// Until C-307 it returned a bare `SubAgents::new`, so every reviewer in the widest fan-out flux
+    /// ships ran on an unbounded executor. Deleting `.with_resource_limits(resource_limits)` from
+    /// that helper reds this test with `4` in flight — that one line is what it binds.
     ///
-    /// The parent blocker parked alongside it is the C-299 per-child guard (Acceptance 4). With a
-    /// ceiling of one, `in_flight == 2` means parent and child each hold their own permit. It would
-    /// read `1` if this story had been "fixed" by handing children the parent's shared budget — the
-    /// shape that reproduced a real deadlock — and `4` if the reviewer children were unbounded.
+    /// **What it does not bind (C-314).** The `independent_copy()` below is applied by *this test*,
+    /// not by `LocalSpawner::spawn` (`crates/flux-orchestrate/src/lib.rs:440`). So a regression that
+    /// switched `spawn` to `clone()` — the shape that produced a real deadlock during C-299 — would
+    /// leave this test green. The binding check for that is
+    /// `a_delegated_child_is_bounded_but_never_starved_by_its_parent`
+    /// (`crates/flux-sdk/tests/resource_limits.rs:873`), which reaches the child across a real
+    /// `SpawnTaskSupervisor` with an ancestor holding the permit; the two together are what make
+    /// "reviewer children inherit the ceiling, per child" true.
+    ///
+    /// Observing the real transformation *here* was tried and is not reachable at this level:
+    ///
+    /// * The shipped bundle's reviewer roles declare `tools: []`
+    ///   (`flux_app::review::builtin_review_roles`, pinned by
+    ///   `builtin_review_roles_ship_the_three_reviewers_toolless`), so no probe op can execute
+    ///   inside a real reviewer child. Spawning one observable would mean replacing the bundle's
+    ///   roles, `child_base` **and** `provider_factory` — everything except `resource_limits`.
+    /// * Even with a substituted probe role, occupancy — the only thing this module measures —
+    ///   cannot tell a bounded child from an unbounded one: a child's batch loop walks its actions
+    ///   strictly sequentially (`execute_batch`, `crates/flux-flow/src/loop_host.rs:859`), so its
+    ///   in-flight count is 1 either way. C-299 recorded the same negative result, and also ruled
+    ///   out the op cache (children are built with `PermissionManager::new()`, so every child op is
+    ///   approval-sensitive and therefore uncacheable).
+    /// * The remaining discriminator for `independent_copy()`-vs-`clone()` is starvation, which
+    ///   needs an ancestor holding a permit while the child asks for one. That geometry is
+    ///   constructible in this crate, but it would red for a `flux-orchestrate` regression and stay
+    ///   green for every `flux-cli` one — a copy of `resource_limits.rs:873` filed in the crate that
+    ///   owns none of the code under test.
+    ///
+    /// The parent blocker parked alongside the children is the C-299 per-child guard (Acceptance 4).
+    /// With a ceiling of one, `in_flight == 2` means parent and child each hold their own permit; it
+    /// reads `4` if `build_review_sub_agents` handed its children no ceiling, and `1` if the
+    /// *ceilings this test constructs the child with* were a shared budget rather than a copy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn app_run_strict_review_reviewers_inherit_the_configured_ceiling() {
         let root = temp_root("strict-review");
@@ -1048,8 +1074,10 @@ mod app_run_resource_ceiling_wiring {
             meter.in_flight(),
             2,
             "expected the parent and exactly ONE reviewer child in flight, saw {} — more means \
-             `build_review_sub_agents` handed its children no ceiling, fewer means they were given \
-             the parent's shared budget instead of a `ResourceLimits::independent_copy`",
+             `build_review_sub_agents` handed its children no ceiling; fewer means the ceilings \
+             this test built the child executor with share the parent's budget rather than being \
+             a `ResourceLimits::independent_copy` of it (the spawn-side half of that claim is \
+             `a_delegated_child_is_bounded_but_never_starved_by_its_parent`, not this test)",
             meter.in_flight()
         );
 
@@ -1062,6 +1090,126 @@ mod app_run_resource_ceiling_wiring {
             meter.peak(),
             2,
             "peak occupancy must be one permit per agent, not one shared budget"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A program whose only journey fans three probe calls out in one `parallel` block — the widest
+    /// concurrency a journey can produce, and therefore the shape that shows whether the executor it
+    /// was built with carries a ceiling. The trigger label is what [`flux_app::App::deliver`] routes.
+    const PROBE_PROGRAM: &str = "\
+trigger c314
+  on \"c314_probe\"
+  run bounded
+
+journey bounded
+  flow
+    parallel
+      branch $a
+        $a = c299_blocker({})
+      branch $b
+        $b = c299_blocker({})
+      branch $c
+        $c = c299_blocker({})
+    return \"done\"
+";
+
+    /// **C-314 Acceptance 3.** The ceilings `flux app run` resolves reach the executor a **journey**
+    /// runs on — the chain `assemble_app_execution_environment` → `App::try_with_execution_environment`
+    /// → `Engine::new`'s shared `execution` template → `build_executor` → `into_executor`.
+    ///
+    /// C-307's reviewer traced that chain by reading and found it holds; nothing pinned it. The two
+    /// sibling tests above both call `.into_executor()` on the environment themselves, so they stop
+    /// at the first hop and stay green for any regression in the middle — e.g. `Engine::new`
+    /// rebuilding its template instead of inheriting the surface's environment, or `build_executor`
+    /// deriving a journey executor that drops the template's ceilings. Both of those were mutated on
+    /// the shipped line to confirm this test is what notices.
+    ///
+    /// It deliberately starts one hop later than the story's wording (`run_app` itself): `run_app`
+    /// resolves a program path, opens an event store and ends in `flux_channels::serve`, so nothing
+    /// can reach it from a test — the same unreachability C-328 had to extract seams for. What it
+    /// enters at is `assemble_app_execution_environment`, the seam `run_app` hands its resolved
+    /// `[limits]` to, and whose `resource_limits` is a required parameter precisely so a caller
+    /// cannot arrive unbounded by omission.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_configured_limits_table_binds_for_an_app_journey_executor() {
+        use flux_lang::program::Module;
+
+        let root = temp_root("app-journey");
+        let meter = Arc::new(Meter::default());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let Module::Program(program) =
+            Module::parse_str(PROBE_PROGRAM).expect("the probe program must parse")
+        else {
+            panic!("PROBE_PROGRAM declares a trigger and a journey, so it is a program");
+        };
+
+        let system = Arc::new(System::new(Workspace::new(&root).unwrap()));
+        let environment = assemble_app_execution_environment(
+            system.clone(),
+            blocking_registry(&meter, &release),
+            Arc::new(AllowApprover),
+            flux_runtime::WorkspaceContext::new(system),
+            flux_secret::Redactor::new(),
+            // The one seam under test: `run_app` hands its resolved `[limits]` in here, and every
+            // journey executor below is derived from the environment it returns.
+            ceiling_of_one(),
+        );
+        let app = Arc::new(
+            flux_app::App::try_with_execution_environment(
+                program,
+                None,
+                "mock",
+                environment,
+                None,
+                Arc::new(EventStore::in_memory().expect("in-memory event store")),
+                flux_app::HostPermissionRules {
+                    // The probe is not in `LEGACY_JOURNEY_ALLOW`; grant it the way `run_app` grants
+                    // the operator's `[permissions] allow`.
+                    allow: vec![BLOCKER.to_string()],
+                    deny: Vec::new(),
+                },
+                Vec::new(),
+            )
+            .expect("the probe program must assemble into an App"),
+        );
+
+        // Sample occupancy while the three branches are parked, then release them all. Spawned so
+        // the delivery below drives the journey on this task.
+        let sampler = {
+            let meter = meter.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let observed = meter.in_flight();
+                release.add_permits(3);
+                observed
+            })
+        };
+
+        let runs = app
+            .deliver("c314_probe", json!({}))
+            .await
+            .expect("the trigger must run its journey");
+        let observed = sampler.await.expect("occupancy sampler");
+
+        assert_eq!(
+            runs.len(),
+            1,
+            "the trigger must have run exactly one journey, got {runs:?}"
+        );
+        assert_eq!(
+            observed, 1,
+            "`[limits] max_concurrent_tool_calls = 1` did not reach the executor `flux app run`'s \
+             journeys run on: {observed} tool calls were in flight at once. The environment the \
+             surface assembled carries the ceiling — so a link between it and `build_executor`'s \
+             `into_executor()` dropped it"
+        );
+        assert_eq!(
+            meter.peak(),
+            1,
+            "peak occupancy must equal the configured ceiling"
         );
         std::fs::remove_dir_all(&root).ok();
     }
