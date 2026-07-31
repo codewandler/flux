@@ -170,9 +170,11 @@ impl Tool for HttpRequestTool {
                     // so both forms are registered — otherwise a percent-encoded token could
                     // survive in a guard/transport error message that quotes the URL.
                     let encoded = percent_encode_component(&secret);
-                    ctx.redactor.add_secret(secret.clone());
+                    // `resolve_secret_env` already refused anything the redactor would decline, so
+                    // both spellings register; the encoded form is never shorter than the raw one.
+                    ctx.redactor.try_add_secret(secret.clone()).map_err(too_short_to_protect(&name))?;
                     if encoded != secret {
-                        ctx.redactor.add_secret(encoded);
+                        ctx.redactor.try_add_secret(encoded).map_err(too_short_to_protect(&name))?;
                     }
                     secret
                 }
@@ -287,8 +289,23 @@ fn resolve_secret_env(name: &str, ctx: &ToolContext, allowed: &[String]) -> Resu
             "http.request: secret env var `{name}` is not set (referenced via {{\"$secret\": \"{name}\"}})"
         ))
     })?;
-    ctx.redactor.add_secret(resolved.clone());
+    // A `$secret` reference that the redactor declines cannot be kept out of a guard or transport
+    // error message quoting the URL, so the request is refused rather than sent (C-315).
+    ctx.redactor
+        .try_add_secret(resolved.clone())
+        .map_err(too_short_to_protect(name))?;
     Ok(resolved)
+}
+
+/// The error a declined registration becomes on the `$secret` path: the value is live, it is about
+/// to go on the wire, and nothing downstream would scrub it.
+fn too_short_to_protect<E: std::fmt::Display>(name: &str) -> impl Fn(E) -> Error + '_ {
+    move |why| {
+        Error::Other(format!(
+            "http.request: secret env var `{name}` cannot be protected: {why}. Its value would \
+             survive in a URL quoted by an error message, so the request was not sent."
+        ))
+    }
 }
 
 /// A parsed `query` field value: a literal scalar already rendered as text, or a secret reference

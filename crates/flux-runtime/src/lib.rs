@@ -1517,12 +1517,26 @@ impl SecretResolver {
 
     /// Register the values of every resolvable ref in `refs` with `redactor`, so they are scrubbed
     /// from tool output and logs.
-    pub fn seed_redactor(&self, redactor: &mut Redactor, refs: &[flux_secret::Ref]) {
+    ///
+    /// Returns the refs whose value resolved but was **declined** by the redactor's registration
+    /// floor ([`flux_secret::MIN_REGISTERED_SECRET_LEN`]). Those values are live credentials that
+    /// will *not* be scrubbed by exact match, so a caller that swallows this return is choosing not
+    /// to tell anyone (C-315). A ref that does not resolve at all is not reported: an unset env var
+    /// is the ordinary case, not a failure.
+    pub fn seed_redactor(
+        &self,
+        redactor: &mut Redactor,
+        refs: &[flux_secret::Ref],
+    ) -> Vec<flux_secret::Ref> {
+        let mut declined = Vec::new();
         for r in refs {
             if let Some(m) = self.resolve(r) {
-                redactor.add_secret(m.value);
+                if redactor.try_add_secret(m.value).is_err() {
+                    declined.push(r.clone());
+                }
             }
         }
+        declined
     }
 }
 

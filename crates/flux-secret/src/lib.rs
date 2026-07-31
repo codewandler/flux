@@ -154,21 +154,89 @@ impl fmt::Debug for Material {
 
 const REDACTED: &str = "[redacted]";
 
-/// Credential-looking prefixes that are redacted even when the exact value isn't registered.
-const SECRET_PREFIXES: &[&str] = &[
-    "sk-ant-",
-    "sk-",
-    "xoxb-",
-    "xoxp-",
-    "xoxe-",
-    "ghp_",
-    "gho_",
-    "github_pat_",
-    "AKIA",
-    "AIza",
-    "ya29.",
-    "eyJ", // JWT-ish
+/// Credential-looking prefixes that are redacted even when the exact value isn't registered, each
+/// with the **minimum token length** that spelling has to reach before it counts as a credential.
+///
+/// The floor is per-prefix rather than global (C-315) because the prefixes are not equally
+/// distinctive. `sk-ant-` is seven characters of vendor and effectively cannot occur by accident;
+/// `hf_` is three, and `hf_hub_download` is an ordinary identifier in any codebase that talks to
+/// Hugging Face. Pinning each floor just under the vendor's real token length keeps a short prefix
+/// from turning ordinary source into `[redacted]` — the failure mode this list is one addition away
+/// from at all times.
+///
+/// Deliberately **not** here: `sk_test_`. A Stripe test key is not production credential material,
+/// and C-216 did not measure it; an unmeasured addition is exactly the drift this table is meant to
+/// resist. See `docs/designs/harness-history.md`.
+const SECRET_PREFIXES: &[(&str, usize)] = &[
+    ("sk-ant-", 8),
+    ("sk-", 8),
+    ("sk_live_", 20), // Stripe live secret key, `sk_live_` + ~24
+    ("xoxb-", 8),
+    ("xoxp-", 8),
+    ("xoxe-", 8),
+    ("ghp_", 8),
+    ("gho_", 8),
+    ("github_pat_", 12),
+    ("glpat-", 20), // GitLab PAT, `glpat-` + 20
+    ("hf_", 30),    // Hugging Face token, `hf_` + 34
+    ("AKIA", 8),
+    ("AIza", 8),
+    ("ya29.", 8),
+    ("eyJ", 8), // JWT-ish
 ];
+
+/// Fragments of an assignment's **name** that declare its value to be credential material.
+///
+/// The contextual rule this feeds (C-315) is the only mechanism here that redacts a token carrying
+/// no vendor marking of its own — an AWS *secret* access key is 40 characters of base64 and nothing
+/// else. It is deliberately narrow on both halves: the name must say "secret" and the value must
+/// look like opaque material ([`is_opaque_material`]). Entropy scoring would catch more and was
+/// rejected for it; see the design note.
+const SECRET_NAME_MARKERS: &[&str] = &[
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "access_key",
+    "private_key",
+    "credential",
+];
+
+/// The shortest value [`Redactor::try_add_secret`] will register.
+///
+/// Registered values are matched by plain substring, so a short one is a censoring machine: register
+/// `"abc"` and every `abc` in every diff, log line and tool result becomes `[redacted]`. The floor
+/// is the price of that matching strategy, and it is public because a caller that cannot register a
+/// value needs to know why.
+pub const MIN_REGISTERED_SECRET_LEN: usize = 6;
+
+/// Why a value was not taken into the redactor's registered set.
+///
+/// Exists because the alternative — the silent no-op `add_secret` used to be — makes a
+/// security-registration call indistinguishable from a successful one at the point where the
+/// operator could still do something about it (C-315).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unregistered {
+    /// Shorter than [`MIN_REGISTERED_SECRET_LEN`] after trimming.
+    TooShort { len: usize },
+}
+
+impl fmt::Display for Unregistered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unregistered::TooShort { len } => write!(
+                f,
+                "secret value not registered: {len} characters is below the \
+                 {MIN_REGISTERED_SECRET_LEN}-character floor that keeps substring matching from \
+                 over-redacting"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Unregistered {}
 
 /// Scrubs registered secret values and common credential shapes from text before it is logged
 /// or shown to the model.
@@ -187,20 +255,53 @@ impl Redactor {
         Self::default()
     }
 
-    /// Register a known secret value (no-op for trivially short values to avoid over-redaction).
+    /// Register a known secret value, reporting the one case in which it is **declined**.
+    ///
+    /// This is the registration entry point production code should use: registering a credential is
+    /// a security action, and a caller that learns nothing when it fails cannot compensate (C-315).
+    /// The only failure is [`Unregistered::TooShort`] — see [`MIN_REGISTERED_SECRET_LEN`] for why
+    /// that floor exists rather than being a rounding error.
+    ///
     /// The value is stored **trimmed** — env/file-sourced secrets often carry a trailing newline,
     /// and storing the raw value would mean the bare token never matches in tool output. Takes
     /// `&self` (interior-mutable, shared store) so a credential materialized mid-run is registered
     /// even when only a clone of the redactor is in hand.
-    pub fn add_secret(&self, value: impl Into<String>) {
+    pub fn try_add_secret(&self, value: impl Into<String>) -> Result<(), Unregistered> {
         let v = value.into();
         let trimmed = v.trim();
-        if trimmed.len() >= 6 {
-            self.values.lock().unwrap().push(trimmed.to_string());
+        if trimmed.len() < MIN_REGISTERED_SECRET_LEN {
+            return Err(Unregistered::TooShort {
+                len: trimmed.len(),
+            });
         }
+        self.values.lock().unwrap().push(trimmed.to_string());
+        Ok(())
     }
 
-    /// Redact registered values (exact substring) and credential-shaped tokens from `input`.
+    /// Register a known secret value, **discarding** the fact that a value below
+    /// [`MIN_REGISTERED_SECRET_LEN`] was not registered at all.
+    ///
+    /// Kept for callers that have already established the value is long enough — chiefly tests
+    /// registering literals. Anywhere the value comes from the environment, a store, a plugin or a
+    /// model, prefer [`Redactor::try_add_secret`]: this form cannot tell a registered credential
+    /// from an ignored one, and `codewandler-flux-secret` is a published 1.x protocol-line crate, so
+    /// the fallible form had to be added beside this one rather than replacing it.
+    pub fn add_secret(&self, value: impl Into<String>) {
+        let _ = self.try_add_secret(value);
+    }
+
+    /// Redact registered values (exact substring) and credential-shaped material from `input`.
+    ///
+    /// Four passes, in this order, because each later one assumes the earlier ones have already
+    /// consumed what they can:
+    ///
+    /// 1. registered values, longest-first;
+    /// 2. [`redact_pem_private_keys`] — the block body between `-----BEGIN … PRIVATE KEY-----` and
+    ///    its `-----END`, which no token rule can see because the body is unprefixed base64;
+    /// 3. [`redact_url_credentials`] — the password in a `scheme://user:password@host` authority,
+    ///    which the tokenizer splits away from anything that identifies it;
+    /// 4. [`redact_patterns`] — the token pass: known credential prefixes, plus a value whose own
+    ///    assignment name declares it a secret.
     pub fn redact(&self, input: &str) -> String {
         let mut out = input.to_string();
         // Longest-first so a value that contains another is replaced whole.
@@ -211,6 +312,8 @@ impl Redactor {
                 out = out.replace(&v, REDACTED);
             }
         }
+        let out = redact_pem_private_keys(&out);
+        let out = redact_url_credentials(&out);
         redact_patterns(&out)
     }
 }
@@ -225,11 +328,61 @@ impl Redactor {
 /// the fix. Leading-only stripping catches `+sk-ant-…` without widening what counts as a token.
 const LINE_MARKERS: &[char] = &['+', '-', '*', '#'];
 
-/// Redact credential-shaped tokens. A token is a maximal run of non-boundary characters; any run
-/// that begins with a known secret prefix — after any leading [`LINE_MARKERS`] are set aside — is
-/// replaced. Boundaries include whitespace AND common delimiters (`= : " ' ` ( ) [ ] { } , ;`), so
+/// Is this token a credential by its own spelling — a known vendor prefix at or above that
+/// prefix's length floor?
+fn has_credential_prefix(body: &str) -> bool {
+    SECRET_PREFIXES
+        .iter()
+        .any(|(prefix, min_len)| body.len() >= *min_len && body.starts_with(prefix))
+}
+
+/// Does an assignment's name declare its value to be credential material?
+///
+/// Substring match on the lower-cased name, so `AWS_SECRET_ACCESS_KEY`, `stripeApiKey` and
+/// `db_password` all land. Bounded in length because the "name" is whatever token happened to
+/// precede the `=`, and a paragraph that happens to contain the word "token" is not a declaration.
+fn names_a_secret(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    SECRET_NAME_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Does this value look like opaque credential material rather than ordinary configuration?
+///
+/// Three conditions, each buying back a class of false positive that the naming rule alone would
+/// produce — this is the guard that keeps `secret_name=my-app-config` and `TOKEN_PATH=/etc/app/key`
+/// out of the redactor's mouth:
+///
+/// - **length ≥ 16.** Real opaque credentials are long; `password=hunter2` is not reached, and that
+///   miss is deliberate — see the design note's residual-gap table.
+/// - **base64/base64url/hex alphabet only.** `.` and `:` are excluded specifically so hostnames,
+///   URLs, version strings and paths-with-extensions can never qualify.
+/// - **letters and digits together.** A path segment, an English word and a `${TEMPLATE_REF}` all
+///   fail this; 40 characters of AWS base64 essentially never do.
+fn is_opaque_material(value: &str) -> bool {
+    const MIN_OPAQUE_LEN: usize = 16;
+    value.len() >= MIN_OPAQUE_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'_' | b'-'))
+        && value.bytes().any(|b| b.is_ascii_digit())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Redact credential-shaped tokens. A token is a maximal run of non-boundary characters; a run is
+/// replaced when either
+///
+/// - it begins with a known secret prefix — after any leading [`LINE_MARKERS`] are set aside — or
+/// - it is the value of an assignment whose **name** declares it a secret and whose own shape is
+///   opaque material (C-315: an AWS secret access key carries no prefix, so the only thing that
+///   identifies it is the `AWS_SECRET_ACCESS_KEY=` in front of it).
+///
+/// Boundaries include whitespace AND common delimiters (`= : " ' ` ( ) [ ] { } , ;`), so
 /// punctuation-glued forms like `api_key=sk-ant-…` and `"sk-ant-…"` are caught, not just
-/// whitespace-separated tokens.
+/// whitespace-separated tokens. The assignment rule keys on `=` only; `key: value` is deliberately
+/// out, because `:` introduces far more prose than it does credentials.
 fn redact_patterns(input: &str) -> String {
     fn is_boundary(c: char) -> bool {
         c.is_whitespace()
@@ -251,30 +404,136 @@ fn redact_patterns(input: &str) -> String {
                     | '>'
             )
     }
-    fn flush(token: &mut String, out: &mut String) {
+    /// Emits `token`, redacted or not, and reports whether it names a secret — the caller pairs
+    /// that with the boundary character to decide about the *next* token.
+    fn flush(token: &mut String, out: &mut String, assigned_to_secret: bool) -> bool {
         // `body` is the token minus any leading diff/list marker; the markers are ASCII, so the
         // byte split is always on a char boundary.
         let body = token.trim_start_matches(LINE_MARKERS);
-        if body.len() >= 8 && SECRET_PREFIXES.iter().any(|p| body.starts_with(p)) {
+        let named = names_a_secret(body);
+        if has_credential_prefix(body) || (assigned_to_secret && is_opaque_material(body)) {
             out.push_str(&token[..token.len() - body.len()]);
             out.push_str(REDACTED);
         } else {
             out.push_str(token);
         }
         token.clear();
+        named
     }
 
     let mut out = String::with_capacity(input.len());
     let mut token = String::new();
+    // Set when the token just flushed named a secret and an `=` closed it, i.e. the next token is
+    // that secret's value.
+    let mut assigned_to_secret = false;
     for c in input.chars() {
         if is_boundary(c) {
-            flush(&mut token, &mut out);
+            let named = flush(&mut token, &mut out, assigned_to_secret);
+            assigned_to_secret = named && c == '=';
             out.push(c);
         } else {
             token.push(c);
         }
     }
-    flush(&mut token, &mut out);
+    flush(&mut token, &mut out, assigned_to_secret);
+    out
+}
+
+/// Replace the body of every `-----BEGIN … PRIVATE KEY-----` block with a single [`REDACTED`] line,
+/// leaving the delimiters in place.
+///
+/// The delimiters stay because they are the only thing that makes the redaction legible: a bare
+/// `[redacted]` in a config file tells a reader nothing, while `-----BEGIN OPENSSH PRIVATE
+/// KEY-----` / `[redacted]` / `-----END …` says exactly what was removed. They are also, in
+/// themselves, not secret.
+///
+/// Scoped to `PRIVATE KEY` on purpose. `-----BEGIN CERTIFICATE-----` and `-----BEGIN PUBLIC
+/// KEY-----` are public material, and blanking them would be censorship, not containment.
+///
+/// A block with no `-----END` is redacted **to the end of the input**. That is the common shape of
+/// a truncated key rather than an exotic one — `flux-system` byte-caps process output, so a key
+/// that runs past the cap arrives with its BEGIN and no END — and there is no reading of an
+/// unterminated private key under which its remaining bytes are safe to show.
+fn redact_pem_private_keys(input: &str) -> String {
+    const PEM_PRIVATE: &str = "PRIVATE KEY";
+    if !input.contains(PEM_PRIVATE) {
+        return input.to_string();
+    }
+    fn is_delimiter(trimmed: &str, opener: &str) -> bool {
+        trimmed.starts_with(opener) && trimmed.ends_with("-----") && trimmed.contains(PEM_PRIVATE)
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut in_body = false;
+    let mut emitted = false;
+    for line in input.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if in_body {
+            if is_delimiter(trimmed, "-----END ") {
+                in_body = false;
+                out.push_str(line);
+            } else if !emitted {
+                emitted = true;
+                out.push_str(REDACTED);
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            // Every further body line is dropped: the block collapses to one marker.
+            continue;
+        }
+        out.push_str(line);
+        if is_delimiter(trimmed, "-----BEGIN ") {
+            in_body = true;
+            emitted = false;
+        }
+    }
+    out
+}
+
+/// Characters that end a URL authority. `/`, `?` and `#` are the structural ones; the rest are how
+/// a URL is punctuated when it sits inside prose, a shell line or a JSON string.
+const AUTHORITY_END: &[char] = &[
+    '/', '?', '#', '"', '\'', '`', '<', '>', ',', ';', ')', ']', '}', '\\',
+];
+
+/// Replace the password in every `scheme://user:password@host` authority.
+///
+/// This is a structural rule, not a heuristic: userinfo with a colon in it *is* a credential by the
+/// URL grammar, so the false-positive rate is zero by construction. It exists because the token
+/// pass cannot help here — `:` is a token boundary, so the password arrives at the matcher as its
+/// own unprefixed, uncontextualized run (C-216 measured exactly this on `DATABASE_URL`).
+///
+/// Only the password is replaced. The scheme, the user and the host stay, because "which database
+/// did it connect to, as whom" is the part of a connection string an operator is reading it for.
+fn redact_url_credentials(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(scheme_end) = rest.find("://") {
+        let start = scheme_end + "://".len();
+        let end = start
+            + rest[start..]
+                .find(|c: char| c.is_whitespace() || AUTHORITY_END.contains(&c))
+                .unwrap_or(rest.len() - start);
+        let authority = &rest[start..end];
+        // The LAST `@` closes the userinfo, so a password containing `@` is still bounded correctly.
+        let password = authority.rfind('@').and_then(|at| {
+            authority[..at]
+                .find(':')
+                .map(|colon| (start + colon + 1, start + at))
+                .filter(|(from, to)| to > from)
+        });
+        match password {
+            Some((from, to)) => {
+                out.push_str(&rest[..from]);
+                out.push_str(REDACTED);
+                out.push_str(&rest[to..end]);
+            }
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -378,6 +637,158 @@ mod tests {
         assert_eq!(r.redact("--- a/note.txt"), "--- a/note.txt");
         assert_eq!(r.redact("+++ b/note.txt"), "+++ b/note.txt");
         assert_eq!(r.redact("# heading-with-hyphens"), "# heading-with-hyphens");
+    }
+
+    /// C-315 — the three vendor spellings C-216 measured as missed, each a plain prefix addition.
+    #[test]
+    fn the_vendor_spellings_c216_measured_are_caught() {
+        let r = Redactor::new();
+        for secret in [
+            "sk_live_51NotARealStripeSecretKey00",
+            "hf_NotARealHuggingFaceAccessToken0000",
+            "glpat-NotARealGitlabPat00000",
+        ] {
+            let out = r.redact(&format!("KEY={secret}\n"));
+            assert!(!out.contains(secret), "leaked: {out}");
+        }
+    }
+
+    /// The other side of a short prefix: `hf_` and `glpat-` have length floors precisely so ordinary
+    /// identifiers keep their spelling. A prefix list that redacts source code is not a fix.
+    #[test]
+    fn a_short_prefix_does_not_swallow_ordinary_identifiers() {
+        let r = Redactor::new();
+        for benign in [
+            "hf_hub_download",
+            "hf_transfer enabled",
+            "glpat-example",
+            "sk_live_x",
+        ] {
+            assert_eq!(r.redact(benign), benign, "over-redacted: {benign}");
+        }
+    }
+
+    /// C-315 — an AWS *secret* access key has no prefix; the only thing identifying it is the name
+    /// of the assignment it sits in.
+    #[test]
+    fn a_secret_named_assignment_redacts_its_opaque_value() {
+        let r = Redactor::new();
+        let line = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY";
+        let out = r.redact(line);
+        assert_eq!(out, "AWS_SECRET_ACCESS_KEY=[redacted]", "leaked: {out}");
+        // The name half is a substring match, so the vocabulary reaches the spellings in the wild.
+        for name in ["db_password", "stripeApiKey", "SERVICE_CREDENTIAL"] {
+            let out = r.redact(&format!("{name}=aB3dEf6hIj9lMn2pQr5t"));
+            assert_eq!(out, format!("{name}=[redacted]"), "leaked: {out}");
+        }
+    }
+
+    /// The contextual rule's whole risk is over-firing on ordinary config, so pin the four ways a
+    /// secret-named assignment is left alone. Each of these is a shape a real repository is full of.
+    #[test]
+    fn a_secret_named_assignment_leaves_ordinary_config_alone() {
+        let r = Redactor::new();
+        for line in [
+            "TOKEN_PATH=/etc/flux/credentials",       // no digit — a path, not material
+            "SECRET_NAME=my-app-production-config",   // no digit
+            "AWS_SECRET_ACCESS_KEY=${AWS_SECRET}",    // template reference
+            "API_TOKEN_URL=https://auth.example.com", // punctuation outside the alphabet
+            "password=hunter2",                       // below the opaque-material floor
+            "secret_ttl=3600",                        // no letters
+        ] {
+            assert_eq!(r.redact(line), line, "over-redacted: {line}");
+        }
+        // And a name that merely *mentions* a secret does not make the next word one.
+        assert_eq!(
+            r.redact("the token was rotated on 2026-01-02T03:04:05Z"),
+            "the token was rotated on 2026-01-02T03:04:05Z"
+        );
+    }
+
+    /// C-315 — PEM private-key material: the body goes, the delimiters stay, and a public block is
+    /// not touched at all.
+    #[test]
+    fn a_pem_private_key_body_is_redacted_and_its_delimiters_are_not() {
+        let r = Redactor::new();
+        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+                   b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz\n\
+                   c2gtZWQyNTUxOQAAACBOtARealKeyMaterialWouldContinueForManyLines00\n\
+                   -----END OPENSSH PRIVATE KEY-----\n";
+        let out = r.redact(&format!("cat > id_ed25519 <<'EOF'\n{key}EOF\n"));
+        assert!(!out.contains("b3BlbnNzaC1rZXktdjEA"), "leaked: {out}");
+        assert!(!out.contains("c2gtZWQyNTUxOQ"), "leaked: {out}");
+        assert_eq!(
+            out,
+            "cat > id_ed25519 <<'EOF'\n\
+             -----BEGIN OPENSSH PRIVATE KEY-----\n\
+             [redacted]\n\
+             -----END OPENSSH PRIVATE KEY-----\n\
+             EOF\n"
+        );
+
+        // A certificate and a public key are public material — blanking them would be censorship.
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKa\n-----END CERTIFICATE-----\n";
+        assert_eq!(r.redact(cert), cert);
+        let public = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0\n-----END PUBLIC KEY-----\n";
+        assert_eq!(r.redact(public), public);
+    }
+
+    /// A key that ran past a byte cap arrives with a BEGIN and no END. There is no reading of the
+    /// remaining bytes under which they are safe to show, so the redaction runs to the end.
+    #[test]
+    fn an_unterminated_private_key_block_is_redacted_to_the_end() {
+        let r = Redactor::new();
+        let out = r.redact("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\ntruncated");
+        assert_eq!(out, "-----BEGIN RSA PRIVATE KEY-----\n[redacted]\n");
+    }
+
+    /// C-315 — the password in a connection URL. `:` is a token boundary, so the token pass sees the
+    /// password as a bare unprefixed run; only the URL grammar identifies it.
+    #[test]
+    fn a_connection_url_password_is_redacted_and_the_rest_of_the_url_is_not() {
+        let r = Redactor::new();
+        assert_eq!(
+            r.redact("DATABASE_URL=postgres://flux:hunter2pass@db.internal:5432/app"),
+            "DATABASE_URL=postgres://flux:[redacted]@db.internal:5432/app"
+        );
+        // A password containing `@` is bounded by the LAST `@`, not the first.
+        assert_eq!(
+            r.redact("redis://user:p@ss@cache:6379"),
+            "redis://user:[redacted]@cache:6379"
+        );
+        // Two of them on one line, and each is handled independently.
+        assert_eq!(
+            r.redact("from amqp://a:b1@x/ to amqp://c:d2@y/"),
+            "from amqp://a:[redacted]@x/ to amqp://c:[redacted]@y/"
+        );
+        // No userinfo, or a user with no password: nothing to redact, nothing changed.
+        for benign in [
+            "https://docs.example.com/a/b?c=d",
+            "ssh://git@github.com/codewandler/flux.git",
+            "see https://example.com, then stop",
+        ] {
+            assert_eq!(r.redact(benign), benign, "over-redacted: {benign}");
+        }
+    }
+
+    /// C-315 — the registration floor is a real decision, and a caller now learns when it applies.
+    /// The silent form is what made a security-registration call indistinguishable from a no-op.
+    #[test]
+    fn a_declined_registration_is_visible_to_the_caller() {
+        let r = Redactor::new();
+        assert_eq!(
+            r.try_add_secret("hunt3"),
+            Err(Unregistered::TooShort { len: 5 })
+        );
+        assert_eq!(r.redact("password=hunt3"), "password=hunt3");
+        assert!(r.try_add_secret("hunt3r").is_ok());
+        assert_eq!(r.redact("password=hunt3r"), "password=[redacted]");
+        // Trimming happens before the floor is applied, so whitespace does not buy length.
+        assert_eq!(
+            r.try_add_secret("  ab  "),
+            Err(Unregistered::TooShort { len: 2 })
+        );
+        assert!(format!("{}", Unregistered::TooShort { len: 2 }).contains("below the 6-character"));
     }
 
     #[test]

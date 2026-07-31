@@ -40,7 +40,15 @@ fn resolve_in(value: &mut Value, redactor: &Redactor) -> Result<()> {
                 "secret env var `{name}` is not set (referenced via `secret \"{name}\"`)"
             ))
         })?;
-        redactor.add_secret(resolved.clone());
+        // A `secret "NAME"` declaration is a promise that the value will not surface. If the
+        // redactor declines it, the promise cannot be kept, and loading the program anyway would
+        // keep that fact from the operator — the exact silence C-315 removed.
+        redactor.try_add_secret(resolved.clone()).map_err(|why| {
+            Error::Config(format!(
+                "secret env var `{name}` cannot be protected: {why}. Referenced via \
+                 `secret \"{name}\"`; either lengthen the value or stop declaring it a secret."
+            ))
+        })?;
         *value = Value::String(resolved);
         return Ok(());
     }

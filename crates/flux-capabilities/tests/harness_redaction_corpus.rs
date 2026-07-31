@@ -67,24 +67,33 @@ const EXTERNAL: [HarnessKind; 3] = [
 
 /// A `$ env | …` dump as it lands in a transcript when a tool result is captured verbatim.
 ///
-/// Four credential shapes the redactor's prefix list knows, and two it does not — the mix a real
-/// dump has. The two it misses are the measurement, not an oversight.
+/// Five credential shapes the redactor catches and one it does not — the mix a real dump has. The
+/// last line is C-315's residual gap: a secret-named binding whose value is below the
+/// opaque-material floor, so no rule reaches it and `add_secret` is the only recourse.
 const TOOL_ENV_DUMP: &str = "\
 $ env | grep -Ei 'key|token|secret'
 ANTHROPIC_API_KEY=sk-ant-api03-c216corpustoolkey000000000000
 AWS_ACCESS_KEY_ID=AKIAC216CORPUSTOOL01
 AWS_SECRET_ACCESS_KEY=wJalrc216corpusToolNotARealSecret000000a
 SLACK_BOT_TOKEN=xoxb-000000000000-000000000000-c216corpustool
-DATABASE_URL=postgres://flux:c216corpustoolpassword@db.internal:5432/app";
+DATABASE_URL=postgres://flux:c216corpustoolpassword@db.internal:5432/app
+REDIS_PASSWORD=c216corpusPw";
 
 /// The same class of content pasted by the human instead of captured from a tool.
+///
+/// The last two lines are C-315's other two residual gaps: the same 40-character AWS shape with no
+/// assignment naming it, and the `key: value` spelling the contextual rule deliberately does not
+/// read. Both are stated here rather than in prose so they cannot rot into an unmeasured claim.
 const PASTED_ENV_DUMP: &str = "\
 here is my .env, why does the deploy fail?
 
 ANTHROPIC_API_KEY=sk-ant-api03-c216corpuspastekey00000000000
 GITHUB_TOKEN=ghp_c216corpuspastetoken0000000000
 GOOGLE_API_KEY=AIzaC216corpusPasteNotAReal00000000000
-AWS_SECRET_ACCESS_KEY=wJalrc216corpusPasteNotARealSecret0000a";
+AWS_SECRET_ACCESS_KEY=wJalrc216corpusPasteNotARealSecret0000a
+(the old one was wJalrc216corpusBareNoNameSecret00000a)
+and the runbook still says
+  password: wJalrc216corpusColonFormSecret0000a";
 
 /// A heredoc'd config — the shape a transcript takes when the agent *writes* the credentials rather
 /// than reading them. Almost nothing here is caught, and that is the point of including it.
@@ -288,14 +297,21 @@ const CASES: &[Case] = &[
             "sk-ant-api03-c216corpustoolkey000000000000",
             "AKIAC216CORPUSTOOL01",
             "xoxb-000000000000-000000000000-c216corpustool",
-        ],
-        dropped: &[],
-        escaped: &[],
-        preserved: &["env | grep -Ei"],
-        under_match: &[
+            // C-315: neither has a prefix. The first is named by its own assignment, the second by
+            // the URL grammar it sits in.
             "wJalrc216corpusToolNotARealSecret000000a",
             "c216corpustoolpassword",
         ],
+        dropped: &[],
+        escaped: &[],
+        // The URL rule takes the password and nothing else: which database, as whom, is what an
+        // operator reads a connection string for.
+        preserved: &[
+            "env | grep -Ei",
+            "postgres://flux:",
+            "@db.internal:5432/app",
+        ],
+        under_match: &["c216corpusPw"],
         surfaced_by: CLAUDE_ONLY,
     },
     // ---------------------------------------------------------------------------------------
@@ -322,11 +338,18 @@ const CASES: &[Case] = &[
             "sk-ant-api03-c216corpuspastekey00000000000",
             "ghp_c216corpuspastetoken0000000000",
             "AIzaC216corpusPasteNotAReal00000000000",
+            // C-315: caught by the assignment that names it, not by its own shape.
+            "wJalrc216corpusPasteNotARealSecret0000a",
         ],
         dropped: &[],
         escaped: &[],
         preserved: &["here is my .env, why does the deploy fail?"],
-        under_match: &["wJalrc216corpusPasteNotARealSecret0000a"],
+        // …and the same 40 characters with nothing naming them stays in the clear. This pair is the
+        // measurement of what C-315 actually bought: context, not entropy.
+        under_match: &[
+            "wJalrc216corpusBareNoNameSecret00000a",
+            "wJalrc216corpusColonFormSecret0000a",
+        ],
         surfaced_by: ALL_THREE,
     },
     // ---------------------------------------------------------------------------------------
@@ -335,19 +358,25 @@ const CASES: &[Case] = &[
         session: "heredoc",
         role: Role::Assistant,
         parts: &[Part::Text(HEREDOC_CONFIG)],
-        // One shape the list knows, so the case proves redaction still fires *inside* a heredoc…
-        redacted: &["ghp_c216corpusheredoctoken00000000"],
-        dropped: &[],
-        escaped: &[],
-        preserved: &["-----BEGIN OPENSSH PRIVATE KEY-----"],
-        // …and four it does not. This is the densest gap in the corpus, and the most realistic:
-        // an agent writing a production config is exactly where these shapes appear.
-        under_match: &[
+        // The densest case in the corpus, and the most realistic: an agent writing a production
+        // config is exactly where these shapes appear. C-216 measured four of the five as missed;
+        // C-315 closed all four — three by vendor spelling, the key body by the PEM block rule.
+        redacted: &[
+            "ghp_c216corpusheredoctoken00000000",
             "sk_live_c216corpusNotARealStripeKey0000",
             "hf_c216corpusNotARealHuggingFaceToken00",
             "glpat-c216corpusNotARealGitlabPat",
             "c216corpusNotARealPrivateKeyMaterialAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ],
+        dropped: &[],
+        escaped: &[],
+        // The delimiters are prose, not secret, and they are the only thing that makes the
+        // redaction legible — so the block loses its body and keeps its frame.
+        preserved: &[
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----END OPENSSH PRIVATE KEY-----",
+        ],
+        under_match: &[],
         surfaced_by: ALL_THREE,
     },
     // ---------------------------------------------------------------------------------------
@@ -831,7 +860,9 @@ fn read_tree(dir: &Path, out: &mut Vec<u8>) {
 fn no_adapter_but_claude_code_surfaces_tool_output() {
     let (home, env) = corpus_home("tool-output");
     let backend = ingested(&env);
-    let dump_marker = "AWS_SECRET_ACCESS_KEY=wJalrc216corpusToolNotARealSecret000000a";
+    // The contained form, since C-315: claude-code surfaces the dump, and what it surfaces of the
+    // AWS secret is the binding, not the key.
+    let dump_marker = "AWS_SECRET_ACCESS_KEY=[redacted]";
 
     let claude = case_records(&backend, HarnessKind::Claude, &CASES[1]);
     assert_eq!(
@@ -958,27 +989,50 @@ fn the_mirrored_containment_seam_is_the_one_the_ingest_applies() {
 // 3 — the corpus has teeth: the weakened-redactor proof
 // =============================================================================================
 
-/// The prefix list `flux-secret` ships, restated because it is private there.
+/// The prefix list `flux-secret` ships — prefix and its own minimum token length — restated because
+/// it is private there.
 ///
 /// Restating it is not a duplication smell here: a weakening has to be able to *differ* from the
 /// shipped list, and [`the_weakening_model_is_faithful_before_it_is_weakened`] pins the un-weakened
-/// model against the real redactor so drift shows up as a failure rather than as a straw man.
-const PREFIXES: &[&str] = &[
-    "sk-ant-",
-    "sk-",
-    "xoxb-",
-    "xoxp-",
-    "xoxe-",
-    "ghp_",
-    "gho_",
-    "github_pat_",
-    "AKIA",
-    "AIza",
-    "ya29.",
-    "eyJ",
+/// model against the real redactor so drift shows up as a failure rather than as a straw man. The
+/// per-prefix floors arrived with C-315, because `hf_` is three characters and `hf_hub_download` is
+/// an ordinary identifier.
+const PREFIXES: &[(&str, usize)] = &[
+    ("sk-ant-", 8),
+    ("sk-", 8),
+    ("sk_live_", 20),
+    ("xoxb-", 8),
+    ("xoxp-", 8),
+    ("xoxe-", 8),
+    ("ghp_", 8),
+    ("gho_", 8),
+    ("github_pat_", 12),
+    ("glpat-", 20),
+    ("hf_", 30),
+    ("AKIA", 8),
+    ("AIza", 8),
+    ("ya29.", 8),
+    ("eyJ", 8),
+];
+
+/// The assignment-name vocabulary the contextual rule reads (C-315), restated for the same reason.
+const SECRET_NAME_MARKERS: &[&str] = &[
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "access_key",
+    "private_key",
+    "credential",
 ];
 
 const LINE_MARKERS: &[char] = &['+', '-', '*', '#'];
+
+const AUTHORITY_END: &[char] = &[
+    '/', '?', '#', '"', '\'', '`', '<', '>', ',', ';', ')', ']', '}', '\\',
+];
 
 fn full_boundary(c: char) -> bool {
     c.is_whitespace()
@@ -1005,41 +1059,160 @@ fn whitespace_boundary(c: char) -> bool {
     c.is_whitespace()
 }
 
-/// A model of `flux_secret::redact_patterns`, parameterized on the three things a regression here
-/// has historically got wrong: the prefix list, what counts as a token boundary, and whether a
-/// leading diff/list marker is set aside before the prefix match.
-fn model_redact(
-    input: &str,
-    prefixes: &[&str],
+/// A model of `flux_secret::Redactor::redact` (minus registered values, which the corpus exercises
+/// separately), parameterized on the five things a regression here has historically got wrong or
+/// could newly get wrong: the prefix list, what counts as a token boundary, whether a leading
+/// diff/list marker is set aside, whether the structural passes run, and whether the contextual
+/// assignment rule runs.
+#[derive(Clone, Copy)]
+struct Model {
+    prefixes: &'static [(&'static str, usize)],
     boundary: fn(char) -> bool,
     strip_markers: bool,
-) -> String {
-    fn flush(token: &mut String, out: &mut String, prefixes: &[&str], strip_markers: bool) {
-        let body = if strip_markers {
+    /// C-315's PEM-block and URL-userinfo passes.
+    structural: bool,
+    /// C-315's secret-named-assignment rule.
+    assignment: bool,
+}
+
+/// The model configured as `flux-secret` actually ships.
+const SHIPPED: Model = Model {
+    prefixes: PREFIXES,
+    boundary: full_boundary,
+    strip_markers: true,
+    structural: true,
+    assignment: true,
+};
+
+fn model_redact(input: &str, model: Model) -> String {
+    let staged = if model.structural {
+        model_url(&model_pem(input))
+    } else {
+        input.to_string()
+    };
+    model_tokens(&staged, model)
+}
+
+/// The PEM private-key block pass: body to one `[redacted]` line, delimiters kept, `PRIVATE KEY`
+/// only, and an unterminated block redacted to the end.
+fn model_pem(input: &str) -> String {
+    if !input.contains("PRIVATE KEY") {
+        return input.to_string();
+    }
+    fn is_delimiter(trimmed: &str, opener: &str) -> bool {
+        trimmed.starts_with(opener) && trimmed.ends_with("-----") && trimmed.contains("PRIVATE KEY")
+    }
+    let mut out = String::new();
+    let mut in_body = false;
+    let mut emitted = false;
+    for line in input.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if in_body {
+            if is_delimiter(trimmed, "-----END ") {
+                in_body = false;
+                out.push_str(line);
+            } else if !emitted {
+                emitted = true;
+                out.push_str("[redacted]");
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            continue;
+        }
+        out.push_str(line);
+        if is_delimiter(trimmed, "-----BEGIN ") {
+            in_body = true;
+            emitted = false;
+        }
+    }
+    out
+}
+
+/// The URL pass: the password in a `scheme://user:password@host` authority, and nothing else.
+fn model_url(input: &str) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(scheme_end) = rest.find("://") {
+        let start = scheme_end + 3;
+        let end = start
+            + rest[start..]
+                .find(|c: char| c.is_whitespace() || AUTHORITY_END.contains(&c))
+                .unwrap_or(rest.len() - start);
+        let authority = &rest[start..end];
+        let password = authority.rfind('@').and_then(|at| {
+            authority[..at]
+                .find(':')
+                .map(|colon| (start + colon + 1, start + at))
+                .filter(|(from, to)| to > from)
+        });
+        match password {
+            Some((from, to)) => {
+                out.push_str(&rest[..from]);
+                out.push_str("[redacted]");
+                out.push_str(&rest[to..end]);
+            }
+            None => out.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn model_names_a_secret(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    SECRET_NAME_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+fn model_is_opaque(value: &str) -> bool {
+    value.len() >= 16
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'_' | b'-'))
+        && value.bytes().any(|b| b.is_ascii_digit())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// The token pass, which is where the three original knobs live plus the assignment rule.
+fn model_tokens(input: &str, model: Model) -> String {
+    fn flush(token: &mut String, out: &mut String, model: Model, assigned: bool) -> bool {
+        let body = if model.strip_markers {
             token.trim_start_matches(LINE_MARKERS)
         } else {
             token.as_str()
         };
-        if body.len() >= 8 && prefixes.iter().any(|p| body.starts_with(p)) {
+        let named = model_names_a_secret(body);
+        let prefixed = model
+            .prefixes
+            .iter()
+            .any(|(p, min)| body.len() >= *min && body.starts_with(p));
+        if prefixed || (model.assignment && assigned && model_is_opaque(body)) {
             out.push_str(&token[..token.len() - body.len()]);
             out.push_str("[redacted]");
         } else {
             out.push_str(token);
         }
         token.clear();
+        named
     }
 
     let mut out = String::with_capacity(input.len());
     let mut token = String::new();
+    let mut assigned = false;
     for c in input.chars() {
-        if boundary(c) {
-            flush(&mut token, &mut out, prefixes, strip_markers);
+        if (model.boundary)(c) {
+            let named = flush(&mut token, &mut out, model, assigned);
+            assigned = named && c == '=';
             out.push(c);
         } else {
             token.push(c);
         }
     }
-    flush(&mut token, &mut out, prefixes, strip_markers);
+    flush(&mut token, &mut out, model, assigned);
     out
 }
 
@@ -1052,7 +1225,7 @@ fn the_weakening_model_is_faithful_before_it_is_weakened() {
     let (home, _env) = corpus_home("model");
     for message in extracted(&home) {
         assert_eq!(
-            model_redact(&message.text, PREFIXES, full_boundary, true),
+            model_redact(&message.text, SHIPPED),
             real_redact(&message.text),
             "the model diverges from the shipped redactor on {}/{}",
             message.harness.id(),
@@ -1065,21 +1238,71 @@ fn the_weakening_model_is_faithful_before_it_is_weakened() {
 /// One weakening: a name to report it by, and the redaction it degrades to.
 type Weakening = (&'static str, Box<dyn Fn(&str) -> String>);
 
-/// The three weakenings, each the shape of a regression this repo has shipped or nearly shipped.
+/// The five weakenings, each the shape of a regression this repo has shipped, nearly shipped, or —
+/// for the last two — could ship the moment C-315's new mechanisms are refactored.
 fn weakenings() -> Vec<Weakening> {
     vec![
         (
             "the credential prefix list emptied",
-            Box::new(|t: &str| model_redact(t, &[], full_boundary, true))
-                as Box<dyn Fn(&str) -> String>,
+            Box::new(|t: &str| {
+                model_redact(
+                    t,
+                    Model {
+                        prefixes: &[],
+                        ..SHIPPED
+                    },
+                )
+            }) as Box<dyn Fn(&str) -> String>,
         ),
         (
             "whitespace-only token boundaries (punctuation-glued credentials hide)",
-            Box::new(|t: &str| model_redact(t, PREFIXES, whitespace_boundary, true)),
+            Box::new(|t: &str| {
+                model_redact(
+                    t,
+                    Model {
+                        boundary: whitespace_boundary,
+                        ..SHIPPED
+                    },
+                )
+            }),
         ),
         (
             "no leading line-marker stripping (C-185's own bug: a diff hides a key)",
-            Box::new(|t: &str| model_redact(t, PREFIXES, full_boundary, false)),
+            Box::new(|t: &str| {
+                model_redact(
+                    t,
+                    Model {
+                        strip_markers: false,
+                        ..SHIPPED
+                    },
+                )
+            }),
+        ),
+        (
+            "the structural passes removed (C-315: a PEM body and a URL password fall back to the \
+             token rules, which cannot see either)",
+            Box::new(|t: &str| {
+                model_redact(
+                    t,
+                    Model {
+                        structural: false,
+                        ..SHIPPED
+                    },
+                )
+            }),
+        ),
+        (
+            "the assignment rule removed (C-315: a credential with no prefix loses the only thing \
+             that identifies it)",
+            Box::new(|t: &str| {
+                model_redact(
+                    t,
+                    Model {
+                        assignment: false,
+                        ..SHIPPED
+                    },
+                )
+            }),
         ),
     ]
 }
@@ -1099,19 +1322,22 @@ fn the_corpus_fails_against_a_weakened_redactor() {
     let expected: &[(&str, &[Shape])] = &[
         (
             "the credential prefix list emptied",
+            // Three, not six — and the change is C-315's most load-bearing side effect, so it is
+            // recorded rather than glossed. Every credential in an `env`-dump or heredoc line is
+            // *also* named by its own assignment, so emptying the prefix list no longer exposes
+            // them: the contextual rule is genuine defence in depth. What it does not reach is a
+            // token in prose (`Bearer sk-ant-…`), on a diff line, or on a line of its own.
             &[
                 Shape::MultiPartContent,
-                Shape::ToolResultOutput,
                 Shape::Base64Blob,
-                Shape::EnvDumpPaste,
-                Shape::HeredocConfig,
                 Shape::InstructionShapedText,
             ],
         ),
         (
             "whitespace-only token boundaries (punctuation-glued credentials hide)",
             // Not Base64Blob: its `eyJ…` blob sits on a line of its own, so a whitespace-only
-            // tokenizer still finds the prefix at the token head.
+            // tokenizer still finds the prefix at the token head. The assignment rule dies with
+            // this weakening too — without `=` as a boundary there is no name/value pair to read.
             &[
                 Shape::ToolResultOutput,
                 Shape::EnvDumpPaste,
@@ -1121,6 +1347,19 @@ fn the_corpus_fails_against_a_weakened_redactor() {
         (
             "no leading line-marker stripping (C-185's own bug: a diff hides a key)",
             &[Shape::MultiPartContent],
+        ),
+        (
+            "the structural passes removed (C-315: a PEM body and a URL password fall back to the \
+             token rules, which cannot see either)",
+            // Exactly the two cases that carry structurally-identified material: the heredoc's
+            // private key and the tool dump's connection URL.
+            &[Shape::ToolResultOutput, Shape::HeredocConfig],
+        ),
+        (
+            "the assignment rule removed (C-315: a credential with no prefix loses the only thing \
+             that identifies it)",
+            // The two cases carrying an AWS *secret* access key, which has no vendor prefix.
+            &[Shape::ToolResultOutput, Shape::EnvDumpPaste],
         ),
     ];
 
@@ -1190,29 +1429,19 @@ fn leaked_shapes(messages: &[HarnessMessage], weak: &dyn Fn(&str) -> String) -> 
 /// shapes it does. This list is the one written into `docs/designs/harness-history.md`; the test
 /// below pins it in both directions so the document cannot rot.
 const UNCAUGHT: &[(&str, &str)] = &[
+    // C-315's residual gaps — what the contextual rule deliberately does NOT reach. Each is a
+    // decision recorded in `docs/designs/harness-history.md`, not an oversight.
     (
-        "an AWS secret access key — 40 chars, no prefix at all",
-        "wJalrc216corpusToolNotARealSecret000000a",
+        "a secret-named assignment whose value is below the opaque-material floor",
+        "REDIS_PASSWORD=c216corpusPw",
     ),
     (
-        "a password inside a connection URL",
-        "postgres://flux:c216corpustoolpassword@db.internal:5432/app",
+        "a bare high-entropy token with neither a prefix nor a naming context",
+        "wJalrc216corpusBareNoNameSecret00000a",
     ),
     (
-        "a Stripe secret key — `sk_live_…`, an underscore where the prefix list has a hyphen",
-        "sk_live_c216corpusNotARealStripeKey0000",
-    ),
-    (
-        "a Hugging Face token — `hf_…`",
-        "hf_c216corpusNotARealHuggingFaceToken00",
-    ),
-    (
-        "a GitLab personal access token — `glpat-…`",
-        "glpat-c216corpusNotARealGitlabPat",
-    ),
-    (
-        "PEM private-key material — the delimiters are prose, the body is unprefixed base64",
-        "c216corpusNotARealPrivateKeyMaterialAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "a secret-named binding in `key: value` form rather than `key=value`",
+        "password: wJalrc216corpusColonFormSecret0000a",
     ),
 ];
 
@@ -1231,6 +1460,34 @@ const CAUGHT: &[(&str, &str)] = &[
     (
         "base64 whose decoded content is JSON, so it begins `eyJ`",
         SERVICE_ACCOUNT_B64,
+    ),
+    // C-315 — the six C-216 measured as uncaught, closed by three mechanisms rather than by a
+    // longer prefix list. Which mechanism catches which is stated in the design doc.
+    (
+        "an AWS secret access key, named by its own assignment (`AWS_SECRET_ACCESS_KEY=…`)",
+        "AWS_SECRET_ACCESS_KEY=wJalrc216corpusToolNotARealSecret000000a",
+    ),
+    (
+        "a password inside a connection URL",
+        "postgres://flux:c216corpustoolpassword@db.internal:5432/app",
+    ),
+    (
+        "a Stripe secret key — `sk_live_…`",
+        "sk_live_c216corpusNotARealStripeKey0000",
+    ),
+    (
+        "a Hugging Face token — `hf_…`",
+        "hf_c216corpusNotARealHuggingFaceToken00",
+    ),
+    (
+        "a GitLab personal access token — `glpat-…`",
+        "glpat-c216corpusNotARealGitlabPat",
+    ),
+    (
+        "PEM private-key material — the block body, with the delimiters left as prose",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+         c216corpusNotARealPrivateKeyMaterialAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
+         -----END OPENSSH PRIVATE KEY-----",
     ),
 ];
 
