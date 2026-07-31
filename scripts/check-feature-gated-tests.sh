@@ -57,7 +57,7 @@ codewandler-flux-plugin	hooks	covered	the root manifest pins host+hooks+pack on 
 codewandler-flux-plugin	host	covered	the root manifest pins host+hooks+pack on for every consumer
 codewandler-flux-plugin	pack	covered	the root manifest pins host+hooks+pack on for every consumer
 codewandler-flux-providers	realtime	run	17 OpenAI Realtime config/event tests; no member enables it
-codewandler-flux-sdk	plugins	skip	RED on main and pre-existing: the fixture plugin declares a process effect without process access, so both tests fail to load it. Wiring it in would red CI on a defect this story did not cause; it is filed as a follow-up. Re-check with: cargo test -p codewandler-flux-sdk --features plugins --test plugins
+codewandler-flux-sdk	plugins	run	2 end-to-end plugin-op tests behind the fixture plugin binary; nothing in the workspace enables it. Un-quarantined by C-309, which fixed what made it red: the effect-less projection default synthesized a process effect no capability backed, so the fixture could not satisfy the authority contract
 codewandler-flux-sdk	pricing	run	1 loader test
 codewandler-flux-sdk	providers	run	1 test + 1 doctest on from_spec
 codewandler-flux-sdk	test-kit	covered	flux-cli takes flux-sdk with test-kit as a dev-dependency

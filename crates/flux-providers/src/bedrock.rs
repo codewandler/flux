@@ -548,17 +548,11 @@ impl Credential for BedrockCredential {
 
 /// Percent-encode a single URL path segment per RFC 3986 (unreserved `A-Za-z0-9-._~` preserved),
 /// encoding everything else (including `/` so a model id can't inject path segments). AWS SigV4
-/// canonical-URI uses the same encoding for non-S3 services.
+/// canonical-URI uses the same encoding for non-S3 services — which is why this delegates to the
+/// shared encoder (C-303) rather than keeping a private copy: SigV4 breaks on a one-character
+/// drift, and `percent_encode_segment_preserves_unreserved_and_encodes_others` pins the contract.
 fn percent_encode_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
+    flux_core::percent_encode_component(s)
 }
 
 /// Hex-encode bytes (lowercase) — the format SigV4 uses for all hashes.

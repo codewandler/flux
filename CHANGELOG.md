@@ -6,6 +6,47 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`http.request` accepts a structured `query` map, and percent-encodes every value per RFC 3986**
+  (C-303). Authored Flux could previously only build a query by interpolating into the URL string,
+  and nothing encoded the result — so a model-supplied value carrying `&` or `=` rewrote the request
+  into parameters the author never wrote. The map is resolved and appended *before*
+  `guard_url_scoped_pinned`, so the egress guard, the pinning and the redirect re-guard all observe
+  the wire URL; there is no second, unguarded URL. A `null` value is omitted (an unsupplied optional
+  field), `false` and `0` are sent, and a duplicate key is an error rather than a silent last-wins.
+  `permission_subjects` and the `NetworkFetch` intent report the encoded URL.
+
+  A `$secret` placed in a query routes through the same C-76 allowlist as one placed in a header,
+  and **both** its raw and percent-encoded spellings are seeded into the redactor — a token that only
+  ever appears on the wire as `sk-live%2F99` would otherwise survive redaction.
+
+  The encoder is now shared (`flux_core::urlencode`), with `flux-credentials` and `flux-providers`
+  converted onto it. It emits upper-case hex because SigV4 requires it, and it is deliberately
+  distinct from the form encoder: a space is `%20`, never `+`. One private copy remains in
+  `flux-plugin` and the design doc's claim to the contrary is tracked by C-313.
+
+### Fixed
+
+- **A plugin operation that declared no effects could not be loaded at all** unless its plugin also
+  declared a `process` capability (C-309). The projection derived a tool's `access` purely from the
+  manifest's capabilities while defaulting an effect-less operation to `[Process, Network]`, and the
+  authority contract refuses any tool declaring an effect it holds no matching access for — so the two
+  composed into an unsatisfiable requirement. `AccessKind::Process` is now unconditional for every
+  plugin op, which is the honest reading: dispatching one is an interaction with an already-spawned
+  subprocess of arbitrary operator-installed code, whereas `capabilities.process` describes only the
+  *further* programs a plugin may shell out to. Effect-less plugin ops are consequently gated on
+  `process.exec` rather than being unloadable. No shipped plugin loses a gate.
+
+  The fix is deliberately on the access side and not the effects side: authority requirements derive
+  from `access`, not `effects`, so relaxing the effects default would have projected operations
+  carrying no requirement at all — skipping the authorization floor instead of satisfying it.
+
+- **`codewandler-flux-sdk`'s `plugins` feature is compiled and run by CI again.** It was quarantined
+  as `skip` in the feature-gate ledger because the defect above made both of its tests red on `main`
+  while `cargo test --workspace` stayed green. The ledger's remaining `skip` entries are now cost-based
+  rather than defect-based.
+
 ## [0.42.1] - 2026-07-31
 
 ### Fixed

@@ -46,6 +46,10 @@ fn record_client(flags: &AgentFlags) -> Result<flux_sdk::Client> {
     flux_sdk::Client::builder()
         .model(model)
         .auto_approve(flags.yes)
+        // C-307: `flux record` runs a real, live turn, so the operator's `[limits]` ceilings apply
+        // to it exactly as they do to `flux run`. (`flux test`'s [`offline_client`] is deliberately
+        // NOT wired — see its doc comment.)
+        .resource_limits(cli_resource_limits(&cfg))
         .storage(flux_sdk::Storage::dir(flux_store_dir()?))
         .build(provider, &cwd)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -54,6 +58,14 @@ fn record_client(flags: &AgentFlags) -> Result<flux_sdk::Client> {
 /// The offline client every `flux test` fixture replays against: deny-all approver (the builder
 /// default — no `auto_approve`) and a provider that refuses to answer. Between them, a replay that
 /// tried to do anything live would fail loudly instead of quietly costing money.
+///
+/// C-307 audited every surface that assembles a runtime without ceilings and wired all of them
+/// except this one, **deliberately**: `flux test` is a regression gate whose whole value is that its
+/// verdict depends only on the fixture. Reading the local `[limits]` table here would let a machine's
+/// config decide a replay — a saturated `max_concurrent_tool_calls` refuses a queued call with a tool
+/// error after `tool_call_queue_timeout`, which is a red test on one developer's box and green on
+/// another. The bound this would buy is also not needed: a replay drives recorded traffic against a
+/// never-called provider, so there is no runaway workload to cap.
 fn offline_client() -> Result<flux_sdk::Client> {
     let cwd = std::env::current_dir().context("current dir")?;
     flux_sdk::Client::builder()
