@@ -95,8 +95,14 @@ pub const OPCODES: &[(&str, &str)] = &[
     ("?", "when"),
     ("?=", "match"),
     ("?~", "route"),
-    ("|", "arm — a match/route case, a parallel/race branch, a fallback branch"),
-    ("|*", "default arm — a match/route default, or a conditional's else"),
+    (
+        "|",
+        "arm — a match/route case, a parallel/race branch, a fallback branch",
+    ),
+    (
+        "|*",
+        "default arm — a match/route default, or a conditional's else",
+    ),
     ("&", "parallel"),
     ("||", "race"),
     ("??", "fallback"),
@@ -468,7 +474,10 @@ pub fn parse_glyph(src: &str) -> Result<DraftAst> {
     let (header, body) = match nodes.first() {
         Some(first) if first.line.op == Op::Flow => {
             if !first.children.is_empty() {
-                return Err(err(first.children[0].line.no, "the `F` flow header takes no body"));
+                return Err(err(
+                    first.children[0].line.no,
+                    "the `F` flow header takes no body",
+                ));
             }
             (flow_decl(&first.line)?, &nodes[1..])
         }
@@ -684,9 +693,7 @@ impl Emit {
 /// The canonical `flow` header for an `F` line: `F [name][(param:Type, …)][>Return]`.
 fn flow_decl(line: &Line<'_>) -> Result<String> {
     let operand = line.operand;
-    let name_len = operand
-        .find(|c: char| c == '(' || c == '>')
-        .unwrap_or(operand.len());
+    let name_len = operand.find(['(', '>']).unwrap_or(operand.len());
     let name = operand[..name_len].trim();
     let mut rest = &operand[name_len..];
 
@@ -803,7 +810,10 @@ fn split_arms<'a, 'b>(
             Op::Arm => {
                 return Err(err(
                     child.line.no,
-                    format!("`{}` takes only a `|*` default arm, not a labelled `|` arm", parent.line.head),
+                    format!(
+                        "`{}` takes only a `|*` default arm, not a labelled `|` arm",
+                        parent.line.head
+                    ),
                 ))
             }
             Op::Default if defaulted => {
@@ -882,7 +892,11 @@ fn emit_stmt(node: &GNode<'_>, level: usize, out: &mut Emit) -> Result<()> {
                 Some((name, ty)) => format!("{name}: {ty}"),
                 None => target.to_string(),
             };
-            let keyword = if node.line.op == Op::Memo { "memo " } else { "" };
+            let keyword = if node.line.op == Op::Memo {
+                "memo "
+            } else {
+                ""
+            };
             out.push(level, &format!("{keyword}{target} = {value}"), at);
             Ok(())
         }
@@ -1033,8 +1047,8 @@ fn emit_stmt(node: &GNode<'_>, level: usize, out: &mut Emit) -> Result<()> {
         // `!? "<message>"[ <risk>]` — the human-in-the-loop gate.
         Op::Confirm => {
             let operand = operand_of(node, "a message")?;
-            let (message, rest) = split_string(operand)
-                .ok_or_else(|| err(at, "`!?` needs a quoted message"))?;
+            let (message, rest) =
+                split_string(operand).ok_or_else(|| err(at, "`!?` needs a quoted message"))?;
             let header = match rest.trim() {
                 "" => format!("confirm {message}"),
                 risk if format::is_word_token(risk) => format!("confirm {message}, risk: {risk}"),
@@ -1129,7 +1143,10 @@ mod tests {
             body: vec![node],
             ..Default::default()
         };
-        assert_eq!(format_glyph(&ast), "F\n@{\"kind\":\"var\",\"name\":\"F\"}\n");
+        assert_eq!(
+            format_glyph(&ast),
+            "F\n@{\"kind\":\"var\",\"name\":\"F\"}\n"
+        );
         assert_eq!(parse_glyph(&format_glyph(&ast)).unwrap(), ast);
     }
 
@@ -1185,10 +1202,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(
-            format_glyph(&ast),
-            "F\n!? \"say \\\"hi\\\"\" high\n"
-        );
+        assert_eq!(format_glyph(&ast), "F\n!? \"say \\\"hi\\\"\" high\n");
         assert_eq!(parse_glyph(&format_glyph(&ast)).unwrap(), ast);
     }
 }

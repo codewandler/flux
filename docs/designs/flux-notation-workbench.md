@@ -78,24 +78,41 @@ reader targets the stable, unambiguous subset and rejects everything else.
 
 ### Flux Glyph
 
+**Built (L-97)** — `crates/flux-lang/src/glyph.rs`, spec in `crates/flux-lang/docs/glyph.md`.
+
 ```text
 F triage(ticket:Ticket)>Answer
 = kind classify(ticket)
 &
-  +docs search(query=ticket)
-  +hits grep(pattern=ticket.title)
+  | docs
+    search(query: ticket)
+  | hits
+    grep(pattern: ticket.title)
 ?= kind
-  |bug
-    !?medium "Open issue?"
-      = issue create_issue(ticket,hits)
+  | "bug"
+    !? "Open issue?" medium
+      = issue create_issue(hits, ticket)
       ^ issue
   |*
     ^ docs
 ```
 
-The initial vocabulary is `F` flow, `=` bind, `^` return, `?` conditional, `?=` match, `?~` route,
-`|` case, `|*` default, `&` parallel, `||` race, `??` fallback, `!?` confirm, `!!` assert, and `~=`
-memo. `@{...}` is the raw-node escape.
+The vocabulary is `F` flow, `=` bind, `^` return, `?` conditional, `?=` match, `?~` route, `|` case,
+`|*` default, `&` parallel, `||` race, `??` fallback, `!?` confirm, `!!` assert, and `~=` memo.
+`@{...}` is the raw-node escape.
+
+Three details settled during implementation, each in service of *exactly* that vocabulary:
+
+- **`|` is the single arm opcode.** The sketch above originally spelled a parallel branch `+docs`,
+  which would have been a fifteenth opcode. Instead `|` means "an arm of the enclosing construct" —
+  a `match`/`route` case, a named `parallel`/`race` branch, an unlabelled `fallback` branch — and the
+  enclosing opcode decides which. An arm in the wrong place is an error, never a guess.
+- **Opcode and operand are always space-separated, and arm bodies are always indented.** The sketch's
+  glued forms (`|bug`, `!?medium`, a branch's statement inline on its arm line) buy a few characters
+  at the cost of a second tokenizer and a special case in the round-trip; regularity won.
+- **Operands in expression position are canonical Flux expressions** (`query: ticket`, `"bug"`), not a
+  Glyph-specific spelling. Glyph projects the AST; it does not fork the expression grammar. That is
+  also what keeps a case value a *value* rather than an accidental symbol read.
 
 ### Flux Tape
 

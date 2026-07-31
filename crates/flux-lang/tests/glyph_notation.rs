@@ -109,22 +109,45 @@ fn the_opcode_vocabulary_is_exactly_the_designs() {
     expected.sort_unstable();
     let mut actual: Vec<&str> = OPCODES.iter().map(|(op, _)| *op).collect();
     actual.sort_unstable();
-    assert_eq!(actual, expected, "the Glyph vocabulary drifted from the design");
+    assert_eq!(
+        actual, expected,
+        "the Glyph vocabulary drifted from the design"
+    );
 }
 
 #[test]
 fn the_escape_carries_a_compact_raw_json_node() {
     // `@{…}` is the one escape: a node with no native Glyph spelling travels as its wire JSON.
+    // A bind carrying an `@effect(…)` marker is two canonical lines, so it has no Glyph spelling.
+    let ast = DraftAst {
+        body: vec![Node::Bind {
+            name: SymbolName("x".into()),
+            value: Box::new(Node::Lit {
+                value: serde_json::json!(1),
+            }),
+            ty: None,
+            effect: Some(FlowEffect::Read),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        format_glyph(&ast),
+        "F\n@{\"kind\":\"bind\",\"name\":\"x\",\"value\":{\"kind\":\"lit\",\"value\":1},\"effect\":\"read\"}\n"
+    );
+    assert_eq!(parse_glyph(&format_glyph(&ast)).unwrap(), ast);
+}
+
+#[test]
+fn a_canonical_one_liner_stays_readable_rather_than_escaping() {
+    // The escape is the *last* resort: any node whose canonical Flux spelling is a single line is
+    // carried through verbatim, so Glyph stays readable instead of degenerating into JSON.
     let ast = DraftAst {
         body: vec![Node::Checkpoint {
             label: "phase-1".into(),
         }],
         ..Default::default()
     };
-    assert_eq!(
-        format_glyph(&ast),
-        "F\n@{\"kind\":\"checkpoint\",\"label\":\"phase-1\"}\n"
-    );
+    assert_eq!(format_glyph(&ast), "F\ncheckpoint \"phase-1\"\n");
     assert_eq!(parse_glyph(&format_glyph(&ast)).unwrap(), ast);
 }
 
@@ -748,9 +771,7 @@ fn gen_node(rng: &mut Rng, depth: usize, samples: &[(&'static str, Node)]) -> No
         },
         9 => Node::Confirm {
             message: (*rng.pick(STRINGS)).to_string(),
-            risk: rng
-                .chance(70)
-                .then(|| (*rng.pick(RISKS)).to_string()),
+            risk: rng.chance(70).then(|| (*rng.pick(RISKS)).to_string()),
             body: gen_body(rng, d, samples),
         },
         10 => Node::Assert {
@@ -923,9 +944,16 @@ fn a_bind_without_a_value_is_rejected_rather_than_guessed() {
 
 #[test]
 fn a_canonical_expression_error_is_reported_at_its_glyph_line() {
-    // The expression grammar is canonical Flux's; its diagnostic must still name the *Glyph* line.
-    let d = rejected("F\n= a 1\n&\n  | docs\n    ^ a\n?= kind\n  | \"bug\"\n    = b read(((\n");
-    assert!(d.contains("line 8"), "{d}");
+    // The expression grammar is canonical Flux's; its diagnostic must still name the *Glyph* line
+    // the author can see. Blank and comment lines carry no structure, so the Glyph line number and
+    // the canonical one deliberately diverge here — the bad statement is Glyph line 9 but only the
+    // fifth canonical line, and the reader must report the former.
+    let d = rejected("# the triage flow\n\nF\n\n= a 1\n\n?= kind\n  | \"bug\"\n    = b read(((\n");
+    assert!(d.contains("line 9"), "{d}");
+    assert!(
+        !d.contains("line 5"),
+        "the canonical line leaked through: {d}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,16 @@ enum Command {
         /// Path to a Flux-Lang text file; reads stdin when omitted.
         file: Option<PathBuf>,
     },
+    /// Project canonical Flux-Lang text (from FILE, or stdin when omitted) as Flux Glyph.
+    Glyph {
+        /// Path to a Flux-Lang text file; reads stdin when omitted.
+        file: Option<PathBuf>,
+    },
+    /// Expand Flux **Glyph** (from FILE, or stdin when omitted) back to canonical Flux-Lang text.
+    Unglyph {
+        /// Path to a Flux Glyph file; reads stdin when omitted.
+        file: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -77,6 +87,8 @@ fn run() -> Result<()> {
         Command::Render { file } => render_ast(file)?,
         Command::Compile { file } => compile_text(file)?,
         Command::Rail { file } => rail_text(file)?,
+        Command::Glyph { file } => glyph_src(&read_source(file)?)?,
+        Command::Unglyph { file } => unglyph_src(&read_source(file)?)?,
     };
     let mut stdout = std::io::stdout();
     stdout
@@ -182,6 +194,40 @@ fn rail_text(file: Option<PathBuf>) -> Result<String> {
     rail_src(&src)
 }
 
+/// Project canonical Flux source as **Flux Glyph** (L-97) — the compact indented opcode notation.
+/// Shares `compile`'s parse entry, so malformed source reports the same diagnostic here.
+///
+/// Glyph is a flow projection, so a program module is projected one flow per document, blank-line
+/// separated, exactly as `rail` does.
+fn glyph_src(src: &str) -> Result<String> {
+    let documents: Vec<String> = match flux_lang::program::Module::parse_str(src)
+        .map_err(|e| Error::Other(format!("parse error: {e}")))?
+    {
+        flux_lang::program::Module::Flow(ast) => vec![flux_lang::glyph::format_glyph(&ast)],
+        flux_lang::program::Module::Program(prog) => prog
+            .flows
+            .iter()
+            .chain(prog.journeys.iter().map(|j| &j.flow))
+            .map(flux_lang::glyph::format_glyph)
+            .collect(),
+    };
+    if documents.is_empty() {
+        return Err(Error::Other(
+            "no flow to project: the module declares no top-level flow or journey".to_string(),
+        ));
+    }
+    Ok(documents.join("\n"))
+}
+
+/// Expand a **Glyph** document back to canonical Flux source. The notation is never sniffed: this
+/// subcommand *is* the explicit declaration that the input is Glyph, and it goes through the AST —
+/// so what it prints is canonical `format` output, not a textual rewrite.
+fn unglyph_src(src: &str) -> Result<String> {
+    let ast = flux_lang::glyph::parse_glyph(src)
+        .map_err(|e| Error::Other(format!("glyph parse error: {e}")))?;
+    Ok(flux_lang::format::format(&ast))
+}
+
 /// A small ANSI palette for terminal rendering.
 const ANSI: Palette = Palette {
     keyword: ("\x1b[1;35m", "\x1b[0m"),
@@ -275,6 +321,39 @@ mod tests {
             out,
             "[flow first]\n  --> [1] --> RETURN\n\n[flow second]\n  --> [2] --> RETURN\n"
         );
+    }
+
+    #[test]
+    fn projects_canonical_flux_as_glyph_and_back() {
+        // L-97: the two directions are separate, explicitly-named subcommands — nothing sniffs the
+        // notation, and a Glyph document expands back to exactly the canonical source it came from.
+        let src = "flow triage(ticket: Ticket)\n  kind = classify(ticket)\n  return kind\n";
+        let glyph = glyph_src(src).unwrap();
+        assert_eq!(
+            glyph,
+            "F triage(ticket:Ticket)\n= kind classify(ticket)\n^ kind\n"
+        );
+        assert_eq!(unglyph_src(&glyph).unwrap(), src);
+    }
+
+    #[test]
+    fn glyph_reports_the_existing_parser_diagnostics() {
+        // Canonical source in, canonical diagnostic out — one parse entry, one error vocabulary.
+        let bad = "= = = not flux = = =";
+        let glyph = glyph_src(bad)
+            .expect_err("malformed flux must not project")
+            .to_string();
+        assert_eq!(glyph, compile_src(bad).expect_err("also fails").to_string());
+    }
+
+    #[test]
+    fn unglyph_refuses_canonical_flux() {
+        // The Glyph reader is not a second canonical parser: feeding it `.flux` is an error, not a
+        // silent pass-through.
+        let err = unglyph_src("flow x\n  return 1\n")
+            .expect_err("canonical Flux is not a Glyph document")
+            .to_string();
+        assert!(err.contains("glyph parse error"), "got: {err}");
     }
 
     /// Render from an in-memory string (test helper mirroring `render_ast`'s parse+render).

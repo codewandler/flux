@@ -68,6 +68,7 @@ and keep it in sync with your change (design + status + plan move together):
 - [`docs/reference.md`](docs/reference.md) — every node kind, fields, semantics (node table generated).
 - [`docs/syntax.md`](docs/syntax.md) — the writable text-syntax spec.
 - [`docs/railflux.md`](docs/railflux.md) — the Railflux ASCII dataflow projection (`src/rail.rs`, `fluxlang rail`). **Output spec only** — the reader is deferred (L-100), so treat this file as the contract that shape must hold to.
+- [`docs/glyph.md`](docs/glyph.md) — Flux Glyph, the compact indented opcode projection (`src/glyph.rs`, `fluxlang glyph`/`unglyph`). **Bidirectional and total**: `parse_glyph(format_glyph(ast)) == ast`. It adds no node kind and no `.flux` syntax — the notation is selected explicitly and never sniffed.
 - [`README.md`](README.md) — what the execution layer *is* (and isn't) + the crate overview.
 
 **Forward design — the evolution**
