@@ -2,7 +2,7 @@
 id: C-328
 title: "A wiring line declares the test that observes it — the pin census"
 pillar: Core
-status: ready
+status: in-progress
 priority: 2
 areas: [flux-codegate, flux-cli]
 design: docs/designs/unobserved-wiring.md
@@ -43,39 +43,39 @@ branches in the pure L0 crates — scoped and nightly. Not this story.)
 
 ## Acceptance
 
-- [ ] **Failing-first, of the strongest available kind:** the census, run at this story's base
+- [x] **Failing-first, of the strongest available kind:** the census, run at this story's base
       commit, reports exactly `crates/flux-cli/src/lab_cmd.rs:52` and `crates/flux-cli/src/review.rs:185`
       as unpinned. Paste the failure output. **A census that is green on its first run has not been
       demonstrated.**
-- [ ] A new alias-resolving `syn::visit::Visit` scanner in `crates/flux-codegate/src/lib.rs`
+- [x] A new alias-resolving `syn::visit::Visit` scanner in `crates/flux-codegate/src/lib.rs`
       (`pin_seams(src) -> Vec<Seam>`) finds method calls whose receiver chain roots at
       `flux_sdk::Client::builder` or `flux_sdk::FlowClient::builder`, skips `#[cfg(test)]` items, and
       records a **byte span** (not a line) so C-329's runner can excise a multi-line chain. Unit-test
       it against fixtures including a renamed import (`use flux_sdk::Client as C;`) and a
       `#[cfg(test)]` decoy — the shape `direct_io_scanner_resolves_imports_aliases_and_all_io_families`
       already uses.
-- [ ] Pins and exemptions are read by the **existing** `allow_reason` (`lib.rs:1748`) with new
+- [x] Pins and exemptions are read by the **existing** `allow_reason` (`lib.rs:1748`) with new
       markers `flux-pin:` and `flux-pin-exempt:`. **A bare marker with no text is not a pin** —
       assert it, mirroring `direct_io_allowance_requires_a_real_reason_immediately_above_the_call`.
       Do not write a second waiver reader.
-- [ ] Every pinned test **exists**, resolved against `workspace_test_files` (`lib.rs:2773`) and the
+- [x] Every pinned test **exists**, resolved against `workspace_test_files` (`lib.rs:2773`) and the
       `#[cfg(test)]` modules the source walker sees. A pin naming a nonexistent test reds, with its
       own fixture test. This is the anti-drift half and it is free.
-- [ ] **Anti-vacuity**, in the idiom of `architecture_source_walk_covers_both_workspaces`
+- [x] **Anti-vacuity**, in the idiom of `architecture_source_walk_covers_both_workspaces`
       (`lib.rs:2998`) and `catalog_coherence.rs:957`: assert a minimum files-scanned and seams-found
       count, and cap the number of `flux-pin-exempt` entries so exemptions cannot quietly become the
       norm.
-- [ ] **C-314 is closed by this story, not deferred.** Two *independently attributable* tests — one
+- [x] **C-314 is closed by this story, not deferred.** Two *independently attributable* tests — one
       that reds when `review.rs:185`'s `.resource_limits(resource_limits)` is deleted, one for
       `lab_cmd.rs:52`. Prove each by making exactly that deletion and showing the test name in the
       failure output. **One test observing both is not acceptable** — that is the mistake C-305's
       first round made.
-- [ ] The census runs beside `cargo test -p flux-codegate` in CI (`.github/workflows/ci.yml:71`) and
+- [x] The census runs beside `cargo test -p flux-codegate` in CI (`.github/workflows/ci.yml:71`) and
       is named in `AGENTS.md`'s dev-loop block.
-- [ ] `docs/designs/unobserved-wiring.md` records the predicate and why it is narrow, the
+- [x] `docs/designs/unobserved-wiring.md` records the predicate and why it is narrow, the
       cargo-mutants rejection (operator set first, cost second), why no existing guard is subsumed,
       and the non-coverage list below.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
 
 ## Notes
 
@@ -97,3 +97,33 @@ branches in the pure L0 crates — scoped and nightly. Not this story.)
   reason. This is a **coverage floor, not a proof**; the reviewer still reads the test.
 - Follow-ons already scoped: C-329 (the runner + `scan.rs` extraction), C-330 (widen the predicate
   across `crates/*/src`), C-331 (compile-time destructure anchor for `Config`/`Limits`).
+
+## Progress
+
+**Half A is complete.** Base `0df177c2`; the census's first run reported exactly the two named sites
+and nothing else — output in the implementation report and reproducible by reverting either pin
+comment.
+
+Landed:
+
+- `flux_codegate::pin_seams` (`lib.rs:1930`) + `Seam` (`:1771`) with `span_start`/`span_end` byte
+  offsets and a `Seam::span() -> Range<usize>` for C-329. `flux_codegate::test_function_names`
+  (`:1951`) collects the resolution universe. `DirectIoAliasCollector` was renamed
+  `ImportAliasCollector` (nothing in it was I/O-specific) and now also resolves `use flux_sdk::*`.
+- Census `every_sdk_client_wiring_seam_pins_a_test_that_observes_it` (`:3478`); the per-seam decision
+  is factored into `pin_verdict` (`:3419`) so the fixture test `pin_verdicts_distinguish_pinned_-`
+  `drifted_and_exempt` (`:3436`) exercises the same code the workspace walk does.
+- C-314 closed: `crates/flux-cli/src/lab_cmd.rs:78` and `crates/flux-cli/src/review.rs:160`, each
+  pinned to its own test. Both call sites were extracted into named seams (`record_client_from`,
+  `review_flow_client`) because neither was reachable from a test before — that unreachability *is*
+  how C-314 happened.
+
+Notes for whoever picks up C-329 or C-330:
+
+- The predicate is one setter (`resource_limits`). `pinned_setter` (`lib.rs`) is the single place to
+  widen it; the design doc records why widening now would produce twelve mostly-noise seams.
+- `MAX_PIN_EXEMPTIONS` is 1 with 0 in use, so there is exactly one slot before the cap must be raised
+  under review.
+- The census is a **coverage floor**: it proves a pin resolves, not that the test dies. Deleting a
+  pinned wiring line makes the seam (and so the census entry) disappear entirely — that gap is
+  precisely C-329's job, and until it lands the two attributable tests are what hold the line.

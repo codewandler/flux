@@ -53,8 +53,15 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings   # must be clean
 cargo fmt --all                                          # then commit the result
-cargo test -p flux-codegate                              # architecture + test-posture lints
+cargo test -p flux-codegate                              # architecture + test-posture + pin census
 ```
+
+**The pin census (C-328) is the one that catches wiring no test observes.** If you added a
+`.resource_limits(..)` to an SDK client-builder chain, it must carry a
+`// flux-pin: <test_name>` comment naming the test that dies when the line is deleted — nineteen
+stories found correct wiring whose removal changed nothing. `docs/designs/unobserved-wiring.md`
+records the predicate, what it deliberately does not cover, and why a pin is a coverage floor rather
+than a proof.
 
 CI enforces all of these. Docs-only changes may use a narrower check — say explicitly in the final
 report what was and was not run. `cargo fmt --check` must also be clean in the **nested `plugins/`
