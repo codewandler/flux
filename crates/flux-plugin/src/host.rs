@@ -2419,6 +2419,59 @@ mod tests {
         }
     }
 
+    /// C-309: the effect-less `[Process, Network]` default and `flux-runtime`'s authority contract
+    /// are two safety mechanisms that must not compose into an unsatisfiable requirement. The
+    /// contract refuses any tool declaring an effect it holds no matching access for, so before
+    /// this fix every effect-less op of a plugin without a `process` capability was **impossible to
+    /// load** — which is how `flux-sdk`'s fixture plugin sat red behind a feature no gate compiled.
+    ///
+    /// The fix is on the ACCESS side, and the direction matters: authority requirements derive from
+    /// `access`, not `effects` (`authority_requirements_from_declaration`), so relaxing the effects
+    /// default instead would have projected an op with neither — carrying no requirement at all and
+    /// skipping the authorization floor. Pin both halves here.
+    #[test]
+    fn every_plugin_op_projects_a_loadable_and_gated_authority_contract() {
+        let op = OperationSpec {
+            name: "pure".into(),
+            description: "declares no effects".into(),
+            ..Default::default()
+        };
+        let cases = [
+            ("nothing granted", PluginCapabilities::default()),
+            (
+                "http only",
+                PluginCapabilities {
+                    http: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "process only",
+                PluginCapabilities {
+                    process: vec!["kubectl".into()],
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (label, caps) in cases {
+            let (_, spec) = plugin_tool_spec("acme", &op, &caps);
+            let requirements =
+                flux_runtime::authority_requirements_from_declaration(&spec, &caps.process, &[])
+                    .unwrap_or_else(|err| {
+                        panic!("`{label}` must project a loadable authority contract: {err}")
+                    });
+            // Loadable is only half of it — an op that loads while requiring nothing would slip the
+            // floor, which is the failure mode the effects-side fix would have introduced.
+            assert!(
+                requirements
+                    .iter()
+                    .any(|req| req.action.0 == "process.exec"),
+                "`{label}` must still be gated on dispatching to its subprocess: {requirements:?}",
+            );
+        }
+    }
+
     /// C-191: a plugin's `effects` / `risk` / `idempotency` are authored outside this repo and are
     /// then trusted verbatim by every approval gate. A manifest that declares a mutating operation
     /// while keeping the read-only risk class is named at load.
@@ -2457,9 +2510,9 @@ mod tests {
     }
 
     /// The projection is what gets checked, not the raw manifest — `access` comes from the
-    /// *plugin's* capabilities and an op that declares no effects is defaulted to
-    /// `[Process, Network]`. Both are properties of `plugin_tool_spec`, so this pins that the
-    /// coherence pass sees them (C-191).
+    /// *plugin's* capabilities plus the unconditional `Process` every plugin op carries (C-309),
+    /// and an op that declares no effects is defaulted to `[Process, Network]`. Both are
+    /// properties of `plugin_tool_spec`, so this pins that the coherence pass sees them (C-191).
     #[test]
     fn plugin_coherence_reads_the_projected_spec_not_the_raw_declaration() {
         // Declares nothing: `plugin_tool_spec` defaults it to `[Process, Network]`, which is

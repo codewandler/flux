@@ -16,6 +16,7 @@ pub mod pricing;
 pub mod readiness;
 mod stream;
 mod timing;
+mod urlencode;
 
 pub use audio::{AudioEncoding, AudioFormat};
 pub use content::{
@@ -32,3 +33,4 @@ pub use pricing::{
 };
 pub use stream::{CacheEfficiency, Chunk, StopReason, Usage};
 pub use timing::OperationTiming;
+pub use urlencode::percent_encode_component;
