@@ -88,11 +88,16 @@ pub struct A2aSettings {
 // before any adapter deserializes these settings. So the token fields above are already plain values.
 
 /// `kind = "room"` settings — a many-party meeting room flux is one participant in (D-204).
+///
+/// `#[non_exhaustive]`: the credential and endpoint fields below arrived with the first real backend
+/// (D-205) and D-206's vendor one will add more, so an external literal construction must not break
+/// on each new backend. Deserialization and the adapters inside this crate are unaffected.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct RoomSettings {
-    /// Which [`Room`](crate::rooms::Room) backend to join with. `"mock"` is the in-process one;
-    /// `"xmpp"` (D-205) and `"jaas"` (D-206) follow. An unrecognized backend is a load error, exactly
-    /// like an unrecognized channel `kind`.
+    /// Which [`Room`](crate::rooms::Room) backend to join with. `"mock"` is the in-process one,
+    /// `"xmpp"` the portable standards-compliant one (D-205); `"jaas"` (D-206) follows. An
+    /// unrecognized backend is a load error, exactly like an unrecognized channel `kind`.
     pub backend: String,
     /// The room address, as the server spells it (an XMPP MUC JID).
     pub room: String,
@@ -108,6 +113,31 @@ pub struct RoomSettings {
     /// story has not chosen yet.
     #[serde(default)]
     pub address_rule: Option<String>,
+
+    // ── `backend = "xmpp"` (D-205) ──
+    /// The RFC 7395 WebSocket endpoint, e.g. `wss://example.org/xmpp-websocket`. Required for the
+    /// `xmpp` backend: a MUC JID says which room, never where to connect.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The XMPP domain for the stream open. Defaults to the endpoint's host, which is right for the
+    /// common single-host deployment but not for a MUC on a separate `conference.` component.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// SASL `PLAIN` username. Absent selects `ANONYMOUS`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// SASL `PLAIN` password — host-resolved like every other credential here, so write it as
+    /// `password secret "KEY"` in the program rather than a literal.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// The MUC's own room password (XEP-0045). Host-resolved the same way.
+    #[serde(default)]
+    pub muc_password: Option<String>,
+    /// Allow the endpoint to resolve to a private/loopback address — a self-hosted prosody on the
+    /// LAN. Off by default: this is the scoped grant `flux_system::net`'s egress guard takes, and
+    /// widening it is an operator decision, not a default.
+    #[serde(default)]
+    pub allow_private_net: bool,
 }
 
 /// The nick flux joins a room under when the declaration does not say. A room containing humans is

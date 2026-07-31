@@ -15,8 +15,9 @@
 //! no vendor SDK. Media (audio, screenshare) needs a real WebRTC endpoint and lands later behind a
 //! feature gate, as extra [`RoomEvent`] variants — which is why that enum is `#[non_exhaustive]`.
 //!
-//! Backends: [`MockRoom`] (in-process, here), `XmppMucRoom` (D-205, the portable one) and `JaasRoom`
-//! (D-206, vendor token acquisition over the same machinery).
+//! Backends: [`MockRoom`] (in-process, here), [`XmppMucRoom`] (D-205, the portable one — a generic
+//! prosody/ejabberd/JaaS MUC over the RFC 7395 WebSocket binding, no browser and no vendor SDK) and
+//! `JaasRoom` (D-206, vendor token acquisition over the same machinery).
 //!
 //! ## Safety
 //!
@@ -31,9 +32,11 @@
 
 mod driver;
 mod mock;
+mod xmpp;
 
-pub use driver::RoomTurnDriver;
+pub use driver::{RoomSessionEnd, RoomTurnDriver};
 pub use mock::MockRoom;
+pub use xmpp::{XmppConfig, XmppMucRoom, DEFAULT_XMPP_HANDSHAKE_TIMEOUT, DEFAULT_XMPP_KEEPALIVE};
 
 use std::fmt;
 

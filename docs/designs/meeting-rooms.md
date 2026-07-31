@@ -180,6 +180,40 @@ decisions a D-205/D-206 implementor needs, not accidents. Source: —
   (Jitsi's `focus`); `is_self` is not cosmetic — a MUC echoes our groupchat messages back to us, so a
   consumer that cannot recognize itself answers itself forever.
 
+**As landed (D-205)** — the portable backend, `crates/flux-channels/src/rooms/xmpp/`. Registered as
+`backend = "xmpp"`, it implements the frame sequence in Feasibility above against any
+prosody/ejabberd/JaaS MUC. Decisions a D-206 implementor inherits:
+
+- **A parser, not an XMPP client.** `quick-xml` (MIT, one transitive dep already in the graph) plus a
+  ~200-line element tree; the protocol is ours. `tokio-xmpp` was rejected for a reason that is
+  structural rather than aesthetic: it opens its own TCP socket and resolves its own DNS, so its
+  egress cannot be routed through `flux_system::net::guard_url_scoped` — and it drags a full XEP stack
+  and a second TLS backend. The WebSocket is `tokio-tungstenite`, already in the tree for the realtime
+  and codex providers, so no second TLS stack enters the graph.
+- **The endpoint is guarded in its `http`/`https` form.** `flux_system::net` speaks HTTP schemes, so
+  `wss://` is rewritten for the guard and the dialled URL is rebuilt from the guard's normalized
+  answer. Loopback and private addresses need `allow_private_net` — the guard's scoped grant, not a
+  bypass. Known gap, inherited from the guard's URL-returning API: the connection is **not pinned** to
+  the vetted addresses, so this closes SSRF-by-configuration and not DNS rebinding. The endpoint is
+  operator configuration and never model output.
+- **`is_self` is decided from two independent signals**, because `Occupant::new` defaults it to
+  `false` and a backend that forgets makes the agent answer its own echo forever: XEP-0045's
+  `<status code='110'/>` (authoritative, and survives the service reassigning our nick), and the nick
+  we joined under. The driver additionally re-checks the nick, so self-suppression no longer rests
+  entirely on the backend.
+- **The room JID is `OnceLock`-set from our own self-presence**, which is what lets `Room::id()` keep
+  returning a borrow while still answering the *server's* spelling rather than the configured one.
+- **`RoomSessionEnd` splits the two failures** (`crates/flux-channels/src/rooms/driver.rs`). The host
+  ends the process on a channel error, which is right for a room that could never be joined and
+  disproportionate for a socket that died mid-meeting — so a join failure is `run`'s `Err` and
+  anything after it is `RoomSessionEnd::Failed`, logged and non-fatal. The driver also now leaves the
+  room on **every** path out of the session, including a failed send.
+- **History and non-client namespaces are dropped.** A `<delay/>`-marked groupchat message is the
+  MUC's replay of what was said before flux arrived; answering it is the same unbounded-cost mistake
+  as answering our own echo.
+- **`OccupantKind` is `Unknown` for everyone but us and `focus`.** XMPP presence carries no
+  human-or-bot signal and inventing one would be worse than admitting we cannot tell.
+
 **The L3 turn seam changed with it (breaking):** `VoiceTurnHandler::turn` is now
 `turn(&self, speaker: &Speaker, user_text: &str)`. `flux_flow::voice::Speaker` is a surface-owned id
 plus an optional display name; a 1:1 surface passes `Speaker::sole()`, which is how a phone line's
@@ -253,8 +287,12 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
    (C-216 corpus, run against the render path).
 5. **Self-announcement is not optional.** Join emits an identifying room message *before* the first inbound
    message is read.
-6. **Text needs no browser.** The XMPP backend's join + say + read test passes in CI with no Chrome
-   installed; the media sidecar is feature-gated and skipped.
+6. **Text needs no browser.** ✅ **Met (D-205).** `crates/flux-channels/tests/xmpp_room.rs` drives the
+   whole join → occupants → say → read → leave path against an in-process WebSocket double with no
+   browser, no vendor SDK and no network; the media sidecar is feature-gated and skipped. The two
+   RFC 7395 traps are regressed on the raw bytes:
+   `every_stanza_the_xmpp_backend_emits_is_jabber_client_qualified` and
+   `the_xmpp_keepalive_is_a_ping_iq_and_never_whitespace`.
 7. **Token refresh is transparent.** A session crossing the 3 h guest-token expiry re-mints and stays
    joined.
 8. **Published media carries signal.** A published track whose source is silence is reported as a failure,

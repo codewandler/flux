@@ -2,7 +2,7 @@
 id: D-205
 title: XMPP MUC room backend — the portable room, no vendor and no browser
 pillar: Agent
-status: ready
+status: in-progress
 priority: 4
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -20,23 +20,77 @@ backend and the one CI runs; D-206 layers vendor token acquisition on top of the
 
 ## Acceptance
 
-- [ ] `XmppMucRoom` implements `Room`: connect (WebSocket, RFC 7395), SASL, resource bind, MUC presence
+- [x] `XmppMucRoom` implements `Room`: connect (WebSocket, RFC 7395), SASL, resource bind, MUC presence
       join, occupant tracking from presence, `groupchat` send/receive, private-message send/receive, leave.
-- [ ] Failing-first test `xmpp_room_joins_and_exchanges_text` against an in-process XMPP double: join →
+- [x] Failing-first test `xmpp_room_joins_and_exchanges_text` against an in-process XMPP double: join →
       occupants contains self → `say` emits a `groupchat` stanza → an inbound stanza surfaces as
       `RoomEvent::Message` with the right `OccupantId`.
-- [ ] **Every stanza is `jabber:client`-qualified.** Regression test: an unqualified stanza is never
+- [x] **Every stanza is `jabber:client`-qualified.** Regression test: an unqualified stanza is never
       emitted (prosody answers `<unsupported-stanza-type/>` and kills the stream — cost real time in the
       spike).
-- [ ] **Keepalive is an XMPP ping IQ, never whitespace.** Regression test asserts no whitespace-only
+- [x] **Keepalive is an XMPP ping IQ, never whitespace.** Regression test asserts no whitespace-only
       frame is ever sent (a `" "` frame is closed by the server with `1007`).
-- [ ] Room JID case is taken from the server, not rebuilt locally (JaaS lowercases the room while the JWT
+- [x] Room JID case is taken from the server, not rebuilt locally (JaaS lowercases the room while the JWT
       keeps the original case).
-- [ ] The whole story's test suite passes with **no Chrome installed**.
+- [x] The whole story's test suite passes with **no Chrome installed**.
 
 ## Progress
-- (not started — but the protocol sequence is already validated end to end; see the design's
-  "Feasibility" section for the exact frames)
+
+Landed. The backend is `crates/flux-channels/src/rooms/xmpp/` — `mod.rs` (`XmppMucRoom`,
+`XmppConfig`), `session.rs` (the RFC 7395 handshake, the MUC join, the socket loop), `stanza.rs` (the
+element tree). Registered as `backend = "xmpp"` in `adapters/room.rs`; settings in
+`config::RoomSettings` (`url`, `domain`, `user`, `password`, `muc_password`, `allow_private_net`),
+which is now `#[non_exhaustive]` as the story's note asked.
+
+**The dependency: `quick-xml` 0.41 (MIT), and nothing else new.** It is a *parser*, not an XMPP
+client — the protocol is ours, about 200 lines of element tree. `tokio-xmpp` was rejected on a
+structural ground rather than taste: it opens its own TCP socket and resolves its own DNS, so its
+egress cannot be routed through `flux_system::net::guard_url_scoped`, and it drags a full XEP stack
+plus a second TLS backend. quick-xml's only transitive dependency, `memchr`, is already in the graph.
+`tokio-tungstenite` (already in the tree for the realtime/codex providers, `rustls-tls-webpki-roots`),
+`futures-util`, `base64`, `url` and `flux-system` are new *edges* from `flux-channels`, not new crates
+in the lock.
+
+**Egress.** The endpoint is guarded in its `http`/`https` form by the one guard, and the dialled URL is
+rebuilt from the guard's normalized answer — no second URL guard. Loopback needs
+`allow_private_net`, which is the guard's own scoped grant. Known gap inherited from the guard's
+URL-returning API and recorded in the design: the connection is not *pinned* to the vetted addresses,
+so this closes SSRF-by-configuration, not DNS rebinding. Credentials are redacted from `XmppConfig`'s
+`Debug` and never appear in an error.
+
+**The two inherited defects are closed.**
+1. *The leaked room.* `RoomTurnDriver::run` now splits into `run` + `session`, and leaves the room on
+   **every** path out including a failed send (`a_failed_send_still_leaves_the_room`). The posture
+   question is decided explicitly with a new `RoomSessionEnd`: a **join** failure is `run`'s `Err` and
+   stays fatal to the host (a silently absent agent is worse than a loud stop), while a session that
+   fails *after* joining is `RoomSessionEnd::Failed` — logged under the channel's name, ends that room,
+   and leaves the program's other channels serving
+   (`a_room_that_dies_mid_meeting_ends_its_channel_but_not_the_host`).
+2. *Self-echo.* The backend decides `is_self` from two independent signals — XEP-0045's
+   `<status code='110'/>` and the nick we joined under — and the driver no longer trusts the flag
+   alone, re-checking `Occupant.nick` against `identity.nick`
+   (`an_occupant_whose_backend_forgot_is_self_is_still_not_answered`, plus the end-to-end
+   `exactly_one_occupant_is_self_and_the_agent_never_answers_its_own_echo`).
+
+Tests — `crates/flux-channels/tests/xmpp_room.rs` against an in-process WebSocket double
+(`tests/support/xmpp_double.rs`) that speaks the exact spike sequence, plus unit tests per module:
+- `xmpp_room_joins_and_exchanges_text` (the failing-first one; at the merge base `XmppMucRoom` did not
+  exist)
+- `every_stanza_the_xmpp_backend_emits_is_jabber_client_qualified` — asserted on the raw frames the
+  double recorded, not on a helper
+- `the_xmpp_keepalive_is_a_ping_iq_and_never_whitespace`
+- `the_room_jid_case_comes_from_the_server` — configured `StandUp@…`, server answers `standup@…`
+- `the_endpoint_is_guarded_and_loopback_needs_a_grant`,
+  `the_debug_rendering_never_carries_a_credential`, `text_and_attributes_are_escaped`
+- `the_xmpp_backend_builds_from_a_decl_and_needs_an_endpoint`
+
+**Left for the stories that own them:** `address_rule` is still carried and not enforced (D-207), so
+every inbound line is a turn; the design's invariant 5 (self-announcement on join) is still in no
+story's Acceptance. `OccupantKind` is `Unknown` for every occupant but us and `focus` — XMPP presence
+carries no human-or-bot signal, which is a constraint D-207's ping-pong rule has to work with rather
+than a gap here. Docs updated: the design's "As landed (D-205)" block and invariant 6, and
+`website/docs/channels/inventory.md` (the `room` auth row, the "no public URL" cell, the `xmpp`
+settings, the failure posture, and the stale "rooms are not a channel yet" known limit).
 
 ## Notes
 
