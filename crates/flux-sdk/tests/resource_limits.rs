@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use flux_core::Result;
+use flux_core::{Chunk, ContentBlock, Result, StopReason};
+use flux_orchestrate::{try_parse_role, RoleRegistry, SubAgents};
 use flux_provider::{ChunkStream, Provider, Request};
 use flux_runtime::{
     AllowApprover, ExecutionAuthorization, ExecutionEnvironment, Executor, PermissionManager,
@@ -462,5 +463,391 @@ async fn the_retained_result_ceiling_bounds_what_the_executor_keeps() {
     assert!(
         executor.retained_result_bytes() > 0,
         "the cache should still be retaining something under the ceiling"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C-299 — the ceilings descend into sub-agents, PER AGENT
+// ---------------------------------------------------------------------------
+//
+// C-290 left `task`-delegated work on a fresh, **unbounded** executor, so a host that set a ceiling
+// and then delegated had the ceiling silently not apply to the delegated half. C-299 gives the child
+// the parent's ceilings — but as an independent copy, so each agent has its own concurrency budget.
+//
+// That choice is forced, and these tests are what forced it. One shared semaphore is the stronger
+// guarantee (a whole-process bound instead of a per-agent one) and it **deadlocks**: a `task` call
+// sits inside `Tool::execute` for the child's entire turn, and so does the agent-loop op that
+// dispatched it (`execute_batch`, and equally `explore` / `ai_segment` / `flow_run` / a model stage).
+// Those ancestors hold slots. The child is reached through `SpawnTaskSupervisor::spawn`, and the
+// re-entrancy exemption is a Tokio task-local that does not cross `tokio::spawn`, so the child cannot
+// inherit it — it queues behind the very calls waiting for it. Verified, not assumed: with a shared
+// semaphore `a_delegated_child_is_bounded_but_never_starved_by_its_parent` fails with `runs == 0`
+// even at a ceiling of 1 with a single delegation.
+//
+// The tests therefore exercise the real engine — real spawn supervisor, real `tokio::spawn` — because
+// that boundary is the whole point. A test on the deterministic `run_flow` path would pass under
+// either shape and prove nothing.
+
+/// A child-side op that occupies `Tool::execute` for a moment, metering occupancy and counting runs.
+struct Probe {
+    meter: Arc<Meter>,
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for Probe {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "probe",
+            "occupies a slot briefly so occupancy is observable",
+            json!({ "type": "object", "properties": {} }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        self.meter.enter();
+        // Long enough that two children overlapping would be observed, short enough that a
+        // correctly serialized fan-out finishes well inside the queue timeout.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        self.meter.leave();
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult::ok("probed"))
+    }
+}
+
+/// Drives a child sub-agent through exactly one `probe` call, then ends its turn.
+struct ProbingChildProvider {
+    turns: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for ProbingChildProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    async fn stream(&self, request: Request) -> Result<ChunkStream> {
+        // The adaptive loop asks for an intent declaration first; answer it and move on.
+        if request.tools.iter().any(|t| t.name == "declare_intent") {
+            let chunks = vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    // `probe` is a pure read with no access kinds, so it lands in the `core`
+                    // virtual family; declaring it is what puts the op in the child's advertised
+                    // catalog for the exploration round that follows.
+                    input: json!({ "intent": "probe the workspace", "capability_families": ["core"] }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+        let chunks = if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
+            vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "probe-1".into(),
+                    name: "probe".into(),
+                    input: json!({}),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ]
+        } else {
+            vec![
+                Chunk::TextDelta("probed".into()),
+                Chunk::Block(ContentBlock::Text {
+                    text: "probed".into(),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+    }
+}
+
+/// A `FlowClient` whose `worker` role delegates to [`ProbingChildProvider`], carrying `limits`.
+/// Every child is built from these same limits, so the concurrency semaphore is shared.
+fn delegating_client(tag: &str, limits: ResourceLimits) -> (FlowClient, Arc<Meter>, Arc<AtomicUsize>) {
+    let meter = Arc::new(Meter::default());
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let mut roles = RoleRegistry::default();
+    roles.insert(
+        try_parse_role(
+            "---\ntools: [probe]\n---\nYou probe the workspace and report.",
+            "worker",
+        )
+        .expect("the worker role must parse"),
+    );
+
+    let mut child_base = ToolRegistry::new();
+    child_base.register(Arc::new(Probe {
+        meter: meter.clone(),
+        runs: runs.clone(),
+    }));
+
+    let factory = Arc::new(|| Ok(Box::new(ProbingChildProvider { turns: AtomicUsize::new(0) }) as Box<dyn Provider>));
+    let sub_agents = SubAgents::new(roles, child_base, factory, "mock", 1024);
+
+    let mut client = FlowClient::builder()
+        .model("mock")
+        .auto_approve(true)
+        .resource_limits(limits)
+        .build(Arc::new(StubProvider), temp_root(tag))
+        .expect("build FlowClient");
+    client.with_sub_agents(sub_agents);
+    (client, meter, runs)
+}
+
+/// Drives a parent *conversational* turn that delegates once via `task`, then answers. This is the
+/// path that installs a real `SpawnTaskSupervisor`, so the child is reached across `tokio::spawn` —
+/// the geometry the deadlock actually lives in.
+struct DelegatingParentProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for DelegatingParentProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    async fn stream(&self, request: Request) -> Result<ChunkStream> {
+        let native = |id: &str, name: &str, input: Value| {
+            vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: id.into(),
+                    name: name.into(),
+                    input,
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ]
+        };
+        if request.tools.iter().any(|t| t.name == "declare_intent") {
+            // `task` declares the `Process` effect, so it lands in the `process` virtual family.
+            let chunks = vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: json!({
+                        "intent": "delegate the probe",
+                        "capability_families": ["process"],
+                    }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+        let chunks = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => native(
+                "task-1",
+                "task",
+                json!({ "role": "worker", "task": "probe it" }),
+            ),
+            1 => native(
+                "finalize-1",
+                "finalize_plan",
+                json!({ "instructions": "Report the delegated result." }),
+            ),
+            _ => vec![
+                Chunk::Block(ContentBlock::Text {
+                    text: "delegated".into(),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ],
+        };
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+    }
+}
+
+/// **The C-299 deadlock proof, in production geometry.** A conversational turn installs a real
+/// `SpawnTaskSupervisor`, so the child is reached through `tokio::spawn` — the boundary C-290's
+/// task-local re-entrancy exemption cannot cross.
+///
+/// The child must be **bounded** (it inherits the ceiling) and yet **never starved** (it must not
+/// queue behind the ancestors awaiting it). This is the test that discriminates between the two
+/// candidate shapes: replace `independent_copy()` with `clone()` in `LocalSpawner::spawn` — i.e. one
+/// shared semaphore — and it fails with `runs == 0` at a ceiling of 1 with a single delegation,
+/// because `execute_batch` and `task` are both holding slots while the child asks for one.
+///
+/// The queue timeout is deliberately short so that failure is a fast, legible refusal rather than a
+/// 30-second stall that reads like slowness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegated_child_is_bounded_but_never_starved_by_its_parent() {
+    let meter = Arc::new(Meter::default());
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let mut roles = RoleRegistry::default();
+    roles.insert(
+        try_parse_role(
+            "---\ntools: [probe]\n---\nYou probe the workspace and report.",
+            "worker",
+        )
+        .expect("the worker role must parse"),
+    );
+    let mut child_base = ToolRegistry::new();
+    child_base.register(Arc::new(Probe {
+        meter: meter.clone(),
+        runs: runs.clone(),
+    }));
+    let factory = Arc::new(|| {
+        Ok(Box::new(ProbingChildProvider {
+            turns: AtomicUsize::new(0),
+        }) as Box<dyn Provider>)
+    });
+    let sub_agents = SubAgents::new(roles, child_base, factory, "mock", 1024);
+
+    let dir = temp_root("deadlock");
+    let client: Client = Client::builder()
+        .model("mock")
+        .auto_approve(true)
+        .resource_limits(
+            ResourceLimits::new()
+                .with_max_concurrent_tool_calls(1)
+                .with_tool_call_queue_timeout(Duration::from_millis(1_500)),
+        )
+        .with_sub_agents(sub_agents)
+        .build(
+            Box::new(DelegatingParentProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            &dir,
+        )
+        .expect("build Client");
+
+    let started = std::time::Instant::now();
+    let out = client
+        .run("delegate the probe")
+        .await
+        .expect("the delegating turn must complete");
+    let elapsed = started.elapsed();
+
+    assert!(
+        out.tool_calls.contains(&"task".to_string()),
+        "the parent turn must actually have delegated, got: {:?}",
+        out.tool_calls
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the child's tool call never ran: it was starved by the ceiling its own ancestors were \
+         holding. A sub-agent must get an INDEPENDENT concurrency budget, not a share of its \
+         parent's — see `ResourceLimits::independent_copy`."
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the delegation took {elapsed:?} — descending the ceiling must not stall on its own children"
+    );
+    assert_eq!(
+        meter.peak(),
+        1,
+        "the child inherited the ceiling, so its own executions must respect it"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The other half of Acceptance 2: the child really is **bounded**, not merely un-starved. A child
+/// whose limits were left at the default would report no ceiling at all; this pins that the numbers
+/// the host configured reached the child's executor, with its own budget.
+#[tokio::test]
+async fn a_child_inherits_the_configured_numbers_with_its_own_budget() {
+    let parent = ResourceLimits::new()
+        .with_max_concurrent_tool_calls(2)
+        .with_max_retained_result_bytes(8_192);
+    let child = parent.independent_copy();
+    assert_eq!(
+        child.max_concurrent_tool_calls(),
+        Some(2),
+        "a sub-agent must inherit the ceiling rather than running unbounded (the C-290 gap)"
+    );
+    assert_eq!(child.max_retained_result_bytes(), Some(8_192));
+    assert!(
+        !child.is_unbounded(),
+        "an inheriting child must not report itself unbounded"
+    );
+}
+
+/// The same property on the **inline** delegation path (no spawn supervisor — the deterministic
+/// `run_flow` shape), where the spawner is awaited on the caller's own task. A regression guard on
+/// the second geometry rather than a discriminating test: an independent child budget is immune here
+/// too, and this keeps it that way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegated_child_runs_on_the_inline_path_without_starving() {
+    let (client, meter, runs) = delegating_client(
+        "delegate",
+        ResourceLimits::new()
+            .with_max_concurrent_tool_calls(1)
+            .with_tool_call_queue_timeout(Duration::from_millis(1_500)),
+    );
+
+    let started = std::time::Instant::now();
+    let out = client
+        .run_flow(
+            "flow c299_delegate\n  return task({ role: \"worker\", task: \"probe it\" })\n",
+            serde_json::Map::new(),
+        )
+        .await
+        .expect("a delegation under a shared ceiling must not fail");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the child's tool call never ran — the shared ceiling deadlocked against the `task` \
+         that was waiting for it. Delegation must hold no slot."
+    );
+    assert!(
+        !out.result.contains("concurrency limit"),
+        "the child was refused by the ceiling its own parent was holding: {}",
+        out.result
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the delegation took {elapsed:?} — a shared ceiling must not stall on its own children"
+    );
+    assert_eq!(meter.peak(), 1, "peak occupancy must respect the ceiling");
+}
+
+/// A fan-out of three concurrent delegations against a ceiling of **one per agent** must all
+/// complete: no delegation may be starved by another's children. Note what this deliberately does
+/// *not* claim — the three children have three separate budgets, so this is not a whole-process bound
+/// (see `ResourceLimits::independent_copy` for why a whole-process bound is not available).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fan_out_of_delegations_all_complete_without_starving_each_other() {
+    let (client, _meter, runs) = delegating_client(
+        "fanout",
+        ResourceLimits::new()
+            .with_max_concurrent_tool_calls(1)
+            .with_tool_call_queue_timeout(Duration::from_secs(5)),
+    );
+
+    let flow = "flow c299_fanout\n  \
+                parallel\n    \
+                branch $a\n      $a = task({ role: \"worker\", task: \"probe a\" })\n    \
+                branch $b\n      $b = task({ role: \"worker\", task: \"probe b\" })\n    \
+                branch $c\n      $c = task({ role: \"worker\", task: \"probe c\" })\n\n  \
+                return \"done\"\n";
+
+    client
+        .run_flow(flow, serde_json::Map::new())
+        .await
+        .expect("a fan-out of delegations must not be starved by the ceiling it shares");
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        3,
+        "only {} of 3 delegated children ran: a fan-out of `task` calls starved each other",
+        runs.load(Ordering::SeqCst)
     );
 }

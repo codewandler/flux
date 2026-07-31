@@ -958,11 +958,26 @@ pub(super) const DEFAULT_ALLOW: &[&str] = &[
     "read", "glob", "grep", "search", "now", "cwd", "home_dir", "sys_info",
 ];
 
+/// Turn the operator's `[limits]` table into runtime ceilings (C-299) — the **one** place the CLI
+/// does so.
+///
+/// Build this **once** per agent assembly and clone it into every consumer. `ResourceLimits` clones
+/// share the concurrency semaphore (that sharing is what makes the ceiling bound the *runtime*
+/// rather than one executor), so calling this twice would silently fork one configured ceiling of N
+/// into two independent ceilings of N — the top-level agent and its sub-agents would then each get
+/// their own budget instead of counting against the operator's single number.
+pub(super) fn cli_resource_limits(cfg: &flux_config::Config) -> flux_runtime::ResourceLimits {
+    flux_runtime::ResourceLimits::from_config(&cfg.limits)
+}
+
 /// Assemble the CLI's shared runtime envelope from already-resolved surface decisions.
 ///
 /// `build_agent_with` remains responsible for choosing the catalog, permissions, approver, and
 /// integrations. This helper is the mechanical C-67 seam: tests and production both prove those
 /// choices enter one explicitly rooted [`ExecutionEnvironment`] without another cwd lookup.
+///
+/// `resource_limits` (C-299) rides through here rather than being read from config inside, so the
+/// caller can hand the **same** ceiling to the sub-agent spawner — see [`cli_resource_limits`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn assemble_cli_execution_environment(
     system: Arc<System>,
@@ -973,11 +988,13 @@ pub(super) fn assemble_cli_execution_environment(
     redactor: flux_secret::Redactor,
     spawner: Option<Arc<dyn flux_runtime::Spawner>>,
     hooks: Vec<Arc<dyn flux_runtime::PreToolHook>>,
+    resource_limits: flux_runtime::ResourceLimits,
 ) -> ExecutionEnvironment {
     let mut environment =
         ExecutionEnvironment::new(system, registry, permissions, approver, authorization)
             .with_redactor(redactor)
-            .with_hooks(hooks);
+            .with_hooks(hooks)
+            .with_resource_limits(resource_limits);
     if let Some(spawner) = spawner {
         environment = environment.with_spawner(spawner);
     }
@@ -1463,6 +1480,12 @@ pub(super) async fn build_agent_with(
     // `PrivateNetAdmit` events to this stream).
     let events = Arc::new(open_event_store()?);
 
+    // C-299: the operator's `[limits]` ceilings, resolved ONCE here and handed to both the
+    // sub-agent spawner just below and the top-level environment further down. Resolved once
+    // deliberately: a second `cli_resource_limits` call would mint a second semaphore, so the
+    // top-level agent's own executors would stop sharing one budget with each other.
+    let resource_limits = cli_resource_limits(&cfg);
+
     // Sub-agent spawner (multi-agent orchestration): the `task` tool delegates to roles, each run
     // as an isolated sub-agent — bounded by the same authorization policy (no blanket allow).
     let mut child_base = ToolRegistry::new();
@@ -1480,6 +1503,11 @@ pub(super) async fn build_agent_with(
             .with_reasoning(flags.think, flags.effort.map(Into::into))
             .with_authorization_cell(policy.clone(), identity.clone())
             .with_audit(events.clone())
+            // C-299: `[limits]` binds `task`-delegated work too, not just the top-level agent —
+            // before this, a sub-agent ran on an unbounded executor. Each child gets an independent
+            // copy of these ceilings (same numbers, own concurrency budget); sharing one budget
+            // across the delegation boundary deadlocks, see `ResourceLimits::independent_copy`.
+            .with_resource_limits(resource_limits.clone())
             .into_spawner(system.clone());
 
     // Tools + permissions: from config (deny/allow rules); if no allow rules are configured,
@@ -1665,6 +1693,10 @@ pub(super) async fn build_agent_with(
         redactor,
         Some(spawner.clone()),
         hooks,
+        // C-299: the operator's `[limits]` table finally binds for the shipped binary. This is the
+        // SAME value already handed to the sub-agent spawner above, not a second `from_config` —
+        // one configured ceiling, one semaphore, counted across the agent and its children.
+        resource_limits,
     )
     .with_workspace(session_workspace)
     .into_executor();
@@ -2274,6 +2306,7 @@ mod execution_environment_conformance {
             redactor(),
             None,
             Vec::new(),
+            flux_runtime::ResourceLimits::new(),
         )
         .into_executor();
         assert_probe_contract(cli.registry(), &expected_spec, "CLI");
@@ -2651,5 +2684,160 @@ mod fleet_and_board_wiring {
             !subjects.iter().any(|s| s == "*" || s.is_empty()),
             "no subject may be a wildcard or empty, got: {subjects:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_resource_ceiling_wiring {
+    //! C-299: a configured `[limits]` table must bind for the **shipped binary**, not only for an
+    //! embedding host that calls `ResourceLimits::from_config` itself.
+    //!
+    //! C-290 built the ceiling and enforced it in `Executor::dispatch`, but `flux-cli` was fenced
+    //! for that story, so `[limits] max_concurrent_tool_calls` did nothing for anyone running
+    //! `flux`. The assertion here is deliberately on **observed occupancy** — how many ops are
+    //! inside `Tool::execute` at once — rather than on what the assembled executor reports it was
+    //! configured with: a wiring story is only done when the wire carries current.
+
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use flux_runtime::{Tool, ToolContext, ToolResult};
+    use serde_json::{json, Value};
+
+    const BLOCKER: &str = "c299_blocker";
+
+    /// Live and peak occupancy of `Tool::execute`, sampled by [`Blocker`] itself.
+    #[derive(Default)]
+    struct Meter {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl Meter {
+        fn enter(&self) {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+        }
+
+        fn leave(&self) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn in_flight(&self) -> usize {
+            self.in_flight.load(Ordering::SeqCst)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A read-only op that parks inside `execute` until the test hands out a release permit, so
+    /// "in flight" means "inside `Tool::execute`" and not "recently returned".
+    struct Blocker {
+        meter: Arc<Meter>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl Tool for Blocker {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                BLOCKER,
+                "blocks until the test releases it",
+                json!({ "type": "object", "additionalProperties": false }),
+            )
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: Value,
+        ) -> flux_core::Result<ToolResult> {
+            self.meter.enter();
+            // `forget` so the permit is consumed: each `add_permits` releases exactly one execution.
+            self.release
+                .acquire()
+                .await
+                .expect("release gate closed")
+                .forget();
+            self.meter.leave();
+            Ok(ToolResult::ok("released"))
+        }
+    }
+
+    /// **The C-299 CLI acceptance test.** A `[limits] max_concurrent_tool_calls = 1` in the config
+    /// file bounds the executor the CLI assembles: three concurrent dispatches, one execution in
+    /// flight. Before this story the same config produced three, because `flux-cli` never read the
+    /// table at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_configured_limits_table_binds_for_the_cli_executor() {
+        let cfg: flux_config::Config = toml::from_str(
+            "[limits]\nmax_concurrent_tool_calls = 1\ntool_call_queue_timeout_ms = 30000\n",
+        )
+        .expect("the `[limits]` concurrency keys must parse");
+
+        let root = std::env::temp_dir().join(format!(
+            "flux-c299-cli-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let meter = Arc::new(Meter::default());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Blocker {
+            meter: meter.clone(),
+            release: release.clone(),
+        }));
+
+        let executor = Arc::new(
+            assemble_cli_execution_environment(
+                Arc::new(System::new(Workspace::new(&root).unwrap())),
+                registry,
+                PermissionManager::from_rules(&[BLOCKER.to_string()], &[]),
+                Arc::new(AllowApprover),
+                ExecutionAuthorization::local(),
+                flux_secret::Redactor::new(),
+                None,
+                Vec::new(),
+                // The one C-299 seam: the CLI turns `[limits]` into runtime ceilings here.
+                cli_resource_limits(&cfg),
+            )
+            .into_executor(),
+        );
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let executor = executor.clone();
+                tokio::spawn(async move { executor.dispatch(BLOCKER, json!({})).await })
+            })
+            .collect();
+        // Long enough for all three to have reached the envelope; only one may be inside `execute`.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            meter.in_flight(),
+            1,
+            "`[limits] max_concurrent_tool_calls = 1` did not bind for the CLI executor: \
+             {} tool calls were in flight at once",
+            meter.in_flight()
+        );
+
+        release.add_permits(3);
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(!result.is_error, "dispatch failed: {}", result.content);
+        }
+        assert_eq!(
+            meter.peak(),
+            1,
+            "peak occupancy must equal the configured ceiling"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

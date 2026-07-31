@@ -2,7 +2,7 @@
 id: C-299
 title: "A configured resource ceiling reaches neither sub-agents nor the `flux` binary"
 pillar: Core
-status: ready
+status: in-progress
 priority: 5
 areas: [flux-cli, flux-orchestrate, flux-runtime]
 note: "C-290 built the ceiling and could reach neither consumer — flux-cli and flux-orchestrate were both fenced. Until this lands, `[limits]` is inert for the binary and `task`-delegated work is unbounded, while the SDK doc says the ceiling binds"

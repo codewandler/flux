@@ -4068,6 +4068,10 @@ impl Executor {
         //    A saturated runtime REFUSES rather than queueing indefinitely. The refusal is not
         //    `denied`: unlike an authorization refusal it is transient, so `retry`/`loop` are right
         //    to try it again, exactly like a pre-tool hook's deny.
+        //
+        //    C-299 note: a sub-agent does NOT contend here. Each child gets an independent copy of
+        //    the ceiling (`ResourceLimits::independent_copy`), never this semaphore — see that
+        //    method for why sharing one across the `task` boundary deadlocks.
         let slot = match self.limits.acquire_execution_slot().await {
             Ok(slot) => slot,
             Err(refusal) => {
