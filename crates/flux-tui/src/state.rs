@@ -119,13 +119,21 @@ pub struct ChatState {
     /// unarmed; a stale arm (older than [`crate::CTRL_C_QUIT_WINDOW`]) reads as unarmed too, so a
     /// far-apart pair of presses re-arms instead of quitting.
     pub(super) ctrl_c_armed_at: Option<Instant>,
-    /// Host-pushed panes (C-221), keyed by id and bounded by [`crate::panes`]'s own constants.
+    /// Host- and agent-pushed panes (C-221), keyed by id and bounded by [`crate::panes`]'s own
+    /// constants.
     ///
-    /// **Host-only for now**: nothing in the model's path reaches this — C-223 wires the `pane.*`
-    /// ops through a `SurfaceSink` into [`ChatState::apply_pane_command`]. Panes live entirely
-    /// outside [`ChatState::transcript_viewport`]: no layout-cache entry, no `focused` index, no
-    /// scroll bookkeeping, and not found by transcript search.
+    /// Two writers reach this, and only two: the surface itself (the C-224 fleet pane) and the
+    /// model's `pane.*` ops, which arrive through [`ChatState::pane_queue`] and never touch the
+    /// store directly. Panes live entirely outside [`ChatState::transcript_viewport`]: no
+    /// layout-cache entry, no `focused` index, no scroll bookkeeping, and not found by transcript
+    /// search.
     pub(super) panes: PaneStore,
+    /// The agent's pane channel (C-305), when a surface minted one before assembling the agent.
+    ///
+    /// Held rather than drained-on-arrival because the sink is written from inside a running tool on
+    /// another task, while the store may only be touched by the event loop that draws it.
+    /// [`ChatState::apply_pending_panes`] is the one crossing point.
+    pub(super) pane_queue: Option<Arc<crate::panes::PaneQueue>>,
     /// The live sub-agent fleet (C-224), folded from A-79's `subagent.activity` stream by
     /// [`crate::fleet::FleetProjection`]. This is the state; [`ChatState::fleet_rows`] is its
     /// resolution against a particular `now`.

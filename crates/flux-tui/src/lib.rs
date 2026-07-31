@@ -22,6 +22,7 @@ use controller::{
     ChannelSink, ModelCallTiming, PendingApproval, UiEvent,
 };
 use panes::PaneStore;
+pub use panes::{PaneListing, PaneQueue};
 #[cfg(test)]
 use projection::staged_intent_entry;
 use projection::{historical_observation_entry, load_history};
@@ -88,6 +89,10 @@ pub struct TuiRunOptions {
     pub file_commands: Vec<flux_runtime::metadata::CommandFile>,
     /// Configured theme name (`dark` / `light` / `mono`); `None` falls back to `dark` (C-104).
     pub theme: Option<String>,
+    /// The pane channel this surface minted **before** assembling the agent (C-305), and therefore
+    /// the same handle the agent's `pane.*` ops write to. `None` leaves the agent with no pane
+    /// vocabulary at all — the caller must not register the ops without passing it.
+    pub pane_queue: Option<Arc<PaneQueue>>,
 }
 
 impl TuiRunOptions {
@@ -98,6 +103,7 @@ impl TuiRunOptions {
             model_resolver: None,
             file_commands: Vec::new(),
             theme: None,
+            pane_queue: None,
         }
     }
 }
@@ -974,7 +980,9 @@ impl ChatState {
         Self::for_session(model, String::new())
     }
 
-    fn for_session(model: String, session_id: String) -> Self {
+    /// A fresh state for one session. `pub` so an integration test can drive the same surface the
+    /// event loop draws; the TUI itself builds it in [`run_with_options`].
+    pub fn for_session(model: String, session_id: String) -> Self {
         ChatState {
             entries: Vec::new(),
             transcript_revision: 0,
@@ -1041,19 +1049,43 @@ impl ChatState {
             active_action_id: None,
             ctrl_c_armed_at: None,
             panes: PaneStore::default(),
+            pane_queue: None,
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
         }
     }
 
-    /// Apply one host-pushed pane command (C-221).
+    /// Apply one pane command (C-221). Bounds — count, rows, width — are enforced by
+    /// [`crate::panes`], never by the command.
     ///
-    /// **The only way a pane reaches this surface.** There is deliberately no model path yet: the
-    /// `pane.*` ops and their `SurfaceSink` install are C-223's story, so today only the host (or a
-    /// test) can open a pane. Bounds — count, rows, width — are enforced by [`crate::panes`], never
-    /// by the command.
+    /// Reached two ways and no others: the surface's own C-224 fleet pane calls it directly, and the
+    /// model's `pane.*` ops arrive through [`ChatState::apply_pending_panes`].
     pub fn apply_pane_command(&mut self, command: flux_runtime::PaneCommand) {
         self.panes.apply(command);
+    }
+
+    /// Attach the pane channel the surface minted before assembling the agent (C-305).
+    pub fn with_pane_queue(mut self, queue: Arc<crate::panes::PaneQueue>) -> Self {
+        self.pane_queue = Some(queue);
+        self
+    }
+
+    /// Apply every pane command the agent has pushed since the last call, and report how many.
+    ///
+    /// This is the model's *only* door into the pane store, and it is driven by the event loop
+    /// immediately before it draws — so a pane the agent opened mid-turn appears on the next frame,
+    /// and one belonging to a turn that has just ended is cleared by `end_turn` rather than
+    /// resurrected by a late command.
+    pub fn apply_pending_panes(&mut self) -> usize {
+        let Some(queue) = self.pane_queue.clone() else {
+            return 0;
+        };
+        let commands = queue.drain();
+        let applied = commands.len();
+        for command in commands {
+            self.apply_pane_command(command);
+        }
+        applied
     }
 
     /// Every pane currently open, each labelled with who owns it (C-224).
@@ -3040,6 +3072,11 @@ pub async fn run_with_options(
     let mut state = ChatState::for_session(model, session_id.clone())
         .with_verbose(verbose)
         .with_file_commands(options.file_commands.clone());
+    // C-305: connect the pane channel the caller minted before `build_agent` to the state the event
+    // loop draws from. Without this the agent's `pane.*` ops enqueue into a channel nobody reads.
+    if let Some(queue) = options.pane_queue.clone() {
+        state = state.with_pane_queue(queue);
+    }
     // C-104: resolve the configured theme for this terminal (NO_COLOR → mono, truecolor → RGB).
     let (theme_name, theme) = resolve_theme(options.theme.as_deref());
     state.theme = theme;
@@ -3102,6 +3139,10 @@ async fn event_loop(
     let mut exit_after_finish = false;
 
     loop {
+        // C-305: the agent's pane commands, applied BEFORE this iteration's UI events on purpose —
+        // `Finished` clears `turn`-lifetime panes, and draining after it would let a command from
+        // the turn that just ended reopen one that should have expired with it.
+        state.apply_pending_panes();
         // Drain everything the running turn has produced.
         while let Some(ev) = pending_ui.take().or_else(|| rx.try_recv().ok()) {
             let Some(ev) = state.accept_ui_event(ev) else {

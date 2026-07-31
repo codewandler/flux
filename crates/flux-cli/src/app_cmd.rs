@@ -772,22 +772,107 @@ const TUI_BUILTIN_COMMANDS: &[&str] = &[
 
 pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {
     let auto_approve = flags.yes;
-    let (agent, session_id, model_spec, _spawner) = build_agent(&flags).await?;
+    // C-305: the pane channel is minted HERE, before the agent exists, and that ordering is the
+    // whole story. `flux_tui::run_with_options` does not create the surface until after the agent is
+    // assembled, but whether the `pane.*` ops are in the catalog at all has to be decided while the
+    // catalog is being built — once, never re-evaluated, so the advertised tool set (and the
+    // provider prompt prefix that caches on it) cannot churn mid-session. Minting the sink first is
+    // what makes that an assembly-time decision instead of a per-call one.
+    let panes = flux_tui::PaneQueue::new();
+    let (agent, session_id, model_spec, _spawner) =
+        build_agent_with_surface(&flags, panes.clone()).await?;
     let initial_rules = agent.executor.allow_rules();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut options = flux_tui::TuiRunOptions::new(auto_approve, Some(model_spec));
-    options.model_resolver = Some(Arc::new(CliTuiModelResolver));
-    options.file_commands = load_command_files(&cwd, TUI_BUILTIN_COMMANDS);
-    // C-104: the persisted theme choice (user-level, project override wins per the merge rules).
-    options.theme = flux_runtime::metadata::load_config(&cwd)
-        .ok()
-        .and_then(|cfg| cfg.theme);
+    let options = tui_options(auto_approve, model_spec, &cwd, panes);
     // Persist even when the TUI returns an error: an earlier "always allow" choice remains a user
     // decision and must not vanish because terminal restoration or a later turn failed.
     let executor = agent.executor.clone();
     let result = flux_tui::run_with_options(agent, session_id, options).await;
     persist_new_rules(&initial_rules, &executor.allow_rules());
     result
+}
+
+/// The TUI's surface options, built around the pane channel `run_tui` minted before the agent.
+///
+/// Split out so the `panes` half is testable: handing `run_with_options` a *different* queue from
+/// the one the agent writes to leaves the vocabulary just as inert as never registering it, and that
+/// failure is silent — the model reports a pane it opened and the user sees nothing.
+fn tui_options(
+    auto_approve: bool,
+    model_spec: String,
+    cwd: &std::path::Path,
+    panes: Arc<flux_tui::PaneQueue>,
+) -> flux_tui::TuiRunOptions {
+    let mut options = flux_tui::TuiRunOptions::new(auto_approve, Some(model_spec));
+    options.pane_queue = Some(panes);
+    options.model_resolver = Some(Arc::new(CliTuiModelResolver));
+    options.file_commands = load_command_files(cwd, TUI_BUILTIN_COMMANDS);
+    // C-104: the persisted theme choice (user-level, project override wins per the merge rules).
+    options.theme = flux_runtime::metadata::load_config(cwd)
+        .ok()
+        .and_then(|cfg| cfg.theme);
+    options
+}
+
+#[cfg(test)]
+mod tui_surface_wiring {
+    //! C-305: the surface half of `run_tui`'s pane wiring.
+    //!
+    //! The registration half — that `build_agent_with` is told whether this assembly minted a sink —
+    //! is pinned by `catalog_coherence`'s source census, and the whole delivery path from a model's
+    //! `pane.open` to the pane store is pinned by `tests/pane_surface_wiring.rs`. What is left, and
+    //! what this covers, is the join between them: the queue handed to the agent and the queue the
+    //! surface drains must be **one channel**. Asserted by pushing through the sink and reading it
+    //! back out of the options, rather than by comparing handles, so a future indirection that
+    //! copied the queue instead of sharing it would still be caught.
+
+    use super::*;
+
+    use flux_runtime::{PaneCommand, PaneData, PaneLifetime, PaneSlot, PaneSpec, SurfaceSink};
+
+    #[test]
+    fn the_options_carry_the_very_pane_channel_the_agent_was_given() {
+        let cwd = std::env::temp_dir().join(format!("flux-c305-options-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("create the test cwd");
+
+        // The handle `run_tui` passes to `build_agent_with_surface`.
+        let panes = flux_tui::PaneQueue::new();
+        let sink: Arc<dyn SurfaceSink> = panes.clone();
+        let options = tui_options(false, "mock/mock".into(), &cwd, panes);
+
+        // One command, emitted exactly as a `pane.*` op's `SurfaceReporter` emits it.
+        sink.emit(PaneCommand::Open(PaneSpec::new(
+            "wired",
+            "Wired",
+            PaneSlot::Right,
+            PaneLifetime::Session,
+            PaneData::Log {
+                lines: vec!["hello".into()],
+            },
+        )));
+
+        let queue = options.pane_queue.clone().expect(
+            "`run_tui`'s options must carry a pane channel — without one the `pane.*` ops \
+                    it registered write into a queue nobody reads",
+        );
+        let mut state = flux_tui::ChatState::for_session("mock/mock".into(), "s1".into())
+            .with_pane_queue(queue);
+        assert_eq!(
+            state.apply_pending_panes(),
+            1,
+            "the surface drained a different channel than the agent writes to"
+        );
+        assert_eq!(
+            state
+                .open_panes()
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wired"]
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
 }
 
 #[cfg(test)]

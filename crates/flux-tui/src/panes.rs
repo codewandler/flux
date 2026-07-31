@@ -145,6 +145,55 @@ impl Pane {
     }
 }
 
+/// Pane commands the agent has pushed but the event loop has not drawn yet. Deliberately generous:
+/// the bound exists so a runaway caller cannot grow the surface's memory without limit, not to
+/// shape behaviour — a turn that legitimately opens and repaints panes stays far below it.
+const MAX_PENDING_COMMANDS: usize = 1024;
+
+/// The TUI's [`SurfaceSink`](flux_runtime::SurfaceSink) — the L6 half of C-220's contract, and the
+/// thing whose *existence at assembly time* surfaces the `pane.*` vocabulary at all (C-305).
+///
+/// It is a queue rather than a direct call into [`ChatState`] because of when it has to exist:
+/// `run_tui` assembles the agent **before** the terminal (and its `ChatState`) are created, and the
+/// surfacing decision must be taken once, at assembly. So the channel is minted first, handed to the
+/// agent, and connected to the state that drains it afterwards. That is the same shape A-94's
+/// `SteeringQueue` uses in the other direction, for the same reason.
+///
+/// [`SurfaceSink::emit`](flux_runtime::SurfaceSink::emit) is called from inside a running tool and
+/// must not block, so this only ever locks a mutex to push. Nothing here renders, and nothing here
+/// sanitizes: sanitizing is [`PaneStore::apply`]'s job through [`AgentPane`], so a payload still
+/// cannot be drawn without having been filtered.
+#[derive(Debug, Default)]
+pub struct PaneQueue {
+    pending: std::sync::Mutex<std::collections::VecDeque<PaneCommand>>,
+}
+
+impl PaneQueue {
+    /// A fresh channel, ready to be handed to an agent assembly. `Arc` because the sink half lives
+    /// inside the runtime's `ToolContext` while the draining half stays with the surface.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Take everything queued so far, leaving the channel empty and open.
+    pub(crate) fn drain(&self) -> Vec<PaneCommand> {
+        self.pending.lock().unwrap().drain(..).collect()
+    }
+}
+
+impl flux_runtime::SurfaceSink for PaneQueue {
+    fn emit(&self, command: PaneCommand) {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= MAX_PENDING_COMMANDS {
+            // A surface-side drop, exactly like an `update` for an id that is not open: the channel
+            // is send-only, so there is nothing to report back through, and dropping the *newest*
+            // keeps the panes the user is already looking at rather than the flood behind them.
+            return;
+        }
+        pending.push_back(command);
+    }
+}
+
 /// One open pane as the surface reports it to a `pane.list` query (C-224).
 ///
 /// `host_owned` is the field that keeps the model from duplicating the fleet pane: it can see the
@@ -808,6 +857,93 @@ mod tests {
         PaneSlot::Bottom,
         PaneSlot::Overlay,
     ];
+
+    /// **C-305.** The agent's channel is the model's one door into the pane store, and it must
+    /// deliver through the *same* bounds and the same trust chrome a host-pushed pane goes through.
+    ///
+    /// Ordering is the load-bearing part and is asserted rather than assumed: a queue that replayed
+    /// commands out of order would turn an `open` + `update` + `close` triple into a pane the user
+    /// cannot get rid of.
+    #[test]
+    fn commands_emitted_on_the_agents_channel_reach_the_store_in_order() {
+        use flux_runtime::SurfaceSink;
+
+        let queue = PaneQueue::new();
+        let sink: Arc<dyn SurfaceSink> = queue.clone();
+        let mut state = ChatState::for_session("m".into(), "s".into()).with_pane_queue(queue);
+
+        assert_eq!(
+            state.apply_pending_panes(),
+            0,
+            "an idle channel applies none"
+        );
+
+        sink.emit(PaneCommand::Open(PaneSpec::new(
+            "build",
+            "Build",
+            PaneSlot::Right,
+            PaneLifetime::Session,
+            PaneData::Log {
+                lines: vec!["first".into()],
+            },
+        )));
+        sink.emit(PaneCommand::Update {
+            id: "build".into(),
+            data: PaneData::Log {
+                lines: vec!["second".into()],
+            },
+        });
+
+        assert_eq!(state.apply_pending_panes(), 2);
+        let listing = state.open_panes();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].id, "build");
+        assert!(
+            !listing[0].host_owned,
+            "an agent-authored pane must never be labelled host-owned"
+        );
+
+        // The `update` landed, which is only true if the two commands were applied in order — an
+        // `update` seen before its `open` is a silent host-side drop.
+        let mut terminal = Terminal::new(TestBackend::new(TRUST_W, TRUST_H)).unwrap();
+        terminal.draw(|f| crate::render(f, &state)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("second"), "the update is drawn:\n{screen}");
+        assert!(
+            screen.contains(AGENT_MARK),
+            "an agent-authored pane keeps its trust mark whichever door it came through:\n{screen}"
+        );
+
+        sink.emit(PaneCommand::Close { id: "build".into() });
+        assert_eq!(state.apply_pending_panes(), 1);
+        assert!(state.open_panes().is_empty(), "the close landed too");
+    }
+
+    /// The channel is bounded by the surface, like every other pane resource: a runaway caller
+    /// cannot grow it without limit while the event loop is between frames.
+    #[test]
+    fn the_agents_channel_is_bounded_by_the_surface() {
+        use flux_runtime::SurfaceSink;
+
+        let queue = PaneQueue::new();
+        let sink: Arc<dyn SurfaceSink> = queue.clone();
+        for index in 0..(MAX_PENDING_COMMANDS + 50) {
+            sink.emit(PaneCommand::Close {
+                id: format!("p{index}"),
+            });
+        }
+        assert_eq!(
+            queue.drain().len(),
+            MAX_PENDING_COMMANDS,
+            "the pending channel must be capped by the surface, not by its caller"
+        );
+    }
 
     /// A pending **destructive** approval: the top risk tier (C-154), and therefore the chrome a
     /// counterfeit would most want to wear.

@@ -167,6 +167,16 @@ pub struct FlowEngine {
     /// executor's log is append-only and shared across this engine's turns, so a plain high-water
     /// mark attributes each tail to the turn that just ended.
     evidence_flushed: std::sync::atomic::AtomicUsize,
+    /// The human surface's pane channel (C-220), installed by the L6 host that assembled this engine
+    /// and carried into **every** turn's [`RuntimeTurnContext`] (C-305). `None` for a headless
+    /// engine, which is why `ToolContext::surface` reports "no surface attached" there.
+    ///
+    /// It has to live on the engine rather than on the executor's stored fallback: a turn runs
+    /// inside `scope_runtime_turn`, and an active lexical scope is authoritative *including its
+    /// absent fields*. A sink set only through [`flux_runtime::ToolContext::set_surface_sink`] is
+    /// therefore invisible to every op in every real turn — a wiring that reads as correct and
+    /// delivers nothing.
+    surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     /// One active public turn per engine. Nested authored operations stay inside the already-held
     /// lifecycle and call the runtime directly, so they never recursively acquire this gate.
     turn_gate: tokio::sync::Mutex<()>,
@@ -361,8 +371,21 @@ impl FlowEngine {
             ambient_signals: Vec::new(),
             sticky_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
+            surface_sink: None,
             turn_gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// C-305: attach the human surface's pane channel, so the `pane.*` ops an L6 host registered
+    /// can actually reach it.
+    ///
+    /// Called once, at assembly, by the surface that minted the sink — the same `Option` that
+    /// decides `flux_tools::try_register_surface_ops`, so a catalog can never advertise a pane op
+    /// this engine has nowhere to send. A headless engine never calls it and its ops fail
+    /// actionably instead of writing into a void.
+    pub fn with_surface_sink(mut self, sink: Arc<dyn flux_runtime::SurfaceSink>) -> Self {
+        self.surface_sink = Some(sink);
+        self
     }
 
     /// Inject session-ambient group-surfacing signals (D-115): host-known facts the per-turn
@@ -523,13 +546,19 @@ impl FlowEngine {
         // reporter above — built from this turn's own sink so a later turn can never observe it.
         let tool_progress: Arc<dyn flux_runtime::ToolProgressSink> =
             Arc::new(crate::loop_host::AgentSinkToolProgressSink(channel.clone()));
-        let runtime = RuntimeTurnContext::new()
+        let mut runtime = RuntimeTurnContext::new()
             .with_cancel(cancel.clone())
             .with_session(session_id)
             .with_spawn_activity_sink(activity)
             .with_tool_progress_sink(tool_progress)
             .with_spawn_supervisor(spawn_supervisor.clone())
             .with_identity(identity.clone());
+        // C-305: the surface's pane channel is engine-owned rather than turn-owned — the host
+        // installed it once, at assembly — but it must be re-attached to every turn's context, since
+        // this scope is authoritative including the fields it omits.
+        if let Some(surface) = &self.surface_sink {
+            runtime = runtime.with_surface_sink(surface.clone());
+        }
         // D-175: `run_turn_pinned` supplies the WHOLE cassette scope for this turn — explicitly
         // WINNING over `FLUX_CASSETTE=0`. The kill switch governs only whether an ordinary turn
         // defaults to `Record` capture; it says nothing about a caller that deliberately pinned a
@@ -3974,6 +4003,75 @@ mod tests {
         assert_eq!(sink.text, "custom loop");
         assert!(requests.lock().unwrap().is_empty());
         assert_eq!(events.conversation(&session).unwrap().len(), 2);
+    }
+
+    /// **C-305.** An installed [`flux_runtime::SurfaceSink`] must be reachable from inside a turn.
+    ///
+    /// This is the whole reason the sink lives on the engine rather than on the executor's stored
+    /// fallback. A turn runs inside `scope_runtime_turn`, and `ToolContext::runtime_turn_context`
+    /// treats an active lexical scope as authoritative **including its absent fields** — so a sink
+    /// installed only through `ToolContext::set_surface_sink` is invisible to every op in every real
+    /// turn, and the `pane.*` vocabulary stays inert while the wiring reads as done. The probe below
+    /// asks the same question a `pane.*` op asks (`ctx.surface()`), from the same place.
+    #[tokio::test]
+    async fn an_installed_surface_sink_is_reachable_from_inside_a_turn() {
+        #[derive(Default)]
+        struct RecordingSurface(Mutex<Vec<flux_runtime::PaneCommand>>);
+        impl flux_runtime::SurfaceSink for RecordingSurface {
+            fn emit(&self, command: flux_runtime::PaneCommand) {
+                self.0.lock().unwrap().push(command);
+            }
+        }
+
+        /// Reports the surface exactly as a `pane.*` op does: through `ctx.surface()`, which is the
+        /// only way to reach a sink.
+        struct SurfaceProbeTool;
+
+        #[async_trait]
+        impl Tool for SurfaceProbeTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only(
+                    "surface_probe",
+                    "Address the human surface, if one is attached.",
+                    json!({"type": "object", "additionalProperties": false}),
+                )
+            }
+
+            async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+                let reporter = ctx.surface().ok_or_else(|| {
+                    Error::Other("no surface is attached to this turn".to_string())
+                })?;
+                reporter.send(flux_runtime::PaneCommand::Close {
+                    id: "probe".to_string(),
+                })?;
+                Ok(ToolResult::ok("sent"))
+            }
+        }
+
+        let surface = Arc::new(RecordingSurface::default());
+        let (engine, events, _root) = tool_engine(
+            Arc::new(SurfaceProbeTool),
+            DraftAst {
+                body: vec![Node::Return {
+                    value: Box::new(call_node("surface_probe")),
+                }],
+                ..Default::default()
+            },
+        );
+        let engine = engine.with_surface_sink(surface.clone());
+        let session = events.create_session("test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "probe the surface", &mut sink)
+            .await
+            .expect("the probe turn completes — a `None` surface fails the op");
+
+        assert_eq!(
+            surface.0.lock().unwrap().len(),
+            1,
+            "the engine's installed sink never reached the turn's `RuntimeTurnContext`"
+        );
     }
 
     #[tokio::test]

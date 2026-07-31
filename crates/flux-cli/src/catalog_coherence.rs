@@ -648,6 +648,11 @@ struct RegistrationCall {
     module: String,
     seam: String,
     source: Option<String>,
+    /// Every argument of the call, rendered by [`registration_source`]. Kept for **all** seams, not
+    /// just the source-labelled ones, because some seams carry a *decision* rather than a pack —
+    /// C-305's `try_register_surface_ops(registry, surface_sink.is_some())` is the case in point,
+    /// and the thing worth pinning there is where the decision came from.
+    arguments: Vec<String>,
 }
 
 fn covered_registration_sources() -> [String; 6] {
@@ -719,20 +724,22 @@ impl RegistrationVisitor<'_> {
         if !seam.starts_with("try_register") {
             return;
         }
+        let arguments: Vec<String> = arguments.into_iter().map(registration_source).collect();
         let source = matches!(
             seam.as_str(),
             "try_register" | "try_register_from" | "try_register_all_from"
         )
         .then(|| {
             arguments
-                .into_iter()
-                .next()
-                .map_or_else(|| "<missing argument>".to_string(), registration_source)
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "<missing argument>".to_string())
         });
         self.calls.push(RegistrationCall {
             module: self.module.to_string(),
             seam,
             source,
+            arguments,
         });
     }
 }
@@ -773,6 +780,7 @@ impl<'ast> Visit<'ast> for RegistrationVisitor<'_> {
                 module: self.module.to_string(),
                 seam: call.method.to_string(),
                 source: Some(source),
+                arguments: call.args.iter().map(registration_source).collect(),
             });
         } else {
             self.record(&call.method, call.args.iter());
@@ -964,6 +972,52 @@ fn every_registration_seam_in_the_cli_assembly_is_classified() {
     );
 }
 
+/// **C-305.** The CLI's assembly must take the pane-surfacing decision *from the sink it is about
+/// to install*, at exactly one production call site.
+///
+/// This is a source assertion rather than a behavioural one because the behaviour it guards is a
+/// single argument inside `build_agent_with`, and `build_agent_with` cannot be called from a test:
+/// it reads the process cwd, creates `~/.flux` roots, opens an event store and indexes the
+/// workspace. Everything downstream of the argument is covered end to end by
+/// `crates/flux-cli/tests/pane_surface_wiring.rs`; this pins the one link that suite has to
+/// reconstruct instead of invoke.
+///
+/// It is worth its length because of what the alternative looks like: hard-coding `false` here
+/// leaves the whole vocabulary inert with **every** existing test still green (verified by doing
+/// it), and hard-coding `true` puts `pane.*` in every headless `flux run`, `flux-server` and SDK
+/// catalog — the exact failure C-223's fail-closed seam exists to prevent. `registration_source`
+/// renders a literal as `<non-string literal>` and `surface_sink.is_some()` as its receiver, so
+/// both mutations are caught.
+#[test]
+fn the_pane_surfacing_decision_comes_from_the_assembling_surfaces_own_sink() {
+    let (_, calls) = cli_registration_calls().expect("the CLI source tree parses");
+    let sites: Vec<_> = calls
+        .iter()
+        .filter(|call| call.seam == "try_register_surface_ops")
+        .collect();
+
+    assert_eq!(
+        sites.len(),
+        1,
+        "the pane vocabulary must be registered at exactly one place in the CLI assembly, found \
+         {sites:?}"
+    );
+    let site = sites[0];
+    assert_eq!(
+        site.module, "execution.rs",
+        "the surfacing decision belongs in the shared agent assembly, not in {}",
+        site.module
+    );
+    assert_eq!(
+        site.arguments.get(1).map(String::as_str),
+        Some("surface_sink"),
+        "`try_register_surface_ops` must be told whether THIS assembly minted a `SurfaceSink` \
+         (`surface_sink.is_some()`); it is currently passed {:?}, which either leaves the pane \
+         vocabulary inert or advertises it to every headless catalog",
+        site.arguments.get(1)
+    );
+}
+
 #[test]
 fn registration_scan_ignores_comments_strings_and_test_only_calls() {
     let calls = registration_calls_in_source(
@@ -991,6 +1045,10 @@ fn registration_scan_ignores_comments_strings_and_test_only_calls() {
             module: "fixture.rs".to_string(),
             seam: "try_register_from".to_string(),
             source: Some("\"flux-cli cognition pack\"".to_string()),
+            arguments: vec![
+                "\"flux-cli cognition pack\"".to_string(),
+                "tool".to_string()
+            ],
         }]
     );
 }
