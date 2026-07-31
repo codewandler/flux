@@ -1160,7 +1160,6 @@ impl Tool for TaskTool {
         Ok(vec![AuthorityRequirement::provider_invoke(role)])
     }
 
-
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: TaskInput = parse_params(params, "task")?;
         let Some(spawner) = &ctx.spawner else {

@@ -571,8 +571,11 @@ impl Provider for ProbingChildProvider {
 }
 
 /// A `FlowClient` whose `worker` role delegates to [`ProbingChildProvider`], carrying `limits`.
-/// Every child is built from these same limits, so the concurrency semaphore is shared.
-fn delegating_client(tag: &str, limits: ResourceLimits) -> (FlowClient, Arc<Meter>, Arc<AtomicUsize>) {
+/// Every child inherits these same numbers, each with its own concurrency budget.
+fn delegating_client(
+    tag: &str,
+    limits: ResourceLimits,
+) -> (FlowClient, Arc<Meter>, Arc<AtomicUsize>) {
     let meter = Arc::new(Meter::default());
     let runs = Arc::new(AtomicUsize::new(0));
 
@@ -591,7 +594,11 @@ fn delegating_client(tag: &str, limits: ResourceLimits) -> (FlowClient, Arc<Mete
         runs: runs.clone(),
     }));
 
-    let factory = Arc::new(|| Ok(Box::new(ProbingChildProvider { turns: AtomicUsize::new(0) }) as Box<dyn Provider>));
+    let factory = Arc::new(|| {
+        Ok(Box::new(ProbingChildProvider {
+            turns: AtomicUsize::new(0),
+        }) as Box<dyn Provider>)
+    });
     let sub_agents = SubAgents::new(roles, child_base, factory, "mock", 1024);
 
     let mut client = FlowClient::builder()
