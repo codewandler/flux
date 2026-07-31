@@ -120,7 +120,8 @@ async fn handle(
 }
 
 /// Length-aware constant-time comparison (mirrors flux-server; avoids leaking the token via timing).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Shared with the `connector` adapter, which authenticates the same bearer the same way.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

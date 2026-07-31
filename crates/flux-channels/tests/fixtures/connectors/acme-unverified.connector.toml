@@ -1,0 +1,56 @@
+# A connector manifest as it exists ON DISK — i.e. after publication, and therefore after anyone
+# with write access to `~/.flux/connectors` has had a chance to edit it.
+#
+# Shape and field names mirror what flux-connectors' `connector-cli` emits
+# (`crates/connector-cli/src/seam.rs`, `fn manifest`); this copy lives here so the flux test suite
+# never reaches into the sibling repository.
+#
+# The defect under test: the `events-api` binding is `transport = "webhook"` and carries **no**
+# `[channels.verification]` table at all. The producing repository cannot emit that — its emitter
+# marks `verification` "always emitted" and its loader refuses an unset scheme on a webhook binding —
+# which is exactly why flux must refuse it again against the file, before any listener binds.
+generator = "flux-connectors 0.6.0"
+connector = "acme"
+gid = "com.acme.api:v1"
+vendor = "Acme"
+description = "Acme messaging"
+base_url = "https://api.acme.example"
+api_version = "v1"
+module = "acme.flux"
+operations = ["acme-messages-post"]
+
+[[events]]
+name = "mention"
+oip = "com.acme.api:v1#mention"
+description = "Someone mentioned the app"
+group = "Messages"
+
+[[channels]]
+name = "events-api"
+oip = "com.acme.api:v1#events-api"
+description = "Acme POSTs to an endpoint the operator exposes"
+transport = "webhook"
+events = ["mention"]
+
+# ← `[channels.verification]` deliberately absent.
+
+[channels.discriminator]
+source = "body"
+name = "event.type"
+
+[channels.delivery_id]
+source = "body"
+name = "event_id"
+
+[channels.payload]
+channel = "event.channel"
+text = "event.text"
+user = "event.user"
+
+[channels.reply]
+operation = "acme-messages-post"
+oip = "com.acme.api:v1#acme-messages-post"
+result = "text"
+
+[channels.reply.bind]
+channel = "channel"

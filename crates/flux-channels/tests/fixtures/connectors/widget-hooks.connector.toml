@@ -1,0 +1,48 @@
+# A SECOND connector, deliberately a different shape from `acme` — this is the fixture behind
+# `a_second_connector_adds_no_lines_to_flux_channels`.
+#
+# Every axis that could tempt someone into a vendor-specific branch differs here:
+#
+#   * a **named service** (`hooks`), so the manifest resolves as `widget-hooks.connector.toml`
+#     rather than `widget.connector.toml`;
+#   * a **header** discriminator instead of a body path — GitHub's shape, not Slack's;
+#   * **no reply** at all (fire-and-forget: the vendor expects only a 2xx);
+#   * a **flat** envelope, so the payload paths have one segment rather than two;
+#   * **no delivery_id**.
+#
+# If driving this needed one line of new Rust, the generic arm would not be generic.
+generator = "flux-connectors 0.6.0"
+connector = "widget"
+service = "hooks"
+gid = "com.widget.hooks:v2"
+vendor = "Widget"
+description = "Widget outbound hooks"
+base_url = "https://hooks.widget.example"
+module = "widget-hooks.flux"
+operations = []
+
+[[events]]
+name = "build.finished"
+description = "A build finished"
+
+[[events]]
+name = "build.failed"
+description = "A build failed"
+
+[[channels]]
+name = "hooks"
+description = "Widget POSTs and names the event in a header"
+transport = "webhook"
+events = ["build.finished", "build.failed"]
+
+[channels.verification]
+kind = "none"
+verified = false
+
+[channels.discriminator]
+source = "header"
+name = "X-Widget-Event"
+
+[channels.payload]
+project = "project"
+status = "status"
