@@ -138,7 +138,8 @@ All notable changes to this project are documented in this file. The format is b
   existence, with a `v0.3.0` floor (measured: of 113 Releases exactly eight carry zero assets, all
   below it) instead of an allowlist.
   ⚠ **The trigger was prose in this changelog.** The release body embeds the CHANGELOG; 0.47.0's
-  entry contained token-shaped text (`Authorization: Bearer <jwt>`), GitHub Actions masked it, and
+  entry contained text shaped like an HTTP authorization header carrying a bearer credential (it was
+  describing one), GitHub Actions masked it, and
   rather than emit the output masked it **discarded the plan job's `val` output entirely** —
   `##[warning]Skip output 'val' since it may contain secret`. A voided `val` nulls
   `artifacts_matrix.include`, which skips every build job, which makes the run report `success`
