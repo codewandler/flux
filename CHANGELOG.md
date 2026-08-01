@@ -6,6 +6,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- ⚠ **A room agent now answers only when addressed** (D-207). `address_rule` was carried but never
+  enforced, so a flux agent in a shared room replied to every line said in it. It is now enforced —
+  mention, whisper, or a wake phrase — with an accumulated **attributed transcript** so an answer can
+  refer to what it overheard, plus a per-room **sliding reply budget** so two agents in one room
+  converge instead of talking until a cap.
+  ⚠ **Action needed on an existing deployment**: the default is `mention`, so a room that relied on
+  the agent answering everything **goes quiet** until it sets `address_rule "always"`. Refusals are
+  silent in the room by design; flux prints one stderr line per distinct reason per session, naming
+  the rule and the nick it answers to, so the silence is diagnosable.
+  **What the review caught.** The first cut matched the **configured** nick rather than the one the
+  service assigned. A MUC may seat an agent under a different nick (`<status code='110'/>`, already
+  modelled and tested here since D-205) — occupants then type the name they can *see*, nothing
+  matches, and the agent falls permanently silent. That failure was *created* by defaulting to
+  `mention`: before, a stale nick could not affect whether the agent spoke. Addressing now tracks the
+  room-visible nick from self-presence.
+  Mention matching was also tightened afterwards, so `https://flux.dev/docs`, `/var/log/flux/agent.log`
+  and "the flux 0.48 release notes" no longer read as addressing the agent — while the seven spellings
+  people actually use to address a bot are pinned in the other direction, because tightening a matcher
+  silently costs recall.
+  ⚠ Two limits stated rather than implied: the never-answer-another-agent's-plain-text rule is
+  unreachable on **every** backend today (`OccupantKind::Agent` is only ever assigned to ourselves), so
+  the budget is what actually bounds an agent pair; and the attributed context reaches the model on the
+  journey path only — `run_agent` drops it for an agent-bound room, which needs its own story because
+  it affects every channel that puts structure beside `text`.
+
 ### Fixed
 
 - **A room-triggered journey authorizes and audits as the speaker, not as the local operator**

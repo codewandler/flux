@@ -2,8 +2,7 @@
 id: D-207
 title: Addressing and reply budget — the agent answers only when spoken to
 pillar: Agent
-status: in-progress
-priority: 5
+status: done
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels, flux-flow]
