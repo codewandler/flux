@@ -33,7 +33,8 @@ use flux_lang::program::ChannelDecl;
 
 use crate::config::{RoomSettings, DEFAULT_ROOM_NICK};
 use crate::rooms::{
-    MockRoom, Room, RoomIdentity, RoomSessionEnd, RoomTurnDriver, XmppConfig, XmppMucRoom,
+    BraveTalkTokens, JaasConfig, JaasRoom, MockRoom, Room, RoomIdentity, RoomSessionEnd,
+    RoomTurnDriver, XmppConfig, XmppMucRoom,
 };
 use crate::{Channel, Deliverer};
 
@@ -57,14 +58,15 @@ impl RoomChannel {
                 XmppConfig::from_settings(&settings)
                     .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", decl.name))?,
             )),
-            // `jaas` (D-206) is **not** declarable yet, deliberately. `JaasRoom` and its
-            // `JaasTokens` seam have landed, but the vendor implementation of that seam — Brave's
-            // `OPTIONS`/`PUT` guest-token handshake and the JaaS conference-request — needs an HTTP
-            // client this crate does not depend on. Until it lands there is nothing to construct a
-            // token source *from*, so a host wires its own through `with_room` below rather than
-            // this declaration answering with a room that cannot mint. See D-206's story notes.
+            // The vendor one: Brave Talk and any 8x8 JaaS tenant (D-206). Same MUC machinery as
+            // `xmpp` underneath — all this adds is where the guest token comes from and what
+            // happens when it expires three hours later.
+            "jaas" => Arc::new(JaasRoom::new(
+                JaasConfig::from_settings(&settings),
+                Arc::new(BraveTalkTokens::from_settings(&settings)),
+            )),
             other => anyhow::bail!(
-                "channel `{}`: unknown room backend `{other}` (known: mock, xmpp)",
+                "channel `{}`: unknown room backend `{other}` (known: mock, xmpp, jaas)",
                 decl.name
             ),
         };

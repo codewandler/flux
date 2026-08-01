@@ -37,7 +37,8 @@ mod xmpp;
 
 pub use driver::{RoomSessionEnd, RoomTurnDriver};
 pub use jaas::{
-    Conference, GuestToken, JaasConfig, JaasRoom, JaasTokens, DEFAULT_JAAS_REFRESH_LEAD,
+    BraveTalkTokens, Conference, GuestToken, JaasConfig, JaasRoom, JaasTokens,
+    DEFAULT_BRAVE_TOKEN_SERVICE, DEFAULT_JAAS_CONFERENCE_SERVICE, DEFAULT_JAAS_REFRESH_LEAD,
     DEFAULT_JAAS_SIGNALLING, JAAS_REFRESH_RETRY, MIN_JAAS_REFRESH_INTERVAL,
 };
 pub use mock::MockRoom;

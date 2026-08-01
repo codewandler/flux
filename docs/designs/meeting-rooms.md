@@ -214,10 +214,10 @@ prosody/ejabberd/JaaS MUC. Decisions a D-206 implementor inherits:
 - **`OccupantKind` is `Unknown` for everyone but us and `focus`.** XMPP presence carries no
   human-or-bot signal and inventing one would be worse than admitting we cannot tell.
 
-**As landed (D-206, partial)** — the vendor backend, `crates/flux-channels/src/rooms/jaas.rs`.
-`JaasRoom` owns exactly the two things that are vendor-specific — where the guest token comes from,
-and what happens when it expires — and delegates everything else to D-205's `XmppMucRoom`.
-Decisions a follow-up implementor inherits:
+**As landed (D-206)** — the vendor backend, `crates/flux-channels/src/rooms/jaas/`. `JaasRoom` owns
+exactly the two things that are vendor-specific — where the guest token comes from, and what happens
+when it expires — and delegates everything else to D-205's `XmppMucRoom`. Decisions a follow-up
+implementor inherits:
 
 - **`JaasTokens` is the network boundary**, the same shape `flux_plugin::pack::Fetcher` uses and for
   the same reason: two operations scoped to `(room, token)` rather than to a caller-supplied URL, so
@@ -233,11 +233,35 @@ Decisions a follow-up implementor inherits:
 - **A guest JWT is a secret that rides a query string.** `GuestToken`'s `Debug` redacts it, and the
   D-205 backend now renders an endpoint *without its query* in every error and `Debug` that names one
   (`xmpp::endpoint_for_display`) — a failed connect would otherwise publish the token to a log.
-- **Two Acceptance items are blocked on dependencies this crate does not carry** and are not
-  implemented: the real `JaasTokens` (Brave's `OPTIONS` + `PUT /api/v1/rooms/<room>` and the
-  `conference-request` call) needs an HTTP client, and own-tenant local JWT signing needs an RS256
-  implementation. Because there is nothing to construct a token source from, `backend = "jaas"` is
-  deliberately *not* declarable yet; a host wires its own through `RoomChannel::with_room`.
+- **`BraveTalkTokens` is the vendor implementation** (`jaas/tokens.rs`), and every request it makes
+  is **pinned** to the addresses `guard_url_scoped_pinned` vetted — `resolve_to_addrs` + `no_proxy`,
+  redirects refused outright, an empty pin set failing closed. That is a stronger posture than the
+  WebSocket path above, which the guard's URL-returning API cannot pin; it mirrors `flux-web`'s
+  crawler rather than inventing anything. Redirects are refused specifically because one would carry
+  the `Authorization: Bearer <jwt>` header off the vetted origin.
+- **No vendor response body ever reaches an error message.** A failing response can echo our own
+  token or CSRF value back at us, so failures name the step, the status and the query-trimmed URL.
+- **Every unpublished vendor assumption is marked `VENDOR ASSUMPTION` at the line that depends on
+  it.** Brave publishes no API for this; the shapes were derived from the open-source client and
+  confirmed live once, on 2026-07-30. The markers exist so a future breakage is diagnosable as *the
+  vendor moved* rather than *our code is wrong*. One of them is explicitly **inferred rather than
+  measured**: the spike only ever saw `ready: true` from focus allocation, so `ready: false` is
+  retried on a fixed backoff rather than keyed on a response field this repo has never observed.
+- **Own-tenant signing is still deferred** and is the one Acceptance item left: it needs an RS256
+  signer this workspace does not carry (`rsa`/`jsonwebtoken`/`ring` are all absent). It is a
+  *second* implementation of `JaasTokens` and changes nothing else — which is what the seam is for.
+- **The guest path carries no credential at all**, which is why `RoomSettings` has no JWT, API-key or
+  private-key field for it: the CSRF handshake exists precisely *because* the endpoint is
+  unauthenticated. When own-tenant signing lands it inherits the credential seam every other channel
+  setting already uses — `flux_app::resolve_secrets` resolves `secret "KEY"` at load and registers
+  the value with the host's `Redactor`.
+- **Known gap: the runtime-minted JWT is not registered with the `Redactor`.** `flux-channels` does
+  not depend on `flux-secret` (the same constraint `adapters/webhook.rs` documents), and unlike a
+  declared secret this token is minted at *runtime*, so `resolve_secrets` never sees it. It is held
+  out of logs structurally instead — redacting `Debug`, query-trimmed endpoints, no response bodies
+  in errors, `HeaderValue::set_sensitive` on the Bearer — but a tool that echoed it would not be
+  scrubbed. Closing this needs `flux-secret` in the manifest and a redactor handed down to the
+  channel.
 
 **The L3 turn seam changed with it (breaking):** `VoiceTurnHandler::turn` is now
 `turn(&self, speaker: &Speaker, user_text: &str)`. `flux_flow::voice::Speaker` is a surface-owned id

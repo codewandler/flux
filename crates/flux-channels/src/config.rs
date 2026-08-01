@@ -310,6 +310,21 @@ pub struct RoomSettings {
     /// widening it is an operator decision, not a default.
     #[serde(default)]
     pub allow_private_net: bool,
+
+    // ── `backend = "jaas"` (D-206) ──
+    //
+    // Note what is *absent*: no field here takes a JWT, an API key or a private key, because the
+    // Brave Talk guest path is unauthenticated — the CSRF handshake exists precisely because there
+    // is no credential. When own-tenant signing lands it inherits the credential seam every other
+    // field here already uses (`flux_app::resolve_secrets` resolves `secret "KEY"` in a channel's
+    // settings at load and registers the value with the host's `Redactor`), so a key is written as
+    // `api_key secret "JAAS_KEY"` and never as a literal.
+    /// The token service that mints guest JWTs. Defaults to Brave's (`https://talk.brave.com`).
+    #[serde(default)]
+    pub token_service: Option<String>,
+    /// The JaaS API that allocates conference focus. Defaults to `https://8x8.vc`.
+    #[serde(default)]
+    pub conference_service: Option<String>,
 }
 
 /// The nick flux joins a room under when the declaration does not say. A room containing humans is

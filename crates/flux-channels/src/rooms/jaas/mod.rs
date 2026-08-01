@@ -17,7 +17,7 @@
 //! ```
 //!
 //! Three consequences are load-bearing, and each is a test rather than a comment alone
-//! (`tests/jaas_room.rs`):
+//! (`tests/jaas_room.rs` for the session, `tests/jaas_tokens.rs` for the HTTP handshake):
 //!
 //! - **The MUC JID comes from the conference-request response**, never from the JWT: the response
 //!   lowercases the room name and the `room` claim does not, so a locally-rebuilt address is wrong in
@@ -33,7 +33,8 @@
 //! [`JaasTokens`] is the seam every vendor HTTP call goes through — the same shape
 //! `flux_plugin::pack::Fetcher` uses, and for the same reason: it is scoped to `(room, token)` rather
 //! than to a caller-supplied URL, so tests inject a hermetic fixture and **no test in this repo ever
-//! reaches Brave or 8x8**.
+//! reaches Brave or 8x8**. [`BraveTalkTokens`] is the real implementation; every request it makes is
+//! pinned to the addresses `flux_system::net::guard_url_scoped_pinned` vetted.
 //!
 //! ## Safety
 //!
@@ -52,6 +53,10 @@
 //! not discover them, and has no batch or multi-room path. Anything beyond own-room use is a
 //! different posture and needs Brave's acceptable-use policy read first — prefer an own JaaS tenant,
 //! or D-205's generic backend. See `docs/designs/meeting-rooms.md`, "Open questions".
+
+mod tokens;
+
+pub use tokens::{BraveTalkTokens, DEFAULT_BRAVE_TOKEN_SERVICE, DEFAULT_JAAS_CONFERENCE_SERVICE};
 
 use std::collections::HashSet;
 use std::fmt;
@@ -546,6 +551,35 @@ impl SessionPump {
             RoomEvent::Ended => RoomEvent::Ended,
         };
         self.events.send(event).await.is_ok()
+    }
+}
+
+/// A room's declaration mapped onto a config — used by the `room` channel adapter.
+impl JaasConfig {
+    /// Build from the channel declaration's settings. `url`, when given, is the **signalling** base
+    /// (`wss://8x8.vc`); the token service and conference service have their own fields, because on
+    /// this backend they are three different hosts' worth of configuration rather than one endpoint.
+    pub(crate) fn from_settings(settings: &crate::config::RoomSettings) -> Self {
+        let mut config = Self::new(settings.room.clone());
+        if let Some(url) = settings.url.clone() {
+            config.signalling = url;
+        }
+        config.private_net = PrivateNetAllow::from_legacy_bool(settings.allow_private_net);
+        config
+    }
+}
+
+impl BraveTalkTokens {
+    /// Build the vendor token source from the channel declaration's settings.
+    pub(crate) fn from_settings(settings: &crate::config::RoomSettings) -> Self {
+        let mut tokens = Self::new();
+        if let Some(base) = settings.token_service.clone() {
+            tokens = tokens.token_service(base);
+        }
+        if let Some(base) = settings.conference_service.clone() {
+            tokens = tokens.conference_service(base);
+        }
+        tokens.allow_private_net(settings.allow_private_net)
     }
 }
 
