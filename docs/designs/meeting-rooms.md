@@ -214,6 +214,31 @@ prosody/ejabberd/JaaS MUC. Decisions a D-206 implementor inherits:
 - **`OccupantKind` is `Unknown` for everyone but us and `focus`.** XMPP presence carries no
   human-or-bot signal and inventing one would be worse than admitting we cannot tell.
 
+**As landed (D-206, partial)** — the vendor backend, `crates/flux-channels/src/rooms/jaas.rs`.
+`JaasRoom` owns exactly the two things that are vendor-specific — where the guest token comes from,
+and what happens when it expires — and delegates everything else to D-205's `XmppMucRoom`.
+Decisions a follow-up implementor inherits:
+
+- **`JaasTokens` is the network boundary**, the same shape `flux_plugin::pack::Fetcher` uses and for
+  the same reason: two operations scoped to `(room, token)` rather than to a caller-supplied URL, so
+  the own-room posture holds *structurally* — there is no shape of the trait that enumerates rooms —
+  and so `crates/flux-channels/tests/jaas_room.rs` never reaches Brave or 8x8.
+- **The refresh re-joins rather than re-authenticating in place.** The token rides the WebSocket URL,
+  so a fresh token means a fresh socket. A forwarding task mints ahead of the expiry, joins a second
+  `XmppMucRoom`, swaps it in and only then leaves the old one — so a `say` never addresses a session
+  that is on its way out. Transparency is achieved by suppressing the new session's replayed
+  `Joined` events for occupants the consumer already knows, and by the deliberate `leave` emitting no
+  `Ended`. Known gap: an occupant who leaves *between* sessions produces no `Left` (they are simply
+  absent from `Room::occupants`, which reads the live session).
+- **A guest JWT is a secret that rides a query string.** `GuestToken`'s `Debug` redacts it, and the
+  D-205 backend now renders an endpoint *without its query* in every error and `Debug` that names one
+  (`xmpp::endpoint_for_display`) — a failed connect would otherwise publish the token to a log.
+- **Two Acceptance items are blocked on dependencies this crate does not carry** and are not
+  implemented: the real `JaasTokens` (Brave's `OPTIONS` + `PUT /api/v1/rooms/<room>` and the
+  `conference-request` call) needs an HTTP client, and own-tenant local JWT signing needs an RS256
+  implementation. Because there is nothing to construct a token source from, `backend = "jaas"` is
+  deliberately *not* declarable yet; a host wires its own through `RoomChannel::with_room`.
+
 **The L3 turn seam changed with it (breaking):** `VoiceTurnHandler::turn` is now
 `turn(&self, speaker: &Speaker, user_text: &str)`. `flux_flow::voice::Speaker` is a surface-owned id
 plus an optional display name; a 1:1 surface passes `Speaker::sole()`, which is how a phone line's
@@ -293,8 +318,11 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
    RFC 7395 traps are regressed on the raw bytes:
    `every_stanza_the_xmpp_backend_emits_is_jabber_client_qualified` and
    `the_xmpp_keepalive_is_a_ping_iq_and_never_whitespace`.
-7. **Token refresh is transparent.** A session crossing the 3 h guest-token expiry re-mints and stays
-   joined.
+7. **Token refresh is transparent.** ✅ **Met (D-206).** A session crossing the 3 h guest-token expiry
+   re-mints and stays joined — `crates/flux-channels/tests/jaas_room.rs::jaas_session_survives_token_expiry`
+   drives it against a fake token service with a 3-second TTL and the in-process XMPP double, and
+   asserts the re-join carried a *different* token, that a message said afterwards still lands, and
+   that the consumer saw neither `Ended` nor a duplicate `Joined`.
 8. **Published media carries signal.** A published track whose source is silence is reported as a failure,
    not as success — asserted with a level probe, because the spike watched the bridge elect a silent bot
    dominant speaker.

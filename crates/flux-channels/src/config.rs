@@ -266,8 +266,10 @@ pub struct A2aSettings {
 #[non_exhaustive]
 pub struct RoomSettings {
     /// Which [`Room`](crate::rooms::Room) backend to join with. `"mock"` is the in-process one,
-    /// `"xmpp"` the portable standards-compliant one (D-205); `"jaas"` (D-206) follows. An
-    /// unrecognized backend is a load error, exactly like an unrecognized channel `kind`.
+    /// `"xmpp"` the portable standards-compliant one (D-205). `"jaas"` (D-206) exists as a type
+    /// ([`JaasRoom`](crate::rooms::JaasRoom)) but is not declarable until its vendor token service
+    /// lands — a host wires one through `RoomChannel::with_room`. An unrecognized backend is a load
+    /// error, exactly like an unrecognized channel `kind`.
     pub backend: String,
     /// The room address, as the server spells it (an XMPP MUC JID).
     pub room: String,

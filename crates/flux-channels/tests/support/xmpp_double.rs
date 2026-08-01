@@ -15,12 +15,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse as WsErrorResponse, Request as WsRequest, Response as WsResponse,
 };
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::WebSocketStream;
 
 /// The MUC JID as a program declares it — mixed case, the way a JaaS token's `room` claim keeps it.
 pub const ROOM_JID_CONFIGURED: &str = "StandUp@conference.example.org";
@@ -30,11 +32,21 @@ pub const ROOM_JID_SERVER: &str = "standup@conference.example.org";
 /// How long a `wait_for` waits before declaring the client never sent what was expected.
 const WAIT: Duration = Duration::from_secs(5);
 
-/// A running double: one WebSocket listener, one connection at a time.
+/// A running double: one WebSocket listener serving **concurrent** connections.
+///
+/// Concurrent rather than one-at-a-time on purpose: a JaaS session that crosses its guest token's
+/// expiry re-mints and *re-joins*, and it opens the new connection before closing the old one
+/// (D-206) — a double that accepts serially would deadlock exactly the path under test. Every
+/// connection's request URI is recorded, which is how a test proves the token rode the URL and that
+/// the re-join carried a fresh one.
 pub struct XmppDouble {
     addr: SocketAddr,
     sent: Arc<Mutex<Vec<String>>>,
-    push: mpsc::UnboundedSender<String>,
+    connections: Arc<Mutex<Vec<String>>>,
+    push: broadcast::Sender<String>,
+    /// Kept so [`XmppDouble::push`] never fails for want of a subscriber. Never drained: a new
+    /// connection subscribes at the tail, so it sees only what is pushed after it arrives.
+    _retain: broadcast::Receiver<String>,
     _accept: tokio::task::JoinHandle<()>,
 }
 
@@ -44,53 +56,41 @@ impl XmppDouble {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let (push, mut push_rx) = mpsc::unbounded_channel::<String>();
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let (push, _retain) = broadcast::channel::<String>(64);
 
         let recorded = sent.clone();
+        let dialled = connections.clone();
+        let pushes = push.clone();
         let accept = tokio::spawn(async move {
-            let Ok((sock, _)) = listener.accept().await else {
-                return;
-            };
-            let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(sock, negotiate).await else {
-                return;
-            };
-
-            let mut opens = 0usize;
             loop {
-                tokio::select! {
-                    outbound = push_rx.recv() => match outbound {
-                        Some(frame) => {
-                            if ws.send(WsMessage::Text(frame.into())).await.is_err() {
-                                return;
-                            }
-                        }
-                        None => return,
-                    },
-                    inbound = ws.next() => {
-                        let frame = match inbound {
-                            Some(Ok(WsMessage::Text(t))) => t.to_string(),
-                            // A close, an error, or a non-text frame ends the session. (A binary or
-                            // whitespace frame would be a protocol error on a real server; the
-                            // keepalive regression test asserts the client never sends one.)
-                            Some(Ok(WsMessage::Close(_))) | None => return,
-                            Some(Err(_)) => return,
-                            Some(Ok(_)) => continue,
-                        };
-                        recorded.lock().unwrap().push(frame.clone());
-                        for reply in replies_to(&frame, &mut opens) {
-                            if ws.send(WsMessage::Text(reply.into())).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = dialled.clone();
+                // The `Err` type is tungstenite's `ErrorResponse` and is not ours to shrink.
+                #[allow(clippy::result_large_err)]
+                let hook = move |req: &WsRequest, resp: WsResponse| {
+                    seen.lock().unwrap().push(req.uri().to_string());
+                    negotiate(req, resp)
+                };
+                let recorded = recorded.clone();
+                let outbound = pushes.subscribe();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(sock, hook).await else {
+                        return;
+                    };
+                    serve(&mut ws, outbound, &recorded).await;
+                });
             }
         });
 
         Self {
             addr,
             sent,
+            connections,
             push,
+            _retain,
             _accept: accept,
         }
     }
@@ -98,6 +98,35 @@ impl XmppDouble {
     /// The `ws://` endpoint to configure a room with.
     pub fn url(&self) -> String {
         format!("ws://{}/xmpp-websocket", self.addr)
+    }
+
+    /// The scheme-and-authority the double is reachable at — what a backend that builds its own path
+    /// (the JaaS one appends `/<tenant>/xmpp-websocket`) is configured with.
+    pub fn ws_base(&self) -> String {
+        format!("ws://{}", self.addr)
+    }
+
+    /// Every connection's request URI, in the order they were accepted.
+    pub fn connections(&self) -> Vec<String> {
+        self.connections.lock().unwrap().clone()
+    }
+
+    /// Block until `n` connections have been accepted. Panics on timeout — "the client never
+    /// reconnected" is exactly the failure the refresh test is looking for.
+    pub async fn wait_for_connections(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            if self.connections().len() >= n {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {n} connections; saw {:?}",
+                    self.connections()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Every text frame the client has sent, in order and verbatim.
@@ -122,6 +151,49 @@ impl XmppDouble {
                 panic!("timed out waiting for a frame; sent were {:?}", self.sent());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// Serve one accepted connection until it ends.
+async fn serve(
+    ws: &mut WebSocketStream<TcpStream>,
+    mut outbound: broadcast::Receiver<String>,
+    recorded: &Arc<Mutex<Vec<String>>>,
+) {
+    // RFC 7395's SASL restart replays `<open/>`, and the two get different feature sets — so this
+    // counts per connection, not for the double's lifetime.
+    let mut opens = 0usize;
+    loop {
+        tokio::select! {
+            pushed = outbound.recv() => match pushed {
+                Ok(frame) => {
+                    if ws.send(WsMessage::Text(frame.into())).await.is_err() {
+                        return;
+                    }
+                }
+                // Lagged: this connection missed pushes it was never the target of. Closed: the
+                // double is gone.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            inbound = ws.next() => {
+                let frame = match inbound {
+                    Some(Ok(WsMessage::Text(t))) => t.to_string(),
+                    // A close, an error, or the end of the socket ends this session. (A binary or
+                    // whitespace frame would be a protocol error on a real server; the keepalive
+                    // regression test asserts the client never sends one.)
+                    Some(Ok(WsMessage::Close(_))) | None => return,
+                    Some(Err(_)) => return,
+                    Some(Ok(_)) => continue,
+                };
+                recorded.lock().unwrap().push(frame.clone());
+                for reply in replies_to(&frame, &mut opens) {
+                    if ws.send(WsMessage::Text(reply.into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
         }
     }
 }
