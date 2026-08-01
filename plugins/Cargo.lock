@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alertmanager"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "asterisk"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "aws"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "confluence"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "codewandler-flux-host-kit",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "docker"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -198,7 +198,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "flux-plugin-onepassword"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "flux-plugin-vault"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "gitlab"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "codewandler-flux-host-kit",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "grafana"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "hex",
@@ -248,7 +248,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "homer"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "huggingface"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -283,7 +283,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jira"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "codewandler-flux-host-kit",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "kubernetes"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -310,7 +310,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "loki"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -334,7 +334,7 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "opsgenie"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "pack-index"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "prometheus"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "slack"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "codewandler-flux-host-kit",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "sql"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
@@ -648,7 +648,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "websearch"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "codewandler-flux-host-kit",
  "schemars",
