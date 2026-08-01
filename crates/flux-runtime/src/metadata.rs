@@ -692,23 +692,21 @@ pub fn expand_command_arguments(body: &str, raw_args: &str) -> String {
     out
 }
 
-/// Serializes tests (in this module AND `flux_runtime::tests`) that repoint `HOME` — the process
-/// env is shared across parallel test threads (mirrors `flux_config`'s `HOME_LOCK`).
-#[cfg(test)]
-pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Serializes tests that assert on `tracing` output against tests that emit the *same* callsite.
 ///
 /// `tracing` caches a callsite's `Interest` process-globally, so a thread that reaches
 /// `extend_skills`' duplicate-skill `warn!` while another thread is between installing its
 /// `with_default` subscriber and emitting builds the cache against the wrong dispatcher, and the
-/// recording subscriber captures nothing. C-297: `HOME_LOCK` used to serialize these two by
+/// recording subscriber captures nothing. C-297: a `HOME_LOCK` used to serialize these two by
 /// accident; now that discovery tests pin a [`DiscoveryEnv`] instead of `HOME`, the coupling is
 /// named for what it actually protects. Assertions on the returned `warnings` need no lock.
 #[cfg(test)]
 static TRACING_CALLSITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Serializes tests that set `FLUX_MANAGED_CONFIG` (C-165) — same rationale as `HOME_LOCK`.
+/// Serializes tests that set `FLUX_MANAGED_CONFIG` (C-165) — the process env is shared across
+/// parallel test threads, so a test that repoints it races every other test in the binary. C-393
+/// removed this module's last `HOME` counterpart: nothing in `flux-runtime` repoints `HOME` any
+/// more, so there is no `HOME_LOCK` here to mirror.
 #[cfg(test)]
 static MANAGED_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

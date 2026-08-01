@@ -2378,7 +2378,15 @@ mod tests {
         std::fs::create_dir_all(&skills_root).unwrap();
         let installed_dir = write_generated_skill(&skills_root, &rendered).unwrap();
 
-        let discovered = flux_runtime::metadata::discover_skills(&project, &[]).unwrap();
+        // C-393: pinned to an empty home, so the operator's `~/.claude/skills` cannot join (or
+        // shadow) the round trip this test is measuring.
+        let discovered = flux_runtime::metadata::discover_skills_in(
+            &project,
+            &[],
+            &flux_runtime::metadata::DiscoveryEnv::empty(),
+        )
+        .unwrap()
+        .skills;
         let skill = discovered
             .iter()
             .find(|s| s.name == "flux-plugin")

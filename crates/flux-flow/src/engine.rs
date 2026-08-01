@@ -144,6 +144,16 @@ pub struct FlowEngine {
     pub groups: Vec<flux_evidence::ToolGroup>,
     /// Workspace root, re-probed each turn for the surfacing signals above.
     pub cwd: std::path::PathBuf,
+    /// The environment the per-turn surfacing probe resolves its **home**-rooted checks against
+    /// (C-393): the `agent_triggerable` signal re-runs command/skill discovery, which includes
+    /// `~/.flux/commands`, `~/.claude/commands` and the user-global skill roots, and the
+    /// `kubernetes` signal tests `~/.kube/config`.
+    ///
+    /// Defaults to [`DiscoveryEnv::from_process`](flux_runtime::metadata::DiscoveryEnv::from_process)
+    /// — production behaviour is unchanged. A test that supplies a non-empty `groups` manifest (the
+    /// only way to reach the probe at all, see `surfaced_op_names`) pins it with
+    /// [`Self::with_discovery_env`] so its verdict is a function of its fixture, not of the machine.
+    discovery_env: flux_runtime::metadata::DiscoveryEnv,
     /// Session-ambient signals injected by the host surface (D-115): facts the per-turn workspace
     /// walk can't see — e.g. the CLI's "the endpoints store is non-empty", computed once from its
     /// startup-loaded registry. Appended to every turn's detected signals for group surfacing;
@@ -368,6 +378,7 @@ impl FlowEngine {
             compact_threshold_chars,
             groups,
             cwd,
+            discovery_env: flux_runtime::metadata::DiscoveryEnv::from_process(),
             ambient_signals: Vec::new(),
             sticky_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
@@ -394,6 +405,20 @@ impl FlowEngine {
     /// sticky-monotonic, so values computed once at startup are enough.
     pub fn with_ambient_signals(mut self, signals: Vec<String>) -> Self {
         self.ambient_signals = signals;
+        self
+    }
+
+    /// Pin the [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) the per-turn surfacing probe
+    /// resolves its home-rooted checks against (C-393), instead of the process's own.
+    ///
+    /// Additive and rarely needed in production — the default is
+    /// [`DiscoveryEnv::from_process`](flux_runtime::metadata::DiscoveryEnv::from_process), which is
+    /// what every real surface wants. Its purpose is a test that supplies a `groups` manifest:
+    /// without it the test's `agent_triggerable`/`kubernetes` signals answer from whatever the
+    /// developer keeps in their own home. Same value-held-env idiom as `load_config_in` (C-332) and
+    /// `router_in` (C-392).
+    pub fn with_discovery_env(mut self, env: flux_runtime::metadata::DiscoveryEnv) -> Self {
+        self.discovery_env = env;
         self
     }
 
@@ -1174,6 +1199,7 @@ impl FlowEngine {
             &self.ambient_signals,
             user_input,
             self.executor.disabled_ops(),
+            &self.discovery_env,
         );
         if let Some(surfaced) = surfaced.as_ref() {
             self.record_active_groups(surfaced, sink);
@@ -1803,6 +1829,12 @@ pub enum LoopSource {
 /// resolved once at executor construction — see `Executor::disabled_ops`) is subtracted last and
 /// unconditionally in both branches: it is purely subtractive and independent of group gating, so
 /// a config-disabled op is never advertised even when its group is force-on or currently active.
+///
+/// `env` is the [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) the per-turn workspace probe
+/// resolves its home-rooted checks against (C-393). It is a required parameter rather than an
+/// internal `from_process()` precisely because the short-circuit above means only a handful of
+/// tests ever reach the probe — the ones that do must state their fixture, and the ones that don't
+/// pay nothing. Production callers thread [`FlowEngine::discovery_env`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn surfaced_op_names(
     reg: &flux_runtime::ToolRegistry,
@@ -1813,6 +1845,7 @@ pub(crate) fn surfaced_op_names(
     ambient: &[String],
     user_input: &str,
     disabled: &std::collections::HashSet<String>,
+    env: &flux_runtime::metadata::DiscoveryEnv,
 ) -> (std::collections::HashSet<String>, Option<SurfacedGroups>) {
     if groups.is_empty() {
         let advertised = reg
@@ -1826,7 +1859,7 @@ pub(crate) fn surfaced_op_names(
             .collect();
         return (advertised, None);
     }
-    let mut signals = flux_runtime::detect_signals(cwd);
+    let mut signals = flux_runtime::detect_signals_in(cwd, env);
     // Session-ambient signals (D-115): host-known facts the workspace walk can't see — e.g. the
     // CLI's "the endpoints store is non-empty", computed once from its startup-loaded registry.
     // They join the probed signals and gate groups identically.
@@ -2222,6 +2255,22 @@ mod tests {
     use serde_json::{json, Value};
 
     static TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    /// The [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) every per-turn surfacing probe in
+    /// this suite resolves against: **no home at all** (C-393).
+    ///
+    /// The probe's `agent_triggerable` signal re-runs command and skill discovery — which includes
+    /// `~/.flux/commands`, `~/.claude/commands` and the three user-global skill roots — and its
+    /// `kubernetes` signal tests `~/.kube/config`. An engine test that reached those through the
+    /// process environment asserted against whatever the developer keeps in their own home, which
+    /// is a verdict about the machine rather than about the fixture.
+    ///
+    /// Only tests with a **non-empty** `groups` manifest reach the probe at all (`surfaced_op_names`
+    /// returns early otherwise), so this is deliberately called at four sites rather than folded
+    /// into a shared engine fixture — there is nothing for the other 37 test fns to pin.
+    fn pinned_env() -> flux_runtime::metadata::DiscoveryEnv {
+        flux_runtime::metadata::DiscoveryEnv::empty()
+    }
 
     /// C-323 — the evidence flush is the seam where a miss becomes *durable*, and this walker used
     /// to visit string leaves only. An all-digit credential is outside every redaction heuristic by
@@ -3546,6 +3595,7 @@ mod tests {
             &[],
             "use slack",
             &std::collections::HashSet::new(),
+            &pinned_env(),
         );
         assert!(first.contains("echo"));
 
@@ -3558,6 +3608,7 @@ mod tests {
             &[],
             "say hello",
             &std::collections::HashSet::new(),
+            &pinned_env(),
         );
         assert!(
             !second.contains("echo"),
@@ -3576,7 +3627,7 @@ mod tests {
         let disabled: std::collections::HashSet<String> =
             ["echo".to_string()].into_iter().collect();
 
-        let (advertised, _) = surfaced_op_names(
+        let (advertised, surfaced) = surfaced_op_names(
             &registry,
             &[],
             &root,
@@ -3585,6 +3636,16 @@ mod tests {
             &[],
             "hi",
             &disabled,
+            // Deliberately NOT pinned: with an empty manifest `surfaced_op_names` returns before it
+            // ever probes, so this test is the short-circuit's own coverage and must keep taking the
+            // path that reads nothing. C-393's census hinges on that guard — 37 of `engine.rs`'s
+            // test fns short-circuit here — so the `None` below pins it: only the early return
+            // yields `None`.
+            &flux_runtime::metadata::DiscoveryEnv::from_process(),
+        );
+        assert!(
+            surfaced.is_none(),
+            "an empty group manifest must return before the workspace probe runs"
         );
         assert!(
             !advertised.contains("echo"),
@@ -3620,6 +3681,7 @@ mod tests {
             &[],
             "hi",
             &disabled,
+            &pinned_env(),
         );
         assert!(
             surfaced.unwrap().active.contains("chat"),
@@ -3886,7 +3948,10 @@ mod tests {
             origin.clone(),
             AgentLoopSpec::default(),
         )
-        .unwrap();
+        .unwrap()
+        // C-393: this engine carries a non-empty manifest, so every `surfaced_for_turn` below runs
+        // the workspace probe — including its home-rooted halves. Pin them to the fixture.
+        .with_discovery_env(pinned_env());
 
         let mut sink = CollectSink::default();
         let before = engine.surfaced_for_turn("session-wt", "hello", &mut sink);
@@ -4279,7 +4344,10 @@ mod tests {
                 }],
             },
         ];
-        let engine = Arc::new(engine);
+        // C-393: a non-empty manifest is what makes `surfaced_op_names` reach the workspace probe,
+        // so this engine's turns would otherwise resolve `agent_triggerable`/`kubernetes` from the
+        // developer's own home.
+        let engine = Arc::new(engine.with_discovery_env(pinned_env()));
         let authority_before = engine.executor.approval_context();
         let first_session = events.create_session("test-model").unwrap();
         let second_session = events.create_session("test-model").unwrap();
@@ -4353,6 +4421,7 @@ mod tests {
             &[],
             "",
             engine.executor.disabled_ops(),
+            &engine.discovery_env,
         );
         let (second_advertised, _) = surfaced_op_names(
             engine.executor.registry(),
@@ -4363,6 +4432,7 @@ mod tests {
             &[],
             "",
             engine.executor.disabled_ops(),
+            &engine.discovery_env,
         );
         assert!(first_advertised.contains("blocking_turn"));
         assert!(!second_advertised.contains("blocking_turn"));

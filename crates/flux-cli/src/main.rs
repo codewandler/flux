@@ -115,6 +115,15 @@ mod tests {
 
     struct CapturingModelProvider(Arc<Mutex<Vec<Request>>>);
 
+    /// The [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) every skill-discovery test below
+    /// resolves against: **no home at all** (C-393). Discovery walks `~/.flux/skills`,
+    /// `~/.agents/skills` and `~/.claude/skills` in addition to the project roots, so the
+    /// process-reading entry points made these verdicts — and the "discovered: …" list in the
+    /// unknown-skill error — a function of the developer's own home.
+    fn pinned_env() -> flux_runtime::metadata::DiscoveryEnv {
+        flux_runtime::metadata::DiscoveryEnv::empty()
+    }
+
     struct IgnoredSpawnActivity;
 
     impl SpawnActivitySink for IgnoredSpawnActivity {
@@ -1543,7 +1552,7 @@ mod tests {
 
         // Config layer beats the well-known default...
         let enabled = vec!["l02-cli-layering".to_string()];
-        let skills = super::load_skills(&root, &cfg, &[], &enabled).unwrap();
+        let skills = super::load_skills_in(&root, &cfg, &[], &enabled, &pinned_env()).unwrap();
         let s = skills
             .iter()
             .find(|s| s.name == "l02-cli-layering")
@@ -1551,7 +1560,14 @@ mod tests {
         assert_eq!(s.body, "from config");
 
         // ...and a CLI --skill-dir beats the config layer.
-        let skills = super::load_skills(&root, &cfg, &[root.join("cli-skills")], &enabled).unwrap();
+        let skills = super::load_skills_in(
+            &root,
+            &cfg,
+            &[root.join("cli-skills")],
+            &enabled,
+            &pinned_env(),
+        )
+        .unwrap();
         let s = skills
             .iter()
             .find(|s| s.name == "l02-cli-layering")
@@ -1625,12 +1641,14 @@ mod tests {
         .unwrap();
         let cfg = flux_config::Config::default();
         assert!(
-            super::load_skills(&root, &cfg, &[], &[])
+            super::load_skills_in(&root, &cfg, &[], &[], &pinned_env())
                 .unwrap()
                 .is_empty(),
             "discovery and prompt triggers must not enable a skill"
         );
-        let enabled = super::load_skills(&root, &cfg, &[], &["automatic".to_string()]).unwrap();
+        let enabled =
+            super::load_skills_in(&root, &cfg, &[], &["automatic".to_string()], &pinned_env())
+                .unwrap();
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].name, "automatic");
         std::fs::remove_dir_all(&root).ok();
@@ -1652,7 +1670,7 @@ mod tests {
         .unwrap();
         let cfg = flux_config::Config::default();
         assert!(
-            super::load_model_invoked_skill_catalog(&root, &cfg, &[], false)
+            super::load_model_invoked_skill_catalog_in(&root, &cfg, &[], false, &pinned_env())
                 .unwrap()
                 .is_empty(),
             "the opt-in is off, so nothing should be discovered"
@@ -1683,7 +1701,9 @@ mod tests {
         )
         .unwrap();
         let cfg = flux_config::Config::default();
-        let catalog = super::load_model_invoked_skill_catalog(&root, &cfg, &[], true).unwrap();
+        let catalog =
+            super::load_model_invoked_skill_catalog_in(&root, &cfg, &[], true, &pinned_env())
+                .unwrap();
         let names: Vec<&str> = catalog.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"pdf-extract"), "got {names:?}");
         assert!(
@@ -1698,17 +1718,20 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("flux-cli-unknown-skill-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let error = super::load_skills(
+        let error = super::load_skills_in(
             &root,
             &flux_config::Config::default(),
             &[],
             &["missing".to_string()],
+            &pinned_env(),
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("unknown skill `missing` (discovered:"),
+        // C-393: with the env pinned, the "discovered" list is exactly the fixture's — which is
+        // empty. Before the seam this could only assert the prefix, because the operator's
+        // `~/.claude/skills` was part of the message.
+        assert_eq!(
+            error.to_string(),
+            "unknown skill `missing` (discovered: none)",
             "{error}"
         );
         std::fs::remove_dir_all(&root).ok();

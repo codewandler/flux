@@ -2074,7 +2074,30 @@ pub fn advertised_op_names(
 /// `project.signal` [`Observation`]s. Cheap enough to run every turn — a handful of `exists()`
 /// checks. The emitted `signal` strings are the contract that group `surface_when` matches against
 /// (see `flux-tools`' `builtin_groups`).
+///
+/// Two of the checks are rooted at the user's home rather than at `cwd`, so this reads the
+/// **process** environment. Tests must call [`detect_signals_in`] with a pinned
+/// [`DiscoveryEnv`](metadata::DiscoveryEnv) instead — see that function for why.
 pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
+    detect_signals_in(cwd, &metadata::DiscoveryEnv::from_process())
+}
+
+/// [`detect_signals`] against an explicit [`DiscoveryEnv`](metadata::DiscoveryEnv) rather than the
+/// process's own (C-393).
+///
+/// Two of the probe's checks are not workspace-relative at all: `agent_triggerable` re-runs command
+/// and skill discovery, which includes the user-global roots (`~/.flux/commands`,
+/// `~/.claude/commands`, `~/.flux/skills`, …), and `kubernetes` tests `~/.kube/config`. Both
+/// therefore answered from whatever the developer happens to keep in their own home, so a test
+/// asserting a signal is *absent* inverted on a machine that has a matching command file or a
+/// kubeconfig — a verdict that is a function of the machine rather than of the fixture, and whose
+/// failure looks exactly like a real regression in whatever diff is in flight.
+///
+/// The same value-held-env idiom as `load_config_in` (C-332), `router_in` (C-392) and
+/// [`DiscoveryEnv`](metadata::DiscoveryEnv) itself (C-297) — not a third injection style. Purely
+/// additive: [`detect_signals`] keeps working and delegates here with
+/// [`DiscoveryEnv::from_process`](metadata::DiscoveryEnv::from_process).
+pub fn detect_signals_in(cwd: &std::path::Path, env: &metadata::DiscoveryEnv) -> Vec<Observation> {
     let mut out = Vec::new();
     let mut push = |sig: &str| {
         out.push(Observation::signal(sig));
@@ -2123,7 +2146,7 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
     }
     // `kubernetes` is ambient (a kubeconfig is reachable), not a workspace-walk marker: it surfaces
     // the `endpoint` discovery group (D-28). True when `KUBECONFIG` is set OR `~/.kube/config` exists.
-    if kubeconfig_present() {
+    if kubeconfig_present(env) {
         push("kubernetes");
     }
     // `browser` is ambient too (a Chromium binary is discoverable): it surfaces the native `browser`
@@ -2139,7 +2162,7 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
     // "accessible" gate can never disagree about what is discoverable. Discovery failures (a
     // symlink escape, an unreadable dir) degrade to "no signal" rather than surfacing the op on an
     // error path.
-    if agent_triggerable_target_present(cwd) {
+    if agent_triggerable_target_present(cwd, env) {
         push("agent_triggerable");
     }
     out
@@ -2147,31 +2170,41 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
 
 /// Whether `cwd`'s discoverable command files or skills include at least one marked
 /// `agent-triggerable: true`. Lenient: any discovery error is treated as "none found".
-fn agent_triggerable_target_present(cwd: &std::path::Path) -> bool {
-    let commands = metadata::discover_commands(cwd)
+///
+/// Takes the same [`DiscoveryEnv`](metadata::DiscoveryEnv) the `command.invoke` op's own
+/// "accessible" gate will use, which is what keeps the invariant `flux-tools`'
+/// `command_invoke` documents true: the signal and the gate can never disagree about what is
+/// discoverable.
+fn agent_triggerable_target_present(cwd: &std::path::Path, env: &metadata::DiscoveryEnv) -> bool {
+    let commands = metadata::discover_commands_in(cwd, env)
         .map(|d| d.commands)
         .unwrap_or_default();
     if commands.iter().any(|c| c.agent_triggerable) {
         return true;
     }
-    metadata::discover_skills(cwd, &[])
+    metadata::discover_skills_in(cwd, &[], env)
+        .map(|d| d.skills)
         .unwrap_or_default()
         .iter()
         .any(|s| s.agent_triggerable)
 }
 
-/// Whether a kubeconfig is reachable: `KUBECONFIG` is set (non-empty) OR `~/.kube/config` exists. This
-/// is ambient (host environment / home dir), independent of `cwd` — kubectl finds its config this way.
-/// Both halves of that check reach the spawned `kubectl`: `KUBECONFIG` and `HOME` are on
-/// `flux_system`'s `SAFE_ENV` allow-list (C-207), so what this probe reads is what the executor
-/// forwards. Adding a signal here that the guarded process path drops would surface ops that
-/// cannot work.
-fn kubeconfig_present() -> bool {
+/// Whether a kubeconfig is reachable: `KUBECONFIG` is set (non-empty) OR `<env home>/.kube/config`
+/// exists. This is ambient (host environment / home dir), independent of `cwd` — kubectl finds its
+/// config this way. Both halves of that check reach the spawned `kubectl`: `KUBECONFIG` and `HOME`
+/// are on `flux_system`'s `SAFE_ENV` allow-list (C-207), so what this probe reads is what the
+/// executor forwards. Adding a signal here that the guarded process path drops would surface ops
+/// that cannot work.
+///
+/// The home half comes from the passed [`DiscoveryEnv`](metadata::DiscoveryEnv) (C-393), so an
+/// empty env is a *complete* fixture for the home-rooted branch: pinning discovery alone would have
+/// left `~/.kube/config` ambient and the `kubernetes` signal still a function of the machine.
+fn kubeconfig_present(env: &metadata::DiscoveryEnv) -> bool {
     if std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty()) {
         return true;
     }
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".kube").join("config"))
+    env.home()
+        .map(|h| h.join(".kube").join("config"))
         .is_some_and(|p| p.exists())
 }
 
@@ -7028,7 +7061,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::create_dir_all(base.join(".git")).unwrap();
         std::fs::write(base.join("go.mod"), "module x\n").unwrap();
-        let sigs = detect_signals(&sub);
+        let sigs = detect_signals_in(&sub, &crate::metadata::DiscoveryEnv::empty());
         let has = |s: &str| {
             sigs.iter()
                 .any(|o| o.data.get("signal").and_then(|v| v.as_str()) == Some(s))
@@ -7044,26 +7077,23 @@ mod tests {
     /// signal off, so `command.invoke`'s owning group stays hidden for ordinary turns.
     #[test]
     fn detect_signals_surfaces_agent_triggerable_only_when_a_target_opts_in() {
-        let _home_guard = crate::metadata::HOME_LOCK.lock().unwrap();
         let base = std::env::temp_dir().join(format!(
             "flux-detect-agent-triggerable-{}",
             std::process::id()
         ));
-        let home = std::env::temp_dir().join(format!(
-            "flux-detect-agent-triggerable-home-{}",
-            std::process::id()
-        ));
         std::fs::create_dir_all(base.join(".flux/commands")).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
             base.join(".flux/commands/human-only.md"),
             "---\ndescription: human only\n---\nbody",
         )
         .unwrap();
 
-        std::env::set_var("HOME", &home);
+        // C-393: an empty `DiscoveryEnv` is the fixture. Before the seam existed this test had to
+        // repoint the *process* `HOME` under a global lock to keep the negative assertion below
+        // honest — which serialized it against every other `HOME`-reading test in the binary and
+        // still left the value visible to every concurrent one.
         let has_signal = |cwd: &std::path::Path| {
-            detect_signals(cwd)
+            detect_signals_in(cwd, &crate::metadata::DiscoveryEnv::empty())
                 .iter()
                 .any(|o| o.data.get("signal").and_then(|v| v.as_str()) == Some("agent_triggerable"))
         };
@@ -7081,7 +7111,51 @@ mod tests {
             has_signal(&base),
             "a discovered agent-triggerable command must surface the signal"
         );
-        std::env::remove_var("HOME");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// C-393, the seam's own pin, in both directions: a *pinned* home's user-global command dir is
+    /// read (so the parameter is really wired to discovery, not decoration), and an **empty** env
+    /// reports the same workspace as signal-free (so no operator's `~/.claude/commands` can invert
+    /// a negative assertion). The process `HOME` is never touched, so this races nothing.
+    #[test]
+    fn detect_signals_in_reads_the_pinned_home_and_never_the_process_home() {
+        let base = std::env::temp_dir().join(format!("flux-c393-cwd-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("flux-c393-home-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(home.join(".claude/commands")).unwrap();
+        // The exact shape C-297 recorded: a user-global command the operator happens to keep,
+        // opted into agent invocation.
+        std::fs::write(
+            home.join(".claude/commands/ghost.md"),
+            "---\ndescription: ghost\nagent-triggerable: true\n---\nboo",
+        )
+        .unwrap();
+
+        let signals = |env: &crate::metadata::DiscoveryEnv| -> Vec<String> {
+            detect_signals_in(&base, env)
+                .iter()
+                .filter_map(|o| o.data.get("signal").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let pinned = signals(&crate::metadata::DiscoveryEnv::empty().with_home(&home));
+        assert!(
+            pinned.contains(&"agent_triggerable".to_string()),
+            "the pinned home's ~/.claude/commands must reach the probe: {pinned:?}"
+        );
+
+        let empty = signals(&crate::metadata::DiscoveryEnv::empty());
+        assert!(
+            !empty.contains(&"agent_triggerable".to_string()),
+            "an empty env has no user-global command roots at all: {empty:?}"
+        );
+
+        // The `~/.kube/config` half of the same parameter is pinned by
+        // `kubeconfig_present_detects_env`, which owns the `KUBECONFIG` variable this probe also
+        // reads; asserting it here too would race that test's set/restore window.
 
         std::fs::remove_dir_all(&base).ok();
         std::fs::remove_dir_all(&home).ok();
@@ -7306,22 +7380,42 @@ mod tests {
 
     #[test]
     fn kubeconfig_present_detects_env() {
-        // `KUBECONFIG` set (non-empty) → kubeconfig is reachable. We can't safely assert the negative
-        // (the host running the test may have ~/.kube/config), so only assert the positive env case.
+        // `KUBECONFIG` set (non-empty) → kubeconfig is reachable. C-393: the negative is now
+        // assertable too — the home half comes from the passed `DiscoveryEnv`, so an empty one
+        // cannot find the host's own `~/.kube/config`. (Before the seam this comment read "we
+        // can't safely assert the negative", which is exactly the cost this story removes: a
+        // weakened assertion is what an ambient read buys.)
         let dir = std::env::temp_dir().join(format!("flux-kube-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("config");
         std::fs::write(&cfg, "apiVersion: v1\n").unwrap();
+        let empty = crate::metadata::DiscoveryEnv::empty();
         let prev = std::env::var_os("KUBECONFIG");
         std::env::set_var("KUBECONFIG", &cfg);
-        assert!(kubeconfig_present());
-        let sigs = detect_signals(&dir);
+        assert!(kubeconfig_present(&empty));
+        let sigs = detect_signals_in(&dir, &empty);
         assert!(sigs
             .iter()
             .any(|o| o.data.get("signal").and_then(|v| v.as_str()) == Some("kubernetes")));
         match prev {
             Some(v) => std::env::set_var("KUBECONFIG", v),
             None => std::env::remove_var("KUBECONFIG"),
+        }
+        // With `KUBECONFIG` back to whatever the operator has: an empty env finds no kubeconfig,
+        // and a pinned home containing one does. This test owns the `KUBECONFIG` variable in this
+        // binary, so the `prev`-restored value is the only ambient input left to guard against.
+        if std::env::var_os("KUBECONFIG").is_none_or(|v| v.is_empty()) {
+            assert!(
+                !kubeconfig_present(&empty),
+                "an empty env has no home to find a kubeconfig under"
+            );
+            let home = dir.join("fixture-home");
+            std::fs::create_dir_all(home.join(".kube")).unwrap();
+            std::fs::write(home.join(".kube/config"), "apiVersion: v1\n").unwrap();
+            assert!(
+                kubeconfig_present(&crate::metadata::DiscoveryEnv::empty().with_home(&home)),
+                "the pinned home's ~/.kube/config must reach the probe"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

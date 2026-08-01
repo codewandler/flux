@@ -1246,7 +1246,7 @@ mod tests {
             cwd: dir.clone(),
             ..AgentSpec::new("mock")
         }
-        .try_with_default_skills()
+        .try_with_default_skills_in(&flux_runtime::metadata::DiscoveryEnv::empty())
         .unwrap();
         let client = ClientBuilder::from_spec(spec)
             .build(provider, &dir)

@@ -251,8 +251,26 @@ impl AgentSpec {
     /// Explicitly enable every skill from the guarded project and trusted user-global default
     /// directories rooted at this spec's `cwd`. Set `cwd` first. Most callers should select named
     /// skills instead of enabling the whole set.
-    pub fn try_with_default_skills(mut self) -> Result<Self> {
-        self.skills = flux_runtime::metadata::discover_skills(&self.cwd, &[])?;
+    ///
+    /// The user-global half is rooted at the **process**'s `HOME`; tests pin it with
+    /// [`Self::try_with_default_skills_in`].
+    pub fn try_with_default_skills(self) -> Result<Self> {
+        let env = flux_runtime::metadata::DiscoveryEnv::from_process();
+        self.try_with_default_skills_in(&env)
+    }
+
+    /// [`Self::try_with_default_skills`] against an explicit
+    /// [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) rather than the process's own (C-393).
+    ///
+    /// Discovery walks `~/.flux/skills`, `~/.agents/skills` and `~/.claude/skills` in addition to
+    /// the project roots, so a test going through the process-reading form asserts against whatever
+    /// the developer keeps in their own home. Same value-held-env idiom as `load_config_in`
+    /// (C-332), `router_in` (C-392) and `DiscoveryEnv` itself (C-297) — purely additive.
+    pub fn try_with_default_skills_in(
+        mut self,
+        env: &flux_runtime::metadata::DiscoveryEnv,
+    ) -> Result<Self> {
+        self.skills = flux_runtime::metadata::discover_skills_in(&self.cwd, &[], env)?.skills;
         Ok(self)
     }
 
@@ -270,11 +288,24 @@ impl AgentSpec {
     /// [`Self::skills`](Self)/[`Self::try_with_default_skills`], which stays the explicit
     /// always-injected activation surface; this only surfaces name+description up front and loads
     /// a body when the model calls `skill.load`.
-    pub fn try_with_model_invoked_skills(mut self) -> Result<Self> {
-        self.model_invoked_skills = flux_runtime::metadata::discover_skills(&self.cwd, &[])?
-            .into_iter()
-            .filter(|skill| !skill.disable_model_invocation)
-            .collect();
+    pub fn try_with_model_invoked_skills(self) -> Result<Self> {
+        let env = flux_runtime::metadata::DiscoveryEnv::from_process();
+        self.try_with_model_invoked_skills_in(&env)
+    }
+
+    /// [`Self::try_with_model_invoked_skills`] against an explicit
+    /// [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) rather than the process's own (C-393)
+    /// — the model-invoked twin of [`Self::try_with_default_skills_in`], and for the same reason.
+    pub fn try_with_model_invoked_skills_in(
+        mut self,
+        env: &flux_runtime::metadata::DiscoveryEnv,
+    ) -> Result<Self> {
+        self.model_invoked_skills =
+            flux_runtime::metadata::discover_skills_in(&self.cwd, &[], env)?
+                .skills
+                .into_iter()
+                .filter(|skill| !skill.disable_model_invocation)
+                .collect();
         Ok(self)
     }
 
@@ -481,7 +512,7 @@ mod tests {
             cwd: root.clone(),
             ..AgentSpec::new("mock")
         }
-        .try_with_model_invoked_skills()
+        .try_with_model_invoked_skills_in(&flux_runtime::metadata::DiscoveryEnv::empty())
         .unwrap();
 
         let names: Vec<&str> = spec
@@ -781,7 +812,7 @@ mod tests {
             cwd: dir.clone(),
             ..AgentSpec::new("mock")
         }
-        .try_with_default_skills()
+        .try_with_default_skills_in(&flux_runtime::metadata::DiscoveryEnv::empty())
         .unwrap();
         let s = spec
             .skills

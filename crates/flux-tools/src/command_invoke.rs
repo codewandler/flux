@@ -5,10 +5,12 @@
 //!    target (`AuthorityRequirement::operation`, checked by `Executor::dispatch` before
 //!    `execute` ever runs — this module does not implement that gate itself).
 //! 2. **accessible** — the named target is discovered in this session: re-running the same
-//!    guarded discovery (`flux_runtime::metadata::discover_commands` /
-//!    `discover_skills`) the engine already used to detect the `agent_triggerable` evidence
-//!    signal (`flux_runtime::detect_signals`), so the two can never disagree about what is
-//!    discoverable.
+//!    guarded discovery (`flux_runtime::metadata::discover_commands_in` /
+//!    `discover_skills_in`) the engine already used to detect the `agent_triggerable` evidence
+//!    signal (`flux_runtime::detect_signals_in`), so the two can never disagree about what is
+//!    discoverable. Both sides resolve their user-global roots from a
+//!    `flux_runtime::metadata::DiscoveryEnv` value rather than the process `HOME` (C-393); the
+//!    gate holds its copy on the registered tool, the signal takes the engine's.
 //! 3. **agent-triggerable** — the discovered target's own frontmatter opts in
 //!    (`agent-triggerable: true`, default `false`); a human-only target is refused even when
 //!    accessible and permitted.
@@ -38,7 +40,9 @@ pub const GROUP: &str = "agent_invoke";
 pub fn try_register_command_invoke(registry: &mut ToolRegistry) -> Result<()> {
     registry.try_register_all_from(
         "flux-tools agent-invocation pack (D-187)",
-        vec![std::sync::Arc::new(CommandInvokeTool) as std::sync::Arc<dyn Tool>],
+        vec![std::sync::Arc::new(CommandInvokeTool {
+            env: flux_runtime::metadata::DiscoveryEnv::from_process(),
+        }) as std::sync::Arc<dyn Tool>],
     )
 }
 
@@ -71,7 +75,18 @@ struct CommandInvokeInput {
     arguments: String,
 }
 
-struct CommandInvokeTool;
+struct CommandInvokeTool {
+    /// The environment the **accessible** gate resolves its user-global discovery roots against
+    /// (C-393).
+    ///
+    /// Registration builds it from the process, so production behaviour is unchanged. It is a
+    /// field rather than a `from_process()` call inside `execute` because the gate must be able to
+    /// agree with the signal: `flux_runtime::detect_signals_in` and `FlowEngine::with_discovery_env`
+    /// let a caller pin the probe that *surfaces* this op, and a gate still reading the process
+    /// `HOME` could then refuse a target the signal had just advertised — exactly the disagreement
+    /// this module's header says can never happen. Tests pin both halves to the same fixture.
+    env: flux_runtime::metadata::DiscoveryEnv,
+}
 
 #[async_trait]
 impl Tool for CommandInvokeTool {
@@ -133,8 +148,8 @@ impl Tool for CommandInvokeTool {
         let system = ctx.system();
         let root = system.workspace().root();
         match args.kind {
-            InvokeKind::Command => invoke_command(root, &args.name, &args.arguments),
-            InvokeKind::Skill => invoke_skill(root, &args.name),
+            InvokeKind::Command => invoke_command(root, &args.name, &args.arguments, &self.env),
+            InvokeKind::Skill => invoke_skill(root, &args.name, &self.env),
         }
     }
 }
@@ -143,8 +158,13 @@ impl Tool for CommandInvokeTool {
 /// [`flux_runtime::detect_signals`] uses, then the **agent-triggerable** gate (3 of 3) on the
 /// match. Unknown name or an untriggerable target both degrade to a clean [`ToolResult::error`],
 /// never a hard `Err` — this is a normal, recoverable refusal, not a system fault.
-fn invoke_command(root: &Path, name: &str, arguments: &str) -> Result<ToolResult> {
-    let discovery = flux_runtime::metadata::discover_commands(root)
+fn invoke_command(
+    root: &Path,
+    name: &str,
+    arguments: &str,
+    env: &flux_runtime::metadata::DiscoveryEnv,
+) -> Result<ToolResult> {
+    let discovery = flux_runtime::metadata::discover_commands_in(root, env)
         .map_err(|e| Error::Other(format!("command.invoke: discover commands: {e}")))?;
     let Some(command) = discovery.commands.iter().find(|c| c.name == name) else {
         return Ok(ToolResult::error(format!(
@@ -162,9 +182,14 @@ fn invoke_command(root: &Path, name: &str, arguments: &str) -> Result<ToolResult
 
 /// Skill counterpart of [`invoke_command`]: same accessible + agent-triggerable gates, returning
 /// the skill body verbatim (no argument substitution — skills don't declare `$ARGUMENTS`).
-fn invoke_skill(root: &Path, name: &str) -> Result<ToolResult> {
-    let skills = flux_runtime::metadata::discover_skills(root, &[])
-        .map_err(|e| Error::Other(format!("command.invoke: discover skills: {e}")))?;
+fn invoke_skill(
+    root: &Path,
+    name: &str,
+    env: &flux_runtime::metadata::DiscoveryEnv,
+) -> Result<ToolResult> {
+    let skills = flux_runtime::metadata::discover_skills_in(root, &[], env)
+        .map_err(|e| Error::Other(format!("command.invoke: discover skills: {e}")))?
+        .skills;
     let Some(skill) = skills.iter().find(|s| s.name == name) else {
         return Ok(ToolResult::error(format!(
             "command.invoke: no skill named `{name}` is discovered in this session"
@@ -244,9 +269,29 @@ mod tests {
         AuthorizationPolicy { grants: Vec::new() }
     }
 
+    /// The [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) this suite's **accessible** gate
+    /// resolves against: **no home at all** (C-393).
+    ///
+    /// The gate walks `~/.flux/commands`, `~/.claude/commands` and the three user-global skill
+    /// roots alongside the fixture's project pair, so through the process-reading form
+    /// `inaccessible_target_is_refused` asserted "no command named `ghost` exists" about the
+    /// developer's home rather than about its own fixture — and inverted outright on a machine
+    /// that happens to keep an agent-triggerable `~/.claude/commands/ghost.md`.
+    fn pinned_env() -> flux_runtime::metadata::DiscoveryEnv {
+        flux_runtime::metadata::DiscoveryEnv::empty()
+    }
+
     fn executor(root: &Path, policy: AuthorizationPolicy) -> Executor {
+        executor_in(root, policy, pinned_env())
+    }
+
+    fn executor_in(
+        root: &Path,
+        policy: AuthorizationPolicy,
+        env: flux_runtime::metadata::DiscoveryEnv,
+    ) -> Executor {
         let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(CommandInvokeTool));
+        registry.register(Arc::new(CommandInvokeTool { env }));
         Executor::new(
             registry,
             PermissionManager::from_rules(&["command.invoke".into()], &[]),
@@ -316,6 +361,49 @@ mod tests {
             result.content
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-393 — the **accessible** gate's own seam pin, in both directions.
+    ///
+    /// A *pinned* home's `~/.claude/commands` really does reach the gate (so the field is wired,
+    /// not decoration), and an empty env sees nothing there. Without the second half the gate stays
+    /// a function of the machine while `detect_signals_in` has already become a function of the
+    /// fixture — and this module's header promises the two can never disagree.
+    #[tokio::test]
+    async fn the_accessible_gate_resolves_the_pinned_home_and_never_the_process_home() {
+        let root = temp_dir("c393-pinned-home");
+        let home = temp_dir("c393-pinned-home-HOME");
+        std::fs::create_dir_all(home.join(".claude/commands")).unwrap();
+        std::fs::write(
+            home.join(".claude/commands/ghost.md"),
+            "---\ndescription: d\nagent-triggerable: true\n---\nhello $1",
+        )
+        .unwrap();
+
+        let params = json!({"kind": "command", "name": "ghost", "arguments": "world"});
+
+        let pinned = executor_in(
+            &root,
+            grant_command_invoke(),
+            flux_runtime::metadata::DiscoveryEnv::empty().with_home(&home),
+        )
+        .dispatch("command.invoke", params.clone())
+        .await;
+        assert!(!pinned.is_error, "{}", pinned.content);
+        assert_eq!(pinned.content, "hello world");
+
+        let empty = executor(&root, grant_command_invoke())
+            .dispatch("command.invoke", params)
+            .await;
+        assert!(empty.is_error, "{}", empty.content);
+        assert!(
+            empty.content.contains("no command named"),
+            "an empty env has no user-global command roots at all: {}",
+            empty.content
+        );
+
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(home).ok();
     }
 
     /// Gate matrix (d): accessible + agent-triggerable, but the policy grants no `command.invoke`
@@ -415,6 +503,12 @@ mod tests {
     /// standing up a full `FlowEngine`, mirroring `spec_group_tag_is_honored_without_a_manifest_tools_list`.
     #[test]
     fn spec_carries_the_agent_invoke_group_tag() {
-        assert_eq!(CommandInvokeTool.spec().group.as_deref(), Some(GROUP));
+        assert_eq!(
+            CommandInvokeTool { env: pinned_env() }
+                .spec()
+                .group
+                .as_deref(),
+            Some(GROUP)
+        );
     }
 }
