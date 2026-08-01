@@ -1935,6 +1935,7 @@ fn host_matches(patterns: &[String], host: &str) -> bool {
     })
 }
 
+pub mod credential_boundary;
 mod loading;
 mod refresh;
 

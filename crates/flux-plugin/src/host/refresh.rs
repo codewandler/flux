@@ -535,6 +535,18 @@ pub(super) fn op_scope_weakenings(
             weakenings.push(format!("no longer declares the secret purpose `{purpose}`"));
         }
     }
+    // C-312 — the platform-sourcing declaration is what installs the credential boundary on this
+    // op's responses, so shedding or downgrading it removes a check the operator's session was
+    // running under. Ranked rather than compared for equality: `Activation` is `Operation` plus one
+    // more check, so tightening is free and only a drop in `strictness` is a weakening. This is the
+    // same class as dropping a `process` narrowing — the declaration is a gate, not a label.
+    if new.platform.strictness() < old.platform.strictness() {
+        weakenings.push(format!(
+            "drops platform sourcing from {:?} to {:?}, removing the credential boundary from its \
+             responses",
+            old.platform, new.platform
+        ));
+    }
     // The per-operation `process` narrowing (C-90) is enforced per call by `OpScopedCaps`, so
     // dropping or broadening it genuinely widens what the op may run — not merely what it discloses.
     if !old.process.is_empty() {

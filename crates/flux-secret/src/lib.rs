@@ -301,18 +301,107 @@ impl Redactor {
     /// 4. [`redact_patterns`] — the token pass: known credential prefixes, plus a value whose own
     ///    assignment name declares it a secret.
     pub fn redact(&self, input: &str) -> String {
-        let mut out = input.to_string();
+        self.scrub(input, &mut None)
+    }
+
+    /// Which class of credential material `input` carries, or `None` if it carries none.
+    ///
+    /// This is [`redact`](Self::redact)'s own verdict, exposed: both run the identical four-pass
+    /// pipeline ([`scrub`](Self::scrub)), and a shape is reported exactly when the pass that
+    /// recognises it changed the text. There is deliberately no second recogniser — a caller that
+    /// **refuses** on credential material and a caller that **hides** it must agree on what counts,
+    /// and the only way to guarantee that is for them to be one implementation. Remove a pass from
+    /// the pipeline and both lose the same shape.
+    ///
+    /// The first matching pass wins, so the return value names *a* shape present, not every one.
+    /// Callers use it for the sentence they report; the security-relevant fact is `Some` vs `None`.
+    ///
+    /// The refusal seam this exists for is C-312's credential boundary on platform-sourced plugin
+    /// operations, where a response carrying credential-shaped material is refused rather than
+    /// merely redacted — redaction hides a leak from the model, refusal says the boundary was
+    /// crossed.
+    pub fn credential_shape(&self, input: &str) -> Option<CredentialShape> {
+        let mut found = None;
+        self.scrub(input, &mut found);
+        found
+    }
+
+    /// The one redaction pipeline, reporting the first pass that recognised something.
+    ///
+    /// Four passes, in this order, because each later one assumes the earlier ones have already
+    /// consumed what they can:
+    ///
+    /// 1. registered values, longest-first;
+    /// 2. [`redact_pem_private_keys`] — the block body between `-----BEGIN … PRIVATE KEY-----` and
+    ///    its `-----END`, which no token rule can see because the body is unprefixed base64;
+    /// 3. [`redact_url_credentials`] — the password in a `scheme://user:password@host` authority,
+    ///    which the tokenizer splits away from anything that identifies it;
+    /// 4. [`redact_patterns`] — the token pass: known credential prefixes, plus a value whose own
+    ///    assignment name declares it a secret.
+    fn scrub(&self, input: &str, found: &mut Option<CredentialShape>) -> String {
+        let mut registered = input.to_string();
         // Longest-first so a value that contains another is replaced whole.
         let mut vals = self.values.lock().unwrap().clone();
         vals.sort_by_key(|v| std::cmp::Reverse(v.len()));
         for v in vals {
             if !v.is_empty() {
-                out = out.replace(&v, REDACTED);
+                registered = registered.replace(&v, REDACTED);
             }
         }
-        let out = redact_pem_private_keys(&out);
-        let out = redact_url_credentials(&out);
-        redact_patterns(&out)
+        if found.is_none() && registered != input {
+            *found = Some(CredentialShape::Registered);
+        }
+        let pem = redact_pem_private_keys(&registered);
+        if found.is_none() && pem != registered {
+            *found = Some(CredentialShape::PrivateKeyBlock);
+        }
+        let urls = redact_url_credentials(&pem);
+        if found.is_none() && urls != pem {
+            *found = Some(CredentialShape::UrlPassword);
+        }
+        let tokens = redact_patterns(&urls);
+        if found.is_none() && tokens != urls {
+            *found = Some(CredentialShape::TokenShape);
+        }
+        tokens
+    }
+}
+
+/// A class of credential material the [`Redactor`] recognises — one variant per pass of its
+/// pipeline, reported by [`Redactor::credential_shape`].
+///
+/// Deliberately coarse. It exists so a refusal can say *what kind of thing* it saw without
+/// quoting the thing, and it is not a taxonomy anyone should branch security decisions on: the
+/// security-relevant distinction is "the redactor recognised something" versus "it did not".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialShape {
+    /// A value registered with this redactor via [`Redactor::try_add_secret`] — on the connectors
+    /// seam, the one secret flux legitimately holds (the deployment session bearer) coming back.
+    Registered,
+    /// A `-----BEGIN … PRIVATE KEY-----` block.
+    PrivateKeyBlock,
+    /// The password in a `scheme://user:password@host` URL authority.
+    UrlPassword,
+    /// A token by its own spelling — a known vendor prefix, or an opaque value in an assignment
+    /// whose name declares it a secret.
+    TokenShape,
+}
+
+impl CredentialShape {
+    /// A short phrase naming the shape, for a refusal message. Never contains the value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CredentialShape::Registered => "a value registered as a secret with this session",
+            CredentialShape::PrivateKeyBlock => "a PEM private-key block",
+            CredentialShape::UrlPassword => "a password in a URL authority",
+            CredentialShape::TokenShape => "credential-shaped token material",
+        }
+    }
+}
+
+impl fmt::Display for CredentialShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -339,7 +428,13 @@ fn has_credential_prefix(body: &str) -> bool {
 /// Substring match on the lower-cased name, so `AWS_SECRET_ACCESS_KEY`, `stripeApiKey` and
 /// `db_password` all land. Bounded in length because the "name" is whatever token happened to
 /// precede the `=`, and a paragraph that happens to contain the word "token" is not a declaration.
-fn names_a_secret(name: &str) -> bool {
+///
+/// **Public because the same rule has to reach structured input** (C-312). [`redact_patterns`]
+/// recovers a name/value pair by tokenizing flat text around `=`; a caller holding a JSON object
+/// or a URL query already *has* the pair, and re-deriving the vocabulary there would be a second
+/// list to drift from this one. Pair it with [`is_opaque_material`] — the naming half alone
+/// over-fires on ordinary config, which is the whole reason the contextual rule has two halves.
+pub fn names_a_secret(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
     }
@@ -359,7 +454,9 @@ fn names_a_secret(name: &str) -> bool {
 ///   URLs, version strings and paths-with-extensions can never qualify.
 /// - **letters and digits together.** A path segment, an English word and a `${TEMPLATE_REF}` all
 ///   fail this; 40 characters of AWS base64 essentially never do.
-fn is_opaque_material(value: &str) -> bool {
+///
+/// Public for the same reason as [`names_a_secret`] — see there.
+pub fn is_opaque_material(value: &str) -> bool {
     const MIN_OPAQUE_LEN: usize = 16;
     value.len() >= MIN_OPAQUE_LEN
         && value
@@ -813,6 +910,102 @@ mod tests {
             Err(Unregistered::TooShort { len: 2 })
         );
         assert!(format!("{}", Unregistered::TooShort { len: 2 }).contains("below the 6-character"));
+    }
+
+    /// C-312 — `credential_shape` is `redact`'s own verdict, not a second recogniser. For every
+    /// input, "a shape was reported" and "the text changed" are the same fact; there is no input
+    /// on which a refusing caller and a hiding caller can disagree.
+    ///
+    /// This is the property that makes the boundary test in `flux-plugin` mean something: delete a
+    /// pass from `scrub` and the refusal loses exactly the shape the redaction lost.
+    #[test]
+    fn a_reported_shape_and_a_changed_text_are_the_same_fact() {
+        let r = Redactor::new();
+        r.try_add_secret("registeredsessionbearer").unwrap();
+        for input in [
+            // Each of the four passes, and then a spread of material that must stay untouched.
+            "bearer registeredsessionbearer here",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+            "postgres://flux:hunter2pass@db.internal:5432/app",
+            concat!("xoxb", "-1234-5678-abcdefghijkl"),
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY",
+            "an ordinary sentence",
+            "TOKEN_PATH=/etc/flux/credentials",
+            "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKa\n-----END CERTIFICATE-----\n",
+            "https://docs.example.com/a/b?c=d",
+            "",
+        ] {
+            assert_eq!(
+                r.credential_shape(input).is_some(),
+                r.redact(input) != input,
+                "detection and redaction disagree on: {input:?}"
+            );
+        }
+    }
+
+    /// The four passes each report their own shape, so a refusal can say what it saw without
+    /// quoting it. Order matters: the first pass that fires wins.
+    #[test]
+    fn each_pass_reports_its_own_shape() {
+        let r = Redactor::new();
+        r.try_add_secret("registeredsessionbearer").unwrap();
+        assert_eq!(
+            r.credential_shape("bearer registeredsessionbearer"),
+            Some(CredentialShape::Registered)
+        );
+        assert_eq!(
+            r.credential_shape(
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\n"
+            ),
+            Some(CredentialShape::PrivateKeyBlock)
+        );
+        assert_eq!(
+            r.credential_shape("postgres://flux:hunter2pass@db.internal:5432/app"),
+            Some(CredentialShape::UrlPassword)
+        );
+        assert_eq!(
+            r.credential_shape(concat!("glpat", "-NotARealGitlabPat00000")),
+            Some(CredentialShape::TokenShape)
+        );
+        assert_eq!(r.credential_shape("nothing to see"), None);
+        // The phrase a refusal prints never contains a value.
+        for shape in [
+            CredentialShape::Registered,
+            CredentialShape::PrivateKeyBlock,
+            CredentialShape::UrlPassword,
+            CredentialShape::TokenShape,
+        ] {
+            assert!(!shape.as_str().is_empty());
+            assert_eq!(shape.to_string(), shape.as_str());
+        }
+    }
+
+    /// C-312 — the two halves of the contextual rule are public so a caller holding *structured*
+    /// input (a JSON object, a URL query) can apply the same vocabulary to a name/value pair it
+    /// already has, instead of maintaining a second list. Pin that they still mean what
+    /// `redact_patterns` uses them for.
+    #[test]
+    fn the_contextual_rules_two_halves_are_reusable_on_their_own() {
+        for name in ["AWS_SECRET_ACCESS_KEY", "db_password", "access_token"] {
+            assert!(names_a_secret(name), "should name a secret: {name}");
+        }
+        for name in ["client_id", "url", "state", ""] {
+            assert!(!names_a_secret(name), "should not name a secret: {name}");
+        }
+        for value in [
+            "wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY",
+            "aB3dEf6hIj9lMn2pQr5t",
+        ] {
+            assert!(is_opaque_material(value), "should be opaque: {value}");
+        }
+        for value in [
+            "hunter2",
+            "/etc/flux/credentials",
+            "https://a.example.com",
+            "3600",
+        ] {
+            assert!(!is_opaque_material(value), "should not be opaque: {value}");
+        }
     }
 
     #[test]

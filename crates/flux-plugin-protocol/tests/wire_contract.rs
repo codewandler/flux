@@ -82,6 +82,7 @@ fn maximal_manifest() -> PluginManifest {
             semantic_effects: vec![flux_spec::FlowEffect::Money],
             internal: true,
             redact_fields: vec!["token".into()],
+            platform: PlatformSourcing::Activation,
         }],
         auth: vec![AuthMethod {
             purpose: "api".into(),

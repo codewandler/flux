@@ -277,6 +277,10 @@ pub struct PluginTool {
     /// The op's declared secret-like field names (GL-031); the op result is passed through
     /// [`redact_secret_fields`] with these before it is stringified into model-visible output.
     redact_fields: Vec<String>,
+    /// Whether this op is fronted by a credential-injecting deployment (C-312), and if so what its
+    /// responses must look like. Non-default installs the credential boundary — see
+    /// [`credential_boundary`](super::credential_boundary).
+    platform: PlatformSourcing,
 }
 
 impl PluginTool {
@@ -300,6 +304,7 @@ impl PluginTool {
             op_process: op.process.clone(),
             staging: op.staging,
             redact_fields: op.redact_fields.clone(),
+            platform: op.platform,
         }
     }
 }
@@ -552,7 +557,7 @@ impl Tool for PluginTool {
         self.staging
     }
 
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let mut host = self.host.lock().await;
         // Enforce the op's `process` narrowing (C-90) on every callback this call issues. The
         // scoped view sits in FRONT of the shared caps, so the manifest-level gate still runs —
@@ -570,6 +575,22 @@ impl Tool for PluginTool {
         };
         match host.call_with_host(&self.operation, params, caps).await {
             Ok(mut v) => {
+                // C-312 — the credential boundary, at INGEST. This runs on the raw response,
+                // before the op's own `redact_fields` masking below and before any
+                // stringification: masking first would let a manifest declare its way past its own
+                // boundary, and checking at display instead of ingest is the C-215 mistake this is
+                // told not to repeat. A no-op unless the manifest declared `platform`.
+                if let Some(refusal) = credential_boundary::refuse_response(
+                    self.platform,
+                    &self.plugin,
+                    &self.operation,
+                    &v,
+                    &ctx.redactor,
+                ) {
+                    // `v` is dropped here: a refused response is discarded whole, never redacted
+                    // and passed on.
+                    return Ok(ToolResult::error(refusal));
+                }
                 // Mask the op's declared secret-like fields (GL-031) before the result is
                 // stringified into model-visible output — a no-op unless the op declared any.
                 redact_secret_fields(&mut v, &self.redact_fields);
@@ -577,7 +598,16 @@ impl Tool for PluginTool {
                     serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
                 ))
             }
-            Err(e) => Ok(ToolResult::error(e.to_string())),
+            // The `err` frame is the same ingest surface as the `result` frame — a plugin that
+            // answers `{"ok": false, "error": "<vendor 401 body>"}` would otherwise put whatever
+            // that body carries straight into a tool result.
+            Err(e) => Ok(ToolResult::error(credential_boundary::scrub_error(
+                self.platform,
+                &self.plugin,
+                &self.operation,
+                e.to_string(),
+                &ctx.redactor,
+            ))),
         }
     }
 }

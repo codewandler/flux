@@ -571,8 +571,19 @@ pub(super) async fn run_plugin_in(
             }
             let result = host.call_with_host(&resolved_op, input, &caps).await;
             let _ = host.shutdown().await;
-            let mut value =
-                result.map_err(|e| anyhow::anyhow!("plugin `{name}` op `{resolved_op}`: {e}"))?;
+            let mut value = result.map_err(|e| {
+                anyhow::anyhow!(
+                    "plugin `{name}` op `{resolved_op}`: {}",
+                    scrub_plugin_error(&manifest, &resolved_op, e.to_string())
+                )
+            })?;
+            // C-312 — the credential boundary, before the value is echoed. This path is an ingest
+            // surface exactly like the projected-tool path: `flux plugin call connectors.…` is how
+            // an operator pokes a connectors deployment by hand, and a raw `println!` of the
+            // response puts whatever it carries into terminal scrollback and shell history.
+            if let Some(refusal) = refuse_platform_response(&value, &manifest, &resolved_op) {
+                bail!("{refusal}");
+            }
             // Mask the op's declared secret-like result fields (GL-031) before echoing — a variable
             // write's response carries the value back and must not leak into scrollback/logs.
             redact_plugin_echo(&mut value, &manifest, &resolved_op);
@@ -1232,6 +1243,49 @@ pub(super) fn redact_plugin_echo(
     {
         flux_plugin::redact_secret_fields(value, fields);
     }
+}
+
+/// C-312 — apply the credential boundary to a `flux plugin call` response, or accept it.
+///
+/// The same check the projected-tool path runs, on the same declaration
+/// ([`OperationSpec::platform`](flux_plugin::OperationSpec)), so the two cannot drift: an op that
+/// is refused when the agent calls it is refused when the operator calls it by hand.
+///
+/// **The redactor here is fresh, and that is a real difference from the session path.** A one-shot
+/// `flux plugin call` has no session to inherit registered secret values from, so the
+/// registered-value pass cannot fire and only shape-based material is caught. That is the weaker
+/// half of the check, not the load-bearing one: on this seam the credential flux must never hold is
+/// the *vendor's*, which flux never sees and therefore could never have registered. The value the
+/// registered pass would add — catching the deployment session bearer echoed back — is genuinely
+/// missing on this path, and is recorded here rather than papered over.
+fn refuse_platform_response(
+    value: &Value,
+    manifest: &flux_plugin::PluginManifest,
+    op: &str,
+) -> Option<String> {
+    let spec = manifest.operations.iter().find(|o| o.name == op)?;
+    flux_plugin::credential_boundary::refuse_response(
+        spec.platform,
+        &manifest.name,
+        op,
+        value,
+        &flux_secret::Redactor::new(),
+    )
+}
+
+/// C-312 — the failure path of the same seam: a platform-sourced op's error message is discarded
+/// when it carries credential material, rather than being printed.
+fn scrub_plugin_error(manifest: &flux_plugin::PluginManifest, op: &str, message: String) -> String {
+    let Some(spec) = manifest.operations.iter().find(|o| o.name == op) else {
+        return message;
+    };
+    flux_plugin::credential_boundary::scrub_error(
+        spec.platform,
+        &manifest.name,
+        op,
+        message,
+        &flux_secret::Redactor::new(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2118,6 +2172,53 @@ pub(super) fn warn_stale_plugins(stale: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C-312: `flux plugin call` is an ingest surface too. The boundary is wired onto the same
+    /// manifest declaration the projected-tool path reads, so an op the agent may not receive a
+    /// credential from is one the operator may not print by hand either.
+    ///
+    /// A vendor token spelling joined at compile time (C-325), well past every length floor.
+    #[test]
+    fn plugin_call_applies_the_credential_boundary_to_a_platform_sourced_response() {
+        let vendor = concat!("xoxb", "-3141592653-2718281828-abcdefghijklmnopqrstuvwx");
+        let manifest = flux_plugin::PluginManifest {
+            name: "connectors".into(),
+            operations: vec![
+                flux_plugin::OperationSpec {
+                    name: "dispatch".into(),
+                    platform: flux_plugin::PlatformSourcing::Operation,
+                    ..Default::default()
+                },
+                flux_plugin::OperationSpec {
+                    name: "whoami".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let leaky = serde_json::json!({ "audit": { "header": format!("Bearer {vendor}") } });
+
+        let refusal = refuse_platform_response(&leaky, &manifest, "dispatch")
+            .expect("a platform-sourced response carrying a credential must be refused");
+        assert!(
+            !refusal.contains(vendor),
+            "the refusal quoted it: {refusal}"
+        );
+        // Scoped to the declaration: a local op of the same plugin is untouched.
+        assert_eq!(refuse_platform_response(&leaky, &manifest, "whoami"), None);
+        // And an ordinary payload of the platform-sourced op still prints.
+        let clean = serde_json::json!({ "ticket": { "id": 4711, "status": "open" } });
+        assert_eq!(
+            refuse_platform_response(&clean, &manifest, "dispatch"),
+            None
+        );
+
+        // The failure path is the same seam.
+        let raw = format!("vendor said: token {vendor} expired");
+        let scrubbed = scrub_plugin_error(&manifest, "dispatch", raw.clone());
+        assert!(!scrubbed.contains(vendor), "{scrubbed}");
+        assert_eq!(scrub_plugin_error(&manifest, "whoami", raw.clone()), raw);
+    }
 
     /// C-310: the operator-facing summary names every op that appeared and every one that was
     /// withdrawn — a count alone would not tell them whether the op they authenticated for is the

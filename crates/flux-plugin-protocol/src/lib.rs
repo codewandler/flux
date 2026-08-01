@@ -209,6 +209,69 @@ pub struct OperationSpec {
     /// nothing secret," matching every existing manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redact_fields: Vec<String>,
+    /// **Who resolves the credential this operation's real work needs** (C-312). Absent (the
+    /// default, and the wire form of every manifest written before this field) means flux does, by
+    /// the ordinary rules: [`Self::secret_purposes`] / the manifest's [`AuthMethod`]s, injected on
+    /// the host's `http.do` path.
+    ///
+    /// A non-default value declares the **connectors seam**: the operation is fronted by a
+    /// deployment that holds the vendor credential, injects it, and calls the vendor itself. flux
+    /// holds exactly one secret on that path — the deployment's own session bearer — and that
+    /// asymmetry is the entire safety argument for the seam. Declaring it here is what installs the
+    /// credential boundary the host enforces on the operation's responses.
+    ///
+    /// The declaration can only ever *add* restrictions, so a plugin self-declaring it cannot
+    /// escalate; and [`validate_manifest_operations`] refuses a manifest that declares it alongside
+    /// `secret_purposes`, because those two say opposite things about who resolves the credential.
+    #[serde(default, skip_serializing_if = "PlatformSourcing::is_none")]
+    pub platform: PlatformSourcing,
+}
+
+/// Whether an operation is fronted by a credential-injecting deployment, and if so what shape its
+/// response must have (C-312).
+///
+/// Per-operation rather than per-manifest deliberately: a connector-platform plugin legitimately
+/// serves *local* operations beside its platform-sourced ones — `whoami`, `providers.list`, the
+/// catalog itself — whose only credential is the deployment session bearer flux does hold and does
+/// resolve. A manifest-wide flag would have to lie about one group or the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformSourcing {
+    /// Not platform-sourced: flux resolves this operation's credentials, as it always has.
+    #[default]
+    None,
+    /// The deployment executes the vendor call and injects the vendor credential. The response is
+    /// treated as out-of-jail input and is **refused** — not merely redacted — if it carries
+    /// credential-shaped material.
+    Operation,
+    /// The deployment's auth-initiation operation. Everything `Operation` requires, plus: the
+    /// response must be **a URL for a human to open** and must never be a token.
+    Activation,
+}
+
+impl PlatformSourcing {
+    /// Whether this is the wire default (used by `skip_serializing_if`, so a manifest that says
+    /// nothing about platform sourcing serializes byte-identically to one written before C-312).
+    pub fn is_none(&self) -> bool {
+        matches!(self, PlatformSourcing::None)
+    }
+
+    /// Whether the credential boundary applies to this operation at all.
+    pub fn is_platform_sourced(&self) -> bool {
+        !self.is_none()
+    }
+
+    /// How much the declaration constrains, as a total order: `Activation` requires everything
+    /// `Operation` does and one check more. A refresh may raise this rank but never lower it
+    /// (`op_scope_weakenings`) — the declaration is a gate, and an op that was gated at load must
+    /// not shed it by answering `manifest` differently the second time.
+    pub fn strictness(&self) -> u8 {
+        match self {
+            PlatformSourcing::None => 0,
+            PlatformSourcing::Operation => 1,
+            PlatformSourcing::Activation => 2,
+        }
+    }
 }
 
 impl OperationSpec {
@@ -303,6 +366,23 @@ pub fn validate_manifest_operations(manifest: &PluginManifest) -> std::result::R
             return Err(format!(
                 "plugin `{}` operations `{previous}` and `{}` both project as `{public_name}`",
                 manifest.name, op.name
+            ));
+        }
+
+        // C-312 — a platform-sourced op says the deployment resolves the vendor credential;
+        // `secret_purposes` asks flux to resolve one for this op. Both cannot be true, and the
+        // combination is not merely redundant: `plugin_tool_spec` turns a non-empty
+        // `secret_purposes` into `AccessKind::Secret` plus a `secret.read` authority requirement,
+        // so accepting it would give a platform-sourced op the authority to be handed a raw
+        // credential — the exact thing the seam exists to make impossible. Refused at load (and,
+        // because a refresh re-runs this function, at every re-grant) rather than ignored, so a
+        // manifest that contradicts itself is an authoring error the operator sees.
+        if op.platform.is_platform_sourced() && !op.secret_purposes.is_empty() {
+            return Err(format!(
+                "plugin `{}` operation `{}` is platform-sourced (`platform` = {:?}) but declares \
+                 secret purposes {:?}: on this seam the deployment resolves the vendor credential, \
+                 so flux must not be asked to — drop `secret_purposes`, or drop `platform`",
+                manifest.name, op.name, op.platform, op.secret_purposes
             ));
         }
 
