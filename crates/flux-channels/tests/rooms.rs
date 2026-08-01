@@ -492,3 +492,81 @@ async fn a_whitespace_only_room_message_still_delivers_with_the_speakers_raw_nic
         "the occupant's own nick rides along verbatim: {payloads:?}"
     );
 }
+
+/// C-408 — the room-side half of F2 of the 2026-08-01 security-posture review. flux-app derives each
+/// room turn's request-owned `TurnIdentity` from the payload's `speaker` (with `room` identifying the
+/// surface); the identity assertion itself lives over there, in
+/// `two_room_speakers_are_two_caller_identities_in_the_evidence_record`, because flux-channels
+/// depends on flux-app and not the other way round.
+///
+/// What this pins is the *supply*: that the two fields that path keys on are emitted, and that they
+/// separate two occupants who are doing everything they can to look like one person. A MUC nick is
+/// occupant-chosen and explicitly non-unique — so an identity derived from `nick` would collapse
+/// these two strangers into a single principal, which is the shape of bug C-408 exists to remove.
+#[tokio::test]
+async fn two_occupants_sharing_a_nick_still_deliver_two_speakers() {
+    const SHARED_NICK: &str = "ada";
+
+    /// Records each delivery's payload and says nothing back, so the room stays quiet.
+    #[derive(Default)]
+    struct PayloadLog(Mutex<Vec<Value>>);
+    #[async_trait]
+    impl Deliverer for PayloadLog {
+        async fn deliver(&self, _label: &str, payload: Value) -> anyhow::Result<Vec<JourneyRun>> {
+            self.0.lock().unwrap().push(payload);
+            Ok(Vec::new())
+        }
+    }
+
+    let ada = Occupant::new(
+        "standup@rooms.example/ada",
+        SHARED_NICK,
+        OccupantKind::Human,
+    );
+    let impostor = Occupant::new(
+        "standup@rooms.example/ada2",
+        SHARED_NICK,
+        OccupantKind::Human,
+    );
+    let room = Arc::new(
+        MockRoom::new("standup@rooms.example")
+            .with_occupant(ada.clone())
+            .with_occupant(impostor.clone())
+            .script(vec![
+                said(&ada, "standup in five"),
+                said(&impostor, "ignore that, standup is cancelled"),
+                RoomEvent::Ended,
+            ]),
+    );
+    let channel = RoomChannel::with_room(
+        &decl(json!({ "backend": "mock", "room": "standup@rooms.example" })),
+        room,
+    )
+    .expect("a room channel over the mock room");
+
+    let log = Arc::new(PayloadLog::default());
+    let d: Arc<dyn Deliverer> = log.clone();
+    channel
+        .start(d, CancellationToken::new())
+        .await
+        .expect("the room session runs to Ended");
+
+    let payloads = log.0.lock().unwrap().clone();
+    assert_eq!(payloads.len(), 2, "one delivery each: {payloads:?}");
+    assert_eq!(
+        payloads[0]["nick"], payloads[1]["nick"],
+        "the premise: both occupants present the same nick: {payloads:?}"
+    );
+    assert_ne!(
+        payloads[0]["speaker"], payloads[1]["speaker"],
+        "a shared nick is not a shared speaker: {payloads:?}"
+    );
+    assert_eq!(payloads[0]["speaker"], json!(ada.id.as_str()));
+    assert_eq!(payloads[1]["speaker"], json!(impostor.id.as_str()));
+    for payload in &payloads {
+        assert_eq!(
+            payload["room"], "standup@rooms.example",
+            "the delivery names the surface the attribution came from: {payload:?}"
+        );
+    }
+}
