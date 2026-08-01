@@ -281,6 +281,9 @@ pub struct PluginTool {
     /// responses must look like. Non-default installs the credential boundary — see
     /// [`credential_boundary`](super::credential_boundary).
     platform: PlatformSourcing,
+    /// Where this op's real work lands when the deployment — not flux — dials (C-311). Disclosed
+    /// at the approval prompt; see [`vendor_disclosure`](super::vendor_disclosure).
+    reaches: VendorReach,
 }
 
 impl PluginTool {
@@ -305,6 +308,7 @@ impl PluginTool {
             staging: op.staging,
             redact_fields: op.redact_fields.clone(),
             platform: op.platform,
+            reaches: op.reaches.clone(),
         }
     }
 }
@@ -436,7 +440,16 @@ impl Tool for PluginTool {
     }
 
     fn permission_subjects(&self, _params: &Value) -> Vec<String> {
-        vec![format!("{}.{}", self.plugin, self.operation)]
+        let mut subjects = vec![format!("{}.{}", self.plugin, self.operation)];
+        // C-311 — the vendor-host disclosure. The per-op approval prompt (plain CLI and TUI alike)
+        // renders exactly this list, so it is the one channel that reaches an operator at the
+        // moment they decide. Present only for a platform-sourced op: where flux dials, the
+        // destination is already bound by `guard_url_scoped` and named by the op's own
+        // `network.fetch` authority, so every existing plugin's subjects are unchanged.
+        if let Some(disclosure) = vendor_disclosure::subject(self.platform, &self.reaches) {
+            subjects.push(disclosure);
+        }
+        subjects
     }
 
     fn semantic_effects(&self) -> Vec<String> {
@@ -488,6 +501,16 @@ impl Tool for PluginTool {
                     .collect()
             };
             requirements.extend(hosts.into_iter().map(AuthorityRequirement::network_fetch));
+        }
+        // C-311 — the same disclosure, on the channel the WHOLE-PLAN prompt reads. That prompt
+        // renders typed requirements and never permission subjects, and an approved plan skips the
+        // per-op gate entirely — so without this a plan-approved batch of platform-sourced ops
+        // would disclose nothing at all. For a declared vendor this is usually a no-op after the
+        // `dedup` below (the manifest's own `http_hosts` must already admit the host, or the
+        // manifest was refused at load); it is here so the op→vendor binding is a property of the
+        // op's contract rather than a coincidence of the manifest-wide grant.
+        if let Some(resource) = vendor_disclosure::network_resource(self.platform, &self.reaches) {
+            requirements.push(AuthorityRequirement::network_fetch(resource));
         }
         requirements.extend(
             self.capabilities

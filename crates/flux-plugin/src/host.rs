@@ -1898,31 +1898,20 @@ fn path_has_traversal(path: &str) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
+/// The runtime egress gate's view of an HTTP host allowlist.
+///
+/// The matcher itself moved to [`flux_plugin_protocol::http_host_allows`] (C-311) so the load-time
+/// re-verification of a per-op `reaches` declaration and this gate cannot disagree about what an
+/// allowlist entry admits — the same "one matcher, two levels" discipline `process_grant_allows`
+/// already follows. This alias keeps the call sites reading as they did.
 fn host_matches(patterns: &[String], host: &str) -> bool {
-    let host = host
-        .trim()
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_ascii_lowercase();
-    patterns.iter().any(|pattern| {
-        let p = pattern
-            .trim()
-            .trim_matches('[')
-            .trim_matches(']')
-            .to_ascii_lowercase();
-        p == "*"
-            || p == host
-            || p.strip_prefix("*.").is_some_and(|suffix| {
-                host.ends_with(suffix)
-                    && host.len() > suffix.len()
-                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-            })
-    })
+    flux_plugin_protocol::http_host_allows(patterns, host)
 }
 
 pub mod credential_boundary;
 mod loading;
 mod refresh;
+pub mod vendor_disclosure;
 
 pub(crate) use loading::invalid_plugin_name;
 pub use loading::*;

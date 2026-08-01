@@ -83,6 +83,7 @@ fn maximal_manifest() -> PluginManifest {
             internal: true,
             redact_fields: vec!["token".into()],
             platform: PlatformSourcing::Activation,
+            reaches: VendorReach::Host("api.fixture.invalid".into()),
         }],
         auth: vec![AuthMethod {
             purpose: "api".into(),

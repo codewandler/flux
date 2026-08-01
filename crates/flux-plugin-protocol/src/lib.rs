@@ -225,6 +225,75 @@ pub struct OperationSpec {
     /// `secret_purposes`, because those two say opposite things about who resolves the credential.
     #[serde(default, skip_serializing_if = "PlatformSourcing::is_none")]
     pub platform: PlatformSourcing,
+    /// **Where this operation's real work lands when flux is not the one dialing** (C-311).
+    ///
+    /// Meaningful only alongside [`Self::platform`]: on the connectors seam the deployment executes
+    /// the vendor call, so flux's own egress guard
+    /// (`flux_system::net::guard_url_scoped`) only ever sees the deployment's base URL. The
+    /// per-vendor egress allowlist therefore stops constraining *which vendor* is reached, and this
+    /// declaration is the compensating control — it is what the operator is shown at the approval
+    /// prompt, so an approval is never given without the material fact.
+    ///
+    /// It is a **declaration, not a proof**: flux cannot observe a socket it does not open.
+    /// [`validate_manifest_operations`] bounds it in the two ways that are checkable at load —
+    /// the value must be a bare host (never a URL), and it must be admitted by the manifest's own
+    /// declared HTTP host allowlist, which the operator already reviewed and the approval prompt
+    /// already renders. A manifest that names a host outside that allowlist is refused.
+    ///
+    /// Absent (the default, and the wire form of every manifest written before this field) is
+    /// [`VendorReach::Undeclared`], which is disclosed *as undeclared* rather than as "reaches
+    /// nothing" — the two are different facts and must not render alike.
+    #[serde(default, skip_serializing_if = "VendorReach::is_undeclared")]
+    pub reaches: VendorReach,
+}
+
+/// What a platform-sourced operation reaches, as its manifest declares it (C-311).
+///
+/// Three states rather than an `Option<String>`, because "the manifest does not say" and "the
+/// deployment serves this itself" are different facts about the same op and an operator must be
+/// able to tell them apart at the approval prompt. Collapsing them is exactly the silence this
+/// story exists to remove.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VendorReach {
+    /// The manifest says nothing about where this operation's real work lands. The wire default,
+    /// and what every manifest written before C-311 deserializes to.
+    #[default]
+    Undeclared,
+    /// The deployment serves this operation itself; no vendor is reached on its behalf. The honest
+    /// declaration for a platform's own bookkeeping ops (`whoami`, `providers.list`).
+    Local,
+    /// The deployment reaches this vendor host on flux's behalf. A bare `host` or `host:port` —
+    /// never a URL; see [`OperationSpec::reaches`].
+    Host(String),
+}
+
+impl VendorReach {
+    /// Whether this is the wire default (used by `skip_serializing_if`, so a manifest that says
+    /// nothing about vendor reach serializes byte-identically to one written before C-311).
+    pub fn is_undeclared(&self) -> bool {
+        matches!(self, VendorReach::Undeclared)
+    }
+
+    /// The declared vendor host, if one was declared.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            VendorReach::Host(host) => Some(host),
+            _ => None,
+        }
+    }
+
+    /// How much the declaration discloses, as a total order: a concrete host discloses more than
+    /// "served locally", which discloses more than silence. A refresh may raise this rank but never
+    /// lower it (`op_scope_weakenings`) — an op that disclosed a vendor at load must not shed the
+    /// disclosure by answering `manifest` differently the second time.
+    pub fn disclosure_rank(&self) -> u8 {
+        match self {
+            VendorReach::Undeclared => 0,
+            VendorReach::Local => 1,
+            VendorReach::Host(_) => 2,
+        }
+    }
 }
 
 /// Whether an operation is fronted by a credential-injecting deployment, and if so what shape its
@@ -384,6 +453,53 @@ pub fn validate_manifest_operations(manifest: &PluginManifest) -> std::result::R
                  so flux must not be asked to — drop `secret_purposes`, or drop `platform`",
                 manifest.name, op.name, op.platform, op.secret_purposes
             ));
+        }
+
+        // C-311 — the vendor-reach disclosure, re-verified rather than trusted as free text.
+        //
+        // Three refusals, in this order, because each later one assumes the earlier ones held:
+        //
+        // 1. a declaration on an op flux itself dials is refused. There, `guard_url_scoped` and the
+        //    op's own `network.fetch` authority already say where the call goes, and a second,
+        //    unverifiable story about the destination beside the enforced one is worse than none;
+        // 2. the value must be a bare host — see [`split_vendor_host`] for why the grammar is the
+        //    redaction control rather than a later renderer;
+        // 3. the host must be admitted by the manifest's OWN declared HTTP host allowlist, using
+        //    the same matcher that gates the plugin's real egress. A per-op field is authored by
+        //    the same untrusted manifest as everything else; bounding it by the manifest-wide
+        //    allowlist means the disclosure can only ever name a host the operator already reviewed
+        //    at install and the approval prompt already renders as `network.fetch`.
+        //
+        // None of the messages quote the rejected value. It is attacker-controlled text on its way
+        // to an operator's terminal, and a diagnostic that echoes it is the channel this check
+        // exists to close.
+        if !op.reaches.is_undeclared() && !op.platform.is_platform_sourced() {
+            return Err(format!(
+                "plugin `{}` operation `{}` declares a vendor reach but is not platform-sourced: \
+                 when flux dials, the destination is already bound by the egress guard and the \
+                 op's own network authority — drop `reaches`, or declare `platform`",
+                manifest.name, op.name
+            ));
+        }
+        if let Some(declared) = op.reaches.host() {
+            let Some((host, _port)) = split_vendor_host(declared) else {
+                return Err(format!(
+                    "plugin `{}` operation `{}` declares a vendor host that is not a bare \
+                     `host`/`host:port` (a URL, userinfo, a path, a wildcard or whitespace are all \
+                     refused). The declared value is not quoted here: it is rendered at an approval \
+                     prompt, so it may not carry anything but a host",
+                    manifest.name, op.name
+                ));
+            };
+            let allowlist = declared_http_hosts(manifest);
+            if !http_host_allows(&allowlist, host) {
+                return Err(format!(
+                    "plugin `{}` operation `{}` declares a vendor host outside this manifest's own \
+                     declared HTTP host allowlist ({allowlist:?}); the disclosure may only name a \
+                     host the manifest already declares it may reach",
+                    manifest.name, op.name
+                ));
+            }
         }
 
         // A per-op `process` narrowing (C-90) must stay inside the manifest-level grant: the
@@ -698,6 +814,99 @@ pub fn process_grant_allows(grants: &[String], argv: &[String]) -> bool {
     })
 }
 
+/// Whether `host` is admitted by any of an HTTP host allowlist's `patterns`.
+///
+/// The grammar the manifest's `http_hosts` / `private_hosts` / endpoint hosts have always used: a
+/// bare `*` admits anything, an exact (case-insensitive) match admits that host, and a `*.suffix`
+/// entry admits any *strict* subdomain of `suffix` (never `suffix` itself). Bracketed IPv6
+/// literals are unwrapped on both sides.
+///
+/// **Public because the same rule has to reach two places** (C-311). It is the runtime egress gate
+/// in `flux-plugin`'s `SystemHostCaps`, and it is also how [`validate_manifest_operations`]
+/// re-verifies a per-operation [`VendorReach::Host`] declaration against the manifest's own
+/// allowlist. Re-deriving the matcher on the validation side would be a second grammar to drift
+/// from the enforced one — the same reason [`process_grant_allows`] lives here rather than beside
+/// its one caller.
+pub fn http_host_allows(patterns: &[String], host: &str) -> bool {
+    let unwrap = |value: &str| {
+        value
+            .trim()
+            .trim_matches('[')
+            .trim_matches(']')
+            .to_ascii_lowercase()
+    };
+    let host = unwrap(host);
+    patterns.iter().any(|pattern| {
+        let p = unwrap(pattern);
+        p == "*"
+            || p == host
+            || p.strip_prefix("*.").is_some_and(|suffix| {
+                host.ends_with(suffix)
+                    && host.len() > suffix.len()
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+            })
+    })
+}
+
+/// Every HTTP host this manifest declares it may reach, from all three places one can be declared:
+/// the `http_hosts` capability, the `private_hosts` capability (which additionally needs an operator
+/// config grant at call time), and each endpoint's own `http_hosts`.
+///
+/// This is the set a [`VendorReach::Host`] declaration is re-verified against (C-311). Private
+/// hosts are in it deliberately: an on-prem vendor reachable only inside the operator's network is
+/// a legitimate destination for a deployment to dial, and leaving it out would force such a
+/// manifest to choose between declaring its reach and disclosing it.
+pub fn declared_http_hosts(manifest: &PluginManifest) -> Vec<String> {
+    let mut hosts = manifest.capabilities.http_hosts.clone();
+    hosts.extend(manifest.capabilities.private_hosts.iter().cloned());
+    for endpoint in &manifest.endpoints {
+        hosts.extend(endpoint.http_hosts.iter().cloned());
+    }
+    hosts
+}
+
+/// Split a declared vendor destination into `(host, port)`, or `None` when it is not a bare host.
+///
+/// The grammar is deliberately narrow, and narrowness *is* the control (C-311): the declared value
+/// is rendered verbatim at an approval prompt, so anything richer than a host is a channel. A URL
+/// cannot be spelled here at all — no scheme (`:` survives only in front of a numeric port), no
+/// `user:password@` authority, no path, query or fragment, no whitespace, no non-ASCII. That is
+/// what makes "a token embedded in a URL by a hostile manifest" structurally unspellable rather
+/// than something a later renderer has to remember to strip.
+///
+/// Labels are the LDH set plus `_` (which real service records use); `*` is **not** admitted — a
+/// disclosure must name a concrete host, even where the allowlist it is checked against may be a
+/// wildcard.
+fn split_vendor_host(value: &str) -> Option<(&str, Option<&str>)> {
+    if value.is_empty() || value.len() > 260 || value != value.trim() {
+        return None;
+    }
+    let (host, port) = match value.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    if let Some(port) = port {
+        if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    if host.is_empty() || host.len() > 253 {
+        return None;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let label_ok = |label: &&str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    };
+    if !labels.iter().all(label_ok) {
+        return None;
+    }
+    Some((host, port))
+}
+
 /// One path scope the host may read on a plugin's behalf via the `fs.read` capability (C-09a).
 /// `path` is a glob: an exact path, or a directory prefix with `/**` (matches the dir itself +
 /// everything under it, incl. nested subdirs) or `/*` (direct children only). `~` expands to
@@ -983,6 +1192,173 @@ mod tests {
         manifest.operations[0].process = vec!["  ".into()];
         let err = validate_manifest_operations(&manifest).unwrap_err();
         assert!(err.contains("blank process constraint"), "{err}");
+    }
+
+    // C-311: the vendor-reach disclosure
+    // -----------------------------------------------------------------
+
+    /// A manifest declaring one vendor op that reaches `reaches`, allowed to talk to `allowlist`.
+    fn disclosing(allowlist: &[&str], reaches: VendorReach) -> PluginManifest {
+        PluginManifest {
+            name: "connectors".into(),
+            capabilities: PluginCapabilities {
+                http: true,
+                http_hosts: allowlist.iter().map(|h| h.to_string()).collect(),
+                ..Default::default()
+            },
+            operations: vec![OperationSpec {
+                name: "zendesk.ticket.create".into(),
+                platform: PlatformSourcing::Operation,
+                reaches,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The wire default is silence, and silence serializes to nothing — a manifest written before
+    /// this field is byte-identical to one that says nothing about vendor reach.
+    #[test]
+    fn an_undeclared_vendor_reach_is_absent_from_the_wire() {
+        let op = OperationSpec {
+            name: "x".into(),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&op).unwrap();
+        assert!(wire.get("reaches").is_none(), "{wire}");
+        assert!(op.reaches.is_undeclared());
+
+        // And it round-trips in both declared shapes.
+        for reach in [VendorReach::Local, VendorReach::Host("a.example".into())] {
+            let op = OperationSpec {
+                reaches: reach.clone(),
+                ..Default::default()
+            };
+            let back: OperationSpec =
+                serde_json::from_value(serde_json::to_value(&op).unwrap()).unwrap();
+            assert_eq!(back.reaches, reach);
+        }
+    }
+
+    /// The re-verification: a per-op declaration may only name a host the manifest itself declares
+    /// it may reach. Without it the field is free text on the individual op, and a plugin could
+    /// disclose a reassuring vendor while its allowlist admitted something else.
+    #[test]
+    fn a_vendor_host_must_be_inside_the_manifests_own_allowlist() {
+        assert!(validate_manifest_operations(&disclosing(
+            &["api.zendesk.com"],
+            VendorReach::Host("api.zendesk.com".into())
+        ))
+        .is_ok());
+        // The allowlist's own wildcard grammar applies — one matcher, not a second one.
+        assert!(validate_manifest_operations(&disclosing(
+            &["*.zendesk.com"],
+            VendorReach::Host("api.zendesk.com".into())
+        ))
+        .is_ok());
+        // A port narrows the disclosure without leaving the allowlisted host.
+        assert!(validate_manifest_operations(&disclosing(
+            &["api.zendesk.com"],
+            VendorReach::Host("api.zendesk.com:8443".into())
+        ))
+        .is_ok());
+
+        let err = validate_manifest_operations(&disclosing(
+            &["api.zendesk.com"],
+            VendorReach::Host("api.attacker.test".into()),
+        ))
+        .unwrap_err();
+        assert!(err.contains("allowlist"), "{err}");
+        // A sibling of an allowlisted host is not the allowlisted host.
+        assert!(validate_manifest_operations(&disclosing(
+            &["*.zendesk.com"],
+            VendorReach::Host("zendesk.com".into())
+        ))
+        .is_err());
+    }
+
+    /// An endpoint's own hosts, and the private-host grant, are declared reach too — a deployment
+    /// whose vendor is on-prem must not have to choose between declaring and disclosing.
+    #[test]
+    fn the_allowlist_spans_every_place_a_host_can_be_declared() {
+        let mut manifest = disclosing(&[], VendorReach::Host("vendor.internal".into()));
+        assert!(validate_manifest_operations(&manifest).is_err());
+
+        manifest.capabilities.private_hosts = vec!["vendor.internal".into()];
+        assert!(validate_manifest_operations(&manifest).is_ok());
+
+        manifest.capabilities.private_hosts.clear();
+        manifest.endpoints = vec![EndpointSpec {
+            name: "vendor".into(),
+            http_hosts: vec!["vendor.internal".into()],
+            ..Default::default()
+        }];
+        assert!(validate_manifest_operations(&manifest).is_ok());
+    }
+
+    /// **The redaction-safety rule, as a grammar.** The declared value is rendered verbatim at an
+    /// approval prompt, so the only defense that cannot be forgotten by a later renderer is one
+    /// that makes a URL unspellable. The refusal must also not quote what it rejected.
+    #[test]
+    fn only_a_bare_host_may_be_declared_and_the_refusal_never_quotes_it() {
+        let token = concat!("xoxb", "-3141592653-2718281828-abcdefghijklmnopqrstuvwx");
+        for bad in [
+            format!("https://svc:{token}@api.zendesk.com/v2?api_token={token}"),
+            format!("api.zendesk.com/v2?api_token={token}"),
+            format!("svc:{token}@api.zendesk.com"),
+            "api.zendesk.com ".to_string(),
+            "api zendesk com".to_string(),
+            "*.zendesk.com".to_string(),
+            "api..zendesk.com".to_string(),
+            "api.zendesk.com:".to_string(),
+            "api.zendesk.com:https".to_string(),
+            String::new(),
+        ] {
+            // `*` in the allowlist so the ONLY thing that can refuse these is the grammar.
+            let err = validate_manifest_operations(&disclosing(&["*"], VendorReach::Host(bad)))
+                .expect_err("a non-host declaration must be refused");
+            assert!(err.contains("bare"), "{err}");
+            assert!(
+                !err.contains(token),
+                "the refusal echoed the smuggled credential: {err}"
+            );
+        }
+    }
+
+    /// The declaration only means something where flux is not the one dialing. Everywhere else the
+    /// egress guard and the op's own network authority already answer the question, and a second
+    /// unverifiable answer beside an enforced one is a decoy.
+    #[test]
+    fn a_vendor_reach_without_platform_sourcing_is_refused() {
+        for reach in [
+            VendorReach::Local,
+            VendorReach::Host("api.zendesk.com".into()),
+        ] {
+            let mut manifest = disclosing(&["api.zendesk.com"], reach);
+            manifest.operations[0].platform = PlatformSourcing::None;
+            let err = validate_manifest_operations(&manifest).unwrap_err();
+            assert!(err.contains("not platform-sourced"), "{err}");
+        }
+        // Silence on an ordinary op is, of course, fine — that is every manifest in existence.
+        let mut manifest = disclosing(&["api.zendesk.com"], VendorReach::Undeclared);
+        manifest.operations[0].platform = PlatformSourcing::None;
+        assert!(validate_manifest_operations(&manifest).is_ok());
+    }
+
+    /// The shared allowlist matcher: the load-time re-verification and the runtime egress gate read
+    /// the same function, so they cannot disagree about what an entry admits.
+    #[test]
+    fn the_http_host_matcher_admits_exactly_what_it_always_did() {
+        let patterns: Vec<String> = ["api.example.com", "*.zendesk.com"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(http_host_allows(&patterns, "API.example.com"));
+        assert!(http_host_allows(&patterns, "api.zendesk.com"));
+        assert!(!http_host_allows(&patterns, "zendesk.com"));
+        assert!(!http_host_allows(&patterns, "evil-api.example.com"));
+        assert!(!http_host_allows(&[], "api.example.com"));
+        assert!(http_host_allows(&["*".to_string()], "anything.at.all"));
     }
 
     // D-54: serve_io malformed-frame handling

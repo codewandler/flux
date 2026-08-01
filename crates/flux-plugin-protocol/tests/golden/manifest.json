@@ -133,6 +133,9 @@
         "kubectl get"
       ],
       "public_name": "fixture.public",
+      "reaches": {
+        "host": "api.fixture.invalid"
+      },
       "redact_fields": [
         "token"
       ],
