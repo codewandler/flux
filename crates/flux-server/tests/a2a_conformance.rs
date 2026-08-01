@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use flux_a2a::AgentProvider;
-use flux_server::{router_multi, CardInfo, ServerAuth, StaticResolver};
+use flux_server::{router_multi_in, CardInfo, ServerAuth, StaticResolver};
 
 use support::{app, post_json, post_raw, test_engine, ProseProvider};
 
@@ -124,11 +124,12 @@ async fn optional_card_metadata_is_emitted_when_set() {
         })
         .with_documentation_url("https://docs.example")
         .with_icon_url("https://icon.example/i.png");
-    let with_meta = flux_server::router(
+    let with_meta = flux_server::router_in(
         engine,
         ServerAuth::Open,
         card_info,
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -199,11 +200,12 @@ async fn await_task_state(app: &Router, task_id: &str, want: &str) -> Value {
 #[tokio::test]
 async fn task_history_is_populated_and_bounded() {
     let engine = test_engine(Arc::new(ProseProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         ServerAuth::Open,
         CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -321,10 +323,11 @@ async fn unsupported_method_on_the_multi_agent_dispatcher() {
     let engine = test_engine(Arc::new(ProseProvider));
     let resolver =
         StaticResolver::new().with_agent("support", engine, CardInfo::for_agent("support", None));
-    let app = router_multi(
+    let app = router_multi_in(
         Arc::new(resolver),
         ServerAuth::Open,
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -372,11 +375,12 @@ async fn unsupported_method_on_the_multi_agent_dispatcher() {
 #[tokio::test]
 async fn non_blocking_send_returns_submitted_then_get_observes_completed() {
     let engine = test_engine(Arc::new(ProseProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         ServerAuth::Open,
         CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -416,11 +420,12 @@ async fn tasks_get_unknown_and_non_a2a_ids_are_not_found() {
     let engine = test_engine(Arc::new(ProseProvider));
     // A real, live session — but a CLI one (no `a2a` tag): unreachable through the task surface.
     let cli_session = engine.events.create_session("m").unwrap();
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         ServerAuth::Open,
         CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -439,11 +444,12 @@ async fn tasks_get_unknown_and_non_a2a_ids_are_not_found() {
 #[tokio::test]
 async fn tasks_cancel_stops_a_live_run_and_rejects_terminal_or_unknown() {
     let engine = test_engine(Arc::new(SlowProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         ServerAuth::Open,
         CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -501,11 +507,12 @@ fn sse_frames(body: &str) -> Vec<Value> {
 #[tokio::test]
 async fn tasks_resubscribe_follows_live_and_replays_terminal() {
     let engine = test_engine(Arc::new(SlowProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         ServerAuth::Open,
         CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -591,11 +598,12 @@ async fn push_notification_config_and_delivery() {
     });
 
     let engine = test_engine(Arc::new(ProseProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         ServerAuth::Open,
         CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
     std::env::remove_var("FLUX_A2A_PUSH_ALLOW_LOCAL");

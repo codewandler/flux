@@ -7,8 +7,9 @@
 //!
 //! The fixture binds a **real** non-loopback socket rather than parsing an address string, so the
 //! address under test is the one an `[a2a]` channel would actually serve on, and then asks
-//! [`flux_server::router`] (the single construction-time enforcement point every serving path
-//! shares, C-190) whether that combination may be built. When the guard is missing the test does not
+//! [`flux_server::router_in`] (the single construction-time enforcement point every serving path
+//! shares, C-190 — `router` reaches it by delegation) whether that combination may be built. When
+//! the guard is missing the test does not
 //! merely assert `is_err()` and stop — it goes on to *demonstrate* the exposure by serving the
 //! router it was handed and driving an anonymous request through it, so the failure message is the
 //! vulnerability report rather than a bare `assertion failed`.
@@ -40,11 +41,14 @@ async fn an_empty_shared_secret_may_not_bind_a_public_address() {
     );
 
     let engine = support::test_engine(Arc::new(support::ProseProvider));
-    let built = flux_server::router(
+    // `router_in` is the same construction-time enforcement point (`router` delegates to it), so
+    // pinning the config env here does not move the guard under test (C-392).
+    let built = flux_server::router_in(
         engine,
         empty_shared_secret(),
         flux_server::CardInfo::flux_coding(),
         addr,
+        &support::pinned_env(),
     );
 
     let router = match built {
@@ -102,11 +106,12 @@ async fn a_real_shared_secret_still_binds_a_public_address() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let engine = support::test_engine(Arc::new(support::ProseProvider));
-    let _router = flux_server::router(
+    let _router = flux_server::router_in(
         engine,
         flux_server::ServerAuth::shared_secret(Some("s3cr3t".into()), None),
         flux_server::CardInfo::flux_coding(),
         addr,
+        &support::pinned_env(),
     )
     .expect("a non-empty shared secret is real authentication; the public bind must still build");
 }

@@ -84,11 +84,12 @@ fn task_id(task: &serde_json::Value) -> String {
 #[tokio::test]
 async fn same_context_id_continues_the_session_with_memory() {
     let engine = support::test_engine(Arc::new(MemoryProbeProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -119,11 +120,12 @@ async fn same_context_id_continues_the_session_with_memory() {
 #[tokio::test]
 async fn different_or_absent_context_ids_stay_isolated() {
     let engine = support::test_engine(Arc::new(MemoryProbeProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 
