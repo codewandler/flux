@@ -15,6 +15,14 @@
 
 ## [Unreleased]
 
+### New
+
+- **A flux agent can join a Brave Talk room.** Declare `backend = "jaas"` on a room channel and the
+  agent acquires its own guest token, joins, and keeps the token fresh across the session — no setup
+  beyond the room you already use. ⚠ This shipped in **0.47.0** and was missed from that release's
+  notes; it is recorded here so it is not lost. Own-tenant mode, where flux signs its own token from
+  a JaaS API key, is not included yet.
+
 ## [0.47.1] - 2026-08-01
 
 ## [0.47.0] - 2026-08-01
