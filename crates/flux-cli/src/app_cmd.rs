@@ -134,9 +134,14 @@ pub(super) async fn assemble_integrations(
     merge_static_endpoints(&endpoint_registry, cfg);
     assembly.ambient_signals = session_ambient_signals(&endpoint_registry);
 
-    let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
-        plugin_registry.clone(),
-    ));
+    // The session redactor, not a fresh one (C-403): the broker's `endpoint.discover` fan-out is a
+    // credential-boundary ingest surface, and the registered-value pass — the only thing that can
+    // recognise a connector deployment's own session bearer echoed back — needs the store the
+    // session's `RedactorSecretSink` writes into.
+    let invoker = Arc::new(
+        flux_capabilities::HostProviderInvoker::new(plugin_registry.clone())
+            .with_redactor(redactor.clone()),
+    );
     let static_resolver = Arc::new(flux_capabilities::StaticResolver::new(
         system.clone(),
         endpoint_registry.config_bindings(),

@@ -72,9 +72,38 @@
 //!   defeats shape matching. The seam's answer to a hostile deployment is not this check — it is
 //!   that the operator started the deployment and holds its credentials; see
 //!   `../flux-connectors/docs/designs/connectors-app.md` on the carve-out.
-//! - The check runs on the projected-tool path and on `flux plugin call`. A **host-dispatched**
-//!   `internal: true` op is out of scope: it is never advertised to the model, and its result goes
-//!   to host code, not to a log or a transcript.
+//! # Where the check runs — every call site, named (C-403)
+//!
+//! Four places in the tree call `PluginHost::call_with_host`. The scope statement lists all four,
+//! because C-312's original wording ("the projected-tool path and `flux plugin call`") described
+//! less than the tree contained, and its one carve-out did not cover the site it left out.
+//!
+//! | Call site | Boundary |
+//! |---|---|
+//! | `host/loading.rs` — the projected-tool path | **runs** |
+//! | `flux-cli`'s `plugin_cmd.rs` — `flux plugin call` | **runs** (fresh redactor; see there) |
+//! | `flux-capabilities`' `broker.rs` — `endpoint.discover` fan-out | **runs** (C-403) |
+//! | `flux-capabilities`' `broker.rs` — `secret.read` | **exempt, by purpose** |
+//!
+//! **`secret.read` is exempt because its purpose is the thing this boundary refuses.** It is how a
+//! discovered endpoint's `credential_ref` becomes a usable value, so a credential-shaped response
+//! is its success case: checking it would fire on success and pass on failure. What bounds it is
+//! the value's *disposition*, not its shape — deny-by-default operator grants plus first-use
+//! approval on `EndpointBroker::resolve_credential_for`, audit by location only, and a result that
+//! reaches host code and the redactor but never a tool result, a transcript, or the endpoint
+//! registry. The reasoning is repeated at that call site, which is where a reader is tempted to
+//! "fix" the asymmetry.
+//!
+//! **The `internal: true` carve-out, re-checked against the ops that exist.** C-312 excused a
+//! host-dispatched `internal: true` op on the grounds that it is never advertised to the model and
+//! its result goes to host code. That carve-out is currently **load-bearing for nothing**: the only
+//! `internal: true` op anywhere in the tree is `plugin.validate`, which `host-kit`'s builder
+//! auto-injects into every plugin manifest and which answers `{operation, valid, problems}`. No
+//! shipped plugin declares one of its own. `internal_op` is public, so a plugin *could* — the
+//! credential-returning `aws-bedrock.auth` shape `host-kit`'s docs describe is a design sketch, not
+//! a plugin in this repository. Stated as a fact about today's tree rather than as a standing
+//! excuse: if a plugin ever ships a platform-sourced `internal: true` op, this carve-out is the
+//! first thing to re-derive rather than to inherit.
 
 use super::*;
 use flux_secret::{is_opaque_material, names_a_secret, Redactor};
