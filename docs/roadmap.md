@@ -151,6 +151,47 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### The SIP channel — flux answers the phone, and places calls (epic) — 🔄 **PROPOSED (D-225…D-229 filed; D-225 BLOCKED upstream)**
+
+A phone call is the oldest and widest channel there is: an inbound number flux answers, and an outbound
+one it uses to call a person when something needs saying. [`codewandler/sipx`](../../sipx) is the stack
+— a Rust SIP/VoIP **user agent**: place and answer, register, hold, transfer, session timers; G.711 and
+DTMF, Opus behind a feature; TLS/WSS; SRTP with SDES. And flux was built partway toward it already:
+`flux-audio`'s own doc names the target — *"telephony's 8 kHz, WebRTC's 48 kHz… versus whatever a model
+speaks natively"* — with PCM16 both endiannesses, a phase-carrying streaming `Resampler` and a `Framer`.
+G.711 is 8 kHz.
+
+⚠ **The architecture is decided by a precedent this repo already set.** sipx **cannot** be linked in.
+D-205 rejected `tokio-xmpp` because *"it opens its own TCP socket and resolves its own DNS, so its
+egress cannot be routed through `guard_url_scoped`"* — and sipx is that class at larger scale
+(`sipx-transport`/`sipx-rtp`/`sipx-media` exist to own sockets; SIP resolves NAPTR→SRV→A; RTP binds
+UDP per call). So flux drives sipx as a **separate process** — the same shape D-208 chose for room
+media. Conveniently, sipx already designed that seam: `sipx-app-protocol` is the `sipx.app.v1` contract
+with a **sans-IO** interpreter, and `sipx-app` is a host meant to be driven by customer code.
+⚠ **But none of its three transports exist yet** (`A-2`/`A-4`/`A-5` — *"the host runs no app callback
+yet"*), so [D-225](stories/D-225-the-sip-sidecar-seam.md) is **blocked upstream**, and the wire *"may
+change incompatibly … in a patch release"*.
+
+**The semantics are not blocked, and they are the part most likely to be rushed later.**
+[D-226](stories/D-226-inbound-a-caller-is-untrusted.md): a SIP `From` header is **trivially forged**, so
+an inbound caller is `Untrusted` without exception — the clearest instance of what C-416 asks every
+adapter to declare, reusing C-408's single constructor.
+[D-227](stories/D-227-outbound-a-call-is-an-effect-that-costs-money.md): dialling **bills money and
+rings a human**, so it is approval-gated with a **default-deny destination allowlist** — the telephone
+analogue of the egress guard, since a model that picks the number is a premium-rate toll-fraud vector,
+and ⚠ normalization must be *inside* the check or the allowlist is a bypass.
+[D-229](stories/D-229-what-redaction-cannot-reach.md): the `Redactor` works on **text**, and a spoken
+secret in audio is redactable by nothing flux has — while **DTMF is how people type PINs and card
+numbers**, and sipx supports DTMF.
+[D-228](stories/D-228-one-voice-turn-machinery.md) insists rooms and SIP share one voice path:
+D-209/D-210 are building it now, `crates/flux-flow/src/voice/` already holds driver/sink/speaker/
+transcript, and a call is a room with one participant and a worse codec.
+
+⚠ **One cross-repo decision to make deliberately**: sipx stabilizes `sipx.app.v1` once *"two dissimilar
+applications have run against it — an inbound IVR and an outbound notifier."* This epic is asking for
+exactly inbound and outbound — **flux can be both**, which turns an awkward coupling into influence over
+the contract while it is still shapeable. Design: [sip-channel.md](designs/sip-channel.md).
+
 ### Watch the agent think — the loop as a live thread, expandable down to the graph (epic) — 🔄 **PROPOSED (A-137…A-139 filed, none started)**
 
 flux's claim is that **the LLM is not the runtime** — and architecture is invisible, so everywhere else
