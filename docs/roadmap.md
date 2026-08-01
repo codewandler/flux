@@ -151,6 +151,48 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### flux recipes — real programs that make the difference click (epic) — 🔄 **PROPOSED (C-425…C-429 filed, none started)**
+
+Someone evaluating flux sees a feature list and a folder of examples, and has no way to tell it is a
+*different kind of thing*. The vision states the thesis — **the LLM is not the runtime** — but a thesis
+is not a demonstration. This epic builds the demonstrations: real programs doing real work, each making
+one guarantee visible enough that a reader can check it rather than believe it.
+
+⚠ **The corpus we have is language samples, not recipes, and the gap is measured.** A keyword sweep of
+the 16 files in `examples/` (2026-08-01) found **zero** examples using `agent_loop`, `await`,
+`datasource`, `agent`, `checkpoint`, `memo`, `throttle`, `debounce`, `risk`, `try`/`catch`/`finally`,
+`race` or `match`; `journey`, `trigger` and `channel` appear once each, all in `channels-app.flux`.
+The durability and resilience vocabulary — the part that separates flux from a chat loop, and the part
+you cannot appreciate from a grammar table — is almost entirely undemonstrated. A durable journey that
+suspends on an event and resumes days later with no model re-spend needs a program that does it.
+[C-428](stories/C-428-the-example-coverage-census.md) turns that into a repeatable census (and must
+confirm the figures against the grammar rather than a grep — C-406's audit regex produced 319 phantom
+findings, and this table is a lead, not evidence).
+
+**The flagship is the tracking framework itself** ([C-425](stories/C-425-the-flagship-recipe-tracking-as-a-flux-app.md)).
+`track` keeps exactly one deterministic component and puts every other invariant in markdown a model is
+asked to honour — and we have first-person evidence of the drift rather than a hypothesis: C-406 found
+epics carrying open work with no tracker, a story citing a `C-330` that was never filed, 185 stale
+`priority` fields, and nine priority values shared by two or more `ready` stories so the rank does not
+rank. Rebuilt as a flux app the split is the thesis made concrete — **the runtime owns the mechanical
+half** (frontmatter validation, board regeneration, the epic audit, CHANGELOG sync) as authored flow
+with declared bounds, **the model owns the semantic half** (writing the story, judging a duplicate).
+Then [C-426](stories/C-426-the-determinism-proof.md) makes the claim checkable: run it twice, replay it
+offline, diff it — separate from the flagship because an unverified determinism claim on a page arguing
+*for* determinism is the worst available failure, and folded in it becomes a README sentence nobody
+runs. ⚠ It must state which layer the claim covers: model-authored stages are not deterministic, the
+*shape* of the run is.
+
+[C-427](stories/C-427-the-recipe-contract.md) generalizes the contract **from** the flagship rather than
+before it (a contract written with no recipe in hand is a guess), preserving the property that makes the
+current corpus honest — `examples_validate.rs` sweeps the whole directory with no hand-picked list, and
+a list is how a corpus rots. [C-429](stories/C-429-the-recipes-surface-and-positioning.md) is the page
+the ask is really about, filed last because it is worthless without recipes underneath it. ⚠ **It names
+no competitor** — claims about another system's internals cannot be verified from here, age into
+misrepresentations, and are *weaker* than a command the reader can run. Every claim on it must be backed
+by such a command; one unbacked claim discredits the true ones. Design:
+[flux-recipes.md](designs/flux-recipes.md).
+
 ### Session screencast — render a recorded run as a terminal cast (epic) — 🔄 **PROPOSED (C-421…C-424 filed, none started)**
 
 Demos, docs and blog posts need to *show* flux working, and today the only way is to point a screen

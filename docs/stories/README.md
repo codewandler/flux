@@ -119,6 +119,11 @@ _Flux has one honest execution model and one `DraftAst`, but different moments w
 - [L-98 — Flux Tape — a flat path-addressed transport notation](L-98-flux-tape-notation.md) · Language · Every line locates its AST node; indentation is cosmetic and malformed path structure fails closed
 - [L-99 — S-Flux — a self-delimiting Lisp projection of DraftAst](L-99-s-flux-notation.md) · Language · Data-only S-expressions with named fields and `(ast {...})` escape — no macros, eval, or embedded Lisp runtime
 
+### flux recipes — real programs that make the difference click
+_Someone evaluating flux against any other agent sees a feature list and a folder of examples, and has_
+- [C-425 — The flagship recipe — the tracking framework as a flux app, where the runtime holds the invariants a prompt cannot](C-425-the-flagship-recipe-tracking-as-a-flux-app.md) · Core · the epic's headline. `track` (codewandler/agentplugins) keeps its invariants in markdown a model is asked to honour, and we have first-person evidence of the drift — C-406 found epics with no tracker, a dangling C-330, 185 stale priorities, nine colliding ranks. Rebuilt in flux the mechanical half becomes authored flow. ⚠ It is a RECIPE, not a product
+- [C-428 — Half the language has no example — `agent_loop`, `await`, `datasource` and eleven more appear in zero files](C-428-the-example-coverage-census.md) · Core · measured 2026-08-01 across the 16 files in examples/: agent_loop 0, await 0, datasource 0, agent 0, checkpoint 0, memo 0, throttle 0, debounce 0, risk 0, try/catch/finally 0, race 0, match 0. journey/trigger/channel appear once each — all in channels-app.flux. ⚠ The durability vocabulary is what separates flux from a chat loop, and it is undemonstrated
+
 ### Flux syntax simplification — one way to write each thing
 - [L-102 — Flux syntax simplification — one way to write each thing (epic)](L-102-flux-syntax-simplification-epic.md) · Language · EPIC — simplify by subtraction: canonical dialect everywhere, a migration tool, then delete the legacy grammar; supersedes L-98/L-99's direction
 - [L-125 — The layout pass re-indents a trailing module-level comment into the last flow's body — on input with no legacy spelling at all](L-125-the-layout-pass-reindents-a-trailing-module-comment.md) · Language · found by L-103 and recorded-not-fixed there. Pre-existing in `format_cst`'s layout pass, so the LSP does it on every save today; `fluxlang fmt` is merely the first thing to apply it to files on disk. It gates L-104, which gates L-106 — the canonicalize quick-fix
@@ -264,6 +269,12 @@ _The hosted connectors platform needs ordinary customer storage and credential s
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
+
+### flux recipes — real programs that make the difference click
+_Someone evaluating flux against any other agent sees a feature list and a folder of examples, and has_
+- [C-426 — Make the determinism claim checkable — the reader runs it, rather than believing it](C-426-the-determinism-proof.md) · Core · BLOCKED on C-425. Deliberately not folded into the flagship: an unverified determinism claim on a page arguing FOR determinism is the worst available failure, and folded in it becomes a README sentence nobody runs. ⚠ Must state precisely which layer the claim covers — model-authored stages are not deterministic, the shape of the run is
+- [C-427 — What makes a recipe a recipe — the contract, and where recipes live](C-427-the-recipe-contract.md) · Core · generalized FROM the flagship, not before it — a recipe contract written with no recipe in hand is speculation. Key property to preserve: examples_validate.rs sweeps the whole directory with no hand-picked list, so a recipe is gated the day it lands
+- [C-429 — The recipes page — argue from the architecture, name no competitor, back every claim with a command](C-429-the-recipes-surface-and-positioning.md) · Core · the artifact the ask is really about, filed LAST because it is worthless without recipes underneath it. ⚠ Compares against the pattern — the transcript as the runtime contract — not against a named product: claims about a competitor's internals cannot be verified from here, age into misrepresentations, and are weaker than a command the reader can run
 
 ### Flux syntax simplification — one way to write each thing
 - [L-104 — Migrate the corpus to the canonical dialect](L-104-canonical-corpus-migration.md) · Language · P2+P3 — agent-loop.flux, examples/*.flux, doc snippets, skill examples; plus the hand-fixes a formatter can't do (fmt(\"\") noise, fmt-pre-binds)
