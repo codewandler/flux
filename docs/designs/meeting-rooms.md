@@ -346,6 +346,108 @@ it is the precondition for the address rule below. The one exception is `Ended` 
 lifecycle terminator, which no participant causes; `RoomEvent::occupant()` returns `None` only there,
 and a consumer that requires `Some` for everything else is holding the port to its contract.
 
+## The media seam — `MediaPeer` and `flux.room-media.v1` (D-208, landed)
+
+Media is a **second port beside `Room`**, not more variants on `RoomEvent`. flux is in the room twice when
+media is on — natively for text and presence, through a browser sidecar for media — and the two halves
+share an address and nothing else. That is what keeps `RoomEvent` browser-free and keeps invariant 6 true
+by construction rather than by discipline: a text consumer's `match` never grows a media-shaped arm it
+cannot see.
+
+Behind the `room-media` cargo feature (off by default, **no new crate dependency** — the ~200 MB weight it
+keeps out of a text-only room is a *runtime* one, a browser on the host) plus an explicit `media { … }`
+block in the channel declaration. Declaring `media` on a flux built without the feature is a **load
+error** naming the feature, never a silent no-op: the way this breaks in the field is an operator watching
+text work and concluding media works too.
+
+```rust
+#[async_trait]
+pub trait MediaPeer: Send + Sync {
+    async fn join(&self, room: &RoomId, identity: &RoomIdentity) -> Result<MediaStream>;
+    async fn publish_audio(&self, audio: &AudioChunk) -> Result<()>;
+    async fn publish_video(&self, video: &VideoFrame) -> Result<()>;
+    async fn mute(&self, muted: bool) -> Result<()>;
+    async fn level(&self) -> Result<Level>;                 // the probe invariant 8 rests on
+    async fn leave(&self) -> Result<()>;
+    async fn verify_audible(&self, floor: f32) -> Result<Level>;  // default: silence is a failure
+}
+```
+
+The wire is one JSON object per line, over the sidecar's stdin/stdout, in both directions:
+
+```text
+flux → sidecar   {"id":1,"cmd":"join","room":"standup@conference.example.org","nick":"flux","kind":"agent"}
+                 {"id":2,"cmd":"publish_audio","audio":{"pcm16_le":"<b64>","sample_rate_hz":48000,"channels":1}}
+                 {"id":3,"cmd":"publish_video","video":{"rgba":"<b64>","width":1280,"height":720}}
+                 {"id":4,"cmd":"mute","muted":true}    {"id":5,"cmd":"level"}    {"id":6,"cmd":"leave"}
+
+sidecar → flux   {"ready":"flux.room-media.v1","owns_device_routing":true}
+                 {"id":1,"ok":true}   {"id":5,"ok":true,"level":{"rms":0.12,"peak":0.31}}
+                 {"id":2,"ok":false,"error":"no published audio track"}
+                 {"event":"audio_frame","from":"…/timo","audio":{…}}
+                 {"event":"speech_started","from":"…/timo"}
+                 {"event":"participant","occupant":"…/timo","nick":"timo","kind":"human","present":true}
+```
+
+Four decisions in it are load-bearing, and each one is a measured finding rather than a preference:
+
+- **The protocol names no capture device, sink, source or audio server.** The recipe that works is
+  Linux-specific, so it lives *inside* the sidecar and the port stays portable. Pinned on the rendered
+  wire, not in prose: `rooms/media/protocol.rs::the_protocol_never_names_a_capture_device`.
+- **What crosses the seam instead is a claim.** `owns_device_routing` in the handshake, **defaulting to
+  `false`**. flux refuses to publish audio through a sidecar that has not taken ownership — because both
+  ways of *not* owning it (Chrome 150 ignoring `--use-fake-device-for-media-capture`, `setAudioInputDevice`
+  not sticking) fail by reporting success.
+- **Publication is checked with a level probe, never a mute-state read** (invariant 8, below).
+- **Stdout noise is skipped and counted, never fatal.** A browser harness prints. Ending a live call over
+  a stray log line is the worse failure; only a line that *claims* to be protocol and is malformed is
+  surfaced, and even that only counts.
+
+**Backpressure.** Inbound audio arrives ~50×/s and never stops. `MediaStream` is bounded and sheds *audio*
+past capacity rather than growing, keeping `MEDIA_CONTROL_RESERVE` (32) slots back so `speech_started` and
+`participant` are never shed — a barge-in that arrives late is a bot talking over a person. Blocking
+instead would push backpressure onto the sidecar's pipe and stall the *outbound* half of the same
+protocol, so a flux that is slow at hearing would stop being able to speak.
+
+**Failure posture.** Every media failure is an **operation** failure. A sidecar that would not start, died,
+or wedged fails the `MediaPeer` call and nothing else: the room stays joined, text and presence keep
+flowing, and `RoomChannel::start` still returns `Ok` — which matters because `flux_channels::serve` ends
+the whole process on a channel `Err`. There is deliberately **no reconnect**: rejoining a live call is a
+decision with a room full of people in it, and it belongs to the session owner, not to a transport.
+
+### Sidecar preflight — the runbook (Linux/PipeWire)
+
+The sidecar is an out-of-tree program; flux only speaks to it. This is what the 2026-07-30 spike had to do
+to get audio a human could hear, and it is the checklist to run **before** a call rather than during one.
+
+1. **Give the agent its own capture device, and only its own.**
+   ```bash
+   pactl load-module module-null-sink sink_name=fluxagent \
+       sink_properties=device.description=fluxagent
+   pactl load-module module-remap-source source_name=fluxagent_mic \
+       master=fluxagent.monitor source_properties=device.description=fluxagent_mic
+   ```
+2. **Move only our own capture stream onto it, per-stream.** Find the browser's source-output id and
+   `pactl move-source-output <id> fluxagent_mic`. **Never** change the default source — the human in the
+   same call is using it, and that property is what makes this safe on a machine someone is working on.
+3. **Do not rely on Chrome's fake-device flags.** `--use-fake-device-for-media-capture` and
+   `--use-file-for-fake-audio-capture` are ignored on Chrome 150; the probe reads peak `0.0004`.
+4. **Do not rely on `setAudioInputDevice`.** It reported the right label and `getCurrentDevices()` kept
+   saying `Default`.
+5. **Announce ownership.** The handshake must say `"owns_device_routing":true`, or flux will refuse to
+   publish audio at all. Say it because it is true, not to get past the check.
+6. **Probe before you trust it.** Answer `{"cmd":"level"}` with a real in-page RMS measurement of the
+   *published* track. Audible measured ≈`0.12`; silence measured `0.0004`; the floor is `0.01`.
+7. **Expect a cleared environment.** flux spawns the sidecar argv-only, cwd-pinned, with the environment
+   cleared to a minimal allow-list — `DISPLAY`, `XDG_RUNTIME_DIR`, `PULSE_SERVER` and friends **do not**
+   reach it. `HOME`, `USER`, `PATH`, `TMPDIR` do. Pass anything else in argv, which flux never interprets:
+   `media { sidecar ["flux-room-media", "--audio-server", "unix:/run/user/1000/pulse/native"] }`.
+8. **Mind the sandbox.** flux confines subprocesses through bubblewrap when a backend is available, and
+   Chrome's own content sandbox needs a nested user namespace inside it (the reason `spawn_debug_pipe` is
+   the browser exemption for tier-3 browsing). A room-media sidecar spawned `Sandboxed` may need
+   `FLUX_SANDBOX=off` for the flux process, or its own `--no-sandbox` posture, and **that trade-off has
+   not been exercised against a live call yet.**
+
 ## Multi-party is the design problem; the plumbing is the easy half
 
 - **Addressing.** The agent hears everything and is the addressee of almost none of it. It must respond
@@ -413,7 +515,13 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
    browser, no vendor SDK and no network; the media sidecar is feature-gated and skipped. The two
    RFC 7395 traps are regressed on the raw bytes:
    `every_stanza_the_xmpp_backend_emits_is_jabber_client_qualified` and
-   `the_xmpp_keepalive_is_a_ping_iq_and_never_whitespace`.
+   `the_xmpp_keepalive_is_a_ping_iq_and_never_whitespace`. **Still met after D-208**, and now with a
+   second guard: the media sidecar is behind an off-by-default cargo feature, so `cargo test --workspace`
+   compiles none of it, and `crates/flux-channels/tests/rooms.rs::room_text_works_without_media_sidecar`
+   asserts both halves — the full text+presence path runs with no browser and nothing spawned, *and* a
+   `media` block declared on a build without the feature is refused by name rather than dropped on the
+   floor. `scripts/check-feature-gated-tests.sh` is what stops the feature's own suite from rotting
+   unexercised.
 7. **Token refresh is transparent.** ✅ **Met (D-206), and the double it rests on now models the case
    that would have made it false.** `crates/flux-channels/tests/jaas_room.rs::jaas_session_survives_token_expiry`
    drives a 3-second TTL against a fake token service and the in-process XMPP double, asserting the
@@ -427,7 +535,18 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
    it cannot rot back into a permissive one.
 8. **Published media carries signal.** A published track whose source is silence is reported as a failure,
    not as success — asserted with a level probe, because the spike watched the bridge elect a silent bot
-   dominant speaker.
+   dominant speaker. ⚠ **Partly met (D-208), and the unmet half is the one that matters most.** The
+   *enforcement* is in and tested: `MediaPeer::verify_audible` refuses anything at or below `0.01` RMS
+   (and refuses an unmeasurable `NaN`, and refuses a `level` reply carrying no measurement at all), a
+   sidecar that does not claim `owns_device_routing` may not publish audio, and both arms are driven over
+   the real wire in `crates/flux-channels/tests/room_media.rs` —
+   `a_published_track_that_carries_silence_fails_the_probe` scripts exactly the spike's shape: publish
+   returns `ok`, mute reads `false`, and the probe reads `0.0004`. What is **not** met is the other side
+   of the contract: **no test in this repository has ever measured a real browser publishing real audio**,
+   because a sidecar's probe number is whatever the sidecar says it is. The check is only worth the
+   honesty of the in-page RMS measurement behind it, and that has to be verified on a live call before
+   this invariant can be called met. Same for invariant 5 (self-announcement), which the media plane does
+   not yet do.
 
 ## Open questions
 

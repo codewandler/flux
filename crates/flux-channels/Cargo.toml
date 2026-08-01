@@ -61,6 +61,16 @@ slack-morphism = { workspace = true, optional = true }
 # its axum is 0.8, same as ours).
 default = ["slack"]
 slack = ["dep:slack-morphism", "slack-morphism/hyper"]
+# The room **media** sidecar (D-208): a headless-browser WebRTC peer flux drives over a local NDJSON
+# control protocol. Off by default and pulling **no new dependency** — the weight it keeps out of a
+# text-only room is a ~200 MB *runtime* one (a browser on the host), not a crate, so the gate stays
+# free of it and `crates/flux-channels/tests/xmpp_room.rs` keeps proving that text needs no browser
+# (the design's invariant 6). Everything the feature adds is spawned through `flux_system::System`
+# and speaks a protocol that names no capture device — the Linux-specific virtual-device routing
+# lives *inside* the sidecar, so the port stays portable.
+#
+# Not compiled by `cargo test --workspace`; `scripts/check-feature-gated-tests.sh` runs its suite.
+room-media = []
 
 [dev-dependencies]
 flux-runtime.workspace = true

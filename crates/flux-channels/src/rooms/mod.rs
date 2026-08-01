@@ -13,8 +13,14 @@
 //! [`Room`] is a trait with swappable backends, the same shape the state store (D-71), the workboard
 //! port (A-113) and the agent-runtime port (A-121) use. It is deliberately **text-only and
 //! backend-agnostic**: presence + groupchat + private messages are pure XMPP and need no browser and
-//! no vendor SDK. Media (audio, screenshare) needs a real WebRTC endpoint and lands later behind a
-//! feature gate, as extra [`RoomEvent`] variants — which is why that enum is `#[non_exhaustive]`.
+//! no vendor SDK.
+//!
+//! Media (audio, screenshare) needs a real WebRTC endpoint, and it is a **second port beside this
+//! one**, not more variants on [`RoomEvent`]: `media::MediaPeer`, behind the `room-media` cargo
+//! feature and an explicit `media { … }` opt-in (D-208). Two peers, one room — flux joins natively
+//! for text and through a browser sidecar for media — and the text half neither knows nor cares
+//! whether the media half exists. That is what lets `RoomEvent` stay browser-free; it remains
+//! `#[non_exhaustive]` for its own reasons.
 //!
 //! Backends: [`MockRoom`] (in-process, here), [`XmppMucRoom`] (D-205, the portable one — a generic
 //! prosody/ejabberd/JaaS MUC over the RFC 7395 WebSocket binding, no browser and no vendor SDK) and
@@ -35,6 +41,8 @@ mod address;
 mod budget;
 mod driver;
 mod jaas;
+#[cfg(feature = "room-media")]
+pub mod media;
 mod mock;
 mod xmpp;
 
@@ -64,13 +72,23 @@ use flux_core::Result;
 /// Take this from the server rather than rebuilding it locally — JaaS lowercases the room name in the
 /// MUC JID while the guest token's `room` claim keeps the original case (D-205/D-206), so a
 /// locally-assembled address is subtly wrong in exactly the way that is hard to see.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// `serde(transparent)`: it crosses the D-208 media control protocol as the bare string the server
+/// spelled, never as a wrapper object — flux does not reinterpret a server address on the way out
+/// any more than it parses one on the way in.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct RoomId(String);
 
 /// One occupant's address **within** a room, as the server assigns it — an XMPP occupant JID
 /// (`standup@conference.example.org/timo`). Room-scoped and opaque: two rooms' ids never compare, and
-/// flux never parses one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// flux never parses one. Serialized transparently, for the reason [`RoomId`] gives.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct OccupantId(String);
 
 macro_rules! room_string_id {
@@ -113,7 +131,13 @@ room_string_id!(OccupantId, "occupant address");
 /// What kind of participant an occupant is. Not cosmetic: D-207 needs it to keep two flux agents from
 /// ping-ponging on each other's plain text, and a MUC's own service occupants (Jitsi's `focus`) must
 /// never be treated as someone to answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The D-208 media protocol reports a participant's kind with this same vocabulary rather than a
+/// second one — a room has one answer to "what is that", however the news of it arrived.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum OccupantKind {
     /// A person.
     Human,
@@ -121,7 +145,10 @@ pub enum OccupantKind {
     Agent,
     /// Room infrastructure (Jitsi's `focus`, a transcription bot, a bridge).
     Service,
-    /// The backend could not tell. Treat as untrusted, like every other occupant.
+    /// The backend could not tell. Treat as untrusted, like every other occupant. Also the
+    /// deserialization default, so a media sidecar that omits the field cannot accidentally assert
+    /// that something is a human.
+    #[default]
     Unknown,
 }
 
@@ -197,8 +224,11 @@ pub enum MessageScope {
 /// **Every variant a participant can cause names the occupant who caused it** — see
 /// [`Self::occupant`]. Only [`Ended`](Self::Ended), the room's own lifecycle terminator, has none.
 ///
-/// `#[non_exhaustive]`: the media variants (`Audio`, `SpeechStarted`) arrive with the feature-gated
-/// sidecar in D-208…D-211, and a consumer written today must not have to change to accommodate them.
+/// `#[non_exhaustive]` so a consumer written today need not change when a variant is added — though
+/// **the media events did not land here**. D-204 expected `Audio`/`SpeechStarted` to arrive on this
+/// enum with the sidecar; D-208 put them on `media::MediaEvent`, a separate stream from a separate
+/// port, because folding them in would have made every text consumer's `match` grow a browser-shaped
+/// arm it can never see. The two planes have an address in common and nothing else.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum RoomEvent {

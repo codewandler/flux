@@ -344,6 +344,56 @@ pub struct RoomSettings {
     /// The JaaS API that allocates conference focus. Defaults to `https://8x8.vc`.
     #[serde(default)]
     pub conference_service: Option<String>,
+
+    // ── media (D-208) ──
+    /// The optional media sidecar — audio and screenshare. **Absent means no media at all**, which
+    /// is the ordinary case: text and presence are native and need no browser.
+    ///
+    /// Declaring this on a flux built **without** the `room-media` cargo feature is a load error
+    /// rather than a no-op. A silently-ignored media block leaves an operator believing a sidecar
+    /// is in the call because text is, and the whole point of D-208's level probe is that
+    /// "configured" and "audible" are not the same fact.
+    #[serde(default)]
+    pub media: Option<MediaSettings>,
+}
+
+/// `media { … }` inside a `kind = "room"` declaration — the optional WebRTC peer (D-208).
+///
+/// **Note what is absent, because it is the portability contract.** There is no device, sink,
+/// source or audio-server field here, and there is none in the control protocol either. The
+/// approach that actually works on this host is Linux-specific (a private PipeWire/Pulse null sink
+/// plus a per-stream `pactl move-source-output`, measured 2026-07-30), and it lives *inside* the
+/// sidecar. flux states which room to join and what to publish; the sidecar owns how a capture
+/// stream reaches the browser. Host specifics an operator needs to pass ride in
+/// [`sidecar`](Self::sidecar) argv, which flux never interprets.
+///
+/// `#[non_exhaustive]`: D-209…D-211 will add knobs to this bag.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct MediaSettings {
+    /// The sidecar's argv, `argv[0]` first. Executed through `flux_system::System` like every other
+    /// flux subprocess: argv-only (no shell), workspace-pinned cwd, and an environment **cleared**
+    /// to the minimal non-secret allow-list — so a sidecar that needs to know anything about the
+    /// host's audio server must be told in argv, never through an inherited variable.
+    pub sidecar: Vec<String>,
+    /// How long to wait for the sidecar's `ready` handshake. Defaults to
+    /// `DEFAULT_MEDIA_HANDSHAKE_TIMEOUT`. A browser cold start is seconds, not milliseconds.
+    #[serde(default)]
+    pub handshake_timeout_secs: Option<u64>,
+    /// How long any one control command may take before it is failed. Defaults to
+    /// `DEFAULT_MEDIA_COMMAND_TIMEOUT`.
+    #[serde(default)]
+    pub command_timeout_secs: Option<u64>,
+    /// Inbound media events held in flight. Defaults to `DEFAULT_MEDIA_EVENT_BUFFER`. Past it,
+    /// **audio frames are dropped** — a room whose audio outruns this is a room flux is already
+    /// behind in, and growing a queue of stale speech is the wrong answer.
+    #[serde(default)]
+    pub event_buffer: Option<usize>,
+    /// The RMS floor a published track must clear to count as audible. Defaults to
+    /// `DEFAULT_MIN_PUBLISH_RMS`. Raise it if a room's noise floor makes the default too generous;
+    /// zero disables the check, which the spike is a standing argument against.
+    #[serde(default)]
+    pub min_publish_rms: Option<f32>,
 }
 
 /// The nick flux joins a room under when the declaration does not say. A room containing humans is
