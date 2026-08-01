@@ -31,6 +31,7 @@
 
 pub mod analyze;
 pub mod ast;
+pub mod canonicalize;
 pub mod context_slice;
 mod cst_decode;
 pub mod dsl;

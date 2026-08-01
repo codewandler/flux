@@ -64,6 +64,16 @@ enum Command {
         /// Path to a Flux Glyph file; reads stdin when omitted.
         file: Option<PathBuf>,
     },
+    /// Rewrite Flux-Lang source in the canonical dialect, comments and declaration order intact.
+    ///
+    /// Rewrites each FILE in place; with no FILE, reads stdin and writes stdout.
+    Fmt {
+        /// Files to rewrite in place; reads stdin and writes stdout when omitted.
+        files: Vec<PathBuf>,
+        /// Report what would change instead of writing it, and exit non-zero if anything would.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() {
@@ -89,6 +99,9 @@ fn run() -> Result<()> {
         Command::Rail { file } => rail_text(file)?,
         Command::Glyph { file } => glyph_src(&read_source(file)?)?,
         Command::Unglyph { file } => unglyph_src(&read_source(file)?)?,
+        // `fmt` writes files and owns its own exit code, so it does not join the print-one-string
+        // path the projections share.
+        Command::Fmt { files, check } => return fmt(&files, check),
     };
     let mut stdout = std::io::stdout();
     stdout
@@ -226,6 +239,136 @@ fn unglyph_src(src: &str) -> Result<String> {
     let ast = flux_lang::glyph::parse_glyph(src)
         .map_err(|e| Error::Other(format!("glyph parse error: {e}")))?;
     Ok(flux_lang::format::format(&ast))
+}
+
+/// `fmt` — canonicalize `.flux` source (L-103).
+///
+/// With no `files`, this is a filter: stdin in, canonical source out. With files, each is rewritten
+/// **in place**, and only when it actually changes (so an already-canonical tree keeps its mtimes
+/// and a `fmt` run is safe to put in a pre-commit hook).
+///
+/// `--check` writes nothing and exits non-zero if any input is not already canonical, printing a
+/// per-file diff summary — the CI shape.
+///
+/// A file that does not parse, or whose rewrite the equivalence guard refuses, is an error in both
+/// modes rather than a silent skip: the whole point of the command is that its output is trustworthy.
+///
+/// One bad file does **not** end the run. `fmt` is meant to be pointed at a whole tree, and a batch
+/// that stops at the first problem hides every file behind it — the operator fixes one thing, re-runs,
+/// and discovers the next. Each file is reported and the run continues; the exit code is non-zero if
+/// anything failed or, under `--check`, if anything was stale.
+fn fmt(files: &[PathBuf], check: bool) -> Result<()> {
+    if files.is_empty() {
+        return fmt_stdin(check);
+    }
+    let (mut stale, mut failed) = (Vec::new(), Vec::new());
+    for path in files {
+        let label = path.display().to_string();
+        let outcome = std::fs::read_to_string(path)
+            .map_err(|e| Error::Other(format!("read {label}: {e}")))
+            .and_then(|src| {
+                let canonical = canonical_text(&src, &label)?;
+                if canonical == src {
+                    return Ok(());
+                }
+                if check {
+                    eprintln!("{label}: not canonical\n{}", diff_summary(&src, &canonical));
+                    stale.push(label.clone());
+                    return Ok(());
+                }
+                std::fs::write(path, &canonical)
+                    .map_err(|e| Error::Other(format!("write {label}: {e}")))
+            });
+        if let Err(e) = outcome {
+            eprintln!("fluxlang: {e}");
+            failed.push(label);
+        }
+    }
+    match (failed.is_empty(), stale.is_empty()) {
+        (true, true) => Ok(()),
+        (false, _) => Err(Error::Other(format!(
+            "{} file(s) could not be formatted: {}",
+            failed.len(),
+            failed.join(", ")
+        ))),
+        (true, false) => Err(Error::Other(format!(
+            "{} file(s) are not canonical: {}",
+            stale.len(),
+            stale.join(", ")
+        ))),
+    }
+}
+
+/// The filter form: stdin in, canonical source on stdout. Under `--check` nothing is written and a
+/// non-canonical input is the error.
+fn fmt_stdin(check: bool) -> Result<()> {
+    let src = read_source(None)?;
+    let canonical = canonical_text(&src, "<stdin>")?;
+    if check {
+        if canonical == src {
+            return Ok(());
+        }
+        eprintln!("<stdin>: not canonical\n{}", diff_summary(&src, &canonical));
+        return Err(Error::Other("input is not canonical".to_string()));
+    }
+    std::io::stdout()
+        .write_all(canonical.as_bytes())
+        .map_err(|e| Error::Other(e.to_string()))
+}
+
+/// The canonical form of `src`, or the reason there isn't one.
+///
+/// [`Canonical::Rejected`] is deliberately loud. It means the source parsed but the rewrite could
+/// not be proven to lower to the same module and carry the same comments — a defect in the
+/// canonicalizer, not in the file, and the last thing that should happen is for `fmt` to shrug and
+/// report success.
+fn canonical_text(src: &str, label: &str) -> Result<String> {
+    use flux_lang::canonicalize::Canonical;
+    match flux_lang::canonicalize::canonicalize_source(src) {
+        Canonical::Unchanged => Ok(src.to_string()),
+        Canonical::Rewritten(out) => Ok(out),
+        Canonical::Unparsed => Err(Error::Other(format!(
+            "{label}: parse error: not valid Flux-Lang source"
+        ))),
+        Canonical::Rejected => Err(Error::Other(format!(
+            "{label}: the canonical rewrite failed its equivalence guard; the file was left alone"
+        ))),
+    }
+}
+
+/// A compact line diff for `--check`: the changed region only, `-` for the file, `+` for canonical.
+///
+/// Common leading and trailing lines are trimmed so the summary points at the edit rather than
+/// reprinting the flow. Each side gets its **own** budget: a single shared cap would be spent
+/// entirely on removals for any change bigger than a few lines, and a diff that never reaches the
+/// `+` side does not tell the reader what to do about it.
+fn diff_summary(before: &str, after: &str) -> String {
+    const MAX_LINES_PER_SIDE: usize = 8;
+    let (old, new): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
+    let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut out = String::new();
+    for (sign, lines) in [
+        ('-', &old[head..old.len() - tail]),
+        ('+', &new[head..new.len() - tail]),
+    ] {
+        for line in lines.iter().take(MAX_LINES_PER_SIDE) {
+            out.push_str(&format!("  {sign}{line}\n"));
+        }
+        if lines.len() > MAX_LINES_PER_SIDE {
+            out.push_str(&format!(
+                "  {sign}… and {} more line(s)\n",
+                lines.len() - MAX_LINES_PER_SIDE
+            ));
+        }
+    }
+    out
 }
 
 /// A small ANSI palette for terminal rendering.
