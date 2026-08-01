@@ -23,10 +23,11 @@ A SIP call can be terminated in two places, and **both are first-class**:
 
 | | **native** | **remote** |
 |---|---|---|
-| who terminates the call | a local sipx process flux drives | [flux-exchange](ecosystem.md) |
+| who terminates the call | sipx, embedded in flux | [flux-exchange](ecosystem.md) |
+| who opens the sockets | **flux** — sipx is handed its IO | the exchange |
 | who holds the SIP credential | the operator's machine | the exchange, per tenant |
-| what flux sees | channel events over a local control wire | channel events over a WebSocket |
-| what flux links | nothing | nothing |
+| what flux sees | the channel vocabulary, in-process | channel events over a WebSocket |
+| what guards the traffic | flux's own `net.rs` guard | the exchange's own posture |
 
 This is the `kubectl` shape the owner named: the same vocabulary whether the thing serving it is
 across a socket on your laptop or across the network behind a cert. flux writes and reads the same
@@ -67,38 +68,52 @@ run against a local sipx process or a hosted exchange without knowing which.
 Rooms already prove the pattern in-repo: one `room` channel with `mock`, `xmpp` and `jaas` backends
 side by side. The SIP channel is the same idea with locality as the axis.
 
-## ⚠ In the native locality, sipx is a process — not a linked crate
+## ⚠ Natively, sipx takes its IO from flux — it is not a sidecar, and not an unguarded link
 
-This constraint applies to **flux linking sipx**, and it is decided by precedent. D-205 rejected
-`tokio-xmpp` for a structural reason, in its own words:
+An earlier draft made sipx a separate process, citing D-205's rejection of `tokio-xmpp`. That was wrong
+twice, and the corrections are the most important part of this design.
 
-> *"it opens its own TCP socket and resolves its own DNS, so its egress cannot be routed through
-> `flux_system::net::guard_url_scoped` — and it drags a full XEP stack and a second TLS backend."*
+**1. The precedent does not transfer.** D-205's reason was: *"it opens its own TCP socket and resolves
+its own DNS, so its egress **cannot** be routed through `guard_url_scoped`."* The operative word is
+*cannot* — a third-party crate that could not be changed. **We own sipx.** "This library owns its
+sockets" is a fact about a current API, not a law, and for a library we control it is a design decision
+we can revisit. Applying a precedent without checking whether its premise held was the mistake.
 
-sipx is that class at larger scale: `sipx-transport`, `sipx-rtp` and `sipx-media` exist to own sockets;
-SIP resolves NAPTR→SRV→A; RTP binds UDP ports per call. Linking it into flux would install a second
-egress path beside the guard, which `AGENTS.md` prohibits.
+**2. ⚠ A sidecar would not have satisfied the invariant — it would have hidden the violation.** sipx in
+another process still resolves its own DNS and opens its own sockets; flux merely cannot see it. That is
+*isolation*, not *guarding*, and the property `AGENTS.md` states — egress through one guard — would have
+been quietly false while looking satisfied. **Injection makes it actually true**, which is the whole
+argument for it.
 
-⚠ **This says nothing about flux-exchange linking sipx.** The exchange is a different domain with its
-own trust boundary; whether it embeds sipx or runs it beside itself is the exchange's decision, and
-this design should not make it.
+**Injection is the pattern flux already prescribes.** `crates/flux-system/src/port.rs`: *"This module
+states the same guarded operations as capability ports so a non-native substrate can serve them
+instead… **This is not a second IO path.** … The port makes the caller substitutable, not the guard."*
+It even prescribes the shape — no god trait, split by guarded resource, and a consumer spanning families
+*"declares its own bundle (see `flux_plugin::PluginSystem`)"*.
 
-**sipx already designed the seam for the native case.** `sipx-app-protocol` is the `sipx.app.v1`
-contract — `Envelope`/`CallSnapshot`/`EventKind` host→app, `Document`/`Instruction` app→host — with a
-**sans-IO** interpreter: *"nothing in this crate opens a socket, reads a clock, or wants an async
-runtime."* `sipx-app` is the host process meant to be driven by customer code. flux is that customer
-code.
+And sipx already has the seams as concrete types: `resolve::{Naptr, Resolver, Srv, resolve}` and
+`endpoint::{Config, Handle, bind}` are exported today. They need to become injectable, not to be
+invented.
 
-⚠ Two scheduling facts:
+### ⚠ The prerequisite flux does not have yet
 
-1. **None of sipx's transports exist yet** — *"what is not here is any of the three transports that
-   would let customer code drive it (`A-2`, `A-4`, `A-5`), so the host runs no app callback yet."* The
-   **native** binding is blocked upstream. The seam, the semantics and the remote binding are not.
-2. **The contract is experimental** — *"`sipx.app.v1` may change incompatibly until two dissimilar
-   applications have run against it — an inbound IVR and an outbound notifier."* This epic asks for
-   exactly inbound and outbound, so **flux can be both of sipx's two stabilizing applications** — which
-   turns an awkward coupling into influence over the contract while it is shapeable. A deliberate
-   cross-repo decision, not a drift.
+Measured 2026-08-01: `port.rs` declares **four** traits — `GuardedEnv`, `GuardedProcess`,
+`GuardedHostFiles`, `GuardedWorkspaceFiles` — and **none for the network**. Egress guarding lives in
+`net.rs` as free functions, usable by flux's own callers but not by a consumer that must be *handed* its
+IO. And **inbound is scattered rather than absent**: `flux-server` has `guard_open_bind`, while
+[C-409](../stories/C-409-channel-served-http-has-no-resource-limits.md) found the channel adapters that
+bind their own listeners *"got none of it."*
+
+SIP needs all three: resolve, dial (UDP **and** TCP), and **bind a local port to receive** — RTP is
+bidirectional, and inbound SIP needs a listener. [C-396](../stories/C-396-datagram-dial-targets.md)
+landed guarded UDP dial today; **the inbound half does not exist.**
+[C-435](../stories/C-435-a-guarded-network-port.md) is that work, filed under
+[execution-substrate](execution-substrate.md) where it belongs — and ⚠ **sipx is exactly the "second
+consumer" that epic exists for**, which is C-395's own argument verbatim: a port with no second consumer
+*"would be indirection without a seam"*, and a second consumer is the condition that expires it.
+
+`sipx.app.v1` and `sipx-app` remain the right seam for a **hosted** sipx (the remote locality). They are
+not rivals to embedding; they answer a different question.
 
 ## Approach
 
@@ -107,7 +122,9 @@ be rushed once wiring works, so they are settleable now.
 
 - **D-225 — one channel, two localities.** The locality-independent channel vocabulary and the parity
   requirement: the same `.flux` program runs against either backend without knowing which.
-- **D-230 — the native backend.** A local sipx process over `sipx.app.v1`. Blocked upstream.
+- **D-230 — the native backend.** sipx embedded, taking its sockets and resolver from flux, so SIP and
+  RTP go through the one guard. Blocked on [C-435](../stories/C-435-a-guarded-network-port.md) and on
+  sipx growing the injection seam.
 - **D-231 — the remote backend.** flux-exchange terminates; flux exchanges channel events over a
   WebSocket. Consumes [C-399](../stories/C-399-remote-guarded-io-backend.md), whose ownership is
   already decided in exactly this direction.
@@ -119,8 +136,12 @@ be rushed once wiring works, so they are settleable now.
 
 ## Alternatives considered
 
-- **Link `sipx` into flux.** Simplest. Rejected on the D-205 precedent — a second egress path beside
-  `guard_url_scoped`. Revisit only if sipx grows a way to hand socket construction to the host.
+- **Link `sipx` and let it open its own sockets.** Rejected — that genuinely is a second egress path
+  beside `guard_url_scoped`. This is the only reading of the D-205 precedent that survives.
+- **Run `sipx` as a sidecar process.** ⚠ Rejected, and worth stating why since it was this design's
+  first answer: a sidecar does not guard anything, it relocates unguarded egress one process away.
+  Acceptable only as a fallback if injection proves impractical in sipx — and then it must be
+  documented as *isolation, not guarding*, so nobody later reads it as satisfying the invariant.
 - **Drive the `sipx` CLI.** Process isolation for free. Rejected: the CLI is *"a scriptable phone, not
   a desktop softphone"* that **reads and writes WAV files**, and its `dial`/`register` select UDP or TCP
   only. File-based media cannot carry a live conversation.
@@ -138,8 +159,10 @@ be rushed once wiring works, so they are settleable now.
 
 - ⚠ **Parity is the thing that rots.** Two backends drift, and the one that drifts silently is the one
   nobody demos. D-225 must make parity testable, not aspirational.
-- ⚠ **Native is blocked upstream** on sipx `A-2`/`A-4`/`A-5`; the wire may break in a patch release.
-  Pin exactly and treat a bump as a reviewed change.
+- ⚠ **Native is blocked on C-435** (no network port, no guarded inbound) and on sipx accepting injected
+  IO — both ours, neither free. ⚠ **RTP binds a local port per call and receives from a remote that may
+  differ from the one dialled**; an inbound design shaped around "accept a connection" will not fit
+  datagram media.
 - ⚠ **Toll fraud** (D-227) — financial and fast. ⚠ **Audio disclosure** (D-229) — redaction cannot reach
   it.
 - **No ICE in sipx.** NAT traversal is limited natively; the remote locality largely dissolves this,

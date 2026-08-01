@@ -179,12 +179,25 @@ credential or knowing a tenant"*, and a SIP trunk is both — while flux's side 
 call channel"), never a named provider. Rooms already prove the pattern in-repo: one `room` channel with
 `mock`, `xmpp` and `jaas` side by side.
 
-⚠ **Natively, sipx is a process, not a linked crate** — the D-205 precedent: *"it opens its own TCP
-socket and resolves its own DNS, so its egress cannot be routed through `guard_url_scoped`"*, and sipx
-is that class at larger scale. That constrains what **flux** links; whether the *exchange* embeds sipx
-is the exchange's decision in its own trust domain, which is why D-231 can move while D-230 cannot —
-sipx's three app transports (`A-2`/`A-4`/`A-5`) do not exist yet, so *"the host runs no app callback
-yet"*, and `sipx.app.v1` *"may change incompatibly … in a patch release."*
+⚠ **Natively, sipx takes its IO from flux** — and this corrects the epic's first draft, which made it a
+sidecar on the D-205 precedent. That was wrong twice. D-205's reason was that `tokio-xmpp` *"opens its
+own TCP socket and resolves its own DNS, so its egress **cannot** be routed through
+`guard_url_scoped`"* — *cannot*, because it is third-party and unchangeable. **We own sipx.** And more
+sharply: **a sidecar would not have satisfied the invariant, it would have hidden the violation** —
+sipx in another process still resolves its own DNS and opens its own sockets, which is *isolation*, not
+*guarding*. Injection makes the guarantee actually true, and it is the pattern `port.rs` already
+prescribes: *"the port makes the caller substitutable, not the guard."* sipx even exports the seams as
+concrete types today (`resolve::{Naptr, Resolver, Srv}`, `endpoint::{Config, Handle, bind}`).
+
+⚠ **The prerequisite is missing and is now filed.** `port.rs` declares **four** traits — `GuardedEnv`,
+`GuardedProcess`, `GuardedHostFiles`, `GuardedWorkspaceFiles` — and **none for the network**; egress
+guarding lives in `net.rs` as free functions unusable by a consumer that must be *handed* its IO, and
+inbound is scattered (`flux-server`'s `guard_open_bind`, while C-409 found the adapters that bind their
+own listeners *"got none of it"*). SIP needs resolve, dial, **and bind-to-receive** — C-396 landed
+guarded UDP dial today, the inbound half does not exist.
+[C-435](stories/C-435-a-guarded-network-port.md) is that work, filed under **execution-substrate**, and
+⚠ **sipx is exactly the "second consumer" that epic exists for** — C-395's own argument verbatim: a port
+with no second consumer *"would be indirection without a seam."*
 
 **The semantics need no transport and are filed `ready`**, because they are what gets rushed once wiring
 works. [D-226](stories/D-226-inbound-a-caller-is-untrusted.md): a SIP `From` header is **trivially
