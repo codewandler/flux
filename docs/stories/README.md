@@ -121,6 +121,7 @@ _Flux has one honest execution model and one `DraftAst`, but different moments w
 
 ### Flux syntax simplification — one way to write each thing
 - [L-102 — Flux syntax simplification — one way to write each thing (epic)](L-102-flux-syntax-simplification-epic.md) · Language · EPIC — simplify by subtraction: canonical dialect everywhere, a migration tool, then delete the legacy grammar; supersedes L-98/L-99's direction
+- [L-125 — The layout pass re-indents a trailing module-level comment into the last flow's body — on input with no legacy spelling at all](L-125-the-layout-pass-reindents-a-trailing-module-comment.md) · Language · found by L-103 and recorded-not-fixed there. Pre-existing in `format_cst`'s layout pass, so the LSP does it on every save today; `fluxlang fmt` is merely the first thing to apply it to files on disk. It gates L-104, which gates L-106 — the canonicalize quick-fix
 - [L-105 — docs/syntax.md teaches one dialect and stops contradicting itself](L-105-single-dialect-syntax-spec.md) · Language · P4 — fix the mandatory-$ contradiction, move aspirational sections to the evolution doc, document `?` and `do`, one legacy-spelling appendix
 
 ### Cross-harness session history as a datasource
