@@ -1987,6 +1987,234 @@ pub fn test_function_names(src: &str) -> syn::Result<Vec<String>> {
     Ok(tests.names)
 }
 
+/// C-393 — one call, from **test** code, to an entry point that resolves flux's user-global
+/// discovery roots (`~/.flux/commands`, `~/.claude/commands`, `~/.flux/skills`, `~/.agents/skills`,
+/// `~/.claude/skills`, `~/.kube/config`) from the **process** environment.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AmbientDiscoveryCall {
+    pub line: usize,
+    /// The called function or method, by its final path segment.
+    pub callee: String,
+}
+
+/// Which part of a source file is test code, for [`ambient_discovery_calls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestScope {
+    /// An integration-test source (`<crate>/tests/**.rs`): every item in the file is test code.
+    WholeFile,
+    /// A `src/` module: only items carrying `#[cfg(test)]`, and everything nested inside them.
+    /// Anchored on the attribute rather than on a text marker because production code follows an
+    /// inline test module in several crates (`flux-cli`'s `execution.rs` has four of them), so a
+    /// "scan from the first `#[cfg(test)]` to EOF" heuristic drags production calls in.
+    CfgTestItems,
+}
+
+/// The entry points whose home-rooted reads answer from the process environment (C-393).
+///
+/// The first four are the readers themselves, in `flux_runtime`; the rest are the wrapper families
+/// that reach them without naming them, which is the class C-392 showed a census misses when it
+/// greps for the reader alone. Each has an additive `*_in(.., &DiscoveryEnv)` counterpart — a
+/// different identifier, so a pinned call never matches this list.
+///
+/// Deliberately a frontier rather than a call graph: it is the measured set of names test code can
+/// reach the probe through today. A new wrapper belongs here the day it is written, which is the
+/// same maintenance contract `flux-server`'s `router_env_is_pinned.rs` carries for its four.
+pub const AMBIENT_DISCOVERY_ENTRY_POINTS: [&str; 10] = [
+    "detect_signals",
+    "discover_skills",
+    "discover_skills_from",
+    "discover_commands",
+    "try_with_default_skills",
+    "with_default_skills",
+    "try_with_model_invoked_skills",
+    "load_command_files",
+    "load_skills",
+    "load_model_invoked_skill_catalog",
+];
+
+/// The pinned counterparts of [`AMBIENT_DISCOVERY_ENTRY_POINTS`], counted so the census cannot pass
+/// by scanning nothing.
+pub const PINNED_DISCOVERY_ENTRY_POINTS: [&str; 10] = [
+    "detect_signals_in",
+    "discover_skills_in",
+    "discover_commands_in",
+    "try_with_default_skills_in",
+    "try_with_model_invoked_skills_in",
+    "load_command_files_in",
+    "load_skills_in",
+    "load_model_invoked_skill_catalog_in",
+    "with_discovery_env",
+    "DiscoveryEnv",
+];
+
+struct DiscoveryCallVisitor<'a> {
+    names: &'a [&'a str],
+    /// `true` once inside a `#[cfg(test)]` item (or from the start, for [`TestScope::WholeFile`]).
+    in_test: bool,
+    hits: Vec<AmbientDiscoveryCall>,
+}
+
+impl DiscoveryCallVisitor<'_> {
+    fn record(&mut self, callee: &syn::Ident) {
+        if !self.in_test {
+            return;
+        }
+        let name = callee.to_string();
+        if self.names.contains(&name.as_str()) {
+            self.hits.push(AmbientDiscoveryCall {
+                line: start_line(callee.span()),
+                callee: name,
+            });
+        }
+    }
+
+    fn scoped<T>(&mut self, gated: bool, node: T, walk: impl FnOnce(&mut Self, T)) {
+        let outer = self.in_test;
+        self.in_test = outer || gated;
+        walk(self, node);
+        self.in_test = outer;
+    }
+
+    /// Walk a macro's token stream for calls.
+    ///
+    /// **This is the blind spot that made a first cut of the C-393 census pass while a reverted
+    /// call site sat in the tree.** `syn` keeps a macro invocation's body as an opaque
+    /// `TokenStream` — it is not an expression tree — and the single most common shape in this
+    /// repo's test corpus is exactly `assert!(load_command_files(&root, ..).is_empty())`. An
+    /// AST-only scanner therefore reports zero violations over a corpus full of them.
+    ///
+    /// Token-level, so "a call" is `<ident> ( .. )`: an identifier immediately followed by a
+    /// parenthesized group. A path (`flux_runtime::detect_signals(..)`) leaves the *last* segment
+    /// pending when the group arrives, which is the identifier that names the callee; a method call
+    /// (`.try_with_default_skills()`) works the same way.
+    fn scan_macro_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        if !self.in_test {
+            return;
+        }
+        let mut pending: Option<proc_macro2::Ident> = None;
+        for tree in tokens {
+            match tree {
+                proc_macro2::TokenTree::Ident(ident) => pending = Some(ident),
+                proc_macro2::TokenTree::Group(group) => {
+                    if let Some(ident) = pending.take() {
+                        if group.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                            self.record(&ident);
+                        }
+                    }
+                    self.scan_macro_tokens(group.stream());
+                }
+                // `::` and `.` continue a call expression; any other punctuation ends it. Turbofish
+                // (`f::<T>(..)`) is a `Group`-free sequence that also keeps the callee pending,
+                // which the `<`/`>` arms below deliberately do not break.
+                proc_macro2::TokenTree::Punct(punct) => {
+                    if !matches!(punct.as_char(), ':' | '.' | '<' | '>') {
+                        pending = None;
+                    }
+                }
+                proc_macro2::TokenTree::Literal(_) => pending = None,
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for DiscoveryCallVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_item_mod(this, item)
+        });
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_item_fn(this, item)
+        });
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_item_impl(this, item)
+        });
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_impl_item_fn(this, item)
+        });
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            if let Some(segment) = path.path.segments.last() {
+                self.record(&segment.ident);
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.record(&call.method);
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.scan_macro_tokens(mac.tokens.clone());
+        syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        // A bare path (`DiscoveryEnv::empty` passed as a value, or a `use`-free qualified
+        // reference) still counts for the pinned tally — it is only ever the *ambient* list that
+        // must be a call, and those names are all functions.
+        if let Some(segment) = path.path.segments.first() {
+            self.record(&segment.ident);
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+}
+
+/// Every call, from test code in `src`, to one of `names`.
+///
+/// Structural rather than textual: `syn` excludes comments and string literals for free, so prose
+/// naming `detect_signals()` is not a call, and `detect_signals_in(..)` is a different identifier
+/// rather than a substring that has to be excluded by hand.
+fn discovery_calls_named(
+    src: &str,
+    scope: TestScope,
+    names: &[&str],
+) -> syn::Result<Vec<AmbientDiscoveryCall>> {
+    let file = syn::parse_file(src)?;
+    let mut visitor = DiscoveryCallVisitor {
+        names,
+        in_test: matches!(scope, TestScope::WholeFile),
+        hits: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.hits.sort();
+    visitor.hits.dedup();
+    Ok(visitor.hits)
+}
+
+/// Every [`AMBIENT_DISCOVERY_ENTRY_POINTS`] call made from test code in `src` (C-393).
+pub fn ambient_discovery_calls(
+    src: &str,
+    scope: TestScope,
+) -> syn::Result<Vec<AmbientDiscoveryCall>> {
+    discovery_calls_named(src, scope, &AMBIENT_DISCOVERY_ENTRY_POINTS)
+}
+
+/// Every [`PINNED_DISCOVERY_ENTRY_POINTS`] reference made from test code in `src` — the vacuity
+/// floor for [`ambient_discovery_calls`].
+pub fn pinned_discovery_calls(
+    src: &str,
+    scope: TestScope,
+) -> syn::Result<Vec<AmbientDiscoveryCall>> {
+    discovery_calls_named(src, scope, &PINNED_DISCOVERY_ENTRY_POINTS)
+}
+
 /// C-325 — the credential shapes a hosted git forge's secret scanning blocks a push on, as
 /// `(vendor prefix, minimum credential-body characters after it)`.
 ///
@@ -3767,6 +3995,160 @@ mod tests {
              Join the literal from fragments instead (`concat!(\"sk-ant-\", \"api03-…\")`), which \
              leaves the value the test asserts over byte-identical:\n  {}",
             violations.join("\n  ")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // C-393 — no test resolves the per-turn workspace probe from the operator's home
+    // -----------------------------------------------------------------------
+
+    /// The scanner's own pins. It must see a qualified call and a method call, ignore prose and
+    /// string literals, ignore an identifier that merely *contains* a banned name, not confuse the
+    /// pinned `*_in` form for the ambient one, and — in a `src/` file — look only inside
+    /// `#[cfg(test)]`.
+    #[test]
+    fn the_discovery_scanner_separates_test_calls_from_production_prose_and_the_pinned_form() {
+        let src = r#"
+/// Production prose naming detect_signals() and discover_commands() is not a call.
+pub fn production() {
+    let _ = flux_runtime::detect_signals(cwd);
+    let _ = "detect_signals(cwd)";
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        let _ = flux_runtime::detect_signals(cwd);
+        let _ = flux_runtime::detect_signals_in(cwd, &env);
+        let _ = spec.try_with_default_skills();
+        let _ = spec.try_with_default_skills_in(&env);
+        let _ = my_detect_signals_wrapper(cwd);
+        let _ = DiscoveryEnv::empty();
+    }
+}
+"#;
+        let hits = ambient_discovery_calls(src, TestScope::CfgTestItems).unwrap();
+        let names: Vec<&str> = hits.iter().map(|h| h.callee.as_str()).collect();
+        assert_eq!(
+            names,
+            ["detect_signals", "try_with_default_skills"],
+            "exactly the two ambient calls inside `#[cfg(test)]` — not the production call, not \
+             the string literal, not the doc comment, not `my_detect_signals_wrapper`, and not \
+             either `_in` form: {hits:?}"
+        );
+
+        // The same file read as an integration-test source: production scope is test scope there,
+        // so the module-level call counts too.
+        let whole = ambient_discovery_calls(src, TestScope::WholeFile).unwrap();
+        assert_eq!(whole.len(), 3, "{whole:?}");
+
+        // And the pinned tally sees the counterparts the census floors on.
+        let pinned = pinned_discovery_calls(src, TestScope::CfgTestItems).unwrap();
+        let pinned_names: Vec<&str> = pinned.iter().map(|h| h.callee.as_str()).collect();
+        assert_eq!(
+            pinned_names,
+            [
+                "detect_signals_in",
+                "try_with_default_skills_in",
+                "DiscoveryEnv"
+            ],
+            "{pinned:?}"
+        );
+    }
+
+    /// A `#[cfg(test)]` helper `fn` at module level (not inside a test `mod`) is test code too —
+    /// `flux-config` and `flux-cli` both have that shape, and a scanner anchored only on `mod`
+    /// would walk straight past it.
+    #[test]
+    fn the_discovery_scanner_reaches_cfg_test_helper_functions_and_impls() {
+        let src = r#"
+#[cfg(test)]
+fn helper(cwd: &Path) {
+    let _ = flux_runtime::metadata::discover_commands(cwd);
+}
+
+#[cfg(test)]
+impl Fixture {
+    fn skills(&self) -> Vec<Skill> {
+        self.spec.clone().try_with_model_invoked_skills().unwrap()
+    }
+}
+"#;
+        let hits = ambient_discovery_calls(src, TestScope::CfgTestItems).unwrap();
+        let names: Vec<&str> = hits.iter().map(|h| h.callee.as_str()).collect();
+        assert_eq!(
+            names,
+            ["discover_commands", "try_with_model_invoked_skills"],
+            "{hits:?}"
+        );
+    }
+
+    /// **The gate.** No test in either workspace reaches the per-turn workspace probe — or the
+    /// command/skill discovery it re-runs — through the process's own `HOME`.
+    ///
+    /// `detect_signals` decides which evidence-gated tool groups surface, and two of its checks are
+    /// rooted at the user's home rather than at `cwd`: `agent_triggerable` re-runs command and skill
+    /// discovery (which includes `~/.flux/commands`, `~/.claude/commands` and the three user-global
+    /// skill roots) and `kubernetes` tests `~/.kube/config`. A test that reached them through the
+    /// process environment asserted against whatever the developer keeps in their own home.
+    ///
+    /// This is a census, not an inspection: the next such call is flagged by a red gate rather than
+    /// by someone remembering. C-333 will generalize the rule; until then this is the workspace-wide
+    /// guard for the `detect_signals` tranche, and `flux-server`'s `router_env_is_pinned.rs` is the
+    /// crate-local one for the router tranche.
+    #[test]
+    fn no_test_resolves_the_workspace_probe_from_the_operators_home() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        let mut scanned = 0usize;
+        let mut pinned = 0usize;
+        let mut violations = Vec::new();
+        let sources = workspace_source_files(repo_root)
+            .into_iter()
+            .map(|path| (path, TestScope::CfgTestItems))
+            .chain(
+                workspace_test_files(repo_root)
+                    .into_iter()
+                    .map(|path| (path, TestScope::WholeFile)),
+            );
+        for (file, scope) in sources {
+            let source = std::fs::read_to_string(&file).expect("read source");
+            scanned += 1;
+            let relative = file
+                .strip_prefix(repo_root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            // A source this crate cannot parse is a scanner blind spot, not a pass.
+            let hits = ambient_discovery_calls(&source, scope)
+                .unwrap_or_else(|e| panic!("parse {relative}: {e}"));
+            for hit in hits {
+                violations.push(format!(
+                    "{relative}:{}: `{}(..)` resolves flux's user-global discovery roots from the \
+                     process $HOME — use the `_in` form with a pinned DiscoveryEnv (C-393)",
+                    hit.line, hit.callee
+                ));
+            }
+            pinned += pinned_discovery_calls(&source, scope).unwrap().len();
+        }
+
+        assert!(
+            violations.is_empty(),
+            "tests whose verdict depends on the machine's $HOME:\n  {}",
+            violations.join("\n  ")
+        );
+        // Anti-vacuity, both halves: a walk that stopped resolving, and a needle list that drifted
+        // off every real call site, both report zero violations and look green.
+        assert!(
+            scanned > 400,
+            "the discovery-probe walk scanned only {scanned} files"
+        );
+        assert!(
+            pinned >= 25,
+            "only {pinned} pinned discovery references found across {scanned} sources — either the \
+             migrated tests moved or the needles drifted and this check measures nothing"
         );
     }
 }

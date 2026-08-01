@@ -364,6 +364,7 @@ fn discover_skills(
     cwd: &std::path::Path,
     cfg: &flux_config::Config,
     cli_dirs: &[std::path::PathBuf],
+    env: &flux_runtime::metadata::DiscoveryEnv,
 ) -> Result<flux_runtime::metadata::SkillDiscovery> {
     let mut extra = cli_dirs
         .iter()
@@ -377,7 +378,7 @@ fn discover_skills(
         })
         .collect::<Vec<_>>();
     extra.extend(flux_runtime::metadata::configured_skill_roots(cfg));
-    flux_runtime::metadata::discover_skills_from(cwd, &extra)
+    flux_runtime::metadata::discover_skills_in(cwd, &extra, env)
         .map_err(|error| anyhow::anyhow!("discover skills: {error}"))
 }
 
@@ -398,13 +399,29 @@ pub(super) fn load_skills(
     cli_dirs: &[std::path::PathBuf],
     enabled: &[String],
 ) -> Result<Vec<flux_skill::Skill>> {
+    let env = flux_runtime::metadata::DiscoveryEnv::from_process();
+    load_skills_in(cwd, cfg, cli_dirs, enabled, &env)
+}
+
+/// [`load_skills`] against an explicit [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv)
+/// rather than the process's own (C-393). Skill discovery walks `~/.flux/skills`,
+/// `~/.agents/skills` and `~/.claude/skills`, so the process-reading form makes a test's verdict —
+/// including the "unknown skill `X` (discovered: …)" message below — a function of the developer's
+/// own home.
+pub(super) fn load_skills_in(
+    cwd: &std::path::Path,
+    cfg: &flux_config::Config,
+    cli_dirs: &[std::path::PathBuf],
+    enabled: &[String],
+    env: &flux_runtime::metadata::DiscoveryEnv,
+) -> Result<Vec<flux_skill::Skill>> {
     // Manual-only means more than "discover everything, then select nothing": an ordinary turn
     // must not pay to walk every project and global skill directory. Discovery is only useful once
     // the caller has explicitly named at least one skill.
     if enabled.is_empty() {
         return Ok(Vec::new());
     }
-    let discovery = discover_skills(cwd, cfg, cli_dirs)?;
+    let discovery = discover_skills(cwd, cfg, cli_dirs, env)?;
     print_skill_warnings(&discovery);
     let discovered = discovery.skills;
     let mut selected = Vec::new();
@@ -445,10 +462,24 @@ pub(super) fn load_model_invoked_skill_catalog(
     cli_dirs: &[std::path::PathBuf],
     model_invoked: bool,
 ) -> Result<Vec<flux_skill::Skill>> {
+    let env = flux_runtime::metadata::DiscoveryEnv::from_process();
+    load_model_invoked_skill_catalog_in(cwd, cfg, cli_dirs, model_invoked, &env)
+}
+
+/// [`load_model_invoked_skill_catalog`] against an explicit
+/// [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) rather than the process's own (C-393) —
+/// the model-invoked twin of [`load_skills_in`], and for the same reason.
+pub(super) fn load_model_invoked_skill_catalog_in(
+    cwd: &std::path::Path,
+    cfg: &flux_config::Config,
+    cli_dirs: &[std::path::PathBuf],
+    model_invoked: bool,
+    env: &flux_runtime::metadata::DiscoveryEnv,
+) -> Result<Vec<flux_skill::Skill>> {
     if !model_invoked {
         return Ok(Vec::new());
     }
-    let discovery = discover_skills(cwd, cfg, cli_dirs)?;
+    let discovery = discover_skills(cwd, cfg, cli_dirs, env)?;
     print_skill_warnings(&discovery);
     Ok(discovery
         .skills
@@ -465,7 +496,24 @@ pub(super) fn load_command_files(
     cwd: &std::path::Path,
     builtin_names: &[&str],
 ) -> Vec<flux_runtime::metadata::CommandFile> {
-    let discovery = match flux_runtime::metadata::discover_commands(cwd) {
+    let env = flux_runtime::metadata::DiscoveryEnv::from_process();
+    load_command_files_in(cwd, builtin_names, &env)
+}
+
+/// [`load_command_files`] against an explicit [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv)
+/// rather than the process's own (C-393).
+///
+/// Command discovery walks `~/.flux/commands` and `~/.claude/commands` alongside the project pair,
+/// so the process-reading form answers from whatever the operator keeps in their own home. This is
+/// the seam C-393's failing-first case names: `no_command_dirs_yields_an_empty_list` asserts a
+/// project with no command directories yields **nothing**, and that assertion inverted on any
+/// machine whose `~/.claude/commands` is non-empty.
+pub(super) fn load_command_files_in(
+    cwd: &std::path::Path,
+    builtin_names: &[&str],
+    env: &flux_runtime::metadata::DiscoveryEnv,
+) -> Vec<flux_runtime::metadata::CommandFile> {
+    let discovery = match flux_runtime::metadata::discover_commands_in(cwd, env) {
         Ok(discovery) => discovery,
         Err(error) => {
             eprintln!("{} discover commands: {error}", style::yellow("warning:"));
@@ -501,6 +549,13 @@ mod command_file_tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    /// The [`DiscoveryEnv`](flux_runtime::metadata::DiscoveryEnv) this suite discovers against:
+    /// **no home at all** (C-393), so `~/.flux/commands` and `~/.claude/commands` contribute
+    /// nothing and each verdict is a function of the fixture below it.
+    fn pinned_env() -> flux_runtime::metadata::DiscoveryEnv {
+        flux_runtime::metadata::DiscoveryEnv::empty()
+    }
+
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "flux-cli-cmdfiles-{label}-{}-{}",
@@ -522,7 +577,7 @@ mod command_file_tests {
         )
         .unwrap();
 
-        let loaded = load_command_files(&root, &["help", "clear"]);
+        let loaded = load_command_files_in(&root, &["help", "clear"], &pinned_env());
         assert!(
             !loaded.iter().any(|c| c.name == "help"),
             "a command file named `help` must not shadow the built-in: {loaded:?}"
@@ -532,11 +587,47 @@ mod command_file_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// C-393's failing-first case. Before the seam this went through the process-reading
+    /// `load_command_files`, so "a project with no command directories yields nothing" was really
+    /// "…and the developer's `~/.claude/commands` is also empty" — the assertion inverted outright
+    /// on a machine that keeps any user-global command file. Measured at the merge base: it FAILS
+    /// under a fixture home containing `~/.claude/commands/ghost.md` and passes under an empty one.
     #[test]
     fn no_command_dirs_yields_an_empty_list() {
         let root = temp_dir("empty");
-        assert!(load_command_files(&root, &["help"]).is_empty());
+        assert!(load_command_files_in(&root, &["help"], &pinned_env()).is_empty());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The seam's own pin, in both directions: a *pinned* home's `~/.claude/commands` is really
+    /// read (so the parameter is wired, not decoration), and an empty one contributes nothing.
+    #[test]
+    fn load_command_files_in_reads_the_pinned_home_and_never_the_process_home() {
+        let root = temp_dir("pinned-home");
+        let home = temp_dir("pinned-home-HOME");
+        std::fs::create_dir_all(home.join(".claude/commands")).unwrap();
+        std::fs::write(
+            home.join(".claude/commands/ghost.md"),
+            "---\ndescription: ghost\n---\nboo",
+        )
+        .unwrap();
+
+        let pinned = load_command_files_in(
+            &root,
+            &["help"],
+            &flux_runtime::metadata::DiscoveryEnv::empty().with_home(&home),
+        );
+        assert!(
+            pinned.iter().any(|c| c.name == "ghost"),
+            "the pinned home's ~/.claude/commands must be discovered: {pinned:?}"
+        );
+        assert!(
+            load_command_files_in(&root, &["help"], &pinned_env()).is_empty(),
+            "an empty env has no user-global command roots at all"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(home).ok();
     }
 }
 

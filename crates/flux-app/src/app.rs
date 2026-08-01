@@ -3038,7 +3038,13 @@ journey pong
         assert!(engine.system_prompt.contains("PERSONA-FROM-ORIGINAL-ROOT"));
         assert!(!engine.system_prompt.contains("PERSONA-FROM-LATER-CWD"));
 
-        let signals = flux_runtime::detect_signals(&engine.cwd);
+        // C-393: both of this test's discovery reads are pinned. The `detect_signals` half was the
+        // obvious one; `try_with_default_skills` below is the second call in the same test that
+        // still walked the operator's `~/.claude/skills` — the shape C-392 found and named.
+        let signals = flux_runtime::detect_signals_in(
+            &engine.cwd,
+            &flux_runtime::metadata::DiscoveryEnv::empty(),
+        );
         let signals: Vec<&str> = signals
             .iter()
             .filter_map(|observation| observation.data["signal"].as_str())
@@ -3059,7 +3065,7 @@ journey pong
             cwd: engine.cwd.clone(),
             ..AgentSpec::new("mock")
         }
-        .try_with_default_skills()
+        .try_with_default_skills_in(&flux_runtime::metadata::DiscoveryEnv::empty())
         .unwrap()
         .skills;
         let skill = skills
