@@ -211,5 +211,9 @@ fn website_concepts_mirrors_the_contributor_page() {
 
 #[test]
 fn website_ecosystem_mirrors_the_contributor_page() {
-    assert_mirrored("docs/ecosystem.md", "website/docs/ecosystem.md", "ecosystem");
+    assert_mirrored(
+        "docs/ecosystem.md",
+        "website/docs/ecosystem.md",
+        "ecosystem",
+    );
 }
