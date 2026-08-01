@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A feature-gated media peer for the room channel** (D-208). The `room-media` Cargo feature adds a
+  `MediaPeer` seam: a separate process owns the WebRTC stack while flux drives it over a thin local
+  NDJSON control protocol (`join`/`leave`, `publish_audio`, `publish_video`, `mute`, plus inbound
+  `audio_frame`/`speech_started`/`participant`). Text and presence keep working with the feature off and
+  no browser present — pinned by a test, and a declared `media { … }` block is now **refused** rather
+  than silently discarded by serde. Inbound audio sheds rather than buffering without limit, reserving
+  slots for control events. Adds **no dependency**.
+  ⚠ **The browser harness itself is not shipped** (D-232), so there is **no audio in a real call yet**;
+  D-209/D-210/D-211 are unblocked on the flux side only.
+  ⚠ Two properties are enforced but unmeasured against a live browser, and either can make a *correct*
+  sidecar silent: `spawn_interactive` **clears the environment**, so `DISPLAY`, `XDG_RUNTIME_DIR` and
+  `PULSE_SERVER` never reach the sidecar (argv must carry the audio-server path), and Chrome's content
+  sandbox may not tolerate `Confinement::Sandboxed`. flux enforces the audio level floor but cannot
+  verify the number — a harness that hardcodes an RMS passes, which is why a genuine in-page
+  measurement is D-232's contract.
+
 ### Changed
 
 - ⚠ **A room agent now answers only when addressed** (D-207). `address_rule` was carried but never

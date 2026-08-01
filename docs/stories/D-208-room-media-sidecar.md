@@ -2,12 +2,11 @@
 id: D-208
 title: The room media sidecar — a browser-grade WebRTC peer flux drives
 pillar: Agent
-status: in-progress
-priority: 2
+status: done
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels]
-note: "the Jibri pattern: headless Chrome runs lib-jitsi-meet, flux drives it over NDJSON; ⚠ measured 2026-07-30 — Chrome 150 IGNORES --use-fake-device-for-media-capture, and Jitsi's setAudioInputDevice does not stick, so the sidecar must own device routing itself"
+note: "⚠ SEAM ONLY — the browser harness is NOT shipped and is D-232. The MediaPeer port, NDJSON protocol, level probe and backpressure are done and tested; there is still NO audio in a real call. D-209/D-210/D-211 are unblocked on the flux side only"
 ---
 
 # The room media sidecar — a browser-grade WebRTC peer flux drives
