@@ -1492,8 +1492,13 @@ fn tutorial_app_exits_cleanly_on_direct_sigint() {
         .expect("deterministic tutorial app fence");
     fs::write(root.join("assistant.flux"), app_source).unwrap();
 
+    // `--no-sandbox` states the posture explicitly (C-266). Since C-410 a `<program.flux>` run is a
+    // channel daemon pinned to the fail-closed profile with or without `--yes`, so a spawn that said
+    // nothing would pass on a developer machine with `bwrap` and refuse to start on a runner
+    // without one. What this test asserts is the SIGINT shutdown handler, which has nothing to do
+    // with confinement — so opting out is the honest declaration rather than a workaround.
     let mut child = Command::new(env!("CARGO_BIN_EXE_flux"))
-        .args(["app", "run", "assistant.flux", "-m", "mock"])
+        .args(["--no-sandbox", "app", "run", "assistant.flux", "-m", "mock"])
         .current_dir(&root)
         .env("HOME", &root)
         .stdin(Stdio::piped())

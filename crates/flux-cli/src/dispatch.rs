@@ -1,5 +1,28 @@
 use super::*;
 
+/// Whether a `flux run …` invocation hands off to the multi-agent **program** host
+/// (`run_app_cmd` → `run_app`) instead of running a turn.
+///
+/// `flux run <app.flux>` and `flux app run <program>` are the same daemon reached by two spellings,
+/// so [`unattended_sandbox_surface`] has to classify them alike — and the only thing that decides
+/// which one `flux run` is happens to be this predicate. [`async_main`] routes on the very same
+/// call, so the classifier cannot come to a different conclusion than the router: they are one
+/// function. Splitting them back into two copies of `ends_with(".flux")` is how the daemon would
+/// quietly slip back out of the floor.
+pub(super) fn run_targets_a_program(
+    entry: Option<&String>,
+    stream_json: bool,
+    stream_json_input: bool,
+    prompt: &[String],
+) -> bool {
+    // `--entry` selects a named flow; both machine-output modes reject a `.flux` argument outright
+    // (see `async_main`), so neither ever reaches program mode.
+    entry.is_none()
+        && !stream_json
+        && !stream_json_input
+        && prompt.first().is_some_and(|p| p.ends_with(".flux"))
+}
+
 /// Why this invocation must use the fail-closed unattended sandbox profile — and, for every
 /// subcommand that must not, why not.
 ///
@@ -31,6 +54,45 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         Commands::App {
             action: AppAction::Run { agent, .. },
         } if agent.yes => Some("auto-approved `flux app run --yes`"),
+        // C-410: **program mode is a daemon, flagged or not.** A `<program.flux>` runs until Ctrl-C
+        // serving its declared channels, and cron / webhook / Slack triggers fire turns with no
+        // operator attached — which is precisely C-262's criterion ("no human approval boundary to
+        // fall back on"), and it does not become false because the run was started without `--yes`.
+        //
+        // An earlier draft of this story exempted the unflagged form on the grounds that it
+        // installs `DenyApprover`. Review killed that, correctly, and the tree agrees twice over:
+        // `run_app` calls `assemble_integrations` at startup, which **spawns every installed plugin
+        // binary** before any journey runs and never consults an approver at all; and a program
+        // that declares no capability policy is dispatched under `LEGACY_JOURNEY_ALLOW`
+        // (flux-app's `app.rs`), whose eight pre-authorised ops return `PermDecision::Allow` and so
+        // never reach the approver either (`approval_sensitive`, flux-runtime). A measured probe
+        // put numbers on it: under the unflagged form a plugin subprocess reached the network
+        // (`curl` exit 0) and wrote outside the workspace; under `--yes` the same spawn was refused
+        // both (exit 6, write denied). Pinning removes that split.
+        //
+        // Both spellings land here, via one shared predicate — see [`run_targets_a_program`].
+        Commands::App {
+            action: AppAction::Run {
+                program: Some(_), ..
+            },
+        } => Some("`flux app run <program>` channel daemon"),
+        Commands::Run {
+            entry,
+            stream_json,
+            stream_json_input,
+            prompt,
+            ..
+        } if run_targets_a_program(entry.as_ref(), *stream_json, *stream_json_input, prompt) => {
+            Some("`flux run <program.flux>` channel daemon")
+        }
+        // `flux app run` with neither a program nor `--serve` is a usage error: `run_app` bails
+        // with the usage line before building anything. Nothing executes, so there is nothing to
+        // confine — and failing it on a missing sandbox backend instead of on the real mistake
+        // would tell the operator the wrong thing. (The exhaustiveness check found this arm; the
+        // classification was not obvious from the enum.)
+        Commands::App {
+            action: AppAction::Run { program: None, .. },
+        } => None,
         Commands::Preset { args }
             if args.iter().any(|arg| arg == "--run")
                 && args.iter().any(|arg| arg == "--yes" || arg == "-y") =>
@@ -49,24 +111,24 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         // ---------------------------------------------------------------------------------------
         // Explicitly exempt. Each group states what stands in for the floor.
         // ---------------------------------------------------------------------------------------
-        // Nothing here can auto-approve: without `--yes` a prompt turn installs `StdinApprover`
-        // (`resolve_permissions`, execution.rs) and waits for the operator, while a
-        // `<program.flux>` — reached through `flux run <app.flux>` as well as `flux app run` —
-        // installs `DenyApprover` ([`app_run_approver`], app_cmd.rs) and refuses every call that
-        // needs approval rather than allowing it.
+        // One operator, present for the whole run, answering a `StdinApprover` prompt per call
+        // (`resolve_permissions`, execution.rs) — C-262's documented interactive contract, kept
+        // deliberately: these are single foreground turns a human typed and is watching, not
+        // daemons. The program-mode spellings of `run` and `app run` were lifted out above; what is
+        // left of `Commands::Run` here is a prompt turn or the REPL.
         //
-        // The unflagged `flux app run <program>` is named here on purpose: it *is* long-running and
-        // event-driven (cron / webhook / Slack channels fire with no operator attached), so what
-        // exempts it is not "a human is watching" but the deny-by-default approver. That premise is
-        // pinned by `the_unflagged_app_run_approver_denies_every_call` — flip `app_run_approver`
-        // and this exemption stops being true, and that test says so.
+        // What this exemption does NOT claim: that nothing native runs unconfined. `build_agent_with`
+        // (execution.rs) calls the same `assemble_integrations` `run_app` does, so an interactive
+        // turn spawns every installed plugin binary at startup too, and a probe confirms those
+        // children reach the network and write outside the workspace. That is the accepted cost of
+        // C-262's interactive contract — plugin binaries are trusted dependencies (AGENTS.md), and
+        // an operator is present — not an oversight this arm is papering over.
         Commands::Run { .. }
         | Commands::Fork { .. }
         | Commands::Record { .. }
         | Commands::Tui { .. }
         | Commands::Flow { .. }
-        | Commands::Preset { .. }
-        | Commands::App { .. } => None,
+        | Commands::Preset { .. } => None,
         // `flux eval` runs its suites by spawning child `flux … --yes` processes
         // (`flux-eval`'s `runner.rs`); each child re-enters this classifier on its own argv and
         // gets the floor there. Pinning the parent would confine the orchestrator, not the work.
@@ -75,12 +137,21 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         // the other side, under that deployment's own posture. There is no local execution to
         // confine.
         Commands::A2a { .. } => None,
-        // The rest of `flux plugin …` is operator-driven management, not operation invocation.
-        // `status`/`refresh` do spawn the plugin to read its manifest and `install --git` builds
-        // unverified source — but each is a foreground command the operator typed (and the source
-        // build additionally requires an explicit confirm, `confirm_source_build` in plugin_cmd.rs),
-        // none of them is reachable from a model, and pinning them would make plugin *management*
-        // impossible on a host with no backend without confining anything an agent can drive.
+        // The rest of `flux plugin …` is management, not operation invocation — that is the whole
+        // of the reason, and the concession it carries is stated rather than buried: `status`,
+        // `refresh` and `skill` DO spawn the plugin binary (`spawn_verified` /
+        // `load_plugin_manifests`, plugin_cmd.rs), and those spawns stay unconfined.
+        //
+        // The line is drawn at what the spawn is *for*. Those three send one protocol-defined
+        // `manifest` request and read the answer; `call` dispatches an arbitrary declared operation,
+        // with whatever egress, process runs and writes the plugin does on the operator's behalf,
+        // and it does so outside `Executor::dispatch` entirely. Confining the manifest read would
+        // additionally make plugin inspection impossible on a host with no backend — `flux doctor`
+        // is then the only thing left that can report on plugins, and it does not spawn them.
+        //
+        // Deliberately bounded, not resolved: a plugin binary is a trusted dependency (AGENTS.md),
+        // so a hostile one is outside this envelope's threat model whichever subcommand starts it.
+        // If that assumption is ever revisited, these three spawns are where to look first.
         Commands::Plugin { .. } => None,
         // Hermetic replay of an already-recorded world: no model call, no live IO, side effects
         // never re-fired (`flux replay`), and `flux test` re-runs the real agent against the
@@ -392,6 +463,27 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
                 style::red("warning:")
             );
         }
+    } else if let Some(surface) = unattended {
+        // C-410: the disclosure the *succeeding* case owed and never paid. Every other line in this
+        // function fires when confinement is absent or was opted out of; a run that is genuinely
+        // confined said nothing at all. That silence is what turns this profile into a support
+        // problem: the first symptom an operator sees is a child process failing with
+        // `curl: (6) Could not resolve host` or a refused write under `$HOME`, with nothing in the
+        // output naming the sandbox as the cause. `--no-sandbox` gets a loud line for the opposite
+        // choice, so the confined side should not be the quiet one.
+        //
+        // Both narrowings are named because both bite: the network is CLOSED by default here, and
+        // writes are limited to the workspace, `$TMPDIR` and the toolchain caches — so a plugin
+        // that keeps state in `~/.config/<vendor>` is refused. stderr, once per process, same
+        // channel and same reasoning as the C-217 disclosure above.
+        eprintln!(
+            "{} sandbox: {surface} is CONFINED — spawned processes have network {} and may write \
+             only to the workspace, $TMPDIR and toolchain caches. Open the network with \
+             `[sandbox] network = true` (or FLUX_SANDBOX_NET=1), widen writes with \
+             `[sandbox] writable`, or opt out with --no-sandbox.",
+            style::dim("note:"),
+            if network { "OPEN" } else { "CLOSED" }
+        );
     }
     Ok(())
 }
@@ -580,7 +672,12 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 // Program mode keys on the `.flux` extension ONLY — matching any existing file would
                 // hijack prompts that happen to start with a filename (`flux run Cargo.toml explain …`
                 // must be a turn about Cargo.toml, not a parse of it as a Program).
-                if prompt.first().is_some_and(|p| p.ends_with(".flux")) {
+                //
+                // `entry`/`stream_json`/`stream_json_input` are already `None`/false by the time
+                // control reaches here (each returned or bailed above), so passing them to the
+                // shared predicate changes nothing — it is spelled this way so that the sandbox
+                // classifier and this router are literally the same decision (C-410).
+                if run_targets_a_program(None, false, false, &prompt) {
                     return run_app_cmd(prompt, &agent).await;
                 }
                 // `flux run` with no prompt drops into the REPL (with the given agent flags).

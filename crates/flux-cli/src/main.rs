@@ -4944,12 +4944,18 @@ mod tests {
     /// `unattended_sandbox_surface` with no environment mutation, so it says what the profile
     /// *covers* rather than what one host's backend discovery happens to do about it.
     ///
-    /// The three rows this story exists for are the last three: `flux plugin call` is pinned (it
-    /// invokes a plugin operation with no approver and outside `Executor::dispatch`), the rest of
-    /// `flux plugin …` is not (operator-driven management — pinning it would only break plugin
-    /// management on a backend-less host), and an unflagged `flux app run <program>` is not (it
-    /// denies every call needing approval, per `app_run_approver`). Before C-410 the whole `plugin`
-    /// subcommand fell through a `_ => None` that nobody had chosen.
+    /// The rows this story exists for: `flux plugin call` is pinned (it invokes a plugin operation
+    /// with no approver and outside `Executor::dispatch`) while the rest of `flux plugin …` is
+    /// management and is not; and **program mode is pinned under both its spellings**, flagged or
+    /// not, because a `<program.flux>` is a channel daemon whose cron/webhook triggers fire with no
+    /// operator attached. Before C-410 the whole `plugin` subcommand fell through a `_ => None`
+    /// nobody had chosen, and the unflagged program daemon was exempt on a premise that review
+    /// disproved.
+    ///
+    /// The two program-mode spellings are the pair most at risk of drifting apart, so they are
+    /// asserted together — `flux run p.flux` and `flux app run p.flux` reach the same `run_app`
+    /// through the same `run_targets_a_program` predicate, and a classification that covered one
+    /// but not the other would just move the hole.
     #[test]
     fn the_unattended_profile_classifies_each_surface_deliberately() {
         use clap::Parser;
@@ -4965,9 +4971,13 @@ mod tests {
             &["flux", "fork", "s_1", "--at", "0", "--yes"][..],
             &["flux", "flow", "run", "f", "--yes"][..],
             &["flux", "app", "run", "--serve", "--yes", "-m", "mock"][..],
-            &["flux", "app", "run", "p.flux", "--yes"][..],
             &["flux", "review", "--files", "README.md"][..],
             &["flux", "plugin", "call", "gitlab", "issue_list"][..],
+            // Program mode, every spelling, with and without `--yes`.
+            &["flux", "app", "run", "p.flux"][..],
+            &["flux", "app", "run", "p.flux", "--yes"][..],
+            &["flux", "run", "p.flux"][..],
+            &["flux", "run", "p.flux", "--yes"][..],
         ] {
             assert!(
                 classify(pinned).is_some(),
@@ -4979,10 +4989,15 @@ mod tests {
             &["flux", "run", "hi"][..],
             &["flux", "tui"][..],
             &["flux", "sessions"][..],
-            &["flux", "app", "run", "p.flux"][..],
             &["flux", "plugin", "ls"][..],
             &["flux", "plugin", "status"][..],
             &["flux", "plugin", "install", "--all"][..],
+            // Not program mode: `--entry` selects a named flow inside the file and routes to
+            // `run_flow_entry`, which is the interactive flow path, not the channel daemon.
+            &["flux", "run", "--entry", "main", "p.flux"][..],
+            // A prompt that merely mentions a `.flux` file is a turn, not a program — the
+            // classifier keys on the FIRST token exactly as the router does.
+            &["flux", "run", "explain", "p.flux"][..],
         ] {
             assert_eq!(
                 classify(exempt),

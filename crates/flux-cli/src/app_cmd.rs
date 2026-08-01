@@ -352,11 +352,16 @@ pub(super) fn assemble_app_execution_environment(
 /// — a program's channels (cron, webhook, Slack) fire with no operator attached, so there is nobody
 /// to answer one.
 ///
-/// Factored out of [`run_app`] because `unattended_sandbox_surface` (dispatch.rs) exempts the
-/// unflagged `flux app run <program>` from C-262's fail-closed sandbox floor **on the strength of
-/// this deny-by-default posture**, and an exemption whose premise lives inside a 300-line async fn
-/// is an exemption no test can hold to account. See
-/// `the_unflagged_app_run_approver_denies_every_call`.
+/// ⚠ **This is not a sandbox boundary, and an earlier draft of C-410 wrongly treated it as one.**
+/// Two things route around it entirely: [`run_app`] calls [`assemble_integrations`] at startup,
+/// which spawns every installed plugin binary before any journey exists and never consults an
+/// approver; and a program declaring no capability policy dispatches under `LEGACY_JOURNEY_ALLOW`
+/// (flux-app's `app.rs`), whose pre-authorised ops resolve to `PermDecision::Allow` and so never
+/// reach an approver either. `flux app run <program>` is therefore pinned to the fail-closed
+/// sandbox profile in its own right — see `unattended_sandbox_surface` (dispatch.rs).
+///
+/// What it *is* remains worth pinning: the `--yes` / no-`--yes` split for calls that do reach
+/// approval. See `app_run_approval_posture`.
 pub(super) fn app_run_approver(auto_approve: bool) -> Arc<dyn Approver> {
     if auto_approve {
         Arc::new(AllowApprover)
@@ -834,19 +839,21 @@ fn tui_options(
 
 #[cfg(test)]
 mod app_run_approval_posture {
-    //! C-410: the premise the sandbox-floor exemption for an unflagged `flux app run <program>`
-    //! rests on.
+    //! The `--yes` / no-`--yes` approval split for `flux app run <program>`, asserted as
+    //! *behaviour* (what the approver answers) rather than as a type — and the `--yes` half is here
+    //! too, because "it denies" proves nothing unless the same function is shown to allow when it
+    //! is supposed to.
     //!
-    //! `unattended_sandbox_surface` (dispatch.rs) pins auto-approved and serving surfaces to the
-    //! fail-closed `Require` posture and leaves this one on the interactive `off`/`on`/`require`
-    //! contract. That is a defensible call **only** while the unflagged form cannot auto-approve
-    //! anything: its channels (cron, webhook, Slack) fire with no operator attached, so if the
-    //! approver ever became permissive the surface would be a headless auto-approving daemon
-    //! outside the floor — the exact shape C-262 exists to catch.
+    //! ⚠ **Recorded negative result (C-410).** This module was written to be the premise of a
+    //! sandbox-floor *exemption* for the unflagged form, and that premise was false. Review found
+    //! two paths that never reach this approver at all: the startup plugin spawn in
+    //! `assemble_integrations`, and `LEGACY_JOURNEY_ALLOW`'s pre-authorised ops, which resolve to
+    //! `PermDecision::Allow` and skip approval by construction. A measured probe confirmed it — the
+    //! unflagged form let a plugin subprocess reach the network and write outside the workspace.
     //!
-    //! So this asserts the posture as *behaviour* (what the approver answers) rather than as a
-    //! type, and the `--yes` half is here too: an assertion that "it denies" proves nothing unless
-    //! the same function is shown to allow when it is supposed to.
+    //! The lesson is the repo's standing one: a guard that asserts a component in isolation is not
+    //! evidence about the surface that component sits in. `flux app run <program>` is now pinned to
+    //! the floor outright, and these tests claim nothing about confinement.
 
     use super::*;
 
@@ -861,8 +868,9 @@ mod app_run_approval_posture {
             .await;
         assert!(
             matches!(choice, ApprovalChoice::Deny),
-            "an unflagged `flux app run <program>` is exempt from the C-262 sandbox floor because \
-             it denies by default; this approver answered {choice:?}"
+            "an unflagged `flux app run <program>` must deny calls that reach approval — a \
+             program's channels fire with no operator to answer a prompt; this approver answered \
+             {choice:?}"
         );
     }
 
@@ -874,8 +882,7 @@ mod app_run_approval_posture {
             .await;
         assert!(
             matches!(choice, ApprovalChoice::Allow),
-            "`flux app run --yes` must still auto-approve (it is pinned to the floor instead); \
-             this approver answered {choice:?}"
+            "`flux app run --yes` must still auto-approve; this approver answered {choice:?}"
         );
     }
 }
