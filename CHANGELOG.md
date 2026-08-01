@@ -8,6 +8,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A room turn is attributed to the speaker, not to the local operator** (C-408, from F2 of the
+  2026-08-01 security-posture review). `AGENTS.md` requires multi-principal surfaces to pass a
+  request-owned `TurnIdentity`; there was exactly **one** caller of `run_turn_as` in the tree, in
+  flux-server. The room path used plain `run_turn`, which snapshots the executor's assembly-time
+  identity — so every occupant's text was recorded as `local` at `Privileged` trust. The room path
+  now derives a request-owned identity from the stable per-occupant `speaker` id, and the evidence
+  record names the speaker.
+  The trust level is **decided, not inherited**: `TurnIdentity::unauthenticated_participant` assigns
+  `TrustLevel::Untrusted` in one place with the reasoning beside it, pinned by a test asserting it
+  sits below Verified, Privileged and System.
+  ⚠ **What this does and does not buy, stated precisely** — the principal id is *asserted by the
+  payload*, not authenticated. In the **trust** dimension a claimed identity is strictly weaker than
+  before. In the **subject** dimension it is merely *different*: `subject_matches` matches a user
+  subject on the principal id, so a grant scoped to `user "alice"` at `required_trust: Untrusted` is
+  satisfied by a claimed `speaker: "alice"` and is **not** satisfied by `local`. Unreachable in the
+  shipped CLI, whose grants are subject `user "*"`; reachable for an embedder that writes an
+  id-keyed grant, and for that embedder the fix is out-of-band identity, because no predicate over an
+  untrusted payload turns an asserted id into an authenticated one.
+  ⚠ The one input direction that fails **open** is a malformed `speaker`, which falls back to the
+  assembly-time identity — deliberate, because failing closed would let one bad field silence a live
+  meeting. Unreachable from the room surface by construction, and pinned.
+  ⚠ **This closes C-408; it does not close F2.** A room-triggered *journey* still authorizes and
+  audits as `local`/`Privileged` — filed as C-415, because `run_journey` is also reached from a
+  model-chosen `spawn` payload and so needs its own decision.
+
+### Fixed
+
 - **⚠ BREAKING: `flux plugin call` and program mode now run under the fail-closed sandbox floor**
   (C-410, from F4 of the 2026-08-01 security-posture review). `unattended_sandbox_surface` had no
   `Commands::Plugin` arm, so `flux plugin call` executed a plugin operation headlessly with the

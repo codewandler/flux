@@ -2,8 +2,7 @@
 id: C-408
 title: "Every room participant shares one `local`/Privileged identity, so a stranger is attributed to the operator"
 pillar: Core
-status: in-progress
-priority: 6
+status: done
 epic: meeting-rooms
 areas: [flux-app, flux-flow, flux-channels]
 note: "F2 of the 2026-08-01 security-posture review at 0.47.1. AGENTS.md states multi-principal surfaces pass a request-owned TurnIdentity; the room path uses plain `run_turn`, so every occupant's text is attributed to `local` at Privileged trust in the evidence record. Inert today only because no app-path grant keys on principal or trust"
