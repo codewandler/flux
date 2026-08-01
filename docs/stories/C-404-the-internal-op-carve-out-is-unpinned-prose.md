@@ -6,7 +6,7 @@ status: ready
 priority: 10
 epic: connector-platform
 areas: [flux-plugin, flux-cli, flux-codegate]
-note: "found by C-403, which rewrote the carve-out into a dated statement of fact and then said plainly that nothing enforces it. host-kit's own docs describe an internal op returning credentials (`aws-bedrock.auth`), so the benign census is a property of today's plugins, not of the design"
+note: "found by C-403's review. The carve-out is NOT dormant — it is the only thing excusing `plugin.validate` at crates/flux-cli/src/plugin_cmd.rs:517, a live host-dispatched site whose `problems`/`warnings` are printed to operator stdout and whose error frame is printed raw. host-kit's own docs describe an internal op returning credentials, so the benign census is a property of today's plugins, not of the design"
 ---
 
 # The `internal: true` carve-out is asserted, not enforced
@@ -18,21 +18,26 @@ Make the credential boundary's one exemption **enforceable**, or remove it.
 [C-312](C-312-connector-credential-boundary.md) put a credential boundary on plugin responses and
 excused exactly one class: a host-dispatched `internal: true` op, on the grounds that it is never
 advertised to the model and its result goes to host code rather than a transcript.
-[C-403](C-403-the-broker-bypasses-the-credential-boundary.md) audited that carve-out, found it
-covered nothing in this tree, and rewrote it as a dated statement of fact — then flagged the real
-problem:
+[C-403](C-403-the-broker-bypasses-the-credential-boundary.md) tried to audit that carve-out and
+**asserted it was load-bearing for nothing**. Its independent review showed that claim is false, and
+the way it failed is the whole argument for this story:
 
-- The census lives in a **doc comment**. Nothing fails when it goes stale.
-- **`internal_op` is public.** A plugin may ship an internal op that returns credentials —
-  host-kit's own documentation describes precisely that shape with `aws-bedrock.auth`.
-- The one live host-dispatched site today, `plugin.validate`
-  (`crates/flux-cli/src/plugin_cmd.rs:517`), is genuinely benign: its contract is
-  `{operation, valid, problems}`. That is a fact about the plugins that exist, not a property the
-  design guarantees.
+- The census lives in a **doc comment**. Nothing fails when it goes stale — and it was already wrong
+  the day it was written. C-403's rewritten scope statement claimed four `call_with_host` sites; the
+  tree has **five** non-test ones, and the omitted one is precisely the site the carve-out excuses.
+- ⚠ **The carve-out is load-bearing right now**, for `plugin.validate` at
+  `crates/flux-cli/src/plugin_cmd.rs:517` — production code, host-dispatched, `internal: true` via
+  host-kit's auto-injection. Its result is **not** discarded: `problems`/`warnings` are lifted at
+  `:533-534` and printed to operator stdout at `:555`, and its error frame is printed raw at `:539`.
+  That is the same scrollback and shell-history surface C-312's own comment cites as the reason
+  `flux plugin call` needs the check. The op's contract (`{operation, valid, problems}`) is benign
+  today, but "benign" is a fact about the plugins that exist.
+- **`internal_op` is public.** A plugin may ship an internal op that returns credentials — host-kit's
+  own documentation describes precisely that shape with `aws-bedrock.auth`.
 
 ⚠ This is the shape this repo has been bitten by before: **a guard whose only check is its own
-stated assumption**. A prose census with no test is indistinguishable from a true one right up until
-it is wrong.
+stated assumption**. A prose census is indistinguishable from a true one right up until it is wrong —
+and here it took one independent read to find that it already was.
 
 ## Acceptance
 
@@ -51,9 +56,9 @@ it is wrong.
 
 ## Notes
 
-- C-403's rewritten scope table in `crates/flux-plugin/src/host/credential_boundary.rs` is the
-  starting inventory — it names four `call_with_host` sites. Re-derive it rather than trusting it;
-  that is the whole point of this story.
+- C-403's rewritten scope table in `crates/flux-plugin/src/host/credential_boundary.rs` is a
+  starting inventory **known to have been wrong once**. Re-derive it from the tree
+  (`git grep -n call_with_host -- '*.rs'`), never trust it; that is the whole point of this story.
 - `crates/flux-cli/src/catalog_coherence.rs:173` builds a `HostProviderInvoker` with a fresh
   redactor. C-403 left it alone because it is a coherence-check helper with nothing registered — if
   this story changes how the boundary sources its redactor, re-check that site.
