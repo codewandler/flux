@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.47.1] - 2026-08-01
+
 ### Fixed
 
 - **0.47.1 re-ships 0.47.0's binaries, which never published.** 0.47.0's crate closure is live on
