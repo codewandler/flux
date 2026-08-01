@@ -121,7 +121,6 @@ _Flux has one honest execution model and one `DraftAst`, but different moments w
 
 ### Flux syntax simplification — one way to write each thing
 - [L-102 — Flux syntax simplification — one way to write each thing (epic)](L-102-flux-syntax-simplification-epic.md) · Language · EPIC — simplify by subtraction: canonical dialect everywhere, a migration tool, then delete the legacy grammar; supersedes L-98/L-99's direction
-- [L-103 — `fluxlang fmt` — the canonical formatter as a CLI, comment-preserving](L-103-fluxlang-fmt.md) · Language · P1 — parse any accepted dialect, rewrite canonical, keep comments; --check mode for CI; everything else in the epic depends on it
 - [L-105 — docs/syntax.md teaches one dialect and stops contradicting itself](L-105-single-dialect-syntax-spec.md) · Language · P4 — fix the mandatory-$ contradiction, move aspirational sections to the evolution doc, document `?` and `do`, one legacy-spelling appendix
 
 ### Cross-harness session history as a datasource
@@ -1033,6 +1032,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-96 — Canonical control headers use call-like named options](L-96-canonical-named-option-headers.md) · Language · Complete L-93: emit `confirm \"…\", risk: medium` and consistent named options while accepting legacy space-keyword headers
 - [L-97 — Flux Glyph — an indented opcode projection for agents](L-97-flux-glyph-notation.md) · Language · F/= /^ /? /?= /?~ /| /|* /& /|| /?? /!? /!! /~= with `@{...}` as the raw-AST escape
 - [L-101 — Serialize a record as a form-encoded request body](L-101-form-urlencoded-body.md) · Language · authored Flux could build a JSON body and nothing else, so every OAuth2 token endpoint was unreachable
+- [L-103 — `fluxlang fmt` — the canonical formatter as a CLI, comment-preserving](L-103-fluxlang-fmt.md) · Language · P1 — parse any accepted dialect, rewrite canonical, keep comments; --check mode for CI; everything else in the epic depends on it
 - [L-114 — Statement-block nesting joins the L-81 depth guard (parser SIGABRT)](L-114-statement-depth-guard.md) · Language · Review F1, HIGH — ~200 nested when blocks (~9 KB on a 2 MiB stack) abort the process; the guard covers expressions/types only
 - [L-115 — Lower `each` headers from CST structure, not reconstructed text](L-115-each-lowering-from-cst.md) · Language · Review F2, HIGH — `each x in \"a->b\"` is a parse error and format emits un-reparseable output; header.split_once(\"->\") sees string content
 - [L-116 — `repeat` gets the loop budget discipline; budget scope is decided](L-116-repeat-and-loop-budgets.md) · Language · Review F3+F4, MEDIUM — repeat has no iteration budget/transcript cap/yield (timeout can never fire over a pure body); loop budgets are per-activation, doc says per-execution

@@ -2,8 +2,7 @@
 id: L-103
 title: "`fluxlang fmt` — the canonical formatter as a CLI, comment-preserving"
 pillar: Language
-status: in-progress
-priority: 10
+status: done
 epic: flux-syntax-simplification
 design: docs/designs/flux-syntax-simplification.md
 areas: [flux-lang, flux-cli]

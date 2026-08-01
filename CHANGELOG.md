@@ -6,6 +6,36 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`fluxlang fmt` — the canonical formatter as a CLI, comment-preserving** (L-103). Rewrites every
+  legacy spelling the parser still accepts into the one form `format` emits, with `--check` for a
+  read-only verdict. Rejection is **file-granular and loud**: a file whose rewrite cannot be proved
+  equivalent is left byte-identical and reported, rather than partially written.
+  ⚠ The story's suggested implementation did not hold — `format_cst::format_source` is a *layout*
+  formatter and returns `None` for all seven legacy spellings — so the canonicalization pass was
+  written as byte-range splices over the lossless CST, with the layout pass following.
+  **What the corpus caught that a fixture could not.** Two places where `$` is *canonical, not
+  legacy*, and rewriting them would have been silent source corruption: inside a native formula
+  `b = a * 2` is a parse error and `format` itself emits `b = $a * 2`; and `concat(a, b)` is the
+  **named-input pun** — it means `a: a, b: b`, so `concat(a, a)` is a duplicate-argument error.
+  ⚠ **What the corpus could *not* catch, and the method fix that followed.** The first cut built its
+  rule table from spellings probed for and confirmed against the corpus — both blind to a legacy form
+  that appears in no shipped file. `throttle "fetches" 5 per 60000` and `debounce "api" 500` are
+  exactly that: accepted by the parser, and reported by `--check` as **already canonical**. A false
+  negative, not a rejection — L-104's migration would have skipped those files as clean and L-107's
+  grammar removal would then have broken them. The table is now derived from `cst_decode.rs` itself,
+  and re-deriving it that way surfaced two further false negatives no review had found: duration
+  *unit* normalization (`timeout 5000ms` → `5s`, `60s` → `1m`) and bare tool names
+  (`with_tools [read_file]` → `["read_file"]`).
+  Reserved-name decisions go through `ast::is_bare_symbol_name`, the parser's own predicate, rather
+  than a second keyword list.
+  ⚠ **Known, recorded, and it gates L-104:** `format_cst`'s layout pass re-indents a module-level
+  comment following the last declaration into that flow's body, on input with *no* legacy spelling at
+  all. Pre-existing in a seam this story deliberately leaves untouched — the LSP has it too — but
+  `fmt` is the first thing to apply it to files on disk, so it should be fixed before L-104 rewrites
+  the corpus.
+
 ### Fixed
 
 - **⚠ BREAKING: a plugin that widens its declared capabilities is refused, not silently adopted**
