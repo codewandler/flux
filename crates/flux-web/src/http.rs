@@ -1036,6 +1036,41 @@ mod tests {
         );
     }
 
+    /// C-313 — the **key** is encoded too, and until this test nothing observed it. C-303's
+    /// reviewer changed `out.push_str(&encoded_key)` to `out.push_str(key)` in `append_query` and
+    /// every test in this crate stayed green: the line was correct but unpinned, and an unpinned
+    /// line is how the injection class `query` exists to close comes back — through the key half
+    /// of the pair. A key is as attacker-reachable as a value: an authored flow builds the `query`
+    /// record, and a record key can be interpolated.
+    #[tokio::test]
+    async fn query_key_is_percent_encoded_like_its_value() {
+        let (base, seen) = capture_request().await;
+        tool(PrivateNetAllow::Any)
+            .execute(
+                &ctx(),
+                json!({ "url": format!("{base}/s"), "query": { "q&injected=1": "cats" } }),
+            )
+            .await
+            .unwrap();
+        let line = request_line(&seen.await.unwrap());
+        assert!(
+            line.starts_with("GET /s?q%26injected%3D1=cats "),
+            "the key's reserved bytes are percent-encoded, so it stays one parameter: {line}"
+        );
+        assert!(
+            !line.contains("&injected"),
+            "an unencoded key smuggles a second parameter exactly as an unencoded value does: \
+             {line}"
+        );
+
+        // The remaining byte classes, as a unit — the key gets RFC 3986 (space is `%20`, not the
+        // form encoder's `+`) and non-ASCII goes out as UTF-8 in upper-case hex, same as a value.
+        assert_eq!(
+            append_query("https://h/p", &[("a b ü".to_string(), "v".to_string())]).unwrap(),
+            "https://h/p?a%20b%20%C3%BC=v"
+        );
+    }
+
     /// L-101's rule, applied to the query: `null` means "do not send this parameter", but `false`
     /// and `0` are values. Getting this backwards silently drops a `?active=false` filter.
     #[tokio::test]
