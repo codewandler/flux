@@ -180,7 +180,8 @@ struct Parser<'s> {
 // Delimited expressions now retain a little more per-level parser state (continuation trivia and
 // optional named-argument ownership). Keep the guard comfortably below the default test-thread stack
 // while still allowing far more nesting than authored Flux needs.
-const MAX_PARSE_DEPTH: usize = 128;
+// L-114 shares this ceiling with `cst_decode`, whose own block-walk cap must stay above it.
+pub(crate) const MAX_PARSE_DEPTH: usize = 128;
 
 fn to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
     FluxLang::kind_to_raw(kind)
@@ -317,11 +318,51 @@ impl<'s> Parser<'s> {
     }
 
     /// The boundary idiom: if an indented block follows (past blanks), enter it via `f`.
+    ///
+    /// L-114: this is the single cut through the statement-nesting recursion — every block a
+    /// statement owns is entered here, and the cycle is `block` → `statement` → a block statement →
+    /// here — so it carries the same [`MAX_PARSE_DEPTH`] guard the expression grammar uses. Over the
+    /// cap the block is swallowed whole by [`error_block`](Self::error_block) instead of recursed
+    /// into, which keeps the tree lossless *and* shallow enough for every consumer that walks it
+    /// recursively (semantic lowering, the formatter, the language server).
     fn block_if_indented(&mut self, f: impl FnOnce(&mut Self)) {
-        if self.at_block() {
-            self.skip_blank_lines();
-            f(self);
+        if !self.at_block() {
+            return;
         }
+        self.skip_blank_lines();
+        if !self.enter() {
+            self.error_block("statement nesting too deep");
+            return;
+        }
+        f(self);
+        self.leave();
+    }
+
+    /// Swallow one whole indented region — the INDENT at the cursor through its matching DEDENT —
+    /// into a single `ERROR` node, iteratively. The depth guard's bail-out: it makes forward
+    /// progress without recursing, so the declarations after the over-deep block still parse.
+    fn error_block(&mut self, message: &str) {
+        self.error(message);
+        self.start(SyntaxKind::ERROR);
+        let mut nesting = 0usize;
+        loop {
+            match self.raw_kind_at(self.pos) {
+                SyntaxKind::EOF => break,
+                SyntaxKind::INDENT => {
+                    nesting += 1;
+                    self.feed_one();
+                }
+                SyntaxKind::DEDENT => {
+                    nesting = nesting.saturating_sub(1);
+                    self.feed_one();
+                    if nesting == 0 {
+                        break;
+                    }
+                }
+                _ => self.feed_one(),
+            }
+        }
+        self.finish_node();
     }
 
     // --- builder feeding ------------------------------------------------
@@ -1760,6 +1801,21 @@ mod tests {
             "deep type nesting bounded"
         );
 
+        // L-114: nested *statement blocks* — the axis the legs above omit. `block` → `statement` →
+        // `when_stmt` → `block` is its own unbounded recursion, and it aborted at ~900 levels on an
+        // 8 MiB stack (~200 on a 2 MiB tokio worker) while the expression guard sat right next to it.
+        let nested = nested_statements(STATEMENT_NESTING_DEPTH);
+        let deep = parse_cst(&nested);
+        assert!(
+            !deep.errors.is_empty(),
+            "deep statement nesting must yield a bounded parse error, not a crash"
+        );
+        assert_eq!(
+            tree_text(&deep),
+            nested,
+            "the tree stays lossless when the depth guard refuses a block"
+        );
+
         // A well-formed shallow program is unaffected by the guard.
         let ok = parse_cst("flow f\n  $x = (((1 + 2)))\n  return $x\n");
         assert!(
@@ -1767,6 +1823,79 @@ mod tests {
             "shallow nesting still parses: {:?}",
             ok.errors
         );
+        let ok_nested = parse_cst(&nested_statements(8));
+        assert!(
+            ok_nested.errors.is_empty(),
+            "hand-writable statement nesting still parses: {:?}",
+            ok_nested.errors
+        );
+    }
+
+    /// L-114: the depth the nested-*statement* legs use. Statement blocks are indentation-delimited,
+    /// so a `depth`-level fixture costs O(depth²) source bytes — 20,000 levels would be a 400 MiB
+    /// string. 2,000 levels is a ~4 MiB fixture and already twice the ~900 levels that `SIGABRT`ed
+    /// `fluxlang compile` on the default 8 MiB stack.
+    const STATEMENT_NESTING_DEPTH: usize = 2_000;
+
+    /// `depth` nested `when` blocks around a `return`, each one indented one step further.
+    fn nested_statements(depth: usize) -> String {
+        let mut src = String::from("flow f\n");
+        for level in 0..depth {
+            src.push_str(&"  ".repeat(level + 1));
+            src.push_str("when $x\n");
+        }
+        src.push_str(&"  ".repeat(depth + 1));
+        src.push_str("return 1\n");
+        src
+    }
+
+    /// L-114: everything downstream of the tolerant parse must survive the same input — the strict
+    /// AST entries (`parse`/`parse_program`, which recurse per block through `cst_decode`) and the
+    /// editor paths that consume the tolerant tree directly (`highlight`, `format_source`).
+    #[test]
+    fn deeply_nested_statements_are_bounded_through_every_consumer() {
+        let nested = nested_statements(STATEMENT_NESTING_DEPTH);
+
+        // The strict entries refuse it as a bounded error rather than recursing into the tree.
+        assert!(
+            crate::parse::parse(&nested).is_err(),
+            "the strict flow entry must return a bounded error"
+        );
+        assert!(
+            crate::parse::parse_program(&nested).is_err(),
+            "the strict module entry must return a bounded error"
+        );
+
+        // `cst_decode` recurses per block over whatever the parser built, so the guard is only worth
+        // anything if the tree handed over is shallow. Assert that directly rather than inferring it
+        // from the error above.
+        let parsed = parse_cst(&nested);
+        let depth = tree_depth(&parsed.syntax());
+        assert!(
+            depth <= MAX_PARSE_DEPTH * 8,
+            "the guard must bound the tree the lowerer recurses over, but it is {depth} deep"
+        );
+
+        // The tolerant editor path never sees the strict error, so it has to survive on its own.
+        assert!(
+            !crate::highlight::highlight(&nested).is_empty(),
+            "the editor still gets highlight spans for an over-deep buffer"
+        );
+        assert_eq!(
+            crate::format_cst::format_source(&nested),
+            None,
+            "a buffer the depth guard refused is not formattable"
+        );
+    }
+
+    /// The longest root-to-leaf node path in a tree, computed iteratively so the measurement itself
+    /// cannot overflow the stack it is measuring.
+    fn tree_depth(root: &crate::syntax::SyntaxNode) -> usize {
+        let mut deepest = 0;
+        for node in root.descendants() {
+            deepest = deepest.max(node.ancestors().count());
+        }
+        deepest
     }
 
     // ---- L-90: incremental reparse (green-node reuse) ----------------------
