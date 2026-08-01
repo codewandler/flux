@@ -99,10 +99,29 @@ percent-encoded per RFC 3986 and appended, because the only alternative — form
 the URL with `fmt` — escapes nothing, so a value carrying `&` or `=` adds a parameter the author
 never wrote. This is the query half of the gap [L-101](../stories/L-101-form-urlencoded-body.md)
 closed for bodies, and it shares L-101's scalar rules (`null` omitted, `false`/`0` sent, nested
-refused). The encoder is `flux_core::percent_encode_component` — one encoder for the whole tree,
-since a percent-encoder that gets copied drifts on exactly the byte an attacker supplies.
+refused). Both halves of a parameter go through it — the **key** as well as the value, since a key
+is assembled from the same authored record and an unencoded `&` in it adds a parameter just as
+readily (C-313 pins that; C-303 shipped it correct but unobserved).
 `permission_subjects` and the `NetworkFetch` intent report the *encoded* URL, minus any
 query-placed credential: they cannot fail, so they cannot consult a redactor.
+
+**How many percent-encoders the tree actually has (C-313).** The encoder is
+`flux_core::percent_encode_component`, and it is **the one RFC 3986 encoder in the root
+workspace**: `flux-web`, `flux-credentials`, `flux-providers` and `flux-plugin`'s
+endpoint-template substitution all delegate to it, none keeps a loop. That is the property worth
+having, because a percent-encoder that gets copied drifts on exactly the byte an attacker supplies.
+Two qualifications keep the claim honest:
+
+- **The form-body encoder is a second, deliberate one.** `flux-lang`'s `urlencode_component`
+  (L-101, `parse(as: "form")`) spells a space `+` per `application/x-www-form-urlencoded`; RFC 3986
+  spells it `%20`. They differ on the byte most likely to appear in a real value, so they stay two
+  named functions rather than one with a flag.
+- **The nested `plugins/` workspace still holds twelve copies**, and they cannot delegate today:
+  `plugins/` is excluded from the root workspace, nothing in it depends on `flux-core`, and
+  `host-kit` — the one crate every plugin already links — exposes no encoder. This is not
+  hypothetical drift: `plugins/gitlab`'s copy omits `~` from the unreserved set, so it emits `%7E`
+  where the other eleven emit `~`. Closing it means giving `host-kit` the shared spelling; that is
+  a plugin-protocol-line change, hence its own story rather than a footnote here.
 
 **The result is a record, not a flat string (C-304).** `http.request` returns
 `{status, headers, body}` under a declared `output_schema`, so an authored flow or a connector

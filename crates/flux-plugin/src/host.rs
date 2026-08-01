@@ -578,7 +578,7 @@ impl SystemHostCaps {
                 .find('}')
                 .ok_or_else(|| format!("endpoint template has an unclosed `{{`: `{template}`"))?;
             let value = self.resolve_config(&after[..close])?;
-            out.push_str(&percent_encode_component(&value));
+            out.push_str(&flux_core::percent_encode_component(&value));
             rest = &after[close + 1..];
         }
         out.push_str(rest);
@@ -1854,21 +1854,6 @@ fn dial_target_from_url(raw: &str) -> std::result::Result<flux_system::net::Dial
         })
         .ok_or("conn.dial: resolved endpoint url has no port (and scheme has no default)")?;
     Ok(flux_system::net::DialTarget::Tcp { host, port })
-}
-
-/// Percent-encode a URL path/query component: unreserved chars (`alnum` `-_.~`) pass through, all
-/// else `%XX` — for substituting config values into an [`EndpointSpec::template`].
-fn percent_encode_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// Parse a credential reference from the `credential` capability payload: either a `Ref`-shaped
