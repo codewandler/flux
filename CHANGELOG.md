@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Five loop-view mocks of one flow, and a recommendation for the live view** (A-144). Internal design
+  artifact under `crates/flux-tui/src/loopmock/`, with a committed 50-render side-by-side set at
+  `docs/designs/agent-loop-visibility-mocks.md` and an interactive
+  `cargo run -p flux-tui --example loop_mocks`. Nothing is wired into the live TUI, and a test walking
+  `src/` recursively asserts it cannot drift there.
+  **The outcome that matters is the recommendation, and review changed it**: from *"build the split"* to
+  ⚠ **"condense finished phases first, then build the split"** — the long-run comparison was confounded
+  in the split's favour, because only it had phase-condensing while the flat thread and tree draw one row
+  per step at every depth *by construction*. The two are separable and the first is most of the win, so
+  A-137 can take the cheaper step alone.
+  Review also found the elision-honesty property documented **unconditionally** but true only at the three
+  viewport heights the artifact happened to draw — false at `rows == 6`, which `render()` itself accepts.
+  Fixed so that any recorded marker which did not survive composition is forced back onto the screen,
+  making it unconditional for every renderer present and future, with the property test widened to 18
+  widths × 28 heights.
+
 - **A feature-gated media peer for the room channel** (D-208). The `room-media` Cargo feature adds a
   `MediaPeer` seam: a separate process owns the WebRTC stack while flux drives it over a thin local
   NDJSON control protocol (`join`/`leave`, `publish_audio`, `publish_video`, `mute`, plus inbound

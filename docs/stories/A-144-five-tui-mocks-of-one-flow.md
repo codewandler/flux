@@ -2,12 +2,11 @@
 id: A-144
 title: "Five hard-coded TUI mocks of the same flow — pick the loop view by looking at it, not by arguing about it"
 pillar: Agent
-status: in-progress
-priority: 6
+status: done
 design: docs/designs/agent-loop-visibility.md
 epic: agent-loop-visibility
 areas: [flux-tui]
-note: "de-risks A-137 before a line of live plumbing is written. Five DIFFERENT layout strategies, one shared hard-coded flow fixture, rendered side by side. ⚠ The deliverable is a RECOMMENDATION, not five pictures — and a mock that only renders a tidy 6-step flow proves nothing about the run that matters"
+note: "⚠ The recommendation CHANGED under review: condense finished phases FIRST, then build the split — the long-run comparison was confounded in mock 3's favour, since only it had phase-condensing. The two are separable and the first is most of the win. Snapshot set: docs/designs/agent-loop-visibility-mocks.md"
 ---
 
 # Look at five, then choose one
