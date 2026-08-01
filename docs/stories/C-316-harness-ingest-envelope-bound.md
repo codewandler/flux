@@ -2,8 +2,7 @@
 id: C-316
 title: "Harness ingest holds one envelope per session, and a schema without session ids makes that one per message"
 pillar: Core
-status: in-progress
-priority: 8
+status: done
 epic: harness-history
 design: docs/designs/harness-history.md
 areas: [flux-capabilities]

@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Harness ingest's live session envelopes are bounded** (C-316). Ingest held one envelope per
+  session for the whole scan, and a harness schema without session identity degenerates that to one
+  per *message* — so retention scaled with transcript size rather than with session count. Proven by
+  a test that measures peak retention from outside, by replaying the upsert stream: twice the
+  messages, twice the retention (5000 → 10000). `MAX_LIVE_SESSION_ENVELOPES` (4096) now flushes the
+  oldest envelope — projected, upserted, released — rather than refusing or dropping, with the cost
+  reported through `sessions_evicted()`.
+  ⚠ **The cost is stated rather than hidden**: a session whose messages straddle an eviction is
+  projected twice, the later projection wins, so its message count becomes a lower bound *and* its
+  rendered time range narrows on both ends — including the start timestamp its title carries.
+  Redaction containment now also covers the session envelope's `session_id`/`model`/`workspace`/
+  `path`. `meta.harness` and `meta.role` are deliberately **exempt**, with the reason recorded at the
+  definition: they are the search filter's key, compared against a closed set of static enum ids, so
+  redacting them makes a search answer "no matches" over an index that holds the rows. Verified: no
+  parse, file, or config path can put operator text into either field.
+  ⚠ The adapters' own `session id → ordinal` maps are a retention this cap does **not** bound, left
+  deliberately — bounding them trades a memory bound for silently colliding record ids.
+
 ### Added
 
 - **The connectors seam refuses a credential-bearing response, rather than redacting one** (C-312).
