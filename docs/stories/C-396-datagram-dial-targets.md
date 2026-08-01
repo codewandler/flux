@@ -2,8 +2,7 @@
 id: C-396
 title: "UDP and ICMP dial targets"
 pillar: Core
-status: in-progress
-priority: 8
+status: done
 design: docs/designs/execution-substrate.md
 epic: execution-substrate
 note: "raw ICMP needs CAP_NET_RAW — an unheld capability must refuse at construction, because a check that happens on the wire has already leaked the attempt"
