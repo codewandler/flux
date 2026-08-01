@@ -8,6 +8,118 @@
 //! [`System`] is the **native** guarded backend. The same guarded operations are also stated as
 //! capability traits in [`port`], so a non-syscall substrate (a Wasm embedder reaching host imports,
 //! a remote executor, a test double) can serve them — see that module for what is and is not a port.
+//!
+//! # Binding `flux-system` without `flux-runtime`
+//!
+//! `flux-system` and `flux-runtime` are **peers at L2** — neither is inside the other, and this
+//! crate does not depend on that one. Linking `flux-system` alone, with your own policy engine on
+//! top, is a **supported** configuration and the reason [`port`]'s traits are unsealed.
+//!
+//! The failure this section exists to prevent is the other thing: **assuming that taking the
+//! substrate also took flux's judgment.** It did not. `AGENTS.md`'s *"every tool in flux runs
+//! through `Executor::dispatch`"* is a claim about **flux**, enforced inside flux's own repository.
+//! A consumer that binds this crate and dispatches its own way is not violating that invariant — it
+//! was never inside it — but it also gets none of what that invariant buys, and the two lists below
+//! say exactly which is which.
+//!
+//! Two related questions, each answered once and cross-linked rather than duplicated:
+//!
+//! - **What does it mean to *implement* the guarded port?** — [`port`]'s module docs. Short answer:
+//!   you take responsibility for these guarantees yourself; the in-repo gate does not reach you.
+//! - **What does it mean to *consume* the substrate without the envelope?** — this section.
+//!
+//! ## Travels with `flux-system` alone
+//!
+//! Every item here is a property of code in this crate, so a consumer that calls it gets it.
+//!
+//! - **Path confinement against a [`Workspace`].** [`Workspace::resolve`] (writes) and
+//!   [`Workspace::resolve_read`] (reads) refuse **both** escape shapes: lexical — a normalized
+//!   `..` that leaves the matched root fails the containment check — and symlink, walked
+//!   component-by-component with `symlink_metadata` so a *dangling* link to an outside target is
+//!   caught too (the case a plain parent-canonicalize misses on write), then re-checked after
+//!   canonicalizing the longest existing ancestor to catch a second-order alias.
+//!   *Bounded by the workspace you construct:* [`Workspace::set_unconfined`] (the explicit
+//!   `--allow-all-paths` / `FLUX_ALLOW_ALL` hatch) lifts confinement entirely, and
+//!   [`Workspace::add_read_root`] widens reads only. Confinement is never lifted implicitly.
+//! - **Argv-only process execution through one `build_command`.** Program is `argv[0]`, there is no
+//!   shell and no shell string is ever built, and cwd is pinned to the workspace root. Every spawn
+//!   mode ([`System::run`], [`System::run_with_env`], [`System::run_with_env_streamed`],
+//!   [`System::spawn_background`], [`System::spawn_interactive`], [`System::spawn_debug_pipe`])
+//!   layers only its own stdio on the command that one private builder returns, so the envelope has
+//!   no bypass *within this crate*. The mechanical "and nowhere else constructs a process" half is
+//!   `flux-codegate`'s in-repo gate; its reach ends at this repository, so downstream it is your
+//!   discipline, not a check.
+//! - **Environment cleared to a non-secret allow-list.** `env_clear()` first, then only
+//!   `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `TZ`, `USER`, `LOGNAME`, `TMPDIR`,
+//!   `RUST_LOG`, `RUST_BACKTRACE`, `RUSTUP_HOME`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`, `KUBECONFIG`.
+//!   A child therefore cannot read a host credential out of `std::env`. *The caller's own `env`
+//!   argument is applied last and wins* — it is a Rust-caller slot, never model input, and a
+//!   consumer that assembles it from material it does not control owns that decision.
+//! - **Captured output byte-capped.** One MiB per stream for a captured run, 256 KiB per stream for
+//!   a [`ManagedChild`], with a truncation notice appended and lossy UTF-8 decoding so a cut never
+//!   lands mid-codepoint. The reader keeps draining past the cap, so a full pipe cannot deadlock the
+//!   child. *Applies to captured output:* [`System::run_with_env_streamed`] inherits the parent's
+//!   stdio and captures nothing, so there is nothing to cap.
+//! - **Egress hostname→address resolution with blocked ranges.** [`net::guard_url_scoped`] rejects
+//!   non-HTTP schemes, then resolves the host and refuses the destination if **any** answer is
+//!   private, loopback, link-local, unique-local, CGNAT, or an IPv4-mapped form of those — so a
+//!   hostname pointing at `169.254.169.254` cannot slip through — unless the caller's
+//!   [`net::PrivateNetAllow`] scope covers that host. *This is a guard you call, not an ambient
+//!   one:* this crate performs no HTTP of its own. [`net::dial_scoped`] is safe by construction —
+//!   it connects to the vetted addresses inside the guard — but the URL-returning guards hand back
+//!   only a `Url`, and a caller whose HTTP client re-resolves that hostname reopens the
+//!   DNS-rebinding TOCTOU. That is what [`net::guard_url_scoped_pinned`] is for: bind the client to
+//!   the addresses it returns.
+//! - **OS sandbox confinement where a backend is available.** [`sandbox::Backend::Bubblewrap`]
+//!   (Linux) / [`sandbox::Backend::Seatbelt`] (macOS), applied at the same single spawn choke point,
+//!   with [`sandbox::SandboxMode::Require`] refusing to spawn at all when no backend is usable.
+//!   ***Opt-in, and off by default:*** [`System::new`] builds [`sandbox::Sandbox::disabled`], so a
+//!   consumer constructing a `System` the obvious way gets **no** OS confinement. Use
+//!   [`System::from_env`] or [`System::with_sandbox`]. [`sandbox::Confinement::Exempt`] spawns are
+//!   never wrapped (that enum documents the complete inventory), and on a platform with no backend
+//!   only [`sandbox::Backend::Unsupported`] is ever returned.
+//!
+//! ## Does **not** travel — these are `flux-runtime`'s
+//!
+//! Read this crate's `Cargo.toml` for the shortest proof: the entire dependency set is
+//! `flux-core`, `tokio` and `url` (plus `libc` on unix). It does not include `flux-policy`,
+//! `flux-secret`, `flux-evidence` or `flux-runtime` — and a crate cannot enforce a policy it has no
+//! dependency on.
+//!
+//! - **Default-deny authorization over subjects × resources × actions.** `flux_policy::evaluate` is
+//!   default-deny — a request is permitted only if some grant matches its subject, action and
+//!   resource, the caller's trust meets `required_trust`, and the caller holds the grant's scopes;
+//!   anything unmatched is `Decision::Deny`. `flux_runtime::Executor` is what makes that a floor
+//!   every call must clear. Nothing in `flux-system` consults a policy: it will run the argv you
+//!   hand it.
+//! - **The approval gate.** `Executor::dispatch` prompts a human when the permission rules do not
+//!   already cover the call, and *forces* a prompt for a destructive risk or intent, a
+//!   policy-flagged effect, or a `Write` tool reporting no path subjects. `flux-system` has no
+//!   approver and asks nobody.
+//! - **Redaction of tool output and errors.** The dispatcher runs a `flux_secret::Redactor` over
+//!   both faces of a result and over any error before it reaches a model, a log, or a surface — and
+//!   re-redacts a cached result against the current secret set. `flux-system` returns raw bytes; a
+//!   secret in a subprocess's stdout comes back verbatim.
+//! - **Evidence recording.** `Executor::dispatch` writes `tool_call`, destructive-marker and
+//!   `tool_error` observations into a `flux_evidence::EvidenceLog` that reactions and later stages
+//!   read. `flux-system` records nothing; a run through it leaves no audit trail of its own.
+//!
+//! Three of those four have their *mechanism* in a pure L0 crate — `flux-policy` (the evaluator),
+//! `flux-secret` (the redactor), `flux-evidence` (the log) — which a second consumer may depend on
+//! directly and enforce its own way; the approval gate is `flux-runtime`'s own. So what fails to
+//! travel is not the mechanism but the **enforcement**: nothing here calls any of them on your
+//! behalf.
+//!
+//! ## Why merging the two crates would be wrong
+//!
+//! A consumer that wants the execution substrate almost never wants flux's approval model — an
+//! unattended service has no human at a terminal to prompt. Fusing judgment and mechanism into one
+//! crate would force that consumer to take both, and the predictable outcome is that it takes
+//! neither and reimplements guarded IO instead. Reimplemented guarded IO is precisely the failure
+//! this crate exists to prevent, so the peer split is a safety property, not a packaging preference.
+//!
+//! Stated for users in `docs/concepts.md`; the engineering consequence is
+//! `docs/designs/execution-substrate.md`.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};

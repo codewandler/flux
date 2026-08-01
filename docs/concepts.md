@@ -154,6 +154,60 @@ never literals.
 
 ---
 
+## Binding `flux-system` without `flux-runtime`
+
+The peer split above has a consequence worth stating as a contract rather than leaving to be
+inferred: **linking `flux-system` alone and bringing your own policy engine is supported.** That is
+what a published substrate with an unsealed port is *for*. The failure this section exists to prevent
+is the other one — assuming that taking the mechanism also took the judgment.
+
+flux's own rule, *"every tool in flux runs through `Executor::dispatch`"*, is a claim about **flux**,
+enforced inside flux's repository. A consumer that binds the substrate and dispatches its own way is
+not violating that rule — it was never inside it. It also inherits none of what the rule buys.
+
+**Travels with `flux-system` alone:**
+
+- **Path confinement** against a workspace — a normalized `..` that leaves the root is refused, and
+  so is a symlink escape, including a *dangling* symlink whose target does not exist yet. Bounded by
+  the workspace you construct: the `--allow-all-paths` hatch lifts confinement explicitly, and
+  read-only roots widen reads only.
+- **Argv-only process execution** through one command builder — no shell, the program is `argv[0]`,
+  the working directory is pinned to the workspace root, and every spawn mode layers only its own
+  stdio on top of that one builder.
+- **Environment cleared** to a minimal non-secret allow-list (`PATH`, `HOME`, locale, `TERM`,
+  toolchain locations, diagnostics knobs), so a child cannot read a host credential out of the
+  environment. The caller's own explicit overrides are applied last and win.
+- **Captured output byte-capped**, cut on a character boundary with a truncation notice, while the
+  reader keeps draining so a full pipe cannot deadlock the child.
+- **Egress guarding** — hostnames resolve to addresses, and the destination is refused if *any*
+  answer is private, loopback, link-local, ULA, CGNAT or an IPv4-mapped form of those, unless the
+  caller holds a scoped grant for that host. It is a guard you call: the substrate performs no HTTP
+  of its own, and a URL-returning guard closes DNS rebinding only if the client pins to the
+  addresses it returned.
+- **OS sandbox confinement** where a backend is available — and only where one was asked for. The
+  sandbox is **opt-in**: a `System` built the plain way has it disabled.
+
+**Does not travel — these are `flux-runtime`'s:**
+
+- **Default-deny authorization** over subjects × resources × actions. Nothing in the substrate
+  consults a policy; it runs the argv it is handed.
+- **The approval gate.** The substrate has no approver and asks nobody.
+- **Redaction of tool output and errors.** The substrate returns raw bytes — a secret in a
+  subprocess's stdout comes back verbatim.
+- **Evidence recording.** A run through the substrate leaves no audit trail of its own.
+
+Three of those four have their *mechanism* in a small pure crate of its own — `flux-policy` (the
+evaluator), `flux-secret` (the redactor), `flux-evidence` (the log) — which a second consumer can
+depend on directly and enforce its own way; the approval gate is `flux-runtime`'s own. So what fails
+to travel is not the mechanism but the **enforcement**: nothing in the substrate calls any of them
+on its behalf.
+
+The crate-level companion to this section is `flux-system`'s own documentation, which names the exact
+function behind each line. The neighbouring question — what it means to *implement* the guarded port
+rather than consume it — is answered once in the `port` module and not repeated here.
+
+---
+
 ## What knows: datasources and evidence
 
 **Datasource** — the knowledge layer: an indexed store of records (workspace documents, integration

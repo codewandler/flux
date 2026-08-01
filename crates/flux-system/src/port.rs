@@ -60,6 +60,11 @@
 //! So: inside flux, "one guarded path starts every OS process" is mechanically enforced. Outside
 //! flux, a consumer that implements these traits is taking responsibility for the guarantees itself.
 //!
+//! That is the *implementor's* question. The adjacent one — what a consumer that merely **links**
+//! `flux-system`, native backend and all, does and does not inherit by doing so — is answered once
+//! at the crate root, under "Binding `flux-system` without `flux-runtime`". Neither answer is
+//! repeated here.
+//!
 //! ## Fail-closed defaults
 //!
 //! Optional port operations default to a denial, never to a weaker equivalent. Bringing a substrate

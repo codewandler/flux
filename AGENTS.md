@@ -99,7 +99,7 @@ convention — enforced by `cargo test -p flux-codegate`; the authoritative map 
 ## Non-negotiable conventions
 
 - **All real filesystem / process / network IO goes through `flux-system`** (`System` / `Workspace`). Tools never touch `std::fs` or `std::process::Command` directly. **argv-only** execution — never build a shell string from model input.
-- **Every tool runs through `Executor::dispatch`** (`flux-runtime`). Don't call a tool's `execute` directly outside tests; the dispatcher is the policy/approval/redaction gate.
+- **Every tool *in flux* runs through `Executor::dispatch`** (`flux-runtime`). Don't call a tool's `execute` directly outside tests; the dispatcher is the policy/approval/redaction gate. This scopes to **this repository**, not to every consumer of the substrate: binding `flux-system` alone and bringing your own policy engine is supported and violates nothing. What such a consumer does and does not inherit is stated once, at `flux-system`'s crate root ("Binding `flux-system` without `flux-runtime`").
 - **Secrets never appear in logs or model-visible output as raw values.** Register them with the `Redactor` (`flux-secret`). Use `secret:env/KEY` refs, not literals.
 - **Errors:** library crates return `flux_core::Result<T>`/`Error` (`thiserror`); the `flux` binary uses `anyhow`. No `unwrap()` in non-test code on fallible IO. *Wire-seam exception:* where the error crosses a protocol boundary as the payload itself (plugin frame `err`, A2A JSON-RPC error, host-capability callback), `Result<_, String>` is correct.
 - **Async is `tokio`, and long-running agent work stays cancellable** — thread `CancellationToken` through the agent loop, `Spawner::spawn`, and orchestration.
