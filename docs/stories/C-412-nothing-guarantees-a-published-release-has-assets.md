@@ -2,8 +2,7 @@
 id: C-412
 title: "Nothing mechanically guarantees a published Release has assets, and v0.47.0 proved it"
 pillar: Core
-status: in-progress
-priority: 5
+status: done
 epic: release-trust-residuals
 areas: [ci, docs]
 note: "F6 of the 2026-08-01 security-posture review at 0.47.1, with live proof. `gh release create` publishes the Release and the asset check runs one step LATER in the same job, so a run that built nothing publishes first and discovers it afterwards — which is exactly what v0.47.0 shipped. (The review's `dist host --steps=create` mechanism was measured during implementation and is inert on dist 0.32.0's GitHub backend.)"

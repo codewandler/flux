@@ -8,6 +8,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A GitHub Release can no longer be published without its assets** (C-412, from F6 of the
+  2026-08-01 security-posture review). v0.47.0 shipped a published Release whose only asset was
+  `dist-manifest.json`, with `/releases/latest` pointing at it, so every download link 404'd.
+  `verify-github-release.sh` gains a `--staged <dir>` mode applying the same asset-set rules to the
+  directory `gh release create` is about to upload, and it runs **above both the attestation and the
+  create step** — so an incomplete set is never attested and never published. The core-asset list is
+  one function shared by the pre- and post-publication checks, so the two cannot drift apart. The
+  fleet audit now compares asset **names and platform-archive counts** rather than only tag
+  existence, with a `v0.3.0` floor (measured: of 113 Releases exactly eight carry zero assets, all
+  below it) instead of an allowlist.
+  ⚠ **The trigger was prose in this changelog.** The release body embeds the CHANGELOG; 0.47.0's
+  entry contained token-shaped text (`Authorization: Bearer <jwt>`), GitHub Actions masked it, and
+  rather than emit the output masked it **discarded the plan job's `val` output entirely** —
+  `##[warning]Skip output 'val' since it may contain secret`. A voided `val` nulls
+  `artifacts_matrix.include`, which skips every build job, which makes the run report `success`
+  having built nothing. The job output crossing to the build matrix is now filtered to the fields it
+  needs, so no announcement prose can void it again.
+  ⚠ Recorded because the first cut of this fix was wrong in an instructive way: it moved
+  `dist host --steps=create` out of the plan job on the theory that this was what published the
+  Release early. It was not — in pinned cargo-dist 0.32.0 that verb's GitHub arm is empty, so the
+  move was **behaviourally inert**, and the real publisher was `gh release create` in `host` all
+  along. A wrong mechanism asserted in a guard's abort text would have misled whoever tripped it.
+
+### Fixed
+
 - **An untrusted event payload can no longer reach the model inside flux's own instruction framing**
   (C-407, from F1 of the 2026-08-01 security-posture review). A room delivery whose `text` is empty
   after trimming fell through to `event_context`, which interpolated every payload field into a
