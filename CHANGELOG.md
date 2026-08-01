@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-08-01
+
 ### Fixed
 
 - **The credential boundary now checks the host-dispatched plugin response too, and the census is

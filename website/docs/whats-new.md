@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.47.0] - 2026-08-01
+
 ### Action needed
 
 - **A `flux app` program using the old positional call form will now refuse to start.** App
