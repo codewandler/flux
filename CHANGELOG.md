@@ -8,6 +8,39 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **⚠ BREAKING: a plugin that widens its declared capabilities is refused, not silently adopted**
+  (C-411, from F5 of the 2026-08-01 security-posture review). The descriptor recorded what a plugin
+  asked for, but a widened manifest was adopted at the next load with no diff surfaced — so the grant
+  an operator reasoned about at install time was not necessarily the grant in force. The first fetch
+  now records a **grant of record**, and a later fetch that asks for more is refused, naming every
+  field that grew and the descriptor path.
+  The check sits at `PluginHost::manifest` — **the single point where a plugin's declaration enters
+  the host** — so `flux plugin call`, `status`, agent startup and the SDK are all covered by one call
+  site. The first attempt put it at tool projection instead, which `flux plugin call` bypasses
+  entirely: that path installs the fetched manifest verbatim, so the widened set became the enforced
+  grant for the dispatched op. ⚠ It was caught by this repo's **own** `call_with_host` census
+  (C-404), which already listed `flux plugin call` as a distinct ingest site — the census contradicted
+  the chokepoint claim before any test did.
+  The grant covers all five fields `with_manifest` installs — `capabilities`, `auth`, `endpoints`,
+  `config`, `discovers` — not just capabilities. That matters: a plugin already granted `http: true`
+  could otherwise widen its reachable hosts by **adding an `EndpointSpec`**, because
+  `ensure_http_host_allowed` admits a host via the endpoint set as well as the declared host list.
+  `from_manifest` destructures the manifest exhaustively, so a new protocol field fails to compile
+  until it is classified.
+  ⚠ **What changes for you.** A plugin upgrade that legitimately adds a capability now refuses until
+  re-granted; the remedy is removing the `[grant]` table from the descriptor, which keeps
+  `previous`/`version`/`sha256` so `rollback` still works offline. Containment is literal, so a
+  cosmetic manifest edit — rotating an endpoint's `env` list, editing a description — also counts as a
+  widening. And a read-only plugin store is now a hard failure where it previously was not, because
+  continuing would re-enter the recording branch at every later load and adopt a widening with no
+  signal at all.
+  The refusal is scoped to the **first** fetch; refresh keeps its own rules. Applying it to every
+  fetch broke two existing refresh tests, because `pin_granted_authority` deliberately
+  accepts-and-ignores a refreshed `endpoints`/`discovers` — the scoping is what makes the two
+  complementary rather than contradictory.
+
+### Fixed
+
 - **A room turn is attributed to the speaker, not to the local operator** (C-408, from F2 of the
   2026-08-01 security-posture review). `AGENTS.md` requires multi-principal surfaces to pass a
   request-owned `TurnIdentity`; there was exactly **one** caller of `run_turn_as` in the tree, in

@@ -14,6 +14,21 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Action needed
 
+- **A plugin that starts asking for more than it did will now refuse to load.** flux records what a
+  plugin declared the first time it runs, and treats that as the grant you agreed to. If a later
+  version asks for more — a new command it may run, a new host it may reach, a new secret it may read
+  — flux refuses it and tells you exactly which of those grew. This closes a gap where a plugin
+  update could quietly widen its own permissions.
+  To accept the new set, remove the `[grant]` table from that plugin's descriptor file (the path is
+  in the message) and let the next run record it afresh. That keeps your rollback target, which
+  uninstalling would discard. `flux plugin status` shows the recorded grant next to what the plugin
+  currently asks for.
+  ⚠ Two consequences worth knowing: the comparison is literal, so even a cosmetic change to a
+  plugin's declared endpoints counts as asking for more; and if flux cannot write to its plugin
+  store, loading now fails rather than continuing unrecorded.
+
+### Action needed
+
 - **Plugins now run sandboxed when flux is working unattended, and some will need a grant.**
   `flux plugin call`, `flux app run <program>` and `flux run <program.flux>` now start plugins inside
   the OS sandbox — the same confinement an auto-approved turn already applied. Two things change for

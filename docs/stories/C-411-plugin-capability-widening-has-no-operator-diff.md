@@ -2,8 +2,7 @@
 id: C-411
 title: "A plugin's capability widening is adopted at next load with no operator-visible diff"
 pillar: Core
-status: in-progress
-priority: 8
+status: done
 epic: connector-platform
 areas: [flux-plugin]
 note: "F5 of the 2026-08-01 security-posture review at 0.47.1. The persisted descriptor records what a plugin asked for; a widened manifest is adopted on the next load without telling the operator what changed"
