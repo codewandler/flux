@@ -1,14 +1,25 @@
-//! The one hand-authored flow all five mocks draw, plus the three load cases that decide the
-//! comparison.
+//! The four load cases the five mocks draw — **two reconstructed from a recorded run, two still
+//! hand-authored** — and the vocabulary they share.
 //!
-//! The flow is the tracking-plugin one — validate story frontmatter, regenerate the board, audit
-//! epics for missing trackers, sync the CHANGELOG — with a model-authored judgement step in the
-//! middle. It is a flow the team already reads every week, and it is the same one C-425 proposes
-//! as the flagship recipe, so the shapes here are the shapes A-137 will actually have to draw.
+//! # Which is which, and why it matters (A-145)
 //!
-//! ⚠ **This is hand-written data, not a captured run.** The timings are plausible, not measured.
-//! What the fixture is good for is layout pressure — step counts, nesting depth, concurrent
-//! children, label lengths — and that is all it is used for.
+//! A-144 authored all four by hand, and its hard cases (49 steps, eight levels, six workers) were
+//! *chosen* by the same context that then picked a layout from them. A-145 replaces the two that
+//! carry the comparison with a projection of a real session out of `~/.flux/events.db`
+//! ([`super::capture`]):
+//!
+//! | case | provenance | what it is |
+//! |---|---|---|
+//! | [`LoadCase::Tidy`] | **recorded** | one turn of `s_1477` — "now, commit all docs in a smart way" |
+//! | [`LoadCase::LongRun`] | **recorded** | all nine turns of `s_1477`, replayed to a cursor |
+//! | [`LoadCase::DeepNesting`] | hand-authored | seven levels of nested delegation |
+//! | [`LoadCase::FanOut`] | hand-authored | six sub-agents running at once |
+//!
+//! ⚠ The last two stay synthetic because **the log cannot currently produce them**: no session in
+//! the store that records op output (post-C-43) also spawns sub-agents, so a real fan-out and a
+//! real tool result cannot come from one capture. That is a finding about the log, recorded in
+//! [`super::capture::FIDELITY`], not a shortcut here — and [`Provenance`] is drawn in every render
+//! header so no reader has to remember which case they are looking at.
 //!
 //! Every step maps onto a shape `UiEvent` already carries
 //! (`crates/flux-tui/src/controller.rs`): [`StepKind::Plan`] is `Plan`, [`StepKind::Phase`] is
@@ -17,6 +28,8 @@
 //! event.
 
 use serde_json::{json, Value};
+
+use super::capture::{self, Slice};
 
 /// The four fixtures. The tidy one is what a mock flatters itself with; the other three are the
 /// ones that decide whether it is a candidate.
@@ -30,15 +43,13 @@ pub const LOAD_CASES: [LoadCase; 4] = [
 /// Which shape of run to draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadCase {
-    /// The flow as it reads in a demo: 15 steps, mid-run, everything visible.
+    /// **Recorded.** One turn of the captured session: a documentation commit, mid-flight.
     Tidy,
-    /// The flow as it reads on a real board: 49 steps under nine top-level rows (a plan step
-    /// plus eight phases) — comfortably more than fits.
+    /// **Recorded.** The whole captured session — nine turns, 33 minutes, replayed to a cursor.
     LongRun,
-    /// Nested delegation: a sub-agent that spawns a sub-agent, seven levels down.
+    /// **Hand-authored.** Nested delegation: a sub-agent that spawns a sub-agent, seven levels down.
     DeepNesting,
-    /// Six tracker-audit workers, five of them running at once and one already finished —
-    /// what a fan-out actually looks like a few seconds in.
+    /// **Hand-authored.** Six tracker-audit workers running at once, each mid-op.
     FanOut,
 }
 
@@ -50,6 +61,42 @@ impl LoadCase {
             LoadCase::LongRun => "long run",
             LoadCase::DeepNesting => "deep nesting",
             LoadCase::FanOut => "fan-out",
+        }
+    }
+
+    /// Whether this case comes off a real machine or out of somebody's head. Drawn, not just
+    /// documented — see [`Provenance`].
+    pub fn is_recorded(self) -> bool {
+        matches!(self, LoadCase::Tidy | LoadCase::LongRun)
+    }
+}
+
+/// Where a fixture's data came from. Carried on [`Fixture`] and rendered into every mock's header,
+/// because a comparison that silently mixes measured and invented load is worse than either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provenance {
+    /// Reconstructed from a committed capture of a real session.
+    Recorded {
+        /// The session id in the store it came from.
+        session: String,
+        /// The model that ran it.
+        model: String,
+        /// Offset from run start of the instant the view is drawn at. The one structural
+        /// approximation the projection makes; see [`super::capture`].
+        cursor_ms: u64,
+    },
+    /// Written by hand for layout pressure. The timings are plausible, not measured.
+    HandAuthored,
+}
+
+impl Provenance {
+    /// The badge every header carries.
+    pub fn badge(&self) -> String {
+        match self {
+            Provenance::Recorded {
+                session, cursor_ms, ..
+            } => format!("recorded {session} @ +{}s", cursor_ms / 1000),
+            Provenance::HandAuthored => "hand-authored".to_string(),
         }
     }
 }
@@ -118,6 +165,9 @@ pub struct Usage {
 pub struct Step {
     /// Pre-order index, assigned by [`Fixture::new`]. Stable within a fixture.
     pub id: usize,
+    /// The durable `StepId` this step was reconstructed from, empty for hand-authored steps. Used
+    /// only while bracketing a capture — no renderer reads it.
+    pub trace_id: String,
     pub kind: StepKind,
     /// The short name — an op, a phase, a role.
     pub label: String,
@@ -145,6 +195,7 @@ impl Step {
     ) -> Self {
         Self {
             id: 0,
+            trace_id: String::new(),
             kind,
             label: label.to_string(),
             detail: detail.to_string(),
@@ -155,6 +206,19 @@ impl Step {
             usage: None,
             children: Vec::new(),
         }
+    }
+
+    /// [`Step::new`], reachable from [`super::capture`] — the reconstruction builds the same steps
+    /// the hand-authored cases do, so the five renderers cannot tell the two apart.
+    pub(super) fn at(
+        kind: StepKind,
+        label: &str,
+        detail: &str,
+        status: Status,
+        start: u64,
+        dur: u64,
+    ) -> Self {
+        Self::new(kind, label, detail, status, start, dur)
     }
 
     fn note(mut self, note: &str) -> Self {
@@ -219,12 +283,41 @@ pub struct Fixture {
     pub elapsed_ms: u64,
     pub steps: Vec<Step>,
     /// The `flow.plan` observation body the graph mock feeds straight to [`crate::plan::render`] —
-    /// the same payload shape the live TUI already receives, `plan_ast` included.
+    /// the same payload shape the live TUI already receives.
     pub plan: Value,
+    /// Measured or invented. Drawn in every header; see [`Provenance`].
+    pub provenance: Provenance,
 }
 
 impl Fixture {
-    fn new(title: &str, elapsed_ms: u64, mut steps: Vec<Step>) -> Self {
+    fn new(title: &str, elapsed_ms: u64, steps: Vec<Step>) -> Self {
+        Self::assembled(
+            title,
+            elapsed_ms,
+            steps,
+            plan_observation(),
+            Provenance::HandAuthored,
+        )
+    }
+
+    /// A fixture reconstructed from a capture. Only [`super::capture`] calls this.
+    pub(super) fn recorded(
+        title: &str,
+        elapsed_ms: u64,
+        steps: Vec<Step>,
+        plan: Value,
+        provenance: Provenance,
+    ) -> Self {
+        Self::assembled(title, elapsed_ms, steps, plan, provenance)
+    }
+
+    fn assembled(
+        title: &str,
+        elapsed_ms: u64,
+        mut steps: Vec<Step>,
+        plan: Value,
+        provenance: Provenance,
+    ) -> Self {
         let mut next = 0usize;
         fn assign(steps: &mut [Step], next: &mut usize) {
             for step in steps {
@@ -238,7 +331,8 @@ impl Fixture {
             title: title.to_string(),
             elapsed_ms,
             steps,
-            plan: plan_observation(),
+            plan,
+            provenance,
         }
     }
 
@@ -303,282 +397,20 @@ impl Fixture {
 /// The fixture for one load case.
 pub fn fixture(case: LoadCase) -> Fixture {
     match case {
-        LoadCase::Tidy => tidy(),
-        LoadCase::LongRun => long_run(),
+        // ⚠ Recorded. The turn is chosen for size (18 steps, closest to the 15 A-144 drew) and
+        // because it is self-contained: status, diff, stage, commit, with an approval in the middle.
+        LoadCase::Tidy => capture::reconstruct(recorded_run(), Slice::Turn(7)),
+        LoadCase::LongRun => capture::reconstruct(recorded_run(), Slice::WholeSession),
+        // Hand-authored — see the module docs for why the log cannot yet produce these two.
         LoadCase::DeepNesting => deep_nesting(),
         LoadCase::FanOut => fan_out(),
     }
 }
 
-/// 15 steps, mid-run: three phases finished, the audit fan-out running, two phases pending. What a
-/// demo shows, and — on its own — what proves nothing.
-fn tidy() -> Fixture {
-    use Status::*;
-    use StepKind::*;
-    Fixture::new(
-        "tracking board sync",
-        12_400,
-        vec![
-            Step::new(Plan, "plan", "low · mutating · 9 ops", Done, 0, 140)
-                .note("frozen from .flux/flows/tracking-sync.flux — 9 ops, 1 model call, 1 fan-out"),
-            Step::new(Phase, "validate", "14 stories · 2 missing `epic:`", Done, 140, 500).kids(vec![
-                Step::new(Tool, "glob", "docs/stories/*.md → 143 files", Done, 145, 120),
-                Step::new(Tool, "read", "docs/stories/_TEMPLATE.md → 41 lines", Done, 265, 12),
-                Step::new(Tool, "track.frontmatter", "143 parsed · 2 missing `epic:`", Done, 277, 363)
-                    .note("A-131 missing `epic:`\nC-388 missing `epic:`\nremaining 141 well-formed"),
-            ]),
-            Step::new(Phase, "judge", "3 epics untracked, 2 ambiguous", Done, 640, 4_260).kids(vec![
-                Step::new(Model, "model.decide", "opus · judge · round 3 · 2 ops", Done, 660, 4_220)
-                    .note(
-                        "the bounded semantic slot: which epics lack a tracker story, and which of\n\
-                         those are ambiguous enough to leave alone. Returns two lists; the runtime\n\
-                         decides what happens to them.",
-                    )
-                    .usage(8_420, 512, 6_100),
-            ]),
-            Step::new(Phase, "audit", "6 workers · 4 running", Running, 4_900, 7_500).kids(vec![
-                Step::new(Spawn, "tracker-audit#1", "agent-loop-visibility → 1 gap", Done, 4_950, 3_150)
-                    .note("A-137 tracked · A-138 tracked · A-139 tracked\nA-144 tracked\ngap: no story covers the fleet pane's fold"),
-                Step::new(Spawn, "tracker-audit#2", "flux-lang-hardening · grep", Running, 4_960, 7_440)
-                    .note("grep \"epic: flux-lang-hardening\" docs/stories\nL-002 · L-003 · L-004 · L-007\nstill reading L-011…"),
-                Step::new(Spawn, "tracker-audit#3", "syntax-simplification · read", Running, 4_970, 7_430)
-                    .note("docs/designs/syntax-simplification.md\n  4 stories claim this epic\n  1 design section has no story\nreading docs/stories/L-014…"),
-            ]),
-            Step::new(Phase, "board", "regenerate the generated region", Pending, 0, 0)
-                .kids(vec![Step::new(Tool, "write", "docs/stories/README.md", Pending, 0, 0)]),
-            Step::new(Phase, "changelog", "sync [Unreleased]", Pending, 0, 0)
-                .kids(vec![Step::new(Tool, "edit", "CHANGELOG.md · 2 edits", Pending, 0, 0)]),
-        ],
-    )
-}
-
-/// 49 steps under nine top-level rows — comfortably more than any viewport here holds. This is the
-/// case that separates the layouts whose cost is per-step from the ones whose cost is per-phase.
-fn long_run() -> Fixture {
-    use Status::*;
-    use StepKind::*;
-    let files = [
-        "A-131-the-fleet-pane.md",
-        "A-137-the-step-thread.md",
-        "A-138-expand-a-step-into-its-graph.md",
-        "A-139-the-loop-view-under-load.md",
-        "C-388-plugin-pack-signing.md",
-        "C-392-server-router-tests.md",
-        "C-395-file-surface-port.md",
-        "C-400-remove-the-downstream-name.md",
-        "C-425-the-flagship-recipe.md",
-    ];
-    /// Build a phase whose children run back to back, advancing the run clock as it goes.
-    fn phase(
-        t: &mut u64,
-        kind: StepKind,
-        label: &str,
-        detail: &str,
-        status: Status,
-        kids: Vec<(String, String, Status, u64)>,
-    ) -> Step {
-        let start = *t;
-        let mut children = Vec::new();
-        for (label, detail, status, dur) in kids {
-            children.push(Step::new(StepKind::Tool, &label, &detail, status, *t, dur));
-            *t += dur;
-        }
-        let total = *t - start;
-        Step::new(kind, label, detail, status, start, total).kids(children)
-    }
-
-    let mut steps = vec![Step::new(
-        Plan,
-        "plan",
-        "low · mutating · 31 ops",
-        Done,
-        0,
-        180,
-    )];
-    let mut t = 180u64;
-    steps.push(phase(
-        &mut t,
-        Phase,
-        "scan",
-        "143 story files",
-        Done,
-        files[..6]
-            .iter()
-            .map(|f| {
-                (
-                    "read".to_string(),
-                    format!("docs/stories/{f}"),
-                    Done,
-                    9 + (f.len() as u64 % 7) * 11,
-                )
-            })
-            .collect(),
-    ));
-    steps.push(phase(
-        &mut t,
-        Phase,
-        "frontmatter",
-        "8 checks · 2 failures",
-        Done,
-        (0..8)
-            .map(|i| {
-                (
-                    "track.frontmatter".to_string(),
-                    format!(
-                        "{} → {}",
-                        files[i % files.len()],
-                        if i % 4 == 1 { "missing `epic:`" } else { "ok" }
-                    ),
-                    if i % 4 == 1 { Failed } else { Done },
-                    34 + (i as u64) * 13,
-                )
-            })
-            .collect(),
-    ));
-    let judge_start = t;
-    steps.push(
-        Step::new(
-            Phase,
-            "judge",
-            "3 epics untracked",
-            Done,
-            judge_start,
-            5_900,
-        )
-        .kids(vec![
-            Step::new(
-                Model,
-                "model.decide",
-                "opus · judge · round 3",
-                Done,
-                judge_start,
-                4_220,
-            )
-            .usage(11_900, 640, 9_200),
-            Step::new(
-                Model,
-                "model.decide",
-                "opus · judge · round 4 (retry)",
-                Done,
-                judge_start + 4_220,
-                1_680,
-            )
-            .usage(12_600, 210, 11_800),
-        ]),
-    );
-    t = judge_start + 5_900;
-    steps.push(phase(
-        &mut t,
-        Phase,
-        "audit",
-        "5 workers",
-        Done,
-        (1..=5)
-            .map(|i| {
-                (
-                    format!("tracker-audit#{i}"),
-                    format!("epic {i} → {} gap(s)", i % 3),
-                    Done,
-                    900 + (i as u64) * 240,
-                )
-            })
-            .collect(),
-    ));
-    steps.push(phase(
-        &mut t,
-        Phase,
-        "rewrite",
-        "9 rows regenerated",
-        Done,
-        files
-            .iter()
-            .map(|f| ("edit".to_string(), format!("docs/stories/{f}"), Done, 18))
-            .collect(),
-    ));
-    steps.push(phase(
-        &mut t,
-        Phase,
-        "board",
-        "generated region only",
-        Done,
-        vec![
-            (
-                "read".to_string(),
-                "docs/stories/README.md".to_string(),
-                Done,
-                11,
-            ),
-            (
-                "write".to_string(),
-                "docs/stories/README.md · 18 234 bytes".to_string(),
-                Done,
-                27,
-            ),
-            (
-                "bash".to_string(),
-                "$ git diff --stat docs/stories/README.md".to_string(),
-                Done,
-                96,
-            ),
-        ],
-    ));
-    steps.push(phase(
-        &mut t,
-        Phase,
-        "changelog",
-        "sync [Unreleased]",
-        Done,
-        vec![
-            ("read".to_string(), "CHANGELOG.md".to_string(), Done, 14),
-            (
-                "edit".to_string(),
-                "CHANGELOG.md · 2 edits".to_string(),
-                Done,
-                22,
-            ),
-            (
-                "grep".to_string(),
-                "\"A-1\" in CHANGELOG.md".to_string(),
-                Done,
-                31,
-            ),
-        ],
-    ));
-    steps.push(phase(
-        &mut t,
-        Phase,
-        "verify",
-        "gate",
-        Running,
-        vec![
-            (
-                "bash".to_string(),
-                "$ cargo fmt --all --check".to_string(),
-                Done,
-                640,
-            ),
-            (
-                "bash".to_string(),
-                "$ cargo test -p flux-codegate".to_string(),
-                Done,
-                8_100,
-            ),
-            (
-                "bash".to_string(),
-                "$ cargo clippy --workspace --all-targets".to_string(),
-                Running,
-                21_400,
-            ),
-            (
-                "bash".to_string(),
-                "$ bash scripts/build-portable-wasm.sh".to_string(),
-                Pending,
-                0,
-            ),
-        ],
-    ));
-    let elapsed = t;
-    Fixture::new("tracking board sync · full regeneration", elapsed, steps)
+/// The committed capture, parsed once. Every render of a recorded case reads this.
+fn recorded_run() -> &'static capture::Capture {
+    static RUN: std::sync::OnceLock<capture::Capture> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| capture::parse(capture::CAPTURE_JSONL))
 }
 
 /// Nested delegation seven levels down — a tracker-audit worker that spawns its own worker. The
@@ -753,24 +585,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_plan_observation_is_a_payload_the_live_plan_card_can_already_read() {
+    fn the_hand_authored_plan_is_a_payload_the_live_plan_card_can_already_read() {
         // If this stops deserializing, the graph mock is drawing something the real renderer
         // would not — which would make it useless as evidence for A-138.
-        let ast = fixture(LoadCase::Tidy).plan["plan_ast"].clone();
+        let ast = fixture(LoadCase::FanOut).plan["plan_ast"].clone();
         let parsed: flux_flow::ast::DraftAst =
             serde_json::from_value(ast).expect("plan_ast is a DraftAst");
         assert_eq!(parsed.name.as_deref(), Some("tracking_sync"));
         assert_eq!(parsed.body.len(), 5);
     }
 
+    /// ⚠ A-145's first correction to A-144. The hand-authored fixture handed the graph mock a
+    /// `plan_ast` because whoever wrote it wanted syntax highlighting. **No run in the store has
+    /// one:** `PlanAttempted` persists `plan_source` (canonical text) and this loop never writes
+    /// `plan_text` at all, so a recorded case can only ever reach `plan::render`'s plain-string
+    /// fallback. The highlighted DAG in A-144's mock 5 snapshots was a picture of a payload the
+    /// durable log does not contain.
+    #[test]
+    fn a_recorded_plan_has_no_ast_because_the_log_never_persisted_one() {
+        for case in LOAD_CASES.iter().filter(|c| c.is_recorded()) {
+            let plan = fixture(*case).plan;
+            assert!(
+                plan.get("plan_ast").is_none(),
+                "{}: a recorded plan cannot have an AST",
+                case.name(),
+            );
+            let src = plan["plan"].as_str().unwrap_or_default();
+            assert!(
+                src.starts_with("flow "),
+                "{}: no durable plan_source to draw: {src:?}",
+                case.name(),
+            );
+            assert!(
+                !crate::plan::render(&plan, &crate::theme::Theme::MONO).is_empty(),
+                "{}: the live plan renderer draws nothing for it",
+                case.name(),
+            );
+        }
+    }
+
     #[test]
     fn every_case_carries_the_load_it_claims() {
-        assert_eq!(fixture(LoadCase::Tidy).step_count(), 15);
-        assert!(
-            fixture(LoadCase::LongRun).step_count() >= 40,
-            "the long run must not fit a viewport: {}",
-            fixture(LoadCase::LongRun).step_count()
-        );
+        // The two recorded cases, at the numbers the capture actually produces. Pinned rather than
+        // bounded: a change here means the projection moved, and that is worth reading a diff over.
+        let tidy = fixture(LoadCase::Tidy);
+        assert_eq!(tidy.step_count(), 18, "one recorded turn");
+        let long = fixture(LoadCase::LongRun);
+        assert_eq!(long.step_count(), 191, "nine recorded turns");
+        assert_eq!(long.steps.len(), 9, "one rail row per turn");
+
         let deep = fixture(LoadCase::DeepNesting);
         let depth = deep.flatten().iter().map(|f| f.depth).max().unwrap();
         assert!(depth >= 7, "deep nesting is only {depth} levels");
@@ -781,6 +644,80 @@ mod tests {
             .filter(|f| f.step.kind == StepKind::Spawn && f.step.status == Status::Running)
             .count();
         assert!(concurrent >= 5, "fan-out is only {concurrent} wide");
+    }
+
+    /// ⚠ **A-145's headline measurement.** A-144's recommendation was revised on review to
+    /// "condense finished phases FIRST", on the reasoning that a finished phase costs one row
+    /// however many steps ran inside it. That reasoning is only worth what the *phase* distribution
+    /// is worth — and the hand-authored fixture's phases were tidy because somebody wrote tidy
+    /// phases (3 to 6 children each, evenly).
+    ///
+    /// A real session's are not. This pins the distribution so the claim is anchored to a
+    /// measurement rather than to a fixture's manners.
+    #[test]
+    fn a_real_runs_phases_are_lumpy_and_the_hand_authored_ones_were_not() {
+        let long = fixture(LoadCase::LongRun);
+        let mut phases: Vec<usize> = long
+            .steps
+            .iter()
+            .flat_map(|turn| turn.children.iter().map(Step::count))
+            .collect();
+        phases.sort_unstable();
+        let singletons = phases.iter().filter(|&&n| n == 1).count();
+        let biggest = *phases.last().expect("phases");
+
+        // Two thirds of the real phases are a single step — condensing them saves nothing…
+        assert!(
+            singletons * 3 >= phases.len() * 2,
+            "{singletons} of {} real phases are one step",
+            phases.len(),
+        );
+        // …while one is fifty-seven, which is where the entire win lives.
+        assert!(
+            biggest >= 50,
+            "the biggest real phase is only {biggest} steps",
+        );
+        // The hand-authored cases have neither shape: no singleton-heavy tail, no outlier.
+        let authored: Vec<usize> = fixture(LoadCase::FanOut)
+            .steps
+            .iter()
+            .flat_map(|r| r.children.iter().map(Step::count))
+            .collect();
+        assert!(
+            authored.iter().max().copied().unwrap_or(0) < 10,
+            "the hand-authored fixture grew an outlier phase: {authored:?}",
+        );
+    }
+
+    /// The provenance badge is on screen, not only in a doc comment — the C-422 discipline applied
+    /// to this artifact itself.
+    #[test]
+    fn every_render_says_whether_its_load_was_measured_or_invented() {
+        for case in LOAD_CASES {
+            let fx = fixture(case);
+            assert_eq!(
+                matches!(fx.provenance, Provenance::Recorded { .. }),
+                case.is_recorded(),
+                "{}: provenance disagrees with the case",
+                case.name(),
+            );
+            let badge = fx.provenance.badge();
+            for mock in super::super::MOCKS {
+                let plain = super::super::render(
+                    mock,
+                    case,
+                    super::super::WIDE,
+                    &crate::theme::Theme::MONO,
+                )
+                .to_plain();
+                assert!(
+                    plain.contains(&badge),
+                    "{} / {}: no provenance badge {badge:?} on screen\n{plain}",
+                    mock.spec().name,
+                    case.name(),
+                );
+            }
+        }
     }
 
     #[test]

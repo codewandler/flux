@@ -142,6 +142,11 @@ mod tests {
     #[test]
     fn the_scope_column_carries_the_nesting_the_layout_refuses_to_draw() {
         let r = loopmock::render(Mock::Thread, LoadCase::Tidy, loopmock::WIDE, &Theme::MONO);
-        assert!(r.to_plain().contains("validate/glob"), "{}", r.to_plain());
+        // The recorded run's own nesting: a turn, the loop phase inside it, the op inside that.
+        assert!(
+            r.to_plain().contains("execute_batch/git_"),
+            "{}",
+            r.to_plain()
+        );
     }
 }

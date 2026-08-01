@@ -325,18 +325,67 @@ mod tests {
     use super::*;
     use crate::loopmock::{self, LoadCase, Mock};
 
+    /// ⚠ **A-145's third correction, and the one that matters most.** The recommendation rests on
+    /// "a finished phase costs one row however many steps ran inside it", so the rail's height
+    /// tracks the program rather than the run. Against the hand-authored fixture that held: one
+    /// run, nine top-level rows, whatever the step count.
+    ///
+    /// Against a real *session* it does not, and the reason is structural rather than a tuning
+    /// miss: the depth-0 unit of a recorded session is a **turn**, and turns accumulate. Nine turns
+    /// is nine rail rows before a single step is drawn, and the focused turn then expands in full.
+    ///
+    /// The condensing still does the bulk of the work — this pins how much — but the claim has to
+    /// be stated as "sub-linear in steps", not "constant".
+    /// The uncondensed rail for a case — the condensing rule on its own, with the terminal's
+    /// windowing taken out of the way.
+    fn rail_height(case: LoadCase) -> usize {
+        let fx = loopmock::fixture(case);
+        rail_rows(
+            &fx,
+            fx.focused(),
+            rail_cols(loopmock::WIDE.cols),
+            usize::MAX,
+            &Theme::MONO,
+            &mut BTreeSet::new(),
+        )
+        .len()
+    }
+
+    /// ⚠ **A-145's re-check of the claim the whole recommendation now rests on.** After review,
+    /// A-144's headline became "condense finished phases FIRST" — because a finished phase costs
+    /// one row however many steps ran inside it. Measured against a real session, that is
+    /// *substantially* true and *not* the constant the fixture implied:
+    ///
+    /// - 191 recorded steps condense to a rail of ~25 rows, a 7× saving, which is the win;
+    /// - but the depth-0 unit of a real session is a **turn**, and turns accumulate — nine of them
+    ///   here — and the focused turn then expands in full. So the rail is sub-linear in steps, not
+    ///   constant, and at 20 rows it already has to scroll.
     #[test]
-    fn the_rails_height_tracks_the_program_not_the_run_length() {
-        // The claim the recommendation rests on: a run three times as long does not cost the rail
-        // three times the rows, because a finished phase stays one row.
-        let tidy = loopmock::fixture(LoadCase::Tidy);
+    fn condensing_makes_a_real_session_sub_linear_but_not_constant() {
         let long = loopmock::fixture(LoadCase::LongRun);
-        assert!(long.step_count() > tidy.step_count() * 3);
+        let rail = rail_height(LoadCase::LongRun);
+
+        // The win, measured: the rail is a small fraction of the flat thread's height.
         assert!(
-            long.steps.len() <= tidy.steps.len() + 3,
-            "the rail grew from {} to {} rows",
-            tidy.steps.len(),
-            long.steps.len()
+            rail * 4 < long.step_count(),
+            "the rail costs {rail} rows for {} steps — barely condensed at all",
+            long.step_count(),
+        );
+        // Not constant: it is one row per turn plus the focused turn in full.
+        assert!(
+            rail > long.steps.len(),
+            "the rail ({rail}) never expanded the focused turn beyond the {} turn rows",
+            long.steps.len(),
+        );
+        assert!(
+            rail > rail_height(LoadCase::Tidy),
+            "nine turns cost the same rail as one; then the fixture, not the layout, was condensing",
+        );
+        // And it still outgrows the terminal this is most often read in.
+        assert!(
+            rail > loopmock::NARROW.rows,
+            "a {rail}-row rail fits a {}-row terminal — the scrolling claim would be wrong",
+            loopmock::NARROW.rows,
         );
     }
 
@@ -358,12 +407,27 @@ mod tests {
 
     #[test]
     fn the_rail_expands_only_the_phase_the_focus_is_in() {
-        let plain =
-            loopmock::render(Mock::Split, LoadCase::Tidy, loopmock::WIDE, &Theme::MONO).to_plain();
-        // The running phase's workers are on the rail…
-        assert!(plain.contains("tracker-audit#2"), "{plain}");
-        // …while a finished phase's tool calls are not.
-        assert!(!plain.contains("_TEMPLATE"), "{plain}");
+        let fx = loopmock::fixture(LoadCase::LongRun);
+        let rail: String = rail_rows(
+            &fx,
+            fx.focused(),
+            rail_cols(loopmock::WIDE.cols),
+            usize::MAX,
+            &Theme::MONO,
+            &mut BTreeSet::new(),
+        )
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+        .collect();
+
+        // Every turn is on the rail, condensed to one row…
+        for turn in 1..=9 {
+            assert!(rail.contains(&format!("turn {turn}")), "{rail}");
+        }
+        // …the focused one expanded into its own phases…
+        assert!(rail.contains("present_results"), "{rail}");
+        // …and nothing from an unfocused turn reaches it — turn 7 is where the commit happened.
+        assert!(!rail.contains("git_commit"), "{rail}");
     }
 
     #[test]

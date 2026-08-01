@@ -38,6 +38,28 @@ fn matrix() -> Vec<(Mock, LoadCase, Viewport)> {
     out
 }
 
+/// A-145's headline: the cases that carry the comparison are **reconstructed from a recorded run**,
+/// not invented by the same context that then picks a layout from them. The proof is that they
+/// contain the recorded run's own vocabulary — `detect_intent`, `explore`, `approve_batch` are the
+/// agent loop's top-level ops as they appear in `~/.flux/events.db`, and no hand-authored fixture
+/// contains them.
+#[test]
+fn the_load_bearing_cases_are_reconstructed_from_a_recorded_run() {
+    let fx = loopmock::fixture(LoadCase::LongRun);
+    assert!(
+        fx.title.contains("s_1477"),
+        "the long-run case is not the recorded session: {:?}",
+        fx.title,
+    );
+    let labels: Vec<&str> = fx.flatten().iter().map(|f| f.step.label.as_str()).collect();
+    for op in ["detect_intent", "explore", "approve_batch", "git_commit"] {
+        assert!(
+            labels.contains(&op),
+            "the recorded run's `{op}` is missing — this is a hand-authored flow, not a capture",
+        );
+    }
+}
+
 /// The exact case the widened sweep was written to catch, pinned by name so a future change to
 /// `min_rows` or to the pane's chrome cannot quietly reintroduce it.
 ///
@@ -327,11 +349,18 @@ fn condensing_and_not_the_second_column_is_what_makes_the_long_run_fit() {
 fn the_graph_mock_annotates_the_renderer_a_138_will_actually_use() {
     // The gutter maps line-for-line onto `plan::render`'s output. If that renderer's shape moves,
     // this is what says so — rather than the annotations silently sliding off their nodes.
-    assert_eq!(
-        loopmock::graph_gutter_len(),
-        loopmock::graph_plan_line_count(),
-        "the graph mock's status gutter no longer lines up with the plan renderer",
-    );
+    //
+    // Per case since A-145: a hand-authored fixture is handed a nine-node `plan_ast` and a matching
+    // table, while a recorded one carries the one-op `plan_source` the log actually persisted and
+    // derives its two-row gutter from it.
+    for case in LOAD_CASES {
+        assert_eq!(
+            loopmock::graph_gutter_len(case),
+            loopmock::graph_plan_line_count(case),
+            "{}: the graph mock's status gutter no longer lines up with the plan renderer",
+            case.name(),
+        );
+    }
 }
 
 /// "Nothing here wires live events, and nothing ships in the default TUI path."

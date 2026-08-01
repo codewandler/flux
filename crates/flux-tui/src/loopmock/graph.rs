@@ -69,15 +69,40 @@ pub(super) const GUTTER: &[&str] = &[
 /// Width of the `✓  120ms ` status gutter cell, before its `│ ` separator.
 const GUTTER_COLS: usize = 10;
 
-/// How many lines the plan renderer emits for the fixture's plan observation. Exposed so the test
-/// can compare it with [`GUTTER`]'s length.
-pub fn graph_plan_line_count() -> usize {
-    crate::plan::render(&super::fixture(super::LoadCase::Tidy).plan, &Theme::MONO).len()
+/// The gutter table for one fixture: which step label prefix annotates each line of
+/// [`crate::plan::render`]'s output.
+///
+/// ⚠ **A-145.** A hand-authored fixture can be given a nine-node program and a hand-written table
+/// to match it. A recorded one cannot: this loop emits **one accepted plan per op**, so a real
+/// "program" is a single call and its gutter is two rows — the `plan` header and that one line.
+/// Deriving the table instead of declaring it is what makes the recorded case drawable at all, and
+/// what makes the resulting picture the honest one.
+fn gutter(fx: &Fixture) -> Vec<String> {
+    if !matches!(fx.provenance, super::Provenance::Recorded { .. }) {
+        return GUTTER.iter().map(|s| s.to_string()).collect();
+    }
+    // `plan · … · N op`, then the flattened `plan_source`. The op the recorded plan calls is the
+    // only thing on that line worth annotating, and it is named after the `=`.
+    let src = fx.plan.get("plan").and_then(|v| v.as_str()).unwrap_or("");
+    let op = src
+        .split_once('=')
+        .map(|(_, rhs)| rhs.trim())
+        .and_then(|rhs| rhs.split('(').next())
+        .map(str::trim)
+        .unwrap_or("");
+    // The renderer emits header + 1 for a one-line plan string.
+    vec![String::new(), op.to_string()]
 }
 
-/// [`GUTTER`]'s length. See [`graph_plan_line_count`].
-pub fn graph_gutter_len() -> usize {
-    GUTTER.len()
+/// How many lines the plan renderer emits for a fixture's plan observation. Exposed so the test can
+/// compare it with the gutter's length, per case.
+pub fn graph_plan_line_count(case: super::LoadCase) -> usize {
+    crate::plan::render(&super::fixture(case).plan, &Theme::MONO).len()
+}
+
+/// The gutter's length for a case. See [`graph_plan_line_count`].
+pub fn graph_gutter_len(case: super::LoadCase) -> usize {
+    gutter(&super::fixture(case)).len()
 }
 
 pub(super) fn draw(
@@ -90,11 +115,12 @@ pub(super) fn draw(
     let budget = vp.rows.saturating_sub(out.len() + tally.footer_rows());
 
     let plan = crate::plan::render(&fx.plan, theme);
+    let table = gutter(fx);
     let flat = fx.flatten();
     let mut drawn: Vec<usize> = Vec::new();
 
     for (i, line) in plan.into_iter().take(budget).enumerate() {
-        let prefix = GUTTER.get(i).copied().unwrap_or("");
+        let prefix = table.get(i).map(String::as_str).unwrap_or("");
         let matches: Vec<&Step> = if prefix.is_empty() {
             Vec::new()
         } else {
@@ -182,19 +208,50 @@ mod tests {
     use super::*;
     use crate::loopmock::{self, LoadCase, Mock};
 
+    fn program_lines(case: LoadCase) -> Vec<String> {
+        loopmock::render(Mock::Graph, case, loopmock::WIDE, &Theme::MONO)
+            .to_plain()
+            .lines()
+            .filter_map(|l| l.split_once('│').map(|(_, right)| right.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn the_program_is_the_same_drawing_under_every_load_case() {
-        // The finding this mock is here to produce: the program does not move. Only the gutter
-        // does — which is both the strength (fixed height) and the weakness (a fan-out of six is
-        // still one row).
-        let strip = |case| {
-            loopmock::render(Mock::Graph, case, loopmock::WIDE, &Theme::MONO)
-                .to_plain()
-                .lines()
-                .filter_map(|l| l.split_once('│').map(|(_, right)| right.to_string()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(strip(LoadCase::Tidy), strip(LoadCase::FanOut));
+    fn the_program_is_the_same_drawing_under_every_hand_authored_case() {
+        // A-144's finding, still true where it was measured: for an authored DAG the program does
+        // not move — only the gutter does. That is both the strength (fixed height) and the
+        // weakness (a fan-out of six is still one row).
+        assert_eq!(
+            program_lines(LoadCase::DeepNesting),
+            program_lines(LoadCase::FanOut)
+        );
+    }
+
+    /// ⚠ **A-145's second correction to A-144.** "The program does not move" was the whole case for
+    /// mock 5 — a fixed-height layout you can read like source. It is a property of the
+    /// hand-authored fixture, which had one nine-node program for the whole run.
+    ///
+    /// A real adaptive run re-authors its program **per op**: the captured session accepted 127
+    /// plans and every one of them is a single call. So the program moves constantly, and it is
+    /// never bigger than one line. The layout whose premise was "show the authored DAG" has, on a
+    /// real run, no DAG to show.
+    #[test]
+    fn a_real_runs_program_is_one_op_and_it_moves_every_step() {
+        let tidy = program_lines(LoadCase::Tidy);
+        let long = program_lines(LoadCase::LongRun);
+        assert_ne!(
+            tidy, long,
+            "the recorded program held still — the capture would have to be single-plan for that",
+        );
+        for (case, lines) in [(LoadCase::Tidy, &tidy), (LoadCase::LongRun, &long)] {
+            let plan_rows = lines.iter().filter(|l| l.contains("flow ")).count();
+            assert_eq!(
+                plan_rows,
+                1,
+                "{}: a recorded plan is one op, so it is one row: {lines:?}",
+                case.name(),
+            );
+        }
     }
 
     #[test]
@@ -209,8 +266,8 @@ mod tests {
 
     #[test]
     fn the_model_call_is_visibly_one_node_among_the_rest() {
-        let plain =
-            loopmock::render(Mock::Graph, LoadCase::Tidy, loopmock::WIDE, &Theme::MONO).to_plain();
+        let plain = loopmock::render(Mock::Graph, LoadCase::FanOut, loopmock::WIDE, &Theme::MONO)
+            .to_plain();
         assert!(plain.contains("model.decide"), "{plain}");
         assert!(plain.contains("track.frontmatter"), "{plain}");
     }
