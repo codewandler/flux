@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **`detect_signals` gets an injection seam, so tests stop probing the operator's home** (C-393).
+  `detect_signals_in` sits beside `detect_signals`, and both home-rooted checks take the env;
+  `AgentSpec::try_with_default_skills_in`, `try_with_model_invoked_skills_in` and
+  `FlowEngine::with_discovery_env` complete the seam. All additive — no published signature changed.
+  `flux-runtime`'s `HOME_LOCK` is deleted outright, since the one test that repointed `$HOME` now
+  pins a value instead.
+  **Measured, not assumed**: under a hostile home populated at every user-global discovery root,
+  exactly **two** tests invert at the merge base — and neither is one of the eleven the story
+  tabulated. The other nine were pinned defensively and correctly, because project roots win
+  precedence. One of the two was a real gate inversion rather than a verdict hazard:
+  `command.invoke` returned a **user-global command's body** instead of refusing an unknown target.
+  Closing it in the same change is what keeps the signal and the gate from disagreeing —
+  `FlowEngine::with_discovery_env` lets a caller pin the probe that surfaces `command.invoke`, so a
+  gate still reading the process `$HOME` could refuse a target the signal had just advertised.
+  A census guards the class, verified to fire by reintroducing each violation — including one inside
+  an `assert!()`, the macro-token path that separates a real guard from a vacuous one. Its blind spot
+  is stated rather than papered over: it sees only *direct* calls from test code, and the
+  `command.invoke` gate was reached through `Executor::dispatch`, found by running the suite under a
+  fixture home rather than by reading. That is concrete evidence for how C-333 should be scoped.
+
 - **The query *key* is now pinned as percent-encoded, and the last private encoder in the root
   workspace is gone** (C-313). Both loose ends from C-303's review. The key-encoding line was
   correct but unobserved: mutating `append_query` to emit the raw key left **80 of 81**

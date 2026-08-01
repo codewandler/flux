@@ -3,8 +3,7 @@ id: C-393
 title: "`detect_signals` has no injection seam, so 11 tests probe the operator's home"
 pillar: Core
 epic: road-to-stable
-status: in-progress
-priority: 7
+status: done
 areas: [flux-runtime, flux-flow, flux-app, flux-agent, flux-sdk, flux-cli, flux-tools, flux-codegate]
 note: "C-332's census, tranche B. `detect_signals(cwd)` reaches skill/command discovery and `~/.kube/config` with the process's real HOME. 11 tests reach it — small, but it is the last unfiled one of C-297's three injection points, and the only one whose reader is a *public* re-exported function"
 ---
@@ -162,3 +161,20 @@ merge base that same home reds `no_command_dirs_yields_an_empty_list` and
 code. `command_invoke`'s gate was reached indirectly, through `Executor::dispatch` → the tool's
 `execute`, and no name-frontier scanner can catch that without flagging every test that registers
 builtins. C-333 (the general ambient-read lint) is where that belongs.
+
+- **Review correction to this story's own text:** the premise that `detect_signals` is "re-exported
+  through the flux-flow facade" is **not true in the tree** — there is no `pub use flux_runtime` in
+  `crates/flux-flow/src/lib.rs` and no such re-export exists. It does not change the outcome (the
+  new entry point is additive either way), but a downstream consumer expecting to pin through the
+  `flux-flow` facade will not find `detect_signals_in` there.
+- **Nothing enforces the `with_discovery_env` / `CommandInvokeTool.env` pairing, and nothing here
+  reasonably could**: the tool struct and its `env` field are private to `flux-tools`, so no caller
+  outside that crate can pin the gate at all — the only pairings available to an external test are
+  (ambient, ambient) or the divergent (pinned engine, ambient gate). Inert today: no test engine
+  registers `command.invoke`. It goes live the first time a test outside `flux-tools` pins an engine
+  *and* registers builtins. Settled by deciding, in C-333, whether `DiscoveryEnv` should be a
+  `ToolContext`-level value rather than a per-tool field.
+- ⚠ `KUBECONFIG` **remains ambient** after this seam — `kubeconfig_present` closes only the
+  home-rooted half, and `std::env::var_os("KUBECONFIG")` is still read. Honestly scoped in the doc
+  comment, and nothing is load-bearing on it (no test asserts absence of the `kubernetes` signal).
+
