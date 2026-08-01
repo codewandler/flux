@@ -180,6 +180,20 @@ All notable changes to this project are documented in this file. The format is b
   the docs — so nothing real is within a factor of 25 of the ceiling.
   Losslessness is preserved on every refusal path: the recovery loop drops only zero-width layout
   markers, verified by a 4,000-case randomized indentation fuzz with zero lossy cases.
+  ⚠ **The lowerer's ceiling was corrected before release, from 256 to 160.** The first cut shipped a
+  guard that could not survive reaching its own limit: the 256-frame descent costs ~1837 KiB against
+  the 2 MiB default thread stack — roughly 10% margin — so **the guard aborted at exactly the depth
+  it exists to refuse**. That was a production defect, not a test artifact: a tokio worker gets the
+  same 2 MiB. Measured cost is linear at ~7.1 KiB per level (four frames per nesting level), so 160
+  leaves ~45% headroom while staying above `MAX_PARSE_DEPTH` (128), which keeps every parser-accepted
+  tree lowerable and the compile-time ordering assert true. Pinned by a test that drives the full
+  descent on an explicit 1.5 MiB stack — the constant alone is not enough to pin, because the
+  per-level cost is a property of the frames and a refactor that fattens `lower_statement` would
+  silently eat the margin.
+  ⚠ Residual, stated rather than hidden: `MAX_PARSE_DEPTH = 128` forces a floor of ~930 KiB, so
+  legitimate parsed input still consumes ~45% of a default stack in a debug build. Lowering that
+  further means moving the parser ceiling or slimming the lowering frames — both language-visible,
+  and neither belongs in a hotfix.
 
 - **Harness ingest's live session envelopes are bounded** (C-316). Ingest held one envelope per
   session for the whole scan, and a harness schema without session identity degenerates that to one
