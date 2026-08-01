@@ -151,6 +151,41 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### Session screencast — render a recorded run as a terminal cast (epic) — 🔄 **PROPOSED (C-421…C-424 filed, none started)**
+
+Demos, docs and blog posts need to *show* flux working, and today the only way is to point a screen
+recorder at a live run and hope. Every asset is then a one-take performance: unreproducible when the
+theme changes, impossible to make in CI. This epic makes a screencast a **render of a recording** —
+run the task once, re-render as often as the layout or the narration needs.
+
+⚠ **"Everything is recorded anyway" is half-true, and the half that isn't is the epic.** What is
+there: `flux-events` rows carry `ts` at **millisecond** resolution, and `EventKind` holds the messages,
+turns, plans and (since C-43) durably-redacted op output — content and timing are on disk, so nothing
+new needs capturing. What is not: the TUI's on-screen surface is `UiEvent`, `pub(super)` and
+**ephemeral**, and the existing durable→screen path (`crates/flux-tui/src/projection.rs`) is **100
+lines handling five observation kinds against 26 live variants**. The data is largely there; the
+projection is not. That 5-of-26 ratio is why [C-422](stories/C-422-the-render-projection.md) — the
+render projection, and a committed *fidelity table* saying per variant whether a cast shows truth, an
+approximation, or nothing — gates the renderer instead of being folded into it. Some variants are
+genuinely unrecoverable (C-158's live tool tail, spinner frames, retry countdowns); a cast must not
+invent them.
+
+The other three: [C-421](stories/C-421-tui-takes-a-task-from-the-cli.md) gives `flux tui` a positional
+prompt — it is the one verb you cannot hand a task, and a run that starts from a command line is a run
+that can be re-recorded unattended; [C-423](stories/C-423-flux-cast.md) paints the timeline headless to
+**asciicast v2** (text, so it diffs in review, and no image dependency — GIF/SVG stays `agg`'s job)
+using the live TUI's own widgets, so a cast shows the product rather than a mock of it; and
+[C-424](stories/C-424-a-cast-is-a-publishing-act.md) is the safety story, deliberately not folded into
+the renderer. ⚠ **A cast's whole purpose is to leave the machine**, unlike every other Time Machine
+verb, and redaction has failed *open* here before (C-339). Rendering is a second chance to leak — a
+secret can be absent from a payload and present in a wrapped, ANSI-styled frame reassembled from it —
+so the test must attack the rendered frames, and an unavailable redactor must refuse the cast rather
+than write it.
+
+This is the visual sibling of **Time Machine** (A-45 replay, A-46 fork, C-44 diff re-*run* a session;
+this re-*shows* one, needing no execution at all) and follows **flux-render**'s precedent (L-74…L-78).
+Design: [session-screencast.md](designs/session-screencast.md).
+
 ### Guarded network primitives — DNS · TCP · UDP · ICMP behind one egress decision (epic) — 🔄 **PROPOSED (C-418; C-284…C-288 filed, none started)**
 
 `guard_url_scoped` resolves a hostname and decides on the **resolved address**, refusing private,
