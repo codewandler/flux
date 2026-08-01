@@ -15,6 +15,23 @@
 
 ## [Unreleased]
 
+### Action needed
+
+- **Plugins now run sandboxed when flux is working unattended, and some will need a grant.**
+  `flux plugin call`, `flux app run <program>` and `flux run <program.flux>` now start plugins inside
+  the OS sandbox — the same confinement an auto-approved turn already applied. Two things change for
+  a plugin that needs them:
+  - **Network is closed.** A plugin that calls a vendor API (gitlab, aws, …) will fail to reach it
+    until you allow it: set `[sandbox] network = true`, export `FLUX_SANDBOX_NET=1`, or pass
+    `--no-sandbox`.
+  - **Writes outside your workspace are refused.** A plugin that keeps state in `~/.config/<vendor>`
+    will fail. The workspace, the temp directory and toolchain caches stay writable.
+
+  flux now prints one line saying it confined the run and what it narrowed, so a failing plugin is
+  not mistaken for a vendor outage. On a machine with no sandbox backend available at all, these
+  commands refuse to start rather than running unconfined — that is deliberate, and `--no-sandbox`
+  is the deliberate way out.
+
 ### New
 
 - **A flux agent can join a Brave Talk room.** Declare `backend = "jaas"` on a room channel and the

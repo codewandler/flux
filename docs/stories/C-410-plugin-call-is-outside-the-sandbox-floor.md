@@ -2,8 +2,7 @@
 id: C-410
 title: "`flux plugin call` is outside both the sandbox floor and the approval envelope"
 pillar: Core
-status: in-progress
-priority: 7
+status: done
 epic: connector-platform
 areas: [flux-cli, flux-sdk]
 note: "F4 of the 2026-08-01 security-posture review at 0.47.1. `unattended_sandbox_surface` has no `Commands::Plugin` arm, so `flux plugin call` runs headless with the sandbox at its `Off` default, no approver, and outside `Executor::dispatch`. C-404's hardening exists precisely because that command prints plugin-authored strings to a terminal"

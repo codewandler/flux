@@ -8,6 +8,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **⚠ BREAKING: `flux plugin call` and program mode now run under the fail-closed sandbox floor**
+  (C-410, from F4 of the 2026-08-01 security-posture review). `unattended_sandbox_surface` had no
+  `Commands::Plugin` arm, so `flux plugin call` executed a plugin operation headlessly with the
+  sandbox at its `Off` default, no approver, and outside `Executor::dispatch` entirely.
+  The hand-maintained enumeration is the real defect, so the fix is structural: the `_ => None`
+  wildcard is **deleted**, and a new `Commands` variant now fails to compile rather than silently
+  inheriting no posture. A codegate guard catches anyone re-adding a catch-all, and both were
+  verified to fire.
+  ⚠ **A stated exemption turned out to be false, and finding that changed the answer.** `app run`
+  was first exempted on the grounds that its deny-by-default approver protects it. It does not:
+  `run_app` calls `assemble_integrations` **at startup**, spawning every installed plugin binary
+  before any journey exists and entirely outside dispatch — measured as network-open and
+  write-outside-workspace-succeeds. Worse, `flux run <program.flux>` reaches the *same* daemon, so
+  pinning only `app run` would have moved the hole rather than closed it. **Program mode is now
+  pinned under both spellings, flagged or not**, keyed on C-262's own criterion — a program serves
+  its channels until Ctrl-C and its cron/webhook triggers fire with no operator attached.
+  The failed premise is kept as a recorded negative result rather than deleted, so the next reader
+  inherits the lesson instead of re-deriving it.
+  ⚠ **What changes for you, beyond the network.** A confined surface also narrows the plugin's
+  writable filesystem to the workspace, `$TMPDIR` and toolchain caches — tested deliberately, and a
+  plugin keeping state in `~/.config/<vendor>` **will newly fail**. Confined runs now print one
+  stderr line naming both narrowings, because the previous behaviour was silent and a plugin that
+  simply stopped reaching its API looked like a vendor outage.
+  Deliberately **not** widened: the REPL and `flux run <prompt>` spawn plugin binaries at startup
+  too, so "spawns plugins outside dispatch" cannot be the pinning criterion without pinning the REPL,
+  which C-262 exempts. Filed as a follow-up rather than folded in silently.
+
+### Fixed
+
 - **A GitHub Release can no longer be published without its assets** (C-412, from F6 of the
   2026-08-01 security-posture review). v0.47.0 shipped a published Release whose only asset was
   `dist-manifest.json`, with `/releases/latest` pointing at it, so every download link 404'd.
