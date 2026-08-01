@@ -213,7 +213,16 @@ fn lower_composite_decl(declaration: &SyntaxNode) -> DecodeResult<CompositeOpDec
 //
 // The ceiling must admit every tree the parser accepts, so keep it above the parser's own
 // `MAX_PARSE_DEPTH` — no `.flux` source can trip this, only a hand-built tree.
-const MAX_LOWER_DEPTH: usize = 256;
+//
+// It must also be low enough that *reaching* it fits the stack, or the guard aborts at exactly the
+// depth it exists to refuse. That is not hypothetical: at the original 256 the descent measured
+// ~1837 KiB in a debug build — 90% of the 2 MiB platform-default thread stack (`DEFAULT_MIN_STACK_SIZE`
+// on linux-gnu, and what both a libtest thread and a tokio worker get). The guard returned its
+// bounded error locally on ~200 KiB of margin and `SIGABRT`ed in CI, where codegen differs just
+// enough to spend it. Measured cost is ~7.1 KiB per level (four frames: `lower_block` →
+// `lower_statement` → `lower_when`/… → `lower_block`), so 160 costs ~1.1 MiB and leaves ~45% of a
+// default stack free. Raising this without re-measuring that descent reintroduces the abort.
+const MAX_LOWER_DEPTH: usize = 160;
 
 // Checked at compile time so the two ceilings can never drift into an order where a program the
 // parser accepts fails to lower: the guard must bound the adversary, not the author.
@@ -2807,14 +2816,20 @@ mod tests {
     /// overflowing the stack. Before the guard this `SIGABRT`ed — the parser's L-81 cap sat one stage
     /// upstream and `Parse`'s public fields let a tree in that never went through it.
     ///
-    /// The fixture stops at 3,000 levels rather than the 20,000 the expression legs use because
-    /// **rowan's own green-node `Drop` is recursive** and aborts at ~4,000 levels: a deeper tree
-    /// would take the process down in the test's cleanup instead of in the code under test. 3,000 is
-    /// still an order of magnitude past the ~200 levels that overflow a 2 MiB tokio-worker stack.
+    /// The fixture is sized from [`MAX_LOWER_DEPTH`] rather than pinned to a literal, for two
+    /// reasons. The guard short-circuits *at* the ceiling, so every depth past it walks exactly the
+    /// same frames — a deeper tree proves nothing more. And depth costs stack twice over: **rowan's
+    /// own green-node `Drop` is recursive**, and measured against a 2 MiB stack it aborts somewhere
+    /// between 3,000 and 6,000 levels, so the original 3,000-level fixture was carrying a second
+    /// cliff at only ~2x margin — one that would take the process down in this test's cleanup rather
+    /// than in the code under test. Deriving the depth keeps it just past the ceiling and far from
+    /// both cliffs; if the ceiling is ever raised above it, `expect_err` fails loudly rather than
+    /// silently testing a tree the guard now admits.
     #[test]
     fn deeply_nested_blocks_are_bounded_not_aborting() {
-        let deep = nested_when_blocks(3_000);
-        let error = lower_block(&deep).expect_err("a 3,000-deep block walk must not recurse");
+        let depth = MAX_LOWER_DEPTH * 2;
+        let deep = nested_when_blocks(depth);
+        let error = lower_block(&deep).expect_err("a block walk past the ceiling must not recurse");
         assert_eq!(error.message, "statement nesting too deep");
 
         // The decrement-on-drop did not leak: a shallow block still lowers on this thread.
@@ -2825,6 +2840,44 @@ mod tests {
                 .len(),
             1,
             "the depth guard must not leak across lowerings"
+        );
+    }
+
+    /// The stack budget the guard is only useful *within* — the invariant the test above cannot see.
+    ///
+    /// A depth guard that returns a bounded error only on a generously-sized stack has not bounded
+    /// anything; it has moved the abort to whichever thread has less. This is the regression that
+    /// actually shipped: at `MAX_LOWER_DEPTH = 256` the descent needed ~1837 KiB against the 2 MiB
+    /// platform default, so it passed on one machine and `SIGABRT`ed on CI's. Pinning the ceiling
+    /// alone would not have caught it — the cost per level is a property of the lowering frames, not
+    /// of the constant, so a refactor that fattens `lower_statement` regresses this with the ceiling
+    /// untouched.
+    ///
+    /// So assert the budget directly: reaching the ceiling must fit a stack *well under* the 2 MiB a
+    /// libtest thread and a tokio worker both get by default. A failure here aborts the process
+    /// rather than failing the assertion — that abort **is** the signal, and it is deterministic
+    /// instead of depending on how the day's codegen laid out the frames.
+    #[test]
+    fn reaching_the_ceiling_fits_a_thread_stack_smaller_than_the_default() {
+        const BUDGET: usize = 1536 * 1024; // 75% of the 2 MiB default, measured cost ~1157 KiB
+
+        let refused = std::thread::Builder::new()
+            .stack_size(BUDGET)
+            .spawn(|| {
+                // A fresh thread starts at depth 0: `LOWER_DEPTH` is thread-local.
+                let deep = nested_when_blocks(MAX_LOWER_DEPTH * 2);
+                lower_block(&deep).map(|body| body.len())
+            })
+            .expect("spawn the stack-bounded probe")
+            .join()
+            .expect("the guarded descent must return, not overflow a 1.5 MiB stack");
+
+        assert_eq!(
+            refused
+                .expect_err("the ceiling must refuse this tree")
+                .message,
+            "statement nesting too deep",
+            "the guard must bottom out in its bounded error inside the budget"
         );
     }
 }
