@@ -151,6 +151,47 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### Remote agents — run the agent here, land the effects there (epic) — 🔄 **PROPOSED (C-436…C-440 filed, none started)**
+
+Run an agent on your machine and your machine is what it touches. Sometimes that is the problem: you
+want the *experience* local — your terminal, your approval prompt, your model — and the *blast radius*
+elsewhere, wired to Docker, sandboxed process execution, or microVMs in Kubernetes.
+`flux tui --remote <addr>`.
+
+⚠ **"Remote agent" names two different things, and one is already shipped.** *Serving a whole agent* —
+planning, model calls and approval all move, your terminal is a thin client — is the A2A surface that
+already exists: `flux app run --serve` gives a `/.well-known/agent-card.json` card, `POST /a2a`
+JSON-RPC (`message/send`/`message/stream`) and sessions. The gap there is a **client**, not an
+architecture. *This epic is the other one*: only **where effects land** moves, and the runtime,
+approver, model choice and credentials stay with you. The Docker analogy actually points at the first
+reading — but the second is the valuable one, because it keeps the property people care about: **you
+approve on your machine, and the effect lands in a microVM.**
+
+**It rides on a boundary that already exists** — `execution-substrate.md`'s rule, *"`flux-runtime`
+decides whether something may happen. `flux-system` is where it happens"*, put across a network; and
+`port.rs` already names *"a remote executor"* among the substrates the port exists for. So the
+substrate half is filed: [C-399](stories/C-399-remote-guarded-io-backend.md) (ready, ownership decided
+as *"flux owns it, flux-exchange reuses it"*), [C-397](stories/C-397-container-process-backend.md),
+[C-435](stories/C-435-a-guarded-network-port.md). ⚠ This epic is the **product on top**, not a second
+copy: [C-436](stories/C-436-flux-tui-remote.md) the surface (remoteness must be *unmissable* — an
+operator who forgets which machine they are on approves the wrong thing);
+[C-437](stories/C-437-which-guarantees-travel.md) a per-guarantee table of what travels, what becomes
+the remote's, and what stops applying — ⚠ *"secrets never off the machine"* has to be restated once
+there are two machines; [C-438](stories/C-438-where-do-the-files-live.md) ⚠ **the hard one**, since a
+coding loop is read-edit-test and either files are remote (your editor shows a different tree) or local
+(a sync problem, which is where this class of tool usually dies) — there is no free third answer;
+[C-439](stories/C-439-trusting-a-remote-substrate.md) an unauthenticated endpoint, and ⚠ **a remote
+that lies** about what it did, which is where the evidence chain quietly stops meaning anything.
+
+[C-440](stories/C-440-the-topologies-page.md) is **useful now rather than after the epic**: a public
+page enumerating *every* way to run flux — fully local · OS-sandboxed · containerized ops · remote
+system · served agent + thin client · embedded SDK · portable wasm · hosted exchange — with pros, cons
+and the command that does it. A topology is decided by where four things sit and they move
+independently: the **runtime**, the **system**, the **model**, the **workspace**. ⚠ Every row must carry
+an honest status, and **`ssh` must be named as a legitimate option** — running flux on the remote box
+works today, and a page that hides the free alternative to make the product look necessary is not
+credible about anything else on it. Design: [remote-agents.md](designs/remote-agents.md).
+
 ### The SIP channel — flux answers the phone, and places calls (epic) — 🔄 **PROPOSED (D-225…D-231 filed; D-230 BLOCKED upstream)**
 
 A phone call is the oldest and widest channel there is: an inbound number flux answers, and an outbound

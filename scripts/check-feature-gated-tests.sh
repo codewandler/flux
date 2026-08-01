@@ -63,6 +63,7 @@ codewandler-flux-sdk	providers	run	1 test + 1 doctest on from_spec
 codewandler-flux-sdk	test-kit	covered	flux-cli takes flux-sdk with test-kit as a dev-dependency
 codewandler-flux-tools	png	covered	flux-cli's default features enable it
 flux-auth	introspect	covered	flux-cli -> flux-server/introspect -> flux-auth/introspect
+flux-channels	room-media	run	the D-208 media-sidecar suite (11 tests in tests/room_media.rs + 12 unit tests under rooms::media); off by default and nothing in the workspace enables it, so `cargo test --workspace` compiles none of it
 flux-channels	slack	covered	default-on, so the workspace build compiles it
 flux-cli	embeddings	skip	a pure passthrough to codewandler-flux-capabilities/embeddings (run above); gates no test of its own
 flux-cli	png	covered	default-on

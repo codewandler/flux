@@ -38,6 +38,28 @@ a spawned process, a half-written file — and a value changed underneath it can
 already happened. That is the actual design problem, and it is why this epic is not "wire the TUI to
 `--inject`".
 
+## ⚠ Exploration is the case that makes this worth building
+
+Owner-directed, 2026-08-01: **the debugger earns its keep most during *exploring*, not during
+debugging a known program** — and the visualization grows organically alongside it.
+
+That reframes both epics. A debugger over a settled program is a convenience. During exploration —
+the agent trying a route, backtracking, trying another — the graph is *accreting*, and stopping it
+mid-accretion to look at what it has, change a value, and let it continue is a different and much
+stronger proposition. You are not inspecting a program; you are watching one being discovered, with a
+hand on it.
+
+⚠ **This partly rehabilitates a layout that lost on its own terms.** A-144 found the graph-first view
+came last, and its reason was precise: *"the program does not move, so most rows are always the parts
+that are not running."* That is a property of a **static** program. During exploration the program is
+exactly what is moving — so the case that disqualified graph-first as the general loop view may be the
+case where it wins. Do not treat A-144's verdict as settling the exploration view; it did not test one.
+
+It also joins this epic to [explore-then-freeze](explore-then-freeze.md): the growing visualization is
+how a human decides **what to keep** when the exploration is distilled into a script (C-430). A
+distiller that drops the trial-and-error is choosing on the operator's behalf; a view of the
+exploration as it grows is what lets them choose instead.
+
 ## Approach
 
 ### A-142 — inspect a paused run

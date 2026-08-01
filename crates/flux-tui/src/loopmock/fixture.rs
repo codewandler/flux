@@ -447,7 +447,7 @@ fn deep_nesting() -> Fixture {
     )
 }
 
-/// Six tracker-audit workers at once, each mid-op — `SpawnActivity` at the width the fleet pane
+/// Six tracker-audit workers, five still running — `SpawnActivity` at the width the fleet pane
 /// already sees. The case that punishes any layout with one column of attention.
 fn fan_out() -> Fixture {
     use Status::*;

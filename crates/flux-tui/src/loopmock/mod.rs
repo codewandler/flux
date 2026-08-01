@@ -20,14 +20,21 @@
 //! ## Two rules every mock obeys
 //!
 //! **Honesty.** A render that withholds anything records an [`Elision`] whose `marker` text is on
-//! screen. The step accounting is derived in one place — `Tally::finish` computes `total - drawn`
-//! rather than believing a renderer's own count — so a mock cannot under-report what it hid; it
-//! can only be wrong about what it drew.
+//! screen. Both halves are enforced centrally rather than trusted to each renderer: `Tally::finish`
+//! derives the hidden step count as `total - drawn`, so a mock cannot under-report what it hid, and
+//! it *forces* any recorded marker that did not survive composition back onto the screen. The
+//! second half exists because it was once false — at `rows == 6` mock 3's pane assembled more lines
+//! than the compose loop kept, so its `+N more` was cut while the elision stayed on the books. A
+//! silent truncation with a comforting entry in a struct nobody sees is the exact failure this
+//! module is about, so the property is now unconditional over every viewport [`render`] accepts,
+//! and `crates/flux-tui/tests/loop_mocks.rs` sweeps that envelope rather than sampling the three
+//! sizes the snapshot set happens to present.
 //!
 //! **Bounds.** Every line leaves through [`clip`], so no mock can overflow its terminal; and each
-//! declares the width below which it stops working ([`MockSpec::min_cols`]). Under that floor it
-//! says so instead of drawing a mangled version of itself, which is the interesting behaviour to
-//! compare — every layout has a floor, and what it does there is a design decision.
+//! declares *two* floors, [`MockSpec::min_cols`] and [`MockSpec::min_rows`]. Under either it says
+//! so instead of drawing a mangled version of itself, which is the interesting behaviour to
+//! compare — every layout has a floor, what it does there is a design decision, and a layout's cost
+//! is two numbers rather than one.
 //!
 //! ⚠ **Provenance (A-145).** Two of the four load cases are now reconstructed from a real recorded
 //! session ([`capture`]); two are still hand-authored, because the durable log cannot currently
@@ -115,6 +122,14 @@ pub struct MockSpec {
     /// The narrowest terminal this layout still works in. Below it the mock refuses rather than
     /// mangles.
     pub min_cols: usize,
+    /// The shortest terminal this layout still works in — its floor in the *other* dimension.
+    ///
+    /// Rows have a floor for the same reason columns do, and one mock's is much higher than the
+    /// rest: mock 3's pane spends four rows on chrome (breadcrumb, header, timing, rule) before it
+    /// says anything, and it must still have room for a body row, an elision marker and the hint.
+    /// Discovering that is part of what the comparison is for — a layout's cost is two numbers,
+    /// not one.
+    pub min_rows: usize,
 }
 
 impl Mock {
@@ -165,8 +180,8 @@ pub struct Render {
     pub elisions: Vec<Elision>,
     /// How many of the fixture's steps this drawing actually represents.
     pub steps_drawn: usize,
-    /// The viewport is narrower than [`MockSpec::min_cols`]; what was drawn is a refusal notice,
-    /// not the layout.
+    /// The viewport is under [`MockSpec::min_cols`] or [`MockSpec::min_rows`]; what was drawn is a
+    /// refusal notice naming the dimension, not the layout.
     pub below_floor: bool,
 }
 
@@ -200,7 +215,7 @@ impl Render {
 pub fn render(mock: Mock, case: LoadCase, vp: Viewport, theme: &Theme) -> Render {
     let spec = mock.spec();
     let fx = fixture(case);
-    if vp.cols < spec.min_cols || vp.rows < MIN_ROWS {
+    if vp.cols < spec.min_cols || vp.rows < spec.min_rows {
         return below_floor(&spec, vp, theme);
     }
     let mut tally = Tally::new(fx.step_count());
@@ -214,14 +229,26 @@ pub fn render(mock: Mock, case: LoadCase, vp: Viewport, theme: &Theme) -> Render
     tally.finish(body, vp, theme)
 }
 
-/// Fewer rows than this and no layout has anything to say.
-const MIN_ROWS: usize = 6;
+/// Fewer rows than this and no layout has anything to say, so no [`MockSpec::min_rows`] may be
+/// lower. It is a sanity bound on the specs, not the envelope itself — the envelope is per mock.
+pub const MIN_ROWS: usize = 6;
 
-/// What a mock draws under its own floor: a refusal that names the width it needs. Silently
+/// What a mock draws under its own floor: a refusal naming the dimension it is short of. Silently
 /// degrading here would teach exactly the wrong lesson — every layout has a floor, and the
 /// question A-137 has to answer is what happens at it, not whether one exists.
 fn below_floor(spec: &MockSpec, vp: Viewport, theme: &Theme) -> Render {
-    let lines = vec![
+    let (need, have) = if vp.cols < spec.min_cols {
+        (
+            format!("needs {} cols", spec.min_cols),
+            format!("have {}", vp.cols),
+        )
+    } else {
+        (
+            format!("needs {} rows", spec.min_rows),
+            format!("have {}", vp.rows),
+        )
+    };
+    let mut lines = vec![
         clip(
             Line::from(Span::styled(
                 spec.name.to_string(),
@@ -229,21 +256,10 @@ fn below_floor(spec: &MockSpec, vp: Viewport, theme: &Theme) -> Render {
             )),
             vp.cols,
         ),
-        clip(
-            Line::from(Span::styled(
-                format!("needs {} cols", spec.min_cols),
-                theme.warn_style(),
-            )),
-            vp.cols,
-        ),
-        clip(
-            Line::from(Span::styled(
-                format!("have {}", vp.cols),
-                theme.muted_style(),
-            )),
-            vp.cols,
-        ),
+        clip(Line::from(Span::styled(need, theme.warn_style())), vp.cols),
+        clip(Line::from(Span::styled(have, theme.muted_style())), vp.cols),
     ];
+    lines.truncate(vp.rows);
     Render {
         lines,
         elisions: Vec::new(),
@@ -291,13 +307,52 @@ impl Tally {
         1
     }
 
+    /// Compose the final render, enforcing the module's honesty property rather than trusting the
+    /// renderer to have got it right.
+    ///
+    /// A recorded elision whose marker did not survive to the screen is not a disclosed elision —
+    /// it is a silent truncation with a comforting entry in a struct nobody sees. So the markers
+    /// are made present *here*, after the viewport bound is applied, displacing the last rows if it
+    /// comes to that. Every renderer is written so this never has to fire; it fires anyway if one
+    /// of them is ever wrong, which is the point of putting it in the one place that owns the
+    /// property. Dropping the record instead would be the tempting fix and the dishonest one.
     fn finish(self, mut lines: Vec<Line<'static>>, vp: Viewport, theme: &Theme) -> Render {
         let mut elisions = self.extra;
         let hidden = self.total.saturating_sub(self.drawn);
+        // Rows the step footer will need. Reserved before anything else competes for them: a
+        // render that ran out of room for its own admission of elision is the exact failure this
+        // module is about.
+        let reserved = usize::from(hidden > 0);
+        lines.truncate(vp.rows.saturating_sub(reserved));
+
+        let drawn_text = |lines: &[Line<'static>]| -> String {
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect()
+        };
+        let text = drawn_text(&lines);
+        let missing: Vec<String> = elisions
+            .iter()
+            .filter(|e| !text.contains(&e.marker))
+            .map(|e| e.marker.clone())
+            .collect();
+        for (i, marker) in missing.iter().enumerate() {
+            let row = lines
+                .len()
+                .saturating_sub(missing.len() - i)
+                .min(lines.len());
+            let line = clip(
+                Line::from(Span::styled(marker.clone(), theme.warn_style())),
+                vp.cols,
+            );
+            match lines.get_mut(row) {
+                Some(slot) => *slot = line,
+                None => lines.push(line),
+            }
+        }
+
         if hidden > 0 {
-            // The footer is the last thing dropped, never the first: a render that ran out of rows
-            // for its own admission of elision would be the exact failure this module is about.
-            lines.truncate(vp.rows.saturating_sub(1));
             let marker = elision_marker(hidden, self.total);
             lines.push(clip(
                 Line::from(Span::styled(marker.clone(), theme.warn_style())),
@@ -479,55 +534,64 @@ pub(crate) fn status_style(status: Status, theme: &Theme) -> Style {
 /// The recommendation this story exists to produce. Five pictures and no decision is the failure
 /// mode, so the decision ships in the artifact rather than only in a review comment.
 pub const RECOMMENDATION: &str = "\
-BUILD MOCK 3 — the split (condensed rail + detail pane) — with mock 1 as its narrow fallback.
+FIRST, CONDENSE FINISHED PHASES. THEN BUILD MOCK 3 — the split (condensed rail + detail pane) —
+with mock 1 as its sub-64-column fallback. The two are separable, and the first is most of the win.
 
-Why, from the snapshots and not from taste. The question a live view has to keep answering while
-the run moves is \"what is it doing right now, and is that reasonable\". Read the 49-step long-run
-row of the matrix: the thread and the tree both scroll 23 rows away from the start and can show
-only a window; the timeline shows bars with no content; the graph shows a program that does not
-contain the running phase at all. The split is the only one that still shows the *whole* run —
-all nine phases, because a finished phase stays one row — and the current command, and its
-timing, at the same time. On the deep-nesting case it is the only layout that shows the model
-call's token cost and its streaming tail next to the chain that produced it. Both of those come
-from the same property: the rail's height is set by the program's phase count while the pane's
-content is set by one step, so neither grows with the run.
+⚠ READ THIS BEFORE THE REST — the comparison is confounded, and in mock 3's favour.
+Only mock 3 was given progressive disclosure. Its rail pre-filters to top-level steps plus the
+focused subtree (`split.rs`, `rail_rows`) before the shared scroll policy ever runs; mocks 1 and 2
+draw one row per step at every depth by construction, so of course they scroll off. The shared
+`window` helper keeps scrolling honest between the five, but it does nothing about the filter
+applied ahead of it. So when the long-run case shows mock 3 holding the whole run while the thread
+and the tree sit at `↑ 23`, that gap measures **condensing**, not **two columns**. A condensed
+one-column thread would hold the whole run too — nine top-level rows plus the running phase's four
+children, thirteen rows, against 49 steps; `condensing_and_not_the_second_column_is_what_makes_
+the_long_run_fit` measures exactly that. Take the cheap lesson first, and read what follows as the
+case for the *second* column only.
 
-The two controls this epic already owes settle it. A-140's pause has an unambiguous home (the
-focused rail row) and A-142's inspection pane does not need building — the right column already
-is it. The other four all have to answer \"where does the pane go\" with a sheet or a bottom
-split, which means A-142 would relayout whatever A-137 shipped.
+What the second column buys, after discounting the confound. Three things survive it, all from the
+deep-nesting and tidy cases rather than the long-run one:
+  - It is the only layout that shows a model call's token cost and its streaming output tail
+    beside the chain that produced it. A one-column thread has nowhere to put three lines of live
+    output without becoming a different layout.
+  - A-142's inspection pane does not need building; the right column already is it. The other four
+    answer \"where does the pane go\" with a sheet or a bottom split, so A-142 would relayout
+    whatever A-137 shipped.
+  - A-140's pause has an unambiguous home — the focused rail row, beside the step it would pause.
 
 What it gives up — the honest list.
-  1. Width, badly. 64 columns, the highest floor of the five, and the snapshots show it refusing
-     in *every* case at 52 columns while all four others still draw. This is the one place the
-     split is the worst option, and it is not a small place. Hence the fallback: below 64 columns
-     A-137 should render mock 1 (the flat thread) rather than refuse — the mocks refuse instead,
-     deliberately, so the cost shows up in the picture rather than in a footnote.
-  2. Content in the rail. At 40 rail columns a leaf row is down to `→ read  7.4s` — the rail
-     carries structure and status, and the *what* lives only in the pane. Compare the fan-out
-     case: the tree shows six workers and what each is doing; the split shows six workers and
-     what one is doing.
-  3. One narrative. A rail beside a pane is not something you scroll back through. This answers
-     the design doc's open question (\"scrollback-inline or a pane\") in favour of the pane, and
-     the transcript keeps the scrollback.
+  1. Width, badly. 64 columns and 10 rows, both the highest floors of the five; the snapshots show
+     it refusing in *every* case at 52 columns while all four others still draw. This is the one
+     place the split is the worst option and it is not a small place. Hence the fallback: below its
+     floor A-137 should render mock 1 rather than refuse. The mocks refuse instead, deliberately,
+     so the cost shows up in the picture rather than in a footnote.
+  2. Content in the rail. At 40 rail columns a leaf row is `→ read  7.4s` — the op and its timing,
+     with the argument gone. Compare the fan-out case: the tree shows six workers and what each is
+     doing *including the argument*; the split shows six workers and their current ops, and the
+     arguments for one.
+  3. One narrative. A rail beside a pane is not something you scroll back through. This answers the
+     design doc's open question (\"scrollback-inline or a pane\") in favour of the pane, and the
+     transcript keeps the scrollback.
   4. Focus state. It is the only layout needing a selection, so it is the only one needing input
      handling and a focus policy — follow the running step, or hold where the operator put it —
      before it renders correctly at all. Budget that into A-137; the other four do not spend it.
 
 Runner-up: mock 2, the tree. At 100 columns it is the most legible drawing of what a run is
-*shaped* like and the only one where a fan-out looks like a fan-out. It loses on the width tax:
-indentation compounds, and by the deep-nesting case at 52 columns the connectors have taken half
-the terminal. Take its connectors with you — the split's pane already draws its children with
-them, and that is not a coincidence.
+*shaped* like and the only one where a fan-out looks like a fan-out with every worker's argument
+visible. It loses on the width tax: indentation compounds, and by the deep-nesting case at 52
+columns the connectors have taken half the terminal. Take its connectors with you — the split's
+pane already draws its children with them, and that is not a coincidence. ⚠ And note it would look
+considerably better than it does here if it were condensed too; the confound above cuts against it
+harder than against any other mock.
 
-Do not build as the top-level view: mock 1 alone (the scope column gets squeezed exactly when
-there is enough structure for it to matter, and concurrency reads as interleaving), or mock 5.
-Mock 5 is the right answer for A-138's expansion and the wrong one for a live view — its
-snapshots show why twice over: the program does not move, so most rows are always the parts that
-are not running, and mapping runtime steps back onto program nodes misattributes as soon as a
-sub-agent runs a program of its own (see the fan-out case, where six workers' `glob` calls land
-on the parent's `glob` node). A-138 should expand *one step* into its graph, which is exactly
-what the split's pane has room to do.";
+Do not build as the top-level view: mock 1 alone (the scope column gets squeezed exactly when there
+is enough structure for it to matter, and concurrency reads as interleaving), or mock 5. Mock 5 is
+the right answer for A-138's expansion and the wrong one for a live view — its snapshots show why
+twice over: the program does not move, so most rows are always the parts that are not running, and
+mapping runtime steps back onto program nodes misattributes as soon as a sub-agent runs a program
+of its own (see the fan-out case, where six workers' `glob` calls land on the parent's `glob`
+node). A-138 should expand *one step* into its graph, which is exactly what the split's pane has
+room to do.";
 
 /// The committed side-by-side comparison, as markdown. This is the artifact a reviewer reads
 /// instead of running anything; `the_snapshot_set_matches_the_renderers` keeps it honest.
@@ -545,19 +609,23 @@ pub fn snapshot_document() -> String {
          CHANGELOG, with a model-authored judgement step in the middle). Nothing here is wired to a\n\
          live run; see `crates/flux-tui/src/loopmock/mod.rs`.\n\n\
          Each mock is drawn under the tidy case **and** the three that decide the question — a long\n\
-         run, deep nesting, a sub-agent fan-out — plus a narrow terminal and one below its floor.\n\n",
+         run, deep nesting, a sub-agent fan-out — plus a narrow terminal, its own floor, and one\n\
+         step under that floor in each dimension.\n\n\
+         ⚠ **The comparison is confounded and the recommendation says so** — only mock 3 was given\n\
+         progressive disclosure, so the long-run gap measures condensing rather than a second\n\
+         column. Read the warning at the top of the recommendation before the pictures.\n\n",
     );
 
     out.push_str("## The recommendation\n\n```text\n");
     out.push_str(RECOMMENDATION);
     out.push_str("\n```\n\n## At a glance\n\n");
-    out.push_str("| mock | primary axis | optimizes for | gives up | min cols |\n");
+    out.push_str("| mock | primary axis | optimizes for | gives up | floor |\n");
     out.push_str("|---|---|---|---|---|\n");
     for mock in MOCKS {
         let s = mock.spec();
         out.push_str(&format!(
-            "| {} | {:?} | {} | {} | {} |\n",
-            s.name, s.axis, s.optimizes_for, s.gives_up, s.min_cols
+            "| {} | {:?} | {} | {} | {}×{} |\n",
+            s.name, s.axis, s.optimizes_for, s.gives_up, s.min_cols, s.min_rows
         ));
     }
     out.push('\n');
@@ -577,8 +645,8 @@ pub fn snapshot_document() -> String {
             s.inspection_pane
         ));
         out.push_str(&format!(
-            "- **Floor:** {} cols (below it, it says so)\n\n",
-            s.min_cols
+            "- **Floor:** {} cols × {} rows (below either, it says so instead of mangling itself)\n\n",
+            s.min_cols, s.min_rows
         ));
 
         for case in LOAD_CASES {
@@ -605,18 +673,46 @@ pub fn snapshot_document() -> String {
             }
         }
 
-        let under = Viewport {
-            cols: s.min_cols - 1,
-            rows: 14,
+        // At its floor exactly, then one under it in each dimension. The floor render is the more
+        // interesting of the three: it is the smallest terminal in which this layout is still
+        // itself, and for one mock that is a much bigger box than for the rest.
+        let at = Viewport {
+            cols: s.min_cols,
+            rows: s.min_rows,
         };
-        let r = render(mock, LoadCase::Tidy, under, &theme);
+        let r = render(mock, LoadCase::FanOut, at, &theme);
         out.push_str(&format!(
-            "### {} · below its floor · {}×{}\n\n```text\n{}```\n\n",
+            "### {} · at its floor · fan-out · {}×{}\n\n```text\n{}```\n\n",
             s.name,
-            under.cols,
-            under.rows,
+            at.cols,
+            at.rows,
             r.to_plain()
         ));
+        for (under, dim) in [
+            (
+                Viewport {
+                    cols: s.min_cols - 1,
+                    rows: s.min_rows,
+                },
+                "one column under",
+            ),
+            (
+                Viewport {
+                    cols: s.min_cols,
+                    rows: s.min_rows - 1,
+                },
+                "one row under",
+            ),
+        ] {
+            let r = render(mock, LoadCase::Tidy, under, &theme);
+            out.push_str(&format!(
+                "### {} · {dim} its floor · {}×{}\n\n```text\n{}```\n\n",
+                s.name,
+                under.cols,
+                under.rows,
+                r.to_plain()
+            ));
+        }
     }
     out
 }
@@ -655,6 +751,42 @@ mod tests {
         assert_eq!(render.elisions.len(), 1);
         assert_eq!(render.elisions[0].hidden, 13);
         assert!(render.to_plain().contains(&render.elisions[0].marker));
+    }
+
+    #[test]
+    fn a_marker_that_did_not_survive_composition_is_forced_onto_the_screen() {
+        // The safety net exercised directly: a renderer that records an elision and then draws
+        // nothing mentioning it must not be able to produce a silent truncation. Every renderer is
+        // written so this cannot happen; `finish` is what makes the property unconditional rather
+        // than true-for-the-viewports-we-happened-to-test.
+        let mut tally = Tally::new(3);
+        tally.drew(3);
+        tally.hid(DETAIL, 4, "+4 more".to_string());
+        let lines = vec![
+            Line::from(Span::raw("chrome")),
+            Line::from(Span::raw("body")),
+        ];
+        let render = tally.finish(lines, Viewport { cols: 20, rows: 2 }, &Theme::MONO);
+        assert!(
+            render.to_plain().contains("+4 more"),
+            "the elision was recorded but never drawn:\n{}",
+            render.to_plain()
+        );
+        assert!(render.lines.len() <= 2);
+    }
+
+    #[test]
+    fn the_step_footer_outlives_a_displaced_detail_marker() {
+        let mut tally = Tally::new(9);
+        tally.drew(2);
+        tally.hid(DETAIL, 3, "+3 more".to_string());
+        let lines = vec![Line::from(Span::raw("x")), Line::from(Span::raw("y"))];
+        let render = tally.finish(lines, Viewport { cols: 40, rows: 3 }, &Theme::MONO);
+        let plain = render.to_plain();
+        for elision in &render.elisions {
+            assert!(plain.contains(&elision.marker), "{plain}");
+        }
+        assert_eq!(render.elisions.len(), 2);
     }
 
     #[test]

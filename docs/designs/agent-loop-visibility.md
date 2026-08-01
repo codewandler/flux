@@ -34,6 +34,32 @@ So this epic is largely a **view** problem, not an instrumentation problem: the 
 graph renderer exists. What is missing is the progressive-disclosure thread that ties them together and
 stays readable while a run is moving.
 
+## ⚠ Once it reads the event store, it stops being a mock
+
+Owner-directed, 2026-08-01, and it changes what this epic is building. A-144's mocks ran on a
+hand-authored fixture — a throwaway. [A-145](../stories/A-145-a-real-run-as-the-mock-fixture.md) drives
+them from a run **reconstructed out of the event database**, and at that point they are not mocks at
+all: they are renderers over real recorded state, and whichever wins is the seed of the shipped view.
+
+⚠ **Three epics now need the same primitive**, and building it three times would be the expensive
+mistake:
+
+| who | needs | story |
+|---|---|---|
+| this epic | render a real run's timeline to compare layouts | A-145 |
+| session-screencast | render a recorded session to an asciicast | [C-422](../stories/C-422-the-render-projection.md) |
+| interactive-debugger | show what a paused run is holding | [A-142](../stories/A-142-inspect-a-paused-run.md) |
+
+**[C-422](../stories/C-422-the-render-projection.md) is the shared foundation** and its finding is the
+one that matters here: the durable record is rich — `ts` at millisecond resolution, `EventKind` holding
+messages, turns, plans and (since C-43) durably-redacted op output — while the TUI's existing
+durable→screen path is **100 lines handling five observation kinds against 26 live `UiEvent`
+variants**. The data is largely there; the projection is not.
+
+⚠ So a reconstruction written for the mocks must not become a second, competing one. What A-145 finds
+it can and cannot rebuild **is** the beginning of C-422's fidelity table, and anything the log cannot
+supply is a finding about the *record*, not a gap in a mock.
+
 ## Approach
 
 Three stories, smallest first, each independently useful.

@@ -32,6 +32,9 @@ pub(super) const SPEC: MockSpec = MockSpec {
     inspection_pane: "a bottom split: the timeline is width-hungry but short, so it can give away \
                       rows more cheaply than any other layout here",
     min_cols: 46,
+    // Header, the tick axis, the footer, and at least two bars — one bar has nothing to overlap
+    // with, and overlap is the whole reason to draw this.
+    min_rows: 7,
 };
 
 /// Left gutter for the step label.

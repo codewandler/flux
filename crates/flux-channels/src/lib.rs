@@ -55,6 +55,6 @@ pub use adapters::{
     build_channels, A2aChannel, ConnectorChannel, RoomChannel, ScheduleChannel, WebhookChannel,
 };
 pub use channel::Channel;
-pub use config::{RoomSettings, DEFAULT_ROOM_NICK};
+pub use config::{MediaSettings, RoomSettings, DEFAULT_ROOM_NICK};
 pub use deliver::{AppDeliverer, Deliverer};
 pub use host::serve;

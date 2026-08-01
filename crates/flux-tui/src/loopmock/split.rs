@@ -33,7 +33,14 @@ pub(super) const SPEC: MockSpec = MockSpec {
     pause_affordance: "the focused rail row, where the ⏸ sits beside the step it would pause",
     inspection_pane: "already built: the right-hand pane *is* A-142's inspection surface",
     min_cols: 64,
+    // The pane spends PANE_CHROME rows before it says anything, and must still hold a body row, an
+    // elision marker and the hint; plus the run header and the step footer. See PANE_CHROME.
+    min_rows: 10,
 };
+
+/// Rows the pane spends on chrome before any content: breadcrumb, header, timing/usage, rule.
+/// The one number behind this mock's row floor — and the reason it has the highest one.
+const PANE_CHROME: usize = 4;
 
 /// The rail is a share of the terminal, clamped so it neither starves the pane nor becomes a
 /// column of ellipses.
@@ -248,7 +255,11 @@ fn pane_rows(
         ));
     }
 
-    let room = budget.saturating_sub(out.len() + 1);
+    // Rows left for the body once the chrome and the hint have been paid for. `draw` composes at
+    // most `budget` rows, so a pane taller than that would push its own `+N more` marker off the
+    // screen while still reporting the elision — an undisclosed truncation, which is the one thing
+    // this module exists not to do. `min_rows` is what keeps this at least 3.
+    let room = budget.saturating_sub(PANE_CHROME + 1);
     let hidden = body.len().saturating_sub(room);
     let shown = if hidden > 0 {
         room.saturating_sub(1)
@@ -277,6 +288,14 @@ fn pane_rows(
         )),
         cols,
     ));
+
+    // Chrome + shown + marker + hint is <= budget by construction of `room`, for every viewport
+    // `render` accepts. This trims the chrome rather than the marker if that ever stops holding —
+    // the timing line and the rule are the pane's least load-bearing rows, and losing one of them
+    // is a worse drawing, while losing the marker would be a lie.
+    while out.len() > budget && out.len() > 2 {
+        out.remove(PANE_CHROME - 1);
+    }
     (out, hidden)
 }
 
