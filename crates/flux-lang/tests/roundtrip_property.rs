@@ -73,6 +73,7 @@ const OPS: &[&str] = &[
     "9op",
     ".dot",
     "op(x)",
+    "a->b",
 ];
 
 /// Free-form string slots (labels, messages, purposes, templates, sources, keys, tools).
@@ -85,9 +86,15 @@ const OPS: &[&str] = &[
 /// `format::is_safe_for_multiline_spelling`. Each unsafe entry also contains a real `\n` — without
 /// one, `compact_str` never even considers the multi-line spelling, so the fallback branch would go
 /// untested.
+///
+/// L-115: two entries carry a `->`. Any header that lowers by scanning its reconstructed text for
+/// an arrow (`each` did) mistakes one of these for its own collect clause, so the pool keeps that
+/// whole class dead rather than leaving it to a hand-written fixture per header.
 const STRINGS: &[&str] = &[
     "",
     "hello",
+    "a->b",
+    "an arrow -> in the middle",
     "line\nbreak",
     "he said \"hi\"",
     "hash # inside",
