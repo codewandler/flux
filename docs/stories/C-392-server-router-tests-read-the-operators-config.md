@@ -3,8 +3,7 @@ id: C-392
 title: "43 `flux-server` tests build a router that reads the operator's `~/.flux/config.toml`"
 pillar: Core
 epic: road-to-stable
-status: ready
-priority: 4
+status: done
 areas: [flux-server, flux-runtime]
 note: "C-332's census, tranche A-remainder. `router()`/`router_multi()` resolve their TTL and resource limits from `load_config(current_dir())`, so an operator `~/.flux/config.toml` with `[server] a2a_session_ttl_secs` / `requests_per_minute` / `max_inflight_per_principal` silently changes what 43 tests assert against. C-332 built `load_config_in`; this story threads it through the router"
 ---

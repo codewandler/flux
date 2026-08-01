@@ -2,8 +2,7 @@
 id: C-395
 title: "State the workspace-confined file surface as a port"
 pillar: Core
-status: ready
-priority: 7
+status: done
 design: docs/designs/execution-substrate.md
 epic: execution-substrate
 note: "C-269 deferred this on the stated grounds that its consumers all hold a concrete System, so a trait would be indirection without a seam — a second consumer is exactly the condition that expires that reasoning"

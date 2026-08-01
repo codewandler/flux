@@ -2,8 +2,7 @@
 id: C-344
 title: "`build_metrics` takes no `Redactor`, so the OTel metrics half never redacts — the module header says it does"
 pillar: Core
-status: ready
-priority: 5
+status: done
 areas: [flux-events]
 note: "found by C-339's OTel audit. build_trace(stream, events, redactor) redacts its free-text attributes; build_metrics(stream, events, pricing) has no redactor parameter at all, so the `model` attribute ships verbatim. The module header at otel.rs:21 claims every free-text value landing in a span/METRIC attribute is redacted. Closing it changes a published crate's public fn signature, which is why C-339 filed it rather than folding it in"
 ---
@@ -78,11 +77,11 @@ record excludes metrics on purpose; the module header simply overclaims.
 
 ## Acceptance
 
-- [ ] **Failing-first**: the probe above as a test — a registered secret in the model id reaches a
+- [x] **Failing-first**: the probe above as a test — a registered secret in the model id reaches a
       metrics attribute today while the trace projection is clean.
-- [ ] Either metrics attributes go through the redactor, or the module header stops claiming they
+- [x] Either metrics attributes go through the redactor, or the module header stops claiming they
       do. Say which and why.
-- [ ] ⚠ **Price the API break before starting.** `crates/flux-events/src/lib.rs:33` is
+- [x] ⚠ **Price the API break before starting.** `crates/flux-events/src/lib.rs:33` is
       `pub mod otel;`, so `build_metrics` is public API of the **published**
       `codewandler-flux-events`. Adding a `&Redactor` parameter is a breaking change and obliges a
       version decision. Note that `scripts/check-crate-versions.sh` is structurally blind to
@@ -90,10 +89,10 @@ record excludes metrics on purpose; the module header simply overclaims.
       resolve this by adding a second `build_metrics_redacted` beside the unredacted one — a
       parallel path leaves the leaking function published, and the repo's standing rule is atomic
       replacement over compat bridges.
-- [ ] Extend `no_exported_span_attribute_carries_a_registered_secret` (or add its sibling) to sweep
+- [x] Extend `no_exported_span_attribute_carries_a_registered_secret` (or add its sibling) to sweep
       the **metrics** projection, so the two halves cannot drift apart again. The existing guard
       asserts over `build_trace` output only, which is why nothing caught this.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
 
 ## Notes
 

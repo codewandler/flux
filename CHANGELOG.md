@@ -6,6 +6,32 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **⚠ BREAKING: `codewandler-flux-events`' `otel::build_metrics` gains a required `&Redactor`**
+  (C-344). The metrics projection shipped its `model` attribute verbatim while the trace half
+  scrubbed the same string through the same redactor, and the module header claimed both were
+  redacted. Both halves now honour it. No compat shim — callers pass the redactor they already give
+  `build_trace`. Proven by a test that found a registered secret in the exported OTLP metrics body
+  before the fix.
+
+- **45 `flux-server` tests stopped reading the operator's `~/.flux/config`** (C-392). A verdict that
+  depends on whose machine it runs on is not a verdict: measured at the base, **17 of 88 tests flip
+  `ok` → `FAILED`** under a fixture home that merely sets `[server] requests_per_minute`. `router_in`
+  / `router_multi_in` take a `DiscoveryEnv`; the public pair delegates, so `guard_open_bind` stays a
+  single enforcement point. A scanner test fails on any ambient `router(`/`from_env(` call in a test,
+  and was verified to fire before being trusted.
+
+### Added
+
+- **The workspace-confined file surface is a port** (C-395). `GuardedWorkspaceFiles` states
+  `read_file`/`write_file` and their byte forms as capability traits, with the native `System`
+  delegating every operation so port and struct are one code path. C-269 deferred this because a
+  trait with no call sites is indirection without a seam; a second consumer is the condition that
+  expired it. Optional operations deny by default — an empty `list_dir` reads as "empty directory"
+  and a `false` `path_exists` is what a caller acts on to overwrite, so a wrong answer is worse than
+  a refusal.
+
 ### Added
 
 - **One written vocabulary for the three projects** (C-401). `docs/concepts.md` defines the terms the
