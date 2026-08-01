@@ -151,6 +151,66 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### Guarded network primitives — DNS · TCP · UDP · ICMP behind one egress decision (epic) — 🔄 **PROPOSED (C-418; C-284…C-288 filed, none started)**
+
+`guard_url_scoped` resolves a hostname and decides on the **resolved address**, refusing private,
+loopback, link-local, ULA, CGNAT and IPv4-mapped ranges unless the caller holds a scoped grant.
+`AGENTS.md` names it a safety invariant and forbids hand-rolling a second URL guard. That invariant is
+about **web egress**; this epic is what it means for everything else — name resolution, stream,
+datagram and raw. C-284 fixes the shape the other four inherit, precisely so a second guard never
+appears.
+
+⚠ **It overlaps the execution substrate above, and that boundary was undocumented until now.** C-396
+("UDP and ICMP dial targets") and C-287/C-288 ("a guarded UDP/ICMP operation") were filed into
+different epics describing adjacent ground. The intended layering: **C-396 is the substrate
+primitive** — the dial target and its guard integration in `flux-system`; **C-287/C-288 are the op
+surface** on top, with intent declaration and per-reply checking. C-396 is the floor, and neither op
+re-derives the guard. If an implementer finds that layering does not hold, that is a backlog problem
+to raise rather than something to settle inside a diff. Tracker:
+[C-418](stories/C-418-guarded-network-primitives-epic.md).
+
+### The verified webhook channel — a delivery flux can prove the origin of (epic) — 🔄 **PROPOSED (C-419; C-292…C-295 filed, none started)**
+
+The inbound counterpart to the epic above. Today an inbound webhook is a JSON body flux trusts
+because it arrived: signature verification is per-vendor or absent, the envelope carries no id, no
+source and no `verified`, and endpoint-verification challenges cost a whole agent turn. Four stories
+make a delivery something flux can prove the origin of (C-292, one parameterized constant-time
+replay-bounded HMAC — not one per vendor), route by (C-294, by event discriminator, without the agent
+parsing the body to decide whether it cares), and hand on with provenance intact (C-295).
+
+⚠ **Two neighbours arrived after those four were written**, and all three meet on one request path:
+[C-409](stories/C-409-channel-served-http-has-no-resource-limits.md) — the webhook adapter binds its
+own listener with **none** of `flux-server`'s body caps, timeouts, rate limits or concurrency
+admission, since C-189 gave those to the server only; and
+[C-416](stories/C-416-a-channel-adapter-should-declare-its-principal.md) — a webhook body's principal
+is authenticated by nothing, and the adapter is the only component that knows it. The useful ordering
+is **prove it (C-292) → carry it (C-295) → decide with it (C-416)**; implementing the three as
+unrelated answers is the failure mode. Tracker:
+[C-419](stories/C-419-verified-webhook-channel-epic.md).
+
+### The connectors seam — a vendor credential flux is structurally unable to hold (epic) — ✅ **CORE SHIPPED (C-420; 7/8 done, C-405 open)**
+
+Let an operator hand flux a *platform* rather than a *secret*: flux calls a connector, the connector
+holds the vendor credential, and flux is structurally unable to receive one back. The invariant is
+that **flux holds exactly one secret on this path — the deployment session bearer** — and a response
+carrying credential-shaped material is *refused*, not merely redacted (C-312). Around it: an op set
+that changes when the operator authenticates a provider, without restarting flux (C-310), and
+vendor-host disclosure at approval (C-311).
+
+⚠ **C-311 is a compensating control, not a fix, and this is the seam's one honest trade-off**: when
+the platform dials the vendor, `guard_url_scoped` only ever sees `localhost:8000`, so flux's
+per-vendor egress allowlist stops constraining which vendor is reached.
+
+**Four of the eight stories were not planned scope** — C-403, C-404, C-410 and C-411 were each found
+by a review *of the previous one*, and each found the same defect class: **a guard or a comment that
+agrees with its own assumption.** C-312 stated its scope; C-403 found a live call site the scope did
+not cover. C-404's carve-out was described as dormant; it was excusing a real dispatched op. C-410
+found the surface that prints plugin-authored strings running outside the envelope C-404 presumed.
+C-411 closed silent grant widening. A new ingest surface here does not inherit the boundary by being
+near it — only by being routed through the check. C-405 (twelve private percent-encoders in the pack,
+one already drifted) is the remaining open story and is a **protocol-line change owing a version
+decision**. Tracker: [C-420](stories/C-420-connector-platform-epic.md).
+
 ### The road to stable — what must be true before flux is measured rather than built (epic) — 🔄 **PROPOSED (C-342; ~16 of 110 open stories block it, 9 owned + 6 cross-referenced)**
 
 flux has 663 done stories and ~110 open, and the open set is not a queue of equal work: roughly 16

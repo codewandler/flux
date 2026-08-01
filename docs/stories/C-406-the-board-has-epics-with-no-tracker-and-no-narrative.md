@@ -61,8 +61,15 @@ stories; priority 10 is held by five (C-219, C-251, C-399, C-404, L-103) and pri
 
 ## Acceptance
 
-- [ ] The five epics without a tracker either get one, or their stories are re-pointed at an epic
+- [x] The five epics without a tracker either get one, or their stories are re-pointed at an epic
       that exists. `connector-platform` first — it has the most closed history to summarize.
+      **Done 2026-08-01**: three trackers filed — [C-418](C-418-guarded-network-primitives-epic.md)
+      (`network-primitives`), [C-419](C-419-verified-webhook-channel-epic.md)
+      (`verified-webhook-channel`), [C-420](C-420-connector-platform-epic.md) (`connector-platform`),
+      each with a matching `docs/roadmap.md` narrative. ⚠ The other two were **audit false
+      positives**: `connector-backed-storage-facade`'s D-221 *is* its own tracker, and
+      `flux-planner-ship`'s single open story (L-40) has `docs/designs/flux-planner-ship.md` as its
+      narrative. See the methodology note below before re-running.
 - [ ] Each of the 22 narrative-less epics is **classified**: initiative (owes a roadmap narrative) or
       remediation bucket (says so in its tracker, and the roadmap does not pretend otherwise). Record
       the classification, so the next audit does not re-derive it.
@@ -84,7 +91,25 @@ stories; priority 10 is held by five (C-219, C-251, C-399, C-404, L-103) and pri
   are from the corrected pass.
 - The board generator is `python3 …/track/0.5.0/scripts/gen_board.py docs` and is deterministic; it
   was current at the time of the audit, so none of the above is board staleness.
+- ⚠ **Second methodology note, for acceptance item 6 (make the audit repeatable).** The re-run on
+  2026-08-01 produced four "missing tracker" hits, and **all four were artifacts of the check, not of
+  the board**. A correct tracker-detection pass must:
+  1. **exclude `docs/stories/_TEMPLATE.md`** — its frontmatter placeholders parse as a story whose
+     epic slug is the template's own trailing comment;
+  2. **detect a tracker by more than the title.** D-221 is an epic tracker with `EPIC —` in its
+     `note:` and `-epic.md` in its filename, but no `(epic)` in its title. Match on any of
+     filename-suffix `-epic.md`, `(epic)` in `title`, or `EPIC` in `note`;
+  3. **treat a `design:` doc as an acceptable narrative** for a small epic. `time-machine` (A-47
+     optional, phases 0–3 shipped) and `flux-planner-ship` (L-40 blocked on flux-model M-15) each have
+     one, and a tracker for a single optional story is ceremony, not information.
+
+  Without all three the check reports ~4 false positives on a healthy board, which is worse than not
+  running it — an audit that cries wolf gets ignored on the run that matters.
 
 ## Progress
 
 - Filed 2026-08-01 from a mechanical audit of all 862 stories, run during a curation pass.
+- 2026-08-01 — acceptance item 1 closed: C-418, C-419 and C-420 filed with matching roadmap
+  narratives; the two remaining slugs classified as false positives and the detection rules that
+  produced them written down above. Five acceptance items remain (narrative classification for the 22,
+  C-363's dangling `C-330`, the stale-`priority` decision, priority collisions, shipping the check).
