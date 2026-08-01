@@ -8,6 +8,7 @@
 
 mod controller;
 pub mod fleet;
+pub mod loopmock;
 mod panes;
 mod projection;
 mod rendering;
