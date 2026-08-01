@@ -151,6 +151,45 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### What the Pi comparison says to fix — and what to defend instead (epic) — 🔄 **PROPOSED (C-444…C-452 filed, none started)**
+
+`docs/reviews/single/2026-08-01-pi-flux-harness-comparison.md` is two isolated source-level reviews
+against one nine-axis rubric with primary-evidence cross-check — the most rigorous outside read flux
+has. ⚠ **But reading it as a scorecard would invert its advice.** Several axes flux scores lower on are
+things flux *chose*: **Performance/complexity 6.5 vs 7.5** is cited to 38 crates and a mandatory
+envelope (removing it raises the score and destroys the product); Pi wins **maximum extension freedom**
+because *"in-process TypeScript can replace nearly every layer"* — and the review's next sentence is
+*"this is also why it is not a security boundary"*; **Ecosystem 7.0 vs 8.0** is 81,617 stars against
+zero, **not closable by code**. So every finding goes into exactly one bucket — *close it* · *defend it*
+· *not code* — and [C-452](stories/C-452-what-flux-defends.md) writes the second bucket down, because
+without it a future contributor sees flux behind on a rubric and closes a gap that was a feature.
+
+**The real gaps, in order.** [C-444](stories/C-444-sdk-secure-defaults.md) is the one that undercuts
+flux's headline claim that authorization and approval are runtime types that *cannot be disabled*:
+`auto_approve(true)` **does not imply confinement**, and SDK resource ceilings are **unbounded by
+default and per agent**, so a delegated tree multiplies them. ⚠ Both are documented — and documented is
+not defaulted; an embedder following the happy path lands in the configuration the review itself calls a
+poor fit. [C-445](stories/C-445-interactive-confinement-posture.md) is the precise remainder after
+C-410: unattended CLI is fail-closed, interactive is deliberately exempt, and *"even installed plugin
+startup can run unconfined"* — a decision worth re-taking now that it is the only unconfined CLI path.
+[C-446](stories/C-446-no-windows-sandbox-backend.md): *"Flux has a mandatory policy/guarded-IO boundary
+everywhere, but not a mandatory OS isolation boundary everywhere."*
+[C-448](stories/C-448-cancellation-coverage.md) audits what cancel actually reaches — Pi's reaches
+retries, compaction and bash, and ⚠ a cancelled turn whose spawned process keeps running is an effect
+continuing after the operator said stop.
+
+**And the question that would settle several arguments at once.**
+[C-451](stories/C-451-the-head-to-head-benchmark.md): the review states plainly that it ran *"no
+task-quality benchmark, runtime benchmark, fuzzing"* — so the performance score, flux's throughput
+ceiling ([C-447](stories/C-447-the-per-engine-turn-mutex.md), where the `turn_gate` mutex is a strength
+and a ceiling at once) and *"Pi parallelizes tool work"* are **all inferences from source**. flux has
+`flux-eval` and is the cheaper side to measure. ⚠ Publish the result even if flux loses. Alongside:
+[C-449](stories/C-449-provider-breadth.md) (39 provider variants — a *decision* about strategy before a
+build, since flux's own ecosystem split says it knows kinds, never vendors) and
+[C-450](stories/C-450-dependency-pinning-discipline.md) (flux is ahead on assurance 9.0 vs 8.0; this is
+the narrow slice where Pi is tighter). Design:
+[pi-comparison-remediation.md](designs/pi-comparison-remediation.md).
+
 ### The docs are missing things a user expects to find (epic) — 🔄 **PROPOSED (C-441…C-443 filed, none started)**
 
 Someone evaluating an agent harness arrives with a checklist they never wrote down — *how does it handle
