@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The connectors seam refuses a credential-bearing response, rather than redacting one** (C-312).
+  The seam's central claim is an asymmetry — the deployment holds and injects the vendor credential,
+  flux holds exactly one secret on that path (the deployment's own session bearer) — and nothing
+  enforced it. A new per-operation `platform` declaration marks an op as platform-sourced; a
+  platform-sourced response carrying credential material is **discarded whole** at ingest, the moment
+  `call_with_host` returns: before the op's own `redact_fields` masking (which a hostile manifest
+  could otherwise declare its way past), before stringification, before the executor's result
+  redaction. The `err` frame is checked too, a refresh may not shed the declaration, and an
+  activation response must be an authorize URL for a human — no userinfo, no secret-naming query or
+  fragment parameter, no `code`. A manifest declaring `platform` alongside `secret_purposes` is
+  refused at load: the two say opposite things about who resolves the credential.
+  A `platform_plugin` fixture makes the tests non-vacuous — a test asserting a credential is absent
+  from a log passes trivially when the credential was never sent. Each enforcement point was proven
+  load-bearing by removing it and watching the raw token flow through.
+  ⚠ The boundary is a **floor, not a proof of impossibility**: a deployment that encodes a credential
+  (base64, split across fields, embedded in an image) defeats shape matching. Two ingest paths on the
+  endpoint broker are outside it — filed as C-403.
+  Wire: `codewandler-flux-plugin-protocol` 1.1.1 → 1.2.0 (additive, serde-defaulted and
+  `skip_serializing_if`, so existing manifests serialize byte-identically);
+  `codewandler-flux-secret` 1.1.1 → 1.2.0 (`Redactor::credential_shape` and `CredentialShape`;
+  `credential_shape` and `redact` are two views of one private pipeline, so a refusing caller and a
+  hiding caller cannot disagree); `codewandler-flux-host-kit` 1.0.1 → 1.1.0.
+
 ### Fixed
 
 - **⚠ BREAKING: `codewandler-flux-events`' `otel::build_metrics` gains a required `&Redactor`**

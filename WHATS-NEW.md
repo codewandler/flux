@@ -15,6 +15,17 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **A connector deployment can no longer hand flux one of your vendor credentials.** When a
+  connector platform answers an operation, flux now checks the response for credential material
+  before anything else looks at it — and if it finds any, it throws the whole response away instead
+  of masking it and passing it on. The same check covers error responses, and a sign-in response must
+  be an ordinary authorization link you could click yourself, with no secret embedded in it. A
+  connector cannot quietly drop this protection once it is running. This is a floor rather than a
+  guarantee: a platform determined to smuggle a credential past it — by encoding it, or splitting it
+  across fields — still can, so it does not replace trusting the deployment you started.
+
 ## [0.45.0] - 2026-08-01
 
 ### Improved

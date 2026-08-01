@@ -2,8 +2,7 @@
 id: C-312
 title: "The credential boundary — prove a vendor credential never enters flux"
 pillar: Core
-status: in-progress
-priority: 9
+status: done
 epic: connector-platform
 areas: [flux-plugin, flux-secret]
 note: "the connectors seam's central invariant, asserted rather than assumed: flux holds exactly ONE secret on this path — the deployment session bearer. A response carrying credential-shaped material is refused, not merely redacted"
