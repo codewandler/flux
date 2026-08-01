@@ -14,6 +14,16 @@
 //! [`recipes`] is a cookbook of reusable, parameterized flow builders (routing, lookup, the loop
 //! family, resilience).
 //!
+//! **The OS-sandbox floor is yours, not the SDK's.** The `flux` binary classifies its own argv and
+//! raises the posture to fail-closed `require` for every surface with no human approval boundary —
+//! auto-approved turns, serving listeners, `flux plugin call` (C-262 / C-410). That classifier is
+//! part of the CLI and none of it runs here: a library has no argv to classify, so
+//! [`auto_approve(true)`](ClientBuilder::auto_approve) — the embedded analogue of `flux run --yes` —
+//! does **not** imply confinement. What a built client resolves instead is the ambient environment
+//! (`FLUX_SANDBOX` / `FLUX_SANDBOX_NET` / `FLUX_SANDBOX_WRITABLE`, and `off` when unset), or
+//! whatever [`with_sandbox`](ClientBuilder::with_sandbox) pins. An unattended embedder that wants
+//! the CLI's floor has to ask for it — see [`Sandbox`] for both ways.
+//!
 //! ```ignore
 //! // Runnable hermetic version: `cargo run -p codewandler-flux-sdk --example client_basic`.
 //! # async fn ex() -> flux_core::Result<()> {
@@ -306,7 +316,37 @@ pub mod subagents {
 /// The OS-sandbox posture types, re-exported so a consumer can inject an explicit sandbox into a
 /// builder via [`ClientBuilder::with_sandbox`]/[`flow::FlowClientBuilder::with_sandbox`] without
 /// taking a direct `flux-system` dependency.
+///
+/// **An embedder owns this floor.** Nothing in this crate infers a posture from how the client is
+/// configured: `auto_approve(true)`, a served HTTP front end, or a cron-driven worker all resolve
+/// the same way an interactive one does. The CLI's fail-closed classification of unattended
+/// surfaces (C-262 / C-410) lives in the `flux` binary and is not reachable from a library. So an
+/// unattended deployment states the posture itself, either way round:
+///
+/// ```ignore
+/// // Explicit, independent of ambient env — the recommended form for a daemon.
+/// use flux_sdk::{Client, Sandbox, SandboxSettings};
+/// use flux_sdk::sandbox::SandboxMode;
+/// let mut settings = SandboxSettings::off();
+/// settings.mode = SandboxMode::Require;   // refuse to spawn at all with no usable backend
+/// settings.network = false;               // what the CLI's unattended profile also defaults to
+/// let client = Client::builder()
+///     .auto_approve(true)
+///     .with_sandbox(Sandbox::resolve(settings))
+///     .build(provider, ".")?;
+/// ```
+///
+/// or by exporting `FLUX_SANDBOX=require` before `build`, which is what
+/// [`SandboxSettings::from_env`] reads when no sandbox is injected. Either way, verify with
+/// [`Sandbox::ensure_available`] rather than assuming: a `require` posture on a host with no
+/// backend is an error you want at startup, not at the first spawn.
 pub use flux_system::sandbox::{Sandbox, SandboxSettings};
+
+/// The sandbox posture enum and backend discovery behind [`Sandbox`], re-exported for an embedder
+/// building a [`SandboxSettings`] by hand (see [`Sandbox`] for why one would).
+pub mod sandbox {
+    pub use flux_system::sandbox::{Backend, SandboxMode};
+}
 
 /// The runtime **resource ceilings** (C-290), re-exported so a consumer can bound a runtime it
 /// constructs — via [`ClientBuilder::resource_limits`] or
@@ -482,6 +522,11 @@ impl ClientBuilder {
         self
     }
     /// Approve every tool call automatically (no human in the loop). Use with care.
+    ///
+    /// This is the library analogue of `flux run --yes`, with one deliberate difference: the CLI
+    /// also raises the OS-sandbox posture to fail-closed `require` for that form, and this does
+    /// **not**. The embedder owns that floor — [`with_sandbox`](Self::with_sandbox), or
+    /// `FLUX_SANDBOX=require` in the environment. See [`Sandbox`].
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
         self
@@ -663,6 +708,11 @@ impl ClientBuilder {
     /// [`build`](Self::build) via `Sandbox::resolve(SandboxSettings::from_env())` — so a consumer that
     /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
     /// Pass one only to pin a posture independent of ambient env.
+    ///
+    /// **These two are the whole story for an embedder** — nothing in this crate infers a posture
+    /// from the client's configuration the way the CLI infers one from its argv (C-262 / C-410), so
+    /// an unattended deployment that does neither runs its spawns unconfined. [`Sandbox`] shows
+    /// both forms.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.envelope.sandbox = Some(sandbox);
         self

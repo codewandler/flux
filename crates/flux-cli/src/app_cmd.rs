@@ -347,6 +347,29 @@ pub(super) fn assemble_app_execution_environment(
     .with_workspace(workspace)
 }
 
+/// The approval posture a `flux app run <program>` executor runs under: `--yes` auto-approves every
+/// call, and without it every call that needs approval is **denied** rather than queued at a prompt
+/// — a program's channels (cron, webhook, Slack) fire with no operator attached, so there is nobody
+/// to answer one.
+///
+/// ⚠ **This is not a sandbox boundary, and an earlier draft of C-410 wrongly treated it as one.**
+/// Two things route around it entirely: [`run_app`] calls [`assemble_integrations`] at startup,
+/// which spawns every installed plugin binary before any journey exists and never consults an
+/// approver; and a program declaring no capability policy dispatches under `LEGACY_JOURNEY_ALLOW`
+/// (flux-app's `app.rs`), whose pre-authorised ops resolve to `PermDecision::Allow` and so never
+/// reach an approver either. `flux app run <program>` is therefore pinned to the fail-closed
+/// sandbox profile in its own right — see `unattended_sandbox_surface` (dispatch.rs).
+///
+/// What it *is* remains worth pinning: the `--yes` / no-`--yes` split for calls that do reach
+/// approval. See `app_run_approval_posture`.
+pub(super) fn app_run_approver(auto_approve: bool) -> Arc<dyn Approver> {
+    if auto_approve {
+        Arc::new(AllowApprover)
+    } else {
+        Arc::new(flux_runtime::DenyApprover)
+    }
+}
+
 pub(super) async fn run_app(
     path: Option<&str>,
     flags: &AgentFlags,
@@ -628,15 +651,10 @@ pub(super) async fn run_app(
         _ => None,
     };
     try_register_fleet(&mut integration_registry, ledger)?;
-    let approver: Arc<dyn Approver> = if auto_approve {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(flux_runtime::DenyApprover)
-    };
     let environment = assemble_app_execution_environment(
         system,
         integration_registry,
-        approver,
+        app_run_approver(auto_approve),
         app_workspace,
         redactor,
         resource_limits,
@@ -817,6 +835,56 @@ fn tui_options(
         .ok()
         .and_then(|cfg| cfg.theme);
     options
+}
+
+#[cfg(test)]
+mod app_run_approval_posture {
+    //! The `--yes` / no-`--yes` approval split for `flux app run <program>`, asserted as
+    //! *behaviour* (what the approver answers) rather than as a type — and the `--yes` half is here
+    //! too, because "it denies" proves nothing unless the same function is shown to allow when it
+    //! is supposed to.
+    //!
+    //! ⚠ **Recorded negative result (C-410).** This module was written to be the premise of a
+    //! sandbox-floor *exemption* for the unflagged form, and that premise was false. Review found
+    //! two paths that never reach this approver at all: the startup plugin spawn in
+    //! `assemble_integrations`, and `LEGACY_JOURNEY_ALLOW`'s pre-authorised ops, which resolve to
+    //! `PermDecision::Allow` and skip approval by construction. A measured probe confirmed it — the
+    //! unflagged form let a plugin subprocess reach the network and write outside the workspace.
+    //!
+    //! The lesson is the repo's standing one: a guard that asserts a component in isolation is not
+    //! evidence about the surface that component sits in. `flux app run <program>` is now pinned to
+    //! the floor outright, and these tests claim nothing about confinement.
+
+    use super::*;
+
+    use flux_runtime::ApprovalChoice;
+    use flux_spec::IntentSet;
+
+    #[tokio::test]
+    async fn the_unflagged_app_run_approver_denies_every_call() {
+        let approver = app_run_approver(false);
+        let choice = approver
+            .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
+            .await;
+        assert!(
+            matches!(choice, ApprovalChoice::Deny),
+            "an unflagged `flux app run <program>` must deny calls that reach approval — a \
+             program's channels fire with no operator to answer a prompt; this approver answered \
+             {choice:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_yes_flagged_app_run_approver_still_allows() {
+        let approver = app_run_approver(true);
+        let choice = approver
+            .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
+            .await;
+        assert!(
+            matches!(choice, ApprovalChoice::Allow),
+            "`flux app run --yes` must still auto-approve; this approver answered {choice:?}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -150,6 +150,11 @@ impl FlowClientBuilder {
     }
     /// Approve every tool call automatically (no human in the loop). Use with care — model-backed
     /// cognition ops egress over the network, so they gate by default.
+    ///
+    /// It does not raise the OS-sandbox posture. The CLI pins its own auto-approved and headless
+    /// surfaces to fail-closed `require` (C-262 / C-410); a library has no argv to classify, so an
+    /// unattended embedder states the posture itself — [`with_sandbox`](Self::with_sandbox) or
+    /// `FLUX_SANDBOX=require`. See [`Sandbox`](crate::Sandbox).
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
         self
@@ -200,6 +205,11 @@ impl FlowClientBuilder {
     /// [`build`](Self::build) via `Sandbox::resolve(SandboxSettings::from_env())` — so a consumer that
     /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
     /// Pass one only to pin a posture independent of ambient env.
+    ///
+    /// **These two are the whole story for an embedder** — nothing in this crate infers a posture
+    /// from the client's configuration the way the CLI infers one from its argv (C-262 / C-410), so
+    /// an unattended deployment that does neither runs its spawns unconfined. See
+    /// [`Sandbox`](crate::Sandbox).
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.envelope.sandbox = Some(sandbox);
         self

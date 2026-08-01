@@ -4940,6 +4940,76 @@ mod tests {
         );
     }
 
+    /// **C-410.** The classification itself, subcommand by subcommand — read straight off
+    /// `unattended_sandbox_surface` with no environment mutation, so it says what the profile
+    /// *covers* rather than what one host's backend discovery happens to do about it.
+    ///
+    /// The rows this story exists for: `flux plugin call` is pinned (it invokes a plugin operation
+    /// with no approver and outside `Executor::dispatch`) while the rest of `flux plugin …` is
+    /// management and is not; and **program mode is pinned under both its spellings**, flagged or
+    /// not, because a `<program.flux>` is a channel daemon whose cron/webhook triggers fire with no
+    /// operator attached. Before C-410 the whole `plugin` subcommand fell through a `_ => None`
+    /// nobody had chosen, and the unflagged program daemon was exempt on a premise that review
+    /// disproved.
+    ///
+    /// The two program-mode spellings are the pair most at risk of drifting apart, so they are
+    /// asserted together — `flux run p.flux` and `flux app run p.flux` reach the same `run_app`
+    /// through the same `run_targets_a_program` predicate, and a classification that covered one
+    /// but not the other would just move the hole.
+    #[test]
+    fn the_unattended_profile_classifies_each_surface_deliberately() {
+        use clap::Parser;
+
+        let classify = |argv: &[&str]| {
+            super::unattended_sandbox_surface(
+                &super::Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}")),
+            )
+        };
+
+        for pinned in [
+            &["flux", "run", "--yes", "hi"][..],
+            &["flux", "fork", "s_1", "--at", "0", "--yes"][..],
+            &["flux", "flow", "run", "f", "--yes"][..],
+            &["flux", "app", "run", "--serve", "--yes", "-m", "mock"][..],
+            &["flux", "review", "--files", "README.md"][..],
+            &["flux", "plugin", "call", "gitlab", "issue_list"][..],
+            // Program mode, every spelling, with and without `--yes`.
+            &["flux", "app", "run", "p.flux"][..],
+            &["flux", "app", "run", "p.flux", "--yes"][..],
+            &["flux", "run", "p.flux"][..],
+            &["flux", "run", "p.flux", "--yes"][..],
+        ] {
+            assert!(
+                classify(pinned).is_some(),
+                "{pinned:?} must inherit the fail-closed unattended profile"
+            );
+        }
+
+        for exempt in [
+            &["flux", "run", "hi"][..],
+            &["flux", "tui"][..],
+            &["flux", "sessions"][..],
+            &["flux", "plugin", "ls"][..],
+            &["flux", "plugin", "status"][..],
+            &["flux", "plugin", "install", "--all"][..],
+            // Not program mode: `--entry` selects a named flow inside the file and routes to
+            // `run_flow_entry`, which is the interactive flow path, not the channel daemon.
+            &["flux", "run", "--entry", "main", "p.flux"][..],
+            // A prompt that merely mentions a `.flux` file is a turn, not a program — the
+            // classifier keys on the FIRST token exactly as the router does.
+            &["flux", "run", "explain", "p.flux"][..],
+        ] {
+            assert_eq!(
+                classify(exempt),
+                None,
+                "{exempt:?} must stay on the interactive off/on/require contract"
+            );
+        }
+
+        // No subcommand at all is the REPL, which is as interactive as it gets.
+        assert_eq!(classify(&["flux"]), None);
+    }
+
     /// D-130 (findings 6/7/9b): `apply_sandbox_env` resolves posture **tightest-wins** — the
     /// strictest of `Require > On > Off` across `--sandbox`, a pre-set `FLUX_SANDBOX`, and config —
     /// so a laxer source can never silently downgrade a stricter one; the sole override is the

@@ -326,3 +326,64 @@ fn a_child_flux_resolves_the_parents_require_posture() {
          `Off` and the operator's `require` died at the process boundary.\ntool_result: {reported}"
     );
 }
+
+/// **C-410.** The confined case owed a disclosure and never paid one.
+///
+/// Every other line `apply_sandbox_env` prints fires when confinement is *absent* or was opted out
+/// of: the `on`-without-a-backend warning, the `--no-sandbox` BYPASSED warning, the
+/// OUTER-CONFINEMENT trust note. A run that is genuinely confined said nothing — so the first
+/// symptom of the profile is a child process failing with `curl: (6) Could not resolve host`, or a
+/// refused write under `$HOME`, with nothing anywhere naming the sandbox as the cause. Choosing the
+/// looser posture was loud and choosing the tighter one was silent.
+///
+/// This lane is the only one that can see it: the line is emitted where `ensure_available()`
+/// succeeded and the sandbox is active, which on a host with no backend is unreachable. Both
+/// narrowings are asserted because both bite in practice — the network is closed, and writes are
+/// limited to the workspace, `$TMPDIR` and the toolchain caches, which is what breaks a plugin that
+/// keeps its state in `~/.config/<vendor>`.
+#[test]
+fn a_confined_unattended_surface_discloses_what_it_narrowed() {
+    if !backend_promised("a_confined_unattended_surface_discloses_what_it_narrowed") {
+        return;
+    }
+    // `plugin call` against a plugin that is not installed: the startup posture preflight runs to
+    // completion (which is what emits the line) and the command then fails on the missing plugin.
+    // That keeps this offline, with no provider and no fixture binary.
+    let run = run_flux(
+        "c410-confined-note",
+        &[],
+        &["plugin", "call", "c410-never-installed", "echo"],
+    );
+    assert!(
+        run.stderr.contains("CONFINED") && run.stderr.contains("sandbox:"),
+        "a confined unattended surface must say so, in the same breath as the posture it \
+         resolved.\nstderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("network CLOSED"),
+        "the disclosure must name the network narrowing — it is the one that produces a DNS \
+         failure with no other explanation.\nstderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("$TMPDIR"),
+        "the disclosure must name the filesystem narrowing too: a plugin that writes outside the \
+         workspace is refused, and nothing else tells the operator that.\nstderr:\n{}",
+        run.stderr
+    );
+    // Routing, same contract as the C-217 disclosure: diagnostics never touch stdout.
+    assert!(
+        !run.stdout.contains("CONFINED"),
+        "the disclosure must not reach stdout.\nstdout:\n{}",
+        run.stdout
+    );
+    // And it must not fire for a surface that was never pinned, or every interactive run would grow
+    // a line about a sandbox it is not using.
+    let unpinned = run_flux("c410-confined-note-off", &[], &["plugin", "ls"]);
+    assert!(
+        !unpinned.stderr.contains("CONFINED"),
+        "an unpinned surface resolved `off` and has nothing to disclose.\nstderr:\n{}",
+        unpinned.stderr
+    );
+}

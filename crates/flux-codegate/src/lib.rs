@@ -1276,7 +1276,20 @@ pub const UNATTENDED_ARGV_FLAGS: &[&str] = &["--yes", "-y", "--serve"];
 
 /// Subcommands that are unattended with **no flag at all** — the trap `--yes`-keyed matching misses.
 /// Kept honest against `dispatch.rs` by the drift check on [`unattended_surface_arms`].
-pub const FLAGLESS_UNATTENDED_SUBCOMMANDS: &[&str] = &["review"];
+///
+/// An entry may name a **subcommand path** (`plugin call`), matched as a contiguous run of argv
+/// tokens. C-410 needs that: `flux plugin call` is unattended, while the rest of `flux plugin …` is
+/// operator-driven management that is not — a bare `plugin` entry would demand a posture
+/// declaration from every `plugin ls`/`status`/`refresh` spawn and buy nothing.
+pub const FLAGLESS_UNATTENDED_SUBCOMMANDS: &[&str] = &["review", "plugin call"];
+
+/// The file extension that turns a `run` into **program mode** — a channel daemon, pinned to the
+/// fail-closed profile with or without `--yes` (C-410).
+///
+/// This is the one unattended shape keyed on neither a flag nor a subcommand *name* but on an
+/// argument, so neither list above can express it: `flux run p.flux` is a daemon while
+/// `flux run hello` is a turn, and both are spelled `run`. [`program_mode_argv`] matches it.
+pub const UNATTENDED_PROGRAM_SUFFIX: &str = ".flux";
 
 /// Environment variables whose appearance in a spawn's builder chain *is* a posture declaration:
 /// each one pins the resolved posture (or forces backend discovery) instead of inheriting whatever
@@ -1310,12 +1323,51 @@ pub struct AmbientSandboxSpawn {
     pub kind: AmbientSandboxKind,
 }
 
-/// Whether `token` names an auto-approving or serving surface. `--serve=<addr>` is the attached-value
-/// spelling of `--serve` and counts the same.
+/// Whether `token` names an auto-approving or serving surface on its own. `--serve=<addr>` is the
+/// attached-value spelling of `--serve` and counts the same. Multi-word
+/// [`FLAGLESS_UNATTENDED_SUBCOMMANDS`] entries are matched by [`unattended_argv`], not here.
 fn unattended_argv_token(token: &str) -> bool {
     UNATTENDED_ARGV_FLAGS.contains(&token)
         || token.starts_with("--serve=")
-        || FLAGLESS_UNATTENDED_SUBCOMMANDS.contains(&token)
+        || FLAGLESS_UNATTENDED_SUBCOMMANDS
+            .iter()
+            .any(|entry| !entry.contains(' ') && *entry == token)
+}
+
+/// Whether this literal argv runs a `<program.flux>` — the C-410 channel daemon, pinned with or
+/// without `--yes`, under either of its spellings (`flux run p.flux`, `flux app run p.flux`).
+///
+/// Keyed on a `run` followed by a `[UNATTENDED_PROGRAM_SUFFIX]` argument, which is as close to
+/// `run_targets_a_program` (flux-cli's dispatch.rs) as a scan of argv literals can get. `--entry`
+/// selects a named flow inside the file and routes away from the daemon, so it disqualifies.
+fn program_mode_argv(argv: &[String]) -> Option<String> {
+    let run_at = argv.iter().position(|token| token == "run")?;
+    let rest = &argv[run_at + 1..];
+    if rest.iter().any(|token| token == "--entry") {
+        return None;
+    }
+    rest.iter()
+        .find(|token| token.ends_with(UNATTENDED_PROGRAM_SUFFIX))
+        .map(|program| format!("run {program}"))
+}
+
+/// The unattended surface this literal argv selects, if any — the token, subcommand path, or
+/// program argument to name in the finding. A single token wins over the wider shapes so the
+/// message points at the sharpest evidence.
+fn unattended_argv(argv: &[String]) -> Option<String> {
+    if let Some(token) = argv.iter().find(|token| unattended_argv_token(token)) {
+        return Some(token.clone());
+    }
+    FLAGLESS_UNATTENDED_SUBCOMMANDS
+        .iter()
+        .filter(|entry| entry.contains(' '))
+        .find(|entry| {
+            let words: Vec<&str> = entry.split(' ').collect();
+            argv.windows(words.len())
+                .any(|window| window.iter().zip(&words).all(|(got, want)| got == want))
+        })
+        .map(|entry| (*entry).to_string())
+        .or_else(|| program_mode_argv(argv))
 }
 
 /// Everything one builder chain said about itself. Accumulated per Command *binding* so a chain
@@ -1344,12 +1396,8 @@ impl SpawnFacts {
         {
             return None;
         }
-        if let Some(token) = self
-            .literal_argv
-            .iter()
-            .find(|token| unattended_argv_token(token))
-        {
-            return Some(AmbientSandboxKind::Unattended(token.clone()));
+        if let Some(surface) = unattended_argv(&self.literal_argv) {
+            return Some(AmbientSandboxKind::Unattended(surface));
         }
         self.forwards_argv
             .then_some(AmbientSandboxKind::ForwardedArgv)
@@ -1609,11 +1657,20 @@ pub fn ambient_sandbox_spawns(src: &str) -> syn::Result<Vec<AmbientSandboxSpawn>
 /// One `match` arm of `flux-cli`'s `unattended_sandbox_surface`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnattendedArm {
-    /// The `Commands::<Variant>` this arm matches, lowercased into its CLI subcommand spelling.
+    /// The `Commands::<Variant>` this arm matches, lowercased into its CLI subcommand spelling —
+    /// extended with the nested `<X>Action::<Variant>` when the arm narrows to one
+    /// (`Commands::Plugin { action: Some(PluginAction::Call { .. }) }` ⇒ `plugin call`), so a
+    /// classification that covers one subcommand of a group is not read as covering the group.
     pub subcommand: String,
     /// Whether the arm is selected by a flag (`yes`, `serve`, `"--run"`) rather than by the
     /// subcommand alone. A flagless arm is invisible to argv-flag matching.
     pub keyed_on_flag: bool,
+    /// Whether the arm is selected by a `<program.flux>` **argument** (`program: Some(_)`, or the
+    /// `run_targets_a_program` guard) rather than by a flag or the subcommand name. Neither
+    /// [`UNATTENDED_ARGV_FLAGS`] nor [`FLAGLESS_UNATTENDED_SUBCOMMANDS`] can express that shape —
+    /// `flux run p.flux` is a daemon and `flux run hello` is a turn, and both are spelled `run` —
+    /// so [`program_mode_argv`] is what recognises it in a spawn's argv.
+    pub keyed_on_program_arg: bool,
 }
 
 /// Collect the surfaces `flux-cli`'s `unattended_sandbox_surface` classifies as unattended, so a
@@ -1640,6 +1697,20 @@ pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
         }
     }
 
+    /// The program-mode tell: a `program` binding in the pattern, or the shared routing predicate
+    /// in the guard.
+    #[derive(Default)]
+    struct ProgramWords {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for ProgramWords {
+        fn visit_ident(&mut self, ident: &'ast proc_macro2::Ident) {
+            if ident == "program" || ident == "run_targets_a_program" {
+                self.found = true;
+            }
+        }
+    }
+
     struct Arms {
         arms: Vec<UnattendedArm>,
     }
@@ -1657,10 +1728,18 @@ pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
             variant.visit_pat(&arm.pat);
             let mut flags = FlagWords::default();
             flags.visit_pat(&arm.pat);
+            let mut program = ProgramWords::default();
+            program.visit_pat(&arm.pat);
             if let Some(subcommand) = variant.name {
+                let mut subcommand = subcommand.to_lowercase();
+                if let Some(action) = variant.action {
+                    subcommand.push(' ');
+                    subcommand.push_str(&action.to_lowercase());
+                }
                 self.arms.push(UnattendedArm {
-                    subcommand: subcommand.to_lowercase(),
+                    subcommand,
                     keyed_on_flag: flags.found,
+                    keyed_on_program_arg: program.found,
                 });
             }
         }
@@ -1678,10 +1757,12 @@ pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
         }
     }
 
-    /// The `Commands::<Variant>` name inside a pattern.
+    /// The `Commands::<Variant>` name inside a pattern, plus the nested `<X>Action::<Variant>` the
+    /// arm narrows to (`PluginAction::Call`, `AppAction::Run`) when there is one.
     #[derive(Default)]
     struct Variant {
         name: Option<String>,
+        action: Option<String>,
     }
     impl Variant {
         fn take(&mut self, path: &syn::Path) {
@@ -1693,6 +1774,8 @@ pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
             if let [enum_name, variant] = segments.as_slice() {
                 if enum_name == "Commands" && self.name.is_none() {
                     self.name = Some(variant.clone());
+                } else if enum_name.ends_with("Action") && self.action.is_none() {
+                    self.action = Some(variant.clone());
                 }
             }
         }
@@ -1725,6 +1808,149 @@ pub fn unattended_surface_arms(src: &str) -> syn::Result<Vec<UnattendedArm>> {
     arms.arms.sort();
     arms.arms.dedup();
     Ok(arms.arms)
+}
+
+/// What `flux-cli`'s `unattended_sandbox_surface` says about `enum Commands` as a whole (C-410).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnattendedCoverage {
+    /// Every `Commands` variant, in declaration order.
+    pub variants: Vec<String>,
+    /// The variants the classifier names in at least one arm — pinned or exempt, either counts.
+    pub classified: BTreeSet<String>,
+    /// Catch-all arms (`_ => …`, or a bare binding) found in the classifier's `match`. Any is a
+    /// finding: a wildcard is what lets a *new* subcommand inherit a classification nobody chose.
+    pub catch_all_arms: usize,
+}
+
+impl UnattendedCoverage {
+    /// The variants no arm names, in declaration order.
+    pub fn unclassified(&self) -> Vec<String> {
+        self.variants
+            .iter()
+            .filter(|variant| !self.classified.contains(*variant))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Read `enum Commands` (`args_src`) against `unattended_sandbox_surface` (`dispatch_src`) and
+/// report what the classifier covers.
+///
+/// The defect C-410 removed was a hand-maintained enumeration drifting from the enum it enumerates:
+/// `Commands::Plugin` simply had no arm, so `flux plugin call` fell through `_ => None` and ran
+/// headless at the `Off` sandbox default. Rust's exhaustiveness check now catches a *new* variant —
+/// but only for as long as nobody re-adds the wildcard, which is precisely the edit that reads like
+/// a harmless cleanup. Hence both halves here: every variant is named, and no arm is a catch-all.
+pub fn unattended_classifier_coverage(
+    args_src: &str,
+    dispatch_src: &str,
+) -> syn::Result<UnattendedCoverage> {
+    let args = syn::parse_file(args_src)?;
+    let variants: Vec<String> = args
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Enum(e) if e.ident == "Commands" => Some(e),
+            _ => None,
+        })
+        .map(|e| e.variants.iter().map(|v| v.ident.to_string()).collect())
+        .unwrap_or_default();
+
+    /// The classifier's own `match` — the first one in the function body. Nested matches inside an
+    /// arm body would belong to that arm's logic, not to the classification, so recursion stops.
+    struct TopMatch<'ast> {
+        arms: Option<&'ast Vec<syn::Arm>>,
+    }
+    impl<'ast> Visit<'ast> for TopMatch<'ast> {
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            if self.arms.is_none() {
+                self.arms = Some(&node.arms);
+            }
+        }
+    }
+
+    /// Every `Commands::<Variant>` an arm's pattern names — all of them, since an or-pattern
+    /// classifies a whole group at once.
+    #[derive(Default)]
+    struct Named {
+        names: BTreeSet<String>,
+    }
+    impl Named {
+        fn take(&mut self, path: &syn::Path) {
+            let segments: Vec<String> = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            if let [enum_name, variant] = segments.as_slice() {
+                if enum_name == "Commands" {
+                    self.names.insert(variant.clone());
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Named {
+        fn visit_pat_struct(&mut self, pat: &'ast syn::PatStruct) {
+            self.take(&pat.path);
+            syn::visit::visit_pat_struct(self, pat);
+        }
+        fn visit_pat_tuple_struct(&mut self, pat: &'ast syn::PatTupleStruct) {
+            self.take(&pat.path);
+            syn::visit::visit_pat_tuple_struct(self, pat);
+        }
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            self.take(&path.path);
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+
+    /// Whether a pattern is a catch-all — every spelling of one, since the point of the check is
+    /// that a wildcard cannot come back under a different name:
+    ///
+    /// - `_` (`Pat::Wild`) and a bare binding `other` (`Pat::Ident` with no subpattern);
+    /// - `x @ _` — a `Pat::Ident` **with** a subpattern, which is a catch-all exactly when its
+    ///   subpattern is (`x @ Commands::Run { .. }` is not). Missing this recursion left `x @ _`
+    ///   caught only by the weaker `unclassified()` backstop;
+    /// - `pat if cond` (`Pat::Guard`) and parenthesised forms, unwrapped;
+    /// - an or-pattern with a catch-all in any position (`_ | x`).
+    fn is_catch_all(pat: &syn::Pat) -> bool {
+        match pat {
+            syn::Pat::Wild(_) => true,
+            syn::Pat::Ident(ident) => match &ident.subpat {
+                Some((_, subpat)) => is_catch_all(subpat),
+                None => true,
+            },
+            syn::Pat::Guard(guard) => is_catch_all(&guard.pat),
+            syn::Pat::Paren(paren) => is_catch_all(&paren.pat),
+            syn::Pat::Or(or) => or.cases.iter().any(is_catch_all),
+            _ => false,
+        }
+    }
+
+    let dispatch = syn::parse_file(dispatch_src)?;
+    let mut coverage = UnattendedCoverage {
+        variants,
+        ..UnattendedCoverage::default()
+    };
+    for item in &dispatch.items {
+        let syn::Item::Fn(function) = item else {
+            continue;
+        };
+        if function.sig.ident != "unattended_sandbox_surface" {
+            continue;
+        }
+        let mut top = TopMatch { arms: None };
+        top.visit_block(&function.block);
+        for arm in top.arms.into_iter().flatten() {
+            if is_catch_all(&arm.pat) {
+                coverage.catch_all_arms += 1;
+            }
+            let mut named = Named::default();
+            named.visit_pat(&arm.pat);
+            coverage.classified.extend(named.names);
+        }
+    }
+    Ok(coverage)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3831,8 +4057,17 @@ fn t() {
     }
 
     /// The trigger table above is only as good as its agreement with the CLI. A new unattended
-    /// surface keyed on a flag is already caught by argv matching; a new *flagless* one (the `review`
-    /// shape) is invisible, so it must be taught to the scanner here.
+    /// surface keyed on a flag is already caught by argv matching; one keyed on anything else is
+    /// invisible until the scanner is taught it.
+    ///
+    /// Three ways an arm can be keyed, and each has its own recogniser: a **flag** (`--yes`,
+    /// `--serve` — [`UNATTENDED_ARGV_FLAGS`]), a **subcommand name** (`review`, `plugin call` —
+    /// [`FLAGLESS_UNATTENDED_SUBCOMMANDS`]), and a **`<program.flux>` argument** (C-410's channel
+    /// daemon — [`program_mode_argv`]). The partition below is exhaustive on purpose: an arm that
+    /// falls into the third bucket must not be silently demanded of the second, which is what
+    /// happened when program mode was first pinned and the drift check asked for a bare `run`
+    /// entry — an entry that would have demanded a posture from every interactive `flux run` spawn
+    /// in the tree.
     #[test]
     fn flagless_unattended_surfaces_match_the_cli_classifier() {
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -3844,9 +4079,48 @@ fn t() {
             arms.len() > 4,
             "did not find `unattended_sandbox_surface`'s arms — has it moved or been renamed? {arms:?}"
         );
+        // Program-mode arms are recognised by argument, not by name, so they are accounted for
+        // separately — and their existence is asserted, or this partition would quietly become a
+        // way to drop an arm out of the check entirely.
+        let program_keyed: BTreeSet<String> = arms
+            .iter()
+            .filter(|arm| arm.keyed_on_program_arg)
+            .map(|arm| arm.subcommand.clone())
+            .collect();
+        assert!(
+            program_keyed.len() >= 2,
+            "expected both spellings of program mode (`run <p.flux>` and `app run <p.flux>`) to be \
+             pinned and recognisable as argument-keyed; found {program_keyed:?}"
+        );
+        for argv in [
+            vec!["run".to_string(), "p.flux".to_string()],
+            vec!["app".to_string(), "run".to_string(), "p.flux".to_string()],
+        ] {
+            assert!(
+                program_mode_argv(&argv).is_some(),
+                "the argv recogniser missed a pinned program-mode spawn: {argv:?}"
+            );
+        }
+        // The controls: a prompt turn and an `--entry` flow run are NOT program mode, and matching
+        // them would demand a posture declaration from most `flux run` spawns in the tree.
+        for argv in [
+            vec!["run".to_string(), "hello".to_string()],
+            vec![
+                "run".to_string(),
+                "--entry".to_string(),
+                "main".to_string(),
+                "p.flux".to_string(),
+            ],
+        ] {
+            assert!(
+                program_mode_argv(&argv).is_none(),
+                "the argv recogniser over-matched a non-daemon spawn: {argv:?}"
+            );
+        }
+
         let flagless: BTreeSet<String> = arms
             .iter()
-            .filter(|arm| !arm.keyed_on_flag)
+            .filter(|arm| !arm.keyed_on_flag && !arm.keyed_on_program_arg)
             .map(|arm| arm.subcommand.clone())
             .collect();
         let declared: BTreeSet<String> = FLAGLESS_UNATTENDED_SUBCOMMANDS
@@ -3859,6 +4133,136 @@ fn t() {
              subcommand that is unattended with no flag at all cannot be recognized in a test's \
              argv unless it is listed there"
         );
+    }
+
+    /// **C-410.** The classifier is a hand-written enumeration of a machine-generated enum, and the
+    /// review found it one variant short: `Commands::Plugin` had no arm, so `flux plugin call` ran
+    /// headless at the `Off` sandbox default because of a `_ => None` nobody re-read.
+    ///
+    /// Rust's exhaustiveness check is the primary guard — a new `Commands` variant does not compile
+    /// until it is classified. This is the guard on *that* guard: a re-added wildcard would restore
+    /// the original defect silently, and it is exactly the edit that reads like tidying up.
+    #[test]
+    fn the_unattended_classifier_covers_every_commands_variant() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let args = std::fs::read_to_string(crates_dir.join("flux-cli/src/args.rs"))
+            .expect("read flux-cli args");
+        let dispatch = std::fs::read_to_string(crates_dir.join("flux-cli/src/dispatch.rs"))
+            .expect("read flux-cli dispatch");
+        let coverage =
+            unattended_classifier_coverage(&args, &dispatch).expect("parse flux-cli sources");
+
+        // Non-vacuity: an empty variant list (a renamed enum, a moved file) would satisfy every
+        // assertion below while checking nothing at all.
+        assert!(
+            coverage.variants.len() > 20,
+            "did not find `enum Commands` — has it moved or been renamed? {:?}",
+            coverage.variants
+        );
+        assert_eq!(
+            coverage.catch_all_arms, 0,
+            "`unattended_sandbox_surface` has a catch-all arm again. That is the C-410 defect \
+             itself: a new subcommand then inherits a sandbox classification nobody chose. Give \
+             every variant an explicit arm — pinned to the fail-closed profile, or exempt with the \
+             reason at the arm."
+        );
+        assert!(
+            coverage.unclassified().is_empty(),
+            "`unattended_sandbox_surface` never names {:?} — each `Commands` variant must be \
+             classified explicitly against the fail-closed unattended profile (C-262/C-410)",
+            coverage.unclassified()
+        );
+    }
+
+    /// The scanner above is only as good as its ability to *see* a wildcard and a gap. Fixtures
+    /// shaped like the real function: one classified, one exempt, one variant with no arm at all,
+    /// and a `_ => None` — the pre-C-410 shape.
+    #[test]
+    fn the_coverage_scanner_sees_a_wildcard_and_a_missing_variant() {
+        const ARGS: &str = r#"
+            pub(super) enum Commands {
+                Run { yes: bool },
+                Plugin { action: Option<PluginAction> },
+                Doctor { json: bool },
+            }
+        "#;
+        const COVERED: &str = r#"
+            fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
+                match cli.command.as_ref()? {
+                    Commands::Run { yes, .. } if *yes => Some("auto-approved"),
+                    Commands::Plugin { action: Some(PluginAction::Call { .. }) } => Some("headless"),
+                    Commands::Run { .. } | Commands::Plugin { .. } | Commands::Doctor { .. } => None,
+                }
+            }
+        "#;
+        const WILDCARD: &str = r#"
+            fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
+                match cli.command.as_ref()? {
+                    Commands::Run { yes, .. } if *yes => Some("auto-approved"),
+                    _ => None,
+                }
+            }
+        "#;
+
+        let good =
+            unattended_classifier_coverage(ARGS, COVERED).expect("parse the covered fixture");
+        assert_eq!(good.catch_all_arms, 0);
+        assert!(
+            good.unclassified().is_empty(),
+            "the fully-classified fixture reported gaps: {:?}",
+            good.unclassified()
+        );
+
+        let bad =
+            unattended_classifier_coverage(ARGS, WILDCARD).expect("parse the wildcard fixture");
+        assert_eq!(bad.catch_all_arms, 1, "the `_ => None` arm was not seen");
+        assert_eq!(
+            bad.unclassified(),
+            vec!["Plugin".to_string(), "Doctor".to_string()],
+            "the variants the wildcard swallowed were not reported"
+        );
+
+        // Every *other* spelling of a catch-all, each on the catch-all assertion in its own right.
+        // Without this the fixture proved only the `_` case and the rest survived on the weaker
+        // `unclassified()` backstop — which reports nothing at all once someone adds the missing
+        // arms and leaves the wildcard in place as a "safety net".
+        for (label, arm) in [
+            ("bare binding", "other => None,"),
+            ("binding with a wildcard subpattern", "x @ _ => None,"),
+            ("guarded wildcard", "_ if cli.no_sandbox => None,"),
+            (
+                "or-pattern with a wildcard",
+                "Commands::Doctor { .. } | _ => None,",
+            ),
+            ("parenthesised wildcard", "(_) => None,"),
+        ] {
+            let src = format!(
+                r#"
+                fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {{
+                    match cli.command.as_ref()? {{
+                        Commands::Run {{ yes, .. }} if *yes => Some("auto-approved"),
+                        Commands::Run {{ .. }} => None,
+                        Commands::Plugin {{ .. }} => None,
+                        Commands::Doctor {{ .. }} => None,
+                        {arm}
+                    }}
+                }}
+            "#
+            );
+            let coverage = unattended_classifier_coverage(ARGS, &src)
+                .unwrap_or_else(|e| panic!("parse the {label} fixture: {e}"));
+            // Non-vacuity: these fixtures classify every variant, so `unclassified()` is empty and
+            // the catch-all assertion is the ONLY thing that can catch them.
+            assert!(
+                coverage.unclassified().is_empty(),
+                "the {label} fixture was meant to leave no gap: {:?}",
+                coverage.unclassified()
+            );
+            assert_eq!(
+                coverage.catch_all_arms, 1,
+                "a catch-all spelled as a {label} was not seen"
+            );
+        }
     }
 
     /// A fixture with both builder roots, a renamed import, a local-binding split, a `#[cfg(test)]`

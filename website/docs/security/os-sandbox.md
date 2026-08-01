@@ -61,11 +61,15 @@ Policy semantics are the same wherever a backend is active:
 ## Turning it on
 
 Interactive/local operation is off by default. The CLI automatically uses `require` with sandbox
-network closed for `--yes` on `run`, `fork`, `record`, `flow run`, or `app run`;
-`preset --run --yes`; the auto-approved `review` flow; and `flux app run --serve`. Those forms refuse
-startup when no backend is usable. A program that serves only its declared channels through an
-unflagged `flux app run <program>` is not classified as `--serve`; it still receives the CLI-resolved
-configuration and environment posture. Direct SDK/server embedders receive no automatic posture
+network closed for `--yes` on `run`, `fork`, `record`, or `flow run`; `preset --run --yes`; the
+auto-approved `review` flow; `flux app run --serve`; `flux plugin call <name> <op>`, which invokes a
+plugin operation with no approver in the loop; and **any run of a `<program.flux>` — `flux app run
+<program>` and `flux run <program.flux>` alike, with or without `--yes`**, because a program serves
+its declared channels until Ctrl-C and its cron/webhook/Slack triggers fire turns with no operator
+attached. Those forms refuse startup when no backend is usable. Every other subcommand is classified
+explicitly as *not* one of them, so a new subcommand cannot join the list by accident — the rest of
+`flux plugin …` is management rather than operation invocation and stays on the interactive
+contract. Direct SDK/server embedders receive no automatic posture
 from `flux-server` and must inject a sandbox or export its environment settings. Both default to off
 with networking open when no posture is selected. Enable confinement with a flag, a config table,
 the environment, or an SDK-injected sandbox. When more than one CLI/config source has an opinion,
@@ -76,6 +80,23 @@ escape emits a prominent, source-attributed `UNCONFINED` warning and should be u
 outer container/VM supplies equivalent filesystem and network isolation. An unrecognized or empty
 `FLUX_SANDBOX` value never downgrades a configured posture, and a config file that fails to parse is
 a hard startup error rather than silently dropping a configured `require`.
+
+### What a confined run narrows, and what that breaks
+
+When one of those forms resolves to a live backend, flux prints one `sandbox: … is CONFINED` note on
+stderr naming both narrowings, so a downstream failure is attributable. Two of them bite in practice
+and are worth planning for:
+
+- **The network is closed.** A spawned child — including a plugin subprocess — cannot resolve or
+  reach anything. A plugin that calls a vendor API fails with a DNS error such as
+  `curl: (6) Could not resolve host`. Open it with `[sandbox] network = true` (or
+  `FLUX_SANDBOX_NET=1`); prefer that over disabling the sandbox.
+- **Writes are limited to the workspace, `$TMPDIR` and the toolchain caches.** A plugin or tool that
+  keeps state outside those — a token cache in `~/.config/<vendor>`, a lock file in `$HOME` — is
+  refused. Add the path with `[sandbox] writable`.
+
+This is why `flux plugin call` is the change most likely to surprise: the same plugin operation has
+always run confined inside `flux run --yes`, but invoking it directly used to be unconfined.
 
 A truthy inherited `FLUX_SANDBOXED` marker asserts that a parent flux sandbox or equivalent outer
 container/VM already confines the process tree. Nested flux accepts that assertion instead of trying

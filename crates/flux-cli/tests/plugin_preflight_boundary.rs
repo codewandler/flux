@@ -171,9 +171,23 @@ impl Installed {
 
     /// `flux plugin call platform echo --dry-run` — the D-88 preflight path — and everything the
     /// operator's terminal receives from it.
+    ///
+    /// `--no-sandbox` states the posture explicitly (C-266): since C-410, `plugin call` is one of
+    /// the surfaces pinned to the fail-closed `require` floor, so a spawn that said nothing would
+    /// pass here — this machine has `bwrap` — and refuse to start on a runner that does not. What
+    /// this file tests is the credential boundary on a plugin *response*, which is unaffected by
+    /// whether the plugin process is confined, so opting out is the honest declaration rather than
+    /// a workaround.
     fn dry_run(&self) -> Verdict {
         let out = Command::new(env!("CARGO_BIN_EXE_flux"))
-            .args(["plugin", "call", "platform", "echo", "--dry-run"])
+            .args([
+                "--no-sandbox",
+                "plugin",
+                "call",
+                "platform",
+                "echo",
+                "--dry-run",
+            ])
             .current_dir(self.dir.path().join("work"))
             .env("HOME", self.dir.path().join("home"))
             .env("NO_COLOR", "1")
