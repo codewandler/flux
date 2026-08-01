@@ -45,6 +45,19 @@
 //! disappear and their schemas may change; the capability declaration and the capability
 //! enforcement both stay at the load-time grant until a restart makes it again.
 //!
+//! "Until a restart makes it again" was, until C-411, an unbounded escape: a restart re-derived the
+//! grant from whatever the plugin's manifest declared *that* time, so a widening merely had to wait
+//! for one. [`PluginHost::manifest`](super::PluginHost::manifest) now applies the same asymmetry at
+//! every fetch, against the grant persisted in the descriptor —
+//! [`GrantOfRecord`](super::GrantOfRecord), which covers the same five manifest fields
+//! [`LoadedPlugin::pin_granted_authority`] pins here and reuses [`capability_widenings`] for the
+//! capability half, so both boundaries answer "is this more authority?" identically.
+//!
+//! The two are not redundant. This module's checks are the stricter pair — they bound a refresh to
+//! *this session's* load-time manifest, which may be narrower than the record — and they are what
+//! catches a re-scoped op, which the record says nothing about. The record bounds what a **new
+//! process** may start from, which nothing here can see.
+//!
 //! Everything else about the catalog is free to change — that is the point. Ops may appear and
 //! disappear, and their schemas and descriptions may change.
 //!

@@ -969,6 +969,13 @@ pub(super) struct PluginStatusReport {
     pub(super) verification: flux_plugin::Verification,
     pub(super) liveness: Liveness,
     pub(super) manifest: Option<flux_plugin::PluginManifest>,
+    /// The **grant of record** (C-411): the authority this install is on record as granting, which
+    /// is the ceiling the live manifest below is measured against. Absent means nothing has been
+    /// recorded yet — the next successful load will record whatever the plugin declares then.
+    /// Reported beside the live manifest rather than instead of it, because the interesting state
+    /// is the *difference*: a plugin asking for more than its record shows up here as
+    /// `unloadable`, with the refusal naming every field that grew.
+    pub(super) grant: Option<flux_plugin::GrantOfRecord>,
 }
 
 /// Resolve `program` (an absolute/relative path, or a bare name on `PATH`) to an existing file.
@@ -1014,6 +1021,7 @@ pub(super) async fn build_status_report(
         }
     };
     Ok(PluginStatusReport {
+        grant: d.grant,
         name: name.to_string(),
         program: d.program,
         args: d.args,
@@ -1059,6 +1067,58 @@ pub(super) async fn spawn_and_load_manifest(
     let m = host.manifest().await.context("fetch plugin manifest")?;
     let _ = host.shutdown().await;
     Ok(m)
+}
+
+/// Print the grant of record (C-411) beneath the live manifest surface: what this install is on
+/// record as granting, which is the ceiling every later load is held to.
+///
+/// The live manifest line above says what the plugin asks for *now*; this says what it is allowed to
+/// ask for. When the two diverge the plugin does not load at all — `status` shows `unloadable` with
+/// the refusal naming each field that grew — so the job here is to make the ceiling legible before
+/// that happens, and to say plainly when there is not one yet.
+fn print_grant_of_record(r: &PluginStatusReport) {
+    let Some(grant) = &r.grant else {
+        println!(
+            "    {}",
+            style::dim(
+                "grant of record: none yet — the next successful load records what the plugin \
+                 declares then"
+            )
+        );
+        return;
+    };
+    let caps = &grant.capabilities;
+    let mut parts: Vec<String> = Vec::new();
+    for (label, len) in [
+        ("process", caps.process.len()),
+        ("secret", caps.secrets.len()),
+        ("http_hosts", caps.http_hosts.len()),
+        ("private_hosts", caps.private_hosts.len()),
+        ("conn", caps.conn.len()),
+        ("fs", caps.fs.len()),
+        ("endpoints", grant.endpoints.len()),
+        ("auth", grant.auth.len()),
+        ("config", grant.config.len()),
+        ("discovers", grant.discovers.len()),
+    ] {
+        if len > 0 {
+            parts.push(format!("{label}({len})"));
+        }
+    }
+    for (label, on) in [
+        ("http", caps.http),
+        ("blob", caps.blob),
+        ("endpoint.discover", caps.discover),
+        ("credential", caps.credential),
+    ] {
+        if on {
+            parts.push(label.to_string());
+        }
+    }
+    if parts.is_empty() {
+        parts.push("nothing (the plugin asked for no host authority)".to_string());
+    }
+    println!("    grant of record:  {}", parts.join(", "));
 }
 
 /// Print one plugin's status: header (name → program args, pin) + liveness label, then the
@@ -1139,6 +1199,7 @@ pub(super) fn print_plugin_status_report(r: &PluginStatusReport) {
             format!("  v{}", m.version)
         };
         println!("    manifest:{ver}  {}", surface.join("  ·  "));
+        print_grant_of_record(r);
         // Version-agreement check (D-48): a manifest that reports a different version than the
         // descriptor records is reported loudly — but it is a labeling disagreement, not
         // tampering (the hash column above is the integrity statement), so it is not fatal.
