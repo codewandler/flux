@@ -70,7 +70,12 @@ impl Diags {
 /// Sanity ceiling for `repeat` `max` (F10): a bound above this is virtually always a model
 /// emitting an effectively-unbounded loop, not a real plan — reject it so the repair loop asks
 /// for a plausible bound (or an `each` over real data).
-const MAX_REPEAT_BOUND: u32 = 100_000;
+///
+/// L-116: *derived* from the interpreter's own budget rather than restated, so the static ceiling
+/// can never drift above the one the runtime actually enforces — a `repeat` this analyzer accepts
+/// is one a single-loop flow can finish. (The runtime budget is per *execution*, so nested loops
+/// can still exhaust it below this bound; that is the point of enforcing it in both places.)
+const MAX_REPEAT_BOUND: u32 = crate::runtime::DEFAULT_MAX_LOOP_ITERATIONS as u32;
 
 /// The serde `kind` tag of a node, for diagnostics — read off the tagged serialization so it can
 /// never drift from the wire format (and needs no 43-arm match to keep in sync).
