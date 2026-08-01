@@ -12,6 +12,9 @@ rust-version.workspace = true
 # moves with it. Additive on both counts: `PlatformSourcing` joins the re-exported protocol
 # vocabulary, and `read_op`/`write_op`/`internal_op` keep their signatures and produce the same
 # spec, now letting `OperationSpec`'s own `Default` fill what they do not name.
+# 1.1.0 (C-311, same unpublished wire): `OperationSpec::reaches` joins it, and `VendorReach` joins
+# the re-exported vocabulary. Additive again — an op that says nothing about vendor reach
+# serializes byte-identically to one written before the field existed.
 version = "1.1.0"
 license.workspace = true
 description = "Shared SDK for flux integration plugins: typed host-capability calls (secret-by-purpose, http+bearer, endpoint, datasource records) + a manifest/op builder over the flux plugin wire protocol"

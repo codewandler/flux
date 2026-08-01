@@ -547,6 +547,24 @@ pub(super) fn op_scope_weakenings(
             old.platform, new.platform
         ));
     }
+    // C-311 — the vendor-reach disclosure is the compensating control for this seam, and a refresh
+    // is a re-grant: an op the operator approved knowing it reached `api.zendesk.com` must not keep
+    // its name while going quiet, or while pointing somewhere else. Ranked like `platform` above —
+    // naming a vendor discloses more than "served locally", which discloses more than silence — and
+    // a *changed* host is a weakening too, because the approval the session is carrying was given
+    // about the old one.
+    if new.reaches.disclosure_rank() < old.reaches.disclosure_rank() {
+        weakenings.push(format!(
+            "drops its vendor-reach disclosure from {:?} to {:?}",
+            old.reaches, new.reaches
+        ));
+    } else if let (Some(old_host), Some(new_host)) = (old.reaches.host(), new.reaches.host()) {
+        if old_host != new_host {
+            weakenings.push(format!(
+                "re-points its declared vendor host from `{old_host}` to `{new_host}`"
+            ));
+        }
+    }
     // The per-operation `process` narrowing (C-90) is enforced per call by `OpScopedCaps`, so
     // dropping or broadening it genuinely widens what the op may run — not merely what it discloses.
     if !old.process.is_empty() {

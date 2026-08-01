@@ -7,6 +7,14 @@
 //! the path — the deployment's own session bearer. That asymmetry *is* the safety argument for the
 //! seam, and an invariant nobody tests is an invariant that decays at the next refactor.
 //!
+//! The seam's *other* cost has its own control and its own module: because the deployment dials,
+//! `guard_url_scoped` never sees the vendor, so flux's per-vendor egress allowlist stops
+//! constraining which vendor is reached. That is compensated by disclosing the destination at the
+//! approval prompt — see [`vendor_disclosure`](super::vendor_disclosure) (C-311). The two are
+//! independent: this module refuses what comes *back*, that one discloses where it *went*. Neither
+//! relaxes the other, and no ingest path is added by the disclosure, so the census below is
+//! unchanged by it.
+//!
 //! An operation opts in by declaring [`PlatformSourcing`] in its manifest. Two things follow:
 //!
 //! 1. It may not declare `secret_purposes` — refused at load by

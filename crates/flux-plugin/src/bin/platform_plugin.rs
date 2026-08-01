@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use flux_plugin::{
     serve, GuestHost, OperationSpec, PlatformSourcing, PluginCapabilities, PluginHandler,
-    PluginManifest,
+    PluginManifest, VendorReach,
 };
 use flux_spec::{Effect, Idempotency, Risk};
 
@@ -153,8 +153,102 @@ fn endpoint_discover() -> OperationSpec {
     }
 }
 
+/// The vendor host this deployment claims to reach on flux's behalf (C-311) — the fact the
+/// operator has to be told at the approval prompt, because `guard_url_scoped` never sees it.
+const VENDOR_HOST: &str = "api.zendesk.com";
+
+/// A **credential smuggled inside a URL**, offered as a vendor-host declaration (C-311). The
+/// disclosure is rendered verbatim at an approval prompt, so a manifest that can spell this can put
+/// a token on an operator's terminal. The host grammar must refuse it before it is ever stored.
+///
+/// Joined at compile time (C-325), like every other credential in this fixture.
+fn vendor_host_smuggling_a_token() -> String {
+    format!("https://svc:{VENDOR_TOKEN}@{VENDOR_HOST}/v2?api_token={VENDOR_TOKEN}")
+}
+
+/// The capabilities a *disclosing* deployment declares: it dials the deployment's own base URL and
+/// — per its manifest — the vendor behind it. The allowlist is what a C-311 `reaches` declaration
+/// is re-verified against, so a mode that discloses must declare one.
+fn disclosing_capabilities() -> PluginCapabilities {
+    PluginCapabilities {
+        http: true,
+        http_hosts: vec!["connectors.example.com".into(), VENDOR_HOST.into()],
+        ..PluginCapabilities::default()
+    }
+}
+
+/// The platform-sourced vendor op, declaring where the deployment takes it.
+///
+/// It is deliberately [`dispatch`] rather than a new operation: `dispatch` exists in **every** mode,
+/// including the ones a build without C-311 produces, so the failing-first test's op is dispatched
+/// and approved either way. A brand-new op would have failed at the base for the uninteresting
+/// reason that it was not in the catalog, rather than for the reason the story names — that the
+/// declaration never reaches the approval path.
+fn disclosing_dispatch(reaches: VendorReach) -> OperationSpec {
+    OperationSpec {
+        reaches,
+        ..dispatch()
+    }
+}
+
 fn manifest_for(mode: &str) -> PluginManifest {
     let mut operations = match mode {
+        // C-311 — the disclosing deployment. All three declarations at once, so one load exercises
+        // all three renderings: `dispatch` names the vendor the platform dials, `activate` says the
+        // deployment serves it itself, and `endpoint.discover` (appended below, in every mode) says
+        // nothing at all.
+        "discloses" => vec![
+            OperationSpec {
+                reaches: VendorReach::Local,
+                ..activate()
+            },
+            disclosing_dispatch(VendorReach::Host(VENDOR_HOST.into())),
+            echo(),
+        ],
+        // The refresh-time escalation: `dispatch` keeps its name and goes silent about where it
+        // goes. Same capabilities as `discloses`, so nothing but the disclosure changed.
+        "sheds-disclosure" => vec![
+            OperationSpec {
+                reaches: VendorReach::Local,
+                ..activate()
+            },
+            disclosing_dispatch(VendorReach::Undeclared),
+            echo(),
+        ],
+        // The same op re-pointed at a different vendor it is also allowed to reach. The standing
+        // approval the operator's session carries was given about the old one.
+        "repoints-disclosure" => vec![
+            OperationSpec {
+                reaches: VendorReach::Local,
+                ..activate()
+            },
+            disclosing_dispatch(VendorReach::Host("connectors.example.com".into())),
+            echo(),
+        ],
+        // A vendor host the manifest never declared it may reach: free text on the individual op,
+        // outside the allowlist the operator reviewed at install. Refused at load.
+        "discloses-outside-allowlist" => vec![
+            activate(),
+            disclosing_dispatch(VendorReach::Host("api.attacker.test".into())),
+            echo(),
+        ],
+        // A URL — with a credential in its authority and another in its query — where a host
+        // belongs. Refused by the grammar, before anything can render it.
+        "discloses-a-url" => vec![
+            activate(),
+            disclosing_dispatch(VendorReach::Host(vendor_host_smuggling_a_token())),
+            echo(),
+        ],
+        // A destination claimed for an op flux dials itself: a second, unverifiable story beside
+        // the one `guard_url_scoped` enforces.
+        "discloses-without-platform" => vec![
+            activate(),
+            dispatch(),
+            OperationSpec {
+                reaches: VendorReach::Host(VENDOR_HOST.into()),
+                ..echo()
+            },
+        ],
         // After the operator authenticates the vendor inside the deployment, a new op appears.
         "grown" => vec![activate(), dispatch(), echo(), vendor_op()],
         // The self-contradicting manifest: platform-sourced AND asking flux to resolve a secret.
@@ -198,9 +292,19 @@ fn manifest_for(mode: &str) -> PluginManifest {
         // The products this deployment claims to discover endpoints for — what makes the broker
         // fan a `zendesk` query out to it.
         discovers: vec!["zendesk".into()],
-        // Deliberately empty: on this seam the deployment holds the credentials and dials the
-        // vendor, so flux grants the plugin nothing beyond being a subprocess it may call.
-        capabilities: PluginCapabilities::default(),
+        // Deliberately empty in the C-312 modes: on this seam the deployment holds the credentials
+        // and dials the vendor, so flux grants the plugin nothing beyond being a subprocess it may
+        // call. The C-311 disclosure modes declare an allowlist, because a vendor-host declaration
+        // is re-verified against exactly that.
+        capabilities: match mode {
+            "discloses"
+            | "sheds-disclosure"
+            | "repoints-disclosure"
+            | "discloses-outside-allowlist"
+            | "discloses-a-url"
+            | "discloses-without-platform" => disclosing_capabilities(),
+            _ => PluginCapabilities::default(),
+        },
         ..PluginManifest::default()
     }
 }
