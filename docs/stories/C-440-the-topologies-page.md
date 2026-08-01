@@ -2,8 +2,7 @@
 id: C-440
 title: "The topologies page — every way to run flux, with pros, cons and the command that does it"
 pillar: Core
-status: in-progress
-priority: 6
+status: done
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [website, docs]

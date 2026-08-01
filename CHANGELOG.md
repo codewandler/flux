@@ -8,6 +8,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A topologies page — every way to run flux, and what each one costs** (C-440).
+  `website/docs/topologies.md` covers nine ways to run flux (fully local · OS-sandboxed ·
+  containerized ops · remote system · served agent + thin client · embedded SDK · portable wasm ·
+  hosted exchange · **plain `ssh`**), each with an honest ships/partial/proposed status and the two
+  questions a reader actually has: **where are my files**, and **where does the approval prompt
+  appear**. Commands are pinned by tests, so a CLI change breaks CI rather than the page silently.
+  ⚠ **`ssh` is a peer row, not a footnote** — running flux on the remote box works today, and the
+  remote-system row names it as the bar to beat.
+  **Four status claims were wrong and the page corrects them**: `flux a2a <url>` ships, so the
+  served-agent gap is **approval**, not a client; flux-exchange is v0.11.0 and does not terminate
+  channels; portable wasm is the language core only, with zero host authority; and the OS-sandbox row
+  needed the caveat that **interactive runs default to `Off`** while only unattended surfaces default
+  to `Require`.
+
 - **The loop-view comparison now runs on a real recorded session** (A-145). A 191-step, 9-turn session is
   captured to `crates/flux-tui/src/loopmock/captures/` and drives all five mocks, replacing a fixture
   written by the same context that then chose a layout from it.
