@@ -585,24 +585,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_plan_observation_is_a_payload_the_live_plan_card_can_already_read() {
+    fn the_hand_authored_plan_is_a_payload_the_live_plan_card_can_already_read() {
         // If this stops deserializing, the graph mock is drawing something the real renderer
         // would not — which would make it useless as evidence for A-138.
-        let ast = fixture(LoadCase::Tidy).plan["plan_ast"].clone();
+        let ast = fixture(LoadCase::FanOut).plan["plan_ast"].clone();
         let parsed: flux_flow::ast::DraftAst =
             serde_json::from_value(ast).expect("plan_ast is a DraftAst");
         assert_eq!(parsed.name.as_deref(), Some("tracking_sync"));
         assert_eq!(parsed.body.len(), 5);
     }
 
+    /// ⚠ A-145's first correction to A-144. The hand-authored fixture handed the graph mock a
+    /// `plan_ast` because whoever wrote it wanted syntax highlighting. **No run in the store has
+    /// one:** `PlanAttempted` persists `plan_source` (canonical text) and this loop never writes
+    /// `plan_text` at all, so a recorded case can only ever reach `plan::render`'s plain-string
+    /// fallback. The highlighted DAG in A-144's mock 5 snapshots was a picture of a payload the
+    /// durable log does not contain.
+    #[test]
+    fn a_recorded_plan_has_no_ast_because_the_log_never_persisted_one() {
+        for case in LOAD_CASES.iter().filter(|c| c.is_recorded()) {
+            let plan = fixture(*case).plan;
+            assert!(
+                plan.get("plan_ast").is_none(),
+                "{}: a recorded plan cannot have an AST",
+                case.name(),
+            );
+            let src = plan["plan"].as_str().unwrap_or_default();
+            assert!(
+                src.starts_with("flow "),
+                "{}: no durable plan_source to draw: {src:?}",
+                case.name(),
+            );
+            assert!(
+                !crate::plan::render(&plan, &crate::theme::Theme::MONO).is_empty(),
+                "{}: the live plan renderer draws nothing for it",
+                case.name(),
+            );
+        }
+    }
+
     #[test]
     fn every_case_carries_the_load_it_claims() {
-        assert_eq!(fixture(LoadCase::Tidy).step_count(), 15);
-        assert!(
-            fixture(LoadCase::LongRun).step_count() >= 40,
-            "the long run must not fit a viewport: {}",
-            fixture(LoadCase::LongRun).step_count()
-        );
+        // The two recorded cases, at the numbers the capture actually produces. Pinned rather than
+        // bounded: a change here means the projection moved, and that is worth reading a diff over.
+        let tidy = fixture(LoadCase::Tidy);
+        assert_eq!(tidy.step_count(), 18, "one recorded turn");
+        let long = fixture(LoadCase::LongRun);
+        assert_eq!(long.step_count(), 191, "nine recorded turns");
+        assert_eq!(long.steps.len(), 9, "one rail row per turn");
+
         let deep = fixture(LoadCase::DeepNesting);
         let depth = deep.flatten().iter().map(|f| f.depth).max().unwrap();
         assert!(depth >= 7, "deep nesting is only {depth} levels");
@@ -613,6 +644,80 @@ mod tests {
             .filter(|f| f.step.kind == StepKind::Spawn && f.step.status == Status::Running)
             .count();
         assert!(concurrent >= 5, "fan-out is only {concurrent} wide");
+    }
+
+    /// ⚠ **A-145's headline measurement.** A-144's recommendation was revised on review to
+    /// "condense finished phases FIRST", on the reasoning that a finished phase costs one row
+    /// however many steps ran inside it. That reasoning is only worth what the *phase* distribution
+    /// is worth — and the hand-authored fixture's phases were tidy because somebody wrote tidy
+    /// phases (3 to 6 children each, evenly).
+    ///
+    /// A real session's are not. This pins the distribution so the claim is anchored to a
+    /// measurement rather than to a fixture's manners.
+    #[test]
+    fn a_real_runs_phases_are_lumpy_and_the_hand_authored_ones_were_not() {
+        let long = fixture(LoadCase::LongRun);
+        let mut phases: Vec<usize> = long
+            .steps
+            .iter()
+            .flat_map(|turn| turn.children.iter().map(Step::count))
+            .collect();
+        phases.sort_unstable();
+        let singletons = phases.iter().filter(|&&n| n == 1).count();
+        let biggest = *phases.last().expect("phases");
+
+        // Two thirds of the real phases are a single step — condensing them saves nothing…
+        assert!(
+            singletons * 3 >= phases.len() * 2,
+            "{singletons} of {} real phases are one step",
+            phases.len(),
+        );
+        // …while one is fifty-seven, which is where the entire win lives.
+        assert!(
+            biggest >= 50,
+            "the biggest real phase is only {biggest} steps",
+        );
+        // The hand-authored cases have neither shape: no singleton-heavy tail, no outlier.
+        let authored: Vec<usize> = fixture(LoadCase::FanOut)
+            .steps
+            .iter()
+            .flat_map(|r| r.children.iter().map(Step::count))
+            .collect();
+        assert!(
+            authored.iter().max().copied().unwrap_or(0) < 10,
+            "the hand-authored fixture grew an outlier phase: {authored:?}",
+        );
+    }
+
+    /// The provenance badge is on screen, not only in a doc comment — the C-422 discipline applied
+    /// to this artifact itself.
+    #[test]
+    fn every_render_says_whether_its_load_was_measured_or_invented() {
+        for case in LOAD_CASES {
+            let fx = fixture(case);
+            assert_eq!(
+                matches!(fx.provenance, Provenance::Recorded { .. }),
+                case.is_recorded(),
+                "{}: provenance disagrees with the case",
+                case.name(),
+            );
+            let badge = fx.provenance.badge();
+            for mock in super::super::MOCKS {
+                let plain = super::super::render(
+                    mock,
+                    case,
+                    super::super::WIDE,
+                    &crate::theme::Theme::MONO,
+                )
+                .to_plain();
+                assert!(
+                    plain.contains(&badge),
+                    "{} / {}: no provenance badge {badge:?} on screen\n{plain}",
+                    mock.spec().name,
+                    case.name(),
+                );
+            }
+        }
     }
 
     #[test]

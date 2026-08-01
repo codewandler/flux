@@ -209,10 +209,33 @@ mod tests {
         assert!(spread <= 2, "concurrent bars are {spread} cols apart");
     }
 
+    /// ⚠ A-145: the case had to move to a hand-authored fixture, and that is itself the finding.
+    /// `Status::Pending` has **no durable source** — the log has no future, and an adaptive run
+    /// authors no plan beyond its next op — so a recorded case contains no pending step for this
+    /// to draw. See `loopmock::capture::FIDELITY`.
     #[test]
     fn a_pending_step_is_not_given_a_position_it_does_not_have() {
-        let plain = loopmock::render(Mock::Timeline, LoadCase::Tidy, loopmock::WIDE, &Theme::MONO)
-            .to_plain();
+        let plain = loopmock::render(
+            Mock::Timeline,
+            LoadCase::FanOut,
+            loopmock::WIDE,
+            &Theme::MONO,
+        )
+        .to_plain();
         assert!(plain.contains("queued"), "{plain}");
+
+        for case in loopmock::LOAD_CASES.iter().filter(|c| c.is_recorded()) {
+            let pending = loopmock::fixture(*case)
+                .flatten()
+                .iter()
+                .filter(|f| f.step.status == Status::Pending)
+                .count();
+            assert_eq!(
+                pending,
+                0,
+                "{}: a recorded run cannot know what it will do next",
+                case.name(),
+            );
+        }
     }
 }

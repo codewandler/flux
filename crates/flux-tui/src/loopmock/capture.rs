@@ -189,19 +189,23 @@ pub const FIDELITY: &[FidelityRow] = &[
     },
     FidelityRow {
         concept: "time-to-first-token, chunk pacing",
-        source: "observation `model.call` (ttft_us, chunks)",
+        source: "—",
         fidelity: Fidelity::Absent,
-        note: "recorded as totals, but the observation is batch-flushed and unanchored, so it can \
-               time no particular call on the timeline. Present in the log, unusable for pacing",
+        note: "⚠ the sharpest case of 'recorded is not the same as recoverable'. `model.call` \
+               observations DO carry `ttft_us` and `chunks` — but they are batch-flushed at the \
+               turn watermark with no step id and no usable ts, so nothing says which call each \
+               belongs to. Present in the log, unusable on a timeline",
     },
     FidelityRow {
         concept: "sub-agent activity (`SpawnActivity`)",
-        source: "observation `subagent.trace`, child streams via `children_of`",
+        source: "—",
         fidelity: Fidelity::Absent,
-        note: "⚠ absent FROM THIS CAPTURE, and structurally hard: no run in the store that has \
-               `op_recorded` (post-C-43) also has sub-agents. The 12 sub-agent streams present are \
-               all pre-C-43, so a real fan-out and a real op output cannot currently be shown by \
-               the same capture. This is why the fan-out and deep-nesting cases stay synthetic",
+        note: "⚠ the finding behind the two synthetic cases. A child run is a separate stream, \
+               reachable via `children_of`, and `subagent.trace` marks where its `task` call \
+               landed — but that observation is batch-flushed, so the splice point is a guess. \
+               Worse, it is moot here: **no session in the store that records op output (post-C-43) \
+               also spawns sub-agents.** All 12 sub-agent parents predate `OpRecorded`, so one \
+               capture cannot currently carry both a real fan-out and a real tool result",
     },
     FidelityRow {
         concept: "compaction (`Compacted`)",
@@ -213,10 +217,11 @@ pub const FIDELITY: &[FidelityRow] = &[
     },
     FidelityRow {
         concept: "the operator's own identity",
-        source: "observation `turn.identity`, `tool_call.caller`",
+        source: "—",
         fidelity: Fidelity::Absent,
-        note: "recorded — 192 rows carry the local username — and deliberately DROPPED at capture. \
-               Nothing about the loop view needs it and it is not publishable",
+        note: "recorded, and deliberately DROPPED at capture: `turn.identity` and every `tool_call` \
+               observation carry a `caller`, 192 rows of the local username in this session alone. \
+               Nothing the loop view draws needs it and it is not publishable",
     },
 ];
 
@@ -471,8 +476,8 @@ pub fn parse(jsonl: &str) -> Capture {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("capture line {}: {e}", i + 1));
+        let value: Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("capture line {}: {e}", i + 1));
         let Some(event) = CaptureEvent::from_json(&value) else {
             continue;
         };
@@ -519,22 +524,31 @@ pub enum Slice {
 /// The instant the view is drawn at.
 ///
 /// A finished session has no present tense (see the module docs), so one has to be chosen. The rule
-/// is deterministic and stated rather than tuned: **halfway through the slice's longest-running
-/// step**. That is the moment a live view is under the most pressure — a long bracket open, its
-/// finished children behind it — which is the moment the layouts have to be compared at.
+/// is deterministic and stated rather than tuned: **halfway through the last recorded step the slice
+/// started**. That is the run at its heaviest — every step it ever had, and one still in flight
+/// with its open ancestors above it — which is the moment the layouts have to be compared at. A
+/// rule that picked an *interesting* moment instead would be the fixture choosing its own evidence
+/// again, which is the defect A-145 exists to remove.
+///
+/// The turn wrappers are excluded. They are this projection's own invention (run events carry no
+/// `turn_id`, so a turn is a bracket inferred from `global_seq` order), and a turn always outlasts
+/// everything inside it.
 fn cursor_ms(steps: &[Step]) -> u64 {
-    fn longest(steps: &[Step], best: &mut (u64, u64)) {
+    fn last(steps: &[Step], best: &mut (u64, u64)) {
         for step in steps {
-            if step.dur_ms > best.0 {
-                *best = (step.dur_ms, step.start_ms + step.dur_ms / 2);
+            if !step.trace_id.starts_with(TURN_ID_PREFIX) && step.start_ms >= best.0 {
+                *best = (step.start_ms, step.start_ms + step.dur_ms / 2);
             }
-            longest(&step.children, best);
+            last(&step.children, best);
         }
     }
     let mut best = (0u64, 0u64);
-    longest(steps, &mut best);
+    last(steps, &mut best);
     best.1
 }
+
+/// Marks a [`Step`] this projection invented to bracket a turn, rather than one the log recorded.
+const TURN_ID_PREFIX: &str = "__turn";
 
 /// Reconstruct a [`Fixture`] from a capture.
 ///
@@ -708,7 +722,7 @@ fn turn_step(n: usize, input: &str, start: u64) -> Step {
         start,
         0,
     );
-    step.trace_id = format!("__turn{n}");
+    step.trace_id = format!("{TURN_ID_PREFIX}{n}");
     step
 }
 
@@ -814,7 +828,11 @@ fn output_note(out: &str, bytes: u64, truncated: bool) -> String {
     } else {
         format!("{bytes}")
     };
-    let mark = if truncated { " · capped at record" } else { "" };
+    let mark = if truncated {
+        " · capped at record"
+    } else {
+        ""
+    };
     if out.is_empty() {
         return format!("{size} bytes{mark}");
     }
@@ -904,11 +922,7 @@ mod tests {
                 );
             }
         }
-        for class in [
-            Fidelity::Faithful,
-            Fidelity::Approximated,
-            Fidelity::Absent,
-        ] {
+        for class in [Fidelity::Faithful, Fidelity::Approximated, Fidelity::Absent] {
             assert!(
                 FIDELITY.iter().any(|r| r.fidelity == class),
                 "the table has no {} row — that is a table that agrees with itself",

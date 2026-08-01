@@ -537,6 +537,66 @@ pub const RECOMMENDATION: &str = "\
 FIRST, CONDENSE FINISHED PHASES. THEN BUILD MOCK 3 — the split (condensed rail + detail pane) —
 with mock 1 as its sub-64-column fallback. The two are separable, and the first is most of the win.
 
+═══ A-145: RE-CHECKED AGAINST A REAL RECORDED RUN — CONFIRMED, WITH THREE CORRECTIONS ═══
+
+The two load-bearing cases are no longer hand-authored. They are a projection of session `s_1477`
+out of `~/.flux/events.db` — nine turns, 33 minutes, 191 steps, gpt-5.5 auditing this repo's docs,
+fixing the gaps, committing them and cutting a release. See `loopmock::capture`.
+
+The headline survives: condense first, then build the split, thread as the fallback. What the real
+run changes is *how much* the condensing buys and *why* the split is worth the second column.
+
+1. CONDENSING IS SUB-LINEAR, NOT CONSTANT — and the win is concentrated in one phase, not spread.
+   191 steps condense to a 25-row rail: a 7.6x saving, and the single biggest effect available.
+   But the fixture's version of this claim was stronger than the truth. Two reasons.
+   (a) The depth-0 unit of a real *session* is a TURN, and turns accumulate: nine turns are nine
+       rail rows before a step is drawn, and the focused turn then expands in full. So the rail
+       grows with the conversation even though it does not grow with the steps — 25 rows fits a
+       28-row terminal and does not fit the 20-row one this is most often read in.
+   (b) Real phases are LUMPY. The 55 phases in this session are: 36 of exactly one step, then
+       2, 2, 3, 3, 5, 5, 5, 7, 8, 17, 19 — and one of 57. Condensing a one-step phase saves
+       nothing; two thirds of the real phases are one-step. The entire win lives in the handful of
+       fat ones. The hand-authored fixture had evenly-sized phases of 3-6 because somebody wrote
+       evenly-sized phases, and that made condensing look uniformly profitable. It is not; it is
+       profitable in bursts. A-137 should still do it — one phase of 57 is reason enough — but it
+       should not expect the row count to become independent of the run.
+
+2. ⚠ THE SPLIT AND THE THREAD HIDE THE SAME NUMBER OF STEPS. This is the correction that most
+   changes the reasoning. On the long-run case at 100x28 both mock 1 and mock 3 report `166 of 191
+   steps not shown`. The split's advantage is NOT that it shows more; it is that it shows a
+   DIFFERENT 25 — every one of the nine turns plus the current turn in full, where the thread shows
+   the last 25 rows and nothing at all about turns 1-7. Coverage, not capacity. That is still a
+   real advantage and still the right call, but the old phrasing ('the only one that still shows
+   the whole run') was an artifact of a fixture whose whole run was one run rather than nine turns.
+
+3. THE TREE MOVES UP AND MOCK 5 DROPS OUT ENTIRELY.
+   - Real nesting is THREE levels (turn > loop phase > op), not the eight the hand-authored
+     deep-nesting case invented. The indentation tax that cost mock 2 the comparison is charged
+     against a shape this log has never recorded. At 100 columns on the real run the tree is the
+     most legible of the five and — unlike the split's rail, which is down to op-and-timing — it
+     still shows each op's ARGUMENT. If A-137 wanted one column instead of two, the condensed tree
+     is now the honest runner-up rather than a distant one.
+   - Mock 5 is worse than A-144 said, for a reason A-144 could not have seen. Its premise is that
+     the model is called from an authored program you can read like source. This loop does not
+     work that way: the captured session accepted 127 plans and EVERY ONE OF THEM IS A SINGLE OP.
+     There is no DAG. The mock draws one program line and hides 189 of 191 steps. And no run in the
+     store persists `plan_ast` at all, so even the syntax highlighting in A-144's mock-5 snapshots
+     was a picture of a payload the durable log does not contain. Keep it for A-138's per-step
+     expansion; it is not a candidate for a live view.
+   - Mock 4 gains a specific defect it did not have against invented timings: real durations span
+     1 ms to 344 s. On a linear axis that renders roughly nine steps in ten as a sub-cell tick, so
+     the layout whose primary axis is time cannot show most of the time it is drawing.
+
+4. WHAT THE REAL RUN CONFIRMS, NAMED SO THE CLAIM IS ANCHORED. The property that did the
+   confirming is the ONE-STEP PHASE COMBINED WITH THE FAT ONE: a layout whose cost is per-step
+   pays for turn 5's 57-step `explore` in full, and a layout whose cost is per-phase pays one row
+   for it and one row for each of the 36 phases that were a single step anyway. That asymmetry is
+   real, it is measured, and nobody designed it.
+
+⚠ Everything below this line is A-144's reasoning against the hand-authored fixture. It is left
+intact and unedited so the two can be compared; where the sections above disagree with it, the
+sections above are the measurement.
+
 ⚠ READ THIS BEFORE THE REST — the comparison is confounded, and in mock 3's favour.
 Only mock 3 was given progressive disclosure. Its rail pre-filters to top-level steps plus the
 focused subtree (`split.rs`, `rail_rows`) before the shared scroll policy ever runs; mocks 1 and 2
@@ -593,6 +653,34 @@ of its own (see the fan-out case, where six workers' `glob` calls land on the pa
 node). A-138 should expand *one step* into its graph, which is exactly what the split's pane has
 room to do.";
 
+/// [`FIDELITY`] as markdown — **the second deliverable of A-145**, and the start of the table
+/// [C-422](../../../../docs/stories/C-422-the-render-projection.md) owes. Reconstructing a real
+/// session is where the durable log's limits actually show up; leaving them in a doc comment is how
+/// they get rediscovered.
+fn fidelity_table() -> String {
+    let mut out = String::from(
+        "## What a recorded case is worth, field by field\n\n\
+         The reconstruction (`loopmock::capture`) rebuilt everything below from the durable log.\n\
+         *faithful* = taken from a durable event with no invention · *approximated* = synthesised,\n\
+         and the note says exactly what · *absent* = not recoverable, so the render shows nothing\n\
+         rather than a guess. ⚠ Several rows are absent **despite being recorded** — the log holds\n\
+         the value but nothing anchors it to a moment.\n\n",
+    );
+    out.push_str("| what the view wants | durable source | fidelity | note |\n");
+    out.push_str("|---|---|---|---|\n");
+    for row in FIDELITY {
+        out.push_str(&format!(
+            "| {} | {} | **{}** | {} |\n",
+            row.concept,
+            row.source,
+            row.fidelity.label(),
+            row.note.replace('|', "\\|"),
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 /// The committed side-by-side comparison, as markdown. This is the artifact a reviewer reads
 /// instead of running anything; `the_snapshot_set_matches_the_renderers` keeps it honest.
 pub fn snapshot_document() -> String {
@@ -602,23 +690,32 @@ pub fn snapshot_document() -> String {
         "<!-- GENERATED by `cargo test -p flux-tui --test loop_mocks` (A-144). Do not hand-edit;\n\
          regenerate with FLUX_UPDATE_GOLDEN=1, which rewrites this file and then fails on purpose. -->\n\n",
     );
-    out.push_str("# A-144 — five loop-view mocks, side by side\n\n");
+    out.push_str("# A-144 / A-145 — five loop-view mocks, side by side\n\n");
     out.push_str(
-        "Five hard-coded layouts drawing one hand-authored fixture (the tracking-plugin flow:\n\
-         validate frontmatter → regenerate the board → audit epics for missing trackers → sync the\n\
-         CHANGELOG, with a model-authored judgement step in the middle). Nothing here is wired to a\n\
-         live run; see `crates/flux-tui/src/loopmock/mod.rs`.\n\n\
-         Each mock is drawn under the tidy case **and** the three that decide the question — a long\n\
-         run, deep nesting, a sub-agent fan-out — plus a narrow terminal, its own floor, and one\n\
+        "Five hard-coded layouts drawing one run. Nothing here is wired to a live agent; see\n\
+         `crates/flux-tui/src/loopmock/mod.rs`.\n\n\
+         ⚠ **Two of the four load cases are a REAL RECORDED RUN, and two are not** (A-145). The\n\
+         tidy and long-run cases are a projection of session `s_1477` out of `~/.flux/events.db` —\n\
+         nine turns, 33 minutes, 191 steps of this repo's own docs being audited, fixed, committed\n\
+         and released. Deep nesting and fan-out are still hand-authored, because **the durable log\n\
+         cannot currently produce them**: no session that records op output (post-C-43) also spawns\n\
+         sub-agents. Every render says which it is in its header, so the two can never be confused\n\
+         for one another; the fidelity table below says what a recorded case is worth field by\n\
+         field.\n\n\
+         Each mock is drawn under all four cases, plus a narrow terminal, its own floor, and one\n\
          step under that floor in each dimension.\n\n\
          ⚠ **The comparison is confounded and the recommendation says so** — only mock 3 was given\n\
          progressive disclosure, so the long-run gap measures condensing rather than a second\n\
-         column. Read the warning at the top of the recommendation before the pictures.\n\n",
+         column. Read the warning at the top of the recommendation before the pictures.\n\n\
+         ⚠ **The capture is a snapshot and cannot be refreshed.** Re-running the capture command\n\
+         records a *different* run; nothing regenerates that file.\n\n",
     );
 
     out.push_str("## The recommendation\n\n```text\n");
     out.push_str(RECOMMENDATION);
-    out.push_str("\n```\n\n## At a glance\n\n");
+    out.push_str("\n```\n\n");
+    out.push_str(&fidelity_table());
+    out.push_str("## At a glance\n\n");
     out.push_str("| mock | primary axis | optimizes for | gives up | floor |\n");
     out.push_str("|---|---|---|---|---|\n");
     for mock in MOCKS {

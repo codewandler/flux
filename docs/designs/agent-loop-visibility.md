@@ -1,14 +1,39 @@
 # Design: Watch the agent think — the loop as a live thread, expandable down to the graph
 
-**Status:** proposed · **Pillar:** Agent · **Stories:** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md) · [A-137](../stories/A-137-the-step-thread.md) · [A-138](../stories/A-138-expand-a-step-into-its-graph.md) · [A-139](../stories/A-139-the-loop-view-under-load.md)
+**Status:** proposed · **Pillar:** Agent · **Stories:** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md) · [A-145](../stories/A-145-a-real-run-as-the-mock-fixture.md) · [A-137](../stories/A-137-the-step-thread.md) · [A-138](../stories/A-138-expand-a-step-into-its-graph.md) · [A-139](../stories/A-139-the-loop-view-under-load.md)
 
 > **The layout is chosen, by looking at it.** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md)
-> drew five hard-coded layouts of one flow under four load cases and three widths; the side-by-side
-> set is [agent-loop-visibility-mocks.md](agent-loop-visibility-mocks.md), and its recommendation is
-> the **split** (a condensed rail whose height tracks the phase count, plus a detail pane) with the
-> flat thread as the sub-64-column fallback. That answers this doc's open "pane or inline" question
-> in favour of the pane, and it settles where A-140's pause and A-142's inspection pane live before
-> A-137 commits to a shape. Nothing there is wired to a live run.
+> drew five hard-coded layouts of one flow under four load cases and a swept viewport envelope; the
+> side-by-side set is [agent-loop-visibility-mocks.md](agent-loop-visibility-mocks.md). Its
+> recommendation, after review found the long-run comparison confounded in the split's favour, is:
+> **condense finished phases first, then build the split** (a condensed rail plus a detail pane),
+> with the flat thread as the sub-64-column fallback. That answers this doc's open "pane or inline"
+> question in favour of the pane, and it settles where A-140's pause and A-142's inspection pane
+> live before A-137 commits to a shape.
+>
+> **[A-145](../stories/A-145-a-real-run-as-the-mock-fixture.md) re-checked that against a real
+> recorded run** — nine turns, 33 minutes, 191 steps out of `~/.flux/events.db` — and **confirmed
+> the headline with three corrections**, all of which A-137 has to budget for. They are stated in
+> full at the top of the recommendation in the snapshot set; in short:
+>
+> 1. **Condensing is sub-linear, not constant, and its win is concentrated.** 191 steps → a 25-row
+>    rail (7.6×), but the depth-0 unit of a real *session* is a turn and turns accumulate, and the
+>    phase sizes are lumpy: 36 of 55 real phases are a **single step** (condensing them saves
+>    nothing) while one is **57** (which is where the whole win is). The hand-authored fixture's
+>    evenly-sized 3–6-step phases made the saving look uniform.
+> 2. **The split and the flat thread hide the same number of steps** on the real run (166 of 191).
+>    The split's advantage is *coverage* — all nine turns plus the current one in full — not
+>    capacity. Still the right call; the old phrasing ("the only one that still shows the whole
+>    run") was an artifact of a fixture whose run was one run rather than nine turns.
+> 3. **Real nesting is three levels, not eight, and mock 5 has nothing to draw.** The indentation
+>    tax that cost the tree the comparison was charged against an invented depth this log has never
+>    recorded, so the condensed tree is now the honest runner-up. Meanwhile the captured session
+>    accepted **127 plans and every one of them is a single op** — there is no authored DAG for a
+>    graph-first view to be about, and `plan_ast` is never persisted at all.
+>
+> ⚠ And the fidelity table the reconstruction produced — what the durable log can and cannot
+> rebuild — is in the same document, and is the start of what [C-422](../stories/C-422-the-render-projection.md)
+> owes.
 
 ## Why
 

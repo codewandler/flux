@@ -230,24 +230,94 @@ struct Rule {
 const SCRUB: &[Rule] = &[
     // The operator's home directory, and with it their username. Reaches this store only as an
     // absolute path some op was handed.
-    Rule { pattern: "/home/", replacement: "/<home>/", class: "absolute home paths (username)", word_start: false },
-    Rule { pattern: "/Users/", replacement: "/<home>/", class: "absolute home paths (username)", word_start: false },
+    Rule {
+        pattern: "/home/",
+        replacement: "/<home>/",
+        class: "absolute home paths (username)",
+        word_start: false,
+    },
+    Rule {
+        pattern: "/Users/",
+        replacement: "/<home>/",
+        class: "absolute home paths (username)",
+        word_start: false,
+    },
     // The downstream consumer's name has no business in this repo, and the locally installed plugin
     // pack puts it in every toolchain listing.
-    Rule { pattern: "babelforce", replacement: "<downstream>", class: "downstream consumer names", word_start: false },
-    Rule { pattern: "babeldesk", replacement: "<downstream>", class: "downstream consumer names", word_start: false },
+    Rule {
+        pattern: "babelforce",
+        replacement: "<downstream>",
+        class: "downstream consumer names",
+        word_start: false,
+    },
+    Rule {
+        pattern: "babeldesk",
+        replacement: "<downstream>",
+        class: "downstream consumer names",
+        word_start: false,
+    },
     // Credential shapes, in case a doc example or a shell line carried one past the Redactor.
-    Rule { pattern: "sk-", replacement: "<key>", class: "credential shapes", word_start: true },
-    Rule { pattern: "ghp_", replacement: "<key>", class: "credential shapes", word_start: true },
-    Rule { pattern: "xoxb-", replacement: "<key>", class: "credential shapes", word_start: true },
-    Rule { pattern: "AKIA", replacement: "<key>", class: "credential shapes", word_start: true },
-    Rule { pattern: "Bearer ", replacement: "<key> ", class: "credential shapes", word_start: true },
-    Rule { pattern: "BEGIN PRIVATE KEY", replacement: "<key>", class: "credential shapes", word_start: false },
-    Rule { pattern: "BEGIN RSA", replacement: "<key>", class: "credential shapes", word_start: false },
+    Rule {
+        pattern: "sk-",
+        replacement: "<key>",
+        class: "credential shapes",
+        word_start: true,
+    },
+    Rule {
+        pattern: "ghp_",
+        replacement: "<key>",
+        class: "credential shapes",
+        word_start: true,
+    },
+    Rule {
+        pattern: "xoxb-",
+        replacement: "<key>",
+        class: "credential shapes",
+        word_start: true,
+    },
+    Rule {
+        pattern: "AKIA",
+        replacement: "<key>",
+        class: "credential shapes",
+        word_start: true,
+    },
+    Rule {
+        pattern: "Bearer ",
+        replacement: "<key> ",
+        class: "credential shapes",
+        word_start: true,
+    },
+    Rule {
+        pattern: "BEGIN PRIVATE KEY",
+        replacement: "<key>",
+        class: "credential shapes",
+        word_start: false,
+    },
+    Rule {
+        pattern: "BEGIN RSA",
+        replacement: "<key>",
+        class: "credential shapes",
+        word_start: false,
+    },
     // Reachable-address shapes.
-    Rule { pattern: "127.0.0.1", replacement: "<loopback>", class: "internal addresses", word_start: false },
-    Rule { pattern: "192.168.", replacement: "<private-net>.", class: "internal addresses", word_start: false },
-    Rule { pattern: ".internal", replacement: ".<internal>", class: "internal addresses", word_start: false },
+    Rule {
+        pattern: "127.0.0.1",
+        replacement: "<loopback>",
+        class: "internal addresses",
+        word_start: false,
+    },
+    Rule {
+        pattern: "192.168.",
+        replacement: "<private-net>.",
+        class: "internal addresses",
+        word_start: false,
+    },
+    Rule {
+        pattern: ".internal",
+        replacement: ".<internal>",
+        class: "internal addresses",
+        word_start: false,
+    },
 ];
 
 /// The classes the header advertises, deduplicated and in declaration order.
