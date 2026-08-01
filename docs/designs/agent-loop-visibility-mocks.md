@@ -28,6 +28,127 @@ records a *different* run; nothing regenerates that file.
 ## The recommendation
 
 ```text
+BUILD THE AXES, AND SHIP THESE DEFAULTS: depth ALL · condense ON · pane OFF.
+Do not adopt a picture. And do not expect the axes to give you mock 3 — they do not, and section 2
+is the measurement that says so.
+
+═══ A-146: THE COMPOSITION WAS TESTED AND IT DOES NOT HOLD ═══
+
+A-146 built the three controls the owner named — a depth limit, condense-completed, an optional
+detail pane — and swept all twelve combinations across four load cases and the same 18x28 viewport
+envelope the five mocks are held to. The claim under test was: 'the flat thread with condensing and
+a depth limit and an optional pane IS the split'.
+
+1. WHAT THE COMPOSITION DOES REPRODUCE, EXACTLY. A partial result is still a result.
+   - THE NESTED TREE is `depth 6 · condense off · pane off` — 6 being plan.rs's MAX_TREE_DEPTH,
+     which mock 2 borrows from the live plan renderer. The same steps, on every load case, at
+     every viewport tested. Mock 2 is a point in this space.
+   - THE FLAT THREAD'S VIEW is `depth ∞ · condense off · pane off`, on every case.
+   - Mocks 4 and 5 are not in the space and were never claimed to be. A-145 already dropped mock 5
+     from candidacy; mock 4's axis is time, which no show/hide control produces.
+
+2. ⚠ THE SPLIT IS NOT A POINT IN THIS SPACE, AND THE BOUNDARY IS EXACT.
+   THE AXES REACH THE SPLIT ONLY WHEN THE RUN HAS ONE TOP-LEVEL STEP, OR THE TERMINAL IS TOO SHORT
+   FOR THE SPLIT TO DRAW ITS OWN RULE. Give it nine turns and the rows to show them, and nothing in
+   the space reaches it. Measured over the full envelope: on the real nine-turn session there are 24
+   viewports where the split both draws its whole rail and withholds something, and ZERO matches in
+   them; on the fan-out case, 42 viewports and zero matches. On ONE recorded turn, 60 of 60 match.
+
+   THE STRUCTURAL REASON. Mock 3's rail is not 'condense completed'. It is one row per top-level
+   step PLUS THE FOCUSED TOP-LEVEL STEP'S ENTIRE SUBTREE — including that subtree's COMPLETED work,
+   which condensing by definition folds away. So the rail discriminates on FOCUS and condensing
+   discriminates on STATUS. With one root the two rules coincide; with nine turns they cannot.
+
+   ⚠ WHAT A-137 ACTUALLY OWES, THEN: not a fourth picture but a fourth DECISION — condensing's
+   GRANULARITY. 'Finished work collapses to one row' does not say at what level, and the answer
+   changes what you get. Fold uniformly (what this module implements) and you get every turn's shape
+   at one row per phase. Fold only at the top level and you get mock 3's rail. Both are defensible;
+   they are not the same view, and a one-bit `condense` flag cannot express the difference. Decide
+   it explicitly rather than inheriting whichever one gets written first.
+
+   ⚠ AN EARLIER READING OF THIS SAME MEASUREMENT, taken only at 100x28, said the axes agree with the
+   split 'exactly when the split is hiding nothing'. The full sweep falsifies it: at 64x10 the split
+   withholds 10 of the tidy case's 18 steps and two configurations still match. The agreement is
+   about ONE ROOT AND TOO FEW ROWS. The distinction matters — the first phrasing would have sent
+   A-137 hunting for the divergence in the elision policy instead of in the rail's rule.
+
+3. ⚠ THE DEPTH LIMIT DOES NOT TURN THE THREAD INTO THE TREE. MOCKS 1 AND 2 ARE THE SAME POINT.
+   The owner's table assigned the depth axis the job of moving between the flat thread and the tree.
+   It cannot, because depth is not what separates them. The thread draws every step at every depth
+   and spends no column on indentation; the tree draws every step at every depth and spends three
+   columns per level. NEITHER HIDES ANYTHING THE OTHER SHOWS — on both recorded cases their step
+   sets are identical, and the composed view at `depth ∞ · condense off · pane off` matches both.
+
+   So the thread↔tree axis is INDENTATION: a drawing decision, invisible to any show/hide control,
+   and a FOURTH axis if A-137 wants both pictures. The depth limit is a real and useful control —
+   it is simply not this one. (It is what makes the deep-nesting case readable, and A-145 measured
+   real nesting at three levels, so on a real run it never has to fire at all.)
+
+4. ⚠ THE INVERSION: ON A REAL RUN, CONDENSING IS WHAT BUYS THE ROOM TO SHOW A FAILURE.
+   The story's stated risk was that condensing would swallow a failed step and flatter the run. The
+   opposite is what happens. Session s_1477 turn 7 ran `git_stage` against a path that no longer
+   existed; it failed with exit 128, and the `execute_batch` phase around it then closed OK — a DONE
+   parent holding a FAILED child, a shape nobody would have authored and which only exists here
+   because the fixture is a real capture. On the nine-turn case at 100x28:
+     - condense OFF: the failure is 166 steps back and the terminal has long since scrolled past it.
+     - condense ON:  six clean turns fold to a row each, TURN 7 REFUSES TO FOLD BECAUSE IT HOLDS A
+                     FAILURE, and the failed git_stage is on screen with its siblings folded to +2.
+   The rule that makes this work is that a subtree is condensable only if it is entirely finished
+   AND entirely successful. The two halves are stated separately in `axes::condensable` so that a
+   later change to what 'finished' means cannot take the failure rule with it.
+
+5. THE FLOORS, RE-MEASURED PER CONFIGURATION — AND THIS RETIRES A CLAIM FROM THE LAST ROUND.
+   A-144 charged the split a 64x10 floor and called it the layout's main cost, recommending mock 1
+   as a separate sub-64-column fallback. The floor is the PANE'S, not the layout's: with the pane
+   off the composed view draws every load case at 40x6 — the flat thread's floor, the lowest of the
+   five — and with it on it refuses one column under 64 exactly as mock 3 does.
+   ⚠ SO THE SUB-64-COLUMN FALLBACK IS NOT A SECOND LAYOUT. IT IS THIS LAYOUT WITH A TOGGLE OFF.
+   That is the concrete thing making the pane optional buys, and it is why `pane` defaults to off.
+
+6. THE DEFAULTS, AND WHAT EACH ONE SHOWS AND HIDES. Every axis defaults to the setting that
+   withholds least, and 'least' means something different on each — which is why this is three
+   arguments and not one ratio.
+
+   DEPTH = ALL.
+     shows  every level of nesting.
+     hides  nothing. Zero depth elisions anywhere in the envelope, on any case.
+     why    A-145 measured real nesting at THREE levels (turn > loop phase > op). The eight-level
+            case that cost the tree A-144's comparison is a shape this log has never recorded, so a
+            limit set against it would pay a real cost to solve an imagined problem. Keep the
+            control for the fan-out a sub-agent produces; do not arm it by default. A default depth
+            that hid a sub-agent's work would be the flattering-view failure this epic exists to
+            avoid, and where it does fire it names the number of LEVELS withheld and how many of the
+            withheld steps failed — 'there is more below' is not an answer a reader can act on.
+
+   CONDENSE = ON.
+     shows  every top-level step; full structure wherever a failure lives; the running path always.
+     hides  finished, wholly successful subtrees — each folded into a row that carries `+N`, plus
+            one summary line saying how many steps went into how many rows.
+     why    it is the single biggest effect available (191 steps to a ~29-row rail) and, per point
+            4, it is what surfaces the failure rather than what buries it. ⚠ Temper the expectation
+            with A-145's second correction: the win is CONCENTRATED, not uniform. 36 of 55 real
+            phases are exactly one step, where folding saves nothing; one is 57, where the whole
+            win lives. Do it — one phase of 57 is reason enough — but do not expect the row count
+            to stop tracking the run.
+
+   PANE = OFF.
+     shows  the rail at full terminal width, which is where a row can still carry an OP'S ARGUMENT.
+            A-145 measured mock 3's 40-column rail down to op-and-timing with the argument gone.
+     hides  the focused step's token cost and output tail — one keystroke away, not a relayout.
+     why    per point 5 it is the axis that owns the 64x10 floor, and at 52 columns — the width A-145
+            notes most of this is actually read at — pane-on refuses entirely while pane-off draws.
+            A default that refuses to draw in the operator's usual terminal is not a default.
+
+⚠ WHAT REMAINS TRUE FROM A-144 AND A-145. Condensing first is still right and is still most of the
+win; the split's second column still buys the only place to put token cost and a streaming tail
+beside the chain that produced it, which is why the pane is an axis rather than a deletion; and the
+condensed tree is still the honest runner-up A-145 promoted it to — it is now literally the default
+this section recommends. What changed is that 'build mock 3' has become 'build the controls, and
+here are the settings', and that mock 3's rail turns out to encode a rule the three controls cannot
+say. Everything below this line is the A-144/A-145 reasoning, left intact.
+
+═══ A-144/A-145's ORIGINAL RECOMMENDATION, SUPERSEDED ABOVE BUT NOT EDITED ═══
+
 FIRST, CONDENSE FINISHED PHASES. THEN BUILD MOCK 3 — the split (condensed rail + detail pane) —
 with mock 1 as its sub-64-column fallback. The two are separable, and the first is most of the win.
 
@@ -1230,5 +1351,311 @@ have 47
 5 · graph-first
 needs 8 rows
 have 7
+```
+
+# A-146 — the same five, as three knobs
+
+A-144 drew five layouts and A-145 re-checked them against a real recorded run. A-146 asks a different question: are the five **points in a space with three orthogonal axes** — a depth limit, condense-completed, and an optional detail pane — so that A-137 can build *controls* and choose *defaults* rather than adopt a picture?
+
+**The answer is no, and the refutation is the deliverable.** Two of the five are reproduced exactly; the split is not reachable at all; and two of the five turn out to be the *same point*. The measurement is in the recommendation above, section by section. What follows is the evidence.
+
+## What each configuration reproduces
+
+| configuration | floor | reproduces |
+|---|---|---|
+| `depth ∞ · condense off · pane off` | 40×6 | **the flat thread's view** (and the tree's, on a real run) — exactly |
+| `depth ∞ · condense off · pane on` | 64×10 | the split *only* where the split hides nothing |
+| `depth ∞ · condense on · pane off` | 40×6 | **the recommended default** |
+| `depth ∞ · condense on · pane on` | 64×10 | — |
+| `depth 3 · condense off · pane off` | 40×6 | — |
+| `depth 3 · condense off · pane on` | 64×10 | — |
+| `depth 3 · condense on · pane off` | 40×6 | — |
+| `depth 3 · condense on · pane on` | 64×10 | — |
+| `depth 1 · condense off · pane off` | 40×6 | — |
+| `depth 1 · condense off · pane on` | 64×10 | — |
+| `depth 1 · condense on · pane off` | 40×6 | — |
+| `depth 1 · condense on · pane on` | 64×10 | — |
+
+And separately, `depth 6 · condense off · pane off` reproduces **the nested tree** exactly, on every load case — 6 being `plan.rs`'s `MAX_TREE_DEPTH`, the bound mock 2 borrows from the live plan renderer.
+
+## ⚠ The recorded failure, with condensing off and on
+
+Session `s_1477` turn 7 ran `git_stage` against a path that no longer existed. It failed with `exit 128` — and the `execute_batch` phase around it then closed **ok**. That is a `Done` parent holding a `Failed` child, which is exactly the shape that makes "finished work collapses to one row" dangerous, and it is not a shape anybody would have thought to author.
+
+The story's stated risk was that condensing would swallow it. On the real nine-turn run the opposite happens — **condensing is what buys the room to show it.** Both drawings below are the same run at the same viewport.
+
+### long run · `depth ∞ · condense off · pane off` · 100×28
+
+**condense off** — the failure is 166 steps back, and the window has scrolled past it. There is no `✗` on this screen.
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense off · pane off recorded s_1477 …
+↑ 165 above
+├─ ✓ ✻ detect_intent                                                                            2.5s
+├─ ✓ § explore                                                                                  5.1s
+├─ ✓ § approve_batch · ⏸ operator approval                                                      2.9s
+├─ ✓ § execute_batch                                                                            23ms
+│  └─ ✓ → git_status · {}                                                                       12ms
+├─ ✓ → observe                                                                                   3ms
+├─ ✓ § explore                                                                                  2.0s
+└─ ✓ ✻ present_results                                                                           3ms
+▶ § turn 9 · now, I want you to cut a new release - so a new tag + gh release                 344.3s
+├─ ✓ ✻ detect_intent                                                                            5.6s
+├─ ✓ § explore                                                                                249.1s
+│  ├─ ✓ → read_many · {"paths":["AGENTS.md","Cargo.toml","CHANGELOG.md","WHATS-NEW.md","pl…   170.4s
+│  ├─ ✓ → read · CHANGELOG.md                                                                   12ms
+│  ├─ ✓ → grep · {"glob":"*.toml","literal":false,"max_results":200,"path":null,"pattern":…     53ms
+│  ├─ ✓ → grep · 0.26.0                                                                        211ms
+│  ├─ ✓ → read_many · plugins/host-kit/Cargo.toml +1                                            8.7s
+│  ├─ ✓ → grep · .github/workflows                                                               7ms
+│  └─ ✓ → glob · .github/workflows                                                               4ms
+├─ ✓ § approve_batch · ⏸ operator approval                                                     71.8s
+├─ ✓ § execute_batch                                                                            78ms
+│  ├─ ✓ → git_status · {}                                                                       23ms
+│  └─ ✓ → git_log · {"limit":20}                                                                13ms
+├─ ✓ → observe                                                                                   3ms
+├─ ✓ § explore                                                                                 17.7s
+└─ ▶ ✻ present_results                                                                      ⏸    2ms
+… 166 of 191 steps not shown
+```
+
+### long run · `depth ∞ · condense on · pane off` · 100×28
+
+**condense on (the default)** — six clean turns fold to a row each, **turn 7 refuses to fold because it holds a failure**, and `✗ → git_stage` is on screen with its clean sibling folded to `+2`.
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense on · pane off recorded s_1477 @…
+↑ 6 above
+├─ ✓ ✻ detect_intent                                                                            4.8s
+├─ ✓ § explore                                                                                 47.5s
+├─ ✓ § approve_batch · ⏸ operator approval                                                      7.9s
+├─ ✓ § execute_batch                                                                           239ms
+│  ├─ ✓ → git_status · {}                                                                       39ms
+│  ├─ ✓ → git_diff · {"path":null,"staged":false}                                               59ms
+│  ├─ ✓ → git_status · {}                                                                       54ms
+│  └─ ✗ → git_stage · {"paths":["CHANGELOG.md","WHATS-NEW.md","crates/flux-sdk/README.md",…     35ms
+├─ ✓ → observe                                                                                   4ms
+├─ ✓ § explore                                                                                 14.4s
+├─ ✓ § approve_batch · ⏸ operator approval                                                      5.8s
+├─ ✓ § execute_batch                                                                    +2     126ms
+├─ ✓ → observe                                                                                   3ms
+├─ ✓ § explore                                                                                  3.6s
+└─ ✓ ✻ present_results                                                                           3ms
+✓ § turn 8 · is the dir clean now?                                                      +8     13.0s
+▶ § turn 9 · now, I want you to cut a new release - so a new tag + gh release                 344.3s
+├─ ✓ ✻ detect_intent                                                                            5.6s
+├─ ✓ § explore                                                                          +7    249.1s
+├─ ✓ § approve_batch · ⏸ operator approval                                                     71.8s
+├─ ✓ § execute_batch                                                                    +2      78ms
+├─ ✓ → observe                                                                                   3ms
+├─ ✓ § explore                                                                                 17.7s
+└─ ▶ ✻ present_results                                                                      ⏸    2ms
+⊕ condensed 160 finished steps into 10 rows
+… 167 of 191 steps not shown
+```
+
+## ⚠ Mocks 1 and 2 are the same point
+
+The depth limit was supposed to move between the flat thread and the tree. It cannot: neither hides anything the other shows. Below, the composed view at `depth ∞ · condense off · pane off` beside both mocks on the same recorded turn — three different pictures, one view.
+
+### composed · depth ∞ · condense off · pane off · tidy
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense off · pane off recorded s_1477 …
+▶ § turn 7 · now, commit all docs in a smart way                                               84.5s
+├─ ✓ ✻ detect_intent                                                                            4.8s
+├─ ✓ § explore                                                                                 47.5s
+├─ ✓ § approve_batch · ⏸ operator approval                                                      7.9s
+├─ ✓ § execute_batch                                                                           239ms
+│  ├─ ✓ → git_status · {}                                                                       39ms
+│  ├─ ✓ → git_diff · {"path":null,"staged":false}                                               59ms
+│  ├─ ✓ → git_status · {}                                                                       54ms
+│  └─ ✗ → git_stage · {"paths":["CHANGELOG.md","WHATS-NEW.md","crates/flux-sdk/README.md",…     35ms
+├─ ✓ → observe                                                                                   4ms
+├─ ✓ § explore                                                                                 14.4s
+├─ ✓ § approve_batch · ⏸ operator approval                                                      5.8s
+├─ ✓ § execute_batch                                                                           126ms
+│  ├─ ✓ → git_stage · {"paths":["crates/flux-sdk/README.md","docs/designs/deterministic-ag…     38ms
+│  └─ ✓ → git_commit · {"body":"- Add Agent Lab as a first-class SDK documentation area.\n…     64ms
+├─ ✓ → observe                                                                                   3ms
+├─ ✓ § explore                                                                                  3.6s
+└─ ▶ ✻ present_results                                                                      ⏸    1ms
+```
+
+### 1 · flat thread · tidy
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  flat thread  recorded s_1477 @ +84s · 84.5s elapsed
+▶ turn 7                            now, commit all docs in a smart way                        84.5s
+✓ turn 7/detect_intent                                                                          4.8s
+✓ turn 7/explore                                                                               47.5s
+✓ turn 7/approve_batch              ⏸ operator approval                                         7.9s
+✓ turn 7/execute_batch                                                                         239ms
+✓ turn 7/execute_batch/git_status   {}                                                          39ms
+✓ turn 7/execute_batch/git_diff     {"path":null,"staged":false}                                59ms
+✓ turn 7/execute_batch/git_status   {}                                                          54ms
+✗ turn 7/execute_batch/git_stage    {"paths":["CHANGELOG.md","WHATS-NEW.md","crates/flux-s…     35ms
+✓ turn 7/observe                                                                                 4ms
+✓ turn 7/explore                                                                               14.4s
+✓ turn 7/approve_batch              ⏸ operator approval                                         5.8s
+✓ turn 7/execute_batch                                                                         126ms
+✓ turn 7/execute_batch/git_stage    {"paths":["crates/flux-sdk/README.md","docs/designs/de…     38ms
+✓ turn 7/execute_batch/git_commit   {"body":"- Add Agent Lab as a first-class SDK document…     64ms
+✓ turn 7/observe                                                                                 3ms
+✓ turn 7/explore                                                                                3.6s
+▶ turn 7/present_results                                                                    ⏸    1ms
+  ⏸ pauses present_results  ·  ↵ opens it in a sheet
+```
+
+### 2 · nested tree · tidy
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  nested tree  recorded s_1477 @ +84s · 84.5s elapsed
+▶ § turn 7 · now, commit all docs in a smart way                                               84.5s
+├─ ✓ ✻ detect_intent ·                                                                          4.8s
+├─ ✓ § explore ·                                                                               47.5s
+├─ ✓ § approve_batch · ⏸ operator approval                                                      7.9s
+├─ ✓ § execute_batch ·                                                                         239ms
+│  ├─ ✓ → git_status · {}                                                                       39ms
+│  ├─ ✓ → git_diff · {"path":null,"staged":false}                                               59ms
+│  ├─ ✓ → git_status · {}                                                                       54ms
+│  └─ ✗ → git_stage · {"paths":["CHANGELOG.md","WHATS-NEW.md","crates/flux-sdk/README.md",…     35ms
+├─ ✓ → observe ·                                                                                 4ms
+├─ ✓ § explore ·                                                                               14.4s
+├─ ✓ § approve_batch · ⏸ operator approval                                                      5.8s
+├─ ✓ § execute_batch ·                                                                         126ms
+│  ├─ ✓ → git_stage · {"paths":["crates/flux-sdk/README.md","docs/designs/deterministic-ag…     38ms
+│  └─ ✓ → git_commit · {"body":"- Add Agent Lab as a first-class SDK documentation area.\n…     64ms
+├─ ✓ → observe ·                                                                                 3ms
+├─ ✓ § explore ·                                                                                3.6s
+└─ ▶ ✻ present_results ·                                                                    ⏸    1ms
+```
+
+## Each axis on its own
+
+The three are independent: each is settable without the others and each changes the drawing with the other two held fixed.
+
+### fan-out · depth 2 · condense off · pane off · 100×28
+
+**the depth axis alone.** Where it bites it says how many *levels* went with it, not merely that something did — a sub-agent's whole run can live in one withheld level.
+
+```text
+◆ tracking board sync · audit fan-out  depth 2 · condense off · pane off hand-authored · 12.4s elap…
+✓ ▤ plan · low · mutating · 9 ops                                                              140ms
+✓ § judge · 6 epics untracked                                                                   4.3s
+└─ ✓ ✻ model.decide · opus · judge · round 3 · 6 ops                                            4.2s
+▶ § audit · 6 workers · 5 running                                                               7.5s
+├─ ✓ ⇩ tracker-audit#1 · agent-loop-visibility                                                  3.1s
+│  └─ ⇣ 1 level, 2 steps
+├─ ▶ ⇩ tracker-audit#2 · flux-lang-hardening                                                    7.5s
+│  └─ ⇣ 1 level, 2 steps
+├─ ▶ ⇩ tracker-audit#3 · syntax-simplification                                                  7.4s
+│  └─ ⇣ 1 level, 2 steps
+├─ ▶ ⇩ tracker-audit#4 · plugin-protocol-decoupling                                             7.4s
+│  └─ ⇣ 1 level, 2 steps
+├─ ▶ ⇩ tracker-audit#5 · run-control                                                            7.3s
+│  └─ ⇣ 1 level, 2 steps
+└─ ▶ ⇩ tracker-audit#6 · interactive-debugger                                                   7.3s
+   └─ ⇣ 1 level, 2 steps
+· § board · regenerate                                                                       pending
+⇣ 1 level below the depth limit withheld — 12 steps
+… 12 of 23 steps not shown
+```
+
+### long run · depth ∞ · condense on · pane on · 100×28
+
+**all three on.** The nearest point in the space to mock 3 — and, per section 2 of the recommendation, still not mock 3.
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense on · pane on recorded s_1477 @ …
+↑ 6 above                                │ turn 9 › present_results
+├─ ✓ ✻ detect_intent                4.8s │ ▶ ✻ present_results                                   2ms
+├─ ✓ § explore                     47.5s │ started +1991.1s   in 17.3k · out 342 · cache 0
+├─ ✓ § approve_batch · ⏸ opera…     7.9s │ ─────────────────────────────────────────────────────────
+├─ ✓ § execute_batch               239ms │ ⏸ pause here · ↹ move focus · ↵ expand
+│  ├─ ✓ → git_status · {}           39ms │ 
+│  ├─ ✓ → git_diff · {"path":n…     59ms │ 
+│  ├─ ✓ → git_status · {}           54ms │ 
+│  └─ ✗ → git_stage · {"paths"…     35ms │ 
+├─ ✓ → observe                       4ms │ 
+├─ ✓ § explore                     14.4s │ 
+├─ ✓ § approve_batch · ⏸ opera…     5.8s │ 
+├─ ✓ § execute_batch        +2     126ms │ 
+├─ ✓ → observe                       3ms │ 
+├─ ✓ § explore                      3.6s │ 
+└─ ✓ ✻ present_results               3ms │ 
+✓ § turn 8 · is the dir cle…+8     13.0s │ 
+▶ § turn 9 · now, I want you t…   344.3s │ 
+├─ ✓ ✻ detect_intent                5.6s │ 
+├─ ✓ § explore              +7    249.1s │ 
+├─ ✓ § approve_batch · ⏸ opera…    71.8s │ 
+├─ ✓ § execute_batch        +2      78ms │ 
+├─ ✓ → observe                       3ms │ 
+├─ ✓ § explore                     17.7s │ 
+└─ ▶ ✻ present_results          ⏸    2ms │ 
+⊕ condensed 160 finished steps into 10 rows
+… 167 of 191 steps not shown
+```
+
+## The floor travels with the pane
+
+A-144 charged the split a 64×10 floor and recommended the flat thread as a separate sub-64-column fallback. The floor belongs to the **pane**: with it off, the same view draws at 40×6 — the lowest floor of the five. So the fallback is not a second layout, it is this layout with a toggle off.
+
+### `depth ∞ · condense on · pane off` · tidy · 40×6
+
+```text
+◆ docs gap audit, fix, commit, release …
+↑ 13 above
+├─ ✓ § explore                      3.6s
+└─ ▶ ✻ present_results          ⏸    1ms
+⊕ condensed 2 finished steps into 1 row
+… 16 of 18 steps not shown
+```
+
+### `depth ∞ · condense on · pane off` · tidy · 52×20
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  de…
+▶ § turn 7 · now, commit all docs in a sma…    84.5s
+├─ ✓ ✻ detect_intent                            4.8s
+├─ ✓ § explore                                 47.5s
+├─ ✓ § approve_batch · ⏸ operator approval      7.9s
+├─ ✓ § execute_batch                           239ms
+│  ├─ ✓ → git_status · {}                       39ms
+│  ├─ ✓ → git_diff · {"path":null,"staged"…     59ms
+│  ├─ ✓ → git_status · {}                       54ms
+│  └─ ✗ → git_stage · {"paths":["CHANGELOG…     35ms
+├─ ✓ → observe                                   4ms
+├─ ✓ § explore                                 14.4s
+├─ ✓ § approve_batch · ⏸ operator approval      5.8s
+├─ ✓ § execute_batch                    +2     126ms
+├─ ✓ → observe                                   3ms
+├─ ✓ § explore                                  3.6s
+└─ ▶ ✻ present_results                      ⏸    1ms
+⊕ condensed 2 finished steps into 1 row
+… 2 of 18 steps not shown
+```
+
+### `depth ∞ · condense on · pane on` · tidy · 52×20
+
+```text
+depth ∞ · condense on · pane on
+needs 64 cols
+have 52
+```
+
+### `depth ∞ · condense on · pane on` · tidy · 64×10
+
+```text
+◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · cond…
+↑ 9 above                  │ turn 7 › present_results
+├─ ✓ § explore       14.4s │ ▶ ✻ present_results             1ms
+├─ ✓ § approve_b…     5.8s │ started +84.5s   in 15.4k · out 17…
+├─ ✓ § execut…+2     126ms │ ───────────────────────────────────
+├─ ✓ → observe         3ms │ ⏸ pause here · ↹ move focus · ↵ ex…
+├─ ✓ § explore        3.6s │ 
+└─ ▶ ✻ present_r… ⏸    1ms │ 
+⊕ condensed 2 finished steps into 1 row
+… 11 of 18 steps not shown
 ```
 
