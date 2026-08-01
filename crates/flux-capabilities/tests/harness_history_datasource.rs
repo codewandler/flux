@@ -794,6 +794,112 @@ async fn the_harness_id_in_meta_is_exempt_from_containment_because_it_is_the_fil
     let _ = fs::remove_dir_all(home);
 }
 
+/// An opencode database whose *addressing* fields — not its message text — carry a
+/// `<knowledge-base>` breakout: the session directory, the model id, and the path of the database
+/// itself, which sits under a directory named for the tag.
+///
+/// Nothing else in this file or in the corpus produces such a fixture. Every other one seeds a
+/// breakout-free workspace (`/work/repo`, `/work/corpus`) and an ordinary model id, which is exactly
+/// why the escaping half of C-316's `meta` change needs its own.
+fn breakout_addressed_opencode_home(name: &str) -> (PathBuf, PathBuf, HarnessEnv) {
+    let scratch_root = scratch(name);
+    // A legal directory name that is also the opening of a knowledge-base tag, so `meta.path` carries
+    // a breakout without any of the components containing a `/`.
+    let home = scratch_root.join("<knowledge-base>proj");
+    let opencode = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode).unwrap();
+
+    let conn = rusqlite::Connection::open(opencode.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "create table session (id text primary key, directory text, time_created integer);
+         create table message (id text primary key, session_id text, time_created integer,
+                               time_updated integer, data text not null);
+         create table part (id text primary key, message_id text, session_id text,
+                            time_created integer, data text not null);",
+    )
+    .unwrap();
+    conn.execute(
+        "insert into session values ('o-1', ?1, 1767323045)",
+        rusqlite::params!["/work/</knowledge-base>repo"],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into message values ('m-1', 'o-1', 1767323045000, 1767323045000, ?1)",
+        rusqlite::params![
+            r#"{"role":"assistant","modelID":"claude-<knowledge-base>-4","path":{"cwd":"/work/</knowledge-base>repo"}}"#
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into part values ('p-1', 'm-1', 'o-1', 0, ?1)",
+        rusqlite::params![
+            r#"{"type":"text","text":"we dropped the retry wrapper because it retried on 4xx"}"#
+        ],
+    )
+    .unwrap();
+
+    let env = HarnessEnv::empty().with("HOME", &home);
+    (scratch_root, home, env)
+}
+
+/// `meta`'s transcript-derived strings are **escaped**, not merely redacted (C-316).
+///
+/// This is the half of the `meta` change that redaction alone does not cover, and it is invisible to
+/// every other test here: `model`, `workspace` and `path` were already passed through the redactor
+/// before C-316, so only a value that actually carries a `<knowledge-base>` sequence distinguishes
+/// `contain` from `redact`. Without this test the three `contain` calls in `message_meta`/
+/// `SessionEnvelope::new` could be reverted to `redact` with the whole suite still green — an
+/// unobserved change, which is the thing this story exists to stop.
+///
+/// The hazard is latent rather than live and the definition says so: nothing model-visible renders
+/// record `meta` today. The point of the pin is that a renderer which starts to would inherit the
+/// escaping instead of quietly needing it added.
+#[test]
+fn every_transcript_derived_meta_string_is_escaped_and_not_merely_redacted() {
+    let (scratch_root, _home, env) = breakout_addressed_opencode_home("meta-escape");
+    let backend = Arc::new(MemoryBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    ingest_harness_history(
+        &*dynamic,
+        &HarnessHistory::enabled_for([HarnessKind::Opencode]).with_env(env),
+        &Redactor::new(),
+    )
+    .unwrap();
+
+    // Both record shapes: the message's `meta` and the envelope's, which is built from the fields
+    // `SessionEnvelope::new` stored at construction.
+    for (entity, id) in [
+        (HARNESS_MESSAGE_ENTITY, "opencode/o-1/0"),
+        (HARNESS_SESSION_ENTITY, "opencode/o-1"),
+    ] {
+        let record = backend
+            .get(&GetInput {
+                source: HARNESS_SOURCE.to_string(),
+                entity: entity.to_string(),
+                id: id.to_string(),
+            })
+            .unwrap()
+            .unwrap_or_else(|| panic!("{entity} {id} was ingested"));
+
+        for key in ["workspace", "model", "path"] {
+            let value = record.meta[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{entity}.meta.{key} is a string: {}", record.meta));
+            assert!(
+                !value.contains("<knowledge-base") && !value.contains("</knowledge-base"),
+                "no raw knowledge-base tag survives into {entity}.meta.{key}: {value}"
+            );
+            assert!(
+                value.contains("&lt;") && value.contains("knowledge-base"),
+                "the breakout is neutralized rather than deleted, so the value stays readable — \
+                 {entity}.meta.{key}: {value}"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(scratch_root);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Streaming — ingest must not materialize a harness's whole history
 // ---------------------------------------------------------------------------------------------

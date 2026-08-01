@@ -119,6 +119,25 @@ exempt with the reason recorded at the definition and in the design, and
 Also removed: a stray `docs/stories/C-316-*.md.tmp.11507.f5054f2a8046` left by the interrupted atomic
 write of this file.
 
+**Review round two** — three MINOR doc-accuracy findings, all closed rather than filed, since a
+comment claiming what the code does not do is this story's own thesis:
+
+1. `HarnessIngestReport::sessions()` documented itself as "distinct sessions seen, **not** the number
+   of envelope records upserted" — the exact inverse of what it counts. It is one per insertion into
+   the live set, so a session re-created after eviction counts twice. Comment rewritten to say so; the
+   internal field renamed `distinct` → `projected`, which is what it is.
+2. `MAX_LIVE_SESSION_ENVELOPES` documented only half the cost of eviction. The re-created envelope
+   also re-seeds `first_ts_ms`/`last_ts_ms`, so the record's time range — and the start timestamp its
+   title carries — narrows to the post-eviction part. Stated in the const, in `sessions_evicted`, in
+   the design, and now *pinned*: `a_session_that_returns_after_eviction_is_projected_again_and_undercounts`
+   asserts the narrowed `ts_ms` and title alongside the undercount.
+3. The escaping half of the `meta` change was unobserved. `model`/`workspace`/`path` were already
+   redacted at the base, so only a value carrying a real `<knowledge-base>` sequence distinguishes
+   `contain` from `redact` — and no other fixture in the suite has one. Pinned by
+   `every_transcript_derived_meta_string_is_escaped_and_not_merely_redacted`, whose opencode fixture
+   puts a breakout in the session directory, the model id, and the database path (via a directory
+   named `<knowledge-base>proj`). It reds at the merge base on all six values.
+
 **Left for whoever picks it up next** (both stated by tests rather than assumed away, neither in this
 story's Goal): the adapters' own `session id -> ordinal` maps are a retention this cap does not
 cover — `the_adapter_ordinal_map_is_a_retention_this_cap_does_not_cover` — and bounding them trades a

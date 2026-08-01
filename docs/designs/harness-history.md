@@ -329,9 +329,13 @@ projected, handed to the backend and let go. Refusing (erroring the scan) would 
 database deny the whole index, and partial recall is this datasource's value; dropping would leave a
 session unsearchable and dangle the message→session link every one of its messages carries, silently.
 Flushing keeps every session addressable and costs one thing, stated rather than hidden: a session
-whose messages straddle an eviction is projected twice and the later projection wins, so its
-`messages` count becomes a lower bound. `HarnessIngestReport::sessions_evicted` reports that this
-could have happened. Two alternatives were rejected — reading the flushed record back to resume its
+whose messages straddle an eviction is projected twice and the later projection wins, so the
+surviving record describes a **suffix** of that session rather than the whole of it. Two fields say
+so: its `messages` count becomes a lower bound, and its time range is re-seeded from the message that
+re-created the envelope, so `ts_ms`/`last_ts_ms` and the start timestamp the *title* carries all move
+forward. `HarnessIngestReport::sessions_evicted` reports that this could have happened, and
+`a_session_that_returns_after_eviction_is_projected_again_and_undercounts` pins both fields.
+Two alternatives were rejected — reading the flushed record back to resume its
 count (one backend round trip per new session, i.e. per *message* in the degenerate schema the cap
 exists for) and LRU instead of FIFO eviction (in the schema that actually evicts every session holds
 one message, so arrival order *is* completion order).
@@ -357,6 +361,19 @@ Proofs: `session_envelope_retention_does_not_scale_with_message_count` measures 
 (doubling the messages must not move the peak);
 `session_envelope_retention_is_bounded_by_ingest_not_by_the_harness_schema` is C-216's ratio test,
 rewritten to assert the bound and to overflow it by 900 sessions.
+
+`HarnessIngestReport::sessions()` counts **envelope projections, not distinct sessions** — one per
+insertion into the live set, so an evicted session seen again is counted twice. The two numbers
+coincide exactly when `sessions_evicted()` is zero, which is every scan that never reaches the cap.
+Worth spelling out because the accessor's name suggests otherwise and its first doc comment asserted
+the inverse.
+
+The `contain` change on `meta` adds *escaping* on top of redaction that was already there, so only a
+value actually carrying a `<knowledge-base>` sequence tells the two apart — and no other fixture in
+the suite has one, since they all seed breakout-free workspaces and ordinary model ids.
+`every_transcript_derived_meta_string_is_escaped_and_not_merely_redacted` supplies that fixture
+(session directory, model id, and a database path under a directory named for the tag) so the change
+is observed rather than merely made.
 
 On `meta`: the attribute surface was never the hazard — `flux_core`'s `open_tag` `attr_escape`s every
 value it writes, and `escape_knowledge_base_body` is not an attribute escaper — so what `contain` on

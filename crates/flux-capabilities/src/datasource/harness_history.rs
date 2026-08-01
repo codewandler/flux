@@ -94,9 +94,17 @@ const UPSERT_BATCH: usize = 512;
 /// - Flushing keeps every session addressable, and what it costs is stated below rather than hidden.
 ///
 /// **What it costs.** A session whose messages are separated by more than this many *other* sessions
-/// is projected twice, and the later projection — which counted only the messages seen after the
-/// eviction — wins. Its `messages` count is then a lower bound rather than a total. This is reported
-/// ([`HarnessIngestReport::sessions_evicted`]), it cannot happen at all until the cap is reached, and
+/// is projected twice, and the later projection wins. That projection is built from the messages seen
+/// *after* the eviction only, so two things about the surviving record describe a suffix of the
+/// session rather than the whole of it:
+///
+/// - its `messages` count is a lower bound rather than a total;
+/// - its **time range is narrowed on both ends** — [`SessionEnvelope::new`] seeds `first_ts_ms` and
+///   `last_ts_ms` from the message that re-created it, so the record's `ts_ms`/`last_ts_ms` and the
+///   start timestamp its *title* carries all move forward to the post-eviction part.
+///
+/// Same signal for both: this is reported ([`HarnessIngestReport::sessions_evicted`]), it cannot
+/// happen at all until the cap is reached, and
 /// on real harness state it is close to unreachable: claude-code and codex write one file per
 /// session, and opencode's scan is ordered so a session's rows arrive together — so the *oldest*
 /// envelope is normally also a finished one. Reading the flushed record back to resume its count was
@@ -242,8 +250,20 @@ impl HarnessIngestReport {
         self.records
     }
 
-    /// Distinct sessions seen. Not the number of envelope *records* upserted: an evicted session
-    /// that reappears is projected again (see [`MAX_LIVE_SESSION_ENVELOPES`]).
+    /// **Session envelopes projected and handed to the backend** — one per insertion into the live
+    /// set, so a session evicted and then seen again is counted twice (see
+    /// [`MAX_LIVE_SESSION_ENVELOPES`]).
+    ///
+    /// It is the count of *upserts*, not of distinct sessions and not of rows in the index: the
+    /// second projection of a re-created session carries the same record id, so it overwrites rather
+    /// than adds. The two numbers coincide exactly when [`sessions_evicted`](Self::sessions_evicted)
+    /// is zero, which is every scan that never reaches the cap. Where they can diverge is pinned by
+    /// `a_session_that_returns_after_eviction_is_projected_again_and_undercounts`, which sees four
+    /// projections of three sessions.
+    ///
+    /// The earlier spelling of this comment had it backwards ("distinct sessions seen, not the number
+    /// of envelope records upserted"), which is precisely the failure this story is about: a comment
+    /// asserting a property the code does not have.
     pub fn sessions(&self) -> usize {
         self.sessions
     }
@@ -259,7 +279,9 @@ impl HarnessIngestReport {
     }
 
     /// How many envelopes were flushed early because the live cap was reached. Non-zero means at
-    /// least one session's `messages` count may be a lower bound rather than a total.
+    /// least one session's record may describe a *suffix* of that session rather than the whole of
+    /// it — a `messages` count that is a lower bound, and a start timestamp that has moved forward.
+    /// See [`MAX_LIVE_SESSION_ENVELOPES`] for why that is the price paid, and for what it buys.
     pub fn sessions_evicted(&self) -> usize {
         self.sessions_evicted
     }
@@ -333,7 +355,7 @@ pub fn ingest_harness_history(
     out.flush()?;
 
     report.records = out.messages;
-    report.sessions = sessions.distinct;
+    report.sessions = sessions.projected;
     report.peak_session_envelopes = sessions.peak;
     report.sessions_evicted = sessions.evicted;
     Ok(report)
@@ -397,7 +419,10 @@ struct SessionEnvelopes {
     cap: usize,
     peak: usize,
     evicted: usize,
-    distinct: usize,
+    /// Insertions, and therefore projections: every entry inserted here is released exactly once,
+    /// through [`Self::release_oldest`]. Named for what it counts rather than `distinct`, which it is
+    /// not — a session re-created after eviction is inserted, and projected, a second time.
+    projected: usize,
 }
 
 impl SessionEnvelopes {
@@ -410,7 +435,7 @@ impl SessionEnvelopes {
             cap: cap.max(1),
             peak: 0,
             evicted: 0,
-            distinct: 0,
+            projected: 0,
         }
     }
 
@@ -431,7 +456,7 @@ impl SessionEnvelopes {
         envelope.observe(message);
         self.arrival.push_back(key.clone());
         self.live.insert(key, envelope);
-        self.distinct += 1;
+        self.projected += 1;
         while self.live.len() > self.cap {
             self.evict_oldest(out)?;
         }
@@ -875,8 +900,17 @@ mod tests {
     use super::*;
     use crate::harness::MessageRole;
 
+    /// The base timestamp the fixtures below offset from.
+    const T0: i64 = 1_767_323_045_000;
+
     /// One message in `session`, enough of a `HarnessMessage` to project.
     fn message_in(session: &str) -> HarnessMessage {
+        message_in_at(session, T0)
+    }
+
+    /// The same, at a chosen instant — for the tests that care which end of a session a record
+    /// describes.
+    fn message_in_at(session: &str, ts_ms: i64) -> HarnessMessage {
         HarnessMessage {
             harness: HarnessKind::Opencode,
             session_id: session.to_string(),
@@ -885,7 +919,7 @@ mod tests {
             text: format!("a message in {session}"),
             model: None,
             workspace: Some("/work/repo".into()),
-            ts_ms: Some(1_767_323_045_000),
+            ts_ms: Some(ts_ms),
             path: PathBuf::from("/home/u/.local/share/opencode/opencode.db"),
         }
     }
@@ -919,7 +953,7 @@ mod tests {
         }
 
         assert_eq!(envelopes.peak, CAP, "the cap is reached and never passed");
-        assert_eq!(envelopes.distinct, SESSIONS);
+        assert_eq!(envelopes.projected, SESSIONS);
         assert_eq!(envelopes.evicted, SESSIONS - CAP);
 
         // Flushed, not dropped: every session is still addressable in the index afterwards.
@@ -950,19 +984,30 @@ mod tests {
     }
 
     /// The cost the cap accepts, written down as a test rather than as a claim: a session whose
-    /// messages straddle an eviction is projected twice, and the second projection counts only what
-    /// it saw. `sessions_evicted` is how a caller finds out this could have happened.
+    /// messages straddle an eviction is projected twice, and the second projection describes only the
+    /// part it saw. `sessions_evicted` is how a caller finds out this could have happened.
+    ///
+    /// **Both halves of that cost are pinned here**, because both are stated by
+    /// [`MAX_LIVE_SESSION_ENVELOPES`]'s doc comment and neither is self-evident from the code: the
+    /// `messages` count is a lower bound, *and* the time range moves forward to the post-eviction
+    /// part — which is what the record's title and `ts_ms` carry.
     #[test]
     fn a_session_that_returns_after_eviction_is_projected_again_and_undercounts() {
         const CAP: usize = 2;
+        const HOUR: i64 = 3_600_000;
         let redactor = Redactor::new();
         let backend = super::super::MemoryBackend::new();
         let mut out = Upserts::new(&backend);
         let mut envelopes = SessionEnvelopes::new(CAP);
 
-        // `a` arrives, then enough others to evict it, then `a` again.
-        for session in ["a", "b", "c", "a"] {
-            let message = message_in(session);
+        // `a` arrives, then enough others to evict it, then `a` again three hours later.
+        for (session, ts) in [
+            ("a", T0),
+            ("b", T0 + HOUR),
+            ("c", T0 + 2 * HOUR),
+            ("a", T0 + 3 * HOUR),
+        ] {
+            let message = message_in_at(session, ts);
             let key = session_id(&message, &redactor);
             envelopes
                 .observe(key, &message, &redactor, &mut out)
@@ -972,8 +1017,8 @@ mod tests {
         out.flush().unwrap();
 
         assert_eq!(
-            envelopes.distinct, 4,
-            "`a` is counted as new when it returns"
+            envelopes.projected, 4,
+            "`a` is projected a second time when it returns — four projections of three sessions"
         );
         assert_eq!(envelopes.evicted, 2);
         // Three sessions, three addresses — the second `a` overwrote the first rather than
@@ -991,6 +1036,19 @@ mod tests {
             stored.body.contains("1 message"),
             "the returning half wins, so the count is a lower bound: {}",
             stored.body
+        );
+        assert_eq!(
+            stored.meta["ts_ms"],
+            json!(T0 + 3 * HOUR),
+            "the time range is re-seeded from the returning message, so the session's recorded start \
+             moves forward off its real one: {}",
+            stored.meta
+        );
+        assert!(
+            stored.title.contains(&format_epoch_ms(T0 + 3 * HOUR))
+                && !stored.title.contains(&format_epoch_ms(T0)),
+            "and the title carries that narrowed start, not the session's real one: {}",
+            stored.title
         );
     }
 
