@@ -1397,9 +1397,13 @@ impl HostCapabilities for SystemHostCaps {
                 // socket through different symlinked spellings (`/tmp` vs macOS `/private/tmp`) must
                 // still match. Resolving here also makes the checked path the dialed path, so the
                 // link cannot be repointed between the two.
+                // Listed variant by variant, not with a wildcard arm: a new `DialTarget` must fail
+                // to compile here so its grant enforcement is decided rather than defaulted.
                 let unix_path = match &target {
                     flux_system::net::DialTarget::Unix { path } => Some(path.clone()),
-                    flux_system::net::DialTarget::Tcp { .. } => None,
+                    flux_system::net::DialTarget::Tcp { .. }
+                    | flux_system::net::DialTarget::Udp { .. }
+                    | flux_system::net::DialTarget::Icmp { .. } => None,
                 };
                 let (target, grants) = if let Some(path) = unix_path {
                     let sys = self.system();
@@ -1432,9 +1436,17 @@ impl HostCapabilities for SystemHostCaps {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                // The dial was admitted. A TCP target that resolves private was let through by the
-                // scoped grant (Unix sockets aren't IP egress) — audit it.
-                if let flux_system::net::DialTarget::Tcp { host, .. } = &target {
+                // The dial was admitted. An IP target that resolves private was let through by the
+                // scoped grant (Unix sockets aren't IP egress) — audit it. Every IP variant is
+                // matched, so a datagram surface added here later is audited by construction rather
+                // than by remembering to.
+                let egress_host = match &target {
+                    flux_system::net::DialTarget::Tcp { host, .. }
+                    | flux_system::net::DialTarget::Udp { host, .. }
+                    | flux_system::net::DialTarget::Icmp { host } => Some(host),
+                    flux_system::net::DialTarget::Unix { .. } => None,
+                };
+                if let Some(host) = egress_host {
                     self.audit_admit(host, &pinned);
                 }
                 let id = self
@@ -1573,10 +1585,16 @@ impl HostCapabilities for SystemHostCaps {
 }
 
 /// The canonical grant string for a dial target (`tcp:host:port` / `unix:/path`).
+///
+/// UDP and ICMP have spellings here so the grant check is total, but `conn.dial` accepts no `kind`
+/// that builds them (C-396): datagram and raw egress stays outside the plugin surface until a
+/// manifest grant is designed for it, and a plugin cannot reach it by omission.
 fn conn_target_str(t: &flux_system::net::DialTarget) -> String {
     match t {
         flux_system::net::DialTarget::Tcp { host, port } => format!("tcp:{host}:{port}"),
         flux_system::net::DialTarget::Unix { path } => format!("unix:{path}"),
+        flux_system::net::DialTarget::Udp { host, port } => format!("udp:{host}:{port}"),
+        flux_system::net::DialTarget::Icmp { host } => format!("icmp:{host}"),
     }
 }
 

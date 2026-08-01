@@ -66,6 +66,29 @@ These are new variants on existing enums rather than a new module —
 is a deployment concern the design must state rather than discover: a capability the process may not
 hold is a **refusal at construction**, not an error at first send.
 
+**Resolved (C-396).** `DialTarget::Udp { host, port }` and `DialTarget::Icmp { host }` run through
+`guard_target_host_pinned` — the same resolution and range checks TCP runs. There is no second
+guard, and both sockets are `connect`ed to the vetted address, so the pin is enforced by the kernel
+rather than by convention: no later call can address anything else.
+
+The platform facts, and what flux does with them:
+
+| Fact | Decision |
+|---|---|
+| Linux raw ICMP (`SOCK_RAW`/`IPPROTO_ICMP`) needs `CAP_NET_RAW`; macOS needs root | Refuse, naming the capability |
+| Linux also offers unprivileged ICMP (`SOCK_DGRAM`/`IPPROTO_ICMP`, per-gid via `net.ipv4.ping_group_range`); macOS offers it to everyone | **No fallback.** It is a differently-privileged path whose wire semantics differ — the kernel owns and rewrites the echo identifier — so falling back would silently change what a probe measures depending on the host it ran on |
+| A confined process (C-410's fail-closed sandbox, network closed) cannot reach the network | The `socket`/`connect` call fails at construction with its errno in the message; nothing is addressed and nothing is sent |
+| Linux/BSD `socket(2)` accepts `SOCK_CLOEXEC`; macOS does not | Request it atomically where it exists. A descriptor marked close-on-exec by a *following* `fcntl` is inheritable for the width of that window, and this process spawns children concurrently while `Command` closes no inherited descriptors — so a `fork`+`exec` in the window hands a child a raw socket that traversed no grant. On macOS the `fcntl` remains and the window narrows but cannot be closed |
+
+The privilege check is the `RawIcmpOpener` seam rather than a probe-then-open pair, because a
+separate probe can disagree with the open that follows it. Opening and connecting a datagram socket
+transmits nothing, which is exactly what lets the check sit at construction. The seam also keeps the
+refusal *wording* in `net.rs`: an implementor reports the kernel's `io::Error` and this crate turns
+`PermissionDenied` into the message naming `CAP_NET_RAW`, so no implementor can weaken it.
+
+Neither variant is reachable from a plugin: `conn.dial` accepts no `kind` that builds one. Datagram
+and raw egress stays outside the plugin surface until a manifest grant is designed for it.
+
 ### 3. Nothing says what binding `flux-system` *without* `flux-runtime` means
 
 This is the sharpest gap and the one most likely to be got wrong quietly.
