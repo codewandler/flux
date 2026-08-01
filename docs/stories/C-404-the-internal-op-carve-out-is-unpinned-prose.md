@@ -2,8 +2,7 @@
 id: C-404
 title: "The credential boundary's `internal: true` carve-out is prose with no test pinning it, and `internal_op` is public"
 pillar: Core
-status: in-progress
-priority: 10
+status: done
 epic: connector-platform
 areas: [flux-plugin, flux-cli, flux-codegate]
 note: "found by C-403's review. The carve-out is NOT dormant — it is the only thing excusing `plugin.validate` at crates/flux-cli/src/plugin_cmd.rs:517, a live host-dispatched site whose `problems`/`warnings` are printed to operator stdout and whose error frame is printed raw. host-kit's own docs describe an internal op returning credentials, so the benign census is a property of today's plugins, not of the design"

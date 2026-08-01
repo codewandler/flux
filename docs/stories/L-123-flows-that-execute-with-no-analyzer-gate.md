@@ -2,8 +2,7 @@
 id: L-123
 title: "Three production paths execute a user flow with no analyzer gate at all, and `fork --edit` is the sharp one"
 pillar: Language
-status: in-progress
-priority: 11
+status: done
 epic: flux-lang-hardening
 design: docs/designs/flux-lang-hardening.md
 areas: [flux-lang, flux-flow, flux-app, flux-sdk]

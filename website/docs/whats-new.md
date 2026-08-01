@@ -12,6 +12,23 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Action needed
+
+- **A `flux app` program using the old positional call form will now refuse to start.** App
+  journeys are checked before they run, the same way `flux flow run` already checks a flow. That
+  catches a mistake before anything happens rather than halfway through — but it also means a
+  journey written in the long-deprecated positional style, like `send("cli", $reply)`, now fails at
+  startup instead of at the moment it runs. The error names the operation, what you passed, and the
+  parameter names it accepts. The fix is the named form: `send(channel: "cli", message: $reply)`.
+  Nothing that ships with flux used the old form, so this only affects your own app programs.
+
+### Fixed
+
+- **The terminal tells you when a pane update was dropped.** Under a burst heavy enough to fill the
+  display queue, commands from the agent used to be discarded with no sign — so a pane the agent
+  believed it had opened simply was not there. You now get one notice saying how many were dropped
+  in that frame, instead of silence.
+
 ## [0.46.0] - 2026-08-01
 
 ### Improved

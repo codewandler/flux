@@ -2,8 +2,7 @@
 id: C-324
 title: "A dropped pane command is a silent success, against the surface's own stated posture"
 pillar: Agent
-status: in-progress
-priority: 11
+status: done
 areas: [flux-tui, flux-runtime]
 note: "found by C-305's review — PaneQueue::emit drops the newest command past MAX_PENDING_COMMANDS while the op still returns ok, but surface.rs's own posture is that the sibling failure (no sink) is 'a clear op failure (never a silent success)'; the channel is send-only so there is no evidence handle to report through, which is why this needs a posture decision rather than a patch"
 ---

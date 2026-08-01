@@ -98,11 +98,19 @@ fully populated before the flow runs, keep the definedness check.
 | fork prefix replay, `diverge_inject` | a slice of an already-executed recorded plan; a slice is not a standalone flow, so analysis would reject valid forks over symbols bound outside it. Cassette-served or envelope-dispatched; loop budget at run time. |
 | journey ask-resume (`resume_flow`) | the suspension latch's own copy of a body `run_journey` already gated, resumed mid-flow. Named gap: a suspension persisted by a pre-gate build resumes ungated. |
 
-**Deliberately opt-in, documented at the public surface:** `flux-sdk`'s `FlowClient::execute*` does
-**not** call `analyze()` for you. Forcing it would break `execute_with`'s seeding (seeded `$name`s
-are unbound to plain `analyze`; only `analyze_seeded` sees them) and would re-pay the cost on every
-run of a stored, already-validated AST. The embedder owns the check, and `FlowClient`'s type-level
-docs say so in those words.
+**Deliberately opt-in, documented at the public surface:** four `FlowClient` doors — `execute`,
+`execute_with`, `execute_with_sink` and `execute_streamed` — do **not** call `analyze()` for you.
+Forcing it would break `execute_with`'s seeding (seeded `$name`s are unbound to plain `analyze`;
+only `analyze_seeded` sees them) and would re-pay the cost on every run of a stored,
+already-validated AST. The embedder owns the check on those four, and each carries a pointer saying
+so.
+
+⚠ **This is per-door, not a property of `execute*` as a family** — an earlier draft of this
+paragraph said otherwise and was wrong. Two doors *do* analyze: `FlowClient::run_flow` is
+`parse → analyze → execute_with` by construction, and `FlowClient::execute_optimized` calls
+`optimize` → `flux_flow::analyze::lower`, whose first statement is `analyze_flow` — strictly more
+than `analyze`. A blanket claim here would put two guaranteeing doors on the ungated side of the
+very table this section exists to be, so state the door, never the family.
 
 One consequence worth recording: gating journeys made the **deprecated 2+-positional call form**
 (`send("cli", $reply)`) a startup error there, as it already was under `flux flow run`.

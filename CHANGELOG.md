@@ -6,6 +6,52 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The credential boundary now checks the host-dispatched plugin response too, and the census is
+  enforced rather than asserted** (C-404). C-312 excused one class — a host-dispatched
+  `internal: true` op — and C-403 argued the exemption was unobservable because host-kit's
+  `internal_op` always yields `PlatformSourcing::None`. ⚠ **Both were wrong, and the review proved
+  it**: `internal` is never read in production at all (the dispatch guard keys only on the op name),
+  the manifest is deserialised straight off the wire with `internal` and `platform` as independent
+  defaulted fields, and host-kit is a convenience rather than the protocol — so a raw-NDJSON plugin
+  can ship exactly that shape. The carve-out was pure prose, never a code branch. It is removed: the
+  `plugin.validate` preflight verdict now goes through the boundary and its error frame is scrubbed,
+  while staying non-fatal so `--dry-run` keeps its fallback.
+  The scope statement is no longer a table a reader must trust — a codegate lint counts every
+  `call_with_host` ingest site per file and fails when the tree stops matching, verified to fire on
+  both branches (a new site in an uncensused file, and a second site in a censused one). It counts
+  *how many* places, not *which expression*, and says so at the definition.
+  ⚠ Residual, pre-existing and disclosed rather than introduced: `flux plugin call` builds a fresh
+  `Redactor` at both its sites, so the registered-value pass — the only recogniser that can catch a
+  shapeless bearer echoed back — cannot fire there. Bounded: that command never installs a secret
+  sink, so nothing would be registered in that process anyway.
+
+- **A dropped pane command is reported instead of silently succeeding** (C-324). The surface's own
+  posture says a sibling failure is "a clear op failure (never a silent success)", and queue
+  overflow was exactly that. The behaviour moved rather than the promise being weakened to match it:
+  an overflowing frame now records one notice naming the dropped count, edge-triggered so a
+  sustained flood does not bury the transcript under its own symptom.
+  ⚠ **The model is still not told, and now the code says why truthfully.** An earlier draft
+  justified it by pointing at `pane.list` as the model's recourse — **there is no `pane.list`**; the
+  registered vocabulary is `pane.open`/`update`/`close` and the design doc says it does not ship.
+  The model has no read-back on this surface at all, which is what C-306 exists to settle. Telling it
+  would mean changing `SurfaceSink::emit` to report acceptance back — a breaking change to a
+  published L2 trait — which is the honest reason, and the one now recorded.
+
+- **Three production paths no longer execute a user flow with no analyzer gate** (L-123). From
+  L-116's threat-model census. The model- and remote-facing surfaces were already clean, so this is
+  defence-in-depth rather than a remote hole — but `flux session fork --edit` parsed a **fresh
+  arbitrary flow** and ran it with no static check while its siblings were gated. The failing-first
+  proof shows why that matters: at the merge base the refusal arrived *after* a side-effecting
+  statement ahead of the bad one had already dispatched.
+  Journeys are analyzed minus symbol definedness, because a journey's symbol environment is
+  payload-shaped — `$delivery` exists only when the delivered payload carries it — and the
+  definedness rule is built for zero false positives. Op resolution, arity, declared-name validity,
+  expression-position legality, loop bounds, `parallel` disjointness and `await`/`checkpoint`
+  placement all stay enforced. The SDK's four ungated doors are documented rather than defaulted,
+  because defaulting would silently break `execute_with`'s seeding contract on a published crate.
+
 ### Added
 
 - **A Brave Talk / JaaS room acquires and refreshes its own guest token** (D-206, guest-token half;
