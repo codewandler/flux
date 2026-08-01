@@ -266,8 +266,15 @@ pub struct A2aSettings {
 #[non_exhaustive]
 pub struct RoomSettings {
     /// Which [`Room`](crate::rooms::Room) backend to join with. `"mock"` is the in-process one,
-    /// `"xmpp"` the portable standards-compliant one (D-205); `"jaas"` (D-206) follows. An
-    /// unrecognized backend is a load error, exactly like an unrecognized channel `kind`.
+    /// `"xmpp"` the portable standards-compliant one (D-205), and `"jaas"`
+    /// ([`JaasRoom`](crate::rooms::JaasRoom), D-206) is Brave Talk and any 8x8 JaaS tenant — the
+    /// same MUC machinery as `xmpp`, plus guest-token acquisition and refresh. An unrecognized
+    /// backend is a load error, exactly like an unrecognized channel `kind`.
+    ///
+    /// The `xmpp` credential settings below (`domain`, `user`, `password`, `muc_password`) are
+    /// **refused** by `jaas` rather than ignored: its stream domain comes from the
+    /// conference-request response and its SASL is `ANONYMOUS`, so accepting them would drop a
+    /// declared secret on the floor while the operator believed it was in play.
     pub backend: String,
     /// The room address, as the server spells it (an XMPP MUC JID).
     pub room: String,
@@ -308,6 +315,21 @@ pub struct RoomSettings {
     /// widening it is an operator decision, not a default.
     #[serde(default)]
     pub allow_private_net: bool,
+
+    // ── `backend = "jaas"` (D-206) ──
+    //
+    // Note what is *absent*: no field here takes a JWT, an API key or a private key, because the
+    // Brave Talk guest path is unauthenticated — the CSRF handshake exists precisely because there
+    // is no credential. When own-tenant signing lands it inherits the credential seam every other
+    // field here already uses (`flux_app::resolve_secrets` resolves `secret "KEY"` in a channel's
+    // settings at load and registers the value with the host's `Redactor`), so a key is written as
+    // `api_key secret "JAAS_KEY"` and never as a literal.
+    /// The token service that mints guest JWTs. Defaults to Brave's (`https://talk.brave.com`).
+    #[serde(default)]
+    pub token_service: Option<String>,
+    /// The JaaS API that allocates conference focus. Defaults to `https://8x8.vc`.
+    #[serde(default)]
+    pub conference_service: Option<String>,
 }
 
 /// The nick flux joins a room under when the declaration does not say. A room containing humans is

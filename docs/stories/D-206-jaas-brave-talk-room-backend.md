@@ -2,7 +2,7 @@
 id: D-206
 title: JaaS / Brave Talk room backend — guest-token acquisition and refresh
 pillar: Agent
-status: ready
+status: in-progress
 priority: 5
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -20,20 +20,97 @@ zero-setup path for a human who already runs Brave Talk.
 
 ## Acceptance
 
-- [ ] `JaasRoom` acquires a guest token: `OPTIONS` for the CSRF header, then
+- [x] `JaasRoom` acquires a guest token: `OPTIONS` for the CSRF header, then
       `PUT /api/v1/rooms/<room>` with the CSRF token and cookie jar → JWT.
-- [ ] Focus allocation via `POST /<tenant>/conference-request/v1` with the JWT as Bearer, and the MUC JID
+      → `BraveTalkTokens::guest_token` (`src/rooms/jaas/tokens.rs`),
+      `tests/jaas_tokens.rs::the_guest_token_handshake_sends_the_csrf_header_and_the_cookie_jar`
+- [x] Focus allocation via `POST /<tenant>/conference-request/v1` with the JWT as Bearer, and the MUC JID
       is taken **from that response** (it lowercases the room; the JWT does not).
-- [ ] The token rides the WebSocket URL as `?token=`, and SASL is `ANONYMOUS` — asserted, because `PLAIN`
+      → `BraveTalkTokens::conference`,
+      `tests/jaas_tokens.rs::focus_allocation_sends_the_jwt_as_bearer_and_answers_with_the_lowercased_muc_jid`
+      and `…::the_muc_jid_comes_from_the_conference_response_not_the_token`
+- [x] The token rides the WebSocket URL as `?token=`, and SASL is `ANONYMOUS` — asserted, because `PLAIN`
       with the JWT is refused and a future maintainer will otherwise "fix" this the wrong way.
-- [ ] **Token refresh:** a session crossing the 3 h expiry re-mints and stays joined. Failing-first test
+      → `tests/jaas_room.rs::the_jaas_token_rides_the_websocket_url_and_sasl_is_anonymous`
+- [x] **Token refresh:** a session crossing the 3 h expiry re-mints and stays joined. Failing-first test
       `jaas_session_survives_token_expiry` against a fake token service with a short TTL.
+      → `tests/jaas_room.rs::jaas_session_survives_token_expiry`, `src/rooms/jaas.rs`'s `SessionPump`
 - [ ] An own-tenant mode where the JWT is signed locally from a configured JaaS API key, so production use
       needs no dependency on Brave's endpoint.
+      **Deferred to its own story: needs an RS256 signing dependency** (`rsa`/`jsonwebtoken`/`ring` are all
+      absent from the workspace). The shape is accommodated — an own-tenant `JaasTokens` is a second
+      implementation of the same trait and nothing else changes. The vendor endpoints are already
+      operator-configurable (`token_service` / `conference_service`), so a JaaS front end that mints
+      guest tokens the Brave way needs no code at all.
 - [ ] Credentials (API key, private key) come from the credential seam, never a literal in a `.flux` file.
+      **There is no credential on the guest path** — Brave's endpoint is unauthenticated, which is *why*
+      the CSRF handshake exists — so no `RoomSettings` field accepts a JWT, API key or private key
+      (`tests/jaas_tokens.rs::the_jaas_backend_is_declarable_and_needs_no_credential_field`). The API key
+      and private key this item names belong to own-tenant mode and are deferred with it; when it lands it
+      inherits the existing seam (`flux_app::resolve_secrets` resolves `secret "KEY"` in a channel's
+      settings at load and registers the value with the host's `Redactor`), so this is left unticked
+      rather than claimed on a technicality.
 
 ## Progress
-- (not started — the full handshake is recorded in the design, measured 2026-07-30)
+- **2026-08-01 — landed the mechanism, blocked on two dependencies.**
+  `crates/flux-channels/src/rooms/jaas.rs` adds `JaasRoom`, the `JaasTokens` network seam
+  (`guest_token` + `conference`, scoped to a room rather than a URL, per `flux_plugin::pack::Fetcher`),
+  `GuestToken` (JWT claim decode, redacting `Debug`), and the refresh pump that re-mints ahead of the
+  expiry and re-joins underneath its consumer. Tests: `crates/flux-channels/tests/jaas_room.rs`
+  (4 integration tests against a fake token service + the in-process XMPP double — no vendor is
+  reached) plus 7 unit tests in the module.
+- **Also landed, and worth knowing:** the D-205 backend now renders an endpoint **without its query
+  string** in every error and `Debug` that names one (`xmpp::endpoint_for_display`). A guest JWT rides
+  `?token=`, so a failed connect previously would have published it into a log.
+- **2026-08-01 — the guest-token half landed** once `reqwest.workspace = true` was granted (one line
+  in `crates/flux-channels/Cargo.toml`; the workspace already pinned reqwest 0.13 and five crates
+  already depended on it). `BraveTalkTokens` (`src/rooms/jaas/tokens.rs`) implements the whole
+  handshake against the seam that was already there — the `JaasTokens` trait needed no change, which
+  is the point of having put it there. `backend = "jaas"` is now declarable.
+  - **Every request is pinned**, not merely guarded: `guard_url_scoped_pinned` +
+    `resolve_to_addrs` + `no_proxy`, redirects refused, empty pin set failing closed — the
+    `flux-web` crawler's posture, and stronger than the WebSocket path, which the guard's
+    URL-returning API cannot pin. Redirects are refused specifically because one would carry the
+    `Authorization: Bearer <jwt>` header off the vetted origin.
+  - **No response body reaches an error.** A vendor can echo our own token back at us.
+  - **Vendor assumptions are marked in the source.** Brave publishes no API for this; every shape is
+    a 2026-07-30 observation of the open-source client's traffic, so each load-bearing one carries a
+    `VENDOR ASSUMPTION` comment at the line that depends on it. One is explicitly *inferred rather
+    than measured*: the spike only saw `ready: true` from focus allocation, so `ready: false` is
+    retried on a fixed backoff instead of keyed on a response field this repo has never seen.
+  - Tests: `crates/flux-channels/tests/jaas_tokens.rs` (7) against an in-process Brave/JaaS double,
+    including one that drives the **whole** of D-206 — HTTP handshake plus D-205's MUC join — with
+    the vendor faked at both seams and nothing on the network.
+- **Known gap worth a follow-up: the runtime-minted JWT is not registered with the `Redactor`.**
+  `flux-channels` does not depend on `flux-secret` (the constraint `adapters/webhook.rs` already
+  documents), and unlike a declared secret this token is minted at runtime, so `resolve_secrets`
+  never sees it. It is held out of logs structurally — redacting `Debug`, query-trimmed endpoints, no
+  bodies in errors, `set_sensitive` on the Bearer header — but a tool that echoed it would not be
+  scrubbed. Closing it needs `flux-secret` in the manifest and a redactor threaded to the channel.
+- **2026-08-01 — rework after review.** Two findings, both real:
+  - **`leave()` could strand a freshly joined session.** The pump only watched its cancellation token
+    inside the forwarding `select!`, so a `leave` landing during a refresh returned `Ok(())` and the
+    replacement was then installed into a room already left — joined, never left, and every later
+    `join` answering "already joined". Reachable on the *ordinary* shutdown path. Fixed by pairing
+    `leave`'s cancel-then-take with a re-check under the same lock before installing, and pinned by
+    `leaving_while_a_replacement_join_is_in_flight_does_not_strand_it` (verified to fail with the
+    guard removed, reporting exactly "a session was stranded in the room — jaas: already joined")
+    plus `leaving_while_a_token_mint_is_in_flight_abandons_it`.
+  - **The refresh overlapped two sessions on one nick, which a real MUC refuses.** Under SASL
+    `ANONYMOUS` each connection is a distinct anonymous JID, so the overlap is XEP-0045 §7.2.9's
+    nickname conflict. The suite could not see it because the double had no occupancy model. The
+    double now tracks nick ownership per connection and answers `<conflict/>` for a held nick
+    (pinned by `xmpp_room.rs::a_second_session_cannot_take_a_nick_the_first_still_holds`), and the
+    refresh was reordered to mint → release → re-take. Also learned from that: the handover is not
+    atomic — the service frees the nick when it *processes* the departure, so the replacement can
+    meet its own predecessor and is retried.
+- **Minor review items, all addressed:** the outgoing session's buffered events are now drained
+  rather than dropped; `read_json` caps incrementally instead of buffering the whole body first;
+  `config.rs`'s backend doc no longer says `jaas` is undeclarable; `ready` is `Option<bool>` so a
+  missing field reports a changed response shape rather than burning the retry budget; and `jaas`
+  now **refuses** `domain`/`user`/`password`/`muc_password` instead of silently dropping a declared
+  secret.
+- **Next step:** own-tenant RS256 signing (D-223), as its own `JaasTokens` implementation.
 
 ## Notes
 - **Acceptable use is an open question and gates this story's scope.** The endpoint is public and

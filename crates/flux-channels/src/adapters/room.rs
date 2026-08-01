@@ -33,7 +33,8 @@ use flux_lang::program::ChannelDecl;
 
 use crate::config::{RoomSettings, DEFAULT_ROOM_NICK};
 use crate::rooms::{
-    MockRoom, Room, RoomIdentity, RoomSessionEnd, RoomTurnDriver, XmppConfig, XmppMucRoom,
+    BraveTalkTokens, JaasConfig, JaasRoom, MockRoom, Room, RoomIdentity, RoomSessionEnd,
+    RoomTurnDriver, XmppConfig, XmppMucRoom,
 };
 use crate::{Channel, Deliverer};
 
@@ -57,9 +58,16 @@ impl RoomChannel {
                 XmppConfig::from_settings(&settings)
                     .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", decl.name))?,
             )),
-            // `jaas` (D-206) registers here.
+            // The vendor one: Brave Talk and any 8x8 JaaS tenant (D-206). Same MUC machinery as
+            // `xmpp` underneath — all this adds is where the guest token comes from and what
+            // happens when it expires three hours later.
+            "jaas" => Arc::new(JaasRoom::new(
+                JaasConfig::from_settings(&settings)
+                    .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", decl.name))?,
+                Arc::new(BraveTalkTokens::from_settings(&settings)),
+            )),
             other => anyhow::bail!(
-                "channel `{}`: unknown room backend `{other}` (known: mock, xmpp)",
+                "channel `{}`: unknown room backend `{other}` (known: mock, xmpp, jaas)",
                 decl.name
             ),
         };

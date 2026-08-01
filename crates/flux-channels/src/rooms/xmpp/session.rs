@@ -25,7 +25,7 @@ use super::stanza::{
     parse, stanza, Element, NS_BIND, NS_CLIENT, NS_DELAY, NS_FRAMING, NS_MUC, NS_MUC_USER, NS_PING,
     NS_SASL,
 };
-use super::XmppConfig;
+use super::{endpoint_for_display, XmppConfig};
 use crate::rooms::{
     MessageScope, Occupant, OccupantId, OccupantKind, RoomEvent, RoomEventSender, RoomIdentity,
 };
@@ -99,17 +99,19 @@ pub(super) async fn connect_and_join(
     occupants: Arc<Mutex<Vec<Occupant>>>,
 ) -> Result<Joined> {
     let endpoint = guarded_endpoint(&config.url, &config.private_net)?;
+    // Never the endpoint verbatim in a message: a JaaS guest token rides its query string (D-206).
+    let shown = endpoint_for_display(&endpoint).to_string();
     let mut request = endpoint
         .as_str()
         .into_client_request()
-        .map_err(|e| Error::Other(format!("xmpp: bad endpoint {endpoint}: {e}")))?;
+        .map_err(|e| Error::Other(format!("xmpp: bad endpoint {shown}: {e}")))?;
     // RFC 7395 §3.1: the WebSocket subprotocol identifier for XMPP.
     request
         .headers_mut()
         .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("xmpp"));
     let (mut ws, _response) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| Error::Other(format!("xmpp: cannot reach {endpoint}: {e}")))?;
+        .map_err(|e| Error::Other(format!("xmpp: cannot reach {shown}: {e}")))?;
 
     let domain = config.domain_or_host();
     open_stream(&mut ws, &domain, config.handshake_timeout).await?;
@@ -168,7 +170,8 @@ fn guarded_endpoint(raw: &str, allow: &PrivateNetAllow) -> Result<String> {
         Some(("ws", _)) => ("ws", "http"),
         _ => {
             return Err(Error::Other(format!(
-                "xmpp: endpoint must be a ws:// or wss:// url, got {raw}"
+                "xmpp: endpoint must be a ws:// or wss:// url, got {}",
+                endpoint_for_display(raw)
             )))
         }
     };

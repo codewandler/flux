@@ -46,6 +46,12 @@ quick-xml = "0.41"
 # SASL PLAIN's `\0user\0password` payload, and the guarded endpoint URL.
 base64.workspace = true
 url.workspace = true
+# ── the JaaS / Brave Talk guest-token handshake (D-206) ──
+# The room backend above joins a MUC over a WebSocket; getting *permission* to join a vendor room is
+# three ordinary HTTP requests first (OPTIONS → CSRF, PUT → JWT, POST → focus). Every one of them is
+# pinned to the addresses `flux_system::net::guard_url_scoped_pinned` vetted — the same posture
+# `flux-web`'s crawler takes — so this adds a caller of the one egress guard, not a second one.
+reqwest.workspace = true
 slack-morphism = { workspace = true, optional = true }
 
 [features]

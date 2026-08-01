@@ -17,7 +17,7 @@
 //!
 //! Backends: [`MockRoom`] (in-process, here), [`XmppMucRoom`] (D-205, the portable one — a generic
 //! prosody/ejabberd/JaaS MUC over the RFC 7395 WebSocket binding, no browser and no vendor SDK) and
-//! `JaasRoom` (D-206, vendor token acquisition over the same machinery).
+//! [`JaasRoom`] (D-206, vendor guest-token acquisition and refresh over the same machinery).
 //!
 //! ## Safety
 //!
@@ -31,10 +31,16 @@
 //! Design: [`docs/designs/meeting-rooms.md`](https://github.com/codewandler/flux/blob/main/docs/designs/meeting-rooms.md).
 
 mod driver;
+mod jaas;
 mod mock;
 mod xmpp;
 
 pub use driver::{RoomSessionEnd, RoomTurnDriver};
+pub use jaas::{
+    BraveTalkTokens, Conference, GuestToken, JaasConfig, JaasRoom, JaasTokens,
+    DEFAULT_BRAVE_TOKEN_SERVICE, DEFAULT_JAAS_CONFERENCE_SERVICE, DEFAULT_JAAS_REFRESH_LEAD,
+    DEFAULT_JAAS_SIGNALLING, JAAS_REFRESH_RETRY, MIN_JAAS_REFRESH_INTERVAL,
+};
 pub use mock::MockRoom;
 pub use xmpp::{XmppConfig, XmppMucRoom, DEFAULT_XMPP_HANDSHAKE_TIMEOUT, DEFAULT_XMPP_KEEPALIVE};
 

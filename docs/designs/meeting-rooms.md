@@ -214,6 +214,71 @@ prosody/ejabberd/JaaS MUC. Decisions a D-206 implementor inherits:
 - **`OccupantKind` is `Unknown` for everyone but us and `focus`.** XMPP presence carries no
   human-or-bot signal and inventing one would be worse than admitting we cannot tell.
 
+**As landed (D-206)** — the vendor backend, `crates/flux-channels/src/rooms/jaas/`. `JaasRoom` owns
+exactly the two things that are vendor-specific — where the guest token comes from, and what happens
+when it expires — and delegates everything else to D-205's `XmppMucRoom`. Decisions a follow-up
+implementor inherits:
+
+- **`JaasTokens` is the network boundary**, the same shape `flux_plugin::pack::Fetcher` uses and for
+  the same reason: two operations scoped to `(room, token)` rather than to a caller-supplied URL, so
+  the own-room posture holds *structurally* — there is no shape of the trait that enumerates rooms —
+  and so `crates/flux-channels/tests/jaas_room.rs` never reaches Brave or 8x8.
+- **The refresh re-joins rather than re-authenticating in place, and it closes before it opens.** The
+  token rides the WebSocket URL, so a fresh token means a fresh socket. The tempting order — open the
+  replacement first, swap under it, then close the old — **a real MUC refuses**: SASL is `ANONYMOUS`,
+  so every connection is a *different* anonymous JID, and two overlapping sessions asking for one
+  nick is XEP-0045 §7.2.9's nickname conflict, answered `<conflict/>`. So the order is mint (pure
+  HTTP, touching neither the MUC nor the nick) → release the old session → take the nick back. Three
+  consequences, none hidden: `say` fails with "not joined" during the gap rather than writing to a
+  socket on its way out; a replacement join that keeps failing ends the room with `Ended`, because
+  once the nick is released there is nothing to fall back on; and the handover is not atomic, so the
+  replacement can meet its own predecessor and is retried. Transparency for the consumer comes from
+  suppressing the replacement's replayed `Joined` events and from the deliberate `leave` emitting no
+  `Ended`. Known gap: an occupant who leaves *between* sessions produces no `Left` (they are simply
+  absent from `Room::occupants`, which reads the live session).
+- **Leaving and refreshing race, and the pairing that settles it is explicit.** `JaasRoom::leave`
+  cancels the pump's token and *then* takes the session out; the pump re-checks that token while
+  holding the same lock before installing a replacement. Without that pairing a `leave` landing
+  mid-refresh returns `Ok(())` while the replacement is installed behind it — joined, never left, and
+  every later `join` answering "already joined", i.e. the room permanently un-rejoinable. That is the
+  ordinary shutdown path (`RoomTurnDriver` breaks on cancellation, then leaves), and it is pinned by
+  `tests/jaas_room.rs::leaving_while_a_replacement_join_is_in_flight_does_not_strand_it`.
+- **The outgoing session's buffered events are drained before its stream is dropped**, so a refresh
+  does not silently discard up to `DEFAULT_ROOM_EVENT_BUFFER` events — human messages among them —
+  with no replay path (the replacement's MUC history arrives `<delay/>`-marked and is dropped).
+- **A guest JWT is a secret that rides a query string.** `GuestToken`'s `Debug` redacts it, and the
+  D-205 backend now renders an endpoint *without its query* in every error and `Debug` that names one
+  (`xmpp::endpoint_for_display`) — a failed connect would otherwise publish the token to a log.
+- **`BraveTalkTokens` is the vendor implementation** (`jaas/tokens.rs`), and every request it makes
+  is **pinned** to the addresses `guard_url_scoped_pinned` vetted — `resolve_to_addrs` + `no_proxy`,
+  redirects refused outright, an empty pin set failing closed. That is a stronger posture than the
+  WebSocket path above, which the guard's URL-returning API cannot pin; it mirrors `flux-web`'s
+  crawler rather than inventing anything. Redirects are refused specifically because one would carry
+  the `Authorization: Bearer <jwt>` header off the vetted origin.
+- **No vendor response body ever reaches an error message.** A failing response can echo our own
+  token or CSRF value back at us, so failures name the step, the status and the query-trimmed URL.
+- **Every unpublished vendor assumption is marked `VENDOR ASSUMPTION` at the line that depends on
+  it.** Brave publishes no API for this; the shapes were derived from the open-source client and
+  confirmed live once, on 2026-07-30. The markers exist so a future breakage is diagnosable as *the
+  vendor moved* rather than *our code is wrong*. One of them is explicitly **inferred rather than
+  measured**: the spike only ever saw `ready: true` from focus allocation, so `ready: false` is
+  retried on a fixed backoff rather than keyed on a response field this repo has never observed.
+- **Own-tenant signing is still deferred** and is the one Acceptance item left: it needs an RS256
+  signer this workspace does not carry (`rsa`/`jsonwebtoken`/`ring` are all absent). It is a
+  *second* implementation of `JaasTokens` and changes nothing else — which is what the seam is for.
+- **The guest path carries no credential at all**, which is why `RoomSettings` has no JWT, API-key or
+  private-key field for it: the CSRF handshake exists precisely *because* the endpoint is
+  unauthenticated. When own-tenant signing lands it inherits the credential seam every other channel
+  setting already uses — `flux_app::resolve_secrets` resolves `secret "KEY"` at load and registers
+  the value with the host's `Redactor`.
+- **Known gap: the runtime-minted JWT is not registered with the `Redactor`.** `flux-channels` does
+  not depend on `flux-secret` (the same constraint `adapters/webhook.rs` documents), and unlike a
+  declared secret this token is minted at *runtime*, so `resolve_secrets` never sees it. It is held
+  out of logs structurally instead — redacting `Debug`, query-trimmed endpoints, no response bodies
+  in errors, `HeaderValue::set_sensitive` on the Bearer — but a tool that echoed it would not be
+  scrubbed. Closing this needs `flux-secret` in the manifest and a redactor handed down to the
+  channel.
+
 **The L3 turn seam changed with it (breaking):** `VoiceTurnHandler::turn` is now
 `turn(&self, speaker: &Speaker, user_text: &str)`. `flux_flow::voice::Speaker` is a surface-owned id
 plus an optional display name; a 1:1 surface passes `Speaker::sole()`, which is how a phone line's
@@ -293,8 +358,17 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
    RFC 7395 traps are regressed on the raw bytes:
    `every_stanza_the_xmpp_backend_emits_is_jabber_client_qualified` and
    `the_xmpp_keepalive_is_a_ping_iq_and_never_whitespace`.
-7. **Token refresh is transparent.** A session crossing the 3 h guest-token expiry re-mints and stays
-   joined.
+7. **Token refresh is transparent.** ✅ **Met (D-206), and the double it rests on now models the case
+   that would have made it false.** `crates/flux-channels/tests/jaas_room.rs::jaas_session_survives_token_expiry`
+   drives a 3-second TTL against a fake token service and the in-process XMPP double, asserting the
+   re-join carried a *different* token, that a message said afterwards still lands, and that the
+   consumer saw neither `Ended` nor a duplicate `Joined`. The claim is only worth as much as the
+   double: an earlier version had no occupancy model, answered every MUC presence identically, and so
+   would have passed a refresh that overlapped its sessions — which a real service refuses with
+   `<conflict/>` (XEP-0045 §7.2.9), leaving the session dead against the vendor while the suite
+   stayed green. The double now tracks nick ownership per connection and refuses a held nick;
+   `tests/xmpp_room.rs::a_second_session_cannot_take_a_nick_the_first_still_holds` pins that arm so
+   it cannot rot back into a permissive one.
 8. **Published media carries signal.** A published track whose source is silence is reported as a failure,
    not as success — asserted with a level probe, because the spike watched the bridge elect a silent bot
    dominant speaker.

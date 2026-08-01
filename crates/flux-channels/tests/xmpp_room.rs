@@ -41,6 +41,35 @@ fn config_for(double: &XmppDouble) -> XmppConfig {
 }
 
 #[tokio::test]
+async fn a_second_session_cannot_take_a_nick_the_first_still_holds() {
+    // XEP-0045 §7.2.9. Under SASL `ANONYMOUS` every connection is a *different* anonymous JID, so
+    // an overlapping session asking for the same nick is a conflict, not a reconnect — the service
+    // refuses the join. D-206's token refresh has to release the nick before it can take it back,
+    // and this is the test that makes the double's occupancy model load-bearing rather than
+    // decorative: without the conflict arm, a backend that overlaps its sessions passes here and
+    // fails against the vendor.
+    let double = XmppDouble::start().await;
+
+    let first = XmppMucRoom::new(config_for(&double));
+    let _held = first.join(&RoomIdentity::agent("flux")).await.unwrap();
+
+    let second = XmppMucRoom::new(config_for(&double));
+    let refused = match second.join(&RoomIdentity::agent("flux")).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the MUC admitted two sessions under one nick"),
+    };
+    assert!(refused.contains("conflict"), "{refused}");
+
+    // Once the holder leaves, the nick is free and the same join succeeds.
+    first.leave().await.unwrap();
+    let mut taken = second
+        .join(&RoomIdentity::agent("flux"))
+        .await
+        .expect("the nick is released when its holder leaves");
+    assert!(matches!(taken.recv().await, Some(RoomEvent::Joined { .. })));
+}
+
+#[tokio::test]
 async fn xmpp_room_joins_and_exchanges_text() {
     let double = XmppDouble::start().await;
     let room = XmppMucRoom::new(config_for(&double));

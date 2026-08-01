@@ -46,6 +46,15 @@ use super::{Occupant, OccupantId, Room, RoomId, RoomIdentity, RoomStream};
 use crate::rooms::room_event_channel;
 use stanza::{stanza, Element, NS_CLIENT};
 
+/// An endpoint as it may be shown to a human: **without its query string**.
+///
+/// A JaaS guest token rides the endpoint's `?token=` (D-206), so an error, a log line or a `Debug`
+/// rendering that quotes the endpoint verbatim publishes a secret. Everything a reader needs in
+/// order to act on it — scheme, host, port, path — survives the trim.
+pub(crate) fn endpoint_for_display(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
 /// How long any one handshake step waits before the join is declared failed.
 pub const DEFAULT_XMPP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often the XMPP ping IQ goes out. Comfortably inside the 60-90 s idle timeout a reverse proxy
@@ -148,7 +157,8 @@ impl fmt::Debug for XmppConfig {
     /// reaches either is a secret that reaches the model.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("XmppConfig")
-            .field("url", &self.url)
+            // Query-trimmed: a JaaS endpoint carries the guest token in `?token=` (D-206).
+            .field("url", &endpoint_for_display(&self.url))
             .field("room", &self.room)
             .field("domain", &self.domain)
             .field("user", &self.user)

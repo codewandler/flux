@@ -5,4 +5,5 @@
 //! includer — `dead_code` is silenced here rather than per-binary.
 #![allow(dead_code)]
 
+pub mod jaas_double;
 pub mod xmpp_double;
