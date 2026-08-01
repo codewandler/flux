@@ -39,16 +39,81 @@ use crate::{FlowError, Result};
 /// `limits.max_depth`; the point is that the process returns a bounded error rather than `SIGABRT`.
 pub const DEFAULT_MAX_COMPOSITE_DEPTH: u64 = 8;
 
-/// L-82: the default per-execution loop-iteration budget. `execute_flow`/`execute_plan` re-enforce
-/// none of the analyzer's caps, so a hot `loop` (`for_ms:600000` with `every_ms:0`) would spin,
-/// growing the value store / event log / transcript without bound until `for_ms` or OOM. A `loop`
-/// exceeding this many iterations fails with a clear error; an explicit `budget` scope can still
-/// bound work more tightly.
+/// L-82: the default loop-iteration budget, and the interpreter's own floor.
+/// `execute_flow`/`execute_plan` re-enforce none of the analyzer's caps — an AST that skipped
+/// `lower()` arrives carrying whatever bound it likes — so without this a hot `loop`
+/// (`for_ms:600000` with `every_ms:0`) or a wire-supplied `repeat max: 4294967295` would spin,
+/// growing the value store / event log / transcript without bound until `for_ms` or OOM.
+///
+/// **Scope is per flow execution, not per loop node** (L-116, review F4). Exactly one
+/// [`LoopBudget`] is created per `execute_flow`/`execute_plan` call and threaded through
+/// `exec_body`; `repeat`, `each` and `loop` all charge that one counter at every nesting depth, and
+/// `parallel`/`race` branches share the same handle. Before L-116 the counter was function-local,
+/// so the budget was really per *node activation* and nested loops multiplied past it —
+/// `repeat 400 { repeat 300 { … } }` ran 120,000 rounds under a budget documented as 100,000.
+///
+/// **Inside flux-lang**, the one boundary that starts a fresh counter is a **composite op call**:
+/// it is its own flow execution, with its own frame store, transcript and step count, and its
+/// nesting is bounded independently by [`DEFAULT_MAX_COMPOSITE_DEPTH`]. Above this crate an *op*
+/// dispatched from a flow body can re-enter the interpreter the same way, and so also starts a
+/// fresh counter — `task` (`flux-orchestrate/src/lib.rs`, used by `examples/strict_review.flux`),
+/// the `flux app` journey spawn (`flux-app/src/app.rs`, bounded by its own `MAX_SPAWN_DEPTH`), and
+/// `flow_run` (`flux-tools/src/flows.rs`). Each is the same multiplication shape as the composite
+/// boundary and is bounded the same way: the *outer* execution still charges its own budget for
+/// every iteration that dispatches one of them, so the nesting cannot run away — but this budget
+/// alone is not a whole-process ceiling, and should not be read as one.
+///
+/// Cost of exceeding it: the flow fails with a bounded error naming the construct that charged the
+/// last iteration. Nothing is killed mid-dispatch and the audit trail is intact; an explicit
+/// `budget` scope can still cap dispatches more tightly. The analyzer's per-node `MAX_REPEAT_BOUND`
+/// is derived from this value so the static ceiling can never drift above the runtime one.
 pub const DEFAULT_MAX_LOOP_ITERATIONS: u64 = 100_000;
+
+/// The per-flow-execution loop-iteration counter behind [`DEFAULT_MAX_LOOP_ITERATIONS`] (L-116).
+///
+/// A cheap shared handle rather than a `&mut` counter, because `parallel` and `race` branches run
+/// concurrently and so cannot share a mutable borrow: with a handle they charge the *same* budget
+/// as their siblings instead of each being handed a private one.
+#[derive(Clone, Debug, Default)]
+struct LoopBudget(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl LoopBudget {
+    /// Charge one iteration of `construct` (`repeat` / `each` / `loop`) against this execution's
+    /// shared budget, failing the flow once the running total crosses
+    /// [`DEFAULT_MAX_LOOP_ITERATIONS`].
+    fn charge(&self, construct: &str) -> Result<()> {
+        let spent = self
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if spent > DEFAULT_MAX_LOOP_ITERATIONS {
+            return Err(FlowError::Runtime(format!(
+                "`{construct}` exceeded the default execution budget of \
+                 {DEFAULT_MAX_LOOP_ITERATIONS} loop iterations — one budget is shared by every \
+                 `repeat`/`each`/`loop` in this flow, so nested loops multiply against it; add an \
+                 `until` guard, lower the `max`, or set a tighter `budget`"
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// L-82: the default per-execution `each` fan-out budget — an `each` over an attacker-sized source
 /// (millions of elements) is rejected up front rather than materialising a value per element.
+///
+/// This is a *fan-out size* check, made before any element runs; the per-element charge against
+/// [`DEFAULT_MAX_LOOP_ITERATIONS`] is what actually bounds the iteration. The two must therefore
+/// stay ordered, and the assert below is what keeps them so.
 pub const DEFAULT_MAX_EACH_ITEMS: u64 = 100_000;
+
+// Checked at compile time so the two ceilings can never drift into an order where an `each` source
+// the up-front check ACCEPTS is one the per-element charge then rejects — which would fail the flow
+// mid-iteration, after an arbitrary prefix of the body's side effects had already happened, rather
+// than refusing the whole `each` up front. Today they are equal, which is the tightest legal
+// ordering: one full-size `each` fits a fresh execution exactly, with nothing to spare. Lowering
+// the loop budget without lowering this is the drift this catches. (L-116; same shape as
+// `cst_decode.rs`'s `MAX_LOWER_DEPTH` / `MAX_PARSE_DEPTH` assert.)
+const _: () = assert!(DEFAULT_MAX_EACH_ITEMS <= DEFAULT_MAX_LOOP_ITERATIONS);
 
 /// L-82: the transcript is fed back to the model each round; an unbounded `loop`/`each` would grow it
 /// without limit. Kept as a ring buffer — the oldest entries are dropped once it exceeds twice this
@@ -1177,6 +1242,9 @@ async fn run_top_level(
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
+    // L-116: ONE loop-iteration budget for this whole flow execution — cloned into every
+    // nested body so `repeat`/`each`/`loop` share it instead of each getting a fresh one.
+    let budget = LoopBudget::default();
     let mut transcript: Vec<String> = Vec::new();
     let mut last = String::new();
     let mut i = start;
@@ -1269,6 +1337,7 @@ async fn run_top_level(
             sink,
             &mut steps,
             &mut transcript,
+            budget.clone(),
         )
         .await?;
         // A `return` exits the flow immediately. An explicit `return <expr>` yields that
@@ -1344,6 +1413,9 @@ async fn run_top_level_resumable(
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
+    // L-116: ONE loop-iteration budget for this whole flow execution — cloned into every
+    // nested body so `repeat`/`each`/`loop` share it instead of each getting a fresh one.
+    let budget = LoopBudget::default();
     let mut transcript: Vec<String> = Vec::new();
     let mut last = String::new();
 
@@ -1538,6 +1610,7 @@ async fn run_top_level_resumable(
             sink,
             &mut steps,
             &mut transcript,
+            budget.clone(),
         )
         .await
         {
@@ -1661,6 +1734,9 @@ pub async fn execute_plan(
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
+    // L-116: ONE loop-iteration budget for this whole flow execution — cloned into every
+    // nested body so `repeat`/`each`/`loop` share it instead of each getting a fresh one.
+    let budget = LoopBudget::default();
     let mut transcript: Vec<String> = Vec::new();
     let mut last = String::new();
     let mut returned: Option<ValueId> = None;
@@ -1683,6 +1759,7 @@ pub async fn execute_plan(
                     sink,
                     &mut steps,
                     &mut transcript,
+                    budget.clone(),
                 )
                 .await?;
                 last = text;
@@ -1692,22 +1769,28 @@ pub async fn execute_plan(
                 }
             }
             Stage::Parallel(ids) => {
-                let futs = ids.iter().map(|id| async move {
-                    let node = node_at(id)?;
-                    let mut buf = BufferSink::default();
-                    let mut s = 0usize;
-                    let mut tr: Vec<String> = Vec::new();
-                    let (text, _lv, step) = exec_body(
-                        store,
-                        executor,
-                        session_id,
-                        std::slice::from_ref(node),
-                        &mut buf,
-                        &mut s,
-                        &mut tr,
-                    )
-                    .await?;
-                    Ok::<_, FlowError>((buf, s, tr, text, step))
+                let futs = ids.iter().map(|id| {
+                    // L-116: each concurrent stage gets a HANDLE to the one execution budget, not a
+                    // private counter, so parallel stages cannot multiply past it.
+                    let budget = budget.clone();
+                    async move {
+                        let node = node_at(id)?;
+                        let mut buf = BufferSink::default();
+                        let mut s = 0usize;
+                        let mut tr: Vec<String> = Vec::new();
+                        let (text, _lv, step) = exec_body(
+                            store,
+                            executor,
+                            session_id,
+                            std::slice::from_ref(node),
+                            &mut buf,
+                            &mut s,
+                            &mut tr,
+                            budget.clone(),
+                        )
+                        .await?;
+                        Ok::<_, FlowError>((buf, s, tr, text, step))
+                    }
                 });
                 let results = futures::future::try_join_all(futs).await?;
                 for (buf, s, tr, text, step) in results {
@@ -1760,6 +1843,14 @@ pub async fn execute_plan(
 
 /// Execute a sequence of nodes, returning the last produced text and whether a `return` unwound the
 /// flow. Boxed because `when`/`repeat` recurse into nested bodies (async recursion needs indirection).
+///
+/// `budget` is the flow execution's ONE loop-iteration counter (L-116) — cloned, not forked, into
+/// every nested body so `repeat`/`each`/`loop` at any depth charge the same
+/// [`DEFAULT_MAX_LOOP_ITERATIONS`].
+// One recursion seam, and every argument is a distinct piece of execution-scoped state that a
+// nested body must see (store/host/session, the body, the sink, the step count, the transcript, the
+// loop budget). Bundling them into a context struct would only rename the same eight.
+#[allow(clippy::too_many_arguments)]
 fn exec_body<'a>(
     store: &'a dyn ValueStore,
     executor: &'a dyn OpHost,
@@ -1768,6 +1859,7 @@ fn exec_body<'a>(
     sink: &'a mut dyn FlowSink,
     steps: &'a mut usize,
     transcript: &'a mut Vec<String>,
+    budget: LoopBudget,
 ) -> BodyFuture<'a> {
     Box::pin(async move {
         let mut last = String::new();
@@ -1942,6 +2034,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -1961,6 +2054,11 @@ fn exec_body<'a>(
                 } => {
                     let mut repeat_collected: Vec<ValueId> = Vec::new();
                     for round in 0..*max {
+                        // L-116: `repeat` carries the same three protections as `loop` — the
+                        // analyzer's `MAX_REPEAT_BOUND` is not a runtime guarantee, and an AST that
+                        // reached `execute_flow` without `lower()` (an SDK caller's own `DraftAst`,
+                        // a `flux app` journey, `session fork --edit`) can carry `max: u32::MAX`.
+                        budget.charge("repeat")?;
                         // Otherwise-discarded round counter (A-39): 1-based, live-only.
                         trace_structural(
                             sink,
@@ -1975,6 +2073,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -1989,6 +2088,13 @@ fn exec_body<'a>(
                         if let Step::Return(v) = step {
                             return Ok((last, v.clone(), Step::Return(v)));
                         }
+                        // L-116: bound the model-facing transcript so a long `repeat` can't grow it
+                        // without limit, and yield cooperatively — a pure body (binds only) reaches
+                        // no other `.await`, so without this an enclosing `timeout` could never
+                        // fire. A timeout that cannot interrupt is worse than none: callers rely on
+                        // it to bound the work.
+                        cap_transcript(transcript);
+                        tokio::task::yield_now().await;
                         // `until` is a *stop-when-true* guard, evaluated after each iteration.
                         if let Some(u) = until {
                             if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps)
@@ -2052,6 +2158,10 @@ fn exec_body<'a>(
                     let saved_item_meta = store.binding(session_id, item)?;
                     let mut collected: Vec<ValueId> = Vec::new();
                     for elem in &elems {
+                        // L-116: the up-front check above bounds ONE `each`'s fan-out; this charges
+                        // the flow execution's shared budget so nested `each`es cannot multiply
+                        // (100k × 100k) past `DEFAULT_MAX_LOOP_ITERATIONS`.
+                        budget.charge("each")?;
                         let vid = store.put_value(session_id, &Value::from_json(elem))?;
                         bind_existing(store, session_id, item, &vid)?;
                         let (blast, bvid, step) = exec_body(
@@ -2062,6 +2172,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -2192,6 +2303,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2280,23 +2392,30 @@ fn exec_body<'a>(
                     // borrow `sink`, so each branch's own `BufferSink` carries the parent's opt-in
                     // forward instead of defaulting to untraced.
                     let trace = sink.trace_structural();
-                    let futs = branches.iter().map(|b| async move {
-                        let mut buf = BufferSink {
-                            trace,
-                            ..Default::default()
-                        };
-                        trace_structural(
-                            &mut buf,
-                            "loop.node",
-                            serde_json::json!({"node": "parallel.branch", "name": b.name.0.clone()}),
-                        );
-                        let mut s = 0usize;
-                        let mut tr: Vec<String> = Vec::new();
-                        let res = exec_body(
-                            store, executor, session_id, &b.body, &mut buf, &mut s, &mut tr,
-                        )
-                        .await;
-                        (b, buf, s, tr, res)
+                    let futs = branches.iter().map(|b| {
+                        // L-116: a HANDLE to the one execution budget per branch (`steps`/transcript
+                        // are forked and merged, the budget is shared), so N concurrent branches
+                        // cannot each spend a private `DEFAULT_MAX_LOOP_ITERATIONS`.
+                        let budget = budget.clone();
+                        async move {
+                            let mut buf = BufferSink {
+                                trace,
+                                ..Default::default()
+                            };
+                            trace_structural(
+                                &mut buf,
+                                "loop.node",
+                                serde_json::json!({"node": "parallel.branch", "name": b.name.0.clone()}),
+                            );
+                            let mut s = 0usize;
+                            let mut tr: Vec<String> = Vec::new();
+                            let res = exec_body(
+                                store, executor, session_id, &b.body, &mut buf, &mut s, &mut tr,
+                                budget,
+                            )
+                            .await;
+                            (b, buf, s, tr, res)
+                        }
                     });
                     let results = futures::future::join_all(futs).await;
                     let mut first_err: Option<FlowError> = None;
@@ -2360,6 +2479,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await
                         {
@@ -2410,6 +2530,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await
                     {
@@ -2436,6 +2557,7 @@ fn exec_body<'a>(
                                 &mut *sink,
                                 &mut *steps,
                                 &mut *transcript,
+                                budget.clone(),
                             )
                             .await?;
                             if !hblast.is_empty() {
@@ -2468,6 +2590,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2488,24 +2611,18 @@ fn exec_body<'a>(
                     let deadline =
                         std::time::Instant::now() + std::time::Duration::from_millis(*for_ms);
                     let mut last_vid: Option<ValueId> = None;
-                    // L-82: a default per-execution iteration budget enforced HERE at the interpreter
-                    // boundary (not only in the analyzer). A hot `loop` (`every_ms:0`) never sleeps
-                    // and its pure-bind body never bumps `steps`, so without this it would spin to
-                    // `for_ms`, growing the store / event log / transcript unbounded. An explicit
-                    // `budget` scope can still cap dispatches more tightly.
-                    let mut iters: u64 = 0;
+                    // L-82: a default iteration budget enforced HERE at the interpreter boundary
+                    // (not only in the analyzer). A hot `loop` (`every_ms:0`) never sleeps and its
+                    // pure-bind body never bumps `steps`, so without this it would spin to `for_ms`,
+                    // growing the store / event log / transcript unbounded. An explicit `budget`
+                    // scope can still cap dispatches more tightly. L-116: the counter is the flow
+                    // execution's shared `budget`, not a local one, so a `loop` nested inside
+                    // another loop can no longer multiply past `DEFAULT_MAX_LOOP_ITERATIONS`.
                     loop {
                         if std::time::Instant::now() >= deadline {
                             break;
                         }
-                        iters += 1;
-                        if iters > DEFAULT_MAX_LOOP_ITERATIONS {
-                            return Err(FlowError::Runtime(format!(
-                                "`loop` exceeded the default execution budget of \
-                                 {DEFAULT_MAX_LOOP_ITERATIONS} iterations — add an `until` guard, an \
-                                 `every_ms` interval, or a tighter `budget`"
-                            )));
-                        }
+                        budget.charge("loop")?;
                         match exec_body(
                             store,
                             executor,
@@ -2514,6 +2631,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await
                         {
@@ -2590,12 +2708,20 @@ fn exec_body<'a>(
                             .iter()
                             .zip(states.iter_mut())
                             .enumerate()
-                            .map(|(idx, (b, (buf, s, tr)))| async move {
-                                (
-                                    idx,
-                                    exec_body(store, executor, session_id, &b.body, buf, s, tr)
+                            .map(|(idx, (b, (buf, s, tr)))| {
+                                // L-116: racing branches share the one execution budget (see the
+                                // `parallel` arm) rather than each getting a private counter.
+                                let budget = budget.clone();
+                                async move {
+                                    (
+                                        idx,
+                                        exec_body(
+                                            store, executor, session_id, &b.body, buf, s, tr,
+                                            budget,
+                                        )
                                         .await,
-                                )
+                                    )
+                                }
                             })
                             .collect();
                         let remaining = std::time::Duration::from_millis(*timeout_ms);
@@ -2691,6 +2817,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await?;
                         let dispatched = (*steps).saturating_sub(start);
@@ -2745,9 +2872,17 @@ fn exec_body<'a>(
                         ));
                         continue;
                     }
-                    let (blast, bvid, step) =
-                        exec_body(store, executor, session_id, dbody, sink, steps, transcript)
-                            .await?;
+                    let (blast, bvid, step) = exec_body(
+                        store,
+                        executor,
+                        session_id,
+                        dbody,
+                        sink,
+                        steps,
+                        transcript,
+                        budget.clone(),
+                    )
+                    .await?;
                     if !blast.is_empty() {
                         last = blast;
                     }
@@ -2775,6 +2910,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -2880,6 +3016,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2937,6 +3074,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2962,6 +3100,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await
                         {
@@ -3027,6 +3166,7 @@ fn exec_body<'a>(
                             &mut buf,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await
                         .map(|(text, lv, step)| (text, lv, step, buf))
@@ -3076,6 +3216,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -3112,6 +3253,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await;
                     executor.pop_cap_scope().await;
@@ -3145,6 +3287,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await?;
                         if let Step::Return(v) = astep {
@@ -3163,6 +3306,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await;
                     // Guaranteed cleanup: `finally` always runs — on success, `return`, or error.
@@ -3174,6 +3318,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await;
                     match body_res {
@@ -3208,6 +3353,7 @@ fn exec_body<'a>(
                             &mut *sink,
                             &mut *steps,
                             &mut *transcript,
+                            budget.clone(),
                         )
                         .await
                         {
@@ -3243,6 +3389,7 @@ fn exec_body<'a>(
                                 &mut *sink,
                                 &mut *steps,
                                 &mut *transcript,
+                                budget.clone(),
                             )
                             .await
                             {
@@ -3291,6 +3438,7 @@ fn exec_body<'a>(
                         &mut *sink,
                         &mut *steps,
                         &mut *transcript,
+                        budget.clone(),
                     )
                     .await?;
                     if let (Some(name), Some(vid)) = (bind, &bvid) {
@@ -8682,6 +8830,198 @@ mod tests {
         assert!(
             err.to_string().contains("execution budget"),
             "an oversized each must be rejected, got: {err}"
+        );
+    }
+
+    /// A pure-bodied `repeat` of `max` rounds, built as an AST — never through `parse`/`lower`,
+    /// because `lower()` is exactly what rejects an implausible `max`, and the threat these tests
+    /// pin is a `DraftAst` that reached `execute_flow` without it (an SDK `execute` door, a
+    /// `flux app` journey, `session fork --edit`).
+    fn unlowered_repeat(max: u32, body: Vec<Node>) -> Node {
+        Node::Repeat {
+            max,
+            until: None,
+            body,
+            collect: None,
+        }
+    }
+
+    /// L-116 (failing-first): `repeat` had NONE of the three protections the `loop` arm carries, so
+    /// an un-lowered `max` above the analyzer's bound spun unchecked (`max: u32::MAX` ≈ 4.3e9
+    /// rounds). It must now hit the same interpreter-side budget `loop` does. Kept just one round
+    /// over the budget so the *pre-fix* run terminates quickly instead of proving the point by
+    /// hanging.
+    #[tokio::test]
+    async fn repeat_over_budget_terminates_under_default_budget() {
+        let host = CfHost::new();
+        let body = vec![unlowered_repeat(
+            DEFAULT_MAX_LOOP_ITERATIONS as u32 + 1,
+            vec![flow_bind("x", flow_lit(json!("y")))],
+        )];
+        // Destructured rather than `unwrap_err()`: on regression the `Ok` carries the whole
+        // multi-megabyte transcript, and a panic that dumps it buries its own reason.
+        let Err(err) = run(&host, body).await else {
+            panic!("an over-budget `repeat` ran to completion instead of hitting the budget");
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "an over-budget repeat must hit the default budget, got: {err}"
+        );
+    }
+
+    /// L-116 (failing-first): the sharper half — a pure `repeat` body reaches no `.await`, so
+    /// before the `yield_now` an enclosing `tokio::time::timeout` could never be polled and simply
+    /// did not fire. A timeout that cannot interrupt is worse than no timeout, because callers rely
+    /// on it. `max` stays *under* the iteration budget so this pins the YIELD POINT, not the
+    /// budget; the pre-fix run still terminates (it just runs to completion and returns `Ok`).
+    #[tokio::test]
+    async fn a_timeout_interrupts_a_pure_bodied_repeat() {
+        let host = CfHost::new();
+        let body = vec![Node::Timeout {
+            ms: 1,
+            body: vec![unlowered_repeat(
+                90_000,
+                vec![flow_bind("x", flow_lit(json!("y")))],
+            )],
+            bind: None,
+        }];
+        let Err(err) = run(&host, body).await else {
+            panic!(
+                "the enclosing `timeout` never fired: a pure `repeat` body has no yield point, so \
+                 the deadline can never be observed"
+            );
+        };
+        assert!(
+            err.to_string().contains("`timeout` exceeded"),
+            "expected the enclosing timeout to fire, got: {err}"
+        );
+    }
+
+    /// L-116 (failing-first): `cap_transcript` applies on the `repeat` path too. The transcript is
+    /// fed back to the model each round, so a long `repeat` must leave it a bounded ring rather
+    /// than one entry per round.
+    #[tokio::test]
+    async fn a_long_repeat_keeps_the_transcript_a_bounded_ring() {
+        let host = CfHost::new();
+        let rounds = MAX_TRANSCRIPT_ENTRIES * 2 + 5_000;
+        let body = vec![unlowered_repeat(
+            rounds as u32,
+            vec![flow_bind("x", flow_lit(json!("y")))],
+        )];
+        let out = run(&host, body).await.unwrap();
+        let entries = out.transcript.matches("[$x = ").count();
+        assert!(
+            entries <= MAX_TRANSCRIPT_ENTRIES * 2,
+            "the repeat transcript must stay a bounded ring, got {entries} entries for {rounds} \
+             rounds"
+        );
+    }
+
+    /// L-116: pins the DECIDED budget scope — **per flow execution**, not per node activation. One
+    /// counter is shared by every `repeat`/`each`/`loop` at every depth, so 400 × 300 nested rounds
+    /// exceed a 100,000 budget instead of multiplying past it under a per-activation counter (each
+    /// of which would see only 400, then 300).
+    #[tokio::test]
+    async fn nested_loops_share_one_per_execution_budget() {
+        let host = CfHost::new();
+        let inner = unlowered_repeat(300, vec![flow_bind("x", flow_lit(json!("y")))]);
+        let body = vec![unlowered_repeat(400, vec![inner])];
+        let Err(err) = run(&host, body).await else {
+            panic!(
+                "400 x 300 nested rounds completed: the budget is still per node activation, so \
+                 each loop saw only its own count and they multiplied past it"
+            );
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "nested repeats must share one execution budget, got: {err}"
+        );
+    }
+
+    /// Half the budget plus a slice — two of these fit *individually* under
+    /// `DEFAULT_MAX_LOOP_ITERATIONS` and exceed it only when they charge the SAME counter. That is
+    /// what makes the three concurrency-seam tests below observable: fork the budget per branch and
+    /// every one of them goes green again.
+    fn over_half_the_budget() -> Node {
+        unlowered_repeat(60_000, vec![flow_bind("x", flow_lit(json!("y")))])
+    }
+
+    /// L-116: the concurrency seam is the whole reason the budget is a shared handle and not a
+    /// `&mut` counter — concurrent branches cannot share a mutable borrow, so a `&mut` design has
+    /// to hand each branch its own, which reinstates one level up exactly the multiplication this
+    /// story closes. Nothing else in the tree combines a loop with `parallel`, so without this test
+    /// the deviation is unobservable: `budget.clone()` could become `LoopBudget::default()` in the
+    /// `parallel` arm and no test would notice (AGENTS.md's "correct wiring whose removal changes
+    /// nothing").
+    #[tokio::test]
+    async fn parallel_branches_charge_one_shared_budget() {
+        let host = CfHost::new();
+        let branch = |name: &str| crate::ast::Branch {
+            name: SymbolName(name.into()),
+            body: vec![over_half_the_budget()],
+        };
+        let body = vec![Node::Parallel {
+            branches: vec![branch("a"), branch("b")],
+        }];
+        let Err(err) = run(&host, body).await else {
+            panic!(
+                "2 x 60,000 concurrent rounds completed: each `parallel` branch was handed a \
+                 private budget, so together they spent 120,000 against a 100,000 ceiling"
+            );
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "parallel branches must charge one shared budget, got: {err}"
+        );
+    }
+
+    /// L-116: the same pin for the `race` arm's branch futures — a second `budget.clone()` site
+    /// that a per-branch fork would silently un-share. `race` joins every branch's failure into one
+    /// message, so the budget error surfaces through the join.
+    #[tokio::test]
+    async fn race_branches_charge_one_shared_budget() {
+        let host = CfHost::new();
+        let branch = |name: &str| crate::ast::Branch {
+            name: SymbolName(name.into()),
+            body: vec![over_half_the_budget()],
+        };
+        let body = vec![Node::Race {
+            timeout_ms: 60_000,
+            bind: None,
+            branches: vec![branch("a"), branch("b")],
+        }];
+        let Err(err) = run(&host, body).await else {
+            panic!(
+                "a `race` branch finished 60,000 rounds: the branches were handed private budgets, \
+                 so neither ever saw the 100,000 ceiling they jointly crossed"
+            );
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "race branches must charge one shared budget, got: {err}"
+        );
+    }
+
+    /// L-116: and the third `budget.clone()` site — `execute_plan`'s parallel *stage*, which is a
+    /// separate entry point from `execute_flow` and forks its own `steps`/transcript per stage.
+    #[tokio::test]
+    async fn parallel_plan_stages_charge_one_shared_budget() {
+        let host = CfHost::new();
+        let body = vec![over_half_the_budget(), over_half_the_budget()];
+        let plan = PhysicalPlan {
+            stages: vec![Stage::Parallel(vec![NodeId(0), NodeId(1)])],
+        };
+        let store = MemStore::new();
+        let mut sink = BufferSink::default();
+        let Err(err) = execute_plan(&store, &host, "s", &body, &plan, &mut sink).await else {
+            panic!(
+                "2 x 60,000 rounds completed across one parallel stage: each stage node was handed \
+                 a private budget instead of a handle to the execution's"
+            );
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "parallel plan stages must charge one shared budget, got: {err}"
         );
     }
 
