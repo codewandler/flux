@@ -17,6 +17,9 @@ pub struct PluginHost {
     system: flux_system::System,
     argv: Vec<String>,
     verified_spawn: Option<(String, PluginDescriptor)>,
+    /// What the last manifest fetch did with the grant of record (C-411) — see
+    /// [`PluginHost::capability_grant`].
+    capability_grant: Option<CapabilityGrant>,
     poisoned: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -79,6 +82,7 @@ impl PluginHost {
             system: system.clone(),
             argv,
             verified_spawn: None,
+            capability_grant: None,
             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -184,13 +188,48 @@ impl PluginHost {
         Ok(response)
     }
 
-    /// Fetch the plugin's manifest.
+    /// Fetch the plugin's manifest — **and bound it by the operator's grant of record** (C-411).
+    ///
+    /// This is the single point at which a plugin's declaration enters the host, which is why the
+    /// grant check lives here and not in [`load_plugin_tools`]: `flux plugin call` spawns through
+    /// [`PluginHost::spawn_verified`], fetches the manifest itself, and installs it via
+    /// [`SystemHostCaps::with_manifest`] without ever touching the projection helper. A descriptor
+    /// spawn records its `(name, descriptor)` on the host, so every such path is covered by one
+    /// call; a descriptor-less [`PluginHost::spawn`] has no operator grant to measure against and is
+    /// unchanged.
+    ///
+    /// A widening is a hard refusal. See [`CapabilityGrant`] for the posture and the remedy.
+    ///
+    /// # Only the **first** fetch on a host is measured
+    ///
+    /// The record answers "what may this plugin start from?", which is a question about a new
+    /// process. A *second* fetch on an already-open host is a catalog refresh, and that has its own
+    /// rules in [`refresh`](super::refresh) — strictly stricter ones, bounded by *this session's*
+    /// load-time manifest rather than by the ceiling, and covering things the record says nothing
+    /// about (a retained op quietly re-scoped). Re-adjudicating it here would also *contradict*
+    /// them: `pin_granted_authority` deliberately **accepts and ignores** a refreshed `endpoints` /
+    /// `discovers`, and turning that into a refusal would break the classification C-322 settled.
+    /// So the check runs once, when the host has no outcome yet, and the refresh path owns
+    /// everything after it.
     pub async fn manifest(&mut self) -> Result<PluginManifest> {
         let f = self.request("manifest", Value::Null).await?;
         if !f.ok {
             return Err(Error::Provider(f.error.unwrap_or_default()));
         }
-        Ok(serde_json::from_value(f.result)?)
+        let manifest: PluginManifest = serde_json::from_value(f.result)?;
+        if self.capability_grant.is_none() {
+            if let Some((name, descriptor)) = &self.verified_spawn {
+                let (outcome, _) = adopt_capability_grant(name, descriptor, &manifest)?;
+                self.capability_grant = Some(outcome);
+            }
+        }
+        Ok(manifest)
+    }
+
+    /// What the **first** [`PluginHost::manifest`] fetch did with this plugin's grant of record —
+    /// `None` before that fetch, or for a descriptor-less spawn that has no grant to measure.
+    pub fn capability_grant(&self) -> Option<&CapabilityGrant> {
+        self.capability_grant.as_ref()
     }
 
     /// Call an operation with no host capabilities (callbacks are denied).
@@ -723,13 +762,13 @@ pub async fn load_plugin_tools(
     make_caps: impl FnOnce(&PluginManifest) -> Arc<dyn HostCapabilities>,
 ) -> Result<LoadedPlugin> {
     let mut host = PluginHost::spawn_verified(system, name, descriptor).await?;
+    // The grant-of-record check runs inside `manifest()` — the one seam every descriptor-based
+    // path shares — so a widening has already been refused by the time this returns.
     let manifest = host.manifest().await?;
     validate_manifest_operations(&manifest).map_err(Error::Other)?;
-    // Before anything is built from the declaration: is this still what the operator's install is
-    // on record as granting? A refusal here has cost nothing but a subprocess spawn, and — like
-    // every other check in this file — it happens before `make_caps` turns the declaration into
-    // enforced authority.
-    let capability_grant = adopt_capability_grant(name, descriptor, &manifest.capabilities)?;
+    let capability_grant = host.capability_grant().cloned().unwrap_or_else(|| {
+        CapabilityGrant::NotRecorded("the plugin was spawned without a descriptor".to_string())
+    });
     let coherence_warnings = op_coherence_warnings(&manifest);
     let caps = make_caps(&manifest);
     let host = Arc::new(tokio::sync::Mutex::new(host));
@@ -757,12 +796,12 @@ pub async fn load_plugin_tools(
 // The grant of record (C-411) — a load is bounded by what the install granted
 // ---------------------------------------------------------------------------
 
-/// What [`load_plugin_tools`] did with the descriptor's grant of record.
+/// What [`PluginHost::manifest`] did with the descriptor's grant of record.
 ///
 /// # The posture, and why it is this one
 ///
-/// A plugin's manifest is fetched from the plugin's own subprocess at every load, so the capability
-/// set the host installs is whatever the plugin last chose to declare. The in-session rules make a
+/// A plugin's manifest is fetched from the plugin's own subprocess at every load, so the authority
+/// the host installs is whatever the plugin last chose to declare. The in-session rules make a
 /// *refresh* safe — [`capability_widenings`] refuses a second manifest that asks for more than the
 /// first, and `op_scope_weakenings`/`PlatformSourcing::strictness` refuse a retained op that sheds
 /// a stated boundary — but all three pin to *this* load's manifest. Nothing bounded the manifest a
@@ -771,95 +810,276 @@ pub async fn load_plugin_tools(
 /// necessarily the grant in force, and nothing said so.
 ///
 /// The posture chosen here is the same one the refresh path already takes, extended across the
-/// process boundary: **a widening is refused, naming every capability that grew.** A diff shown at
-/// load and adopted anyway would be a disclosure, not a gate — the load path has no operator
-/// attached to accept it (agent startup, `flux plugin call`, a server), so "surface and continue"
-/// would mean the wider grant is in force by the time anyone reads the message. Refusing is also
-/// what makes the *narrowing* direction safe to ignore: the grant on record is, by construction,
-/// known to be a superset of what the plugin last asked for.
+/// process boundary: **a widening is refused, naming every field that grew.** A diff shown at load
+/// and adopted anyway would be a disclosure, not a gate — the load path has no operator attached to
+/// accept it (agent startup, `flux plugin call`, a server), so "surface and continue" would mean the
+/// wider grant is in force by the time anyone reads the message. Refusing is also what makes the
+/// *narrowing* direction safe to ignore: the grant on record is, by construction, known to be a
+/// superset of what the plugin last asked for.
+///
+/// # Where the check lives, and why it is not in `load_plugin_tools`
+///
+/// It is enforced in [`PluginHost::manifest`], the single point at which a plugin's declaration
+/// enters the host — because `load_plugin_tools` is **not** the only path that installs one.
+/// `flux plugin call` spawns through [`PluginHost::spawn_verified`], fetches the manifest itself and
+/// hands it straight to [`SystemHostCaps::with_manifest`]; this repo's own C-404 census (in
+/// `flux-codegate`) lists that command as a *distinct* plugin-response ingest site for exactly this
+/// reason. Checking inside the projection helper would have left the one command an operator uses to
+/// poke a plugin by hand adopting a widening silently. Every descriptor-based spawn records its
+/// `(name, descriptor)` on the host, so putting the check at the fetch covers all of them at once.
 ///
 /// # The grant of record is a ceiling, not a snapshot
 ///
-/// [`PluginDescriptor::capabilities`] records what the plugin declared the first time it was loaded
-/// under this descriptor, and a later load may declare **less** without moving it. Narrowing is not
-/// penalised (the host enforces the narrower declaration for that session, via `make_caps`), and
-/// returning to the recorded set is not a widening. Exactly the asymmetry `prepare_refresh` applies
-/// within a session, for the same reason: overstating teaches an operator to over-grant, while a
-/// surrender costs nothing that is not already granted.
+/// [`PluginDescriptor::grant`] records what the plugin declared the first time it was loaded under
+/// this descriptor, and a later load may declare **less** without moving it. Narrowing is not
+/// penalised (the host enforces the narrower declaration for that session), and returning to the
+/// recorded set is not a widening. Exactly the asymmetry `prepare_refresh` applies within a session,
+/// for the same reason: overstating teaches an operator to over-grant, while a surrender costs
+/// nothing that is not already granted.
 ///
 /// # Where the record comes from
 ///
 /// A descriptor written before this rule existed — or by a fresh `install`/`add` — carries no grant,
-/// which is not a widening but an install: the first load writes what the plugin declared back into
-/// the descriptor it was read from. That write needs [`PluginDescriptor::origin`], so an in-memory
-/// descriptor (the SDK's `load_tools`, tests) reports [`CapabilityGrant::NotRecorded`] rather than
-/// failing — there is no operator store behind it to guard. Every rewrite of an existing descriptor
-/// carries the record forward ([`add_descriptor`]); `flux plugin uninstall` removes it, which is how
-/// an operator deliberately re-grants.
+/// which is not a widening but an install: the first fetch writes what the plugin declared back into
+/// the descriptor it was read from. That write needs [`PluginDescriptor::origin`]; a descriptor that
+/// has one and cannot be written is a **hard error**, because a store that exists but cannot record
+/// the grant is a store whose grant can never be enforced — continuing would silently re-enter this
+/// branch at every later load and adopt a widening with no signal at all. Only a descriptor with no
+/// store behind it (the SDK's `load_tools`, an embedder, a test fixture) yields
+/// [`CapabilityGrant::NotRecorded`]. Every rewrite of an existing descriptor carries the record
+/// forward ([`add_descriptor`]); removing the `[grant]` table re-grants without discarding the
+/// descriptor's `previous`/`sha256` rollback state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityGrant {
-    /// No grant was on record, and what this load's manifest declared was written to the descriptor
-    /// as the grant of record. Every later load is measured against it.
+    /// No grant was on record, and what this fetch declared was written to the descriptor as the
+    /// grant of record. Every later load is measured against it.
     Recorded,
     /// The declaration is within the grant already on record — unchanged, or narrower.
     WithinGrant,
-    /// No grant was on record and none could be written, so the next load is as unguarded as this
-    /// one. Carries why: an in-memory descriptor (no [`PluginDescriptor::origin`]) or a store that
-    /// could not be written. Never a refusal — a read-only plugin store must not stop plugins
-    /// loading, and this load is no worse than every load before C-411.
+    /// The descriptor has no plugin store behind it ([`PluginDescriptor::origin`] is `None`), so
+    /// there is nothing to record into and no operator grant to guard: an embedder built this
+    /// descriptor in memory and owns that decision itself. Carries the reason. A store that exists
+    /// but cannot be written is an error instead, never this.
     NotRecorded(String),
 }
 
-/// Measure a fetched capability declaration against the descriptor's grant of record, recording it
-/// when there is none. `Err` is the refusal — see [`CapabilityGrant`] for why widening is refused
-/// rather than disclosed.
+/// The authority a plugin's manifest asks the host to install, captured as the operator's grant of
+/// record (C-411) and persisted in [`PluginDescriptor::grant`].
+///
+/// # Why it is not just `capabilities`
+///
+/// [`SystemHostCaps::with_manifest`] installs five manifest fields, and `capabilities` is only the
+/// most obvious one. `endpoints` is a **second egress surface** — `ensure_http_host_allowed` admits
+/// a host when `host_matches(&self.grants.http_hosts, host) || self.endpoint_allows_host(host)`, so
+/// a plugin already granted `http: true` could widen its reachable hosts across a load by adding an
+/// [`EndpointSpec`], with [`capability_widenings`] reporting nothing at all. `auth` decides which env
+/// values the host resolves and injects on the plugin's behalf, `config` is the surface the gated
+/// `config` capability exposes (and the substitution source for endpoint templates), and `discovers`
+/// enlists the plugin as an authority on where a product lives.
+///
+/// Those are exactly the five fields `LoadedPlugin::pin_granted_authority` classifies as **PINNED**
+/// — the operator's load-time grant. Recording the same five is what makes the load boundary and the
+/// refresh boundary bound one thing, rather than two overlapping subsets of it.
+///
+/// # Equality
+///
+/// `PluginDescriptor` derives `PartialEq`/`Eq`; the wire structs on the independently versioned
+/// protocol line derive neither, and moving a derive there would oblige a wire-contract version
+/// decision for an assertion. Equality is defined here instead, as two-way containment under
+/// [`GrantOfRecord::widenings`]: two grants are equal when neither asks for anything the other does
+/// not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrantOfRecord {
+    /// The deny-by-default host capability set (`process`/`secrets`/`http`/…).
+    #[serde(default)]
+    pub capabilities: PluginCapabilities,
+    /// Auth methods by purpose: which env values the host resolves and injects for this plugin.
+    #[serde(default)]
+    pub auth: Vec<AuthMethod>,
+    /// Declared endpoints — the second egress surface beside `capabilities.http_hosts`.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointSpec>,
+    /// Declared non-secret config values the gated `config` capability may return.
+    #[serde(default)]
+    pub config: Vec<ConfigSpec>,
+    /// Products this plugin enlists as a discovery provider for.
+    #[serde(default)]
+    pub discovers: Vec<String>,
+}
+
+impl GrantOfRecord {
+    /// The authority a manifest asks for.
+    ///
+    /// The destructure is exhaustive **on purpose**, exactly as `pin_granted_authority` and
+    /// [`capability_widenings`] are: a `..manifest` struct-update would let a newly added manifest
+    /// field become installable authority that no record covers — which is precisely the gap this
+    /// type exists to close for `endpoints`. Adding a field to [`PluginManifest`] reds here, and at
+    /// `the_grant_of_record_covers_every_field_with_manifest_installs`, until someone classifies it.
+    pub fn from_manifest(manifest: &PluginManifest) -> Self {
+        let PluginManifest {
+            // Granted authority — recorded here, and bounded by `widenings`.
+            capabilities,
+            auth,
+            endpoints,
+            config,
+            discovers,
+            // Not authority. `name` cannot move (the descriptor is keyed by it); `version`,
+            // `groups` and `datasources` are descriptive or organisational; and `operations` are
+            // the thing a manifest exists to change — each op's scope is gated by the authority
+            // above, and a retained op name additionally by `op_scope_weakenings`.
+            name: _,
+            version: _,
+            operations: _,
+            datasources: _,
+            groups: _,
+        } = manifest;
+        Self {
+            capabilities: capabilities.clone(),
+            auth: auth.clone(),
+            endpoints: endpoints.clone(),
+            config: config.clone(),
+            discovers: discovers.clone(),
+        }
+    }
+
+    /// Every way `self` asks for authority `granted` does not already carry, one phrase each. Empty
+    /// means this declaration stays inside the grant of record.
+    ///
+    /// Containment is **literal** throughout, matching [`capability_widenings`]: an entry must
+    /// appear verbatim in the record. For the list-shaped fields that means an added *or* an edited
+    /// entry both count — an [`EndpointSpec`] re-pointed at another host under the same `name` is a
+    /// widening of reach, not a rename, and the same argument applies to an `auth` method that keeps
+    /// its purpose and changes its env. The wire structs carry no `PartialEq`, so entries are
+    /// compared by canonical JSON; that is exact and costs the protocol line nothing.
+    pub fn widenings(&self, granted: &GrantOfRecord) -> Vec<String> {
+        fn gained<T: Serialize>(
+            field: &str,
+            granted: &[T],
+            declared: &[T],
+            label: impl Fn(&T) -> String,
+        ) -> Vec<String> {
+            let known: Vec<Value> = granted
+                .iter()
+                .filter_map(|entry| serde_json::to_value(entry).ok())
+                .collect();
+            declared
+                .iter()
+                .filter(|entry| match serde_json::to_value(entry) {
+                    Ok(v) => !known.contains(&v),
+                    // An entry that will not serialize cannot be shown to be inside the record, and
+                    // of the two readings the permissive one is the dangerous one.
+                    Err(_) => true,
+                })
+                .map(|entry| format!("`{field}` gains or re-points `{}`", label(entry)))
+                .collect()
+        }
+
+        let mut out = capability_widenings(&granted.capabilities, &self.capabilities);
+        out.extend(gained("auth", &granted.auth, &self.auth, |m| {
+            m.purpose.clone()
+        }));
+        out.extend(gained(
+            "endpoints",
+            &granted.endpoints,
+            &self.endpoints,
+            |e| e.name.clone(),
+        ));
+        out.extend(gained("config", &granted.config, &self.config, |c| {
+            c.name.clone()
+        }));
+        out.extend(gained(
+            "discovers",
+            &granted.discovers,
+            &self.discovers,
+            String::clone,
+        ));
+        out
+    }
+}
+
+impl PartialEq for GrantOfRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.widenings(other).is_empty() && other.widenings(self).is_empty()
+    }
+}
+
+impl Eq for GrantOfRecord {}
+
+/// Measure a fetched declaration against the descriptor's grant of record, recording it when there
+/// is none. `Err` is the refusal — see [`CapabilityGrant`] for why a widening is refused rather than
+/// disclosed, and why this is reached from [`PluginHost::manifest`] rather than from the projection.
+///
+/// Answers the grant it settled on alongside the outcome. [`PluginHost::manifest`] does not need it
+/// (it runs this once per host), but a caller that wants to know *what* was recorded — the status
+/// surface, a test — should not have to re-derive it from the manifest.
 pub(super) fn adopt_capability_grant(
     name: &str,
     descriptor: &PluginDescriptor,
-    declared: &PluginCapabilities,
-) -> Result<CapabilityGrant> {
-    let Some(GrantOfRecord(granted)) = &descriptor.capabilities else {
-        return Ok(record_grant_of_record(descriptor, declared));
+    manifest: &PluginManifest,
+) -> Result<(CapabilityGrant, GrantOfRecord)> {
+    let declared = GrantOfRecord::from_manifest(manifest);
+    let Some(granted) = &descriptor.grant else {
+        let outcome = record_grant_of_record(name, descriptor, &declared)?;
+        return Ok((outcome, declared));
     };
-    // The same literal-containment rule the refresh path applies, deliberately: a grant grammar
-    // that gains wildcards must not quietly make an old record admit more than it named.
-    let widenings = capability_widenings(granted, declared);
+    let widenings = declared.widenings(granted);
     if widenings.is_empty() {
-        return Ok(CapabilityGrant::WithinGrant);
+        return Ok((CapabilityGrant::WithinGrant, declared));
     }
+    // The remedy names the lossless re-grant first: dropping the `[grant]` table leaves `previous`,
+    // `version` and `sha256` intact, where an uninstall/install round-trip discards the offline
+    // rollback target along with the record.
+    let where_recorded = descriptor
+        .origin
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| format!("~/.flux/plugins/{name}.toml"));
+    // Phrased for both callers: this refuses a manifest, and the same fetch backs a first load and
+    // a catalog refresh alike.
     Err(Error::Other(format!(
-        "plugin `{name}`: refusing to load — its manifest now asks for more host authority than \
-         the grant on record ({}). The capabilities an operator reviewed when this plugin was \
-         installed are the ones in force; a widened set is adopted only by re-installing it \
-         (`flux plugin uninstall {name}`, then `flux plugin install {name}`), which re-records \
-         the grant.",
+        "plugin `{name}`: refusing its manifest — it now asks for more host authority than the \
+         grant on record ({}). The authority an operator reviewed when this plugin was installed \
+         is what stays in force; adopt the wider set deliberately by removing the `[grant]` table \
+         from {where_recorded} (or `flux plugin uninstall {name}` and install it again), which \
+         re-records the grant at the next load.",
         widenings.join("; ")
     )))
 }
 
-/// Write `declared` back into the descriptor file it was read from, as the grant every later load
-/// is measured against. Best-effort by design — see [`CapabilityGrant::NotRecorded`].
+/// Write `declared` back into the descriptor file it was read from, as the grant every later load is
+/// measured against.
+///
+/// A descriptor with no [`PluginDescriptor::origin`] has no store to guard, and is reported rather
+/// than failed. A descriptor that *has* one and cannot be written is an error — see
+/// [`CapabilityGrant`]'s "Where the record comes from" for why silently continuing there is the one
+/// outcome that reproduces the defect this rule closes.
 fn record_grant_of_record(
+    name: &str,
     descriptor: &PluginDescriptor,
-    declared: &PluginCapabilities,
-) -> CapabilityGrant {
+    declared: &GrantOfRecord,
+) -> Result<CapabilityGrant> {
     let Some(path) = descriptor.origin.clone() else {
-        return CapabilityGrant::NotRecorded(
+        return Ok(CapabilityGrant::NotRecorded(
             "the descriptor was not read from a plugin store".to_string(),
-        );
+        ));
     };
     let recorded = PluginDescriptor {
-        capabilities: Some(GrantOfRecord(declared.clone())),
+        grant: Some(declared.clone()),
         origin: None,
         ..descriptor.clone()
     };
-    let written = toml::to_string_pretty(&recorded)
+    toml::to_string_pretty(&recorded)
         .map_err(|e| format!("serialize descriptor: {e}"))
-        .and_then(|body| std::fs::write(&path, body).map_err(|e| e.to_string()));
-    match written {
-        Ok(()) => CapabilityGrant::Recorded,
-        Err(e) => CapabilityGrant::NotRecorded(format!("{}: {e}", path.display())),
-    }
+        .and_then(|body| std::fs::write(&path, body).map_err(|e| e.to_string()))
+        .map_err(|e| {
+            Error::Other(format!(
+                "plugin `{name}`: refusing its manifest — it has no grant on record yet and one \
+                 could not be written to {} ({e}). Without a record, a later manifest could widen \
+                 what this plugin may ask the host for and nothing would notice.",
+                path.display()
+            ))
+        })?;
+    Ok(CapabilityGrant::Recorded)
 }
 
 // ---------------------------------------------------------------------------
@@ -918,15 +1138,15 @@ pub struct PluginDescriptor {
     /// commit is an idempotent no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_commit: Option<String>,
-    /// The host capabilities this install is on record as granting (C-411) — the ceiling every
-    /// later load is measured against by [`load_plugin_tools`]. Absent until the first load records
-    /// what the plugin declared; see [`CapabilityGrant`] for the posture and [`GrantOfRecord`] for
-    /// why it is a newtype.
+    /// The host authority this install is on record as granting (C-411) — the ceiling every later
+    /// manifest fetch is measured against by [`PluginHost::manifest`]. Absent until the first fetch
+    /// records what the plugin declared; see [`CapabilityGrant`] for the posture and
+    /// [`GrantOfRecord`] for what it covers and why.
     ///
     /// **Last on purpose.** It is the descriptor's only TOML *table*, and `toml` refuses to emit a
     /// value after one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<GrantOfRecord>,
+    pub grant: Option<GrantOfRecord>,
     /// The file this descriptor was read from, set by [`load_descriptor`] and [`discover`] and
     /// **never serialized** — provenance, not configuration.
     ///
@@ -936,26 +1156,6 @@ pub struct PluginDescriptor {
     #[serde(skip)]
     pub origin: Option<std::path::PathBuf>,
 }
-
-/// A [`PluginCapabilities`] persisted as an operator's **grant of record** (C-411).
-///
-/// A newtype for one reason: `PluginDescriptor` derives `PartialEq`/`Eq`, and the wire struct on the
-/// independently versioned protocol line derives neither. Rather than move a derive onto the
-/// protocol crate — which would oblige a wire-contract version decision for an assertion — equality
-/// is defined here, as the two-way literal containment `capability_widenings` already treats as
-/// equality: two grants are equal when neither asks for anything the other does not.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct GrantOfRecord(pub PluginCapabilities);
-
-impl PartialEq for GrantOfRecord {
-    fn eq(&self, other: &Self) -> bool {
-        capability_widenings(&self.0, &other.0).is_empty()
-            && capability_widenings(&other.0, &self.0).is_empty()
-    }
-}
-
-impl Eq for GrantOfRecord {}
 
 /// The outcome of re-hashing a descriptor's binary against its recorded `sha256` (D-48) — the
 /// enforcement step that turns `pin` from an advisory label into a supply-chain statement.
@@ -1082,7 +1282,8 @@ pub fn discover(dir: &std::path::Path) -> Vec<DiscoveredPlugin> {
 /// re-running `add` — leaves *what it may ask the host for* exactly where the operator left it.
 /// Owning the carry-forward here rather than at each caller is what makes it hold for a caller
 /// that has not thought about it: an install that re-granted by accident is the whole failure this
-/// rule exists to stop. Dropping the record is `flux plugin uninstall` — the file goes with it.
+/// rule exists to stop. Dropping the record is deliberate: remove the `[grant]` table (which keeps
+/// `previous`/`version`/`sha256`, so `rollback` still works offline), or uninstall the plugin.
 pub fn add_descriptor(
     dir: &std::path::Path,
     name: &str,
@@ -1093,16 +1294,16 @@ pub fn add_descriptor(
     // that used to succeed into a failure — the same "never fail for one bad file" posture
     // `discover` takes. There is nothing to lose either way: an unparseable descriptor was already
     // being overwritten wholesale.
-    let carried = match &descriptor.capabilities {
+    let carried = match &descriptor.grant {
         Some(_) => None,
         None => load_descriptor(dir, name)
             .ok()
             .flatten()
-            .and_then(|stored| stored.capabilities),
+            .and_then(|stored| stored.grant),
     };
     std::fs::create_dir_all(dir).map_err(Error::Io)?;
     let body = toml::to_string_pretty(&PluginDescriptor {
-        capabilities: descriptor.capabilities.clone().or(carried),
+        grant: descriptor.grant.clone().or(carried),
         origin: None,
         ..descriptor.clone()
     })

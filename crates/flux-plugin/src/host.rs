@@ -2003,26 +2003,110 @@ mod tests {
             program: "/bin/true".into(),
             ..Default::default()
         };
-        let declared = PluginCapabilities {
-            secrets: vec!["TOKEN".into()],
-            ..PluginCapabilities::default()
+        let declared = PluginManifest {
+            capabilities: PluginCapabilities {
+                secrets: vec!["TOKEN".into()],
+                ..PluginCapabilities::default()
+            },
+            ..PluginManifest::default()
         };
         assert!(
             matches!(
-                loading::adopt_capability_grant("p", &descriptor, &declared).unwrap(),
+                loading::adopt_capability_grant("p", &descriptor, &declared)
+                    .unwrap()
+                    .0,
                 CapabilityGrant::NotRecorded(_)
             ),
-            "no origin, no record — and no refusal either"
+            "no store, no record — and no refusal either"
         );
 
         // But a descriptor that *does* carry a record is guarded whether it came from a file or not.
         let pinned = PluginDescriptor {
-            capabilities: Some(GrantOfRecord(PluginCapabilities::default())),
+            grant: Some(GrantOfRecord::default()),
             ..descriptor
         };
         let err = loading::adopt_capability_grant("p", &pinned, &declared)
             .expect_err("a widening beyond the recorded grant is refused");
         assert!(err.to_string().contains("`secrets` gains `TOKEN`"), "{err}");
+    }
+
+    /// C-411 — the record has to cover everything `SystemHostCaps::with_manifest` turns into
+    /// enforced authority, not just `capabilities`. `endpoints` is the one that bites:
+    /// `ensure_http_host_allowed` admits a host via `http_hosts` **or** `endpoint_allows_host`, so
+    /// a plugin already granted `http: true` could otherwise widen its reachable hosts across a
+    /// load by adding an `EndpointSpec` and `capability_widenings` would report nothing.
+    #[test]
+    fn the_grant_of_record_covers_every_field_with_manifest_installs() {
+        let base = PluginManifest {
+            capabilities: PluginCapabilities {
+                http: true,
+                http_hosts: vec!["api.example.com".into()],
+                ..PluginCapabilities::default()
+            },
+            ..PluginManifest::default()
+        };
+        let granted = GrantOfRecord::from_manifest(&base);
+        assert!(
+            granted.widenings(&granted).is_empty(),
+            "the recorded grant does not widen itself"
+        );
+
+        // Reach added through the endpoint surface rather than through `http_hosts`.
+        let via_endpoint = GrantOfRecord::from_manifest(&PluginManifest {
+            endpoints: vec![EndpointSpec {
+                name: "vendor".into(),
+                http_hosts: vec!["api.attacker.test".into()],
+                ..EndpointSpec::default()
+            }],
+            ..base.clone()
+        });
+        assert_eq!(
+            via_endpoint.widenings(&granted),
+            vec!["`endpoints` gains or re-points `vendor`".to_string()],
+            "an added endpoint is a widening of reach"
+        );
+
+        // The same endpoint name, re-pointed. A rename check would miss this; literal containment
+        // does not.
+        let repointed = GrantOfRecord::from_manifest(&PluginManifest {
+            endpoints: vec![EndpointSpec {
+                name: "vendor".into(),
+                http_hosts: vec!["api.elsewhere.test".into()],
+                ..EndpointSpec::default()
+            }],
+            ..base.clone()
+        });
+        assert_eq!(
+            repointed.widenings(&via_endpoint),
+            vec!["`endpoints` gains or re-points `vendor`".to_string()],
+            "a re-pointed endpoint is a widening too"
+        );
+
+        // The other three installed fields are covered by the same rule.
+        let more = GrantOfRecord::from_manifest(&PluginManifest {
+            auth: vec![AuthMethod::bearer("vendor", vec!["VENDOR_TOKEN".into()])],
+            config: vec![ConfigSpec {
+                name: "cloud_id".into(),
+                ..ConfigSpec::default()
+            }],
+            discovers: vec!["zendesk".into()],
+            ..base.clone()
+        });
+        assert_eq!(
+            more.widenings(&granted),
+            vec![
+                "`auth` gains or re-points `vendor`".to_string(),
+                "`config` gains or re-points `cloud_id`".to_string(),
+                "`discovers` gains or re-points `zendesk`".to_string(),
+            ],
+            "auth, config and discovers are all bounded"
+        );
+
+        // And the ceiling is still asymmetric: declaring less is not a widening.
+        assert!(
+            granted.widenings(&more).is_empty(),
+            "a narrowing stays inside the record"
+        );
     }
 
     /// C-411 — a descriptor rewrite is not a re-grant. Every install/pin/rollback path funnels
@@ -2035,9 +2119,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let granted = PluginCapabilities {
-            process: vec!["kubectl get".into()],
-            ..PluginCapabilities::default()
+        let granted = GrantOfRecord {
+            capabilities: PluginCapabilities {
+                process: vec!["kubectl get".into()],
+                ..PluginCapabilities::default()
+            },
+            ..GrantOfRecord::default()
         };
         add_descriptor(
             &dir,
@@ -2045,13 +2132,13 @@ mod tests {
             &PluginDescriptor {
                 program: "/bin/true".into(),
                 version: Some("1.0.0".into()),
-                capabilities: Some(GrantOfRecord(granted.clone())),
+                grant: Some(granted.clone()),
                 ..Default::default()
             },
         )
         .unwrap();
 
-        // An `install` onto a new version: a fresh descriptor that says nothing about capabilities.
+        // An `install` onto a new version: a fresh descriptor that says nothing about the grant.
         add_descriptor(
             &dir,
             "p",
@@ -2065,11 +2152,7 @@ mod tests {
 
         let stored = load_descriptor(&dir, "p").unwrap().expect("descriptor");
         assert_eq!(stored.version.as_deref(), Some("2.0.0"), "the launch moved");
-        assert_eq!(
-            stored.capabilities,
-            Some(GrantOfRecord(granted)),
-            "the grant of record did not"
-        );
+        assert_eq!(stored.grant, Some(granted), "the grant of record did not");
         assert_eq!(
             stored.origin.as_deref(),
             Some(dir.join("p.toml").as_path()),
@@ -2091,7 +2174,7 @@ mod tests {
             load_descriptor(&dir, "p")
                 .unwrap()
                 .expect("descriptor")
-                .capabilities
+                .grant
                 .is_none(),
             "uninstall clears the grant of record"
         );

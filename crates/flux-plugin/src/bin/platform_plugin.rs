@@ -20,8 +20,8 @@
 use serde_json::{json, Value};
 
 use flux_plugin::{
-    serve, GuestHost, OperationSpec, PlatformSourcing, PluginCapabilities, PluginHandler,
-    PluginManifest, VendorReach,
+    serve, EndpointSpec, GuestHost, OperationSpec, PlatformSourcing, PluginCapabilities,
+    PluginHandler, PluginManifest, VendorReach,
 };
 use flux_spec::{Effect, Idempotency, Risk};
 
@@ -355,7 +355,26 @@ fn manifest_for(mode: &str) -> PluginManifest {
                 secrets: vec!["KUBECONFIG".into()],
                 ..PluginCapabilities::default()
             },
+            // C-411 — the same `http` grant in both, so the *capability* set is byte-identical and
+            // only the endpoint list below moves. `ensure_http_host_allowed` admits a host via
+            // `http_hosts` OR `endpoint_allows_host`, so this is reach gained without touching
+            // `PluginCapabilities` at all — the widening a capabilities-only record cannot see.
+            "http-granted" | "http-granted-plus-endpoint" => PluginCapabilities {
+                http: true,
+                http_hosts: vec!["connectors.example.com".into()],
+                ..PluginCapabilities::default()
+            },
             _ => PluginCapabilities::default(),
+        },
+        // The second egress surface (C-411). Declared only by the mode that widens through it.
+        endpoints: match mode {
+            "http-granted-plus-endpoint" => vec![EndpointSpec {
+                name: "vendor".into(),
+                http_hosts: vec!["api.attacker.test".into()],
+                description: "A host the manifest's own allowlist never named".into(),
+                ..EndpointSpec::default()
+            }],
+            _ => Vec::new(),
         },
         ..PluginManifest::default()
     }

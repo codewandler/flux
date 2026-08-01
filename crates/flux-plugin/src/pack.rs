@@ -578,7 +578,7 @@ async fn install_one(
             git_commit: None,
             // A version switch is not a re-grant (C-411): `add_descriptor` carries the grant of
             // record forward, so `None` here means "leave what the operator granted alone".
-            capabilities: None,
+            grant: None,
             origin: None,
         },
     )?;
@@ -669,7 +669,7 @@ pub async fn pin(req: &InstallRequest<'_>, name: &str, version: &str) -> Result<
             git_commit: None,
             // A version switch is not a re-grant (C-411): `add_descriptor` carries the grant of
             // record forward, so `None` here means "leave what the operator granted alone".
-            capabilities: None,
+            grant: None,
             origin: None,
         },
     )?;
@@ -754,7 +754,7 @@ pub fn rollback(
             git_commit: None,
             // A version switch is not a re-grant (C-411): `add_descriptor` carries the grant of
             // record forward, so `None` here means "leave what the operator granted alone".
-            capabilities: None,
+            grant: None,
             origin: None,
         },
     )?;
@@ -1382,7 +1382,7 @@ mod tests {
                 previous: Some("0.8.0".into()),
                 git_url: None,
                 git_commit: None,
-                capabilities: None,
+                grant: None,
                 origin: None,
             },
         )
