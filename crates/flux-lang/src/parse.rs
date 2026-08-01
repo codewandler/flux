@@ -962,6 +962,97 @@ mod tests {
         });
     }
 
+    /// L-115: an `each` header's `->` is the CST's own `ARROW` token, never the first `->`
+    /// substring of the reconstructed header line. Splitting the text found the arrow *inside* the
+    /// source expression's strings, so both of these were rejected — and the diagnostic blamed a
+    /// collect target the header never wrote.
+    #[test]
+    fn each_arrow_is_read_from_structure_not_from_source_text() {
+        let ast = parse("flow f\n  each x in \"a->b\"\n    do go\n").unwrap();
+        assert_eq!(
+            ast.body,
+            vec![Node::Each {
+                source: Box::new(lit(s("a->b"))),
+                item: "x".into(),
+                body: vec![call("go", vec![])],
+                collect: None,
+                flat: false,
+            }]
+        );
+
+        let ast = parse("flow f\n  each part in split($text, \"->\")\n    do go\n").unwrap();
+        assert_eq!(
+            ast.body,
+            vec![Node::Each {
+                source: Box::new(call("split", vec![var("text"), lit(s("->"))])),
+                item: "part".into(),
+                body: vec![call("go", vec![])],
+                collect: None,
+                flat: false,
+            }]
+        );
+
+        // A real arrow still lowers — `-> c` and `-> flat c`, including when the source carries a
+        // `->` of its own.
+        for (header, source, collect, flat) in [
+            ("$xs -> out", var("xs"), "out", false),
+            ("$xs -> flat all", var("xs"), "all", true),
+            ("\"a->b\" -> out", lit(s("a->b")), "out", false),
+            ("\"a->b\" -> flat all", lit(s("a->b")), "all", true),
+            (
+                "split($text, \"->\") -> flat all",
+                call("split", vec![var("text"), lit(s("->"))]),
+                "all",
+                true,
+            ),
+        ] {
+            let src = format!("flow f\n  each x in {header}\n    do go\n");
+            let ast = parse(&src).unwrap_or_else(|e| panic!("parse failed for {src:?}: {e}"));
+            assert_eq!(
+                ast.body,
+                vec![Node::Each {
+                    source: Box::new(source),
+                    item: "x".into(),
+                    body: vec![call("go", vec![])],
+                    collect: Some(collect.into()),
+                    flat,
+                }],
+                "for {src:?}"
+            );
+        }
+    }
+
+    /// L-115 round-trip: `format` spells an `Each` source containing `->` verbatim, so the parse
+    /// side must not claim that `->` as the collect arrow. When it did, the formatter emitted text
+    /// no parser accepts — a round-trip totality break, not a cosmetic one.
+    #[test]
+    fn each_sources_containing_an_arrow_round_trip() {
+        for (collect, flat) in [
+            (None, false),
+            (Some(SymbolName::from("out")), false),
+            (Some(SymbolName::from("all")), true),
+        ] {
+            for source in [
+                lit(s("a->b")),
+                call("split", vec![var("text"), lit(s("->"))]),
+            ] {
+                let ast = DraftAst {
+                    body: vec![Node::Each {
+                        source: Box::new(source),
+                        item: "x".into(),
+                        body: vec![call("go", vec![])],
+                        collect: collect.clone(),
+                        flat,
+                    }],
+                    ..Default::default()
+                };
+                let text = format(&ast);
+                assert!(!text.contains("@json"), "each stays native: {text}");
+                assert_round_trips(&ast);
+            }
+        }
+    }
+
     #[test]
     fn ctx_and_ctx_append_round_trip() {
         assert_round_trips(&DraftAst {

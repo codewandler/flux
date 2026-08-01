@@ -16,7 +16,7 @@ use crate::program::{
     AgentDecl, AgentLoopDecl, ChannelDecl, CompositeLimits, CompositeOpDecl, CompositeOpMeta,
     DatasourceDecl, JourneyDecl, Module, PermissionDecl, Program, TriggerDecl,
 };
-use crate::syntax::{SyntaxKind, SyntaxNode};
+use crate::syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use flux_spec::{Effect, Idempotency, Risk};
 
 type DecodeResult<T> = std::result::Result<T, LowerError>;
@@ -432,34 +432,56 @@ fn lower_when(statement: &SyntaxNode) -> DecodeResult<Node> {
     })
 }
 
+/// `each <item> in <source> [-> [flat] <collect>]`.
+///
+/// The header is read from the statement's own token structure — its direct token children, with
+/// the source expression opaque — never from reconstructed text (L-115). Scanning the line for the
+/// first `->` finds one *inside* the source expression's strings, so `each x in "a->b"` and
+/// `each part in split($text, "->")` were rejected with a diagnostic naming a collect target the
+/// header never wrote, and `format` emitted un-reparseable text for any `Each` whose source carries
+/// an arrow. The parser already decided where the arrow is; this reads that decision back.
 fn lower_each(statement: &SyntaxNode) -> DecodeResult<Node> {
-    let header = semantic_line(statement);
-    let rest = rest_after_keyword(statement, "each")?;
-    let (item, tail) = parse_symbol_prefix(&rest, statement, "each item")?;
-    if keyword_rest(tail.trim_start(), "in").is_none() {
+    let header = direct_header_tokens(statement);
+    let mut tokens = header.iter();
+    if tokens.next().map(SyntaxToken::text) != Some("each") {
+        return Err(error(statement, "expected `each`"));
+    }
+    let item = symbol_token(tokens.next(), statement, "each item")?;
+    if tokens.next().map(SyntaxToken::text) != Some("in") {
         return Err(error(statement, "`each` expects `item in source`"));
     }
-    let has_arrow = header.contains("->");
-    let (collect, flat) = if let Some((_, tail)) = header.split_once("->") {
-        let tail = tail.trim_start();
-        let (flat, tail) = if let Some(rest) = keyword_rest(tail, "flat") {
-            (true, rest)
-        } else {
-            (false, tail)
-        };
-        (
-            Some(parse_symbol_exact(tail, statement, "each collect")?),
-            flat,
-        )
-    } else {
-        (None, false)
+    let (collect, flat) = match tokens.next() {
+        None => (None, false),
+        Some(arrow) if arrow.kind() == SyntaxKind::ARROW => {
+            // `flat` is a reserved word, so a *bare* `flat` here is always the modifier — a collect
+            // target of that name can only be spelled `$flat`, which is a `VAR` token.
+            let mut next = tokens.next();
+            let flat = next
+                .is_some_and(|token| token.kind() == SyntaxKind::IDENT && token.text() == "flat");
+            if flat {
+                next = tokens.next();
+            }
+            (Some(symbol_token(next, statement, "each collect")?), flat)
+        }
+        Some(token) => {
+            return Err(error(
+                statement,
+                format!("unexpected text in `each` header: `{}`", token.text()),
+            ));
+        }
     };
+    if let Some(extra) = tokens.next() {
+        return Err(error(
+            statement,
+            format!("unexpected text after `each collect`: `{}`", extra.text()),
+        ));
+    }
     Ok(Node::Each {
         source: Box::new(required_expression(statement, "each source")?),
         item,
         body: lower_first_block(statement)?,
         collect,
-        flat: has_arrow && flat,
+        flat,
     })
 }
 
@@ -2678,6 +2700,36 @@ fn has_direct_token(node: &SyntaxNode, kind: SyntaxKind) -> bool {
     node.children_with_tokens()
         .filter_map(|element| element.into_token())
         .any(|token| token.kind() == kind)
+}
+
+/// The tokens `node` owns *directly* on its header line, trivia dropped and in source order.
+///
+/// Child nodes are opaque: an operand the parser wrapped in an expression node contributes nothing.
+/// That is the difference from [`semantic_line`], and the whole point — a keyword or operator found
+/// here was written by the header itself, not by a string inside one of its operands.
+fn direct_header_tokens(node: &SyntaxNode) -> Vec<SyntaxToken> {
+    let mut tokens = Vec::new();
+    for token in node
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+    {
+        match token.kind() {
+            SyntaxKind::NEWLINE | SyntaxKind::COMMENT => break,
+            SyntaxKind::WHITESPACE => {}
+            _ => tokens.push(token),
+        }
+    }
+    tokens
+}
+
+/// One declared symbol read from a single header token (`x`, `$x`) rather than from a text scan.
+fn symbol_token(
+    token: Option<&SyntaxToken>,
+    at: &SyntaxNode,
+    context: &str,
+) -> DecodeResult<SymbolName> {
+    let token = token.ok_or_else(|| error(at, format!("`{context}` expects a symbol name")))?;
+    parse_symbol_exact(token.text(), at, context)
 }
 
 fn header_tokens(node: &SyntaxNode) -> Vec<(SyntaxKind, String)> {
