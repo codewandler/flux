@@ -1,6 +1,14 @@
 # Design: Watch the agent think — the loop as a live thread, expandable down to the graph
 
-**Status:** proposed · **Pillar:** Agent · **Stories:** [A-137](../stories/A-137-the-step-thread.md) · [A-138](../stories/A-138-expand-a-step-into-its-graph.md) · [A-139](../stories/A-139-the-loop-view-under-load.md)
+**Status:** proposed · **Pillar:** Agent · **Stories:** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md) · [A-137](../stories/A-137-the-step-thread.md) · [A-138](../stories/A-138-expand-a-step-into-its-graph.md) · [A-139](../stories/A-139-the-loop-view-under-load.md)
+
+> **The layout is chosen, by looking at it.** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md)
+> drew five hard-coded layouts of one flow under four load cases and three widths; the side-by-side
+> set is [agent-loop-visibility-mocks.md](agent-loop-visibility-mocks.md), and its recommendation is
+> the **split** (a condensed rail whose height tracks the phase count, plus a detail pane) with the
+> flat thread as the sub-64-column fallback. That answers this doc's open "pane or inline" question
+> in favour of the pane, and it settles where A-140's pause and A-142's inspection pane live before
+> A-137 commits to a shape. Nothing there is wired to a live run.
 
 ## Why
 
