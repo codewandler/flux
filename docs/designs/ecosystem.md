@@ -1,0 +1,327 @@
+# Design: the flux ecosystem — three repositories, one vocabulary
+
+**Status:** proposed, owner-directed 2026-08-01 · **Scope:** cross-repository · **Produces:**
+[`docs/ecosystem.md`](../ecosystem.md) (the end-user description), amendments to
+`flux-connectors/docs/vision.md`, and the charter for `codewandler/flux-exchange`
+
+> This document is the *reasoning*. `docs/ecosystem.md` is the *description* derived from it. Where
+> they disagree, this one is the argument and that one is the summary — fix both.
+>
+> Measurements were taken on **2026-08-01** against the working trees at
+> `~/projects/flux`, `~/projects/flux-connectors`, and the downstream product tree that consumes
+> them. Re-grep by symbol; line numbers move.
+
+## Why this exists
+
+Three repositories grew from one idea and their charters no longer describe them. flux-connectors'
+vision says connectors are *"paid SaaS services"* and that technology adapters *"stay core to flux as
+plugins"* — a sentence that has now blocked four filed stories (C-46, C-123, C-133, C-157), each one
+an instance of the same missing category. Meanwhile a downstream product had independently built a
+*fourth* implementation of the same host, and had written a design around publishing crates that
+were, in fact, already published.
+
+The cost of not having this document is not confusion; it is duplicated work and stalled backlog.
+
+## The four domains, and the test that separates them
+
+Each domain gets one interrogative. The test is mechanical on purpose — a boundary that requires
+taste is a boundary that erodes.
+
+| Domain | Test | Owns |
+|---|---|---|
+| **flux** (engine) | *Does it change what happens when an effect executes?* | The envelope, the substrate, Flux-Lang, the agent, the SDK. Knows **kinds**, never vendors. |
+| **flux-connectors** | *Is it true of the vendor regardless of who runs it?* | Vendor facts, compiled. Operations, events, credentials-required, config-required. No runtime, no tenancy, no credential values. |
+| **flux-exchange** | *Does it require holding a credential or knowing a tenant?* | Principals, connections, credentials, channels, leases, stored programs, execution records. |
+| **a downstream product** | *Is it true only of one company's customers?* | Its accounts, its channels, its console, its identity provider. |
+
+Three consequences worth stating because they are the ones people get wrong:
+
+- **A vendor definition belongs in the public flux-connectors repository whenever the API it
+  describes is public** — that is what makes it a vendor fact rather than a private one. An
+  *identity adapter* for one company never does, because it is true only of that company.
+- **A connector is not a plugin's rival.** See §The runtime axis — a plugin becomes one *runtime
+  kind* a connector can declare, which is what dissolves the false dichotomy the current charters
+  encode.
+- **No flux-family repository names a downstream company.** The rule is the fourth row applied to
+  the documentation itself: a product's name is true only of that product, so it belongs in that
+  product's repository. This document's own first draft violated it, which is evidence the rule
+  needs to be written down rather than assumed. A pre-existing audit of the flux tree found ten
+  files already carrying such a name, including three crate sources — that cleanup is its own
+  story, not this document's.
+
+## What the charters get wrong, specifically
+
+Three claims in `flux-connectors/docs/vision.md` and its README must be replaced, not softened.
+
+**1. "Connectors are paid SaaS services."** False, and expensively so. A Wikipedia search connector
+has no credential at all. Ollama is a local process. A generic `http` or `mcp` connector is neither a
+SaaS product nor a technology adapter — C-46 named it *"a third category the boundary does not
+name"* two months before this document. The replacement framing:
+
+> A connector describes **an external capability reached over a declared protocol.** Authentication
+> is optional. What makes something a connector is that its surface can be *described*; what makes
+> something not one is that it cannot.
+
+**2. "Technology adapters stay core to flux as plugins."** Superseded by the runtime axis below.
+Docker, Kubernetes and SQL do not need to be plugins-rather-than-connectors; they need a runtime
+other than HTTP, which is a different statement.
+
+**3. "Being flux's execution path" as a non-goal.** This was already amended once for the
+multi-tenant host, and the amendment did not go far enough — flux-exchange *is* a path flux traffic
+takes in a hosted deployment. The line that survives, and that must survive, is narrower:
+
+> **flux must never *require* flux-exchange.** A `.flux` program loading a connector module on a
+> laptop is a complete path. Trading plugin-binary distribution pain for service lock-in would be a
+> bad trade made twice.
+
+## The runtime axis — what replaces the plugin/connector dichotomy
+
+The stated pain that motivated flux-connectors was distribution: writing a plugin means Rust, the
+plugin protocol, cross-compilation, GitHub release artifacts, a signed pack index, crates.io, and an
+install step for every user. That tax is real and it is not intrinsic to the *protocol* — it is
+intrinsic to shipping a binary to every user.
+
+**Reframe: a plugin is one runtime kind a connector may declare.**
+
+| Runtime | Executes by | Status in `flux-system` |
+|---|---|---|
+| `http` | a guarded request | `flux-web`'s `http.request`, egress guarded by `net::guard_url_scoped` |
+| `socket` | a guarded dial | `net::DialTarget` / `DialStream` / `dial_scoped` exist; UDP and ICMP are new variants on the same enums |
+| `process` | a guarded, argv-only spawn | exists — one `build_command`, sandbox backends for bubblewrap and Seatbelt |
+| `container` | a spawn inside docker/k8s | new `Backend` variants, or a `GuardedProcess` port implementation |
+| `remote` | delegation to another substrate | anticipated by `flux-system`'s `port` module, which names *"a remote executor"* |
+| `plugin` | the flux plugin protocol over stdio | a special case of `process` |
+
+The invariant that must survive the generalization, because it is the one that makes the whole thing
+reviewable:
+
+> **The runtime is declared by the connector, never chosen by the caller.** A caller who can pick the
+> runtime is a caller who can pick an effect. The manifest names; the operator grants.
+
+### The multi-tenancy rule that falls out of it
+
+HTTP is easy to multi-tenant because the effect leaves the machine. Process spawning, container
+exec and raw sockets do not — they consume the host's own identity, network position, filesystem and
+descriptors.
+
+> **A locally-executing runtime cannot be safely multi-tenant in one process.** It requires either
+> single-tenant deployment (which is exactly local-dev mode: one operator, no login) or per-tenant
+> isolation at the OS or pod level.
+
+Because the manifest *declares* its runtime, a hosted deployment can **refuse** a `process` connector
+mechanically rather than relying on an operator noticing. That is a fail-closed rule and it costs one
+check.
+
+## `flux-system` as the shared substrate
+
+Three consumers want the same execution primitives with different policy: the flux CLI,
+flux-exchange, and at least one downstream product. The instinct is to create a new crate for it.
+That instinct is wrong, because the crate already exists and a new one would collide with
+`flux-runtime` — which is the **opposite** concern.
+
+- `flux-runtime` (L2) — `Executor::dispatch`. Permission → approval → execute. **Judgment.**
+- `flux-system` (L2) — the only place real IO happens. **Mechanism.**
+
+They are peers at the same layer, not stacked, and fusing them would force every consumer of the
+substrate to also take flux's approval model — including consumers with no human at a terminal to
+prompt. Reimplementing guarded IO to escape that is precisely the failure the substrate prevents.
+
+**Decision: publish `codewandler-flux-system` as the shared substrate and grow its `port` module.**
+No new crate, no new name. Two follow-ons:
+
+- The workspace-confined **file surface becomes a port** (C-269 deferred this on the correct
+  grounds that its consumers all held a concrete `System`, so a trait had no seam — a second
+  consumer is exactly the condition that changes).
+- New runtime backends land as `Backend` variants or port implementations, never as a second IO path.
+
+## The three lifetimes
+
+Routinely conflated, and the conflation produces real bugs — a webhook endpoint that dies when an
+agent disconnects, or a lease that outlives the grant that opened it.
+
+| | Scope | Direction | Dies when |
+|---|---|---|---|
+| **Session** | a conversation | — | it is closed or expires; resumable |
+| **Channel** | a deployment | pushes | the operator removes it |
+| **Lease** | a caller's grant | pulls | the holder releases it, or TTL |
+
+A **room** is a channel with attribution — flux already models this correctly, and the reason it
+carries an occupant id on every event is that attribution is the precondition for deciding whether
+to answer.
+
+**On the word "lease".** The owner's original framing was "session (open|close)", which is the right
+mechanism under a colliding name: flux's `session` already means an event-sourced conversation, and
+the two have opposite lifetimes and opposite owners. `lease` is used so that a sentence about one can
+never be misread as a sentence about the other.
+
+## The remote binding: `invoke` and `subscribe`
+
+A connector declares two directions, so a host can serve either one remotely. The seam is therefore
+not "channels" — it is a **remote connector binding with two verbs**, and the symmetry is the design.
+
+- **`invoke`** — the caller names an operation id and arguments. The host resolves the credential,
+  evaluates the operation's own compiled Flux to build the request, and dispatches. This exists
+  today in `flux-connectors/crates/connectors-api`.
+- **`subscribe`** — the host terminates the vendor webhook, holds the socket, or runs the poll; it
+  verifies the signature **with the credential it owns**; it maps the payload through the binding the
+  manifest declares; and it emits a normalized, typed event to a subscriber. This does not exist.
+
+The invariant, which is the whole security argument:
+
+> **The credential never crosses the seam in either direction; the authority does.** Outbound, flux
+> sends an operation id and arguments and receives a result. Inbound, the vendor sends a signed
+> payload to the host and flux receives a verified, connector-declared event. In neither direction
+> does flux come to hold a value it did not already have.
+
+### The confused-deputy argument, second half
+
+`flux-connectors/docs/designs/connectors-api.md` makes this argument for `invoke` and has never had
+to make it for `subscribe`. It owes it, and this is the shape:
+
+The outbound answer is that *the caller cannot name the authority* — not a host (the URL comes from
+compiled Flux), not a credential (the address is derived from session tenant + manifest authority),
+not a tenant (read from the session and from nothing a caller controls).
+
+The inbound answer is its mirror: **a subscriber cannot name a binding it has not been granted.** The
+event stream is scoped by the same tenant derivation as the credential address. A subscription is not
+a request for events from a source the caller names; it is a projection of the connections that
+tenant already has.
+
+### Transport
+
+**HTTP** for everything one-shot: catalogue reads, credential and connection management, stateless
+`invoke`, the whole management surface.
+
+**One websocket per connected agent** for the three things that do not fit request/response, which
+are all the same shape — a long-lived authenticated bidirectional frame stream:
+
+1. inbound events (`subscribe`),
+2. streamed operation output (`logs -f`, process stdout, a socket read loop),
+3. lease liveness — the host must learn the holder died so it can release what it is holding.
+
+flux needs no new concept to consume this. `flux-channels` already has a generic `connector` channel
+kind that reads a manifest and drives a binding locally; a `mode = "remote"` setting opens a stream
+instead of binding a listener, and `trigger { on = … }` is unchanged because the event names come
+from the same manifest either way.
+
+## Principals and grants
+
+flux-exchange's primary caller is an **agent**, not a human. Humans sign in to manage and to observe.
+That inverts the usual assumption and it has to be in the model from the start rather than bolted on.
+
+**Three principal kinds, one grant model:**
+
+- **User** — a human. Manages connections, credentials, groups; may run operations interactively.
+- **Agent** — a non-human principal holding its own minted token, belonging to roles.
+- **Service** — another backend acting on behalf of `(account, actor)`. Products that already front
+  a connector service tend to have invented this header set independently, so adopting the model is
+  usually a rename rather than a change.
+
+A grant is `(principal | role) × connection × operation-selector`, and the selector is a **predicate
+over declared metadata** — `risk <= low`, `effects ⊆ {network}`, `idempotency = idempotent` — plus
+explicit allow/deny by operation id for exceptions. Writing it over metadata rather than over names
+is what stops it drifting: the catalogue already publishes `risk`, `effects` and `idempotency` for
+every operation, so "this role may only call non-writing operations" is checkable rather than
+maintained.
+
+The property that makes agent principals safe:
+
+> **An agent's token grants access to an operation, never to a credential.** The credential is
+> resolved by the host from the connection the grant names. A stolen agent token yields a bounded
+> operation set against one tenant's connections — never a vendor token.
+
+## Workflows are stored programs, not a second model
+
+flux-exchange needs to persist "workflows": triggers, conditions, schedules, and flows of operations
+that may or may not involve an agent. `flux-app` already is this — a `.flux` program declaring
+`agent`, `channel`, `datasource`, `trigger` and `journey`, where an agent is one node kind and
+nothing requires one.
+
+**Decision: a workflow is a stored, versioned, per-tenant `flux-app` Program.** A visual editor emits
+the IR; the IR lowers to Flux. The simplified schema an editor wants is a *projection*, never a
+second execution model.
+
+What that buys, and why any other choice is worse: determinism, replay, fork/diff, approval gates,
+typing, and risk derivation all come free, and a composed operation becomes **indistinguishable from
+a vendor one** — same catalogue entry, same gating, same address. An agent cannot tell whether an
+operation came from an OpenAPI document or from someone dragging boxes, which is precisely what makes
+the editor useful to agents rather than only to humans.
+
+This also means flux-exchange never ships an interpreter, which keeps flux-connectors' north star
+(*"a connector is compiled, never interpreted"*) intact across the whole family.
+
+**Unblocked upstream; not yet downstream — and the distinction is the whole story.** The prerequisite
+was `http.request` returning a flat string, which refused any composite operation reading a field out
+of a previous step's response. It now returns the record `{status, headers, body}` as canonical
+`content`, keeping the flat rendering as the model-facing `view` (`flux-web/src/http.rs`).
+
+That landed in flux at **v0.43.0**. **flux-connectors pins `codewandler-flux-web` 0.41.0**, where it
+is still the flat string — so `$resp.body.data.id` is selectable in flux today and *not* in
+flux-connectors, whose `Graph` → composite-operation lowering therefore still refuses correctly for
+its pinned dependency. The unblock is real, it is upstream, and it reaches the connector compiler on a
+flux-web bump and not before.
+
+Recording it this way rather than as "unblocked" is deliberate: the first draft of this document said
+the latter, and a reader acting on it would have rewritten a live refusal that is correct for the
+version actually in the lockfile. Downstream migration plans naming this as a blocker should be
+re-checked against the *pin*, not against flux's HEAD.
+
+## How a downstream product reuses this without forking it
+
+The requirement: a product must be able to adopt flux-exchange without a rewrite, and without its own
+concerns leaking into a public repository. Both halves matter — a reuse story that requires a fork is
+not reuse, and one that requires the shared repository to learn a customer's name is not shared.
+
+**The mechanism is ports plus published crates, not a fork.**
+
+- flux-exchange publishes its host as a **crate**, not only a binary: routes, tenancy, the grant
+  model and the runtime registry, all behind traits. A product composes that crate into its own
+  binary with its own identity adapter, its own secret store, and any additional runtimes.
+- **Identity is a port.** flux-exchange ships an OIDC adapter for self-serve sign-in and a dev mode;
+  a product with its own IdP binds token introspection instead. Same trait.
+- **The secret store, the transport and the runtime registry are already ports** in
+  `connector-pack` / `connector-secrets`.
+
+This makes the no-leak rule structural rather than disciplinary: the public crate has no downstream
+dependency to leak through, because it has only traits. It is also why the reuse story is documented
+here in the abstract and the adoption plan lives in the adopting repository — the split is the rule
+working, not an omission.
+
+One fact belongs here rather than downstream, because it is a property of this family and more than
+one consumer has recorded it wrongly:
+
+> **The connector crates are published.** `codewandler-connector-{catalog,spec,secrets,pack}` are all
+> on crates.io at **0.8.0** as of 2026-07-31. Documents in at least two repositories still record a
+> verified 404 and plan around a `path`/`git` dependency. Re-check before designing around it.
+
+Two patterns generalize from the first adoption and are worth stating for the next one:
+
+- **An HTTP consumer cannot tell a folded host from a remote one**, so folding the exchange into a
+  product's own process as an interim and splitting it out later is a configuration change rather
+  than a migration — provided the consumer speaks to it over HTTP from the first day.
+- **An existing hand-written integration becomes a runtime behind the host** rather than something to
+  port operation-by-operation before the host is useful. Its binary becomes an implementation detail
+  of one deployment instead of a published, versioned artifact — which is the distribution tax this
+  whole family exists to remove.
+
+## Open questions
+
+- **Whether flux-exchange's console reuses flux-connectors' explorer components.** They import no
+  framework by tested invariant, so they are mountable — but the two data models are cousins, not the
+  same type. Deferred to the flux-exchange charter.
+- **Whether `subscribe` ships before or after multi-tenant sign-in.** The inbound confused-deputy
+  argument above is sound only once a principal exists; until then a loopback bind is what stands in
+  for one, exactly as it does for `invoke`.
+- **Contract conformance.** `flux-connectors/docs/designs/connector-contracts.md` is hard-blocked on
+  a global operation-naming story (C-23, `backlog`, never started) because `fills_slot` *infers*
+  conformance from trailing name segments. That inference is measurably broken in both directions —
+  a bare `list` now matches 42 of 53 providers, and `put` matches nothing at all. **Recommendation:
+  drop inference and declare conformance explicitly** (a service states
+  `secret_store.get = "onepassword-item-get"`), which dissolves C-23 as a prerequisite for roughly
+  the cost of one IR field. Not decided here; it belongs to flux-connectors' board.
+
+## Related
+
+- [`docs/ecosystem.md`](../ecosystem.md) — the description this design produces
+- [`docs/concepts.md`](../concepts.md) — the shared vocabulary
+- [`docs/vision.md`](../vision.md) — flux's own charter, unchanged by this document

@@ -1,10 +1,3 @@
----
-sidebar_position: 3
-title: Concepts
-description: "The flux vocabulary: the one boundary, the terms that describe it, and what each crate is responsible for."
----
-
-<!-- BEGIN generated:concepts -->
 # Concepts
 
 This page defines the words the rest of the documentation uses. Read it before the agent, language,
@@ -316,4 +309,3 @@ consumer is exactly the condition that changes.
 - [Flux-Lang overview](https://codewandler.github.io/flux/docs/language/overview) — the authored language around model boundaries.
 - [Infrastructure](https://codewandler.github.io/flux/docs/infrastructure) — how the pieces fit at runtime.
 - [Ecosystem](./ecosystem.md) — flux, flux-connectors and flux-exchange.
-<!-- END generated:concepts -->

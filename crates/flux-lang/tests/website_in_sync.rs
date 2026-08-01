@@ -6,6 +6,11 @@
 //!    (`flux_lang::prelude::prelude_type_rows()`).
 //!  - `website/docs/whats-new.md` carries the customer-facing release history from the root
 //!    `WHATS-NEW.md` (minus its maintainer comment and duplicate H1).
+//!  - `website/docs/concepts.md` and `website/docs/ecosystem.md` carry the bodies of
+//!    `docs/concepts.md` and `docs/ecosystem.md`. These two pages are authored in the contributor
+//!    tree because they are read from both sides — a contributor deciding where a change belongs,
+//!    and a user deciding what to install — and a fork between those audiences is how a public page
+//!    ends up contradicting the tree it documents. The website copy owns only its frontmatter.
 //!
 //! Both derive from the same catalogs as `tests/skill_in_sync.rs` (the language skill + the
 //! in-crate `docs/reference.md`), so the website can never carry a stale hand-edited mirror.
@@ -152,4 +157,59 @@ fn website_customer_changelog_is_in_sync() {
         "website/docs/whats-new.md is out of date — regenerate with `FLUX_UPDATE_GOLDEN=1 cargo \
          test -p codewandler-flux-lang --test website_in_sync`"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Contributor-authored pages mirrored to the site
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The body of a `docs/` page: everything after any frontmatter block, trimmed.
+///
+/// These sources carry no Docusaurus frontmatter — the website copy owns that — so this is a plain
+/// read today. The strip is kept because a source that grows frontmatter would otherwise duplicate
+/// it into the mirror and break the site build, which is a failure worth making impossible rather
+/// than remembering.
+fn docs_page_body(rel: &str) -> String {
+    let source =
+        std::fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let body = match source.strip_prefix("---") {
+        Some(rest) => rest
+            .split_once("\n---")
+            .map_or(source.as_str(), |(_, after)| after),
+        None => source.as_str(),
+    };
+    body.trim().to_string()
+}
+
+/// Assert (or regenerate) one mirrored page.
+fn assert_mirrored(source: &str, target: &str, tag: &str) {
+    let path = repo_path(target);
+    let begin = format!("<!-- BEGIN generated:{tag} -->");
+    let end = format!("<!-- END generated:{tag} -->");
+    let block = format!("{begin}\n{}\n{end}", docs_page_body(source));
+
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let expected = splice(&content, &begin, &end, &block);
+
+    if golden_mode::mode() == Mode::Rewrite {
+        std::fs::write(&path, &expected)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        golden_mode::rewrote(&path);
+    }
+    assert_eq!(
+        content, expected,
+        "{target} is out of date with {source} — regenerate with \
+         `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync`"
+    );
+}
+
+#[test]
+fn website_concepts_mirrors_the_contributor_page() {
+    assert_mirrored("docs/concepts.md", "website/docs/concepts.md", "concepts");
+}
+
+#[test]
+fn website_ecosystem_mirrors_the_contributor_page() {
+    assert_mirrored("docs/ecosystem.md", "website/docs/ecosystem.md", "ecosystem");
 }

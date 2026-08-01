@@ -25,6 +25,8 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 ## Map
 | If you want… | Read |
 |---|---|
+| **The shared vocabulary** — every term the docs use | [concepts.md](concepts.md) — *authored here; `website/docs/` mirrors it, guarded by `website_in_sync`* |
+| **The three projects** — flux, flux-connectors, flux-exchange, and who owns what | [ecosystem.md](ecosystem.md) — *authored here, same mirror*; reasoning in [designs/ecosystem.md](designs/ecosystem.md) |
 | Why flux exists; the principles | [vision.md](vision.md) |
 | The design — layers, safety envelope, loop, **crate map** | [architecture.md](architecture.md) |
 | Status + what's next | [roadmap.md](roadmap.md) |
