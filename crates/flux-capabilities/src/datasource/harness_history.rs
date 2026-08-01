@@ -580,17 +580,13 @@ fn message_title(message: &HarnessMessage, redactor: &Redactor) -> String {
     contain(&parts.join(" · "), redactor)
 }
 
-/// The `meta` the design fixes. **Every string value goes through [`contain`]**, exactly as `body`,
-/// `title` and `id` do (C-316).
+/// The `meta` the design fixes. **Every transcript-derived string goes through [`contain`]**, exactly
+/// as `body`, `title` and `id` do (C-316): `session_id`, `model`, `workspace` and `path`.
 ///
-/// Uniformly, rather than per key. `harness` and `role` are enum ids and pass through untouched, and
-/// spelling the rule as "meta strings are contained" instead of "these three keys are transcript-
-/// derived" is what stops the next field added here from being the one that is not.
-///
-/// C-215 redacted these and did not escape them, on the reasoning that nothing model-visible renders
+/// C-215 redacted those and did not escape them, on the reasoning that nothing model-visible renders
 /// record `meta`. That was true and is *still* true — [`records_to_context_blocks`] builds its own
 /// `{source, entity}` meta and drops the record's, and `render_match`/`render_record` print only
-/// id/title/body — but a comment there claimed the opposite ("renders string meta as tag
+/// id/title/body — but a comment here claimed the opposite ("renders string meta as tag
 /// attributes"), which is how a latent hazard becomes a live one. Two things are worth keeping
 /// straight if a renderer ever does pass this meta on:
 ///
@@ -600,18 +596,27 @@ fn message_title(message: &HarnessMessage, redactor: &Redactor) -> String {
 /// - what [`contain`] buys is the *body* surface: a meta value rendered as text can no longer close
 ///   the block around it.
 ///
+/// **`harness` and `role` are exempt, and the exemption is the point rather than an oversight.** They
+/// are `HarnessKind`/`MessageRole` ids — this crate's own closed enums, never a byte of transcript —
+/// so there is nothing in them to contain. And `harness` is load-bearing beyond that: it is the key
+/// the selector lowers onto ([`record_is_from`] compares it to [`HarnessKind::id`]), so putting it
+/// through a lossy transform would make a filter's correctness depend on what the operator happens to
+/// have registered with the redactor. A registered value occurring inside a harness id would rewrite
+/// every one of that harness's records to `[redacted]` and `search(harness: …)` would then answer "no
+/// matches" over an index that holds the rows — silently, because the failure direction is
+/// under-return rather than leakage. Pinned by
+/// `the_harness_id_in_meta_is_exempt_from_containment_because_it_is_the_filters_key`. The session
+/// envelope's `meta` follows the same split, in [`SessionEnvelope::project`].
+///
 /// [`records_to_context_blocks`]: super::records_to_context_blocks
 fn message_meta(message: &HarnessMessage, redactor: &Redactor) -> Value {
     let mut meta = Map::new();
-    meta.insert(
-        "harness".into(),
-        json!(contain(message.harness.id(), redactor)),
-    );
+    meta.insert("harness".into(), json!(message.harness.id()));
     meta.insert(
         "session_id".into(),
         json!(contain(&message.session_id, redactor)),
     );
-    meta.insert("role".into(), json!(contain(message.role.id(), redactor)));
+    meta.insert("role".into(), json!(message.role.id()));
     meta.insert(
         "model".into(),
         match &message.model {

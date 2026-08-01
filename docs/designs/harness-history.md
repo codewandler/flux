@@ -315,8 +315,9 @@ not audit the JSON walkers; that is filed separately.
   `sessionID` in `message.data` falls back to the message's own id, and envelopes then scaled
   one-for-one with messages. The scan budget did not bound this retention.
 - **`meta`'s string values are redacted but not escaped** (`workspace`, `model`, `path`), where the
-  body, title and id are both — *closed in C-316:* every string value in `meta` now goes through
-  `contain`, uniformly rather than per key.
+  body, title and id are both — *closed in C-316:* every **transcript-derived** string in `meta` now
+  goes through `contain`. `harness` and `role` stay exempt, and the reason is recorded at the
+  definition rather than left to be rediscovered — see below.
 
 ## C-316 — the bound, and what it does not bound
 
@@ -362,3 +363,16 @@ value it writes, and `escape_knowledge_base_body` is not an attribute escaper �
 `meta` buys is the *body* surface, for a future renderer that prints a meta value as text. The comment
 in `message_meta` that claimed `records_to_context_blocks` renders record `meta` as tag attributes was
 wrong (it builds its own `{source, entity}`) and is corrected.
+
+**`harness` and `role` are exempt, deliberately, and the exemption is narrower than the tidier rule.**
+Containing every meta string uniformly is the rule that reads better and it is wrong here. Both are
+`HarnessKind`/`MessageRole` ids — this crate's own closed enums, never a byte of transcript — so there
+is nothing in them to contain; and `harness` is the key the selector lowers onto (`record_is_from`
+compares it to `HarnessKind::id`). Running it through the redactor would make a filter's correctness
+depend on the operator's secret list: register a value that occurs inside a harness id and every
+record of that harness gets `meta.harness = "[redacted]"`, after which `search(harness: …)` answers
+"no matches" over an index that holds the rows. The failure direction is under-return rather than
+leakage, so nothing else would have caught it —
+`the_harness_id_in_meta_is_exempt_from_containment_because_it_is_the_filters_key` pins both halves:
+the harness id survives a redactor holding it, and a transcript-derived meta value carrying the same
+substring does not.

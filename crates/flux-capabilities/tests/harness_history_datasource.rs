@@ -723,6 +723,77 @@ fn every_message_record_carries_the_harness_it_came_from() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// The one `meta` string C-316 deliberately leaves **out** of `contain`, and why: `meta.harness` is
+/// the harness filter's key (`record_is_from` compares it to `HarnessKind::id`), not transcript text.
+///
+/// Containing every meta string uniformly is the tidier rule and it is wrong here, because it makes
+/// a filter's correctness depend on the operator's secret list: register a value that occurs inside
+/// a harness id and every record of that harness gets `meta.harness = "[redacted]"`, after which
+/// `search(harness: …)` answers "no matches" over an index that holds the row. The damage is
+/// under-return rather than leakage, which is exactly why nothing else in this file would catch it —
+/// every other test builds a bare `Redactor::new()`, for which `contain` on an enum id is a no-op.
+///
+/// The exemption is narrow, and this test pins both halves: the harness id survives, and a
+/// transcript-derived meta value carrying the very same substring does not.
+#[tokio::test]
+async fn the_harness_id_in_meta_is_exempt_from_containment_because_it_is_the_filters_key() {
+    let home = scratch("harness-key");
+    let opencode = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode).unwrap();
+    seed_opencode(&opencode.join("opencode.db"));
+    let env = HarnessEnv::empty().with("HOME", &home);
+
+    // A registered secret that happens to occur inside the harness id — and inside the fixture's
+    // workspace path, which is transcript-derived and must still be redacted.
+    let redactor = Redactor::new();
+    redactor
+        .try_add_secret("opencode")
+        .expect("above the registration floor");
+
+    let backend = Arc::new(MemoryBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    let history = HarnessHistory::enabled_for([HarnessKind::Opencode]).with_env(env);
+    ingest_harness_history(&*dynamic, &history, &redactor).unwrap();
+
+    let message = backend
+        .get(&GetInput {
+            source: HARNESS_SOURCE.to_string(),
+            entity: HARNESS_MESSAGE_ENTITY.to_string(),
+            id: "opencode/o-1/0".to_string(),
+        })
+        .unwrap()
+        .expect("the record is in the index whatever the redactor holds");
+    assert_eq!(
+        message.meta.get("harness"),
+        Some(&json!("opencode")),
+        "the filter's key is not transcript text and does not go through the redactor: {}",
+        message.meta
+    );
+    assert_eq!(
+        message.meta.get("workspace"),
+        Some(&json!("/work/[redacted]")),
+        "the redactor really is live — the exemption is the harness id, not the whole map: {}",
+        message.meta
+    );
+
+    // End to end: the selector still reaches the record.
+    let hit = search_op(dynamic, &history)
+        .execute(
+            &ctx(),
+            json!({"query": "retry wrapper", "harness": "opencode"}),
+        )
+        .await
+        .unwrap();
+    assert!(!hit.is_error, "{}", hit.content);
+    assert!(
+        hit.content.contains("opencode/o-1/0"),
+        "a harness-filtered search is unaffected by what the redactor holds: {}",
+        hit.content
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Streaming — ingest must not materialize a harness's whole history
 // ---------------------------------------------------------------------------------------------
