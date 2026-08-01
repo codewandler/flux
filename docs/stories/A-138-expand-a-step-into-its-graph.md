@@ -2,11 +2,11 @@
 id: A-138
 title: "Expand a step into its execution graph — the moment the architecture becomes visible"
 pillar: Agent
-status: backlog
+status: blocked
 design: docs/designs/agent-loop-visibility.md
 epic: agent-loop-visibility
 areas: [flux-tui, flux-lang]
-note: "reuses what exists: crates/flux-tui/src/plan.rs already renders a flow.plan observation as a styled DAG, preferring plan_ast so the tree is syntax-highlighted via flux_flow::render::render_styled. Do not grow a second plan renderer"
+note: "⚠ PREMISE UNDERMINED by A-145: the captured real session accepted 127 plans, EVERY ONE a single op, and `plan_ast` is never persisted at all — so there was no DAG to draw and A-144's graph mock pictured a payload the log does not contain. Re-scope or establish that a real authored flow does produce one, BEFORE building"
 ---
 
 # Show the program the model is being called from
@@ -20,6 +20,22 @@ so an observer can see the model call as one typed node inside an authored progr
 
 flux's claim is that the LLM is not the runtime. Everywhere else that is an assertion. Here it is
 visible: the graph is the program, and the model call is a node in it.
+
+## ⚠ A-145 found there may be nothing to draw
+
+Blocking, and it must be settled before any of the Acceptance below is worth attempting. Driving the
+mocks from a real recorded session (191 steps, 9 turns) found:
+
+- the session accepted **127 plans, every one a single op** — no DAG, nothing to expand into;
+- **`plan_ast` is never persisted**, so A-144's syntax-highlighted graph mock pictured a payload the log
+  does not contain;
+- rendered graph-first, that run draws **one line and hides 189 of 191 steps**.
+
+⚠ The distinction that decides this story: is `plan_ast` absent from **the log**, from **that capture**,
+or from **adaptive runs only**? An *authored* flow — `flux flow run` over a real `.flux` file — plausibly
+does produce a multi-node plan, and the demo case is an authored loop. **Establish which, first.** If
+the answer is "adaptive runs are single-op by construction", this story is about authored flows only and
+should say so in its title.
 
 ## Acceptance
 

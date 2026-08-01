@@ -2,8 +2,7 @@
 id: A-145
 title: "Replace the mocks' hand-authored flow with a real recorded run — and re-check the recommendation against it"
 pillar: Agent
-status: in-progress
-priority: 6
+status: done
 design: docs/designs/agent-loop-visibility.md
 epic: agent-loop-visibility
 areas: [flux-tui, docs]

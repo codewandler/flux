@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The loop-view comparison now runs on a real recorded session** (A-145). A 191-step, 9-turn session is
+  captured to `crates/flux-tui/src/loopmock/captures/` and drives all five mocks, replacing a fixture
+  written by the same context that then chose a layout from it.
+  **It confirmed the headline and corrected three things.** Condensing's win is **concentrated, not
+  uniform** — 36 of 55 real phases are exactly one step, while one is 57, where the whole saving lives;
+  the even 3–6-step phases of a hand-authored fixture made it look smooth. The split and the flat thread
+  hide the **same** 166 of 191 steps, so the split's advantage is **coverage, not capacity**. And real
+  nesting is **three levels, not eight** — the indentation tax that cost the tree its ranking was charged
+  against a depth the log has never recorded.
+  ⚠ **Two findings about the log itself**, which matter beyond this story: **`plan_ast` is never
+  persisted** and the session accepted 127 plans that were **every one a single op** — so there was no
+  DAG for a graph-first view to draw (A-138 is now blocked pending re-scope); and **observations are
+  batch-flushed at the turn watermark**, 250 of them spanning 33 minutes landing within 100 ms of
+  `turn_ended`, so `ts` paces `run` events faithfully and observations not at all.
+  The capture is an allow-list rather than a filter — every `Observation` dropped, free text cut to 100
+  characters — and four candidate sessions were **rejected as unpublishable** rather than scrubbed.
+
 - **Five loop-view mocks of one flow, and a recommendation for the live view** (A-144). Internal design
   artifact under `crates/flux-tui/src/loopmock/`, with a committed 50-render side-by-side set at
   `docs/designs/agent-loop-visibility-mocks.md` and an interactive
