@@ -1,10 +1,24 @@
 use super::*;
 
-/// Why this invocation must use the fail-closed unattended sandbox profile. Interactive REPL/TUI
-/// use is deliberately absent: those surfaces retain the operator-visible `off`/`on`/`require`
-/// contract, while auto-approved or serving work has no human approval boundary to fall back on.
-fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
+/// Why this invocation must use the fail-closed unattended sandbox profile — and, for every
+/// subcommand that must not, why not.
+///
+/// The profile covers work with **no human approval boundary to fall back on**: auto-approved
+/// turns, serving listeners, and direct headless invocation. Everything else retains the
+/// operator-visible `off`/`on`/`require` contract.
+///
+/// **The match is deliberately exhaustive — do not add a `_` arm.** The defect C-410 removed was a
+/// hand-maintained enumeration silently drifting from `Commands`: a `_ => None` fallback classified
+/// `flux plugin call` (a headless plugin invocation with no approver and no dispatcher) as
+/// interactive, purely because nobody had written an arm for it. Without a wildcard, a new
+/// subcommand is a *compile error* until someone decides which side of the floor it belongs on, and
+/// flux-codegate's `the_unattended_classifier_covers_every_commands_variant` fails if the wildcard
+/// comes back or a variant stops being named here.
+pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
     match cli.command.as_ref()? {
+        // ---------------------------------------------------------------------------------------
+        // Pinned to the fail-closed profile (C-262).
+        // ---------------------------------------------------------------------------------------
         Commands::Run { agent, .. } if agent.yes => Some("auto-approved `flux run --yes`"),
         Commands::Fork { agent, .. } if agent.yes => Some("auto-approved `flux fork --yes`"),
         Commands::Record { agent, .. } if agent.yes => Some("auto-approved `flux record --yes`"),
@@ -24,7 +38,72 @@ fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
             Some("auto-approved `flux preset --run --yes`")
         }
         Commands::Review { .. } => Some("auto-approved `flux review` strict-review flow"),
-        _ => None,
+        // C-410: `flux plugin call <name> <op>` invokes a plugin operation directly — no
+        // interactive approver, and (per this crate's own scoping rule) outside `Executor::dispatch`
+        // entirely. It spawns exactly the native code an auto-approved turn's plugin tool call
+        // spawns, so it inherits the same floor instead of running at the `Off` default.
+        Commands::Plugin {
+            action: Some(PluginAction::Call { .. }),
+        } => Some("headless `flux plugin call`"),
+
+        // ---------------------------------------------------------------------------------------
+        // Explicitly exempt. Each group states what stands in for the floor.
+        // ---------------------------------------------------------------------------------------
+        // Nothing here can auto-approve: without `--yes` a prompt turn installs `StdinApprover`
+        // (`resolve_permissions`, execution.rs) and waits for the operator, while a
+        // `<program.flux>` — reached through `flux run <app.flux>` as well as `flux app run` —
+        // installs `DenyApprover` ([`app_run_approver`], app_cmd.rs) and refuses every call that
+        // needs approval rather than allowing it.
+        //
+        // The unflagged `flux app run <program>` is named here on purpose: it *is* long-running and
+        // event-driven (cron / webhook / Slack channels fire with no operator attached), so what
+        // exempts it is not "a human is watching" but the deny-by-default approver. That premise is
+        // pinned by `the_unflagged_app_run_approver_denies_every_call` — flip `app_run_approver`
+        // and this exemption stops being true, and that test says so.
+        Commands::Run { .. }
+        | Commands::Fork { .. }
+        | Commands::Record { .. }
+        | Commands::Tui { .. }
+        | Commands::Flow { .. }
+        | Commands::Preset { .. }
+        | Commands::App { .. } => None,
+        // `flux eval` runs its suites by spawning child `flux … --yes` processes
+        // (`flux-eval`'s `runner.rs`); each child re-enters this classifier on its own argv and
+        // gets the floor there. Pinning the parent would confine the orchestrator, not the work.
+        Commands::Eval { .. } => None,
+        // A2A talks to a *remote* agent over HTTP: the turn, its tools and its spawns all happen on
+        // the other side, under that deployment's own posture. There is no local execution to
+        // confine.
+        Commands::A2a { .. } => None,
+        // The rest of `flux plugin …` is operator-driven management, not operation invocation.
+        // `status`/`refresh` do spawn the plugin to read its manifest and `install --git` builds
+        // unverified source — but each is a foreground command the operator typed (and the source
+        // build additionally requires an explicit confirm, `confirm_source_build` in plugin_cmd.rs),
+        // none of them is reachable from a model, and pinning them would make plugin *management*
+        // impossible on a host with no backend without confining anything an agent can drive.
+        Commands::Plugin { .. } => None,
+        // Hermetic replay of an already-recorded world: no model call, no live IO, side effects
+        // never re-fired (`flux replay`), and `flux test` re-runs the real agent against the
+        // cassette under a deny-all approver and a never-called provider.
+        Commands::Replay { .. } | Commands::Test { .. } => None,
+        // Operator-facing reads, reports and local file writes. None of them starts a turn, none is
+        // reachable from a model, and each runs in the foreground on argv the operator typed —
+        // there is no autonomous execution here for the profile to bound.
+        Commands::Render { .. }
+        | Commands::Loop { .. }
+        | Commands::Sessions { .. }
+        | Commands::Wakeups { .. }
+        | Commands::Usage(..)
+        | Commands::Diff { .. }
+        | Commands::Export { .. }
+        | Commands::Auth { .. }
+        | Commands::Endpoint { .. }
+        | Commands::Policy { .. }
+        | Commands::Catalog { .. }
+        | Commands::Skill { .. }
+        | Commands::Changelog { .. }
+        | Commands::Completion { .. }
+        | Commands::Doctor { .. } => None,
     }
 }
 

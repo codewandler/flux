@@ -347,6 +347,24 @@ pub(super) fn assemble_app_execution_environment(
     .with_workspace(workspace)
 }
 
+/// The approval posture a `flux app run <program>` executor runs under: `--yes` auto-approves every
+/// call, and without it every call that needs approval is **denied** rather than queued at a prompt
+/// — a program's channels (cron, webhook, Slack) fire with no operator attached, so there is nobody
+/// to answer one.
+///
+/// Factored out of [`run_app`] because `unattended_sandbox_surface` (dispatch.rs) exempts the
+/// unflagged `flux app run <program>` from C-262's fail-closed sandbox floor **on the strength of
+/// this deny-by-default posture**, and an exemption whose premise lives inside a 300-line async fn
+/// is an exemption no test can hold to account. See
+/// `the_unflagged_app_run_approver_denies_every_call`.
+pub(super) fn app_run_approver(auto_approve: bool) -> Arc<dyn Approver> {
+    if auto_approve {
+        Arc::new(AllowApprover)
+    } else {
+        Arc::new(flux_runtime::DenyApprover)
+    }
+}
+
 pub(super) async fn run_app(
     path: Option<&str>,
     flags: &AgentFlags,
@@ -628,15 +646,10 @@ pub(super) async fn run_app(
         _ => None,
     };
     try_register_fleet(&mut integration_registry, ledger)?;
-    let approver: Arc<dyn Approver> = if auto_approve {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(flux_runtime::DenyApprover)
-    };
     let environment = assemble_app_execution_environment(
         system,
         integration_registry,
-        approver,
+        app_run_approver(auto_approve),
         app_workspace,
         redactor,
         resource_limits,
@@ -817,6 +830,54 @@ fn tui_options(
         .ok()
         .and_then(|cfg| cfg.theme);
     options
+}
+
+#[cfg(test)]
+mod app_run_approval_posture {
+    //! C-410: the premise the sandbox-floor exemption for an unflagged `flux app run <program>`
+    //! rests on.
+    //!
+    //! `unattended_sandbox_surface` (dispatch.rs) pins auto-approved and serving surfaces to the
+    //! fail-closed `Require` posture and leaves this one on the interactive `off`/`on`/`require`
+    //! contract. That is a defensible call **only** while the unflagged form cannot auto-approve
+    //! anything: its channels (cron, webhook, Slack) fire with no operator attached, so if the
+    //! approver ever became permissive the surface would be a headless auto-approving daemon
+    //! outside the floor — the exact shape C-262 exists to catch.
+    //!
+    //! So this asserts the posture as *behaviour* (what the approver answers) rather than as a
+    //! type, and the `--yes` half is here too: an assertion that "it denies" proves nothing unless
+    //! the same function is shown to allow when it is supposed to.
+
+    use super::*;
+
+    use flux_runtime::ApprovalChoice;
+    use flux_spec::IntentSet;
+
+    #[tokio::test]
+    async fn the_unflagged_app_run_approver_denies_every_call() {
+        let approver = app_run_approver(false);
+        let choice = approver
+            .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
+            .await;
+        assert!(
+            matches!(choice, ApprovalChoice::Deny),
+            "an unflagged `flux app run <program>` is exempt from the C-262 sandbox floor because \
+             it denies by default; this approver answered {choice:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_yes_flagged_app_run_approver_still_allows() {
+        let approver = app_run_approver(true);
+        let choice = approver
+            .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
+            .await;
+        assert!(
+            matches!(choice, ApprovalChoice::Allow),
+            "`flux app run --yes` must still auto-approve (it is pinned to the floor instead); \
+             this approver answered {choice:?}"
+        );
+    }
 }
 
 #[cfg(test)]

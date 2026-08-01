@@ -4940,6 +4940,61 @@ mod tests {
         );
     }
 
+    /// **C-410.** The classification itself, subcommand by subcommand — read straight off
+    /// `unattended_sandbox_surface` with no environment mutation, so it says what the profile
+    /// *covers* rather than what one host's backend discovery happens to do about it.
+    ///
+    /// The three rows this story exists for are the last three: `flux plugin call` is pinned (it
+    /// invokes a plugin operation with no approver and outside `Executor::dispatch`), the rest of
+    /// `flux plugin …` is not (operator-driven management — pinning it would only break plugin
+    /// management on a backend-less host), and an unflagged `flux app run <program>` is not (it
+    /// denies every call needing approval, per `app_run_approver`). Before C-410 the whole `plugin`
+    /// subcommand fell through a `_ => None` that nobody had chosen.
+    #[test]
+    fn the_unattended_profile_classifies_each_surface_deliberately() {
+        use clap::Parser;
+
+        let classify = |argv: &[&str]| {
+            super::unattended_sandbox_surface(
+                &super::Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}")),
+            )
+        };
+
+        for pinned in [
+            &["flux", "run", "--yes", "hi"][..],
+            &["flux", "fork", "s_1", "--at", "0", "--yes"][..],
+            &["flux", "flow", "run", "f", "--yes"][..],
+            &["flux", "app", "run", "--serve", "--yes", "-m", "mock"][..],
+            &["flux", "app", "run", "p.flux", "--yes"][..],
+            &["flux", "review", "--files", "README.md"][..],
+            &["flux", "plugin", "call", "gitlab", "issue_list"][..],
+        ] {
+            assert!(
+                classify(pinned).is_some(),
+                "{pinned:?} must inherit the fail-closed unattended profile"
+            );
+        }
+
+        for exempt in [
+            &["flux", "run", "hi"][..],
+            &["flux", "tui"][..],
+            &["flux", "sessions"][..],
+            &["flux", "app", "run", "p.flux"][..],
+            &["flux", "plugin", "ls"][..],
+            &["flux", "plugin", "status"][..],
+            &["flux", "plugin", "install", "--all"][..],
+        ] {
+            assert_eq!(
+                classify(exempt),
+                None,
+                "{exempt:?} must stay on the interactive off/on/require contract"
+            );
+        }
+
+        // No subcommand at all is the REPL, which is as interactive as it gets.
+        assert_eq!(classify(&["flux"]), None);
+    }
+
     /// D-130 (findings 6/7/9b): `apply_sandbox_env` resolves posture **tightest-wins** — the
     /// strictest of `Require > On > Off` across `--sandbox`, a pre-set `FLUX_SANDBOX`, and config —
     /// so a laxer source can never silently downgrade a stricter one; the sole override is the

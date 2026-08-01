@@ -278,6 +278,62 @@ fn unattended_and_serving_surfaces_fail_closed_before_work() {
     }
 }
 
+/// **C-410's failing-first test.** `flux plugin call <name> <op>` invokes a plugin operation
+/// headlessly: no interactive approver, and — per this crate's own scoping rule — outside
+/// `Executor::dispatch` entirely. It is exactly the shape C-262's profile exists for, and it had no
+/// arm in `unattended_sandbox_surface` at all, so it ran at the `Off` default.
+///
+/// The plugin name is deliberately one that cannot be installed under this test's pinned `$HOME`.
+/// That is what makes the assertion sharp: the floor is a *startup* preflight, so the run must die
+/// on the posture before it ever resolves a descriptor or spawns a subprocess. Reaching the
+/// "not installed" error would mean the profile ran too late to protect the spawn it exists for.
+#[test]
+fn plugin_call_fails_closed_before_it_reaches_the_plugin() {
+    let run = run_flux(
+        "c410-plugin-call",
+        None,
+        false,
+        &["plugin", "call", "c410-never-installed", "echo"],
+    );
+    assert!(
+        !run.success,
+        "`plugin call` unexpectedly started with no usable sandbox backend\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        run.stderr.contains("unattended sandbox profile refused")
+            && run.stderr.contains("container/VM"),
+        "`plugin call` needs the same actionable fail-closed error the other headless surfaces \
+         get\nstderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("c410-never-installed"),
+        "the floor must be applied at startup, before any plugin resolution or spawn\nstderr:\n{}",
+        run.stderr
+    );
+}
+
+/// The other half of the classification, and what keeps the arm above from being a blanket pin on
+/// the whole `plugin` subcommand: the operator-facing, non-invoking plugin commands stay on the
+/// interactive `off`/`on`/`require` contract. `plugin ls` reads the descriptor store and prints —
+/// it invokes no operation, so pinning it would only make plugin *management* impossible on a host
+/// with no backend without buying any confinement.
+#[test]
+fn the_operator_facing_plugin_commands_are_not_pinned_to_the_floor() {
+    let run = run_flux("c410-plugin-ls", None, false, &["plugin", "ls"]);
+    assert!(
+        run.success,
+        "`plugin ls` must not inherit the fail-closed floor\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        !run.stderr.contains("unattended sandbox profile refused"),
+        "`plugin ls` invokes nothing and must stay on the interactive contract\nstderr:\n{}",
+        run.stderr
+    );
+}
+
 /// `FLUX_SANDBOXED=1` is accepted for real nested runs, but it is also forgeable ambient state.
 /// The unattended profile may proceed only with a prominent audit line recording that trust choice.
 #[test]

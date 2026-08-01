@@ -62,9 +62,13 @@ Policy semantics are the same wherever a backend is active:
 
 Interactive/local operation is off by default. The CLI automatically uses `require` with sandbox
 network closed for `--yes` on `run`, `fork`, `record`, `flow run`, or `app run`;
-`preset --run --yes`; the auto-approved `review` flow; and `flux app run --serve`. Those forms refuse
-startup when no backend is usable. A program that serves only its declared channels through an
-unflagged `flux app run <program>` is not classified as `--serve`; it still receives the CLI-resolved
+`preset --run --yes`; the auto-approved `review` flow; `flux app run --serve`; and
+`flux plugin call <name> <op>`, which invokes a plugin operation with no approver in the loop.
+Those forms refuse startup when no backend is usable. Every other subcommand is classified
+explicitly as *not* one of them, so a new subcommand cannot join the list by accident — the rest of
+`flux plugin …` is operator-driven management and stays on the interactive contract, and a program
+run through an unflagged `flux app run <program>` is not classified as `--serve`: it denies every
+call that needs approval instead of auto-approving one, and it still receives the CLI-resolved
 configuration and environment posture. Direct SDK/server embedders receive no automatic posture
 from `flux-server` and must inject a sandbox or export its environment settings. Both default to off
 with networking open when no posture is selected. Enable confinement with a flag, a config table,

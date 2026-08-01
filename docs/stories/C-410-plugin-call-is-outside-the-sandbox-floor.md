@@ -2,7 +2,7 @@
 id: C-410
 title: "`flux plugin call` is outside both the sandbox floor and the approval envelope"
 pillar: Core
-status: ready
+status: in-progress
 priority: 7
 epic: connector-platform
 areas: [flux-cli, flux-sdk]
@@ -36,16 +36,16 @@ C-404's hardening is the tell that this surface matters: it exists precisely bec
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test asserting `flux plugin call` runs under the fail-closed posture —
+- [x] **Failing-first**: a test asserting `flux plugin call` runs under the fail-closed posture —
       failing at the merge base, where it runs at `Off`.
-- [ ] Each of the three surfaces is **classified explicitly** — pinned to `Require`, or exempt with
+- [x] Each of the three surfaces is **classified explicitly** — pinned to `Require`, or exempt with
       the reason at the definition. No surface is left simply unenumerated.
-- [ ] ⚠ A check that fails when a **new** `Commands` variant appears without a classification. The
+- [x] ⚠ A check that fails when a **new** `Commands` variant appears without a classification. The
       defect here is a hand-maintained enumeration drifting from an enum, and this repo has a
       standing scar about guards that only restate their own assumptions — so verify it fires.
-- [ ] The SDK's position is documented at its public surface: an embedder owns the floor, or gets
+- [x] The SDK's position is documented at its public surface: an embedder owns the floor, or gets
       one.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
 
 ## Notes
 
@@ -55,3 +55,38 @@ C-404's hardening is the tell that this surface matters: it exists precisely bec
 ## Progress
 
 - Filed 2026-08-01 from the 0.47.1 security-posture review.
+- **`unattended_sandbox_surface` is now exhaustive over `Commands`** — the `_ => None` fallback is
+  gone and every one of the 28 variants is named by an arm, pinned or exempt-with-a-reason. That
+  makes rustc the primary drift check: a new subcommand does not compile until someone chooses a
+  side. Verified it fires by adding a `Commands::C410Probe` variant and watching
+  `dispatch.rs:18` red with `non-exhaustive patterns: &args::Commands::C410Probe { .. } not
+  covered`, then restoring.
+- **`flux plugin call` is pinned to the floor.** It invokes a plugin operation with no approver and
+  outside `Executor::dispatch`; it now inherits `require` + closed sandbox network like
+  `flux run --yes`. The rest of `flux plugin …` is not: `ls`/`status`/`install`/… are operator-driven
+  management, and pinning them would only make plugin management impossible on a backend-less host.
+- **`flux app run <program>` without `--serve`/`--yes` is exempt, with the reason at the arm** — it
+  installs `DenyApprover`, so every call needing approval is refused rather than auto-allowed. That
+  premise used to be an inline `if` inside a 300-line `run_app`; it is now `app_run_approver` with
+  `the_unflagged_app_run_approver_denies_every_call` holding it, so flipping the approver breaks a
+  named test instead of silently invalidating the exemption.
+- **The wildcard cannot come back quietly.** `flux-codegate`'s
+  `the_unattended_classifier_covers_every_commands_variant` parses `enum Commands` against the
+  classifier and fails on a catch-all arm or an unnamed variant, and
+  `the_coverage_scanner_sees_a_wildcard_and_a_missing_variant` proves the scanner sees both on
+  fixtures. Verified end to end by re-collapsing the exemptions to `_ => None` and watching it red.
+- **C-266's spawn census learned subcommand paths.** `FLAGLESS_UNATTENDED_SUBCOMMANDS` now carries
+  `"plugin call"` (matched as a contiguous argv window, so `plugin ls`/`status`/`refresh` spawns are
+  untouched). It immediately caught one true positive — `plugin_preflight_boundary.rs`'s C-404
+  spawns would have passed here and refused to start on a backend-less runner — now fixed with an
+  explicit `--no-sandbox`.
+- **The SDK's position is stated at its public surface**: crate root, the `Sandbox` re-export (with
+  both worked forms), and both doors' `auto_approve`/`with_sandbox`. `SandboxMode`/`Backend` are
+  re-exported as `flux_sdk::sandbox` because without them an embedder could not build the `Require`
+  settings the docs tell them to build.
+- Gate green: workspace build/test/clippy/fmt, `-p flux-codegate`, the nested `plugins/` workspace
+  build + fmt, `FLUX_BWRAP_BIN=/nonexistent/bwrap cargo test --workspace` (the no-backend posture CI
+  runs in), and `FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend`.
+- Not done here (fenced from this story): the CHANGELOG entry, the board row, and the customer-facing
+  `WHATS-NEW.md` note that `flux plugin call` now requires a sandbox backend — that last one is
+  user-visible and is owed.
