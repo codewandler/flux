@@ -27,7 +27,7 @@ fn root_examples_are_lsp_clean_and_round_trip_every_projection() {
         .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("flux"))
         .collect::<Vec<_>>();
     examples.sort();
-    assert_eq!(examples.len(), 15, "root .flux example census changed");
+    assert_eq!(examples.len(), 16, "root .flux example census changed");
 
     for path in examples {
         let source = std::fs::read_to_string(&path).expect("read example");
