@@ -41,6 +41,9 @@ pub(super) const SPEC: MockSpec = MockSpec {
         "a bottom split showing the node's runtime steps — which is also the only way \
                       this layout can show them at all",
     min_cols: 48,
+    // The program has a fixed height, so too few rows shows a fragment of a shape rather than the
+    // shape — which would flatter the one layout whose selling point is that it always fits.
+    min_rows: 8,
 };
 
 /// Which fixture step annotates each line of [`crate::plan::render`]'s output, by label prefix.

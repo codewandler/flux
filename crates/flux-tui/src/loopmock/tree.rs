@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 
 use super::{
     clip, header, ms, shorten, status_style, width, window, Axis, Fixture, MockSpec, Status, Tally,
-    Viewport, PAUSE_GLYPH,
+    Viewport, MIN_ROWS, PAUSE_GLYPH,
 };
 use crate::plan::MAX_TREE_DEPTH;
 use crate::theme::Theme;
@@ -30,6 +30,8 @@ pub(super) const SPEC: MockSpec = MockSpec {
     inspection_pane: "a bottom split under the tree — the tree wants all the width it can get, so \
                       it cannot give a pane a side",
     min_cols: 44,
+    // Header, footer, and enough rows that a subtree reads as a subtree rather than a fragment.
+    min_rows: MIN_ROWS,
 };
 
 const TIME_COL: usize = 7;

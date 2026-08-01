@@ -32,11 +32,13 @@ pub const LOAD_CASES: [LoadCase; 4] = [
 pub enum LoadCase {
     /// The flow as it reads in a demo: 15 steps, mid-run, everything visible.
     Tidy,
-    /// The flow as it reads on a real board: 49 steps across nine phases — more than fits.
+    /// The flow as it reads on a real board: 49 steps under nine top-level rows (a plan step
+    /// plus eight phases) — comfortably more than fits.
     LongRun,
     /// Nested delegation: a sub-agent that spawns a sub-agent, seven levels down.
     DeepNesting,
-    /// Six tracker-audit workers running at once, each mid-op.
+    /// Six tracker-audit workers, five of them running at once and one already finished —
+    /// what a fan-out actually looks like a few seconds in.
     FanOut,
 }
 
@@ -350,9 +352,8 @@ fn tidy() -> Fixture {
     )
 }
 
-/// 49 steps across nine phases — dozens of steps, comfortably more than any viewport holds. This
-/// is the case that separates the layouts whose cost is per-step from the ones whose cost is
-/// per-phase.
+/// 49 steps under nine top-level rows — comfortably more than any viewport here holds. This is the
+/// case that separates the layouts whose cost is per-step from the ones whose cost is per-phase.
 fn long_run() -> Fixture {
     use Status::*;
     use StepKind::*;
@@ -614,7 +615,7 @@ fn deep_nesting() -> Fixture {
     )
 }
 
-/// Six tracker-audit workers at once, each mid-op — `SpawnActivity` at the width the fleet pane
+/// Six tracker-audit workers, five still running — `SpawnActivity` at the width the fleet pane
 /// already sees. The case that punishes any layout with one column of attention.
 fn fan_out() -> Fixture {
     use Status::*;

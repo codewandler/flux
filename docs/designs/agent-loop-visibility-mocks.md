@@ -9,71 +9,85 @@ CHANGELOG, with a model-authored judgement step in the middle). Nothing here is 
 live run; see `crates/flux-tui/src/loopmock/mod.rs`.
 
 Each mock is drawn under the tidy case **and** the three that decide the question — a long
-run, deep nesting, a sub-agent fan-out — plus a narrow terminal and one below its floor.
+run, deep nesting, a sub-agent fan-out — plus a narrow terminal, its own floor, and one
+step under that floor in each dimension.
+
+⚠ **The comparison is confounded and the recommendation says so** — only mock 3 was given
+progressive disclosure, so the long-run gap measures condensing rather than a second
+column. Read the warning at the top of the recommendation before the pictures.
 
 ## The recommendation
 
 ```text
-BUILD MOCK 3 — the split (condensed rail + detail pane) — with mock 1 as its narrow fallback.
+FIRST, CONDENSE FINISHED PHASES. THEN BUILD MOCK 3 — the split (condensed rail + detail pane) —
+with mock 1 as its sub-64-column fallback. The two are separable, and the first is most of the win.
 
-Why, from the snapshots and not from taste. The question a live view has to keep answering while
-the run moves is "what is it doing right now, and is that reasonable". Read the 49-step long-run
-row of the matrix: the thread and the tree both scroll 23 rows away from the start and can show
-only a window; the timeline shows bars with no content; the graph shows a program that does not
-contain the running phase at all. The split is the only one that still shows the *whole* run —
-all nine phases, because a finished phase stays one row — and the current command, and its
-timing, at the same time. On the deep-nesting case it is the only layout that shows the model
-call's token cost and its streaming tail next to the chain that produced it. Both of those come
-from the same property: the rail's height is set by the program's phase count while the pane's
-content is set by one step, so neither grows with the run.
+⚠ READ THIS BEFORE THE REST — the comparison is confounded, and in mock 3's favour.
+Only mock 3 was given progressive disclosure. Its rail pre-filters to top-level steps plus the
+focused subtree (`split.rs`, `rail_rows`) before the shared scroll policy ever runs; mocks 1 and 2
+draw one row per step at every depth by construction, so of course they scroll off. The shared
+`window` helper keeps scrolling honest between the five, but it does nothing about the filter
+applied ahead of it. So when the long-run case shows mock 3 holding the whole run while the thread
+and the tree sit at `↑ 23`, that gap measures **condensing**, not **two columns**. A condensed
+one-column thread would hold the whole run too — nine top-level rows plus the running phase's four
+children, thirteen rows, against 49 steps; `condensing_and_not_the_second_column_is_what_makes_
+the_long_run_fit` measures exactly that. Take the cheap lesson first, and read what follows as the
+case for the *second* column only.
 
-The two controls this epic already owes settle it. A-140's pause has an unambiguous home (the
-focused rail row) and A-142's inspection pane does not need building — the right column already
-is it. The other four all have to answer "where does the pane go" with a sheet or a bottom
-split, which means A-142 would relayout whatever A-137 shipped.
+What the second column buys, after discounting the confound. Three things survive it, all from the
+deep-nesting and tidy cases rather than the long-run one:
+  - It is the only layout that shows a model call's token cost and its streaming output tail
+    beside the chain that produced it. A one-column thread has nowhere to put three lines of live
+    output without becoming a different layout.
+  - A-142's inspection pane does not need building; the right column already is it. The other four
+    answer "where does the pane go" with a sheet or a bottom split, so A-142 would relayout
+    whatever A-137 shipped.
+  - A-140's pause has an unambiguous home — the focused rail row, beside the step it would pause.
 
 What it gives up — the honest list.
-  1. Width, badly. 64 columns, the highest floor of the five, and the snapshots show it refusing
-     in *every* case at 52 columns while all four others still draw. This is the one place the
-     split is the worst option, and it is not a small place. Hence the fallback: below 64 columns
-     A-137 should render mock 1 (the flat thread) rather than refuse — the mocks refuse instead,
-     deliberately, so the cost shows up in the picture rather than in a footnote.
-  2. Content in the rail. At 40 rail columns a leaf row is down to `→ read  7.4s` — the rail
-     carries structure and status, and the *what* lives only in the pane. Compare the fan-out
-     case: the tree shows six workers and what each is doing; the split shows six workers and
-     what one is doing.
-  3. One narrative. A rail beside a pane is not something you scroll back through. This answers
-     the design doc's open question ("scrollback-inline or a pane") in favour of the pane, and
-     the transcript keeps the scrollback.
+  1. Width, badly. 64 columns and 10 rows, both the highest floors of the five; the snapshots show
+     it refusing in *every* case at 52 columns while all four others still draw. This is the one
+     place the split is the worst option and it is not a small place. Hence the fallback: below its
+     floor A-137 should render mock 1 rather than refuse. The mocks refuse instead, deliberately,
+     so the cost shows up in the picture rather than in a footnote.
+  2. Content in the rail. At 40 rail columns a leaf row is `→ read  7.4s` — the op and its timing,
+     with the argument gone. Compare the fan-out case: the tree shows six workers and what each is
+     doing *including the argument*; the split shows six workers and their current ops, and the
+     arguments for one.
+  3. One narrative. A rail beside a pane is not something you scroll back through. This answers the
+     design doc's open question ("scrollback-inline or a pane") in favour of the pane, and the
+     transcript keeps the scrollback.
   4. Focus state. It is the only layout needing a selection, so it is the only one needing input
      handling and a focus policy — follow the running step, or hold where the operator put it —
      before it renders correctly at all. Budget that into A-137; the other four do not spend it.
 
 Runner-up: mock 2, the tree. At 100 columns it is the most legible drawing of what a run is
-*shaped* like and the only one where a fan-out looks like a fan-out. It loses on the width tax:
-indentation compounds, and by the deep-nesting case at 52 columns the connectors have taken half
-the terminal. Take its connectors with you — the split's pane already draws its children with
-them, and that is not a coincidence.
+*shaped* like and the only one where a fan-out looks like a fan-out with every worker's argument
+visible. It loses on the width tax: indentation compounds, and by the deep-nesting case at 52
+columns the connectors have taken half the terminal. Take its connectors with you — the split's
+pane already draws its children with them, and that is not a coincidence. ⚠ And note it would look
+considerably better than it does here if it were condensed too; the confound above cuts against it
+harder than against any other mock.
 
-Do not build as the top-level view: mock 1 alone (the scope column gets squeezed exactly when
-there is enough structure for it to matter, and concurrency reads as interleaving), or mock 5.
-Mock 5 is the right answer for A-138's expansion and the wrong one for a live view — its
-snapshots show why twice over: the program does not move, so most rows are always the parts that
-are not running, and mapping runtime steps back onto program nodes misattributes as soon as a
-sub-agent runs a program of its own (see the fan-out case, where six workers' `glob` calls land
-on the parent's `glob` node). A-138 should expand *one step* into its graph, which is exactly
-what the split's pane has room to do.
+Do not build as the top-level view: mock 1 alone (the scope column gets squeezed exactly when there
+is enough structure for it to matter, and concurrency reads as interleaving), or mock 5. Mock 5 is
+the right answer for A-138's expansion and the wrong one for a live view — its snapshots show why
+twice over: the program does not move, so most rows are always the parts that are not running, and
+mapping runtime steps back onto program nodes misattributes as soon as a sub-agent runs a program
+of its own (see the fan-out case, where six workers' `glob` calls land on the parent's `glob`
+node). A-138 should expand *one step* into its graph, which is exactly what the split's pane has
+room to do.
 ```
 
 ## At a glance
 
-| mock | primary axis | optimizes for | gives up | min cols |
+| mock | primary axis | optimizes for | gives up | floor |
 |---|---|---|---|---|
-| 1 · flat thread | Sequence | density and scanning — one row per step at any depth, so the whole run is the same shape whether it is flat or six levels deep | structure. The scope column is the first thing width pressure eats, and it gets squeezed exactly when there is enough nesting for it to matter; concurrency reads as interleaving rather than as parallelism | 40 |
-| 2 · nested tree | Structure | showing what called what — a sub-agent's work is visibly *inside* the step that spawned it, and a fan-out is visibly a fan-out | width, compounding with depth: every level costs three columns forever, so the deepest steps — the ones actually running — get the least room to describe themselves. And once it scrolls, a step's own ancestors are what scroll away first | 44 |
-| 3 · thread + detail pane | Selection | keeping one step fully legible while the run moves — finished phases cost one row each however many steps ran inside them, and the pane is the only place in these five with room for arguments, token cost and live output at once | width (64 cols, the highest floor of the five) and one narrative — a rail beside a pane is not something you scroll back through. It also needs a focus policy before it renders at all, which none of the other four do | 64 |
-| 4 · timeline | Time | where the time went and what actually overlapped — a fan-out is six bars starting at the same x, which is the only drawing here where concurrency is visible rather than inferred | content. A bar is not a sentence: it shows that the audit phase took 7.5s and never what it found. It also flattens after two levels — a bar for a step six deep would be one cell wide — and a fast run collapses into a wall of one-cell bars | 46 |
-| 5 · graph-first | Program | making the architecture visible — the model call is one typed node in an authored DAG, and the run is annotation on top of it. It is also the only layout whose height is fixed by the program rather than by the run | the present tense. A program does not move, so most rows are always the parts that are not running; a loop node collapses N runtime steps into one row, and a sub-agent's own program is not in this program at all. Dynamic structure — six workers, a retry, a nested spawn — is exactly what it cannot draw | 48 |
+| 1 · flat thread | Sequence | density and scanning — one row per step at any depth, so the whole run is the same shape whether it is flat or six levels deep | structure. The scope column is the first thing width pressure eats, and it gets squeezed exactly when there is enough nesting for it to matter; concurrency reads as interleaving rather than as parallelism | 40×6 |
+| 2 · nested tree | Structure | showing what called what — a sub-agent's work is visibly *inside* the step that spawned it, and a fan-out is visibly a fan-out | width, compounding with depth: every level costs three columns forever, so the deepest steps — the ones actually running — get the least room to describe themselves. And once it scrolls, a step's own ancestors are what scroll away first | 44×6 |
+| 3 · thread + detail pane | Selection | keeping one step fully legible while the run moves — finished phases cost one row each however many steps ran inside them, and the pane is the only place in these five with room for arguments, token cost and live output at once | width (64 cols, the highest floor of the five) and one narrative — a rail beside a pane is not something you scroll back through. It also needs a focus policy before it renders at all, which none of the other four do | 64×10 |
+| 4 · timeline | Time | where the time went and what actually overlapped — a fan-out is six bars starting at the same x, which is the only drawing here where concurrency is visible rather than inferred | content. A bar is not a sentence: it shows that the audit phase took 7.5s and never what it found. It also flattens after two levels — a bar for a step six deep would be one cell wide — and a fast run collapses into a wall of one-cell bars | 46×7 |
+| 5 · graph-first | Program | making the architecture visible — the model call is one typed node in an authored DAG, and the run is annotation on top of it. It is also the only layout whose height is fixed by the program rather than by the run | the present tense. A program does not move, so most rows are always the parts that are not running; a loop node collapses N runtime steps into one row, and a sub-agent's own program is not in this program at all. Dynamic structure — six workers, a retry, a nested spawn — is exactly what it cannot draw | 48×8 |
 
 ## 1 · flat thread
 
@@ -82,7 +96,7 @@ what the split's pane has room to do.
 - **Gives up:** structure. The scope column is the first thing width pressure eats, and it gets squeezed exactly when there is enough nesting for it to matter; concurrency reads as interleaving rather than as parallelism
 - **A-140 pause control:** a ⏸ column between detail and elapsed, on the running row
 - **A-142 inspection pane:** the thread is one column, so inspection has to be a sheet over it (like the approval sheet) or a bottom split — it cannot sit beside the thread
-- **Floor:** 40 cols (below it, it says so)
+- **Floor:** 40 cols × 6 rows (below either, it says so instead of mangling itself)
 
 ### 1 · flat thread · tidy · 100×28
 
@@ -285,12 +299,31 @@ _withheld: 6 steps_
 … 6 of 23 steps not shown
 ```
 
-### 1 · flat thread · below its floor · 39×14
+### 1 · flat thread · at its floor · fan-out · 40×6
+
+```text
+◆ tracking board sync · audit fan-out  …
+  ↑ 19 earlier
+✓ …audit#6/glob docs/stories/*…     70ms
+▶ ….frontmatter docs/stories/A… ⏸   7.2s
+· board         regenerate       pending
+… 20 of 23 steps not shown
+```
+
+### 1 · flat thread · one column under its floor · 39×6
 
 ```text
 1 · flat thread
 needs 40 cols
 have 39
+```
+
+### 1 · flat thread · one row under its floor · 40×5
+
+```text
+1 · flat thread
+needs 6 rows
+have 5
 ```
 
 ## 2 · nested tree
@@ -300,7 +333,7 @@ have 39
 - **Gives up:** width, compounding with depth: every level costs three columns forever, so the deepest steps — the ones actually running — get the least room to describe themselves. And once it scrolls, a step's own ancestors are what scroll away first
 - **A-140 pause control:** a ⏸ on the running row, where the connectors already draw the eye
 - **A-142 inspection pane:** a bottom split under the tree — the tree wants all the width it can get, so it cannot give a pane a side
-- **Floor:** 44 cols (below it, it says so)
+- **Floor:** 44 cols × 6 rows (below either, it says so instead of mangling itself)
 
 ### 2 · nested tree · tidy · 100×28
 
@@ -502,12 +535,31 @@ _withheld: 6 steps_
 … 6 of 23 steps not shown
 ```
 
-### 2 · nested tree · below its floor · 43×14
+### 2 · nested tree · at its floor · fan-out · 44×6
+
+```text
+◆ tracking board sync · audit fan-out  nest…
+↑ 19 rows above — scrolled to the running s…
+   ├─ ✓ → glob · docs/stories/*.md      70ms
+   └─ ▶ → track.frontmatter · docs… ⏸   7.2s
+· § board · regenerate               pending
+… 20 of 23 steps not shown
+```
+
+### 2 · nested tree · one column under its floor · 43×6
 
 ```text
 2 · nested tree
 needs 44 cols
 have 43
+```
+
+### 2 · nested tree · one row under its floor · 44×5
+
+```text
+2 · nested tree
+needs 6 rows
+have 5
 ```
 
 ## 3 · thread + detail pane
@@ -517,7 +569,7 @@ have 43
 - **Gives up:** width (64 cols, the highest floor of the five) and one narrative — a rail beside a pane is not something you scroll back through. It also needs a focus policy before it renders at all, which none of the other four do
 - **A-140 pause control:** the focused rail row, where the ⏸ sits beside the step it would pause
 - **A-142 inspection pane:** already built: the right-hand pane *is* A-142's inspection surface
-- **Floor:** 64 cols (below it, it says so)
+- **Floor:** 64 cols × 10 rows (below either, it says so instead of mangling itself)
 
 ### 3 · thread + detail pane · tidy · 100×28
 
@@ -640,12 +692,35 @@ needs 64 cols
 have 52
 ```
 
-### 3 · thread + detail pane · below its floor · 63×14
+### 3 · thread + detail pane · at its floor · fan-out · 64×10
+
+```text
+◆ tracking board sync · audit fan-out  thread + detail pane 12.…
+↑ 14 above                 │ audit › tracker-audit#6 › track.fr…
+  ▶ ⇩ tracker-audit…  7.3s │ ▶ → track.frontmatter  docs/storie…
+    ✓ → glob          70ms │ started +5.2s
+    ▶ → read          7.2s │ ───────────────────────────────────
+  ▶ ⇩ tracker-audit…  7.3s │ ⏸ pause here · ↹ move focus · ↵ ex…
+    ✓ → glob          70ms │ 
+    ▶ → track.front… ⏸7.2s │ 
+· § board          pending │ 
+… 15 of 23 steps not shown
+```
+
+### 3 · thread + detail pane · one column under its floor · 63×10
 
 ```text
 3 · thread + detail pane
 needs 64 cols
 have 63
+```
+
+### 3 · thread + detail pane · one row under its floor · 64×9
+
+```text
+3 · thread + detail pane
+needs 10 rows
+have 9
 ```
 
 ## 4 · timeline
@@ -655,7 +730,7 @@ have 63
 - **Gives up:** content. A bar is not a sentence: it shows that the audit phase took 7.5s and never what it found. It also flattens after two levels — a bar for a step six deep would be one cell wide — and a fast run collapses into a wall of one-cell bars
 - **A-140 pause control:** a ⏸ in the label gutter of the running row, at the live edge of its bar
 - **A-142 inspection pane:** a bottom split: the timeline is width-hungry but short, so it can give away rows more cheaply than any other layout here
-- **Floor:** 46 cols (below it, it says so)
+- **Floor:** 46 cols × 7 rows (below either, it says so instead of mangling itself)
 
 ### 4 · timeline · tidy · 100×28
 
@@ -833,12 +908,32 @@ _withheld: 12 steps_
 … 12 of 23 steps not shown
 ```
 
-### 4 · timeline · below its floor · 45×14
+### 4 · timeline · at its floor · fan-out · 46×7
+
+```text
+◆ tracking board sync · audit fan-out  timeli…
+                  0ms  3.1s      9.3s 
+↑ 2 earlier rows
+▶ audit                   ███████████▶    7.5s
+ ✓ tracker-audit…         ████▏           3.1s
+ ▶ tracker-audit…         ███████████▶    7.5s
+… 20 of 23 steps not shown
+```
+
+### 4 · timeline · one column under its floor · 45×7
 
 ```text
 4 · timeline
 needs 46 cols
 have 45
+```
+
+### 4 · timeline · one row under its floor · 46×6
+
+```text
+4 · timeline
+needs 7 rows
+have 6
 ```
 
 ## 5 · graph-first
@@ -848,7 +943,7 @@ have 45
 - **Gives up:** the present tense. A program does not move, so most rows are always the parts that are not running; a loop node collapses N runtime steps into one row, and a sub-agent's own program is not in this program at all. Dynamic structure — six workers, a retry, a nested spawn — is exactly what it cannot draw
 - **A-140 pause control:** the status gutter, on the node currently executing — a pause here reads as a breakpoint on a line of the program, which is what A-140 would want
 - **A-142 inspection pane:** a bottom split showing the node's runtime steps — which is also the only way this layout can show them at all
-- **Floor:** 48 cols (below it, it says so)
+- **Floor:** 48 cols × 8 rows (below either, it says so instead of mangling itself)
 
 ### 5 · graph-first · tidy · 100×28
 
@@ -1018,11 +1113,32 @@ _withheld: 4 steps_
 … 4 of 23 steps not shown
 ```
 
-### 5 · graph-first · below its floor · 47×14
+### 5 · graph-first · at its floor · fan-out · 48×8
+
+```text
+◆ tracking board sync · audit fan-out  graph-fi…
+✓   140ms │ plan  low · mutating  · 9 ops
+          │ flow tracking_sync
+          │ ├─ seq -> $validated
+⏸  7×1.1s │ │  ├─ $stories = glob({"pattern":"d…
+⏸  2×7.3s │ │  ├─ $template = read({"path":"doc…
+⏸    7.2s │ │  └─ $meta = track.frontmatter({fi…
+… 12 of 23 steps not shown
+```
+
+### 5 · graph-first · one column under its floor · 47×8
 
 ```text
 5 · graph-first
 needs 48 cols
 have 47
+```
+
+### 5 · graph-first · one row under its floor · 48×7
+
+```text
+5 · graph-first
+needs 8 rows
+have 7
 ```
 

@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 
 use super::{
     clip, fit, header, ms, status_style, width, window, Axis, Fixture, MockSpec, Status, Tally,
-    Viewport, PAUSE_GLYPH,
+    Viewport, MIN_ROWS, PAUSE_GLYPH,
 };
 use crate::theme::Theme;
 
@@ -28,6 +28,9 @@ pub(super) const SPEC: MockSpec = MockSpec {
     inspection_pane: "the thread is one column, so inspection has to be a sheet over it (like the \
                       approval sheet) or a bottom split — it cannot sit beside the thread",
     min_cols: 40,
+    // Header, the footer, and enough step rows that the thread reads as a thread. The lowest row
+    // floor of the five, which is most of why it is the recommended fallback.
+    min_rows: MIN_ROWS,
 };
 
 /// Widest the scope column is allowed to get before it is just stealing from the detail.
