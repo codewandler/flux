@@ -84,6 +84,46 @@ install_jobs.each do |name|
   step = install_steps.fetch(0)
   abort "#{name} bypasses the verified release-tooling installer" unless step["run"] == "scripts/install-release-tooling.sh"
 end
+
+# C-412 — the Release object may not exist before the artifacts it advertises.
+#
+# release.yml is cargo-dist-generated, and what dist generates puts `dist host --steps=create` in the
+# planning job: the Release is published by the FIRST job, before anything is built, and everything
+# after it is free to fail or skip while `/releases/latest` points at a Release whose downloads 404.
+# v0.47.0 shipped exactly that. Re-running `dist generate` would restore it silently, so the shape is
+# locked here rather than left to a comment.
+jobs.fetch("plan").fetch("steps").each do |step|
+  next unless step.fetch("run", "").match?(/dist\s+host/)
+  abort "the plan job creates the GitHub Release before any artifact exists (C-412)"
+end
+host_dist = steps.find { |step| step.fetch("run", "").match?(/dist\s+host/) }
+abort "host never invokes dist host" unless host_dist
+%w[create upload release].each do |hosting_step|
+  next if host_dist.fetch("run").include?("--steps=#{hosting_step}")
+  abort "host's dist invocation is missing --steps=#{hosting_step}"
+end
+
+# ...and no job may publish without first establishing that the builds ran. `host`'s own `if:`
+# tolerates skipped build jobs because promoting a prepared candidate legitimately skips them, so
+# "skipped" has to be told apart from "nothing was built" inside the job, before publication.
+build_results = %w[build-local-artifacts build-global-artifacts].map { |job| "needs.#{job}.result" }
+checks_build_results = lambda do |step|
+  text = [step.fetch("run", ""), step.fetch("env", {}).values.join("\n")].join("\n")
+  build_results.all? { |reference| text.include?(reference) }
+end
+guard_index = steps.index { |step| checks_build_results.call(step) }
+abort "host never checks whether the build jobs actually ran" unless guard_index
+abort "host checks the build results only after publishing" unless guard_index < release_index
+
+# The preparation half of the same defect: a candidate run whose builds skipped must FAIL, not skip
+# its way to a green `success` that a human then reads as "ready to tag".
+candidate = jobs.fetch("record-release-candidate")
+build_results.each do |reference|
+  next unless candidate.fetch("if", "").include?(reference)
+  abort "record-release-candidate gates itself on #{reference}, so a run that builds nothing skips silently (C-412)"
+end
+abort "record-release-candidate does not fail when the build jobs did not run" unless
+  candidate.fetch("steps").any? { |step| checks_build_results.call(step) }
 RUBY
 }
 
@@ -112,8 +152,36 @@ if [ "${1:-}" = "--self-test" ]; then
     echo "self-test accepted an attestation that existed only as a decoy comment" >&2
     exit 1
   fi
+
+  # C-412. Each fixture below reverts one half of the fix to the shape that published v0.47.0, which
+  # is the shape `dist generate` would write back.
+  #
+  # 1. The Release created in the planning job, before anything is built.
+  sed 's/dist plan --tag=/dist host --steps=create --tag=/' "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted release creation in the plan job" >&2
+    exit 1
+  fi
+  # 2. The host job publishing without first distinguishing "candidate promoted" from "nothing built".
+  awk '
+    /- name: Refuse to publish a release with nothing built/ { in_guard=1 }
+    in_guard && /^      - uses: actions\/checkout@/ { in_guard=0 }
+    !in_guard { print }
+  ' "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a host job that publishes without checking the build results" >&2
+    exit 1
+  fi
+  # 3. The candidate receipt gating itself on the builds, so a run that builds nothing skips quietly.
+  sed "s/^    if: \${{ always() && needs.plan.outputs.preparing == 'true' && needs.plan.result == 'success' }}/    if: \${{ always() \&\& needs.plan.outputs.preparing == 'true' \&\& needs.build-local-artifacts.result == 'success' \&\& needs.build-global-artifacts.result == 'success' }}/" \
+    "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a candidate receipt that skips instead of failing when nothing built" >&2
+    exit 1
+  fi
+
   scripts/verify-github-release.sh --self-test
-  echo "PASS self-test: unauthenticated bootstrap and structural attestation regressions rejected"
+  echo "PASS self-test: unauthenticated bootstrap and structural attestation/release-ordering regressions rejected"
   exit 0
 fi
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# check-release-tags.sh — every shipped version tag has a GitHub Release, and `/releases/latest`
-# points at the newest one.
+# check-release-tags.sh — every shipped version tag has a GitHub Release, that Release carries the
+# assets its install instructions advertise, and `/releases/latest` points at the newest one.
 #
 # Why this exists (C-47 / N-001): a beta retest found `/releases/latest` serving an older version
 # than the newest `vX.Y.Z` tag, because the Release workflow can push a tag and then fail before
@@ -20,6 +20,14 @@
 #      on 2026-07-29 flipped `/releases/latest` from v0.33.0 to v0.9.3 until it was repaired with
 #      `gh release edit v0.33.0 --latest`. The backfill runbook now passes `--latest=false`, but a
 #      runbook is a request, not a guarantee — this check is the guarantee.
+#   3. A Release that EXISTS but cannot be installed from (C-412). Rules 1 and 2 both key on
+#      `.tag_name` — existence — so a published Release whose assets are missing is invisible to
+#      both, and `/releases/latest` happily points at it. v0.47.0 shipped exactly that: the Release
+#      object was created by the FIRST job of the Release workflow (`dist host --steps=create`,
+#      before a single artifact existed), every build job then skipped, and the run still concluded
+#      `success`. The result was a published Release carrying one asset — `dist-manifest.json` — and
+#      a `/releases/latest` whose every advertised download 404'd. The response at the time was an
+#      allowlist entry; rule 3 is the guard.
 #
 # So: audit the whole tag/release fleet on every push to main, not just the tag being cut.
 #
@@ -39,8 +47,8 @@
 #
 #   scripts/check-release-tags.sh              # audit the live repo
 #   scripts/check-release-tags.sh --repo o/n   # audit another repo
-#   scripts/check-release-tags.sh --self-test  # prove the check catches both defects, and that an
-#                                              # in-flight cut is distinguished from drift
+#   scripts/check-release-tags.sh --self-test  # prove the check catches all three defects, and that
+#                                              # an in-flight cut is distinguished from drift
 #
 # Exit 0 clean, 1 real drift (a failure), 2 the GitHub state could not be read (a logged skip —
 # a GitHub outage must not turn main red). An unreadable workflow-run list is exit 2 like any other
@@ -68,6 +76,19 @@ TAB="$(printf '\t')"
 #   v0.17.0  cargo-dist could not find bin `flux_sdk_plugin_fixture`; all five platform builds
 #            failed identically — a config defect at that commit, not a flake, so re-running it
 #            would fail the same way.                           -> superseded by v0.17.1
+#   v0.47.0  the plan job's `val` output — the dist manifest the build matrix is computed from — was
+#            dropped by Actions with `Skip output 'val' since it may contain secret`, because the
+#            0.47.0 release body it embeds contains a string GitHub masks. Every build job's `if`
+#            then evaluated against an empty manifest and skipped, and the run still concluded
+#            `success`. The Release object the plan job had already created was deleted by hand, so
+#            this tag now genuinely has no Release and the entry is load-bearing rather than
+#            decorative.                                        -> superseded by v0.47.1
+#            ⚠ KEPT DELIBERATELY (C-412), not because the hole is open: the mechanism is closed at
+#            source in `.github/workflows/release.yml` — the Release object is no longer created
+#            before artifacts exist, a preparation run that builds nothing now fails instead of
+#            reporting `success`, and rule 3 below detects the published-but-assetless result. What
+#            an entry cannot undo is history: v0.47.0's binaries were never built and its tag is
+#            permanently undownloadable, which is precisely what this list is for.
 #
 # An entry here is a claim that the version is unshippable, not a way to silence a tag you have not
 # investigated. Adding one means the version is permanently undownloadable.
@@ -75,6 +96,28 @@ ALLOWED_WITHOUT_RELEASE='v0.11.1
 v0.12.0
 v0.17.0
 v0.47.0'
+
+# Rule 3's floor (C-412). A published Release is only useful if the install commands in its own body
+# resolve, so the audit checks for the assets those commands name rather than for a count: a count
+# would have to be `>= 28` today and `>= 16` before flux-lsp shipped, and v0.27.0 legitimately has 27
+# (it published without `dist-manifest.json` — the C-47 incident — yet installs fine). Names survive
+# that history; a number does not. The count is still reported in the failure text, because "1 asset"
+# is the fact a human recognises.
+#
+# This is deliberately a WEAKER set than `scripts/verify-github-release.sh` enforces at cut time.
+# That script owns the closed set and the provenance attestations for the ONE tag being cut, and may
+# demand the full shape. This one audits eleven years of history on every push to main, so it asks
+# only the question that has a stable answer across all of it: can a user install this version?
+REQUIRED_INSTALL_ASSETS='flux-cli-installer.sh
+flux-cli-installer.ps1
+sha256.sum'
+
+# Releases older than this predate the shipped line: `v0.1.0`, `v0.2.0` and six other pre-0.3 dev-era
+# tags carry Release objects with zero assets, created before cargo-dist hosting existed. They are
+# audited for existence (rules 1 and 2) but not for installability, because they never advertised an
+# install. This is a boundary with a reason, not a per-tag pardon list — every `vX.Y.Z` at or after
+# it is held to the full rule, with no exceptions and nowhere to add one.
+INSTALLABLE_SINCE='v0.3.0'
 
 # Only `vX.Y.Z` tags are release tags. This deliberately excludes the `plugins-v*` pack line (cut by
 # a separate hand-driven workflow with its own assets) and pre-0.3 dev tags like
@@ -97,6 +140,34 @@ missing_releases() {
 # The highest version in a newline-delimited list, by semver order.
 newest_version() {
   printf '%s\n' "$1" | grep -v '^$' | sort -V | tail -1
+}
+
+# Is version tag $1 at or after version tag $2, by semver order? Lexical comparison is wrong for
+# exactly the case that matters here (v0.10.0 vs v0.3.0), so this goes through `sort -V` like
+# `newest_version` does.
+at_least_version() {
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]
+}
+
+# What a published Release ($1, newline-delimited asset names) is missing before a user can install
+# it, as a human-readable list — or nothing when it is installable (C-412).
+#
+# The archive rules are patterns rather than exact names because the target list changes between
+# releases; the installer scripts and `sha256.sum` are exact because their names are the ones the
+# release body's own `curl … | sh` line hardcodes. `flux-lsp` is deliberately not required — it is
+# optional at cut time too (`verify-github-release.sh:57`), and the 16-asset releases before it
+# existed are installable.
+install_asset_gaps() {
+  local names="$1" gaps='' want
+  while IFS= read -r want; do
+    [ -n "$want" ] || continue
+    printf '%s\n' "$names" | grep -Fxq "$want" || gaps="$gaps, $want"
+  done <<<"$REQUIRED_INSTALL_ASSETS"
+  printf '%s\n' "$names" | grep -Eq '^flux-cli-.+\.tar\.xz$' ||
+    gaps="$gaps, a flux-cli-*.tar.xz archive"
+  printf '%s\n' "$names" | grep -Eq '^flux-cli-.+\.zip$' ||
+    gaps="$gaps, a flux-cli-*.zip archive"
+  printf '%s' "${gaps#, }"
 }
 
 # The Release-workflow runs for tag $2 in repo $1, one `status<TAB>conclusion` record per run, newest
@@ -181,7 +252,7 @@ v0.11.1')"
   [ "$(newest_version 'v0.9.3')" != "$(newest_version 'v0.33.0')" ] || {
     fail "self-test: v0.9.3 and v0.33.0 compared equal"; exit 1; }
 
-  # Rule 3 (C-252) — a gap is only drift once nothing is still building it. The newest tag having no
+  # Rule 1's deferral (C-252) — a gap is only drift once nothing is still building it. The newest tag having no
   # Release *while its Release workflow is in flight* is the normal, correct mid-cut observation; the
   # same tag with a finished-and-failed run, or with no run at all, is the N-001 shape and must still
   # fail. These two cases are the whole point: the fix must NOT be "skip the newest tag".
@@ -228,7 +299,128 @@ completed${TAB}failure"
   [ "$st_kind" = "missing" ] || {
     fail "self-test: a completed run with no Release classified as '$st_kind', want 'missing'"; exit 1; }
 
-  printf '\033[32mPASS\033[0m self-test: tag/release drift, a stale latest pointer, and an in-flight cut are all distinguishable\n'
+  # Rule 3 (C-412) — a Release that exists but cannot be installed from. Every fixture below is a
+  # REAL listing taken from `gh release view <tag> --json assets`, never a hand-made subset: the same
+  # trap `verify-github-release.sh` documents at its own fixture (a hand-written asset list agrees
+  # with the classifier that produced it, and then rejects every actual release) applies here, and
+  # this rule's whole job is to agree with eleven versions' worth of real history.
+  #
+  # v0.47.0 as it actually shipped: the Release object the plan job created, with the only file that
+  # ever reached it.
+  got="$(install_asset_gaps 'dist-manifest.json')"
+  [ -n "$got" ] || {
+    fail "self-test: v0.47.0's published shape (dist-manifest.json alone) reported no install gap"
+    exit 1; }
+  case "$got" in
+    *flux-cli-installer.sh*) ;;
+    *) fail "self-test: the install-gap verdict must name the missing installer, got '$got'"; exit 1 ;;
+  esac
+  # A Release with no assets at all is the same defect, and must not read as "nothing to check".
+  [ -n "$(install_asset_gaps '')" ] || {
+    fail "self-test: a Release with zero assets reported no install gap"; exit 1; }
+
+  # v0.46.0's real 28 assets — the shape a healthy cut produces today. Must be clean.
+  v046_assets='dist-manifest.json
+sha256.sum
+source.tar.gz
+source.tar.gz.sha256
+flux-cli-installer.sh
+flux-cli-installer.ps1
+flux-cli-aarch64-apple-darwin.tar.xz
+flux-cli-aarch64-apple-darwin.tar.xz.sha256
+flux-cli-aarch64-unknown-linux-gnu.tar.xz
+flux-cli-aarch64-unknown-linux-gnu.tar.xz.sha256
+flux-cli-x86_64-apple-darwin.tar.xz
+flux-cli-x86_64-apple-darwin.tar.xz.sha256
+flux-cli-x86_64-unknown-linux-gnu.tar.xz
+flux-cli-x86_64-unknown-linux-gnu.tar.xz.sha256
+flux-cli-x86_64-pc-windows-msvc.zip
+flux-cli-x86_64-pc-windows-msvc.zip.sha256
+flux-lsp-installer.sh
+flux-lsp-installer.ps1
+flux-lsp-aarch64-apple-darwin.tar.xz
+flux-lsp-aarch64-apple-darwin.tar.xz.sha256
+flux-lsp-aarch64-unknown-linux-gnu.tar.xz
+flux-lsp-aarch64-unknown-linux-gnu.tar.xz.sha256
+flux-lsp-x86_64-apple-darwin.tar.xz
+flux-lsp-x86_64-apple-darwin.tar.xz.sha256
+flux-lsp-x86_64-unknown-linux-gnu.tar.xz
+flux-lsp-x86_64-unknown-linux-gnu.tar.xz.sha256
+flux-lsp-x86_64-pc-windows-msvc.zip
+flux-lsp-x86_64-pc-windows-msvc.zip.sha256'
+  got="$(install_asset_gaps "$v046_assets")"
+  [ -z "$got" ] || { fail "self-test: v0.46.0's real 28 assets reported an install gap: $got"; exit 1; }
+
+  # v0.3.0's real 16 assets — the pre-flux-lsp era. A rule that required the LSP, or a count floor
+  # calibrated on today's 28, would fail every release before v0.23.0.
+  v030_assets='dist-manifest.json
+sha256.sum
+source.tar.gz
+source.tar.gz.sha256
+flux-cli-installer.sh
+flux-cli-installer.ps1
+flux-cli-aarch64-apple-darwin.tar.xz
+flux-cli-aarch64-apple-darwin.tar.xz.sha256
+flux-cli-aarch64-unknown-linux-gnu.tar.xz
+flux-cli-aarch64-unknown-linux-gnu.tar.xz.sha256
+flux-cli-x86_64-apple-darwin.tar.xz
+flux-cli-x86_64-apple-darwin.tar.xz.sha256
+flux-cli-x86_64-unknown-linux-gnu.tar.xz
+flux-cli-x86_64-unknown-linux-gnu.tar.xz.sha256
+flux-cli-x86_64-pc-windows-msvc.zip
+flux-cli-x86_64-pc-windows-msvc.zip.sha256'
+  got="$(install_asset_gaps "$v030_assets")"
+  [ -z "$got" ] || { fail "self-test: v0.3.0's real 16 assets reported an install gap: $got"; exit 1; }
+
+  # v0.27.0's real 27 assets: published without `dist-manifest.json` (the C-47 incident) and still
+  # perfectly installable. This is why rule 3 asks for names and not for a count.
+  got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -Fxv 'dist-manifest.json')")"
+  [ -z "$got" ] || { fail "self-test: v0.27.0's real 27-asset shape reported an install gap: $got"; exit 1; }
+
+  # Each exactly-named requirement is individually load-bearing — a rule that only ever checked the
+  # first one would pass every fixture above.
+  while IFS= read -r want; do
+    [ -n "$want" ] || continue
+    got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -Fxv "$want")")"
+    [ "$got" = "$want" ] || {
+      fail "self-test: dropping $want from a real release reported '$got', want exactly '$want'"
+      exit 1; }
+  done <<<"$REQUIRED_INSTALL_ASSETS"
+
+  # The archive rules are "at least one", deliberately: the target list has changed across releases
+  # and `verify-github-release.sh` requires one of each kind too, so losing a single platform is not
+  # this audit's business — losing the whole platform class is.
+  got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -Fxv 'flux-cli-x86_64-unknown-linux-gnu.tar.xz')")"
+  [ -z "$got" ] || { fail "self-test: dropping one of five Unix archives reported '$got'"; exit 1; }
+  got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -v '^flux-cli-.*\.tar\.xz$')")"
+  case "$got" in
+    *tar.xz*) ;;
+    *) fail "self-test: a release with no flux-cli Unix archive at all reported '$got'"; exit 1 ;;
+  esac
+  got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -Fxv 'flux-cli-x86_64-pc-windows-msvc.zip')")"
+  case "$got" in
+    *zip*) ;;
+    *) fail "self-test: a release with no Windows zip reported '$got'"; exit 1 ;;
+  esac
+  # A `.sha256` sidecar must never be mistaken for the archive it shadows — that would let a release
+  # carrying only checksums pass as installable.
+  got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -v '\.tar\.xz$' | grep -v '\.zip$')")"
+  case "$got" in
+    *tar.xz*) ;;
+    *) fail "self-test: checksum sidecars satisfied the archive requirement (got '$got')"; exit 1 ;;
+  esac
+
+  # The installability floor is a semver comparison, not a string one: v0.10.0 is after v0.3.0.
+  at_least_version 'v0.3.0' "$INSTALLABLE_SINCE" || {
+    fail "self-test: the floor version itself is not at or after the floor"; exit 1; }
+  at_least_version 'v0.10.0' "$INSTALLABLE_SINCE" || {
+    fail "self-test: v0.10.0 compared as older than $INSTALLABLE_SINCE (lexical comparison)"; exit 1; }
+  at_least_version 'v0.47.0' "$INSTALLABLE_SINCE" || {
+    fail "self-test: v0.47.0 — the version this rule exists for — was excused by the floor"; exit 1; }
+  at_least_version 'v0.2.24' "$INSTALLABLE_SINCE" && {
+    fail "self-test: a pre-0.3 dev-era Release was held to the install rule"; exit 1; }
+
+  printf '\033[32mPASS\033[0m self-test: tag/release drift, an assetless published Release, a stale latest pointer, and an in-flight cut are all distinguishable\n'
   exit 0
 fi
 
@@ -240,7 +432,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     -h|--help)
-      sed -n '2,47p' "$0" >&2
+      sed -n '2,55p' "$0" >&2
       exit 0
       ;;
     *)
@@ -254,12 +446,19 @@ command -v gh >/dev/null 2>&1 || { fail "gh is not installed"; exit 2; }
 
 all_tags="$(gh api "repos/$REPO/tags" --paginate --jq '.[].name' 2>/dev/null)" || {
   printf 'skip: could not read tags for %s\n' "$REPO" >&2; exit 2; }
-all_releases="$(gh api "repos/$REPO/releases" --paginate --jq '.[].tag_name' 2>/dev/null)" || {
+# One record per Release: `tag<TAB>space-separated asset names`. Rules 1 and 2 need only the tag, but
+# asking for the assets in the same call costs nothing and is what makes rule 3 possible at all —
+# reading `.tag_name` alone is precisely why an assetless v0.47.0 was invisible to this audit. dist
+# asset names contain no spaces (they are `<app>-<target>.<ext>` and its `.sha256` sidecar), so a
+# space is a safe join here; `install_asset_gaps` matches whole lines, so a name that somehow did
+# would split into two names it does not recognise and be reported, never silently accepted.
+all_release_records="$(gh api "repos/$REPO/releases" --paginate \
+  --jq '.[] | "\(.tag_name)\t\(.assets | map(.name) | join(" "))"' 2>/dev/null)" || {
   printf 'skip: could not read releases for %s\n' "$REPO" >&2; exit 2; }
 [ -n "$all_tags" ] || { printf 'skip: %s reported no tags\n' "$REPO" >&2; exit 2; }
 
 tags="$(printf '%s\n' "$all_tags" | version_tags)"
-releases="$(printf '%s\n' "$all_releases" | version_tags)"
+releases="$(printf '%s\n' "$all_release_records" | cut -f1 | version_tags)"
 
 status=0
 
@@ -297,6 +496,31 @@ if [ -n "$drift_report" ]; then
   status=1
 fi
 
+# Rule 3 (C-412) — a Release that exists but advertises downloads that 404. Rules 1 and 2 above both
+# key on existence, so this is the only rule that would have seen v0.47.0.
+uninstallable_report=''
+while IFS="$TAB" read -r release_tag release_assets; do
+  [ -n "$release_tag" ] || continue
+  # Version tags only: the `plugins-v*` pack line is cut by a different workflow with a different
+  # asset set, exactly as rules 1 and 2 exclude it.
+  [ -n "$(printf '%s\n' "$release_tag" | version_tags)" ] || continue
+  at_least_version "$release_tag" "$INSTALLABLE_SINCE" || continue
+  asset_names="$(printf '%s\n' "$release_assets" | tr ' ' '\n' | grep -v '^$')"
+  gaps="$(install_asset_gaps "$asset_names")"
+  [ -n "$gaps" ] || continue
+  uninstallable_report="$uninstallable_report  $release_tag — $(printf '%s\n' "$asset_names" | grep -c .) asset(s), missing $gaps"$'\n'
+done <<<"$all_release_records"
+
+if [ -n "$uninstallable_report" ]; then
+  fail "published Release(s) whose assets cannot install — every download link in their release notes 404s:"
+  printf '%s' "$uninstallable_report" >&2
+  printf 'This is worse than a missing Release: /releases/latest can point at one, so `curl … | sh`\n' >&2
+  printf 'breaks for every user while every tag looks accounted for. Re-run the Release workflow for\n' >&2
+  printf 'the tag to upload the real assets, or delete the Release object and record the version in\n' >&2
+  printf 'ALLOWED_WITHOUT_RELEASE with the reason its binaries were never built (C-412).\n' >&2
+  status=1
+fi
+
 newest="$(newest_version "$releases")"
 latest="$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null)" || {
   printf 'skip: could not read /releases/latest for %s\n' "$REPO" >&2; exit 2; }
@@ -311,8 +535,8 @@ if [ "$status" -eq 0 ]; then
   publishing=''
   [ -z "$pending_report" ] ||
     publishing=", $(printf '%s' "$pending_report" | grep -c .) still publishing"
-  printf '\033[32mPASS\033[0m %s: %s released version tag(s)%s, /releases/latest = %s\n' \
-    "$REPO" "$(printf '%s\n' "$releases" | grep -vc '^$')" "$publishing" "$latest"
+  printf '\033[32mPASS\033[0m %s: %s released version tag(s)%s, all installable since %s, /releases/latest = %s\n' \
+    "$REPO" "$(printf '%s\n' "$releases" | grep -vc '^$')" "$publishing" "$INSTALLABLE_SINCE" "$latest"
 fi
 
 exit "$status"
