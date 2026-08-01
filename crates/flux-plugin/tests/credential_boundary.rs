@@ -272,8 +272,7 @@ async fn a_refresh_cannot_shed_an_ops_platform_sourcing() {
         .loaded
         .refresh()
         .await
-        .err()
-        .expect("a refresh that sheds platform sourcing must be refused")
+        .expect_err("a refresh that sheds platform sourcing must be refused")
         .to_string();
     assert!(error.contains("dispatch"), "must name the op: {error}");
     assert!(

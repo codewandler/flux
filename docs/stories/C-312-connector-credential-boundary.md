@@ -104,7 +104,9 @@ An invariant nobody tests is an invariant that decays at the next refactor. This
     weaker half, recorded at the call site rather than papered over.
   - **`codewandler-flux-plugin-protocol` 1.1.1 → 1.2.0**: additive, serde-defaulted, and
     `skip_serializing_if` keeps every existing manifest byte-identical on the wire. A plugin-pack
-    release is owed for the host-kit half.
+    release is owed for the host-kit half. Both lockfiles carry the one-line version move, and the
+    nested one is not optional: `flux-codegate`'s `plugin_builds_exclude_host_only_crates` resolves
+    `plugins/` metadata with `--locked`, so a stale `plugins/Cargo.lock` reds the gate.
 
 ## Notes
 - The one secret flux *does* hold on this path is the deployment session bearer, and it is stored like

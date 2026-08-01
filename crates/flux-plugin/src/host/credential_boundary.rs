@@ -187,18 +187,18 @@ fn credential_material(
     redactor: &Redactor,
     path: &mut Vec<String>,
 ) -> Option<Found> {
-    /// The JSON path, for the refusal message — **itself redacted**.
-    ///
-    /// A path is built from property NAMES, and a name is attacker-controlled text from the same
-    /// untrusted response as its value: a response keyed *by* the credential
-    /// (`{"xoxb-…": "…"}`) would otherwise put it into the refusal sentence, which is the leak the
-    /// refusal exists to prevent. Redaction rather than omission, so the shape of the path a
-    /// reader needs to locate the problem survives.
-    ///
-    /// **Each component is redacted separately, then joined.** Redacting the joined path would not
-    /// work: `.` is not a token boundary for the redactor (deliberately — it is what keeps
-    /// hostnames and version strings out of its mouth), so `a.xoxb-…` is one token that does not
-    /// *start* with a credential prefix and renders in the clear. Found by the test below.
+    // The JSON path, for the refusal message — **itself redacted**.
+    //
+    // A path is built from property NAMES, and a name is attacker-controlled text from the same
+    // untrusted response as its value: a response keyed *by* the credential
+    // (`{"xoxb-…": "…"}`) would otherwise put it into the refusal sentence, which is the leak the
+    // refusal exists to prevent. Redaction rather than omission, so the shape of the path a
+    // reader needs to locate the problem survives.
+    //
+    // **Each component is redacted separately, then joined.** Redacting the joined path would not
+    // work: `.` is not a token boundary for the redactor (deliberately — it is what keeps
+    // hostnames and version strings out of its mouth), so `a.xoxb-…` is one token that does not
+    // *start* with a credential prefix and renders in the clear. Found by the test below.
     let here = |path: &[String]| {
         if path.is_empty() {
             "the response root".to_string()
