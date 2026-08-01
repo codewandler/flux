@@ -158,6 +158,13 @@ pub const DEFAULT_CONTEXT_BUDGET: usize = 8192;
 /// unbounded until the provider's context window errors. Matches the CLI's `FLUX_COMPACT_CHARS`
 /// default so behaviour is consistent across surfaces; override per-agent via
 /// [`AgentSpec::with_compaction`] (or, on the served path, the `AgentDecl` settings / env).
+///
+/// **The value is deliberate, and 48,000 is rarely reached** (C-443). A sweep of a 112,114-event
+/// local store found *zero* compactions: 85% of sessions are one-shot runs, and the average
+/// multi-turn session is ~9% of this threshold. That is a statement about the workload, not an
+/// argument to lower it — a threshold low enough to fire on those sessions would compact almost
+/// every real one, spending a provider call and discarding fidelity under no memory pressure.
+/// Raising it weakens the unbounded-growth guard this constant exists for.
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 48_000;
 
 /// A first-class agent definition: model, persona, skills, tool selection, permissions, and the
