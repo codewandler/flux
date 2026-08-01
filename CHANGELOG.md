@@ -22,9 +22,51 @@ All notable changes to this project are documented in this file. The format is b
   as cancelled, turns have compact separators, light themes give tool cards a quiet surface, and an
   empty session points to resumable history.
 
-## [Unreleased]
-
 ### Fixed
+
+- **⚠ Security: a webhook delivery is now authenticated before its body is decoded** (C-291). A
+  `channel webhook` had **no signature verification path at all**. The raw body is now captured and
+  the caller authenticated *before* parsing — a signature is over bytes, so anything that
+  re-serializes first has verified something other than what the sender signed. Proven with a fixture
+  built to be destroyed by a round trip (keys reorder, a duplicate key collapses, whitespace is
+  erased); feeding the verifier a re-serialized body reds exactly one test of sixty-four.
+
+  Nine guards, each mutation-proved on the shipped line, with the two refusal sites independently
+  attributable — deleting the load-site guard reds two integration tests while all 64 unit tests stay
+  green, and deleting the handler-site guard does the reverse.
+
+  **⚠ BREAKING: a non-loopback webhook with a `token` and no `verify` no longer loads.** Add
+  `verify "none"` to keep today's behaviour, or a `verify { … }` record once schemes land. The error
+  names the channel and the address and prints the literal line to add. Loopback is untouched.
+  Warn-and-continue was rejected because it collapses "unstated" and "explicitly none" at the one
+  moment the difference is actionable. A declared-but-unperformable verification is a load error
+  before any port is bound, so nothing degrades silently to unverified.
+
+- **One total JSON redaction walk, replacing four hand-rolled copies** (C-338). C-323 had to fix the
+  same node-kind hole in four separate walkers — two of which feed **durable stores** and also skipped
+  object keys. That duplication was the mechanism by which the defect existed at all: there was no
+  place where "total" was defined once.
+
+  The shared walk lives in `flux-core`, which needed **no new dependency edge and no manifest change**
+  — both options originally proposed turned out to be fenced edits. The guard is structural: the
+  walk's match is exhaustive by variant with no catch-all, so a new `serde_json::Value` variant fails
+  the *build*. The whatif cassette's two paths survive and got stronger, with the branch choice now
+  coming from the walk's own report rather than a second traversal that could disagree with it.
+
+- **`[limits]` now has an observed journey chain, and a misleading test comment is corrected**
+  (C-314). The `flux app run` journey path — `assemble_app_execution_environment` →
+  `App::try_with_execution_environment` → `Engine::new` → `build_executor` → `into_executor` — is
+  pinned by a test proved against **middle-link** mutations rather than endpoints. The per-child
+  reviewer assertion, which observed a transformation the test performed itself, now documents what
+  it really guards: occupancy structurally cannot see a child's ceiling, because a child's actions are
+  walked sequentially, one op each.
+
+- **The user config layer is pinned by value instead of process `HOME`** (C-332). C-297 enumerated 73
+  `HOME`-reading tests and recorded its follow-ups in prose only, so 53 known-hazardous tests were
+  invisible to the board. The largest reachable tranche now takes an injected environment, so a test's
+  verdict no longer depends on the developer's home directory. The remaining tranches are filed with
+  measured counts and their seam — including the finding that `flux-server`'s 43 tests never call the
+  config reader at all, so a census that greps for the reader finds none of them.
 
 - **Credential-shaped literals no longer block `git push`, and cannot recur** (C-325). Pushing main
   was rejected by GitHub secret scanning. Every detection was a provable false positive — synthetic

@@ -91,6 +91,17 @@
 
 ### Fixed
 
+- **Security: a webhook channel now checks who is calling before it reads what they sent.** If you
+  expose a webhook, flux authenticates the request first and only then decodes the body — and it
+  checks the signature against the exact bytes the sender signed, not a reformatted copy. Previously
+  a webhook channel had no way to verify a signature at all.
+  **You may need to act:** a webhook that listens beyond your own machine must now say what it does
+  about verification. If it has a token and no verification, add the line `verify "none"` to keep
+  today's behaviour. flux refuses to start otherwise, names the channel, and prints the exact line to
+  add — rather than opening a port whose protection you might have assumed. Webhooks that only listen
+  on your own machine are unaffected.
+
+
 - **Security: a credential made only of digits is now hidden everywhere, including where it was
   slipping through.** flux hides credentials you have registered wherever they appear. But a
   credential that is only digits — an account id, a numeric key — cannot be recognised by any of the
