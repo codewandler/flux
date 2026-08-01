@@ -6,13 +6,13 @@
 > This is a joined design for `flux`, `../flux-connectors`, and a future hosted connectors
 > platform. Flux owns execution, tenancy, authorization, guarded IO, and secret handling.
 > flux-connectors owns portable declarations and generated adapter descriptions. The hosted
-> platform owns account-scoped configuration and the Babelforce-managed default binding.
+> platform owns account-scoped configuration and the platform-managed default binding.
 
 ## Why
 
 The hosted connectors platform needs ordinary customer storage and credential storage to be
 replaceable without giving every backend a bespoke call path. An account may bring several stores,
-while an unconfigured account should still be able to use a Babelforce-managed object store. The
+while an unconfigured account should still be able to use a platform-managed object store. The
 shared problem is selection and tenancy; the data-plane safety contracts are intentionally
 different.
 
@@ -22,7 +22,7 @@ A platform account may configure many named stores. Each store has a backend typ
 `aws.s3`, `local`, `hashicorp.vault`, or `onepassword.connect`, but callers select a store by its
 stable **name**, not by type: two S3 stores are a valid configuration. Omitting the name selects the
 account's default. In the hosted product, an account with no object-store default receives the
-hidden Babelforce-managed S3 binding.
+hidden platform-managed S3 binding.
 
 One registry serves two deliberately different facades:
 
@@ -132,12 +132,12 @@ unqualified `default_store` would either route secrets into ordinary storage or 
 default impossible.
 
 - Hosted object storage: the account-selected default wins. If absent, the platform registry
-  returns the hidden `babelforce` binding backed by a Babelforce-owned S3 bucket and credentials.
+  returns the hidden `platform` binding backed by a platform-owned S3 bucket and credentials.
 - Standalone object storage: a configured default wins; otherwise object access reports that no
   default is configured. Flux does not silently choose the workspace.
 - Standalone credentials: the existing 0600 file store remains the compatibility default.
 - Hosted credentials: the account or operator must bind a credential-capable profile. There is no
-  pod-local-file fallback and the Babelforce S3 object binding is not credential-capable.
+  pod-local-file fallback and the platform S3 object binding is not credential-capable.
 
 An explicit store name always wins over a default. An unknown name, a name owned by another
 account, or a profile without the requested capability is an error before backend IO.
@@ -224,7 +224,7 @@ The tenant is never accepted from an operation parameter or request header that 
 been resolved into immutable identity by the hosting surface. A privileged cross-tenant API is not
 part of v1; platform administration must bind a different request context explicitly.
 
-For the Babelforce binding, bucket, region, endpoint, prefix, and AWS identity are host-owned and
+For the platform binding, bucket, region, endpoint, prefix, and AWS identity are host-owned and
 absent from the account's visible profile. The customer sees the binding name and safe status, not
 the bucket credentials or an S3 URL.
 
@@ -348,7 +348,7 @@ list response, or an operation whose risk/idempotency metadata contradicts the r
 
 AWS is the first remote provider: `com.amazonaws/s3:2006-03-01`. The connector catalogue still
 needs SigV4 request signing and honest XML response handling before the generated S3 adapter can be
-used. The hosted Babelforce adapter may be supplied natively first, using already-bound AWS values,
+used. The hosted platform adapter may be supplied natively first, using already-bound AWS values,
 but it implements the same conformance suite and does not create a second public API.
 
 ### `secret_storage`
@@ -483,7 +483,7 @@ contract while implementing it.
 
 1. Persist account-scoped named profiles and two defaults; keep backend configuration and bootstrap
    values out of tenant-visible records.
-2. Supply the hidden Babelforce S3 object binding and derive the authenticated tenant for every
+2. Supply the hidden platform S3 object binding and derive the authenticated tenant for every
    object request.
 3. Bind BYOS profiles to connector adapter descriptors, private-network grants, audit, and health
    reporting.
@@ -494,13 +494,13 @@ Each implementation slice owns failing-first tests, and the assembled journey mu
 
 - two named S3 stores in one account; type filtering returns both, access by type is refused, access
   by name selects exactly one;
-- an account-selected object default, the Babelforce fallback when absent, and no standalone
+- an account-selected object default, the platform fallback when absent, and no standalone
   workspace fallback;
 - a malicious `../`, absolute, encoded-separator, or foreign-tenant path never reaches a backend;
 - two accounts asking for the same relative path receive different physical keys;
 - object GET streams to a bounded blob handle and no object bytes appear in `ToolResult`;
 - oversized GET, PUT, list page, metadata, cursor, and path inputs fail at host bounds;
-- wrong-capability selection (Babelforce S3 as credential store) fails before IO;
+- wrong-capability selection (platform S3 as credential store) fails before IO;
 - remote store `NotFound` is distinct from 401/403, transport, decode, and timeout failures, and no
   failure reads or writes the local store;
 - bootstrap accepts env/file/workload identity, refuses store references, and never surfaces its
@@ -515,12 +515,12 @@ Each implementation slice owns failing-first tests, and the assembled journey mu
   refusal, version conditions, and concealed-field diversion;
 - operator operations are absent from the agent registry and present only in an explicitly
   authorized admin registry;
-- the native Babelforce S3 adapter and later connector-generated S3 adapter pass one object-backend
+- the native platform S3 adapter and later connector-generated S3 adapter pass one object-backend
   conformance suite.
 
 ## Explicitly out of scope
 
-- Treating the Babelforce-managed S3 bucket as a credential vault. A future S3 credential adapter
+- Treating the platform-managed S3 bucket as a credential vault. A future S3 credential adapter
   needs its own KMS/envelope-encryption and key-policy design.
 - Fan-out reads across stores or automatic reconciliation. One operation resolves one binding.
 - A routing-rule language. V1 has exact named selection, two defaults, and exact host bindings.

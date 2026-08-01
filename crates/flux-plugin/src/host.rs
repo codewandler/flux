@@ -5599,8 +5599,8 @@ mod tests {
     #[test]
     fn verify_descriptor_labels_from_source_and_spawn_verified_admits_it() {
         let from_source = PluginDescriptor {
-            program: "/opt/flux-plugin-babelforce-manager".into(),
-            git_url: Some("https://gitlab.example/group/flux-plugin-babelforce-manager.git".into()),
+            program: "/opt/flux-plugin-acme-manager".into(),
+            git_url: Some("https://gitlab.example/group/flux-plugin-acme-manager.git".into()),
             git_commit: Some("abc123".into()),
             ..Default::default()
         };

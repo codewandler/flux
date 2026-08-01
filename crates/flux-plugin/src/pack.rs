@@ -2094,8 +2094,8 @@ mod tests {
     #[test]
     fn repo_slug_is_a_bare_safe_dir_name() {
         assert_eq!(
-            repo_slug("https://gitlab.example/group/flux-plugin-babelforce-manager.git"),
-            "flux-plugin-babelforce-manager"
+            repo_slug("https://gitlab.example/group/flux-plugin-acme-manager.git"),
+            "flux-plugin-acme-manager"
         );
         assert_eq!(repo_slug("git@github.com:codewandler/flux.git"), "flux");
         assert_eq!(repo_slug("https://example/x/"), "x");

@@ -32,6 +32,6 @@ Vault token healthy across renewal and JWT rotation.
   the published 0.14.8 closure without path overrides.
 
 ## Notes
-- Downstream consumer: `/home/timo/babelforce/projects/ai-agent-platform`, story C-27.
+- Downstream consumer: the private `ai-agent-platform` repo, story C-27.
 - Kubernetes login endpoint: `POST /v1/auth/<mount>/login`; renewal uses
   `POST /v1/auth/token/renew-self`.

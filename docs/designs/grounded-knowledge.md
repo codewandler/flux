@@ -10,7 +10,7 @@ Master plan (cross-repo, incl. the ai-agents consumer half): `~/.claude/plans/sh
 ## Why
 
 flux's datasource layer (D-07) delivers knowledge to a model **only** as retrieval **tool calls**
-(`search`/`get`/…). Two gaps surface when a consumer (the babelforce ai-agents service) builds a
+(`search`/`get`/…). Two gaps surface when a consumer (a downstream ai-agents service) builds a
 customer-facing knowledge feature on top:
 
 1. **No prompt-injection path.** A small KB (an FAQ, a page of policy) is best handed to the model
@@ -79,7 +79,7 @@ all stand. This epic turns existing scaffolding on (SqliteBackend, SemanticIndex
 
 ## Consumer (ai-agents)
 
-The babelforce ai-agents service wires to these: raw-text/file KB shapes ingest via D-50; a small attached
+The downstream ai-agents service wires to these: raw-text/file KB shapes ingest via D-50; a small attached
 KB injects via A-19 (`<knowledge-base>` blocks in the voice/text persona) while a large one keeps the
 `search` tool; a KB's `embeddings=local` turns on D-51's local semantic path in that account's SQLite
 store. See the ai-agents `knowledge-sources-v2` epic + the master plan.

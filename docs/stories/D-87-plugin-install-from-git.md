@@ -23,7 +23,7 @@ one hosted on a private GitLab) installs without the signed github pack channel.
    cannot ride it;
 2. `--dir <path>` — a local scan of already-built binaries (no fetch, no build).
 
-The concrete driver is ai-agent-platform's `flux-plugin-babelforce-manager`, which lives on private
+The concrete driver is ai-agent-platform's `flux-plugin-<vendor>-manager`, which lives on private
 GitLab: there is no remote-install path for it today. A `--git` source — clone + build-from-source,
 the `cargo install --git` model — is the missing, source-transparent alternative to a pre-signed pack.
 
@@ -58,12 +58,12 @@ the `cargo install --git` model — is the missing, source-transparent alternati
   pack hash).
 - **Cross-cutting dependency — build-time dep resolution.** The cloned plugin's own dependencies must
   resolve on the installing machine at build time. flux itself is public github (fine), but a private
-  SDK dep (e.g. `babelforce-manager-sdk`) needs to be crates.io-public **or** served from a private
+  SDK dep (e.g. `<vendor>-manager-sdk`) needs to be crates.io-public **or** served from a private
   Cargo registry — and GitLab has **no native Cargo registry** (issue gitlab-org/gitlab#33060), so
   that means `gitlab-cargo-shim` / Kellnr / Artifactory, or keeping it a git dep the build env can
   reach. Settle this alongside `--git` install, or it works only where the private deps are reachable.
 - Security model mirrors `cargo install --git`: prefer `--locked`, print the resolved commit, require
   a confirm. A future refinement could add per-consumer signing so a from-source install can still be
   attested.
-- Consumer: ai-agent-platform `flux-plugin-babelforce-manager` (the babelforce manager control-plane
+- Consumer: ai-agent-platform `flux-plugin-<vendor>-manager` (the vendor's manager control-plane
   plugin) is the first real target.

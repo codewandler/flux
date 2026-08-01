@@ -1957,33 +1957,30 @@ mod tests {
 [default]
 region = us-east-1
 
-[profile babelforce-dev]
-sso_session = babelforce
+[profile acme-dev]
+sso_session = acme
 sso_account_id = 123456789012
 sso_role_name = DeveloperAccess
 
-[sso-session babelforce]
+[sso-session acme]
 sso_start_url = https://d-xxxxxxxxxx.awsapps.com/start
 sso_region = eu-central-1
 "#;
         let cfg = parse_aws_config(text);
         assert_eq!(cfg["default"]["region"], "us-east-1");
-        assert_eq!(cfg["profile babelforce-dev"]["sso_session"], "babelforce");
+        assert_eq!(cfg["profile acme-dev"]["sso_session"], "acme");
+        assert_eq!(cfg["profile acme-dev"]["sso_account_id"], "123456789012");
         assert_eq!(
-            cfg["profile babelforce-dev"]["sso_account_id"],
-            "123456789012"
-        );
-        assert_eq!(
-            cfg["sso-session babelforce"]["sso_start_url"],
+            cfg["sso-session acme"]["sso_start_url"],
             "https://d-xxxxxxxxxx.awsapps.com/start"
         );
-        assert_eq!(cfg["sso-session babelforce"]["sso_region"], "eu-central-1");
+        assert_eq!(cfg["sso-session acme"]["sso_region"], "eu-central-1");
     }
 
     #[test]
     fn profile_section_is_default_or_profile_prefix() {
         assert_eq!(profile_section("default"), "default");
-        assert_eq!(profile_section("babelforce-dev"), "profile babelforce-dev");
+        assert_eq!(profile_section("acme-dev"), "profile acme-dev");
     }
 
     #[test]
@@ -2001,9 +1998,9 @@ sso_region = eu-central-1
         // The cache filename for an sso-session profile is sha1(session_name).hex — matching the
         // `aws` CLI's own cache layout (verified live against the dev account).
         std::env::set_var("HOME", "/tmp/flux-sso-test-home");
-        let p = sso_cache_path("babelforce").unwrap();
+        let p = sso_cache_path("acme").unwrap();
         let mut h = sha1::Sha1::new();
-        h.update(b"babelforce");
+        h.update(b"acme");
         let digest = hex::encode(h.finalize());
         assert_eq!(
             p,

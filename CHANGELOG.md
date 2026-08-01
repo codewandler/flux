@@ -22,6 +22,20 @@ All notable changes to this project are documented in this file. The format is b
   and a written contract states which guarantees travel with the substrate alone and which are
   `flux-runtime`'s. No layer moves and no IO path is added.
 
+### Changed
+
+- **No flux-family repository names a downstream company** (C-400). Test fixtures, two design
+  documents and five stories referred to one downstream company by name. A product's name is true
+  only of that product, so it belongs in that product's repository — the same boundary rule
+  `docs/ecosystem.md` applies to code, applied to documentation and fixtures. Crate fixtures now use
+  the house `acme` placeholder; `connector-backed-storage-facade.md` uses the vocabulary it had
+  already established for itself ("the hosted platform", "platform-managed", "platform-owned") and
+  renames its proposed binding identifier to `platform`; and the stories keep the engineering reason
+  — private GitLab plus no native Cargo registry (`gitlab-org/gitlab#33060`) — while dropping the
+  private citation. All 14 crate-source occurrences were inside `#[cfg(test)]` modules, which ship
+  in the `.crate` tarball and are browsable on docs.rs. No production code, public item, test name,
+  or behaviour changed.
+
 ## [0.45.0] - 2026-08-01
 
 ### Improved

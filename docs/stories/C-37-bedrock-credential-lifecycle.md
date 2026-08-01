@@ -41,7 +41,7 @@ refresh by chain-step-1).
       `cargo test -p flux-codegate`.
 
 ## Progress
-- Identified while wiring the babelforce ai-agent-platform deployment onto Bedrock via EKS Pod
+- Identified while wiring a downstream ai-agent-platform deployment onto Bedrock via EKS Pod
   Identity: the injected session creds rotate (~hours), so resolve-once means a dead provider
   after the first expiry in an always-on server.
 - Landed: `expiration` capture in all three temporary-cred sources; expiry-aware re-resolution in

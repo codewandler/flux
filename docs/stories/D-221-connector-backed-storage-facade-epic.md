@@ -5,7 +5,7 @@ pillar: Core
 status: backlog
 design: docs/designs/connector-backed-storage-facade.md
 epic: connector-backed-storage-facade
-note: "EPIC — account-scoped named stores with per-capability defaults; Babelforce S3 for objects, Vault/1Password for credentials, and connector declarations driving both without exposing secrets"
+note: "EPIC — account-scoped named stores with per-capability defaults; platform-managed S3 for objects, Vault/1Password for credentials, and connector declarations driving both without exposing secrets"
 ---
 
 # Connector-backed storage — one registry, safe object and credential facades
@@ -24,7 +24,7 @@ Flux remains the only runtime and safety envelope.
       selector.
 - [ ] `ObjectStoreFacade` derives tenant prefixes from immutable host identity, accepts only
       validated relative paths, and returns bounded opaque blob handles rather than arbitrary bytes.
-- [ ] The hosted platform can supply a hidden Babelforce-managed S3 object default, while that
+- [ ] The hosted platform can supply a hidden platform-managed S3 object default, while that
       binding is structurally ineligible for credential storage.
 - [ ] `CredentialStore` supports general secret records plus OAuth refresh/expiry metadata, and one
       injected/default seam is used consistently by CLI, SDK, providers, plugins, doctor, and the
