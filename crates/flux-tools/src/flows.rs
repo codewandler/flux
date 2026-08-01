@@ -466,7 +466,11 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         let mut workspace = Workspace::new(&project).unwrap();
         workspace.add_named_root("global_flows", &global).unwrap();
-        (temp, System::new(workspace))
+        (
+            temp,
+            System::new(workspace)
+                .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+        )
     }
 
     fn write(base: &Path, path: &str, source: &str) {

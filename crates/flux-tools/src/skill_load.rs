@@ -111,7 +111,8 @@ mod tests {
     fn ctx_with_loader(loader: Option<Arc<dyn SkillLoader>>) -> ToolContext {
         let dir = std::env::temp_dir().join(format!("flux-skill-load-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let system = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let system = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap())
+            .with_worktree_base(crate::test_worktrees::pinned_worktree_base());
         let mut ctx = ToolContext::new(Arc::new(system));
         ctx.skill_loader = loader;
         ctx

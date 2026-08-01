@@ -218,7 +218,10 @@ mod tests {
     }
 
     fn ctx_for(root: &Path) -> ToolContext {
-        ToolContext::new(Arc::new(System::new(Workspace::new(root).unwrap())))
+        ToolContext::new(Arc::new(
+            System::new(Workspace::new(root).unwrap())
+                .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+        ))
     }
 
     fn grant_command_invoke() -> AuthorizationPolicy {

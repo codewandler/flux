@@ -502,7 +502,8 @@ mod tests {
     /// A dispatch context, with or without a host pane channel.
     fn ctx(label: &str, sink: Option<Arc<RecordingSink>>) -> ToolContext {
         let root = temp_root(label);
-        let system = flux_system::System::new(flux_system::Workspace::new(&root).unwrap());
+        let system = flux_system::System::new(flux_system::Workspace::new(&root).unwrap())
+            .with_worktree_base(crate::test_worktrees::pinned_worktree_base());
         let ctx = ToolContext::new(Arc::new(system));
         if let Some(sink) = sink {
             ctx.set_surface_sink(sink);

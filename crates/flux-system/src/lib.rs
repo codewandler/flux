@@ -478,59 +478,114 @@ fn worktree_base_dir() -> PathBuf {
     }
 }
 
-/// Allocate a fresh private parent directory for a context-local git worktree (C-97):
-/// `<base>/flux-worktree-<pid>-<seq>` with owner-only permissions on Unix, where `<base>` comes
-/// from [`worktree_base_dir`]. The directory is created outside any workspace root on purpose —
-/// the caller derives a re-rooted [`System`] ([`System::rerooted`]) at the checkout inside it.
-pub fn allocate_worktree_dir() -> Result<PathBuf> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = worktree_base_dir();
-    std::fs::create_dir_all(&base)
-        .map_err(|e| Error::Config(format!("worktree base {}: {e}", base.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+/// Where context-local git worktree parents are allocated — held as a **value** rather than read
+/// from the process environment at the point of use (C-391).
+///
+/// [`WorktreeBase::from_process`] is what production resolves ([`worktree_base_dir`]: the
+/// `$FLUX_WORKTREE_DIR` / `$HOME/.flux/worktrees` / temp-dir ladder), and every [`System`] carries
+/// one, so a test pins *where the write lands* by pinning the system it drives rather than by
+/// exporting an environment variable. That distinction is the whole story: an unpinned allocation
+/// creates a real directory tree under the developer's `~/.flux/worktrees`, and a test that dies
+/// between `git_worktree_enter` and `git_worktree_leave` strands it there. The same value-held-env
+/// shape as `HarnessEnv` (C-213) and `DiscoveryEnv` (C-297/C-332) — not a third injection idiom,
+/// and specifically not `std::env::set_var`, which races every other thread in the process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeBase(PathBuf);
+
+impl WorktreeBase {
+    /// Resolve the base from the process environment — what every production entry point uses.
+    pub fn from_process() -> Self {
+        Self(worktree_base_dir())
     }
-    let dir = base.join(format!("flux-worktree-{}-{seq}", std::process::id()));
-    std::fs::create_dir(&dir)
-        .map_err(|e| Error::Config(format!("worktree dir {}: {e}", dir.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+
+    /// Pin the base to an explicit directory. For tests, and for any host that decides where its
+    /// worktrees live rather than inheriting the operator's home.
+    pub fn pinned(dir: impl Into<PathBuf>) -> Self {
+        Self(dir.into())
     }
-    dir.canonicalize()
-        .map_err(|e| Error::Config(format!("worktree dir {}: {e}", dir.display())))
+
+    /// The directory allocations land in.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Allocate a fresh private parent directory for a context-local git worktree (C-97):
+    /// `<base>/flux-worktree-<pid>-<seq>` with owner-only permissions on Unix. The directory is
+    /// created outside any workspace root on purpose — the caller derives a re-rooted [`System`]
+    /// ([`System::rerooted`]) at the checkout inside it.
+    pub fn allocate(&self) -> Result<PathBuf> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = &self.0;
+        std::fs::create_dir_all(base)
+            .map_err(|e| Error::Config(format!("worktree base {}: {e}", base.display())))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = base.join(format!("flux-worktree-{}-{seq}", std::process::id()));
+        std::fs::create_dir(&dir)
+            .map_err(|e| Error::Config(format!("worktree dir {}: {e}", dir.display())))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        dir.canonicalize()
+            .map_err(|e| Error::Config(format!("worktree dir {}: {e}", dir.display())))
+    }
+
+    /// Remove a directory previously produced by [`allocate`](Self::allocate). Fail-closed: refuses
+    /// any path that is not a direct child of *this* base carrying the `flux-worktree-` prefix, so
+    /// a corrupted session state can never turn cleanup into an arbitrary recursive delete.
+    pub fn remove(&self, path: &Path) -> Result<()> {
+        let base = self
+            .0
+            .canonicalize()
+            .map_err(|e| Error::Config(format!("worktree base dir: {e}")))?;
+        let ok = path.parent() == Some(base.as_path())
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("flux-worktree-"));
+        if !ok {
+            return Err(Error::Config(format!(
+                "refusing to remove {:?}: not an allocated flux worktree dir",
+                path
+            )));
+        }
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Config(format!(
+                "worktree dir cleanup {}: {e}",
+                path.display()
+            ))),
+        }
+    }
 }
 
-/// Remove a directory previously allocated by [`allocate_worktree_dir`]. Fail-closed: refuses any
-/// path that is not directly under the resolved [`worktree_base_dir`] with the `flux-worktree-`
-/// prefix, so a corrupted session state can never turn cleanup into an arbitrary recursive delete.
+impl Default for WorktreeBase {
+    fn default() -> Self {
+        Self::from_process()
+    }
+}
+
+/// Allocate a worktree parent under the base resolved from the **process** environment.
+///
+/// Prefer [`System::allocate_worktree_dir`], which allocates under the base that system carries: a
+/// caller holding a `System` already has the seam, and going through it is what keeps a test's
+/// worktrees out of the operator's home (C-391).
+pub fn allocate_worktree_dir() -> Result<PathBuf> {
+    WorktreeBase::from_process().allocate()
+}
+
+/// Remove a directory previously allocated by [`allocate_worktree_dir`], fail-closed against the
+/// base resolved from the **process** environment. Prefer [`System::remove_worktree_dir`], for the
+/// same reason: the removal guard must resolve the *same* base the allocation used.
 pub fn remove_worktree_dir(path: &Path) -> Result<()> {
-    let tmp = worktree_base_dir()
-        .canonicalize()
-        .map_err(|e| Error::Config(format!("worktree base dir: {e}")))?;
-    let ok = path.parent() == Some(tmp.as_path())
-        && path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("flux-worktree-"));
-    if !ok {
-        return Err(Error::Config(format!(
-            "refusing to remove {:?}: not an allocated flux worktree dir",
-            path
-        )));
-    }
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::Config(format!(
-            "worktree dir cleanup {}: {e}",
-            path.display()
-        ))),
-    }
+    WorktreeBase::from_process().remove(path)
 }
 
 /// Whether the environment variable `key` is set to a truthy value (`1`/`true`/`yes`/`on`).
@@ -1194,17 +1249,24 @@ pub struct PipeChild {
 pub struct System {
     workspace: Workspace,
     sandbox: Sandbox,
+    worktree_base: WorktreeBase,
 }
 
 impl System {
-    /// Build a `System` with the sandbox **disabled** — env-free and infallible, so every
-    /// hermetic test site (and any caller that doesn't want the environment consulted) is
-    /// unaffected by the sandbox seam. Production entry points should use
+    /// Build a `System` with the sandbox **disabled** — infallible, so every hermetic test site
+    /// (and any caller that doesn't want the sandbox environment consulted) is unaffected by the
+    /// sandbox seam. Production entry points should use
     /// [`System::from_env`]/[`System::with_sandbox`] instead.
+    ///
+    /// The one thing it does snapshot from the environment is the worktree base
+    /// ([`WorktreeBase::from_process`]), so an existing caller's allocations land exactly where
+    /// they did before; a test that drives `git_worktree_enter`/`fleet.isolate` pins it with
+    /// [`System::with_worktree_base`] rather than writing into the operator's home (C-391).
     pub fn new(workspace: Workspace) -> Self {
         Self {
             workspace,
             sandbox: Sandbox::disabled(),
+            worktree_base: WorktreeBase::from_process(),
         }
     }
 
@@ -1215,7 +1277,11 @@ impl System {
     pub fn from_env(cwd: impl AsRef<Path>) -> Result<Self> {
         let workspace = Workspace::from_env(cwd)?;
         let sandbox = Sandbox::resolve(SandboxSettings::from_env());
-        Ok(Self { workspace, sandbox })
+        Ok(Self {
+            workspace,
+            sandbox,
+            worktree_base: WorktreeBase::from_process(),
+        })
     }
 
     /// Attach an explicit sandbox posture — the builder counterpart to [`System::from_env`] for
@@ -1226,18 +1292,47 @@ impl System {
         self
     }
 
+    /// Pin where this system's context-local git worktrees are allocated (C-391). The builder
+    /// counterpart to the process-resolved default: a test pins a base it owns, so no allocation
+    /// — and no allocation a panic strands — can land in the operator's `~/.flux/worktrees`.
+    pub fn with_worktree_base(mut self, base: WorktreeBase) -> Self {
+        self.worktree_base = base;
+        self
+    }
+
+    /// The base this system allocates worktree parents under.
+    pub fn worktree_base(&self) -> &WorktreeBase {
+        &self.worktree_base
+    }
+
+    /// Allocate a fresh private worktree parent under this system's base — the guarded entry point
+    /// `git_worktree_enter` and `fleet.isolate` use. See [`WorktreeBase::allocate`].
+    pub fn allocate_worktree_dir(&self) -> Result<PathBuf> {
+        self.worktree_base.allocate()
+    }
+
+    /// Remove a parent this system allocated, fail-closed against *its* base — the counterpart to
+    /// [`allocate_worktree_dir`](Self::allocate_worktree_dir), so cleanup can never resolve a
+    /// different base than the allocation did. See [`WorktreeBase::remove`].
+    pub fn remove_worktree_dir(&self, path: &Path) -> Result<()> {
+        self.worktree_base.remove(path)
+    }
+
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
     }
 
-    /// Derive a `System` re-rooted at `root` while preserving both the workspace access posture
-    /// (via [`Workspace::with_root`]) and the resolved sandbox. Spawned processes under the
-    /// derived system run with the new root as cwd and the sandbox's writable set follows it
-    /// automatically ([`sandbox::SpawnPolicy::for_workspace`] derives from the workspace root).
+    /// Derive a `System` re-rooted at `root` while preserving the workspace access posture (via
+    /// [`Workspace::with_root`]), the resolved sandbox, and the worktree base. Spawned processes
+    /// under the derived system run with the new root as cwd and the sandbox's writable set follows
+    /// it automatically ([`sandbox::SpawnPolicy::for_workspace`] derives from the workspace root).
+    /// The worktree base is carried over because the re-rooted system *is* the entered worktree:
+    /// its own allocations, and the cleanup of the one it lives in, must resolve the same base.
     pub fn rerooted(&self, root: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             workspace: self.workspace.with_root(root)?,
             sandbox: self.sandbox.clone(),
+            worktree_base: self.worktree_base.clone(),
         })
     }
 
@@ -2738,6 +2833,42 @@ mod tests {
         std::fs::remove_dir(&foreign).unwrap();
         assert!(other.exists());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// C-391: the base is a **value** a `System` carries, so pinning it needs no environment
+    /// variable and no lock — which is the whole point, since `std::env::set_var` from a test races
+    /// every other thread in the process. A derived (re-rooted) system keeps the pin, and the
+    /// fail-closed removal guard resolves *the system's own* base: a system pinned elsewhere
+    /// refuses to remove another's allocation.
+    #[test]
+    fn a_pinned_worktree_base_is_carried_by_the_system_and_survives_rerooting() {
+        let (root, system) = temp_workspace();
+        let base = sandbox::fixture_path("wt-pinned");
+        let system = system.with_worktree_base(WorktreeBase::pinned(&base));
+
+        let dir = system.allocate_worktree_dir().unwrap();
+        assert_eq!(dir.parent().unwrap(), base.canonicalize().unwrap());
+        assert!(dir.is_dir());
+
+        // The entered worktree's own system must resolve the same base — it is what removes the
+        // very directory it lives under when the session ends.
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let rerooted = system.rerooted(&checkout).unwrap();
+        assert_eq!(rerooted.worktree_base(), system.worktree_base());
+
+        // Fail-closed across bases, not merely across paths.
+        let elsewhere = sandbox::fixture_dir("wt-elsewhere");
+        let other = System::new(Workspace::new(&root).unwrap())
+            .with_worktree_base(WorktreeBase::pinned(&elsewhere));
+        assert!(other.remove_worktree_dir(&dir).is_err());
+        assert!(dir.exists(), "the refusal removed nothing");
+
+        rerooted.remove_worktree_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The base falls back to `$HOME/.flux/worktrees` (never `/tmp`, which is commonly a

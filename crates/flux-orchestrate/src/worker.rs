@@ -501,8 +501,9 @@ impl AgentRuntime for ProcessRuntime {
         // `rerooted` is the *whole* guard on this path, deliberately. `Workspace::with_root`
         // canonicalizes and requires the directory to exist, and it does **not** require the new root
         // to sit under the old one — which is the only reason `fleet.isolate`'s checkout can be
-        // accepted at all: `allocate_worktree_dir` creates it outside every workspace root on purpose
-        // (`$FLUX_WORKTREE_DIR`, else `$HOME/.flux/worktrees`). An earlier revision also ran the path
+        // accepted at all: `System::allocate_worktree_dir` creates it outside every workspace root on
+        // purpose, under the base that system carries (`$FLUX_WORKTREE_DIR`, else
+        // `$HOME/.flux/worktrees`, unless pinned — C-391). An earlier revision also ran the path
         // through `Workspace::resolve`, the write-path resolver, which admits only the primary and
         // `@named` roots — so it rejected the one input this parameter exists to take.
         let rerooted = match spec.worktree.as_deref() {
@@ -1428,8 +1429,9 @@ mod tests {
     /// to the checkout it was given, **and that checkout lives outside the workspace root**.
     ///
     /// The arrangement here is the one `fleet.isolate` actually produces, which is the whole point.
-    /// `flux_system::allocate_worktree_dir` creates its parent under `$FLUX_WORKTREE_DIR` (else
-    /// `$HOME/.flux/worktrees`) — "outside any workspace root **on purpose**", per its own doc — and
+    /// `System::allocate_worktree_dir` creates its parent under the base that system carries
+    /// (`$FLUX_WORKTREE_DIR`, else `$HOME/.flux/worktrees`, unless pinned — C-391) —
+    /// "outside any workspace root **on purpose**", per its own doc — and
     /// C-241 hands back `<that>/checkout`. An earlier revision of this op ran the path through
     /// `Workspace::resolve`, the write-path resolver, which admits only the primary and `@named`
     /// roots; it therefore rejected every real `fleet.isolate` output with "escapes the workspace

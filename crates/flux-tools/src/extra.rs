@@ -704,7 +704,10 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("flux-extra-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+        let c = ToolContext::new(Arc::new(
+            System::new(Workspace::new(&dir).unwrap())
+                .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+        ));
         (dir, c)
     }
 
