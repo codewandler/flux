@@ -1464,3 +1464,376 @@ async fn the_default_bound_is_documented_and_wider_than_flux_s_own_fan_out() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// C-415 — the journey half of the room identity gap
+// ---------------------------------------------------------------------------
+
+/// What one op dispatch saw about the principal it ran as.
+#[derive(Debug, Clone)]
+struct SeenCaller {
+    /// The tag the flow passed, so a parent and a spawned child are distinguishable.
+    tag: String,
+    /// `tool_call.caller` — the id the **safety envelope itself** authorized and audited this
+    /// dispatch under. `Executor::dispatch` writes that observation before it calls `execute`, so
+    /// reading it back from inside the tool reads the record the gate just made, not a restatement.
+    audited: String,
+    /// The request-owned [`flux_runtime::TurnIdentity`] frozen for the turn, when one was installed
+    /// — `None` means the dispatch fell back to the executor's assembly-time identity.
+    turn_principal: Option<String>,
+    /// That identity's trust level, rendered.
+    turn_trust: Option<String>,
+}
+
+/// A read-only op whose whole purpose is to report the identity its own dispatch ran under.
+struct IdentityProbe(Arc<Mutex<Vec<SeenCaller>>>);
+
+#[async_trait]
+impl Tool for IdentityProbe {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec::read_only(
+            "whoami",
+            "report the caller identity this dispatch ran under",
+            json!({
+                "type": "object",
+                "properties": { "tag": { "type": "string" } },
+                "required": ["tag"]
+            }),
+        )
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext,
+        params: serde_json::Value,
+    ) -> flux_core::Result<ToolResult> {
+        let audited = ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .by_kind("tool_call")
+            .last()
+            .and_then(|o| o.data.get("caller").and_then(|c| c.as_str()))
+            .unwrap_or("<no tool_call observation>")
+            .to_string();
+        let identity = ctx.turn_identity();
+        self.0.lock().unwrap().push(SeenCaller {
+            tag: params["tag"].as_str().unwrap_or_default().to_string(),
+            audited,
+            turn_principal: identity.as_ref().map(|i| i.caller().principal.id.clone()),
+            turn_trust: identity.as_ref().map(|i| format!("{:?}", i.trust().level)),
+        });
+        Ok(ToolResult::ok("ok"))
+    }
+}
+
+const ADA: &str = "standup@rooms.example/ada";
+const MALLORY: &str = "standup@rooms.example/mallory";
+
+/// Every `journey.identity` attribution the app recorded durably, in order — the operator's
+/// after-the-fact view of who caused a journey's effects.
+///
+/// The stream name is written out rather than read from `flux_app::JOURNEY_AUDIT_STREAM` on
+/// purpose: it keeps this whole file compiling against the merge base, so the failing-first run is
+/// reproducible. It pins the same thing either way — the value the published const carries is what
+/// `record_journey_identity` writes to, so changing one without the other reds this.
+fn recorded_attributions(app: &App) -> Vec<serde_json::Value> {
+    app.events()
+        .observations("journey-audit")
+        .expect("the journey audit stream")
+        .into_iter()
+        .filter(|o| o.kind == "journey.identity")
+        .map(|o| o.data)
+        .collect()
+}
+
+/// C-415 (the journey half of F2 of the 2026-08-01 security-posture review). C-408 gave the *agent*
+/// path a request-owned identity; `run_journey` still built its `RuntimeTurnContext` with no
+/// `.with_identity(..)`, so a room-triggered **journey** authorized and audited every op as the
+/// assembly-time `local` operator at `Privileged`. A room is the most multi-principal surface flux
+/// has, and `docs/designs/meeting-rooms.md` says a room event wakes a journey *or* an agent — so
+/// closing only the agent half left the identity invariant (`AGENTS.md`) open on the other.
+#[tokio::test]
+async fn a_room_triggered_journeys_op_authorizes_and_audits_as_the_speaker() {
+    const SRC: &str = "\
+permissions
+  allow [whoami]
+
+trigger t
+  on \"standup\"
+  run report
+
+journey report
+  flow
+    $who = whoami({ \"tag\": \"journey\" })
+    return \"{who}\"
+";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe: Arc<dyn Tool> = Arc::new(IdentityProbe(seen.clone()));
+    let app = App::try_with_tools(program(SRC), None, "test-model", false, vec![probe])
+        .expect("valid app");
+
+    app.deliver(
+        "standup",
+        json!({
+            "room": "standup@rooms.example",
+            "speaker": ADA,
+            // Non-unique by construction in a MUC — never the thing an identity is derived from.
+            "nick": "ada",
+            "text": "what is the status?",
+            "name": "standup",
+        }),
+    )
+    .await
+    .expect("deliver");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the journey dispatched its op once: {seen:?}"
+    );
+    assert_eq!(
+        seen[0].audited, ADA,
+        "the op the journey dispatched must authorize and audit as the SPEAKER, not as the local \
+         operator: {seen:?}"
+    );
+    assert_eq!(seen[0].turn_principal.as_deref(), Some(ADA), "{seen:?}");
+    assert_eq!(
+        seen[0].turn_trust.as_deref(),
+        Some("Untrusted"),
+        "a room occupant presented no credential — C-408's decision, reused: {seen:?}"
+    );
+
+    // Where the attribution is RECORDED. A journey has no engine turn and therefore no
+    // `turn.identity` observation, and its executor's evidence log dies with the run — so the run
+    // writes one `journey.identity` observation into the app's durable event store, on the journey
+    // run's own stream.
+    let recorded = recorded_attributions(&app);
+    assert_eq!(
+        recorded.len(),
+        1,
+        "one attribution per journey run: {recorded:?}"
+    );
+    assert_eq!(recorded[0]["journey"], json!("report"), "{recorded:?}");
+    assert_eq!(recorded[0]["caller"], json!(ADA), "{recorded:?}");
+    assert_eq!(recorded[0]["source"], json!("room"), "{recorded:?}");
+    assert_eq!(
+        recorded[0]["attribution"],
+        json!("delivery"),
+        "{recorded:?}"
+    );
+    assert_eq!(
+        recorded[0]["trust"]["level"],
+        json!("untrusted"),
+        "{recorded:?}"
+    );
+}
+
+/// The other half of C-415's contract, and the same pin C-408 put on the agent path: only a
+/// delivery that *names* a principal gets a request-owned identity. A schedule tick names nobody, so
+/// its journey keeps the executor's immutable assembly-time identity — `local` at `Privileged` —
+/// exactly as before. Without this, "derive an identity from the payload" could quietly become
+/// "derive one from every payload", and a `startup` trigger would start reporting a principal nobody
+/// asserted.
+#[tokio::test]
+async fn a_journey_for_an_event_that_names_no_principal_keeps_the_assembly_time_identity() {
+    const SRC: &str = "\
+permissions
+  allow [whoami]
+
+trigger tick
+  on \"schedule\"
+  run sweep
+
+journey sweep
+  flow
+    $who = whoami({ \"tag\": \"tick\" })
+    return \"{who}\"
+";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe: Arc<dyn Tool> = Arc::new(IdentityProbe(seen.clone()));
+    let app = App::try_with_tools(program(SRC), None, "test-model", false, vec![probe])
+        .expect("valid app");
+
+    app.deliver("schedule", json!({ "at": "2026-08-01T09:00:00Z" }))
+        .await
+        .expect("deliver");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].audited, "local", "{seen:?}");
+    assert_eq!(
+        seen[0].turn_principal, None,
+        "no principal was named, so none is installed: {seen:?}"
+    );
+
+    // The record says so out loud rather than by omission: an operator reading this back learns
+    // that nobody but the operator was ever named, not merely that a field is missing.
+    let recorded = recorded_attributions(&app);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0]["caller"], json!("local"), "{recorded:?}");
+    assert_eq!(
+        recorded[0]["attribution"],
+        json!("assembly"),
+        "{recorded:?}"
+    );
+    assert_eq!(
+        recorded[0]["trust"]["level"],
+        json!("privileged"),
+        "{recorded:?}"
+    );
+}
+
+/// A park is a pause in one logical turn, not the start of a new one — so the continuation
+/// authorizes and audits as the principal the run *started* as (C-415).
+///
+/// Two things would be wrong here and this pins both. Falling back to the executor's assembly-time
+/// identity would mean a room stranger's journey finishes as the local operator merely because it
+/// asked a question — the exact defect C-415 removes, reintroduced across the suspension. Adopting
+/// the *replier's* speaker instead would be an outer-surface swap of a live turn's caller, which the
+/// identity invariant forbids outright; so Mallory answering Ada's question does not make the rest
+/// of Ada's journey run as Mallory.
+#[tokio::test]
+async fn a_parked_room_journey_resumes_as_the_speaker_that_started_it() {
+    const SRC: &str = "\
+channel cli
+
+permissions
+  allow [whoami, ask]
+
+trigger t
+  on \"standup\"
+  run interview
+
+journey interview
+  flow
+    $answer = ask({ \"channel\": \"cli\", \"message\": \"status?\" })
+    $who = whoami({ \"tag\": \"after-reply\" })
+    return \"{answer}\"
+";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe: Arc<dyn Tool> = Arc::new(IdentityProbe(seen.clone()));
+    let app = App::try_with_tools(program(SRC), None, "test-model", false, vec![probe])
+        .expect("valid app");
+
+    app.deliver(
+        "standup",
+        json!({ "room": "standup@rooms.example", "speaker": ADA, "text": "start" }),
+    )
+    .await
+    .expect("deliver");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the journey parked before reaching the probe"
+    );
+
+    // A DIFFERENT occupant answers.
+    app.deliver(
+        "cli",
+        json!({ "room": "standup@rooms.example", "speaker": MALLORY, "text": "green" }),
+    )
+    .await
+    .expect("reply");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "the continuation ran: {seen:?}");
+    assert_ne!(
+        seen[0].audited, "local",
+        "asking a question must not hand the continuation back to the operator: {seen:?}"
+    );
+    assert_ne!(
+        seen[0].audited, MALLORY,
+        "the replier does not become the running turn's caller: {seen:?}"
+    );
+    assert_eq!(seen[0].audited, ADA, "{seen:?}");
+
+    let recorded = recorded_attributions(&app);
+    let resumed = recorded
+        .iter()
+        .find(|r| r["attribution"] == json!("resumed"))
+        .unwrap_or_else(|| panic!("the resumed segment is attributed too: {recorded:?}"));
+    assert_eq!(resumed["caller"], json!(ADA), "{recorded:?}");
+}
+
+/// C-415's hard half, and the reason it is a story of its own: `run_journey` is ALSO reached from
+/// `run_journey_for_spawn` — with a payload the **model authored**. If a spawn-sourced delivery
+/// derived its principal from its payload the way a channel delivery does, a model could name any
+/// principal it liked and the record would believe it.
+///
+/// The rule this pins: a spawn-sourced journey **never derives** an identity from its payload; it
+/// inherits the enclosing turn's, which is by construction the turn that spawned it. So the forged
+/// `speaker` below is inert, and the child runs as the same untrusted stranger the parent did —
+/// never a different principal, never a stronger one.
+#[tokio::test]
+async fn a_spawned_journey_inherits_the_spawning_turn_and_cannot_be_told_who_it_is() {
+    const SRC: &str = "\
+permissions
+  allow [whoami, spawn]
+
+trigger t
+  on \"standup\"
+  run parent
+
+journey parent
+  flow
+    $me = whoami({ \"tag\": \"parent\" })
+    $out = spawn({ \"run\": \"child\", \"input\": { \"room\": \"standup@rooms.example\", \"speaker\": \"standup@rooms.example/mallory\" } })
+    return \"{out}\"
+
+journey child
+  flow
+    $who = whoami({ \"tag\": \"child\" })
+    return \"{who}\"
+";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe: Arc<dyn Tool> = Arc::new(IdentityProbe(seen.clone()));
+    let app = App::try_with_tools(program(SRC), None, "test-model", false, vec![probe])
+        .expect("valid app");
+
+    app.deliver(
+        "standup",
+        json!({
+            "room": "standup@rooms.example",
+            "speaker": ADA,
+            "text": "run the report",
+            "name": "standup",
+        }),
+    )
+    .await
+    .expect("deliver");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "parent then child: {seen:?}");
+    let parent = seen.iter().find(|s| s.tag == "parent").expect("parent op");
+    let child = seen.iter().find(|s| s.tag == "child").expect("child op");
+
+    assert_eq!(parent.audited, ADA, "{seen:?}");
+    assert_ne!(
+        child.audited, MALLORY,
+        "the model-authored spawn payload named a principal and it MUST be inert: {seen:?}"
+    );
+    assert_eq!(
+        child.audited, ADA,
+        "a spawned journey runs as the turn that spawned it: {seen:?}"
+    );
+    assert_eq!(
+        child.turn_trust.as_deref(),
+        Some("Untrusted"),
+        "no stronger than the spawning turn: {seen:?}"
+    );
+    assert_eq!(child.turn_principal, parent.turn_principal, "{seen:?}");
+
+    // The record says the child's principal was inherited, not asserted by its own payload.
+    let recorded = recorded_attributions(&app);
+    let child_record = recorded
+        .iter()
+        .find(|r| r["journey"] == json!("child"))
+        .unwrap_or_else(|| panic!("the child run is attributed too: {recorded:?}"));
+    assert_eq!(child_record["caller"], json!(ADA), "{recorded:?}");
+    assert_eq!(
+        child_record["attribution"],
+        json!("inherited"),
+        "a spawn-sourced run never derives from its own payload: {recorded:?}"
+    );
+}

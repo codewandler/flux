@@ -39,6 +39,7 @@ use std::sync::Arc;
 use flux_flow::state::FlowStore;
 use flux_lang::ast::{Node, SymbolName};
 use flux_lang::program::ChannelDecl;
+use flux_runtime::TurnIdentity;
 
 use crate::ops::is_cli_channel;
 
@@ -63,6 +64,16 @@ pub(crate) struct ParkedAsk {
     pub(crate) store: Arc<FlowStore>,
     /// Ops dispatched before the park (prior segments); the resumed run's count adds to this.
     pub(crate) steps: usize,
+    /// The request-owned identity the pre-park segment ran under, when one was installed (C-415).
+    ///
+    /// Carried across the suspension so the continuation authorizes and audits as the **same**
+    /// principal the run started as. A park is a pause in one logical turn, not a new one, and
+    /// `AGENTS.md`'s identity invariant forbids an outer-surface swap mid-turn — so the reply's own
+    /// speaker deliberately does **not** become the resumed segment's caller, even though the reply
+    /// event carries one. Without this the continuation would silently fall back to the executor's
+    /// assembly-time `local`/`Privileged`, i.e. a room stranger's journey would finish as the
+    /// operator simply because it asked a question.
+    pub(crate) identity: Option<TurnIdentity>,
 }
 
 /// True when a `label`-tagged inbound event is the reply a park on `asked` channel waits for:

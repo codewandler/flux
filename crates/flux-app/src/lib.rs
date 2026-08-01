@@ -42,7 +42,7 @@ mod secrets;
 mod supervisor;
 
 pub use admission::{DeliveryLoad, DEFAULT_MAX_INFLIGHT_DELIVERIES, MAX_INFLIGHT_DELIVERIES_ENV};
-pub use app::{App, HostPermissionRules, JourneyRun, RecordingSink};
+pub use app::{App, HostPermissionRules, JourneyRun, RecordingSink, JOURNEY_AUDIT_STREAM};
 pub use bus::{Bus, Event, SentMessage};
 pub use review::{review_code_journey, strict_review_op, strict_review_program};
 pub use secrets::resolve_secrets;
