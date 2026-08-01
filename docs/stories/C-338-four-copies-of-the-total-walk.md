@@ -3,7 +3,7 @@ id: C-338
 title: "Four copies of the same total-walk redaction logic, which is how the node-kind hole recurred"
 pillar: Core
 epic: road-to-stable
-status: in-progress
+status: done
 priority: 8
 areas: [flux-web, flux-flow, flux-orchestrate, flux-secret]
 note: "C-323 had to fix the SAME defect in four separate walkers — flux-web's redact_json, flux-flow's engine evidence flush and cassette input_view, and flux-orchestrate's spawn reporter. Two of them also skipped object KEYS. The duplication is the reason one walker could narrow while the others did not"
