@@ -723,6 +723,183 @@ fn every_message_record_carries_the_harness_it_came_from() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// The one `meta` string C-316 deliberately leaves **out** of `contain`, and why: `meta.harness` is
+/// the harness filter's key (`record_is_from` compares it to `HarnessKind::id`), not transcript text.
+///
+/// Containing every meta string uniformly is the tidier rule and it is wrong here, because it makes
+/// a filter's correctness depend on the operator's secret list: register a value that occurs inside
+/// a harness id and every record of that harness gets `meta.harness = "[redacted]"`, after which
+/// `search(harness: …)` answers "no matches" over an index that holds the row. The damage is
+/// under-return rather than leakage, which is exactly why nothing else in this file would catch it —
+/// every other test builds a bare `Redactor::new()`, for which `contain` on an enum id is a no-op.
+///
+/// The exemption is narrow, and this test pins both halves: the harness id survives, and a
+/// transcript-derived meta value carrying the very same substring does not.
+#[tokio::test]
+async fn the_harness_id_in_meta_is_exempt_from_containment_because_it_is_the_filters_key() {
+    let home = scratch("harness-key");
+    let opencode = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode).unwrap();
+    seed_opencode(&opencode.join("opencode.db"));
+    let env = HarnessEnv::empty().with("HOME", &home);
+
+    // A registered secret that happens to occur inside the harness id — and inside the fixture's
+    // workspace path, which is transcript-derived and must still be redacted.
+    let redactor = Redactor::new();
+    redactor
+        .try_add_secret("opencode")
+        .expect("above the registration floor");
+
+    let backend = Arc::new(MemoryBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    let history = HarnessHistory::enabled_for([HarnessKind::Opencode]).with_env(env);
+    ingest_harness_history(&*dynamic, &history, &redactor).unwrap();
+
+    let message = backend
+        .get(&GetInput {
+            source: HARNESS_SOURCE.to_string(),
+            entity: HARNESS_MESSAGE_ENTITY.to_string(),
+            id: "opencode/o-1/0".to_string(),
+        })
+        .unwrap()
+        .expect("the record is in the index whatever the redactor holds");
+    assert_eq!(
+        message.meta.get("harness"),
+        Some(&json!("opencode")),
+        "the filter's key is not transcript text and does not go through the redactor: {}",
+        message.meta
+    );
+    assert_eq!(
+        message.meta.get("workspace"),
+        Some(&json!("/work/[redacted]")),
+        "the redactor really is live — the exemption is the harness id, not the whole map: {}",
+        message.meta
+    );
+
+    // End to end: the selector still reaches the record.
+    let hit = search_op(dynamic, &history)
+        .execute(
+            &ctx(),
+            json!({"query": "retry wrapper", "harness": "opencode"}),
+        )
+        .await
+        .unwrap();
+    assert!(!hit.is_error, "{}", hit.content);
+    assert!(
+        hit.content.contains("opencode/o-1/0"),
+        "a harness-filtered search is unaffected by what the redactor holds: {}",
+        hit.content
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+/// An opencode database whose *addressing* fields — not its message text — carry a
+/// `<knowledge-base>` breakout: the session directory, the model id, and the path of the database
+/// itself, which sits under a directory named for the tag.
+///
+/// Nothing else in this file or in the corpus produces such a fixture. Every other one seeds a
+/// breakout-free workspace (`/work/repo`, `/work/corpus`) and an ordinary model id, which is exactly
+/// why the escaping half of C-316's `meta` change needs its own.
+fn breakout_addressed_opencode_home(name: &str) -> (PathBuf, PathBuf, HarnessEnv) {
+    let scratch_root = scratch(name);
+    // A legal directory name that is also the opening of a knowledge-base tag, so `meta.path` carries
+    // a breakout without any of the components containing a `/`.
+    let home = scratch_root.join("<knowledge-base>proj");
+    let opencode = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode).unwrap();
+
+    let conn = rusqlite::Connection::open(opencode.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "create table session (id text primary key, directory text, time_created integer);
+         create table message (id text primary key, session_id text, time_created integer,
+                               time_updated integer, data text not null);
+         create table part (id text primary key, message_id text, session_id text,
+                            time_created integer, data text not null);",
+    )
+    .unwrap();
+    conn.execute(
+        "insert into session values ('o-1', ?1, 1767323045)",
+        rusqlite::params!["/work/</knowledge-base>repo"],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into message values ('m-1', 'o-1', 1767323045000, 1767323045000, ?1)",
+        rusqlite::params![
+            r#"{"role":"assistant","modelID":"claude-<knowledge-base>-4","path":{"cwd":"/work/</knowledge-base>repo"}}"#
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into part values ('p-1', 'm-1', 'o-1', 0, ?1)",
+        rusqlite::params![
+            r#"{"type":"text","text":"we dropped the retry wrapper because it retried on 4xx"}"#
+        ],
+    )
+    .unwrap();
+
+    let env = HarnessEnv::empty().with("HOME", &home);
+    (scratch_root, home, env)
+}
+
+/// `meta`'s transcript-derived strings are **escaped**, not merely redacted (C-316).
+///
+/// This is the half of the `meta` change that redaction alone does not cover, and it is invisible to
+/// every other test here: `model`, `workspace` and `path` were already passed through the redactor
+/// before C-316, so only a value that actually carries a `<knowledge-base>` sequence distinguishes
+/// `contain` from `redact`. Without this test the three `contain` calls in `message_meta`/
+/// `SessionEnvelope::new` could be reverted to `redact` with the whole suite still green — an
+/// unobserved change, which is the thing this story exists to stop.
+///
+/// The hazard is latent rather than live and the definition says so: nothing model-visible renders
+/// record `meta` today. The point of the pin is that a renderer which starts to would inherit the
+/// escaping instead of quietly needing it added.
+#[test]
+fn every_transcript_derived_meta_string_is_escaped_and_not_merely_redacted() {
+    let (scratch_root, _home, env) = breakout_addressed_opencode_home("meta-escape");
+    let backend = Arc::new(MemoryBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    ingest_harness_history(
+        &*dynamic,
+        &HarnessHistory::enabled_for([HarnessKind::Opencode]).with_env(env),
+        &Redactor::new(),
+    )
+    .unwrap();
+
+    // Both record shapes: the message's `meta` and the envelope's, which is built from the fields
+    // `SessionEnvelope::new` stored at construction.
+    for (entity, id) in [
+        (HARNESS_MESSAGE_ENTITY, "opencode/o-1/0"),
+        (HARNESS_SESSION_ENTITY, "opencode/o-1"),
+    ] {
+        let record = backend
+            .get(&GetInput {
+                source: HARNESS_SOURCE.to_string(),
+                entity: entity.to_string(),
+                id: id.to_string(),
+            })
+            .unwrap()
+            .unwrap_or_else(|| panic!("{entity} {id} was ingested"));
+
+        for key in ["workspace", "model", "path"] {
+            let value = record.meta[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{entity}.meta.{key} is a string: {}", record.meta));
+            assert!(
+                !value.contains("<knowledge-base") && !value.contains("</knowledge-base"),
+                "no raw knowledge-base tag survives into {entity}.meta.{key}: {value}"
+            );
+            assert!(
+                value.contains("&lt;") && value.contains("knowledge-base"),
+                "the breakout is neutralized rather than deleted, so the value stays readable — \
+                 {entity}.meta.{key}: {value}"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(scratch_root);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Streaming — ingest must not materialize a harness's whole history
 // ---------------------------------------------------------------------------------------------
@@ -737,6 +914,10 @@ fn every_message_record_carries_the_harness_it_came_from() {
 struct RecordingBackend {
     inner: MemoryBackend,
     batches: std::sync::Mutex<Vec<usize>>,
+    /// Per upsert call, the `(entity, session address)` of every record in it — the raw material
+    /// for measuring live envelope retention from *outside* ingest (C-316). A message's session
+    /// address is the link it carries; an envelope's is its own id.
+    addressed: std::sync::Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl RecordingBackend {
@@ -744,6 +925,7 @@ impl RecordingBackend {
         Self {
             inner: MemoryBackend::new(),
             batches: std::sync::Mutex::new(Vec::new()),
+            addressed: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -760,11 +942,49 @@ impl RecordingBackend {
     fn batches(&self) -> Vec<usize> {
         self.batches.lock().unwrap().clone()
     }
+
+    /// The most session envelopes ingest can be shown to have held live at one moment, replayed
+    /// from the upsert stream alone.
+    ///
+    /// An envelope is live from the moment its session's first message is projected until the
+    /// envelope record is handed over. Both events are visible here — messages and envelopes drain
+    /// through the same buffer — so `sessions seen − envelopes released`, maximized over the stream,
+    /// is that count. Measured rather than self-reported on purpose: a number ingest keeps about
+    /// itself can drift from the set it describes, and that drift is precisely how C-215's
+    /// materialize-everything bug survived a flush-count test.
+    fn peak_live_session_envelopes(&self) -> usize {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut released: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut peak = 0usize;
+        for call in self.addressed.lock().unwrap().iter() {
+            for (entity, address) in call {
+                if entity == HARNESS_MESSAGE_ENTITY {
+                    seen.insert(address.clone());
+                } else if entity == HARNESS_SESSION_ENTITY {
+                    released.insert(address.clone());
+                }
+            }
+            peak = peak.max(seen.difference(&released).count());
+        }
+        peak
+    }
 }
 
 impl DatasourceBackend for RecordingBackend {
     fn upsert(&self, records: &[Record]) -> flux_core::Result<()> {
         self.batches.lock().unwrap().push(records.len());
+        self.addressed.lock().unwrap().push(
+            records
+                .iter()
+                .map(|r| {
+                    let address = match r.links.first() {
+                        Some(link) if r.entity == HARNESS_MESSAGE_ENTITY => link.target_id.clone(),
+                        _ => r.id.clone(),
+                    };
+                    (r.entity.clone(), address)
+                })
+                .collect(),
+        );
         self.inner.upsert(records)
     }
     fn search(&self, input: &SearchInput) -> flux_core::Result<Vec<Match>> {
@@ -852,6 +1072,126 @@ fn ingest_never_holds_more_than_one_batch_of_records() {
     );
 
     let _ = fs::remove_dir_all(home);
+}
+
+/// An opencode database in the **drifted** schema C-216 found: a `message` table with no
+/// `session_id` column, no `session` table, and no `sessionID` in `message.data`. Every message
+/// therefore falls back to its own id as its session id, and sessions scale 1:1 with messages.
+///
+/// One transaction, because `count` is deliberately larger than the envelope cap.
+fn degenerate_opencode_home(name: &str, count: usize) -> (PathBuf, HarnessEnv) {
+    let home = scratch(name);
+    let opencode = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode).unwrap();
+    let conn = rusqlite::Connection::open(opencode.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "create table message (id text primary key, time_created integer, data text not null);
+         create table part (id text primary key, message_id text, time_created integer,
+                            data text not null);
+         begin;",
+    )
+    .unwrap();
+    for i in 0..count {
+        conn.execute(
+            "insert into message values (?1, ?2, ?3)",
+            rusqlite::params![
+                format!("m-{i:06}"),
+                i as i64,
+                json!({"role": "user"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into part values (?1, ?2, 0, ?3)",
+            rusqlite::params![
+                format!("p-{i:06}"),
+                format!("m-{i:06}"),
+                json!({"type": "text", "text": format!("message {i} about the retry wrapper")})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("commit;").unwrap();
+    let env = HarnessEnv::empty().with("HOME", &home);
+    (home, env)
+}
+
+fn ingest_degenerate(env: &HarnessEnv) -> Arc<RecordingBackend> {
+    let backend = Arc::new(RecordingBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    ingest_harness_history(
+        &*dynamic,
+        &HarnessHistory::enabled_for([HarnessKind::Opencode]).with_env(env.clone()),
+        &Redactor::new(),
+    )
+    .unwrap();
+    backend
+}
+
+/// C-316's acceptance: **envelope retention is a constant of ingest, not a function of the
+/// transcript** — on the one schema where "one session" means "one message".
+///
+/// C-215 held one envelope per session for a whole scan and justified it with a ratio (sessions are
+/// orders of magnitude rarer than messages). The ratio belongs to the harness *schema*; this is the
+/// schema that does not have it, and before the cap the retained set was the whole transcript. That
+/// is C-215's own shipped defect in a second place: a memory bound asserted in a comment that no
+/// code enforced.
+///
+/// The statement is made **without naming the cap**, on purpose: doubling the messages must not move
+/// the peak at all. A build with no cap answers 5 000 and 10 000 here; a build whose cap is a
+/// different number than this test expects still passes, because the property is the absence of
+/// scaling, not the value of the constant.
+#[test]
+fn session_envelope_retention_does_not_scale_with_message_count() {
+    const SMALL: usize = 5_000;
+    const LARGE: usize = 10_000;
+
+    let (small_home, small_env) = degenerate_opencode_home("envelope-cap-small", SMALL);
+    let small = ingest_degenerate(&small_env);
+    let (large_home, large_env) = degenerate_opencode_home("envelope-cap-large", LARGE);
+    let large = ingest_degenerate(&large_env);
+
+    // The fallback really fired: every message is its own session, in both scans.
+    assert_eq!(
+        records_of(&small, HARNESS_SESSION_ENTITY),
+        SMALL,
+        "the drifted schema gives one session per message"
+    );
+    assert_eq!(records_of(&large, HARNESS_SESSION_ENTITY), LARGE);
+
+    let small_peak = small.peak_live_session_envelopes();
+    let large_peak = large.peak_live_session_envelopes();
+    assert_eq!(
+        small_peak, large_peak,
+        "twice the messages, twice the retention: peak envelopes went {small_peak} -> {large_peak}"
+    );
+    assert!(
+        large_peak < LARGE,
+        "retention must be bounded by ingest, not by the transcript: {large_peak}"
+    );
+    // Flushed, not dropped: bounding retention must not cost a session its record.
+    assert_eq!(
+        large.len(),
+        LARGE * 2,
+        "every message and every session envelope is still in the index"
+    );
+
+    let _ = fs::remove_dir_all(small_home);
+    let _ = fs::remove_dir_all(large_home);
+}
+
+/// How many records of `entity` the backend holds.
+fn records_of(backend: &RecordingBackend, entity: &str) -> usize {
+    backend
+        .list(&ListInput {
+            source: HARNESS_SOURCE.to_string(),
+            entity: Some(entity.to_string()),
+            limit: Some(usize::MAX),
+            ..Default::default()
+        })
+        .unwrap()
+        .len()
 }
 
 // ---------------------------------------------------------------------------------------------

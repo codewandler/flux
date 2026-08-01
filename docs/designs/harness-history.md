@@ -1,6 +1,7 @@
 # Cross-harness session history as a datasource
 
-**Epic:** C-212 · **Stories:** C-213 → C-216 · **Status:** designed, none started
+**Epic:** C-212 · **Stories:** C-213 → C-216, C-316 · **Status:** C-213 → C-216 landed; C-316 (the
+envelope bound the corpus asked for) implemented
 
 ## The ask
 
@@ -307,16 +308,88 @@ not audit the JSON walkers; that is filed separately.
   `no_adapter_but_claude_code_surfaces_tool_output`.
 - **No adapter surfaces a tool call's input**, so a credential passed as a tool argument is never
   indexed. Same shape of finding: containment by omission.
-- **Session-envelope retention is bounded by the schema, not by the code.** `ingest_harness_history`
-  holds one `SessionEnvelope` per session for the whole scan on the reasoning that sessions are three
-  to five orders of magnitude rarer than messages. That ratio is a property of the *harness schema*:
-  an opencode database with no `session_id` column and no `sessionID` in `message.data` falls back to
-  the message's own id, and envelopes then scale one-for-one with messages —
-  `session_envelope_retention_is_bounded_by_sessions_only_when_the_schema_has_them` states the ratio.
-  The scan budget does not bound this retention. Left as a finding rather than fixed: the fix is a
-  bound inside ingest, which is C-215's blast radius, not C-216's.
+- **Session-envelope retention was bounded by the schema, not by the code** — *fixed in C-316,* see
+  below. `ingest_harness_history` held one `SessionEnvelope` per session for the whole scan on the
+  reasoning that sessions are three to five orders of magnitude rarer than messages. That ratio is a
+  property of the *harness schema*: an opencode database with no `session_id` column and no
+  `sessionID` in `message.data` falls back to the message's own id, and envelopes then scaled
+  one-for-one with messages. The scan budget did not bound this retention.
 - **`meta`'s string values are redacted but not escaped** (`workspace`, `model`, `path`), where the
-  body, title and id are both. Nothing model-visible renders record `meta` today —
-  `records_to_context_blocks` writes only `source`/`entity` as tag attributes, and
-  `render_match`/`render_record` print id, title and body — so this is latent rather than live. A
-  future renderer that prints `meta` would need `contain` applied there too.
+  body, title and id are both — *closed in C-316:* every **transcript-derived** string in `meta` now
+  goes through `contain`. `harness` and `role` stay exempt, and the reason is recorded at the
+  definition rather than left to be rediscovered — see below.
+
+## C-316 — the bound, and what it does not bound
+
+The retention above is now capped inside ingest by `MAX_LIVE_SESSION_ENVELOPES` (4096), so no schema
+— degenerate, drifted or hostile — can make the live envelope set scale with message count.
+
+**At the cap an envelope is flushed, not dropped and not refused.** The oldest live envelope is
+projected, handed to the backend and let go. Refusing (erroring the scan) would let one unusual
+database deny the whole index, and partial recall is this datasource's value; dropping would leave a
+session unsearchable and dangle the message→session link every one of its messages carries, silently.
+Flushing keeps every session addressable and costs one thing, stated rather than hidden: a session
+whose messages straddle an eviction is projected twice and the later projection wins, so the
+surviving record describes a **suffix** of that session rather than the whole of it. Two fields say
+so: its `messages` count becomes a lower bound, and its time range is re-seeded from the message that
+re-created the envelope, so `ts_ms`/`last_ts_ms` and the start timestamp the *title* carries all move
+forward. `HarnessIngestReport::sessions_evicted` reports that this could have happened, and
+`a_session_that_returns_after_eviction_is_projected_again_and_undercounts` pins both fields.
+Two alternatives were rejected — reading the flushed record back to resume its
+count (one backend round trip per new session, i.e. per *message* in the degenerate schema the cap
+exists for) and LRU instead of FIFO eviction (in the schema that actually evicts every session holds
+one message, so arrival order *is* completion order).
+
+Message records and evicted envelopes now share one outgoing buffer, so peak *record* retention stays
+one `UPSERT_BATCH` rather than two summed, and an envelope leaves memory on the same flush as the
+messages around it.
+
+**Two things the cap deliberately does not bound, both stated by tests rather than assumed away:**
+
+- **The bytes in one envelope.** `session_id`, `workspace` and `path` are transcript-derived and
+  bounded only by the adapter's `max_line_bytes` (8 MiB). The cap is on the *number* of envelopes.
+  The same observation applies to record ids, which are model-visible via `render_match` and are not
+  length-bounded either; that is a separate story.
+- **The adapters' own `session id -> ordinal` maps** (`harness/opencode.rs` and the two JSONL
+  adapters), which are keyed by exactly the identifier this schema degenerates and so still grow one
+  entry per message on it. Bounding them trades a memory bound for silently colliding record ids — an
+  evicted ordinal restarts at 0 — so it belongs in its own story with C-214's blast radius. Stated by
+  `the_adapter_ordinal_map_is_a_retention_this_cap_does_not_cover`.
+
+Proofs: `session_envelope_retention_does_not_scale_with_message_count` measures peak live retention
+**from outside**, by replaying the upsert stream, and states the property without naming the constant
+(doubling the messages must not move the peak);
+`session_envelope_retention_is_bounded_by_ingest_not_by_the_harness_schema` is C-216's ratio test,
+rewritten to assert the bound and to overflow it by 900 sessions.
+
+`HarnessIngestReport::sessions()` counts **envelope projections, not distinct sessions** — one per
+insertion into the live set, so an evicted session seen again is counted twice. The two numbers
+coincide exactly when `sessions_evicted()` is zero, which is every scan that never reaches the cap.
+Worth spelling out because the accessor's name suggests otherwise and its first doc comment asserted
+the inverse.
+
+The `contain` change on `meta` adds *escaping* on top of redaction that was already there, so only a
+value actually carrying a `<knowledge-base>` sequence tells the two apart — and no other fixture in
+the suite has one, since they all seed breakout-free workspaces and ordinary model ids.
+`every_transcript_derived_meta_string_is_escaped_and_not_merely_redacted` supplies that fixture
+(session directory, model id, and a database path under a directory named for the tag) so the change
+is observed rather than merely made.
+
+On `meta`: the attribute surface was never the hazard — `flux_core`'s `open_tag` `attr_escape`s every
+value it writes, and `escape_knowledge_base_body` is not an attribute escaper — so what `contain` on
+`meta` buys is the *body* surface, for a future renderer that prints a meta value as text. The comment
+in `message_meta` that claimed `records_to_context_blocks` renders record `meta` as tag attributes was
+wrong (it builds its own `{source, entity}`) and is corrected.
+
+**`harness` and `role` are exempt, deliberately, and the exemption is narrower than the tidier rule.**
+Containing every meta string uniformly is the rule that reads better and it is wrong here. Both are
+`HarnessKind`/`MessageRole` ids — this crate's own closed enums, never a byte of transcript — so there
+is nothing in them to contain; and `harness` is the key the selector lowers onto (`record_is_from`
+compares it to `HarnessKind::id`). Running it through the redactor would make a filter's correctness
+depend on the operator's secret list: register a value that occurs inside a harness id and every
+record of that harness gets `meta.harness = "[redacted]"`, after which `search(harness: …)` answers
+"no matches" over an index that holds the rows. The failure direction is under-return rather than
+leakage, so nothing else would have caught it —
+`the_harness_id_in_meta_is_exempt_from_containment_because_it_is_the_filters_key` pins both halves:
+the harness id survives a redactor holding it, and a transcript-derived meta value carrying the same
+substring does not.

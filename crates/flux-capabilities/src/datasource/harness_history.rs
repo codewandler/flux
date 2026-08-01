@@ -33,7 +33,7 @@
 //! Nothing here writes another harness's state; the read-only guarantee is the scan layer's
 //! (`open_sqlite_read_only`) and is not re-litigated per adapter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
@@ -65,12 +65,64 @@ pub const HARNESS_SESSION_REL: &str = "session";
 ///
 /// Extraction streams (C-214) precisely so a multi-year history is never materialized, and ingest
 /// must not undo that by collecting every projected record and upserting once at the end. The drain
-/// therefore lives **inside the sink** (`ingest_harness_history`'s `emit`), not after the adapter
-/// returns: a flush placed after the adapter call runs only once the whole harness has been
-/// projected, which is precisely the shape the scan budget alone permits to reach
-/// [`MAX_MESSAGES`](crate::harness::MAX_MESSAGES) records first. Peak retention is this many message
-/// records; pinned by `ingest_never_holds_more_than_one_batch_of_records`.
+/// therefore lives **inside the sink** ([`Upserts::push`]), not after the adapter returns: a flush
+/// placed after the adapter call runs only once the whole harness has been projected, which is
+/// precisely the shape the scan budget alone permits to reach
+/// [`MAX_MESSAGES`](crate::harness::MAX_MESSAGES) records first. Peak retention is this many
+/// records — message records and evicted envelopes share the one buffer; pinned by
+/// `ingest_never_holds_more_than_one_batch_of_records`.
 const UPSERT_BATCH: usize = 512;
+
+/// The most session envelopes ingest holds **live** at one moment (C-316).
+///
+/// C-215 held one envelope per session for a whole scan and justified it with a ratio: sessions are
+/// three to five orders of magnitude rarer than messages, so the retained set is negligible. That
+/// ratio is a property of the *harness schema*, not of this code, and C-216 found the branch where
+/// it collapses — an opencode database with no `session_id` column and no `sessionID` in
+/// `message.data` falls back to the message's own id, at which point envelopes scale **1:1 with
+/// messages**. So the bound lives here now, and a degenerate or hostile transcript hits it whatever
+/// the schema does.
+///
+/// **What happens at the cap: the oldest envelope is projected, handed to the backend, and dropped
+/// from the live set** ([`SessionEnvelopes::evict_oldest`]) — flushed, not discarded and not
+/// refused. For a search index that is the only defensible answer of the three:
+///
+/// - *Refusing* (erroring the scan) lets one unusual database deny the whole index, and partial
+///   recall is this datasource's entire value.
+/// - *Dropping* leaves a session unsearchable and dangles the message→session link that every one
+///   of its messages carries, and it fails silently.
+/// - Flushing keeps every session addressable, and what it costs is stated below rather than hidden.
+///
+/// **What it costs.** A session whose messages are separated by more than this many *other* sessions
+/// is projected twice, and the later projection wins. That projection is built from the messages seen
+/// *after* the eviction only, so two things about the surviving record describe a suffix of the
+/// session rather than the whole of it:
+///
+/// - its `messages` count is a lower bound rather than a total;
+/// - its **time range is narrowed on both ends** — [`SessionEnvelope::new`] seeds `first_ts_ms` and
+///   `last_ts_ms` from the message that re-created it, so the record's `ts_ms`/`last_ts_ms` and the
+///   start timestamp its *title* carries all move forward to the post-eviction part.
+///
+/// Same signal for both: this is reported ([`HarnessIngestReport::sessions_evicted`]), it cannot
+/// happen at all until the cap is reached, and
+/// on real harness state it is close to unreachable: claude-code and codex write one file per
+/// session, and opencode's scan is ordered so a session's rows arrive together — so the *oldest*
+/// envelope is normally also a finished one. Reading the flushed record back to resume its count was
+/// the alternative and is rejected: that is one backend round trip per new session, i.e. one per
+/// *message* in exactly the degenerate schema this cap exists for. Least-recently-used eviction was
+/// rejected for the same futility — in the schema that actually evicts, every session holds exactly
+/// one message, so arrival order *is* completion order and LRU buys nothing for its bookkeeping.
+///
+/// **What this bound is not.** It bounds the *number* of live envelopes. It does not bound the bytes
+/// in any one of them: `session_id`, `workspace` and `path` are transcript-derived and bounded only
+/// by the adapter's [`max_line_bytes`](crate::harness::ScanBudget::max_line_bytes) (8 MiB). And it is
+/// ingest's retention only — each adapter keeps its own `session id -> ordinal` map for the length of
+/// a scan (`harness::opencode::opencode_messages` and friends), which scales with distinct session
+/// ids on exactly the same schema and is *not* capped here. Bounding that one trades a memory bound
+/// for silently colliding record ids (an evicted counter restarts at 0), so it needs its own story
+/// rather than a quiet edit; it is stated, not assumed away, by
+/// `the_adapter_ordinal_map_is_a_retention_this_cap_does_not_cover`.
+pub const MAX_LIVE_SESSION_ENVELOPES: usize = 4096;
 
 // -------------------------------------------------------------------------------------------
 // The opt-in
@@ -167,6 +219,8 @@ pub struct HarnessIngestReport {
     stats: MessageStats,
     records: usize,
     sessions: usize,
+    peak_session_envelopes: usize,
+    sessions_evicted: usize,
 }
 
 impl HarnessIngestReport {
@@ -196,9 +250,40 @@ impl HarnessIngestReport {
         self.records
     }
 
-    /// Session envelope records upserted.
+    /// **Session envelopes projected and handed to the backend** — one per insertion into the live
+    /// set, so a session evicted and then seen again is counted twice (see
+    /// [`MAX_LIVE_SESSION_ENVELOPES`]).
+    ///
+    /// It is the count of *upserts*, not of distinct sessions and not of rows in the index: the
+    /// second projection of a re-created session carries the same record id, so it overwrites rather
+    /// than adds. The two numbers coincide exactly when [`sessions_evicted`](Self::sessions_evicted)
+    /// is zero, which is every scan that never reaches the cap. Where they can diverge is pinned by
+    /// `a_session_that_returns_after_eviction_is_projected_again_and_undercounts`, which sees four
+    /// projections of three sessions.
+    ///
+    /// The earlier spelling of this comment had it backwards ("distinct sessions seen, not the number
+    /// of envelope records upserted"), which is precisely the failure this story is about: a comment
+    /// asserting a property the code does not have.
     pub fn sessions(&self) -> usize {
         self.sessions
+    }
+
+    /// The most session envelopes held live at any one moment during this scan — the direct
+    /// observable behind [`MAX_LIVE_SESSION_ENVELOPES`], and never larger than it.
+    ///
+    /// This is the number C-215 asserted and did not enforce. It is maintained by the same method
+    /// that inserts an envelope ([`SessionEnvelopes::observe`]), so it cannot drift from the set it
+    /// describes the way a separately-incremented counter can.
+    pub fn peak_session_envelopes(&self) -> usize {
+        self.peak_session_envelopes
+    }
+
+    /// How many envelopes were flushed early because the live cap was reached. Non-zero means at
+    /// least one session's record may describe a *suffix* of that session rather than the whole of
+    /// it — a `messages` count that is a lower bound, and a start timestamp that has moved forward.
+    /// See [`MAX_LIVE_SESSION_ENVELOPES`] for why that is the price paid, and for what it buys.
+    pub fn sessions_evicted(&self) -> usize {
+        self.sessions_evicted
     }
 }
 
@@ -220,12 +305,11 @@ pub fn ingest_harness_history(
         return Ok(report);
     }
 
-    // Session envelopes are the one thing held across a whole scan, and deliberately: there are
-    // three to five orders of magnitude fewer sessions than messages, and an envelope is a handful
-    // of scalars rather than a body. Message records are never accumulated — see `emit` below.
-    let mut sessions: BTreeMap<String, SessionEnvelope> = BTreeMap::new();
-    let mut batch: Vec<Record> = Vec::new();
-    let mut upserted = 0usize;
+    // Session envelopes are the one thing held *across* messages rather than streamed straight out,
+    // and the set is bounded by `MAX_LIVE_SESSION_ENVELOPES` rather than by how many sessions the
+    // harness happens to have. Message records are never accumulated — see `emit` below.
+    let mut sessions = SessionEnvelopes::new(MAX_LIVE_SESSION_ENVELOPES);
+    let mut out = Upserts::new(backend);
 
     for kind in history.harnesses() {
         let Some(root) = open_root(*kind, &history.env, &mut report) else {
@@ -240,23 +324,18 @@ pub fn ingest_harness_history(
                 if failed.is_some() {
                     return;
                 }
-                sessions
-                    .entry(session_id(&message, redactor))
-                    .or_insert_with(|| SessionEnvelope::new(&message, redactor))
-                    .observe(&message);
-                batch.push(project_message(&message, redactor));
-                // The drain that makes this streaming rather than collecting. It has to happen
-                // *here*, inside the sink: a flush after the adapter returns runs only once the
-                // whole harness has been projected, which is the shape the scan budget alone would
-                // allow to reach `MAX_MESSAGES` (5 000 000) records before the first upsert.
-                if batch.len() >= UPSERT_BATCH {
-                    match backend.upsert(&batch) {
-                        Ok(()) => {
-                            upserted += batch.len();
-                            batch.clear();
-                        }
-                        Err(error) => failed = Some(error),
-                    }
+                // Both halves drain through `out`, whose flush is the only place records reach the
+                // backend. It has to happen *here*, inside the sink: a flush after the adapter
+                // returns runs only once the whole harness has been projected, which is the shape
+                // the scan budget alone would allow to reach `MAX_MESSAGES` (5 000 000) records
+                // before the first upsert.
+                let key = session_id(&message, redactor);
+                if let Err(error) = sessions.observe(key, &message, redactor, &mut out) {
+                    failed = Some(error);
+                    return;
+                }
+                if let Err(error) = out.push(project_message(&message, redactor)) {
+                    failed = Some(error);
                 }
             };
             extract(*kind, &root, history.budget, &mut emit)
@@ -268,25 +347,150 @@ pub fn ingest_harness_history(
         }
         merge_stats(&mut report.stats, &scan?);
         // The tail of this harness, so a batch is never carried across roots.
-        flush(backend, &mut batch, &mut upserted)?;
+        out.flush()?;
     }
 
-    flush(backend, &mut batch, &mut upserted)?;
-    report.records = upserted;
+    // Whatever is still live at the end of the scan — at most the cap — projects last.
+    sessions.drain(&mut out)?;
+    out.flush()?;
 
-    report.sessions = sessions.len();
-    let mut envelopes: Vec<Record> = Vec::with_capacity(UPSERT_BATCH.min(sessions.len()));
-    for envelope in sessions.values() {
-        envelopes.push(envelope.project());
-        if envelopes.len() >= UPSERT_BATCH {
-            backend.upsert(&envelopes)?;
-            envelopes.clear();
+    report.records = out.messages;
+    report.sessions = sessions.projected;
+    report.peak_session_envelopes = sessions.peak;
+    report.sessions_evicted = sessions.evicted;
+    Ok(report)
+}
+
+/// The one buffer between the projection and the backend, and the only place a record is upserted.
+///
+/// Message records and session envelopes share it deliberately: one buffer means one bound
+/// ([`UPSERT_BATCH`]) on peak record retention rather than two that have to be added up, and it
+/// means an evicted envelope leaves memory on the same flush as the messages around it.
+struct Upserts<'a> {
+    backend: &'a dyn DatasourceBackend,
+    batch: Vec<Record>,
+    /// Message records handed to the backend.
+    messages: usize,
+}
+
+impl<'a> Upserts<'a> {
+    fn new(backend: &'a dyn DatasourceBackend) -> Self {
+        Self {
+            backend,
+            batch: Vec::with_capacity(UPSERT_BATCH),
+            messages: 0,
         }
     }
-    if !envelopes.is_empty() {
-        backend.upsert(&envelopes)?;
+
+    fn push(&mut self, record: Record) -> Result<()> {
+        self.batch.push(record);
+        if self.batch.len() >= UPSERT_BATCH {
+            self.flush()?;
+        }
+        Ok(())
     }
-    Ok(report)
+
+    fn flush(&mut self) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        self.backend.upsert(&self.batch)?;
+        self.messages += self
+            .batch
+            .iter()
+            .filter(|r| r.entity == HARNESS_MESSAGE_ENTITY)
+            .count();
+        self.batch.clear();
+        Ok(())
+    }
+}
+
+/// The live session envelopes of one ingest, bounded by [`MAX_LIVE_SESSION_ENVELOPES`].
+///
+/// The cap is enforced in the same method that inserts, and `peak` is recorded there too, so the
+/// number [`HarnessIngestReport::peak_session_envelopes`] reports is the size of this set rather
+/// than a tally kept alongside it — the distinction C-215 paid for with a flush count that passed
+/// on both shapes of the bug.
+struct SessionEnvelopes {
+    live: BTreeMap<String, SessionEnvelope>,
+    /// Insertion order, for FIFO eviction. Holds exactly the keys in `live`: a key is pushed when it
+    /// is inserted and popped when it is evicted or drained.
+    arrival: VecDeque<String>,
+    cap: usize,
+    peak: usize,
+    evicted: usize,
+    /// Insertions, and therefore projections: every entry inserted here is released exactly once,
+    /// through [`Self::release_oldest`]. Named for what it counts rather than `distinct`, which it is
+    /// not — a session re-created after eviction is inserted, and projected, a second time.
+    projected: usize,
+}
+
+impl SessionEnvelopes {
+    fn new(cap: usize) -> Self {
+        Self {
+            live: BTreeMap::new(),
+            arrival: VecDeque::new(),
+            // A cap of zero would evict every envelope before it saw its own message, which is a
+            // configuration mistake rather than a posture; one is the smallest thing that works.
+            cap: cap.max(1),
+            peak: 0,
+            evicted: 0,
+            projected: 0,
+        }
+    }
+
+    /// Fold one message into its session's envelope, evicting the oldest envelopes into `out` until
+    /// at most `cap` are live.
+    fn observe(
+        &mut self,
+        key: String,
+        message: &HarnessMessage,
+        redactor: &Redactor,
+        out: &mut Upserts<'_>,
+    ) -> Result<()> {
+        if let Some(live) = self.live.get_mut(&key) {
+            live.observe(message);
+            return Ok(());
+        }
+        let mut envelope = SessionEnvelope::new(message, redactor);
+        envelope.observe(message);
+        self.arrival.push_back(key.clone());
+        self.live.insert(key, envelope);
+        self.projected += 1;
+        while self.live.len() > self.cap {
+            self.evict_oldest(out)?;
+        }
+        self.peak = self.peak.max(self.live.len());
+        Ok(())
+    }
+
+    /// Project the oldest live envelope and let it go **because the cap was reached** — the whole
+    /// bound is this one call's consequence, and it is the only thing that increments `evicted`.
+    fn evict_oldest(&mut self, out: &mut Upserts<'_>) -> Result<()> {
+        if self.release_oldest(out)? {
+            self.evicted += 1;
+        }
+        Ok(())
+    }
+
+    /// Project the oldest live envelope. Returns whether there was one.
+    fn release_oldest(&mut self, out: &mut Upserts<'_>) -> Result<bool> {
+        let Some(key) = self.arrival.pop_front() else {
+            return Ok(false);
+        };
+        let Some(envelope) = self.live.remove(&key) else {
+            return Ok(false);
+        };
+        out.push(envelope.project())?;
+        Ok(true)
+    }
+
+    /// Project everything still live at the end of a scan. At most `cap` records, by construction —
+    /// and not an eviction, because nothing was cut short.
+    fn drain(&mut self, out: &mut Upserts<'_>) -> Result<()> {
+        while self.release_oldest(out)? {}
+        Ok(())
+    }
 }
 
 /// Run one harness's adapter. Split out so the dispatch is total — an enabled harness with no
@@ -327,21 +531,6 @@ fn open_root(
     let candidate = kind.state_path(env)?;
     report.roots_opened.push(candidate.clone());
     candidate.exists().then_some(candidate)
-}
-
-/// Hand whatever is buffered to the backend and empty the buffer.
-fn flush(
-    backend: &dyn DatasourceBackend,
-    batch: &mut Vec<Record>,
-    upserted: &mut usize,
-) -> Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    backend.upsert(batch)?;
-    *upserted += batch.len();
-    batch.clear();
-    Ok(())
 }
 
 fn merge_stats(total: &mut MessageStats, one: &MessageStats) {
@@ -416,8 +605,35 @@ fn message_title(message: &HarnessMessage, redactor: &Redactor) -> String {
     contain(&parts.join(" · "), redactor)
 }
 
-/// The `meta` the design fixes. String values are redacted — they come out of the same untrusted
-/// JSON the body does, and `records_to_context_blocks` renders string meta as tag attributes.
+/// The `meta` the design fixes. **Every transcript-derived string goes through [`contain`]**, exactly
+/// as `body`, `title` and `id` do (C-316): `session_id`, `model`, `workspace` and `path`.
+///
+/// C-215 redacted those and did not escape them, on the reasoning that nothing model-visible renders
+/// record `meta`. That was true and is *still* true — [`records_to_context_blocks`] builds its own
+/// `{source, entity}` meta and drops the record's, and `render_match`/`render_record` print only
+/// id/title/body — but a comment here claimed the opposite ("renders string meta as tag
+/// attributes"), which is how a latent hazard becomes a live one. Two things are worth keeping
+/// straight if a renderer ever does pass this meta on:
+///
+/// - the *attribute* surface is already safe without this, because `flux_core`'s `open_tag`
+///   `attr_escape`s every value it writes — and [`contain`] would not have helped there anyway, since
+///   [`escape_knowledge_base_body`] neutralizes `<knowledge-base` sequences and not quotes;
+/// - what [`contain`] buys is the *body* surface: a meta value rendered as text can no longer close
+///   the block around it.
+///
+/// **`harness` and `role` are exempt, and the exemption is the point rather than an oversight.** They
+/// are `HarnessKind`/`MessageRole` ids — this crate's own closed enums, never a byte of transcript —
+/// so there is nothing in them to contain. And `harness` is load-bearing beyond that: it is the key
+/// the selector lowers onto ([`record_is_from`] compares it to [`HarnessKind::id`]), so putting it
+/// through a lossy transform would make a filter's correctness depend on what the operator happens to
+/// have registered with the redactor. A registered value occurring inside a harness id would rewrite
+/// every one of that harness's records to `[redacted]` and `search(harness: …)` would then answer "no
+/// matches" over an index that holds the rows — silently, because the failure direction is
+/// under-return rather than leakage. Pinned by
+/// `the_harness_id_in_meta_is_exempt_from_containment_because_it_is_the_filters_key`. The session
+/// envelope's `meta` follows the same split, in [`SessionEnvelope::project`].
+///
+/// [`records_to_context_blocks`]: super::records_to_context_blocks
 fn message_meta(message: &HarnessMessage, redactor: &Redactor) -> Value {
     let mut meta = Map::new();
     meta.insert("harness".into(), json!(message.harness.id()));
@@ -429,14 +645,14 @@ fn message_meta(message: &HarnessMessage, redactor: &Redactor) -> Value {
     meta.insert(
         "model".into(),
         match &message.model {
-            Some(model) => json!(redactor.redact(model)),
+            Some(model) => json!(contain(model, redactor)),
             None => Value::Null,
         },
     );
     meta.insert(
         "workspace".into(),
         match &message.workspace {
-            Some(workspace) => json!(redactor.redact(workspace)),
+            Some(workspace) => json!(contain(workspace, redactor)),
             None => Value::Null,
         },
     );
@@ -447,7 +663,7 @@ fn message_meta(message: &HarnessMessage, redactor: &Redactor) -> Value {
 }
 
 fn path_string(path: &Path, redactor: &Redactor) -> String {
-    redactor.redact(&path.to_string_lossy())
+    contain(&path.to_string_lossy(), redactor)
 }
 
 fn project_message(message: &HarnessMessage, redactor: &Redactor) -> Record {
@@ -488,8 +704,10 @@ impl SessionEnvelope {
             harness: message.harness,
             id: session_id(message, redactor),
             session_id: contain(&message.session_id, redactor),
-            workspace: message.workspace.as_ref().map(|w| redactor.redact(w)),
-            model: message.model.as_ref().map(|m| redactor.redact(m)),
+            // Contained, not merely redacted (C-316): these are the strings this record's `meta`
+            // carries, and `meta` follows the same rule as the body it sits beside.
+            workspace: message.workspace.as_ref().map(|w| contain(w, redactor)),
+            model: message.model.as_ref().map(|m| contain(m, redactor)),
             path: path_string(&message.path, redactor),
             first_ts_ms: message.ts_ms,
             last_ts_ms: message.ts_ms,
@@ -680,6 +898,159 @@ pub(crate) fn record_is_from(record: &Record, kind: HarnessKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::MessageRole;
+
+    /// The base timestamp the fixtures below offset from.
+    const T0: i64 = 1_767_323_045_000;
+
+    /// One message in `session`, enough of a `HarnessMessage` to project.
+    fn message_in(session: &str) -> HarnessMessage {
+        message_in_at(session, T0)
+    }
+
+    /// The same, at a chosen instant — for the tests that care which end of a session a record
+    /// describes.
+    fn message_in_at(session: &str, ts_ms: i64) -> HarnessMessage {
+        HarnessMessage {
+            harness: HarnessKind::Opencode,
+            session_id: session.to_string(),
+            index: 0,
+            role: MessageRole::User,
+            text: format!("a message in {session}"),
+            model: None,
+            workspace: Some("/work/repo".into()),
+            ts_ms: Some(ts_ms),
+            path: PathBuf::from("/home/u/.local/share/opencode/opencode.db"),
+        }
+    }
+
+    /// The cap is a property of the set, not a number reported beside it: however many distinct
+    /// sessions arrive, the live map never holds more than `cap` of them.
+    ///
+    /// Driven at the container rather than through an ingest so the overflow is unmistakable — the
+    /// integration proof that the *shipped* cap is the one enforced is
+    /// `session_envelope_retention_does_not_scale_with_message_count`.
+    #[test]
+    fn the_live_envelope_set_never_exceeds_its_cap_however_many_sessions_arrive() {
+        const CAP: usize = 8;
+        const SESSIONS: usize = CAP * 4 + 3;
+        let redactor = Redactor::new();
+        let backend = super::super::MemoryBackend::new();
+        let mut out = Upserts::new(&backend);
+        let mut envelopes = SessionEnvelopes::new(CAP);
+
+        for i in 0..SESSIONS {
+            let message = message_in(&format!("s-{i:03}"));
+            let key = session_id(&message, &redactor);
+            envelopes
+                .observe(key, &message, &redactor, &mut out)
+                .unwrap();
+            assert!(
+                envelopes.live.len() <= CAP,
+                "after {i} sessions the live set held {}",
+                envelopes.live.len()
+            );
+        }
+
+        assert_eq!(envelopes.peak, CAP, "the cap is reached and never passed");
+        assert_eq!(envelopes.projected, SESSIONS);
+        assert_eq!(envelopes.evicted, SESSIONS - CAP);
+
+        // Flushed, not dropped: every session is still addressable in the index afterwards.
+        envelopes.drain(&mut out).unwrap();
+        out.flush().unwrap();
+        assert_eq!(
+            backend.len(),
+            SESSIONS,
+            "an evicted envelope reaches the backend rather than being discarded"
+        );
+    }
+
+    /// A cap of zero is a configuration mistake, not a posture, and is clamped rather than obeyed —
+    /// obeying it would evict every envelope before it had seen its own message.
+    #[test]
+    fn a_zero_cap_is_clamped_to_one_rather_than_evicting_everything() {
+        let redactor = Redactor::new();
+        let backend = super::super::MemoryBackend::new();
+        let mut out = Upserts::new(&backend);
+        let mut envelopes = SessionEnvelopes::new(0);
+        let message = message_in("s-1");
+        let key = session_id(&message, &redactor);
+        envelopes
+            .observe(key, &message, &redactor, &mut out)
+            .unwrap();
+        assert_eq!(envelopes.live.len(), 1);
+        assert_eq!(envelopes.evicted, 0);
+    }
+
+    /// The cost the cap accepts, written down as a test rather than as a claim: a session whose
+    /// messages straddle an eviction is projected twice, and the second projection describes only the
+    /// part it saw. `sessions_evicted` is how a caller finds out this could have happened.
+    ///
+    /// **Both halves of that cost are pinned here**, because both are stated by
+    /// [`MAX_LIVE_SESSION_ENVELOPES`]'s doc comment and neither is self-evident from the code: the
+    /// `messages` count is a lower bound, *and* the time range moves forward to the post-eviction
+    /// part — which is what the record's title and `ts_ms` carry.
+    #[test]
+    fn a_session_that_returns_after_eviction_is_projected_again_and_undercounts() {
+        const CAP: usize = 2;
+        const HOUR: i64 = 3_600_000;
+        let redactor = Redactor::new();
+        let backend = super::super::MemoryBackend::new();
+        let mut out = Upserts::new(&backend);
+        let mut envelopes = SessionEnvelopes::new(CAP);
+
+        // `a` arrives, then enough others to evict it, then `a` again three hours later.
+        for (session, ts) in [
+            ("a", T0),
+            ("b", T0 + HOUR),
+            ("c", T0 + 2 * HOUR),
+            ("a", T0 + 3 * HOUR),
+        ] {
+            let message = message_in_at(session, ts);
+            let key = session_id(&message, &redactor);
+            envelopes
+                .observe(key, &message, &redactor, &mut out)
+                .unwrap();
+        }
+        envelopes.drain(&mut out).unwrap();
+        out.flush().unwrap();
+
+        assert_eq!(
+            envelopes.projected, 4,
+            "`a` is projected a second time when it returns — four projections of three sessions"
+        );
+        assert_eq!(envelopes.evicted, 2);
+        // Three sessions, three addresses — the second `a` overwrote the first rather than
+        // duplicating it, and the surviving record counts one message rather than two.
+        assert_eq!(backend.len(), 3);
+        let stored = backend
+            .get(&flux_datasource::GetInput {
+                source: HARNESS_SOURCE.to_string(),
+                entity: HARNESS_SESSION_ENTITY.to_string(),
+                id: "opencode/a".to_string(),
+            })
+            .unwrap()
+            .expect("`a` is still addressable after being evicted");
+        assert!(
+            stored.body.contains("1 message"),
+            "the returning half wins, so the count is a lower bound: {}",
+            stored.body
+        );
+        assert_eq!(
+            stored.meta["ts_ms"],
+            json!(T0 + 3 * HOUR),
+            "the time range is re-seeded from the returning message, so the session's recorded start \
+             moves forward off its real one: {}",
+            stored.meta
+        );
+        assert!(
+            stored.title.contains(&format_epoch_ms(T0 + 3 * HOUR))
+                && !stored.title.contains(&format_epoch_ms(T0)),
+            "and the title carries that narrowed start, not the session's real one: {}",
+            stored.title
+        );
+    }
 
     #[test]
     fn containment_redacts_before_it_escapes() {

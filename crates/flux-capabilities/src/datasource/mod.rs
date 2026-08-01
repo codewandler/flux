@@ -61,6 +61,7 @@ pub use board::{
 pub use harness_history::{
     ingest_harness_history, HarnessHistory, HarnessIngestReport, HarnessSelector,
     HARNESS_MESSAGE_ENTITY, HARNESS_SESSION_ENTITY, HARNESS_SESSION_REL, HARNESS_SOURCE,
+    MAX_LIVE_SESSION_ENVELOPES,
 };
 pub use host_caps::DatasourceHostCaps;
 pub use ingest::{
