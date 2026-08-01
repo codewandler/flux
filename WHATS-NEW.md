@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-08-01
+
 ### Action needed
 
 - **A plugin that starts asking for more than it did will now refuse to load.** flux records what a

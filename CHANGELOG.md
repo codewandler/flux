@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-08-01
+
 ### Added
 
 - **`fluxlang fmt` — the canonical formatter as a CLI, comment-preserving** (L-103). Rewrites every
