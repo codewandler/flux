@@ -52,3 +52,4 @@ __pycache__/
 # I-03 measurement raw recordings (local evidence, re-derivable reports)
 bench/ttff/results/
 bench/tbench-compare/results/
+target-int/
