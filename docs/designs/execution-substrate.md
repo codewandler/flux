@@ -1,0 +1,124 @@
+# Design: the execution substrate — `flux-system` for a second consumer
+
+**Status:** proposed · **Pillar:** Core · **Epic:** [C-394](../stories/C-394-execution-substrate-epic.md)
+· **Extends:** [portable-wasm-runtime.md](portable-wasm-runtime.md) (which introduced the port seam)
+· **Context:** [ecosystem.md](ecosystem.md)
+
+> Citations read on **2026-08-01** at workspace v0.42.0. Re-grep by symbol; line numbers move.
+
+## Why now
+
+`flux-system` has had exactly one consumer since it was written: flux. That is about to stop being
+true — [flux-exchange](ecosystem.md) is a service that runs operations for many callers, and the
+primitives it needs are the ones `flux-system` already guards: an HTTP request with a resolved-IP
+egress guard, a dial, an argv-only spawn, an OS sandbox.
+
+The wrong response is a new crate. The right response is to finish the seam `flux-system` already
+has, because **the seam exists and was built for exactly this**: `port.rs` states the guarded
+operations as capability traits so *"a WebAssembly embedder that answers through host imports, **a
+remote executor**, or a test double"* can serve them, and it is explicit that the traits are
+unsealed and that downstream implementors are expected.
+
+## The distinction that must not be lost
+
+The single most common misreading of this codebase, and the reason this design leads with it:
+
+> **`flux-runtime` decides whether something may happen. `flux-system` is where it happens.**
+
+They are both **L2** — peers at one layer, not stacked. Fusing them, or building a third crate that
+spans them, would force every consumer of the substrate to also take flux's approval model. An
+unattended service has no human at a terminal to prompt, so such a consumer would reimplement
+guarded IO instead — which is the exact failure the substrate exists to prevent.
+
+This is now stated publicly in [`docs/concepts.md`](../concepts.md); this design is the engineering
+consequence.
+
+## What is already there
+
+| Need | Status |
+|---|---|
+| HTTP with SSRF guard | `flux-web` + `net::guard_url_scoped` — resolves hostnames, blocks private/loopback/link-local/ULA/CGNAT unless scoped-granted |
+| TCP dial | `net::DialTarget` / `DialStream` / `dial_scoped` / `dial_scoped_pinned` |
+| Argv-only spawn | one `System::build_command`; env cleared to a non-secret allow-list; output byte-capped |
+| OS sandbox | `sandbox::Backend` — bubblewrap (Linux), Seatbelt (macOS); `SpawnPolicy`, `Confinement` |
+| The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`; fail-closed defaults; `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` enumerates in-repo backends |
+| Published | yes — `codewandler-flux-system`, lib name `flux_system` |
+
+So the substrate is real and shipped. What is missing is narrower than it looks.
+
+## What is missing
+
+### 1. The workspace-confined file surface is not a port
+
+`port.rs` says so itself: *"The workspace-confined file surface (`read_file`, `write_file`, …) is
+**not yet a port** — see C-269's story notes. Its consumers all still hold a concrete `System`, and a
+trait with no call sites would be indirection without a seam."*
+
+That reasoning was correct and is now **expired**. A second consumer is precisely the call site the
+deferral was waiting for. This is [C-395](../stories/C-395-file-surface-port.md), and it is the only
+story in this epic whose justification is a deferral condition being met rather than a new idea.
+
+### 2. `DialTarget` covers TCP, not UDP or ICMP
+
+Reachability checks, protocol probes and anything resembling `ping` need datagram and raw sockets.
+These are new variants on existing enums rather than a new module —
+[C-396](../stories/C-396-datagram-dial-targets.md). Raw ICMP additionally needs `CAP_NET_RAW`, which
+is a deployment concern the design must state rather than discover: a capability the process may not
+hold is a **refusal at construction**, not an error at first send.
+
+### 3. Nothing says what binding `flux-system` *without* `flux-runtime` means
+
+This is the sharpest gap and the one most likely to be got wrong quietly.
+
+`AGENTS.md` states the invariant as *"Every tool runs through `Executor::dispatch`"*. That is a
+statement about **flux**. A consumer that links `flux-system` and brings its own policy engine is
+not violating it — it was never inside it — but nothing in the tree says so, and a reader who finds
+the invariant and then finds a consumer bypassing `Executor` will reasonably conclude something is
+broken.
+
+`port.rs` answers the adjacent question (what it means to *implement* the port: *"a consumer that
+implements these traits is taking responsibility for the guarantees itself"*) and not this one (what
+it means to *consume* the substrate without the envelope).
+
+[C-398](../stories/C-398-substrate-guarantee-contract.md) writes the contract: which guarantees are
+`flux-system`'s and travel with it (path confinement, argv-only, egress guarding, sandbox
+confinement, env clearing, output capping), and which are `flux-runtime`'s and **do not** (default-deny
+authorization, approval, redaction of tool output, evidence). A consumer taking only the first set is
+supported; a consumer that assumes it got the second is the failure this contract prevents.
+
+### 4. Container and remote backends — ownership undecided
+
+A `container` runtime (spawn inside docker/k8s) and a `remote` runtime (delegate to another
+substrate) are both named in [ecosystem.md](ecosystem.md)'s runtime table. Neither is obviously
+flux's to build:
+
+- The port is **unsealed**, so an out-of-repo consumer can implement either without flux changing.
+- `flux-codegate`'s backend gate reaches only this repository, so an in-repo backend costs a reviewed
+  allowance that an out-of-repo one does not.
+- flux's own CLI has no use for either.
+
+They are therefore filed as `backlog` with ownership stated as open
+([C-397](../stories/C-397-container-process-backend.md),
+[C-399](../stories/C-399-remote-guarded-io-backend.md)), not as `ready` work. The decision belongs
+with whoever needs one first, and the epic should not pretend otherwise.
+
+## What this epic explicitly does not do
+
+- **It does not move flux-runtime.** No change to `Executor::dispatch`, the approval chain, or the
+  layer map.
+- **It does not add an IO path.** Every item above is either a trait over the existing path or a new
+  variant inside it. A second `Command::new` or a second URL guard would be a defect, not a feature.
+- **It does not weaken a default.** Port operations default to denial; new ones must too.
+- **It does not build flux-exchange.** That lives in its own repository. This epic makes the
+  substrate consumable; it does not consume it.
+
+## The check that keeps this honest
+
+Each story's Acceptance names a failing-first test. Two are worth calling out because they are the
+ones a well-meaning implementation would skip:
+
+- C-395 must show that a **port-based** consumer is confined exactly as a concrete `System` consumer
+  is — the same escape attempts (`..`, a symlink out of the root) refused through the trait.
+- C-396 must show that a raw-ICMP target with insufficient capability is refused **at construction**,
+  not at first send. A capability check that happens on the wire is a check that already leaked the
+  attempt.

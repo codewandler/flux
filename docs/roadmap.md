@@ -85,6 +85,43 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
 > the itemized history.
 
+### The execution substrate — `flux-system` for a second consumer (epic) — 🔄 **PROPOSED (C-394; C-395…C-399 filed, none started)**
+
+`flux-system` has had exactly one consumer since it was written. That is about to stop being true:
+[flux-exchange](designs/ecosystem.md) is a service that runs operations for many callers, and the
+primitives it needs — a guarded request, a guarded dial, an argv-only spawn, an OS sandbox — are the
+ones `flux-system` already holds.
+
+**The response is not a new crate.** The seam already exists and was built for this: `port.rs` states
+the guarded operations as capability traits so *"a WebAssembly embedder…, **a remote executor**, or a
+test double"* can serve them, and it is explicit that the traits are unsealed. What is missing is
+narrower than it looks.
+
+The distinction the epic exists to protect, now stated publicly in
+[`docs/concepts.md`](concepts.md): **`flux-runtime` decides whether something may happen;
+`flux-system` is where it happens.** They are peers at L2, not stacked. Fusing them would force every
+consumer of the substrate to take flux's approval model too — and a consumer with no human at a
+terminal would reimplement guarded IO instead, which is the exact failure the substrate prevents.
+
+Three gaps are real work. **C-395** makes the workspace-confined file surface a port; C-269 deferred
+it on the stated grounds that *"a trait with no call sites would be indirection without a seam"*, and
+a second consumer is precisely the condition that expires. **C-396** adds UDP and ICMP dial targets,
+with the sharp requirement that an unheld `CAP_NET_RAW` refuses at *construction* — a capability check
+that happens on the wire has already contacted the destination. **C-398** is the one most likely to be
+got wrong quietly: `AGENTS.md` says *"Every tool runs through `Executor::dispatch`"*, which is true of
+**flux** and reads as a claim about every consumer; nothing states which guarantees travel with
+`flux-system` alone (path confinement, argv-only, egress guarding, sandbox, env clearing, output
+capping) and which are `flux-runtime`'s and do not (default-deny authorization, approval, redaction,
+evidence).
+
+**C-397** (container backend) and **C-399** (remote port backend) are members but sit in `backlog`
+with **ownership undecided** — the port is unsealed, so an out-of-repo consumer can implement either
+without flux changing, an in-repo backend costs a reviewed codegate allowance, and flux's own CLI has
+no use for either. Deciding that is their first acceptance criterion, deliberately.
+
+The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
+Design: [execution-substrate.md](designs/execution-substrate.md).
+
 ### The road to stable — what must be true before flux is measured rather than built (epic) — 🔄 **PROPOSED (C-342; ~16 of 110 open stories block it, 9 owned + 6 cross-referenced)**
 
 flux has 663 done stories and ~110 open, and the open set is not a queue of equal work: roughly 16
