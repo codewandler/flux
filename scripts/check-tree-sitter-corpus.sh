@@ -61,9 +61,11 @@
 # `scripts/check-release-tags.sh`; do not invent a second one.
 #
 # ⚠ It needs the network, so it is NOT a PR gate — `.github/workflows/tree-sitter-corpus.yml` runs it
-# nightly and on demand, and on no push, PR or tag. That workflow's header records why, and records
-# that the lane is RED at the pin it landed with: 7 of the 15 examples do not parse, on constructs
-# the grammar never supported. The fix is upstream, not an allowlist here.
+# nightly and on demand, and on no push, PR or tag. That workflow's header records why, and states
+# the contract the lane enforces: the whole corpus parses clean at the pinned rev, with no allowlist
+# and no exempted file. It landed RED — 7 of the 15 examples then in the corpus did not parse at
+# `9ea9890`, on constructs the grammar never supported — and C-340 fixed that upstream and moved the
+# pin. When it reds again the fix is upstream, then move the pin; never an allowlist here.
 #
 set -uo pipefail
 

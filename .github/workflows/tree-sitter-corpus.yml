@@ -14,25 +14,40 @@ name: tree-sitter-corpus
 # the one place a reader looks for it, and matches what `adversarial-assurance.yml` already does for
 # its weekly lane.
 #
-# Deliberately NOT triggered on version tags either, and that is not caution — this lane is RED THE
-# DAY IT LANDS, and a red release-tag trigger would fail a cut over a defect in a different
-# repository that no cut can fix.
+# Deliberately NOT triggered on version tags either. A grammar defect lives in a DIFFERENT
+# repository, so a red here is never something a cut can fix — failing a release on it would block
+# shipping flux over a bug flux cannot land the fix for.
 #
-# ⚠ WHY IT IS RED, and why that is the finding rather than a reason to weaken it. At the pin this
-# lands with (`9ea9890`), 7 of the 15 canonical examples do not parse. The C-301 duration fix and the
-# L-96 / `permissions` improvements DID arrive with this pin — `zendesk.triage.flux` is clean now and
-# was not at `29cff6c` — but the grammar has never supported several constructs the corpus has used
-# all along: bare-identifier binds (`src = grep(...)`, not just `$src = ...`), typed binds
-# (`need: Need = ...`), `ctx` blocks, `+=`, and a `goal "..."` line at column 0 under a `flow` header
-# (which alone cascades to 73 defects in `release.flux`).
+# ⚠ THE CONTRACT THIS LANE ENFORCES, and what a red means when you see one (L-118). Green is the
+# normal state and has been since the pin moved to `2dbec53`: all sixteen canonical `examples/*.flux`
+# parse with zero ERROR and zero MISSING nodes. There is no allowlist, no expected-failure list, and
+# no file exempted — the whole corpus, or red. Keep it that way; the two things that would quietly
+# destroy this lane's value are an allowlist and a second corpus, and it has neither.
 #
-# Nobody knew, and the reason is exactly the one C-334 forbids repeating: the grammar repo has its
-# OWN 3-file `examples/` corpus, and its CI parses that one. Measured at this same rev, that corpus
-# is 100% clean while flux's is 47% broken. A second corpus did not merely permit the drift — it
-# certified it. So the fix is upstream in `codewandler/flux-tree-sitter`, followed by moving the pin;
-# an allowlist here would silence half the corpus and re-create the blind spot in a new place.
+# So a red here means exactly one thing: **the revision `.helix/languages.toml` pins cannot parse
+# Flux that flux itself ships as canonical**, and every construct the log names is a red squiggle in
+# Helix, Neovim and Zed right now. The fix is upstream in `codewandler/flux-tree-sitter`, followed by
+# MOVING THE PIN — landing the grammar fix without moving the pin reaches nobody, which is the
+# C-334 failure mode and has now been observed twice.
 #
-# Nightly-only means a standing red blocks nobody's push, PR or cut while that work is owed.
+# HOW IT GOT HERE, because the shape of the last red is the pattern to follow. C-334 built this
+# check; its first run against the then-current pin (`9ea9890`) reported 166 defect nodes across 7 of
+# the 15 examples then in the corpus, on six construct families the grammar had never supported —
+# bare-identifier binds, typed binds, `ctx` blocks, `+=`, a column-0 `goal "..."` under a `flow`
+# header, and optional field access. C-340 fixed them upstream, family by family, and moved the pin
+# to `2dbec53`. Nobody had known, and the reason is the one C-334 forbids repeating: the grammar repo
+# had its OWN 3-file `examples/` corpus and its CI parsed that one, which at the identical rev was
+# 100% clean while flux's was 47% broken. A second corpus did not merely permit the drift — it
+# certified it. C-340 demoted that corpus to a smoke set; the grammar repo's CI now parses THIS
+# corpus, so both repositories are held to one contract.
+#
+# NIGHTLY-ONLY IS THE STANDING HAZARD, and it is why this preamble is guarded rather than trusted.
+# A red here blocks no push, no PR and no cut, so nothing puts a reader in front of it and a stale
+# claim in this header can outlive the state it describes by months — which is exactly what happened
+# between C-340 and L-118, when this block went on announcing a red that had already been fixed.
+# `crates/flux-lang/tests/tree_sitter_lane_contract.rs` now fails on any PR if this file stops naming
+# the revision the pin actually carries, or points at a story that does not exist. Move the pin and
+# you must move this preamble with it.
 #
 # `timeout-minutes` is set. No job in `ci.yml` sets one — the check clones a repo and runs `npm
 # install`, both of which hang rather than fail when a network path goes bad, and an unbounded
