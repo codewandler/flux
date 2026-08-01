@@ -312,10 +312,12 @@ async fn exactly_one_occupant_is_self_and_the_agent_never_answers_its_own_echo()
         ))
         .await;
     // …and one that is from somebody else, so the test can tell "suppressed" from "not delivered yet".
+    // It names us, so D-207's address rule lets it through and self-suppression is the only thing
+    // that can explain the count below.
     double
         .push(format!(
             "<message xmlns='jabber:client' type='groupchat' from='{ROOM_JID_SERVER}/timo'>\
-             <body>morning</body></message>"
+             <body>flux: morning</body></message>"
         ))
         .await;
 

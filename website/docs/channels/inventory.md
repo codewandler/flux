@@ -205,10 +205,27 @@ channel standup
   it: some hosts lowercase the room in its address while other identifiers keep the original case. Once
   joined, flux uses the address the server reported and ignores the case you wrote here.
 - `nick` — the name flux joins under. Defaults to `flux`. The server may hand back a different one on
-  a collision, and flux follows it.
-- `address_rule` — when the agent should treat a turn as aimed at it. **Accepted but not yet enforced:**
-  today every inbound message produces a turn, so a room with two people talking to each other will
-  wake the program on every line.
+  a collision, and flux follows it — including for `mention` matching below, so the room only ever has
+  to type the name it can actually see.
+- `address_rule` — when the agent should treat a public line as aimed at it. A comma-separated list
+  of `mention` (the line **addresses** flux — the default), `wake: <phrase>` (the line carries that
+  phrase), `always` (every line) or `never` (no public line). A **private message is always
+  addressed**, whatever the rule says. Anything outside that vocabulary is a load error rather than a
+  silent widening. A line that does not address flux updates its context and produces no turn, no
+  reply and no model call.
+
+  `mention` asks whether somebody spoke *to* flux, not whether the word appeared: `@flux`, `flux: …`,
+  `any idea, flux?`, a line that opens with the nick, or one that ends with it. Talking *about* flux
+  is not addressing it, so `see https://flux.dev/docs` and `the flux 0.48 release notes` go
+  unanswered. A `wake:` phrase is looser on purpose — it matches anywhere in the line, since you
+  chose it and can make it as distinctive as your room needs.
+
+  When flux stays quiet it says why once per session on stderr, naming the rule and the nick it is
+  answering to — the first thing to check if a room agent seems to have stopped listening.
+- `reply_budget` / `reply_window_secs` — the ceiling on how often this room can make flux answer,
+  default **12 turns per 60 seconds**. It gates the turn, not the outbound line, so a message past
+  the ceiling costs nothing at all. This is what stops two agents in one room answering each other
+  without end; it does not accumulate, so a quiet room recovers on the window alone.
 
 Settings for `backend "xmpp"`:
 
@@ -225,9 +242,11 @@ Settings for `backend "xmpp"`:
   prosody on your LAN. **Off by default:** flux's egress guard refuses internal addresses unless you
   say so.
 
-**Payload:** `{ "room", "text", "speaker", "nick", "name" }`. `speaker` is the occupant's stable,
-room-scoped address and `nick` their display name — two occupants can share a nick, so key anything
-per-person on `speaker`.
+**Payload:** `{ "room", "text", "speaker", "nick", "name", "context" }`. `speaker` is the occupant's
+stable, room-scoped address and `nick` their display name — two occupants can share a nick, so key
+anything per-person on `speaker`. `context` is what was said in the room since flux last answered,
+attributed the same way (`{ "speaker", "nick", "text" }` per line, oldest first, bounded), so an
+answer can refer to what someone asked earlier without the agent having replied to it.
 
 **Reply:** non-empty run results are said back into the room, publicly for a public message and
 privately for a private one. Our own echoed messages never become turns.
@@ -275,9 +294,10 @@ Stated plainly, because each one changes how you would deploy a channel:
 4. **Headless means no approver.** Anything that would prompt for approval cannot be confirmed in a
    channel-driven run. Set an explicit `permissions` ceiling; do not rely on `--yes`, which can only
    auto-approve *within* the ceiling and never widens it.
-5. **A room agent answers everything.** `room` ships presence and text against real MUC servers, but
-   `address_rule` is carried and not yet enforced — every line said in the room becomes a turn,
-   including two people talking to each other. Put a room agent in a busy room only if you mean to pay
-   for every sentence in it.
+5. **A room agent answers only when addressed.** `address_rule` decides which public lines are aimed
+   at flux; everything else updates its context silently and costs nothing. Two further rules bound
+   the agent-to-agent case: flux never auto-replies to another automated participant's plain text,
+   and every room carries a reply budget per unit time. Setting `address_rule "always"` opts back
+   into answering every sentence said in the room — and paying for it.
 6. **Rooms carry no media.** Audio and screenshare need a WebRTC endpoint and are not implemented; the
    `room` kind is text and presence only.

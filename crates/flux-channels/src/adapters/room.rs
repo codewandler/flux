@@ -22,19 +22,21 @@
 //! joining is not** (a socket that died mid-meeting ends the room, not the schedule and the webhook
 //! running beside it). See [`RoomSessionEnd`].
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use flux_flow::voice::{Speaker, VoiceReply, VoiceTurnHandler};
+use flux_flow::voice::{RoomTranscript, Speaker, VoiceReply, VoiceTurnHandler};
 use flux_lang::program::ChannelDecl;
 
 use crate::config::{RoomSettings, DEFAULT_ROOM_NICK};
 use crate::rooms::{
-    BraveTalkTokens, JaasConfig, JaasRoom, MockRoom, Room, RoomIdentity, RoomSessionEnd,
-    RoomTurnDriver, XmppConfig, XmppMucRoom,
+    AddressRule, BraveTalkTokens, JaasConfig, JaasRoom, MockRoom, ReplyBudget, Room, RoomIdentity,
+    RoomSessionEnd, RoomTurnDriver, XmppConfig, XmppMucRoom, DEFAULT_ROOM_REPLY_BUDGET,
+    DEFAULT_ROOM_REPLY_WINDOW,
 };
 use crate::{Channel, Deliverer};
 
@@ -42,6 +44,9 @@ pub struct RoomChannel {
     name: String,
     identity: RoomIdentity,
     room: Arc<dyn Room>,
+    address_rule: AddressRule,
+    reply_budget: usize,
+    reply_window: Duration,
 }
 
 impl RoomChannel {
@@ -71,7 +76,7 @@ impl RoomChannel {
                 decl.name
             ),
         };
-        Ok(Self::over(decl, &settings, room))
+        Self::over(decl, &settings, room)
     }
 
     /// Build the channel over an already-constructed [`Room`], ignoring `settings.backend`. The seam a
@@ -79,7 +84,7 @@ impl RoomChannel {
     /// backend uses rather than re-deriving one from the declaration.
     pub fn with_room(decl: &ChannelDecl, room: Arc<dyn Room>) -> anyhow::Result<Self> {
         let settings = Self::settings(decl)?;
-        Ok(Self::over(decl, &settings, room))
+        Self::over(decl, &settings, room)
     }
 
     /// The channel's declared settings, with the declaration's name in any error.
@@ -88,16 +93,39 @@ impl RoomChannel {
             .map_err(|e| anyhow::anyhow!("channel `{}` settings: {e}", decl.name))
     }
 
-    fn over(decl: &ChannelDecl, settings: &RoomSettings, room: Arc<dyn Room>) -> Self {
+    fn over(
+        decl: &ChannelDecl,
+        settings: &RoomSettings,
+        room: Arc<dyn Room>,
+    ) -> anyhow::Result<Self> {
         let nick = settings
             .nick
             .clone()
             .unwrap_or_else(|| DEFAULT_ROOM_NICK.to_string());
-        Self {
+        // A rule outside the vocabulary fails the load rather than degrading to "answer everything"
+        // — the failure D-207's whole point is to prevent, arriving as a typo (D-204 carried this
+        // field unvalidated on purpose, because the vocabulary had not been chosen yet).
+        let address_rule = match settings.address_rule.as_deref() {
+            Some(spec) => AddressRule::parse(spec)
+                .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", decl.name))?,
+            None => AddressRule::default(),
+        };
+        let reply_window = match settings.reply_window_secs {
+            Some(0) => anyhow::bail!(
+                "channel `{}`: `reply_window_secs` of 0 is a budget that resets on every message",
+                decl.name
+            ),
+            Some(secs) => Duration::from_secs(secs),
+            None => DEFAULT_ROOM_REPLY_WINDOW,
+        };
+        Ok(Self {
             name: decl.name.clone(),
             identity: RoomIdentity::agent(nick),
             room,
-        }
+            address_rule,
+            reply_budget: settings.reply_budget.unwrap_or(DEFAULT_ROOM_REPLY_BUDGET),
+            reply_window,
+        })
     }
 }
 
@@ -112,6 +140,7 @@ impl Channel for RoomChannel {
             label: self.name.clone(),
             room: self.room.id().as_str().to_string(),
             deliverer: d,
+            overheard: Mutex::new(RoomTranscript::new()),
         };
         // The posture, decided explicitly (D-205). `crate::serve` treats a channel error as fatal to
         // the whole process, so the two failures are separated here rather than collapsed:
@@ -124,6 +153,8 @@ impl Channel for RoomChannel {
         //   Logged under the channel's name and ended, the same posture this adapter already takes
         //   for a failed delivery.
         match RoomTurnDriver::new(self.room.clone(), self.identity.clone())
+            .with_address_rule(self.address_rule.clone())
+            .with_reply_budget(ReplyBudget::new(self.reply_budget, self.reply_window))
             .run(&handler, &cancel)
             .await
         {
@@ -137,23 +168,49 @@ impl Channel for RoomChannel {
     }
 }
 
-/// The turn handler the channel drives: one attributed room message → one `deliver` under the channel
-/// name → the journeys' results said back into the room.
+/// The turn handler the channel drives: one **addressed** room message → one `deliver` under the
+/// channel name → the journeys' results said back into the room.
+///
+/// The messages that were *not* addressed to flux still land here, as
+/// [`overheard`](VoiceTurnHandler::overheard), and accumulate in an attributed
+/// [`RoomTranscript`]. They cost nothing until flux is next spoken to, and then they ride the
+/// delivery as `context` — which is what lets an answer refer to "what Timo asked" rather than to a
+/// question with no conversation around it.
 struct RoomDelivery {
     label: String,
     room: String,
     deliverer: Arc<dyn Deliverer>,
+    /// What was said in the room while flux was not the addressee, oldest first and bounded.
+    overheard: Mutex<RoomTranscript>,
 }
 
 #[async_trait]
 impl VoiceTurnHandler for RoomDelivery {
     async fn turn(&self, speaker: &Speaker, user_text: &str) -> VoiceReply {
+        // Drained, so the same context is never carried into two turns and re-billed. Each line
+        // keeps its speaker id — a MUC nick is occupant-chosen and non-unique (C-408), so context
+        // attributed by display name would merge two strangers into one voice.
+        let context: Vec<_> = self
+            .overheard
+            .lock()
+            .unwrap()
+            .drain()
+            .into_iter()
+            .map(|line| {
+                json!({
+                    "speaker": line.speaker.id(),
+                    "nick": line.speaker.display_name(),
+                    "text": line.text,
+                })
+            })
+            .collect();
         let payload = json!({
             "room": self.room,
             "text": user_text,
             "speaker": speaker.id(),
             "nick": speaker.display_name(),
             "name": self.label,
+            "context": context,
         });
         match self.deliverer.deliver(&self.label, payload).await {
             Ok(runs) => {
@@ -172,5 +229,12 @@ impl VoiceTurnHandler for RoomDelivery {
                 VoiceReply::Continue(String::new())
             }
         }
+    }
+
+    /// A line flux heard but was not addressed by. It is recorded and **not delivered** — no
+    /// journey, no planner, no spend — so the only thing an unaddressed room costs is memory, and
+    /// that is bounded by the transcript's own capacity.
+    async fn overheard(&self, speaker: &Speaker, text: &str) {
+        self.overheard.lock().unwrap().push(speaker, text);
     }
 }
