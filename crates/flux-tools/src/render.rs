@@ -603,7 +603,10 @@ mod tests {
             "flow greet(name: String)\n  do notify \"hi\"\n  return $name\n",
         )
         .unwrap();
-        ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())))
+        ToolContext::new(Arc::new(
+            System::new(Workspace::new(&dir).unwrap())
+                .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+        ))
     }
 
     #[tokio::test]

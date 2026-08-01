@@ -620,7 +620,10 @@ mod tests {
     fn ctx() -> ToolContext {
         let dir = std::env::temp_dir().join(format!("flux-transform-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())))
+        ToolContext::new(Arc::new(
+            System::new(Workspace::new(&dir).unwrap())
+                .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+        ))
     }
 
     #[tokio::test]

@@ -3890,7 +3890,7 @@ impl Tool for GitWorktreeEnterTool {
         let short_head = &head[..head.len().min(8)];
         let branch = format!("flux/worktree/{}-{seq}-{short_head}", std::process::id());
 
-        let parent = flux_system::allocate_worktree_dir()?;
+        let parent = system.allocate_worktree_dir()?;
         let checkout = parent.join("checkout");
         let (ok, add_out) = run_git(
             &system,
@@ -3905,7 +3905,7 @@ impl Tool for GitWorktreeEnterTool {
         )
         .await?;
         if !ok {
-            let _ = flux_system::remove_worktree_dir(&parent);
+            let _ = system.remove_worktree_dir(&parent);
             return Ok(ToolResult::error(format!(
                 "git_worktree_enter: git worktree add failed: {add_out}"
             )));
@@ -3921,7 +3921,7 @@ impl Tool for GitWorktreeEnterTool {
                 )
                 .await;
                 let _ = run_git(&system, &["branch", "-d", &branch]).await;
-                let _ = flux_system::remove_worktree_dir(&parent);
+                let _ = system.remove_worktree_dir(&parent);
                 return Ok(ToolResult::error(format!(
                     "git_worktree_enter: could not derive a system rooted at the worktree: {e}"
                 )));
@@ -3942,7 +3942,7 @@ impl Tool for GitWorktreeEnterTool {
             )
             .await;
             let _ = run_git(&system, &["branch", "-d", &branch]).await;
-            let _ = flux_system::remove_worktree_dir(&parent);
+            let _ = system.remove_worktree_dir(&parent);
             return Ok(ToolResult::error(format!("git_worktree_enter: {e}")));
         }
 
@@ -4134,7 +4134,7 @@ impl Tool for GitWorktreeLeaveTool {
         if !ok && !out.contains("not found") {
             return Ok(Self::cleanup_pending("git branch -d", &out));
         }
-        if let Err(e) = flux_system::remove_worktree_dir(&session.parent_dir) {
+        if let Err(e) = original.remove_worktree_dir(&session.parent_dir) {
             return Ok(Self::cleanup_pending(
                 "temporary directory removal",
                 &e.to_string(),
@@ -4173,8 +4173,9 @@ impl Tool for GitWorktreeLeaveTool {
 // turn and give each local worker its own checkout.
 //
 // The host owns the naming: the branch is `impl/<item>` and the directory comes from
-// `flux_system::allocate_worktree_dir` (a fresh 0700 parent per call), so two concurrent calls
-// cannot collide and a worker cannot claim an isolation it was not given.
+// `System::allocate_worktree_dir` (a fresh 0700 parent per call under the base that system carries,
+// C-391), so two concurrent calls cannot collide and a worker cannot claim an isolation it was not
+// given.
 //
 // It lives here, beside the git family it is built from, rather than in `flux-orchestrate` with its
 // `fleet.*` siblings: those three are outbound A2A calls to a REMOTE worker over `flux-a2a`, while
@@ -4353,7 +4354,7 @@ impl Tool for FleetIsolateTool {
 
         // One fresh 0700 parent per call: this is what makes two concurrent calls disjoint without
         // any coordination between them.
-        let parent = flux_system::allocate_worktree_dir()?;
+        let parent = system.allocate_worktree_dir()?;
         let checkout = parent.join("checkout");
         let (ok, add_out) = run_git(
             &system,
@@ -4368,7 +4369,7 @@ impl Tool for FleetIsolateTool {
         )
         .await?;
         if !ok {
-            let _ = flux_system::remove_worktree_dir(&parent);
+            let _ = system.remove_worktree_dir(&parent);
             return Ok(ToolResult::error(format!(
                 "fleet.isolate: git worktree add failed for {branch}: {add_out}"
             )));
@@ -4504,9 +4505,63 @@ pub fn register_dev_builtins(registry: &mut flux_runtime::ToolRegistry) {
     try_register_dev_builtins(registry).expect("flux-tools developer pack registration failed");
 }
 
+/// C-391 test support: the worktree base **every** test `System` in this crate is pinned to.
+///
+/// `git_worktree_enter` and `fleet.isolate` allocate a real parent directory through the `System`
+/// they are given. Unpinned, that lands in the operator's `$HOME/.flux/worktrees` — a unit suite
+/// writing into the developer's home, and stranding a tree there whenever a test dies between
+/// `enter` and `leave`. Lives outside `mod tests` so the sibling modules' test blocks can reach the
+/// same pin; `tests/worktree_base_is_pinned.rs` fails the build on any test `System` that skips it.
+#[cfg(test)]
+pub(crate) mod test_worktrees {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The name prefix of the per-test-thread base — named once, so the pin, its cleanup guard and
+    /// the test that asserts *where* an allocation lands all agree on one spelling.
+    pub(crate) const TEST_WORKTREE_BASE_PREFIX: &str = "flux-tools-worktrees-";
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A test-owned base that removes itself when its test thread ends — **however it ends**. The
+    /// hazard this closes is not the happy path (`git_worktree_leave` already removes what `enter`
+    /// created) but the one that stranded five real trees in an operator's `~/.flux/worktrees`: a
+    /// test that panics *between* enter and leave. A `Drop` on a `thread_local!` runs while the
+    /// panicking test thread unwinds, so an allocation cannot outlive the test that made it.
+    pub(crate) struct TestWorktreeBase(pub(crate) PathBuf);
+
+    impl Drop for TestWorktreeBase {
+        fn drop(&mut self) {
+            // Teardown, so a cleanup hiccup must never be reported as a test failure. A leftover
+            // `git worktree add` checkout lives inside, hence the recursive form.
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    thread_local! {
+        static BASE: TestWorktreeBase = {
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "{TEST_WORKTREE_BASE_PREFIX}{}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TestWorktreeBase(dir)
+        };
+    }
+
+    /// The base for the current test thread, as the value [`flux_system::System::with_worktree_base`]
+    /// takes. One base per thread rather than one per context, so a test driving several contexts
+    /// still has a single directory to clean up.
+    pub(crate) fn pinned_worktree_base() -> flux_system::WorktreeBase {
+        BASE.with(|base| flux_system::WorktreeBase::pinned(&base.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_worktrees::{pinned_worktree_base, TEST_WORKTREE_BASE_PREFIX};
     use flux_system::{System, Workspace};
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4517,7 +4572,11 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("flux-tools-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let c = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+        // Every test system is pinned (C-391): an unpinned one allocates its worktree parents in
+        // the operator's `~/.flux/worktrees` — a unit test writing into the developer's home.
+        let c = ToolContext::new(Arc::new(
+            System::new(Workspace::new(&dir).unwrap()).with_worktree_base(pinned_worktree_base()),
+        ));
         (dir, c)
     }
 
@@ -6844,6 +6903,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-391: **where the write lands.** A worktree parent is allocated by the guarded `System`,
+    /// so it goes to the base that system was pinned to — never to the operator's real
+    /// `$HOME/.flux/worktrees`, which is where an unpinned allocation lands and where five
+    /// abandoned `flux-worktree-*/checkout` trees were found. This asserts the *location*, not the
+    /// worktree mechanics: it is deliberately spelled without naming the new seam, so the identical
+    /// source fails at the merge base (parent under `$HOME`) and passes after.
+    #[tokio::test]
+    async fn git_worktree_enter_allocates_under_the_pinned_base_never_the_operators_home() {
+        let (dir, c) = worktree_ctx();
+        let r = GitWorktreeEnterTool.execute(&c, json!({})).await.unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        let session = c.workspace_context().worktree_session().unwrap();
+        let parent = session.parent_dir.clone();
+
+        let base = parent.parent().expect("an allocation has a base directory");
+        assert!(
+            base.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(TEST_WORKTREE_BASE_PREFIX)),
+            "the worktree parent must be allocated under this test's own pinned base, not {}",
+            base.display()
+        );
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            assert!(
+                !parent.starts_with(&home),
+                "a test allocated {} inside the operator's home ({}) — a unit test must not write \
+                 there at all, and a panic between enter and leave would strand it",
+                parent.display(),
+                std::path::Path::new(&home).display()
+            );
+        }
+
+        let r = GitWorktreeLeaveTool.execute(&c, json!({})).await.unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(!parent.exists(), "leave removed the allocated parent");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-391, the other half: a test that dies **between** enter and leave strands nothing. That is
+    /// the exact shape of the run that left five `flux-worktree-848868-*/checkout` trees in the
+    /// operator's home — `leave` never ran, so nothing removed them. Here a real allocation is made
+    /// on a thread that then panics, and the base is gone once that thread has ended: the
+    /// `thread_local!` guard's `Drop` runs while the test thread unwinds.
+    #[test]
+    fn a_panicking_test_thread_leaves_no_worktree_behind() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let panicked = std::thread::spawn(move || {
+            let base = pinned_worktree_base();
+            let parent = base.allocate().unwrap();
+            // Something a `git worktree add` would have put there, so the assertion below is about
+            // a populated tree and not merely an empty directory. Asserted *here*, before the
+            // panic: the cleanup this test is about is prompt, and observing existence from the
+            // parent thread would be a race against it.
+            std::fs::create_dir_all(parent.join("checkout")).unwrap();
+            assert!(parent.join("checkout").is_dir(), "the tree really existed");
+            tx.send((base.path().to_path_buf(), parent)).unwrap();
+            panic!("a test failing between git_worktree_enter and git_worktree_leave");
+        });
+        let (base, parent) = rx.recv().expect("the thread allocated before panicking");
+        assert!(
+            panicked.join().is_err(),
+            "the thread must have panicked for this to prove anything"
+        );
+
+        assert!(
+            !parent.exists(),
+            "the panicking thread stranded {} — in a run without the pin this is what lands in \
+             the operator's ~/.flux/worktrees and stays there",
+            parent.display()
+        );
+        assert!(!base.exists(), "and its base went with it");
+    }
+
     /// C-98: a dirty checkout is rejected — no branch, no worktree, no session.
     #[tokio::test]
     async fn git_worktree_enter_rejects_dirty_main() {
@@ -6986,7 +7118,7 @@ mod tests {
         let base = raw_git(&dir, &["rev-parse", "HEAD"]);
 
         // A real worktree branched at base, with a conflicting edit committed.
-        let parent = flux_system::allocate_worktree_dir().unwrap();
+        let parent = c.system().allocate_worktree_dir().unwrap();
         let checkout = parent.join("checkout");
         let branch = "flux/worktree/conflict-test";
         raw_git(
@@ -7558,13 +7690,15 @@ mod tests {
     /// Remove an isolated worktree the way its caller is expected to: unregister the checkout,
     /// then drop the host-allocated parent. Never asserts — this is teardown, and a cleanup
     /// hiccup must not be reported as a failure of what the test proves.
-    fn drop_isolated_worktree(repo: &std::path::Path, worktree: &str) {
+    fn drop_isolated_worktree(system: &System, repo: &std::path::Path, worktree: &str) {
         let _ = std::process::Command::new("git")
             .args(["worktree", "remove", "--force", worktree])
             .current_dir(repo)
             .output();
         if let Some(parent) = std::path::Path::new(worktree).parent() {
-            let _ = flux_system::remove_worktree_dir(parent);
+            // Through the allocating system, so the fail-closed removal guard resolves the same
+            // base the allocation used (C-391).
+            let _ = system.remove_worktree_dir(parent);
         }
     }
 
@@ -7637,8 +7771,8 @@ mod tests {
         assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
         assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), base);
 
-        drop_isolated_worktree(&dir, &wt_a);
-        drop_isolated_worktree(&dir, &wt_b);
+        drop_isolated_worktree(&c.system(), &dir, &wt_a);
+        drop_isolated_worktree(&c.system(), &dir, &wt_b);
         std::fs::remove_dir_all(&dir).ok();
     }
 

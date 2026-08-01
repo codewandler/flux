@@ -211,7 +211,10 @@ mod tests {
             reg,
             PermissionManager::from_rules(&["observe".into(), "evidence".into()], &[]),
             Arc::new(AllowApprover),
-            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+            ToolContext::new(Arc::new(
+                System::new(Workspace::new(&dir).unwrap())
+                    .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+            )),
         );
 
         // A flow-emitted observation lands in the shared log.
@@ -248,7 +251,10 @@ mod tests {
             reg,
             PermissionManager::from_rules(&["observe".into(), "metrics".into()], &[]),
             Arc::new(AllowApprover),
-            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+            ToolContext::new(Arc::new(
+                System::new(Workspace::new(&dir).unwrap())
+                    .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+            )),
         );
 
         // Two iteration markers a loop would emit.

@@ -587,7 +587,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flux-newest-py-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let ctx = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+        let ctx = ToolContext::new(Arc::new(
+            System::new(Workspace::new(&dir).unwrap())
+                .with_worktree_base(crate::test_worktrees::pinned_worktree_base()),
+        ));
 
         // No `.py` → None, so `python_run` keeps its honest error.
         assert_eq!(newest_py(&ctx).await, None);

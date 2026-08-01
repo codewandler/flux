@@ -184,6 +184,16 @@ Confirmed viable:
   every process needing `/tmp` during the epic's own merge verification. Allocation now defaults
   to `~/.flux/worktrees` with `$FLUX_WORKTREE_DIR` as the override; the temp dir is only a
   last-resort fallback when `$HOME` is unset.
+- **The base is a value the `System` carries, not an ambient read (C-391).** `WorktreeBase` is
+  resolved once — `WorktreeBase::from_process()` for production, `WorktreeBase::pinned(dir)` for a
+  caller that decides for itself — and `System::allocate_worktree_dir` / `remove_worktree_dir`
+  resolve *that* base, so an allocation and its fail-closed cleanup can never disagree about where
+  the parent lives. `rerooted` carries it into the entered worktree for the same reason. The
+  motivation was a defect, not symmetry: with no seam, every test driving `git_worktree_enter` or
+  `fleet.isolate` created real directory trees in the developer's `~/.flux/worktrees`, and a test
+  that died between `enter` and `leave` stranded them — five such trees were found on the machine
+  that filed the story. Pinning by `std::env::set_var` was rejected as the racy anti-pattern the
+  `HarnessEnv`/`DiscoveryEnv` seams exist to remove.
 
 ## Acceptance / done
 
