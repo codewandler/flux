@@ -21,11 +21,12 @@ use serde_json::json;
 #[tokio::test]
 async fn message_stream_emits_a_working_frame_then_a_final_completed_frame() {
     let engine = support::test_engine(Arc::new(support::MultiDeltaProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine,
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        &support::pinned_env(),
     )
     .unwrap();
 

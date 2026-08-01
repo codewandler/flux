@@ -1,15 +1,20 @@
 //! C-41 / C-18: A2A session TTL pruning exercised through the real HTTP surface (not the
-//! `router_with_ttl` white-box seam the crate's own inline tests use — this suite only sees
+//! `router_with_ttl_in` white-box seam the crate's own inline tests use — this suite only sees
 //! `flux_server`'s public API).
 //!
-//! `flux_server::router` resolves the TTL from `[server] a2a_session_ttl_secs` in the layered
+//! `flux_server::router_in` resolves the TTL from `[server] a2a_session_ttl_secs` in the layered
 //! `flux-config` (`crates/flux-config/src/lib.rs`), read from the **process** current directory at
-//! router-build time (`a2a_ttl_from_config` in `crates/flux-server/src/lib.rs`). That is the only
-//! knob reachable from outside the crate (the `A2aTtl`/`router_with_ttl` seam the inline tests use
-//! is `pub(crate)`), so this test drives it the same way the production CLI does: write a project
-//! `.flux/config.toml` and point the process at that directory for the duration of the test. A
-//! process-wide `Mutex` serializes the `set_current_dir` critical section (cwd is global process
-//! state) and an RAII guard restores the original directory even on panic.
+//! router-build time (`a2a_ttl_from_config_in` in `crates/flux-server/src/lib.rs`). That is the
+//! only knob reachable from outside the crate (the `A2aTtl`/`router_with_ttl_in` seam the inline
+//! tests use is private), so this test drives it the same way the production CLI does: write a
+//! project `.flux/config.toml` and point the process at that directory for the duration of the
+//! test. A process-wide `Mutex` serializes the `set_current_dir` critical section (cwd is global
+//! process state) and an RAII guard restores the original directory even on panic.
+//!
+//! The **user** layer of that same merge is `$HOME/.flux/config.toml`, and it is not process state
+//! here: every router below is built against `support::pinned_env()` (an empty `DiscoveryEnv`), so
+//! an operator who sets `a2a_session_ttl_secs` in their own home cannot change the merged TTL these
+//! tests assert against (C-392).
 //!
 //! ## The C-29 queued-session property — not independently reachable here
 //!
@@ -113,18 +118,21 @@ async fn send_and_get_task_id(app: axum::Router, context_id: &str) -> String {
 /// age past the configured TTL is swept away by the *next* `message/send`'s mint-time sweep — the
 /// same lazy-sweep-at-mint mechanism `a2a.rs::create_a2a_session` documents, driven here purely
 /// through `POST /a2a` and the production `[server] a2a_session_ttl_secs` config knob (no access to
-/// the crate's private `A2aTtl`/`router_with_ttl` test seam).
+/// the crate's private `A2aTtl`/`router_with_ttl_in` test seam).
 #[tokio::test]
 async fn expired_a2a_session_is_swept_at_the_next_mint() {
     let project = project_dir_with_ttl(1); // 1s TTL — small enough to cross for real in a test.
     let _cwd = CwdGuard::enter(&project);
 
     let engine = support::test_engine(Arc::new(support::ProseProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine.clone(),
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        // The TTL under test comes from the PROJECT layer written above; pinning an empty home
+        // keeps the operator's `~/.flux/config.toml` out of the merge entirely (C-392).
+        &support::pinned_env(),
     )
     .unwrap();
 
@@ -160,11 +168,14 @@ async fn ttl_zero_disables_pruning_through_http() {
     let _cwd = CwdGuard::enter(&project);
 
     let engine = support::test_engine(Arc::new(support::ProseProvider));
-    let app = flux_server::router(
+    let app = flux_server::router_in(
         engine.clone(),
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
         "127.0.0.1:0".parse().unwrap(),
+        // The TTL under test comes from the PROJECT layer written above; pinning an empty home
+        // keeps the operator's `~/.flux/config.toml` out of the merge entirely (C-392).
+        &support::pinned_env(),
     )
     .unwrap();
 

@@ -39,6 +39,11 @@ use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 use flux_runtime::TurnIdentity;
 
+/// The value-held `HOME` every config read in this crate resolves its **user** layer through
+/// (C-297/C-332), re-exported so a caller of [`router_in`]/[`router_multi_in`] can name the
+/// parameter without depending on `flux-runtime` directly.
+pub use flux_runtime::metadata::DiscoveryEnv;
+
 use resource::{ResourceGovernor, WorkPermit};
 
 type Shared = Arc<FlowEngine>;
@@ -729,11 +734,15 @@ impl ServerLimits {
     /// `FLUX_SERVER_MAX_BODY_BYTES` (positive integer bytes) and `FLUX_SERVER_REQUEST_TIMEOUT_SECS`
     /// (positive integer seconds; `0`/missing/unparseable falls back to the documented default —
     /// `0` is never read as "disable", so the daemon is never accidentally left unbounded).
-    fn from_env() -> Self {
+    ///
+    /// The layered flux config supplies the fallbacks the env knobs do not set, and its **user**
+    /// layer is `<env home>/.flux/config.toml` — hence the explicit [`DiscoveryEnv`] rather than a
+    /// `std::env` read (C-392; the seam is C-332's `load_config_in`).
+    fn from_env_in(env: &DiscoveryEnv) -> Self {
         let d = Self::default();
         let config = std::env::current_dir()
             .ok()
-            .and_then(|cwd| flux_runtime::metadata::load_config(&cwd).ok());
+            .and_then(|cwd| flux_runtime::metadata::load_config_in(&cwd, env).ok());
         let max_body_bytes = std::env::var("FLUX_SERVER_MAX_BODY_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -855,40 +864,81 @@ pub fn router(
     card: CardInfo,
     bind: SocketAddr,
 ) -> anyhow::Result<Router> {
+    router_in(engine, auth, card, bind, &DiscoveryEnv::from_process())
+}
+
+/// [`router`] against an explicit [`DiscoveryEnv`] rather than the process's own (C-392).
+///
+/// Router construction resolves two things from the layered flux config — the A2A session TTL
+/// (`[server] a2a_session_ttl_secs`) and the resource limits (`[server] requests_per_minute`,
+/// `max_inflight_per_principal`, …) — and that config's **user** layer is
+/// `<env home>/.flux/config.toml`. Without this seam every test that builds a router inherits
+/// whatever the operator happens to keep in their own `~/.flux/config.toml`, so the verdict is a
+/// function of the machine rather than of the fixture, and the resulting failure looks exactly like
+/// a real regression in whatever diff is in flight. Tests pass [`DiscoveryEnv::empty`]; production
+/// goes through [`router`], which passes [`DiscoveryEnv::from_process`].
+///
+/// This is the same seam, and the same idiom, as `flux_runtime::metadata::load_config_in` (C-332)
+/// and `DiscoveryEnv` itself (C-297) — a value-held env, not a third injection style.
+///
+/// It refuses [`ServerAuth::Open`] on a non-loopback `bind` identically to [`router`]: the guard
+/// runs here, and [`router`] reaches it by delegation, so there is exactly one enforcement point
+/// and the safety invariant cannot be threaded around by picking the other entry point.
+pub fn router_in(
+    engine: Arc<FlowEngine>,
+    auth: ServerAuth,
+    card: CardInfo,
+    bind: SocketAddr,
+    env: &DiscoveryEnv,
+) -> anyhow::Result<Router> {
     guard_open_bind(&auth, bind)?;
-    Ok(router_with_ttl(engine, auth, card, a2a_ttl_from_config()))
+    Ok(router_with_ttl_in(
+        engine,
+        auth,
+        card,
+        a2a_ttl_from_config_in(env),
+        env,
+    ))
 }
 
 /// Resolve the A2A session TTL from the layered flux config (`[server] a2a_session_ttl_secs`,
-/// project over user, default 1h, `0` = never prune). Resolved here — at router build — so every
+/// project over user, default 1h, `0` = never prune). Resolved at router build — so every
 /// mount of the router (the standalone server and the `a2a` channel) gets the same retention
 /// behavior without each caller plumbing the knob. A malformed config file falls back to the
 /// default with a warning rather than failing the surface (the CLI already fails loudly on it).
-fn a2a_ttl_from_config() -> A2aTtl {
+///
+/// The user layer is `<env home>/.flux/config.toml`, which is why this takes a [`DiscoveryEnv`]
+/// (C-392) rather than reading process `HOME` through `load_config`.
+fn a2a_ttl_from_config_in(env: &DiscoveryEnv) -> A2aTtl {
     let ttl = std::env::current_dir()
         .ok()
-        .and_then(|cwd| match flux_runtime::metadata::load_config(&cwd) {
-            Ok(cfg) => Some(cfg.a2a_session_ttl_secs()),
-            Err(e) => {
-                eprintln!("(ignoring malformed flux config for the A2A session TTL: {e})");
-                None
-            }
-        })
+        .and_then(
+            |cwd| match flux_runtime::metadata::load_config_in(&cwd, env) {
+                Ok(cfg) => Some(cfg.a2a_session_ttl_secs()),
+                Err(e) => {
+                    eprintln!("(ignoring malformed flux config for the A2A session TTL: {e})");
+                    None
+                }
+            },
+        )
         .unwrap_or(flux_config::DEFAULT_A2A_SESSION_TTL_SECS);
     A2aTtl(ttl)
 }
 
-/// [`router`] with an explicit A2A session TTL (tests inject one; production resolves from config).
-fn router_with_ttl(
+/// [`router_in`] with an explicit A2A session TTL (tests inject one; production resolves from
+/// config). `env` still reaches [`ServerLimits::from_env_in`], so a TTL-injecting test is not
+/// silently left reading the operator's home for its *limits*.
+fn router_with_ttl_in(
     engine: Arc<FlowEngine>,
     auth: ServerAuth,
     card: CardInfo,
     a2a_ttl: A2aTtl,
+    env: &DiscoveryEnv,
 ) -> Router {
-    router_with_ttl_and_limits(engine, auth, card, a2a_ttl, ServerLimits::from_env())
+    router_with_ttl_and_limits(engine, auth, card, a2a_ttl, ServerLimits::from_env_in(env))
 }
 
-/// [`router_with_ttl`] with explicit resource limits (C-189). Tests inject tiny limits to exercise
+/// [`router_with_ttl_in`] with explicit resource limits (C-189). Tests inject tiny limits to exercise
 /// the `413`/`408` paths; production reads them from the environment once at build time.
 fn router_with_ttl_and_limits(
     engine: Arc<FlowEngine>,
@@ -1124,19 +1174,37 @@ pub fn router_multi(
     auth: ServerAuth,
     bind: SocketAddr,
 ) -> anyhow::Result<Router> {
-    guard_open_bind(&auth, bind)?;
-    Ok(router_multi_with_ttl(resolver, auth, a2a_ttl_from_config()))
+    router_multi_in(resolver, auth, bind, &DiscoveryEnv::from_process())
 }
 
-fn router_multi_with_ttl(
+/// [`router_multi`] against an explicit [`DiscoveryEnv`] rather than the process's own — the same
+/// seam, and for the same reason, as [`router_in`] (C-392). It refuses an [`ServerAuth::Open`]
+/// non-loopback bind identically, and [`router_multi`] reaches that refusal by delegating here.
+pub fn router_multi_in(
+    resolver: Arc<dyn AgentResolver>,
+    auth: ServerAuth,
+    bind: SocketAddr,
+    env: &DiscoveryEnv,
+) -> anyhow::Result<Router> {
+    guard_open_bind(&auth, bind)?;
+    Ok(router_multi_with_ttl_in(
+        resolver,
+        auth,
+        a2a_ttl_from_config_in(env),
+        env,
+    ))
+}
+
+fn router_multi_with_ttl_in(
     resolver: Arc<dyn AgentResolver>,
     auth: ServerAuth,
     a2a_ttl: A2aTtl,
+    env: &DiscoveryEnv,
 ) -> Router {
-    router_multi_with_ttl_and_limits(resolver, auth, a2a_ttl, ServerLimits::from_env())
+    router_multi_with_ttl_and_limits(resolver, auth, a2a_ttl, ServerLimits::from_env_in(env))
 }
 
-/// [`router_multi_with_ttl`] with explicit resource limits (C-189).
+/// [`router_multi_with_ttl_in`] with explicit resource limits (C-189).
 fn router_multi_with_ttl_and_limits(
     resolver: Arc<dyn AgentResolver>,
     auth: ServerAuth,
@@ -1995,11 +2063,12 @@ mod tests {
             .end_turn(&sid, turn_id, "accepted", 1, "done", None)
             .unwrap();
 
-        let app = router(
+        let app = router_in(
             engine,
             ServerAuth::Open,
             CardInfo::flux_coding(),
             "127.0.0.1:0".parse().unwrap(),
+            &DiscoveryEnv::empty(),
         )
         .unwrap();
         let (status, body) = get_json(app.clone(), &format!("/sessions/{sid}/usage")).await;
@@ -2068,11 +2137,12 @@ mod tests {
 
         // Mint the A2A session through the REAL handler (message/send), proving creation-time
         // tagging on the production path.
-        let app = router_with_ttl(
+        let app = router_with_ttl_in(
             engine,
             ServerAuth::Open,
             CardInfo::flux_coding(),
             A2aTtl(60),
+            &DiscoveryEnv::empty(),
         );
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "message/send",
@@ -2426,7 +2496,7 @@ mod tests {
     /// a stuck request. Even with a 50 ms timeout and a provider that sleeps 500 ms, the stream is
     /// established (`200`) rather than severed with `408`: the handler returns its `Sse` response
     /// promptly and the turn streams behind it. (This confirms the exemption's intent; the layer
-    /// would not fire on this fast-returning handler even if applied — see [`router_with_ttl`].)
+    /// would not fire on this fast-returning handler even if applied — see [`router_with_ttl_in`].)
     #[tokio::test]
     async fn sse_stream_route_is_exempt_from_the_request_timeout() {
         let (engine, events) = test_engine(Arc::new(SlowProvider {
@@ -2852,11 +2922,12 @@ mod tests {
         let (engine, _events) = usage_test_engine();
 
         // Unauthenticated + non-loopback: refused when the router is built.
-        let refused = router(
+        let refused = router_in(
             engine.clone(),
             ServerAuth::Open,
             CardInfo::flux_coding(),
             "0.0.0.0:8080".parse().unwrap(),
+            &DiscoveryEnv::empty(),
         );
         assert!(
             refused.is_err(),
@@ -2866,11 +2937,12 @@ mod tests {
         // Authenticated + non-loopback is fine — the refusal is specifically the UNAUTHENTICATED
         // case (a shared secret makes a routable bind safe).
         assert!(
-            router(
+            router_in(
                 engine.clone(),
                 ServerAuth::from_token(Some("s3cr3t".to_string())),
                 CardInfo::flux_coding(),
                 "0.0.0.0:8080".parse().unwrap(),
+                &DiscoveryEnv::empty(),
             )
             .is_ok(),
             "an authenticated non-loopback router still builds"
@@ -2878,11 +2950,12 @@ mod tests {
 
         // Open + loopback is the dev path — it builds, and (being open) serves a protected route
         // without a token, which is exactly why the non-loopback refusal above matters.
-        let app = router(
+        let app = router_in(
             engine,
             ServerAuth::Open,
             CardInfo::flux_coding(),
             "127.0.0.1:0".parse().unwrap(),
+            &DiscoveryEnv::empty(),
         )
         .expect("an open loopback router builds");
         let res = app

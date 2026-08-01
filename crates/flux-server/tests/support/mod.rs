@@ -146,18 +146,31 @@ pub fn test_engine(provider: Arc<dyn flux_provider::Provider>) -> Arc<FlowEngine
     Arc::new(engine)
 }
 
-/// Build the real production router (`flux_server::router`) over a fresh prose-completing engine —
-/// the default fixture most tests need. Callers who need a different provider or an explicit TTL
-/// build the engine/router directly with [`test_engine`] and `flux_server::router`.
+/// The [`flux_server::DiscoveryEnv`] every router in this suite is built against: **no home at
+/// all**, so the router's config read (the A2A session TTL and the C-189 resource limits) consults
+/// the managed and project layers only and never the operator's `~/.flux/config.toml` (C-392).
+///
+/// Without this pin an operator who sets `[server] requests_per_minute` or `a2a_session_ttl_secs`
+/// in their own home changes what this suite asserts against — a verdict that depends on the
+/// machine rather than the fixture, whose failure looks exactly like a real regression.
+pub fn pinned_env() -> flux_server::DiscoveryEnv {
+    flux_server::DiscoveryEnv::empty()
+}
+
+/// Build the real production router (`flux_server::router_in`) over a fresh prose-completing engine
+/// — the default fixture most tests need. Callers who need a different provider or an explicit TTL
+/// build the engine/router directly with [`test_engine`] and `flux_server::router_in`, passing
+/// [`pinned_env`].
 pub fn app(token: Option<String>) -> Router {
     let engine = test_engine(Arc::new(ProseProvider));
-    flux_server::router(
+    flux_server::router_in(
         engine,
         flux_server::ServerAuth::from_token(token),
         flux_server::CardInfo::flux_coding(),
         // A loopback bind so the C-190 construction-time refusal admits the fixture (unauthenticated
         // fixtures use `token = None` → `ServerAuth::Open`, which is loopback-only by construction).
         "127.0.0.1:0".parse().unwrap(),
+        &pinned_env(),
     )
     .expect("loopback router builds")
 }
