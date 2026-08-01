@@ -1221,6 +1221,13 @@ impl Engine {
             .with_session(&session_id);
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
+        // L-123: the journey's own body gets the static gate too, not just its composite ops — a
+        // journey is an operator-authored flow this engine did not produce, so it sits on the
+        // analyzed side of the line (`docs/designs/flux-lang-hardening.md`). Run it here rather
+        // than at parse time and it checks what will ACTUALLY execute: after `rewrite_asks`'s
+        // ask/await lowering, against the executor's own (capability-narrowed) catalog, with the
+        // seeded payload symbols counted as bound.
+        analyze_journey(&executor, &self.program.ops, &store, &session_id, &ast)?;
 
         // Where the asked channel is read from if this run parks: the expects-reply sends recorded
         // from here on belong to this segment.
@@ -1418,6 +1425,14 @@ impl Engine {
             .with_session(&session_id);
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
+        // L-123: no `analyze_journey` here, and that is deliberate rather than an omission. `body`
+        // is not fresh input — it is the suspension latch's own persisted copy of the journey body
+        // `run_journey` already gated on the way in, resumed mid-flow at `node`. Re-analyzing it
+        // would re-check identical bytes, and would do it against a *partial* symbol picture (the
+        // pre-park prefix's binds live in `store`, so a definedness pass here is strictly weaker
+        // than the one that already ran). The gap it leaves is narrow and named: a suspension
+        // persisted by a build older than the gate resumes ungated — backstopped, as every path
+        // here is, by `Executor::dispatch` and L-116's per-execution loop budget.
 
         let sent_before = self.bus.sent().len();
         let input = FluxValue::String(reply);
@@ -1980,6 +1995,52 @@ fn join_diags(diags: &[flux_lang::analyze::Diagnostic]) -> String {
         .map(|d| d.message.clone())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// L-123 — the static gate for a journey body, the flux-app half of the invariant recorded in
+/// `docs/designs/flux-lang-hardening.md`: **a flow body this engine did not produce is analyzed
+/// before it executes.** A journey is authored Flux-Lang loaded from the app's program file, so it
+/// is on the analyzed side, exactly like the agent loop's AST and the model's lowered `flow_run`.
+///
+/// Both inputs are deliberately the *executing* ones, not their authored counterparts, so the check
+/// cannot pass on a flow that differs from the one that runs: the catalog is `executor`'s own
+/// registry (already narrowed to this journey's capabilities) plus the program's composite ops —
+/// the pair `execute_flow_with_composites` resolves against — and `ast` is post-`rewrite_asks`, so
+/// the ask/await lowering is what gets checked.
+///
+/// **Symbol definedness is deliberately excluded, and it is the one check that is.** A journey's
+/// symbol environment is *payload-shaped*: [`seed_payload`] binds `$input` plus one symbol per
+/// top-level field of whichever event happened to arrive, so whether `$delivery` is bound is a fact
+/// about this delivery, not about the program. A journey may legitimately read a field only some
+/// events carry. `analyze_flow`'s definedness rule is explicitly built for **zero false positives**
+/// (L-15/F5); honouring that principle in a dynamic environment means treating every referenced
+/// symbol as potentially payload-supplied. Hence the prebound set below is the session's real
+/// symbols *union everything the body reads* — which neutralises exactly that one check.
+///
+/// Everything statically decidable stays enforced: op resolution, call arity, declared-name
+/// validity, expression-position legality, loop bounds, `parallel` bind disjointness, and
+/// `await`/`checkpoint`/`cap_scope` placement. An unbound `$var` remains a precise runtime error at
+/// the statement that reads it, exactly as before.
+///
+/// This is a static-contract check, not an authorization boundary — every op still dispatches
+/// through `Executor::dispatch`.
+fn analyze_journey(
+    executor: &flux_runtime::Executor,
+    composites: &[flux_lang::program::CompositeOpDecl],
+    store: &FlowStore,
+    session_id: &str,
+    ast: &flux_lang::ast::DraftAst,
+) -> Result<()> {
+    let catalog =
+        flux_flow::registry::OpRegistry::new(executor.registry()).with_composites(composites);
+    let mut prebound = store.bound_symbol_names(session_id).map_err(other)?;
+    flux_lang::analyze::for_each_node(&ast.body, &mut |node| {
+        if let flux_lang::ast::Node::Var { name } = node {
+            prebound.insert(name.0.clone());
+        }
+    });
+    flux_lang::analyze::analyze_flow(ast, &catalog, &prebound)
+        .map_err(|d| Error::Other(format!("journey failed validation: {}", join_diags(&d))))
 }
 
 /// Seed an event's payload into the journey's session so the flow can read it: the whole payload binds

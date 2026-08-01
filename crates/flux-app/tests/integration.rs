@@ -381,6 +381,14 @@ async fn unmatched_event_runs_nothing() {
 
 /// The event payload is seeded into the journey's session: a top-level field binds to its own symbol,
 /// so `fmt("...{text}...")` and `$reply` resolve.
+///
+/// L-123: `send` is written in the canonical named-object form. It used to read
+/// `send("cli", $reply)` — the **deprecated** 2+-positional form that `map_args_to_input` keeps
+/// alive only "so a legacy stored plan still executes" (`flux-lang/src/runtime.rs`), and that
+/// `analyze_flow` has always rejected for new plans. It survived here purely because the journey
+/// path was the one authored-flow door with no analyzer pass; `flux flow run` rejects the same
+/// line today via `lower` (`flux-cli/src/flow_cmd.rs`). Both shipped journey examples
+/// (`crates/flux-app/examples/hello.flux`, `examples/channels-app.flux`) already use this form.
 const ECHO: &str = "\
 channel cli
 
@@ -391,7 +399,7 @@ trigger t
 journey echo
   flow
     $reply = fmt(\"you said: {text}\")
-    send(\"cli\", $reply)
+    send({ \"channel\": \"cli\", \"message\": $reply })
     return $reply
 ";
 
@@ -413,7 +421,46 @@ async fn user_input_payload_is_seeded_and_echoed() {
     assert_eq!(sent.len(), 1);
     assert_eq!(
         sent[0].message, "you said: ping",
-        "send received the $reply var, positionally mapped"
+        "send received the $reply var under its named `message` parameter"
+    );
+}
+
+/// A journey whose body names an operation no catalog entry resolves.
+const UNKNOWN_OP: &str = "\
+channel cli
+
+trigger t
+  on \"startup\"
+  run bad
+
+journey bad
+  flow
+    send({ \"channel\": \"cli\", \"message\": \"before\" })
+    no_such_op()
+    return \"done\"
+";
+
+/// L-123: a journey body is authored Flux-Lang this engine did not produce, so it gets the same
+/// static gate `flux flow run` and `fork --edit` do. Before the gate a journey ran ungated: the
+/// statements ahead of the bad one dispatched their side effects, and only then did the interpreter
+/// halt on the unresolvable op.
+#[tokio::test]
+async fn a_journey_naming_an_unregistered_op_is_refused_before_anything_runs() {
+    let app = App::new(program(UNKNOWN_OP), None, "test-model");
+
+    let err = app
+        .deliver("startup", json!({}))
+        .await
+        .expect_err("a journey naming an unregistered op must be refused, not executed");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no_such_op"),
+        "the refusal names the offending op: {msg}"
+    );
+    assert!(
+        app.bus().sent().is_empty(),
+        "the refusal lands BEFORE the first statement — the preceding `send` never dispatched"
     );
 }
 

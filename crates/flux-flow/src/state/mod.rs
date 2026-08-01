@@ -30,6 +30,7 @@ pub mod port;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
+use std::collections::HashSet;
 // Only the SQLite-backed constructor takes a filesystem path — see `FlowStore::open`.
 #[cfg(feature = "sqlite")]
 use std::path::Path;
@@ -520,6 +521,21 @@ impl FlowStore {
             })
             .collect();
         Ok(SessionView { symbols })
+    }
+
+    /// Every symbol name bound in a session, **regardless of visibility** — the
+    /// `session_symbols` set [`flux_lang::analyze::analyze_flow`] wants when a flow is analyzed
+    /// against a store that is already populated (L-123: the fork session's replayed prefix, a
+    /// journey's seeded payload). Distinct from [`view`](Self::view) on purpose: `view` is the
+    /// *model-facing* projection and drops hidden symbols, and a definedness check that dropped
+    /// them would report a demonstrably bound `$name` as unbound.
+    pub fn bound_symbol_names(&self, session_id: &str) -> Result<HashSet<String>> {
+        Ok(self
+            .backend
+            .symbols(session_id)?
+            .into_iter()
+            .map(|s| s.name.0)
+            .collect())
     }
 }
 
