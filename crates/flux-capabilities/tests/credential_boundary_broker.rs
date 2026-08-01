@@ -39,7 +39,7 @@ const SESSION_BEARER: &str = "connectors-session-bearer-0a1b2c3d4e5f";
 /// The product the fixture declares in its manifest `discovers`.
 const PRODUCT: &str = "zendesk";
 
-/// The `platform_plugin` fixture binary.
+/// The `platform_plugin` fixture binary, built on demand when the current run has not produced it.
 ///
 /// `CARGO_BIN_EXE_*` is set only for the package that declares the bin, and `platform_plugin`
 /// belongs to `flux-plugin` — so derive the path from this test binary instead: an integration test
@@ -47,22 +47,95 @@ const PRODUCT: &str = "zendesk";
 /// Deriving it rather than hard-coding `target/debug` is what makes this follow a custom
 /// `CARGO_TARGET_DIR`, and a stale binary from *another* checkout's target dir is exactly the trap
 /// a hard-coded path walks into.
+///
+/// Deriving the path does not make the fixture *exist*. `cargo test --workspace` compiles every
+/// member's binaries before it runs any test binary, so the fixture is simply there; but CI's
+/// Postgres job runs this package on its own (`cargo test -p codewandler-flux-events -p
+/// codewandler-flux-capabilities --features postgres`), and a `-p` run does not build another
+/// package's binaries. That left the fixture absent and all five tests below red.
+///
+/// So build it here rather than skip. **Skipping is not an option worth having**: these assert that
+/// a vendor credential is refused at the broker, and a security test that quietly no-ops when its
+/// fixture is missing is worse than no test at all. A build that fails is still a loud failure.
+///
+/// The build is deliberately conditional on the binary being absent. When cargo built the fixture
+/// for this run it is cargo, not this function, that decides freshness; re-running a nested `cargo
+/// build -p codewandler-flux-plugin` under `cargo test --workspace` would resolve features over
+/// just the `flux-plugin` subtree rather than the whole workspace, and the two resolutions would
+/// rebuild over each other on every dev-loop test run.
 fn platform_plugin_bin() -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("this test binary has a path");
-    let profile = exe
+    /// Built at most once per test process — the five tests below run on parallel threads.
+    static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let exe = std::env::current_exe().expect("this test binary has a path");
+        let profile_dir = exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("a test binary lives at <target>/<profile>/deps/<name>");
+        let bin = profile_dir.join(format!("platform_plugin{}", std::env::consts::EXE_SUFFIX));
+        if !bin.exists() {
+            build_platform_plugin(profile_dir, &bin);
+        }
+        bin
+    })
+    .clone()
+}
+
+/// Build the `platform_plugin` fixture into `profile_dir`, or panic saying why it could not be.
+///
+/// `--target-dir` is pinned to the directory the fixture path was derived from, so the build cannot
+/// land somewhere other than where the caller looks; `--profile` is recovered from that same path
+/// (cargo's `dev` profile writes to a directory named `debug`, every other profile writes to a
+/// directory carrying its own name). `CARGO` is the cargo that launched this test — falling back to
+/// `PATH` keeps a directly-executed test binary working. The cwd is pinned to this package's
+/// manifest directory so workspace discovery does not depend on where the binary was invoked from.
+fn build_platform_plugin(profile_dir: &std::path::Path, bin: &std::path::Path) {
+    let target_dir = profile_dir
         .parent()
-        .and_then(std::path::Path::parent)
-        .expect("a test binary lives at <target>/<profile>/deps/<name>");
-    let bin = profile.join(format!("platform_plugin{}", std::env::consts::EXE_SUFFIX));
+        .expect("a profile directory lives under the target directory");
+    let profile = match profile_dir.file_name().and_then(std::ffi::OsStr::to_str) {
+        Some("debug") => "dev",
+        Some(name) => name,
+        None => panic!(
+            "the profile directory {} has no name to recover a cargo profile from",
+            profile_dir.display()
+        ),
+    };
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    let output = std::process::Command::new(&cargo)
+        .args([
+            "build",
+            "-p",
+            "codewandler-flux-plugin",
+            "--bin",
+            "platform_plugin",
+            "--profile",
+            profile,
+        ])
+        .arg("--target-dir")
+        .arg(target_dir)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "could not run `{cargo} build -p codewandler-flux-plugin --bin platform_plugin` to \
+                 produce the fixture these credential-boundary tests drive: {err}"
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "building the `platform_plugin` fixture failed ({}):\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         bin.exists(),
-        "the `platform_plugin` fixture is missing at {}. It is a binary of the `flux-plugin` \
-         package, so run this test as part of `cargo test --workspace` (or `cargo build -p \
-         codewandler-flux-plugin` first) — a `-p codewandler-flux-capabilities` run does not build \
-         another package's binaries.",
+        "`cargo build -p codewandler-flux-plugin --bin platform_plugin --profile {profile}` \
+         reported success but left no fixture at {}",
         bin.display()
     );
-    bin
 }
 
 /// A temp dir that removes itself on drop, so a failing assertion cannot leak it.
