@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-01
+
 ### Improved
 
 - **The public website now matches the product that ships** (C-343). Runtime explanations now use

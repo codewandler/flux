@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-01
+
 ### Improved
 
 - **The documentation is more accurate and easier to navigate.** The website now explains the
