@@ -67,9 +67,9 @@ fn truncate_chars(s: &str, cap: usize) -> (String, bool) {
 /// directly misses registered values whose spelling changes under JSON escaping (quotes,
 /// backslashes, and newlines), which would make `input_view` a recoverable durable secret leak.
 ///
-/// The scrub itself is [`crate::engine::redact_json_in_place`] — the same total walker the evidence
-/// flush uses, so no node kind is exempt here either (C-323): a registered all-digit credential
-/// arriving as a JSON *number*, or a credential used as an object *key*, is caught.
+/// The scrub itself is [`flux_core::redact_json_total`] — the tree's one total walk, the same the
+/// evidence flush uses, so no node kind is exempt here either (C-323): a registered all-digit
+/// credential arriving as a JSON *number*, or a credential used as an object *key*, is caught.
 ///
 /// **How the rewrite is applied, and why there are two paths.** Patching the original text — which
 /// is what this did before C-323 — preserves the caller's field order and whitespace, and that
@@ -83,23 +83,27 @@ fn truncate_chars(s: &str, cap: usize) -> (String, bool) {
 /// from the scrubbed value instead. Re-encoding is structurally safe by construction; it costs the
 /// caller's key order, and only for a payload that actually carried a credential in one of those
 /// positions. An input that needed no redaction at all is returned verbatim.
+///
+/// Both paths survive C-338's consolidation; what changed is that the *choice* between them is now
+/// the scrub's own [`flux_core::JsonRedaction`] report rather than a second traversal re-deciding
+/// which nodes were rewritten. Two walks meant two chances to narrow, and the two could disagree
+/// about which nodes a redaction had touched — the disagreement that leaves an unparseable view.
 fn redacted_input_view(redactor: &Redactor, input_json: &str) -> (String, bool) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(input_json) else {
+    let Ok(mut scrubbed) = serde_json::from_str::<serde_json::Value>(input_json) else {
         let redacted = redactor.redact(input_json);
         let changed = redacted != input_json;
         return (redacted, changed);
     };
-    let mut scrubbed = value.clone();
-    crate::engine::redact_json_in_place(redactor, &mut scrubbed);
-    if scrubbed == value {
+    let report = flux_core::redact_json_total(&mut scrubbed, &|text| redactor.redact(text));
+    if !report.changed() {
         return (input_json.to_string(), false);
     }
 
     // Replace complete encoded string tokens in the original serialization, preserving field order
-    // and whitespace — but only when `string_leaf_replacements` confirms every redaction this tree
-    // needs is a string leaf.
-    let mut replacements = Vec::new();
-    if string_leaf_replacements(redactor, &value, &mut replacements) {
+    // and whitespace — available exactly when the scrub reports that every redaction it made landed
+    // on a string leaf.
+    if !report.needs_reencode {
+        let mut replacements = report.string_leaf_replacements;
         replacements.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
         replacements.dedup();
         let mut rendered = input_json.to_string();
@@ -113,48 +117,6 @@ fn redacted_input_view(redactor: &Redactor, input_json: &str) -> (String, bool) 
         // Unreachable for a tree that just came out of `from_str`, but a view is never worth a
         // panic — fall back to the whole-text scrub, which is strictly safer than the input.
         Err(_) => (redactor.redact(input_json), true),
-    }
-}
-
-/// Collect the encoded string tokens to rewrite, and report whether textual substitution is
-/// **sufficient** for this tree.
-///
-/// Returns `false` — and leaves `replacements` unusable — as soon as a redaction is needed that
-/// textual substitution cannot express safely: an object *key* (rewriting it in the text would have
-/// to move the value with it) or a non-string scalar (no self-delimiting token to replace). The
-/// caller re-encodes the scrubbed tree in that case.
-fn string_leaf_replacements(
-    redactor: &Redactor,
-    value: &serde_json::Value,
-    replacements: &mut Vec<(String, String)>,
-) -> bool {
-    match value {
-        serde_json::Value::String(text) => {
-            let redacted = redactor.redact(text);
-            if redacted == *text {
-                return true;
-            }
-            match (
-                serde_json::to_string(text),
-                serde_json::to_string(&redacted),
-            ) {
-                (Ok(raw), Ok(redacted)) => {
-                    replacements.push((raw, redacted));
-                    true
-                }
-                _ => false,
-            }
-        }
-        serde_json::Value::Array(items) => items
-            .iter()
-            .all(|item| string_leaf_replacements(redactor, item, replacements)),
-        serde_json::Value::Object(fields) => fields.iter().all(|(key, value)| {
-            redactor.redact(key) == *key && string_leaf_replacements(redactor, value, replacements)
-        }),
-        scalar => {
-            let literal = scalar.to_string();
-            redactor.redact(&literal) == literal
-        }
     }
 }
 

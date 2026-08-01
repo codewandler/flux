@@ -14,6 +14,7 @@ pub mod humanize;
 mod message;
 pub mod pricing;
 pub mod readiness;
+mod redaction;
 mod stream;
 mod timing;
 mod urlencode;
@@ -31,6 +32,7 @@ pub use pricing::{
     canonical_model_parts, canonical_model_spec, is_metered_cloud_spec, is_subscription,
     resolve_role_model, CostSource, Money, PricingTable, RateOverride, Rates,
 };
+pub use redaction::{redact_json_total, JsonRedaction};
 pub use stream::{CacheEfficiency, Chunk, StopReason, Usage};
 pub use timing::OperationTiming;
 pub use urlencode::percent_encode_component;
