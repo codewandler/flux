@@ -67,6 +67,42 @@ such subcommand (verified against `fluxlang --help` at 0.45.0).
 - Nothing here touches `cst_decode`'s `semantic_line` sites, so **L-122's scope is not absorbed**:
   the pass reads CST node kinds and direct-child tokens, never reconstructed text.
 
+### Rework after review
+
+Review found two false negatives. Both are the dangerous shape — `--check` calling a legacy file
+canonical, so L-104 skips it and L-107's grammar removal then breaks it.
+
+- **The rule set is now derived from the decoder (`cst_decode.rs`), not from the corpus.** That was
+  the root cause: I had probed for legacy spellings by guessing them, and `throttle`/`debounce`
+  legacy forms occur in **no shipped file**, so neither the guesses nor the corpus test could see
+  them. Added: `throttle "f" 5 per 60000` → `throttle "f", max: 5, per: 1m`, `debounce "api" 500` →
+  `debounce "api", wait: 500ms`.
+- **`do fmt` / `do parse` / `do peek` are canonical, not legacy** — `format` emits the `do` form for
+  them unchanged. Desugaring one produced a different node, tripped the equivalence guard, and since
+  the guard rejects per *file*, one such line made a whole file un-migratable. `desugar_do_call` now
+  consults `ast::is_reserved_word`, and their arguments keep the sigil `fmt_legacy_call_args` gives
+  them.
+- Two more false negatives found while re-deriving from the decoder: **duration *unit*
+  normalization** (`timeout 5000ms` → `5s`, `60s` → `1m`, `5_000` → `5s`; previously only a *missing*
+  suffix was supplied) and **bare tool names** (`with_tools [read_file]` →
+  `with_tools ["read_file"]`, since `parse_setting_prefix` takes an identifier as a string).
+- **A comment directly above a body-line `until` is no longer re-anchored.** Hoisting the clause out
+  from under it silently re-aimed the comment at the next statement; the comment multiset is
+  order-insensitive so the guard could never see it. That shape is now declined, and the test asserts
+  on the *text* rather than the multiset.
+- `apply`'s edit ordering was wrong for a zero-width insertion sharing a start with a replacement
+  (the insertion was dropped as "contained"). Insertions now sort first and coverage tracks the
+  furthest end reached.
+- `fmt` no longer abandons a batch at the first bad file — each is reported and the run continues.
+
+**Out of scope, recorded rather than fixed:** `format_cst`'s layout pass re-indents a module-level
+comment that follows the last declaration into that flow's body (col 0 → col 2), on input with no
+legacy spelling at all. It is a pre-existing defect in the seam this story deliberately leaves
+untouched, and the LSP's format-document has it too. `fmt` is simply the first thing to apply it to
+files on disk — so it should be fixed before L-104 rewrites the corpus. Related: `format` renders a
+string list compactly (`["a","b"]`) where `format_cst` puts a space after the comma, so `with_tools`
+output is canonical in *spelling* but not a byte-level `format` fixed point.
+
 ## Notes
 
 - Suggested implementation: wrap `format_cst::format_source` (already proof-carrying — it refuses

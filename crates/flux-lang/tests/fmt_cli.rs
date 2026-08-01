@@ -140,6 +140,31 @@ fn fmt_check_exits_zero_on_canonical_input_and_non_zero_otherwise() {
 }
 
 #[test]
+fn fmt_reports_a_bad_file_without_abandoning_the_rest_of_the_batch() {
+    // `fmt` is meant to be pointed at a whole tree. Stopping at the first bad file hides every file
+    // behind it, so the operator fixes one thing, re-runs, and meets the next one.
+    let dir = std::env::temp_dir().join(format!("fluxlang-fmt-batch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let broken = dir.join("a-broken.flux");
+    let legacy = dir.join("b-legacy.flux");
+    std::fs::write(&broken, "flow x\n  confirm \"y\n").expect("write broken fixture");
+    std::fs::write(&legacy, MIXED_DIALECT).expect("write legacy fixture");
+
+    let (code, _, stderr) = fluxlang(
+        &["fmt", broken.to_str().unwrap(), legacy.to_str().unwrap()],
+        "",
+    );
+    assert_ne!(code, 0, "a file that cannot be formatted fails the run");
+    assert!(stderr.contains("parse error"), "it says why: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&legacy).expect("read back"),
+        CANONICAL,
+        "the file after the broken one was still formatted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fmt_refuses_source_it_cannot_parse() {
     // Lexically malformed on purpose (an unterminated string): a fixture that is merely "a spelling
     // the parser rejects today" is one the next syntax story silently makes valid.

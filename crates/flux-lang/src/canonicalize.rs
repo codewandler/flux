@@ -26,10 +26,18 @@
 //! | `retry 3 backoff exponential delay 500` | `retry 3, backoff: exponential, delay: 500ms` |
 //! | `loop for 5000 every 1000` | `loop for 5s, every: 1s` |
 //! | `confirm "ok?" risk high` | `confirm "ok?", risk: high` |
-//! | `timeout 30000` / `race 5000` | `timeout 30s` / `race 5s` |
+//! | `throttle "f" 5 per 60000` | `throttle "f", max: 5, per: 1m` |
+//! | `debounce "api" 500` | `debounce "api", wait: 500ms` |
+//! | `timeout 30000` / `timeout 5000ms` / `timeout 60s` | `timeout 30s` / `timeout 5s` / `timeout 1m` |
 //! | `race timeout: 5s` | `race 5s` |
+//! | `with_tools [read_file]` | `with_tools ["read_file"]` |
 //! | `repeat 10` + a body line `until $done` | `repeat 10, until: done` |
 //! | `await $b = "src" when $c` | `await b = "src", when: c` |
+//!
+//! The table was built from the **decoder** (`cst_decode.rs`), not from the corpus. `throttle` and
+//! `debounce` have legacy spellings that appear in no shipped file, so a corpus-driven rule set
+//! misses them silently — and a formatter's false negative (reporting a legacy file as canonical)
+//! is worse than a rejection, because the migration then skips it.
 //!
 //! # The guard
 //! The rewrite is a *spelling* change and nothing else, so the output is held to the same
@@ -124,14 +132,28 @@ type Edit = (std::ops::Range<usize>, String);
 /// Apply `edits` to `src`. Edits are applied back-to-front so earlier ranges stay valid, and any
 /// edit nested inside a wider one is dropped — the `until` hoist deletes a whole line that the sigil
 /// rule may also have wanted to touch, and the hoist has already rewritten the text it carried up.
+///
+/// Ordering matters in two ways. A **zero-width insertion** sorts before a replacement starting at
+/// the same offset, because the two do not conflict and both are wanted: `debounce "api" 500` needs
+/// `, wait: ` inserted at the number *and* the number itself respelled as `500ms`. Among genuine
+/// replacements the widest sorts first, so the containment test drops the nested one rather than the
+/// container. Coverage is tracked as the furthest end reached, not merely the previous edit's, so a
+/// zero-width insertion cannot mask the replacement in front of it.
 fn apply(src: &str, mut edits: Vec<Edit>) -> String {
-    edits.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(b.0.end.cmp(&a.0.end)));
+    edits.sort_by(|a, b| {
+        a.0.start
+            .cmp(&b.0.start)
+            .then_with(|| a.0.is_empty().cmp(&b.0.is_empty()).reverse())
+            .then_with(|| b.0.end.cmp(&a.0.end))
+    });
     let mut kept: Vec<Edit> = Vec::with_capacity(edits.len());
+    let mut covered = 0usize;
     for edit in edits {
-        match kept.last() {
-            Some(prev) if edit.0.start < prev.0.end => continue,
-            _ => kept.push(edit),
+        if edit.0.start < covered {
+            continue;
         }
+        covered = covered.max(edit.0.end);
+        kept.push(edit);
     }
     let mut out = src.to_string();
     for (range, text) in kept.into_iter().rev() {
@@ -153,9 +175,17 @@ fn collect_edits(root: &SyntaxNode, src: &str) -> Vec<Edit> {
             SyntaxKind::RETRY_STMT => name_header_options(&node, &["backoff", "delay"], &mut edits),
             SyntaxKind::LOOP_STMT => name_header_options(&node, &["every", "until"], &mut edits),
             SyntaxKind::RACE_STMT => positional_race_deadline(&node, &mut edits),
+            // `throttle "f" 5 per 60000`: the max is bare, but the window always carries the `per`
+            // keyword (`lower_throttle` requires it), so only the max needs a name.
+            SyntaxKind::THROTTLE_STMT => {
+                name_positional_operands(&node, &["max"], &mut edits);
+                name_header_options(&node, &["per"], &mut edits);
+            }
+            SyntaxKind::DEBOUNCE_STMT => name_positional_operands(&node, &["wait"], &mut edits),
+            SyntaxKind::WITH_TOOLS_STMT => quote_tool_names(&node, &mut edits),
             _ => {}
         }
-        durations(&node, &mut edits);
+        durations(&node, src, &mut edits);
     }
     for token in tokens(root) {
         if token.kind() == SyntaxKind::VAR {
@@ -223,6 +253,21 @@ fn is_pun_ambiguous_argument(token: &SyntaxToken) -> bool {
         .is_some_and(|list| list.kind() == SyntaxKind::ARG_LIST && list.children().count() > 1)
 }
 
+/// Is this `$sym` an argument of a `do` call that keeps its `do` spelling?
+///
+/// `format` projects those through `fmt_legacy_call_args`, which sigils *every* symbol argument
+/// regardless of how many there are — so `do fmt $x` is already canonical and stripping the `$`
+/// would make this pass disagree with the formatter it defers to.
+fn is_argument_of_a_retained_do_call(token: &SyntaxToken) -> bool {
+    token
+        .parent()
+        .filter(|parent| parent.kind() == SyntaxKind::VAR_EXPR)
+        .and_then(|var| var.parent())
+        .filter(|list| list.kind() == SyntaxKind::ARG_LIST)
+        .and_then(|list| list.parent())
+        .is_some_and(|call| call.kind() == SyntaxKind::CALL_STMT && retains_do_spelling(&call))
+}
+
 /// `$x` → `x`. The sigil is legacy on an ordinary symbol reference (the canonical projection emits
 /// bare identifiers); it stays wherever dropping it would be read as something else.
 fn unsigil(token: &SyntaxToken, edits: &mut Vec<Edit>) {
@@ -230,6 +275,7 @@ fn unsigil(token: &SyntaxToken, edits: &mut Vec<Edit>) {
     if !crate::ast::is_bare_symbol_name(bare)
         || in_native_formula(token)
         || is_pun_ambiguous_argument(token)
+        || is_argument_of_a_retained_do_call(token)
     {
         return;
     }
@@ -274,18 +320,38 @@ fn unbrace_single_object_call(arg_list: &SyntaxNode, edits: &mut Vec<Edit>) {
     }
 }
 
+/// The `do <name>` of a [`SyntaxKind::CALL_STMT`], if it has one.
+fn do_keyword(call: &SyntaxNode) -> Option<(SyntaxToken, SyntaxNode)> {
+    let kw = child_tokens(call).find(|t| !t.kind().is_trivia() && !t.kind().is_layout())?;
+    if kw.kind() != SyntaxKind::IDENT || kw.text() != "do" {
+        return None;
+    }
+    let name = call.children().find(|c| c.kind() == SyntaxKind::NAME)?;
+    Some((kw, name))
+}
+
+/// Does this `do` call keep its `do` spelling?
+///
+/// `do fmt $x` / `do parse $x` / `do peek $x` are *canonical*, not legacy: those names are
+/// special-cased pure spellings rather than op names, `format` emits the `do` form for them
+/// unchanged, and `fmt($x)` is a different node. Rewriting one used to trip the equivalence guard,
+/// which rejects per **file** — so a single such line made a whole file un-migratable, the exact
+/// outcome this module's guard policy exists to avoid. `is_reserved_word` is the same
+/// parser/formatter SSOT `unsigil` consults; declining on a genuinely op-named reserved word costs
+/// one un-migrated line, which is the cheap side of that trade.
+fn retains_do_spelling(call: &SyntaxNode) -> bool {
+    do_keyword(call)
+        .is_some_and(|(_, name)| crate::ast::is_reserved_word(name.text().to_string().trim()))
+}
+
 /// `do poll` → `poll()`, `do file_bug $u` → `file_bug($u)` (the sigil rule then takes the `$`).
 fn desugar_do_call(call: &SyntaxNode, edits: &mut Vec<Edit>) {
-    let Some(kw) = child_tokens(call).find(|t| !t.kind().is_trivia() && !t.kind().is_layout())
-    else {
+    let Some((kw, name)) = do_keyword(call) else {
         return;
     };
-    if kw.kind() != SyntaxKind::IDENT || kw.text() != "do" {
+    if retains_do_spelling(call) {
         return;
     }
-    let Some(name) = call.children().find(|c| c.kind() == SyntaxKind::NAME) else {
-        return;
-    };
     let name_end = node_span(&name).end;
     // Drop `do` and the whitespace behind it.
     edits.push((span(&kw).start..node_span(&name).start, String::new()));
@@ -301,11 +367,24 @@ fn desugar_do_call(call: &SyntaxNode, edits: &mut Vec<Edit>) {
 
 /// A body-line `until $done` under `repeat`/`loop` → a `, until: done` option on the header.
 ///
-/// The clause carries a comment often enough to matter, and a comment cannot be hoisted onto a
-/// header line without inventing a position for it, so a commented `until` line is left where the
-/// author put it rather than silently relocated.
+/// This is the only rule that *moves* a line, so it is the only one that can strand a comment, and
+/// the equivalence guard cannot help: the comment multiset is order-insensitive, so a re-anchored
+/// comment is invisible to it. Two shapes are therefore declined outright rather than guessed at —
+/// a comment *on* the clause (there is no position for it on a header line) and a comment
+/// *directly above* it (hoisting the clause out from under it silently re-aims the comment at the
+/// next statement, turning a note about the loop guard into a note about whatever follows).
 fn hoist_until(clause: &SyntaxNode, src: &str, edits: &mut Vec<Edit>) {
     if tokens(clause).any(|t| t.kind() == SyntaxKind::COMMENT) {
+        return;
+    }
+    let clause_line = node_span(clause).start;
+    let line_start = src[..clause_line].rfind('\n').map_or(0, |i| i + 1);
+    if src[..line_start]
+        .trim_end_matches('\n')
+        .rsplit('\n')
+        .next()
+        .is_some_and(|above| above.trim_start().starts_with('#'))
+    {
         return;
     }
     let Some(stmt) = clause.parent().and_then(|block| block.parent()) else {
@@ -357,9 +436,49 @@ fn hoist_until(clause: &SyntaxNode, src: &str, edits: &mut Vec<Edit>) {
 fn name_header_options(stmt: &SyntaxNode, options: &[&str], edits: &mut Vec<Edit>) {
     for token in child_tokens(stmt) {
         if token.kind() == SyntaxKind::IDENT && options.contains(&token.text()) {
-            let at = span(&token);
-            edits.push((at.clone(), format!(", {}:", token.text())));
-            let _ = at;
+            edits.push((span(&token), format!(", {}:", token.text())));
+        }
+    }
+}
+
+/// Give a statement's **positional** numeric operands their canonical option names, in order:
+/// `throttle "f" 5 per 60000` → `throttle "f", max: 5, per: 60000`, `debounce "api" 500` →
+/// `debounce "api", wait: 500`. (`durations` then spells the millisecond ones as literals.)
+///
+/// `lower_throttle`/`lower_debounce` (`cst_decode.rs`) read this operand run from reconstructed text
+/// *and* accept the same fields as named options, which is what makes the positional form legacy.
+/// Neither spelling occurs anywhere in the shipped corpus, so nothing but a rule written from the
+/// decoder would have caught it.
+///
+/// Only direct-child numbers are positional — a number inside a [`SyntaxKind::HEADER_OPTION`] is
+/// already named and is not a child of the statement.
+fn name_positional_operands(stmt: &SyntaxNode, labels: &[&str], edits: &mut Vec<Edit>) {
+    let numbers = child_tokens(stmt).filter(|t| t.kind() == SyntaxKind::NUMBER);
+    for (number, label) in numbers.zip(labels) {
+        let at = span(&number).start;
+        edits.push((at..at, format!(", {label}: ")));
+    }
+}
+
+/// `with_tools [read_file, write_file]` → `with_tools ["read_file", "write_file"]`.
+///
+/// `parse_setting_prefix` (`cst_decode.rs`) accepts a bare identifier wherever it wants a string, so
+/// an unquoted tool name lowers identically to a quoted one — a doubled spelling with no marker in
+/// the tree beyond the token kind. The elements are direct-child tokens of the statement (there is
+/// no list node here), so the bracket run is tracked by hand.
+///
+/// `true`/`false`/`null` are *not* quoted: those lower to non-string values that the tool list then
+/// rejects, and inventing a string for them would turn a loud error into a silent one.
+fn quote_tool_names(stmt: &SyntaxNode, edits: &mut Vec<Edit>) {
+    let mut in_list = false;
+    for token in child_tokens(stmt) {
+        match token.kind() {
+            SyntaxKind::L_BRACK => in_list = true,
+            SyntaxKind::R_BRACK => return,
+            SyntaxKind::IDENT if in_list && !matches!(token.text(), "true" | "false" | "null") => {
+                edits.push((span(&token), format!("\"{}\"", token.text())));
+            }
+            _ => {}
         }
     }
 }
@@ -390,7 +509,7 @@ const DURATION_OPTIONS: &[&str] = &["delay", "every", "for", "per", "timeout", "
 /// Only the positions the language actually reads as milliseconds are touched — `repeat 10`,
 /// `budget 5`, `retry 3` and `max: 5` are counts, and giving one of those a unit would be a
 /// different program.
-fn durations(node: &SyntaxNode, edits: &mut Vec<Edit>) {
+fn durations(node: &SyntaxNode, src: &str, edits: &mut Vec<Edit>) {
     let numbers: Vec<SyntaxToken> = match node.kind() {
         // The deadline of these statements is their one positional operand.
         SyntaxKind::TIMEOUT_STMT | SyntaxKind::RACE_STMT => child_tokens(node)
@@ -402,9 +521,15 @@ fn durations(node: &SyntaxNode, edits: &mut Vec<Edit>) {
             .filter(|t| t.kind() == SyntaxKind::NUMBER)
             .collect(),
         // `retry 3 delay <ms>` — the count is the first number, the delay every number after it.
-        SyntaxKind::RETRY_STMT => child_tokens(node)
+        // `throttle "f" 5 per <ms>` is the same shape: a leading count, then a window.
+        SyntaxKind::RETRY_STMT | SyntaxKind::THROTTLE_STMT => child_tokens(node)
             .filter(|t| t.kind() == SyntaxKind::NUMBER)
             .skip(1)
+            .collect(),
+        // `debounce "api" <ms>` — its one positional operand is the wait.
+        SyntaxKind::DEBOUNCE_STMT => child_tokens(node)
+            .find(|t| t.kind() == SyntaxKind::NUMBER)
+            .into_iter()
             .collect(),
         SyntaxKind::HEADER_OPTION => {
             let mut header = child_tokens(node).filter(|t| !t.kind().is_trivia());
@@ -419,22 +544,47 @@ fn durations(node: &SyntaxNode, edits: &mut Vec<Edit>) {
         _ => return,
     };
     for number in numbers {
-        if has_unit(&number) {
-            continue;
-        }
-        let Ok(ms) = number.text().parse::<u64>() else {
+        let Some((at, ms)) = duration_operand(&number) else {
             continue;
         };
-        edits.push((span(&number), fmt_duration(ms)));
+        let canonical = fmt_duration(ms);
+        if src.get(at.clone()) != Some(canonical.as_str()) {
+            edits.push((at, canonical));
+        }
     }
 }
 
-/// Is this number already a duration literal? `500ms` lexes as NUMBER + IDENT with nothing between
-/// them; `500 ms` is two operands and not a duration at all.
-fn has_unit(number: &SyntaxToken) -> bool {
-    number.next_token().is_some_and(|next| {
+/// A duration operand's full byte span and its value in milliseconds.
+///
+/// A duration is a `NUMBER` plus an optional immediately-adjacent unit `IDENT` — `500ms` lexes as
+/// two tokens the lexer never joins, while `500 ms` is two separate operands and not a duration at
+/// all. **No suffix means milliseconds** (`take_duration`, `cst_decode.rs`), and `_` digit
+/// separators are stripped before the value is read.
+///
+/// This normalizes the *unit* as well as supplying a missing one, because that is what canonical
+/// means here: `fmt_duration` picks the largest exact unit, so `5000ms`, `5_000` and `5000` are all
+/// spelled `5s`, and `60s` is spelled `1m`. Only supplying the missing suffix would leave
+/// `timeout 5000ms` reported as already canonical when `format` disagrees.
+fn duration_operand(number: &SyntaxToken) -> Option<(std::ops::Range<usize>, u64)> {
+    let digits = number.text().replace('_', "");
+    let value: u64 = digits.parse().ok()?;
+    let unit = number.next_token().filter(|next| {
         next.kind() == SyntaxKind::IDENT && next.text_range().start() == number.text_range().end()
-    })
+    });
+    let (multiplier, end) = match unit.as_ref().map(|u| (u.text().to_string(), u)) {
+        None => (1, span(number).end),
+        Some((u, token)) => (
+            match u.as_str() {
+                "ms" => 1,
+                "s" => 1_000,
+                "m" => 60_000,
+                // Not a duration unit — leave the operand alone rather than guess what it is.
+                _ => return None,
+            },
+            span(token).end,
+        ),
+    };
+    Some((span(number).start..end, value.checked_mul(multiplier)?))
 }
 
 #[cfg(test)]
@@ -549,6 +699,67 @@ mod tests {
     }
 
     #[test]
+    fn names_the_legacy_throttle_and_debounce_positional_operands() {
+        // `lower_throttle`/`lower_debounce` (`cst_decode.rs`) accept a positional operand run
+        // *alongside* the named options, so both statements have a legacy spelling — and neither
+        // appears anywhere in the shipped corpus, which is exactly why the corpus test cannot see
+        // this. A missed rule here is a silent false negative: `--check` would call the file clean.
+        assert_eq!(
+            canon(&flow(
+                "  throttle \"fetches\" 5 per 60000\n    call()\n  return 1\n"
+            )),
+            flow("  throttle \"fetches\", max: 5, per: 1m\n    call()\n  return 1\n")
+        );
+        assert_eq!(
+            canon(&flow("  debounce \"api\" 500\n    call()\n  return 1\n")),
+            flow("  debounce \"api\", wait: 500ms\n    call()\n  return 1\n")
+        );
+    }
+
+    #[test]
+    fn leaves_the_pure_op_do_spellings_alone() {
+        // `do fmt $x` is *canonical*, not legacy: `fmt`/`parse`/`peek`/`thing` are special-cased
+        // pure spellings, `format` emits the `do` form for them unchanged, and rewriting one to
+        // `fmt($x)` produces a different node. Before this rule the rewrite tripped the equivalence
+        // guard, which rejects per **file** — so one such line made a whole file un-migratable.
+        for src in [
+            flow("  x = 1\n  do fmt $x\n  return 1\n"),
+            flow("  x = \"{}\"\n  do parse $x\n  return 1\n"),
+            flow("  x = 1\n  do peek $x\n  return 1\n"),
+        ] {
+            assert_eq!(
+                canonicalize_source(&src),
+                Canonical::Unchanged,
+                "the pure-op `do` spelling is canonical: {src}"
+            );
+        }
+        // A legacy `do` on an ordinary op, on the line right after, still canonicalizes.
+        assert_eq!(
+            canon(&flow("  x = 1\n  do fmt $x\n  do notify $x\n  return 1\n")),
+            flow("  x = 1\n  do fmt $x\n  notify(x)\n  return 1\n")
+        );
+    }
+
+    #[test]
+    fn does_not_reanchor_a_comment_sitting_above_a_body_line_until() {
+        // Hoisting the `until` out from under its own leading comment silently re-aims that comment
+        // at the next statement. The comment *multiset* is order-insensitive, so only an assertion
+        // on the text can see this — the guard never will.
+        let src = flow(
+            "  repeat 10 -> c\n    # why we stop early\n    until $done\n    step()\n  return c\n",
+        );
+        let out = canon(&src);
+        assert!(
+            out.contains("# why we stop early\n    until done"),
+            "the comment keeps the statement it documents: {out}"
+        );
+        assert!(
+            !out.contains("# why we stop early\n    step()"),
+            "the comment must not be re-aimed at the next statement: {out}"
+        );
+    }
+
+    #[test]
     fn spells_bare_millisecond_operands_as_durations() {
         assert_eq!(
             canon(&flow("  timeout 30000 -> o\n    slow()\n  return o\n")),
@@ -559,6 +770,42 @@ mod tests {
                 "  debounce \"api\", wait: 500\n    call()\n  return 1\n"
             )),
             flow("  debounce \"api\", wait: 500ms\n    call()\n  return 1\n")
+        );
+    }
+
+    #[test]
+    fn normalizes_a_duration_unit_not_merely_a_missing_one() {
+        // `fmt_duration` picks the largest exact unit, so a *present* unit can still be
+        // non-canonical. Supplying only the missing suffix would report `timeout 5000ms` as already
+        // canonical while `format` spells it `5s` — a false negative, the shape that matters most
+        // for `--check`. `_` digit separators are stripped the way `take_duration` strips them.
+        for (legacy, canonical) in [
+            ("timeout 5000ms -> o", "timeout 5s -> o"),
+            ("timeout 60s -> o", "timeout 1m -> o"),
+            ("timeout 5_000 -> o", "timeout 5s -> o"),
+            ("timeout 250 -> o", "timeout 250ms -> o"),
+        ] {
+            assert_eq!(
+                canon(&flow(&format!("  {legacy}\n    slow()\n  return o\n"))),
+                flow(&format!("  {canonical}\n    slow()\n  return o\n"))
+            );
+        }
+        // 90000ms is 90s, not 1.5m — an inexact division keeps the smaller unit.
+        assert_eq!(
+            canon(&flow("  timeout 90000ms -> o\n    slow()\n  return o\n")),
+            flow("  timeout 90s -> o\n    slow()\n  return o\n")
+        );
+    }
+
+    #[test]
+    fn quotes_bare_tool_names() {
+        // `parse_setting_prefix` takes a bare identifier as a string, so the unquoted list is a
+        // legacy spelling rather than a different program.
+        assert_eq!(
+            canon(&flow(
+                "  with_tools [read_file, write_file]\n    act()\n  return 1\n"
+            )),
+            flow("  with_tools [\"read_file\", \"write_file\"]\n    act()\n  return 1\n")
         );
     }
 

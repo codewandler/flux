@@ -252,35 +252,50 @@ fn unglyph_src(src: &str) -> Result<String> {
 ///
 /// A file that does not parse, or whose rewrite the equivalence guard refuses, is an error in both
 /// modes rather than a silent skip: the whole point of the command is that its output is trustworthy.
+///
+/// One bad file does **not** end the run. `fmt` is meant to be pointed at a whole tree, and a batch
+/// that stops at the first problem hides every file behind it — the operator fixes one thing, re-runs,
+/// and discovers the next. Each file is reported and the run continues; the exit code is non-zero if
+/// anything failed or, under `--check`, if anything was stale.
 fn fmt(files: &[PathBuf], check: bool) -> Result<()> {
     if files.is_empty() {
         return fmt_stdin(check);
     }
-    let mut stale = Vec::new();
+    let (mut stale, mut failed) = (Vec::new(), Vec::new());
     for path in files {
         let label = path.display().to_string();
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| Error::Other(format!("read {label}: {e}")))?;
-        let canonical = canonical_text(&src, &label)?;
-        if canonical == src {
-            continue;
-        }
-        if check {
-            eprintln!("{label}: not canonical\n{}", diff_summary(&src, &canonical));
-            stale.push(label);
-        } else {
-            std::fs::write(path, &canonical)
-                .map_err(|e| Error::Other(format!("write {label}: {e}")))?;
+        let outcome = std::fs::read_to_string(path)
+            .map_err(|e| Error::Other(format!("read {label}: {e}")))
+            .and_then(|src| {
+                let canonical = canonical_text(&src, &label)?;
+                if canonical == src {
+                    return Ok(());
+                }
+                if check {
+                    eprintln!("{label}: not canonical\n{}", diff_summary(&src, &canonical));
+                    stale.push(label.clone());
+                    return Ok(());
+                }
+                std::fs::write(path, &canonical)
+                    .map_err(|e| Error::Other(format!("write {label}: {e}")))
+            });
+        if let Err(e) = outcome {
+            eprintln!("fluxlang: {e}");
+            failed.push(label);
         }
     }
-    if stale.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
+    match (failed.is_empty(), stale.is_empty()) {
+        (true, true) => Ok(()),
+        (false, _) => Err(Error::Other(format!(
+            "{} file(s) could not be formatted: {}",
+            failed.len(),
+            failed.join(", ")
+        ))),
+        (true, false) => Err(Error::Other(format!(
             "{} file(s) are not canonical: {}",
             stale.len(),
             stale.join(", ")
-        )))
+        ))),
     }
 }
 
