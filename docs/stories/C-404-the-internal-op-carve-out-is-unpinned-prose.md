@@ -2,7 +2,7 @@
 id: C-404
 title: "The credential boundary's `internal: true` carve-out is prose with no test pinning it, and `internal_op` is public"
 pillar: Core
-status: ready
+status: in-progress
 priority: 10
 epic: connector-platform
 areas: [flux-plugin, flux-cli, flux-codegate]
@@ -41,18 +41,34 @@ and here it took one independent read to find that it already was.
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test that ships an internal op returning credential material through the
+- [x] **Failing-first**: a test that ships an internal op returning credential material through the
       host-dispatch path and asserts the outcome the story decides on — failing at the merge base,
       where the material passes through.
-- [ ] **Decide and implement one of**: apply the boundary to internal ops too (removing the
+      → `crates/flux-cli/tests/plugin_preflight_boundary.rs`'s
+      `a_platform_sourced_preflight_carrying_a_vendor_credential_is_refused`, driving the real
+      `flux plugin call --dry-run` binary against `platform_plugin`'s new `leak-validate` mode (an
+      `internal: true`, `platform`-sourced `plugin.validate`). At `def26f35` it printed
+      `xoxb-…` to operator stdout.
+- [x] **Decide and implement one of**: apply the boundary to internal ops too (removing the
       carve-out entirely), or keep it and pin the census with a check that fails when a new
       host-dispatched `call_with_host` site appears without justification. Do not leave a third
       option where the comment is merely updated again.
-- [ ] If the carve-out survives, the reason is stated **at the definition** and the enforcing test is
+      → **Both.** The carve-out is removed (`crates/flux-cli/src/plugin_cmd.rs:535`, the preflight
+      verdict; `:565`, its error frame), *and* the census is pinned by
+      `flux-codegate`'s `every_plugin_response_ingest_site_is_in_the_credential_boundary_census`.
+      Removing the carve-out alone would have left `secret.read` exempt behind the same unenforced
+      prose.
+- [x] If the carve-out survives, the reason is stated **at the definition** and the enforcing test is
       named there, so the next reader finds the check rather than the claim.
-- [ ] The check is verified to fire — reintroduce the violation it forbids and show it failing, the
+      → It does not survive. The one remaining exemption (`secret.read`, exempt *by purpose*, not by
+      dispatcher) is stated in `credential_boundary.rs`'s header, which now cites the census test by
+      name instead of carrying a table.
+- [x] The check is verified to fire — reintroduce the violation it forbids and show it failing, the
       way C-391/C-392's scanner tests were validated before being trusted.
-- [ ] Full gate green in both workspaces.
+      → Both failure branches were reintroduced and observed red, then restored: a new
+      `call_with_host` in an uncensused file (`flux-plugin/src/host.rs`) and a second one in a
+      censused file (`flux-cli/src/plugin_cmd.rs`).
+- [x] Full gate green in both workspaces.
 
 ## Notes
 
@@ -70,3 +86,22 @@ and here it took one independent read to find that it already was.
 
 - Filed 2026-08-01 from C-403's audit, which fixed the discovery path and deliberately scoped this
   out rather than widening itself.
+- Implemented 2026-08-01 on `impl/C-404`, off `def26f35`.
+  - **Census re-derived from the tree, not from the table.** `git grep -n call_with_host -- '*.rs'`
+    gives six non-test `.call_with_host(` expressions in three files: `broker.rs` ×2,
+    `plugin_cmd.rs` ×2, `loading.rs` ×2. C-403's five-row table was correct as of this commit —
+    which was never the point. The scanner now derives the same six with `syn` and fails when the
+    number moves.
+  - **C-403's "wiring no test can observe" argument was half right and is answered rather than
+    inherited.** `host_kit::internal_op` really does yield `PlatformSourcing::None`, so the check is
+    a no-op on every plugin in this repository. But `host-kit` is a convenience, not the protocol:
+    a plugin speaking raw NDJSON can declare `plugin.validate` with `platform` set, and the fixture
+    now does exactly that. So the wiring *is* observable, and the failing-first test observes it end
+    to end through the real binary rather than through `refuse_platform_response` directly — the
+    story is about a wiring claim, and a helper-level test would have re-asserted the helper.
+  - **The error path is scrubbed, not escalated.** A preflight that errors has always been
+    non-fatal (plugins predating D-88 do not serve the op), so `scrub_plugin_error` replaces the
+    message and the schema-only fallback is kept. Escalating it would change `--dry-run`'s contract
+    for a reason this story does not carry.
+  - `crates/flux-cli/src/catalog_coherence.rs:173` was re-checked per the story's note: it is
+    untouched. Nothing here changes how the boundary sources its redactor.

@@ -2215,6 +2215,145 @@ pub fn pinned_discovery_calls(
     discovery_calls_named(src, scope, &PINNED_DISCOVERY_ENTRY_POINTS)
 }
 
+/// C-404 — one **production** call to `PluginHost::call_with_host`: a place where a
+/// plugin-authored response enters flux.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PluginResponseIngest {
+    pub line: usize,
+}
+
+/// The method whose return value is a plugin-authored response crossing into flux
+/// (`PluginHost::call_with_host`).
+///
+/// One name, not a frontier: unlike C-393's discovery readers there are no wrapper families here —
+/// `call_with_host` is the only way a plugin's `operation.call` response is obtained, and
+/// `PluginHost::call` is a thin self-delegation this scanner sees as the call it is.
+pub const PLUGIN_RESPONSE_INGEST_METHOD: &str = "call_with_host";
+
+struct PluginIngestVisitor {
+    /// `true` once inside a `#[cfg(test)]` item — test code has no operator-visible surface to
+    /// protect and is deliberately not counted.
+    in_test: bool,
+    hits: Vec<PluginResponseIngest>,
+}
+
+impl PluginIngestVisitor {
+    fn record(&mut self, callee: &proc_macro2::Ident) {
+        if self.in_test || *callee != PLUGIN_RESPONSE_INGEST_METHOD {
+            return;
+        }
+        self.hits.push(PluginResponseIngest {
+            line: start_line(callee.span()),
+        });
+    }
+
+    fn scoped<T>(&mut self, gated: bool, node: T, walk: impl FnOnce(&mut Self, T)) {
+        let outer = self.in_test;
+        self.in_test = outer || gated;
+        walk(self, node);
+        self.in_test = outer;
+    }
+
+    /// Walk a macro's token stream for calls — the blind spot C-393 documents: `syn` keeps a macro
+    /// body as an opaque `TokenStream`, so an ingest inside `tokio::select!` or an `assert!` is
+    /// invisible to an AST-only scan. "A call" is `<ident> ( .. )`.
+    fn scan_macro_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        if self.in_test {
+            return;
+        }
+        let mut pending: Option<proc_macro2::Ident> = None;
+        for tree in tokens {
+            match tree {
+                proc_macro2::TokenTree::Ident(ident) => pending = Some(ident),
+                proc_macro2::TokenTree::Group(group) => {
+                    if let Some(ident) = pending.take() {
+                        if group.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                            self.record(&ident);
+                        }
+                    }
+                    self.scan_macro_tokens(group.stream());
+                }
+                proc_macro2::TokenTree::Punct(punct) => {
+                    if !matches!(punct.as_char(), ':' | '.' | '<' | '>') {
+                        pending = None;
+                    }
+                }
+                proc_macro2::TokenTree::Literal(_) => pending = None,
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for PluginIngestVisitor {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_item_mod(this, item)
+        });
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_item_fn(this, item)
+        });
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_item_impl(this, item)
+        });
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        let gated = has_cfg_test(&item.attrs);
+        self.scoped(gated, item, |this, item| {
+            syn::visit::visit_impl_item_fn(this, item)
+        });
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.record(&call.method);
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        // The UFCS spelling — `PluginHost::call_with_host(&mut host, ..)` — is the same ingest.
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            if let Some(segment) = path.path.segments.last() {
+                self.record(&segment.ident);
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.scan_macro_tokens(mac.tokens.clone());
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+/// Every production plugin-response ingest site in `src` (C-404).
+///
+/// Structural rather than textual, which is the whole reason this replaced a doc-comment census:
+/// `syn` excludes comments and string literals for free, so the table *describing* the sites is not
+/// itself counted as one — the failure mode that made the prose census wrong on the day it was
+/// written. Items carrying `#[cfg(test)]` are excluded; the method's own `pub async fn` definition
+/// is not a call and so is not a hit.
+pub fn plugin_response_ingest_sites(src: &str) -> syn::Result<Vec<PluginResponseIngest>> {
+    let file = syn::parse_file(src)?;
+    let mut visitor = PluginIngestVisitor {
+        in_test: false,
+        hits: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.hits.sort();
+    // Deliberately NOT deduplicated: two ingests chained on one line are two ingests, and a census
+    // that pins counts must not let the second hide behind the first's line number.
+    Ok(visitor.hits)
+}
+
 /// C-325 — the credential shapes a hosted git forge's secret scanning blocks a push on, as
 /// `(vendor prefix, minimum credential-body characters after it)`.
 ///
@@ -2293,7 +2432,7 @@ pub fn push_protection_shapes(src: &str) -> Vec<(usize, String)> {
 mod tests {
     use super::*;
     use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     // One exhaustively reviewed classification for first-party operation implementation packs in
@@ -3176,6 +3315,155 @@ impl Exec for Double {}
             violations.is_empty(),
             "guarded-IO port implemented outside the reviewed native backend:\n  {}",
             violations.join("\n  ")
+        );
+    }
+
+    /// The credential-boundary census (C-404): **every production `call_with_host` is enumerated
+    /// here, with what the boundary does about it.**
+    ///
+    /// C-312 put the boundary on plugin responses and described its scope in a doc comment. That
+    /// comment was wrong on the day it was written — it claimed four sites where the tree had five,
+    /// and the one it omitted was precisely the site its single carve-out existed to excuse. Nothing
+    /// failed. C-403 rewrote it into a five-row table; still prose, still nothing failing when it
+    /// goes stale.
+    ///
+    /// This is the check that fails instead. A new `call_with_host` anywhere in either workspace's
+    /// production code is a **new place a plugin-authored response enters flux**, and the author of
+    /// that call has to come here and say what the boundary does about it — which is a review, not a
+    /// formality: `refuse_response`/`scrub_error` is what stands between a hostile deployment's
+    /// answer and a transcript, an evidence observation, or an operator's scrollback.
+    ///
+    /// Counted per file rather than per line so the pin survives ordinary edits above a call site
+    /// and still fails on an added or removed one. `flux-codegate` does not depend on `flux-plugin`
+    /// and must not — this scans source text, which is why the rule can live in the layering-lint
+    /// crate at all.
+    #[test]
+    fn every_plugin_response_ingest_site_is_in_the_credential_boundary_census() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        // `(file, ingest sites in it, what the boundary does about them)`.
+        //
+        // The prose that used to carry this lives at the head of
+        // `crates/flux-plugin/src/host/credential_boundary.rs`, which now cites this test. Keep the
+        // two in step: this table is the enforced half.
+        const CENSUS: &[(&str, usize, &str)] = &[
+            (
+                "crates/flux-capabilities/src/endpoint/broker.rs",
+                2,
+                "`endpoint.discover` fan-out — boundary RUNS (C-403); `secret.read` — EXEMPT by \
+                 purpose, handing a credential value to host code is its success case (reasoned at \
+                 the call site)",
+            ),
+            (
+                "crates/flux-cli/src/plugin_cmd.rs",
+                2,
+                "`flux plugin call` — boundary RUNS; the `plugin.validate` preflight — boundary \
+                 RUNS since C-404 removed the `internal: true` carve-out",
+            ),
+            (
+                "crates/flux-plugin/src/host/loading.rs",
+                2,
+                "`PluginHost::call` self-delegation with `DenyHostCaps` (no non-test caller, not a \
+                 surface of its own); the projected-tool path — boundary RUNS (C-312)",
+            ),
+        ];
+
+        let rs_files = workspace_source_files(repo_root);
+        assert!(
+            rs_files.len() > 20,
+            "expected to scan a representative set of source files, found {}",
+            rs_files.len()
+        );
+
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for file in &rs_files {
+            let rel = file
+                .strip_prefix(repo_root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(file).unwrap();
+            let hits = plugin_response_ingest_sites(&src).unwrap_or_else(|error| {
+                panic!("parse {} for the ingest census: {error}", file.display())
+            });
+            if !hits.is_empty() {
+                found.insert(rel, hits.len());
+            }
+        }
+
+        let mut violations = Vec::new();
+        for (path, expected, disposition) in CENSUS {
+            match found.remove(*path) {
+                Some(count) if count == *expected => {}
+                Some(count) => violations.push(format!(
+                    "{path}: the census records {expected} plugin-response ingest site(s) \
+                     ({disposition}) but the tree has {count} — say what the credential boundary \
+                     does about the new one, then update this table"
+                )),
+                None => violations.push(format!(
+                    "{path}: the census records {expected} plugin-response ingest site(s) but the \
+                     tree has none — the sites moved, and the census now pins nothing"
+                )),
+            }
+        }
+        for (path, count) in found {
+            violations.push(format!(
+                "{path}: {count} uncensused `{PLUGIN_RESPONSE_INGEST_METHOD}` call(s) — a new place \
+                 a plugin-authored response enters flux. Decide whether the credential boundary \
+                 runs there (`flux_plugin::credential_boundary::refuse_response` / `scrub_error`), \
+                 then add the file to CENSUS with that decision"
+            ));
+        }
+
+        assert!(
+            violations.is_empty(),
+            "the credential-boundary census no longer describes the tree (C-404):\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    /// The scanner's own pins: it must see a method call and a UFCS call, see one inside a macro
+    /// body, ignore the `pub async fn` definition and prose naming it, and ignore `#[cfg(test)]`
+    /// code.
+    ///
+    /// The last two are the ones that matter. A scanner that counted the *definition* would make
+    /// `loading.rs` read 3 and the census a number nobody could derive; a scanner that counted the
+    /// doc comment describing the census would count the census itself — which is exactly how the
+    /// prose version stayed wrong.
+    #[test]
+    fn plugin_ingest_scanner_sees_calls_and_ignores_definitions_prose_and_test_code() {
+        let src = r#"
+//! The census names `call_with_host` in prose, which is not a call.
+impl PluginHost {
+    /// Calls `call_with_host` — also prose.
+    pub async fn call(&mut self, op: &str) -> Result<Value> {
+        self.call_with_host(op, input, &DenyHostCaps).await
+    }
+    pub async fn call_with_host(&mut self, op: &str) -> Result<Value> {
+        let _ = "call_with_host";
+        todo!()
+    }
+}
+fn ufcs(host: &mut PluginHost) {
+    let _ = PluginHost::call_with_host(host, "op");
+}
+fn in_a_macro(host: &mut PluginHost) {
+    assert!(host.call_with_host("op").is_ok());
+}
+#[cfg(test)]
+mod tests {
+    fn fixture(host: &mut PluginHost) {
+        let _ = host.call_with_host("op");
+    }
+}
+"#;
+        let hits = plugin_response_ingest_sites(src).unwrap();
+        assert_eq!(
+            hits.len(),
+            3,
+            "the self-delegation, the UFCS call and the one inside `assert!` — and nothing \
+             else: {hits:?}"
         );
     }
 

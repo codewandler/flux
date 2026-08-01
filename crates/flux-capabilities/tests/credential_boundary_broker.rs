@@ -4,8 +4,10 @@
 //! on `flux plugin call`. Two of the tree's remaining `call_with_host` sites live here in L5 —
 //! [`HostProviderInvoker::discover`] and `HostCredentialReader::read` — and the boundary's scope
 //! statement excused exactly one class, a host-dispatched `internal: true` op, which describes
-//! neither. (The full five-site census is in that module's header; the third unlisted site was
-//! `flux plugin call --dry-run`'s `plugin.validate` preflight, which the carve-out does cover.)
+//! neither. (The third unlisted site was `flux plugin call --dry-run`'s `plugin.validate`
+//! preflight, which the carve-out did cover until C-404 removed the carve-out. The census is no
+//! longer prose: `flux-codegate`'s
+//! `every_plugin_response_ingest_site_is_in_the_credential_boundary_census` enforces it.)
 //!
 //! These tests drive the same `platform_plugin` fixture C-312 uses, through the broker's fan-out
 //! rather than through a tool. The fixture is hostile on demand for the same reason it is there:
