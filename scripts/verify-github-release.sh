@@ -2,23 +2,45 @@
 #
 # Verify that a version tag has a GitHub Release object with the binary assets users install from
 # /releases/latest. Intended for the post-tag Release workflow and for maintainer backfill checks.
+#
+# Two modes, and the difference is *when* they run (C-412):
+#
+#   <tag>           AFTER publication. Reads the live Release, and additionally verifies a provenance
+#                   attestation for every executable asset — which can only be done once the assets
+#                   are downloadable. This is the historical mode.
+#   --staged <dir>  BEFORE publication. Reads the local directory `gh release create` is about to
+#                   upload, and applies the same asset-set rules to it. No network, no attestations.
+#
+# Why the staged mode exists: the `host` job published the Release and *then* verified it, so a run
+# with an incomplete artifact directory created a public, broken Release and only afterwards went
+# red. v0.47.0 is that exact sequence — attempt 1 of the tag run published at 12:55:07 inside a
+# `host` job that started at 12:54:47 and failed at 12:55:08 on the verify step, leaving a Release
+# whose only asset was `dist-manifest.json` with `/releases/latest` pointing at it. A check that runs
+# after publication can only report the damage; the staged mode is the same check moved to where it
+# can prevent it.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
 usage: scripts/verify-github-release.sh [--repo owner/name] <tag>
+       scripts/verify-github-release.sh --staged <dir>
        scripts/verify-github-release.sh --self-test
 
 Checks that <tag> has a GitHub Release with installer scripts, checksum metadata,
 at least one Unix archive plus one Windows zip, and a valid GitHub provenance
 attestation for every executable release asset.
 
-Requires: gh authenticated for the target repo.
+With --staged, applies the same asset-set rules to a local directory before it is
+published, so an incomplete set never becomes a public Release. Attestations are not
+checked in this mode — they do not exist yet.
+
+Requires: gh authenticated for the target repo (not needed for --staged).
 EOF
 }
 
 REPO="${GITHUB_REPOSITORY:-codewandler/flux}"
 TAG=""
+STAGED_DIR=""
 
 err() {
   if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
@@ -78,6 +100,31 @@ validate_asset_set() {
   done
 }
 
+# The assets a release must carry whatever else it has: the two installer scripts the release body's
+# own `curl … | sh` lines fetch, the checksum index, and the manifest. One definition, called by both
+# modes, so the pre-publication and post-publication checks cannot drift apart — a staged check that
+# was weaker than the published one would let exactly the shape it exists to stop through.
+require_core_assets() {
+  local missing=() required name found
+  for required in \
+    dist-manifest.json \
+    flux-cli-installer.sh \
+    flux-cli-installer.ps1 \
+    sha256.sum
+  do
+    found=0
+    for name in "$@"; do
+      [ "$name" = "$required" ] && { found=1; break; }
+    done
+    [ "$found" -eq 1 ] || missing+=("$required")
+  done
+  [ "${#missing[@]}" -eq 0 ] && return 0
+  err "release asset set is missing required asset(s): ${missing[*]}"
+  printf 'assets present:\n' >&2
+  printf '  %s\n' "$@" >&2
+  return 1
+}
+
 verify_attestation() {
   local artifact="$1" source_digest="$2"
   gh attestation verify "$artifact" \
@@ -124,6 +171,64 @@ if [ "${1:-}" = "--self-test" ]; then
     echo "self-test accepted a checksum sidecar for a nonexistent asset" >&2
     exit 1
   fi
+  # The core-asset rule is shared by both modes; prove it fires rather than trusting the sharing.
+  if require_core_assets "${real_release_assets[@]}" >/dev/null 2>&1; then :; else
+    echo "self-test rejected a real release's core asset set" >&2
+    exit 1
+  fi
+  if require_core_assets flux-cli-installer.sh sha256.sum >/dev/null 2>&1; then
+    echo "self-test accepted an asset set with no dist-manifest.json" >&2
+    exit 1
+  fi
+
+  # --staged: the same rules against a directory, before anything is published (C-412). Driven
+  # through the real entry point with real files, because the whole point of this mode is what it
+  # does to a directory on disk — a fixture of filenames would not exercise the listing at all.
+  staged_root="$(mktemp -d)"
+  stage_dir() {
+    local dir="$staged_root/$1"; shift
+    mkdir -p "$dir"
+    local name
+    for name in "$@"; do
+      : >"$dir/$name"
+    done
+    printf '%s' "$dir"
+  }
+  good_dir="$(stage_dir good "${real_release_assets[@]}")"
+  if ! "$0" --staged "$good_dir" >/dev/null 2>&1; then
+    echo "self-test rejected a staged directory holding a real release's asset set" >&2
+    rm -rf -- "$staged_root"
+    exit 1
+  fi
+  # v0.47.0's shape: the manifest reached the artifact directory and nothing else did.
+  v047_dir="$(stage_dir v047 dist-manifest.json)"
+  if "$0" --staged "$v047_dir" >/dev/null 2>&1; then
+    echo "self-test accepted a staged directory holding only dist-manifest.json" >&2
+    rm -rf -- "$staged_root"
+    exit 1
+  fi
+  empty_dir="$staged_root/empty"
+  mkdir -p "$empty_dir"
+  if "$0" --staged "$empty_dir" >/dev/null 2>&1; then
+    echo "self-test accepted an empty staged directory" >&2
+    rm -rf -- "$staged_root"
+    exit 1
+  fi
+  if "$0" --staged "$staged_root/does-not-exist" >/dev/null 2>&1; then
+    echo "self-test accepted a staged directory that does not exist" >&2
+    rm -rf -- "$staged_root"
+    exit 1
+  fi
+  # The closed set has to apply before publication too, or the staged gate would wave through an
+  # executable that the post-publication gate then rejects — after it is already downloadable.
+  backdoor_dir="$(stage_dir backdoor "${real_release_assets[@]}" flux-cli-backdoor.exe)"
+  if "$0" --staged "$backdoor_dir" >/dev/null 2>&1; then
+    echo "self-test accepted a staged executable outside the closed asset set" >&2
+    rm -rf -- "$staged_root"
+    exit 1
+  fi
+  rm -rf -- "$staged_root"
+
   captured=()
   gh() { captured=("$@"); }
   TAG="v1.2.3"
@@ -134,7 +239,7 @@ if [ "${1:-}" = "--self-test" ]; then
     echo "self-test lost exact tag-ref/source-digest attestation binding" >&2
     exit 1
   fi
-  echo "PASS release verifier self-test rejects unverified extra assets and binds exact source digest"
+  echo "PASS release verifier self-test rejects unverified extra assets before and after publication, and binds exact source digest"
   exit 0
 fi
 
@@ -143,6 +248,11 @@ while [ "$#" -gt 0 ]; do
     --repo)
       [ "$#" -ge 2 ] || { usage; exit 2; }
       REPO="$2"
+      shift 2
+      ;;
+    --staged)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      STAGED_DIR="$2"
       shift 2
       ;;
     -h|--help)
@@ -162,6 +272,27 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Pre-publication mode (C-412). Runs on the directory `gh release create` is about to upload, so a
+# set that would produce a broken Release is rejected while the Release does not yet exist. Only the
+# attestation half is skipped, and only because the assets are not downloadable yet — the asset-set
+# rules below are the same function calls the post-publication mode makes.
+if [ -n "$STAGED_DIR" ]; then
+  [ -z "$TAG" ] || { echo "--staged takes a directory, not a tag" >&2; usage; exit 2; }
+  [ -d "$STAGED_DIR" ] || { err "staged artifact directory does not exist: $STAGED_DIR"; exit 1; }
+  staged=()
+  for staged_path in "$STAGED_DIR"/*; do
+    [ -f "$staged_path" ] || continue
+    staged+=("$(basename "$staged_path")")
+  done
+  # An empty directory is the v0.47.0 shape in its purest form, and would otherwise sail through
+  # every loop below without executing a single comparison.
+  [ "${#staged[@]}" -gt 0 ] || { err "staged artifact directory has no files: $STAGED_DIR"; exit 1; }
+  require_core_assets "${staged[@]}"
+  validate_asset_set "${staged[@]}"
+  echo "staged artifact set in $STAGED_DIR is publishable: ${#staged[@]} file(s), ${#executable_assets[@]} executable."
+  exit 0
+fi
+
 [ -n "$TAG" ] || { usage; exit 2; }
 
 if ! gh release view "$TAG" --repo "$REPO" --json tagName >/tmp/flux-release-view.json 2>/tmp/flux-release-view.err; then
@@ -178,31 +309,7 @@ fi
 
 mapfile -t assets < <(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
 
-has_asset() {
-  local want="$1"
-  local name
-  for name in "${assets[@]}"; do
-    [ "$name" = "$want" ] && return 0
-  done
-  return 1
-}
-
-missing=()
-for required in \
-  dist-manifest.json \
-  flux-cli-installer.sh \
-  flux-cli-installer.ps1 \
-  sha256.sum
-do
-  has_asset "$required" || missing+=("$required")
-done
-
-if [ "${#missing[@]}" -gt 0 ]; then
-  err "GitHub Release $REPO@$TAG is missing required asset(s): ${missing[*]}"
-  printf 'assets present:\n' >&2
-  printf '  %s\n' "${assets[@]}" >&2
-  exit 1
-fi
+require_core_assets "${assets[@]}"
 
 # Closed-set verification: release.yml attests and uploads one canonical artifact directory. An
 # extra filename must never become a second, unverified distribution channel beside that set.

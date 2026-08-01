@@ -22,12 +22,14 @@
 #      runbook is a request, not a guarantee — this check is the guarantee.
 #   3. A Release that EXISTS but cannot be installed from (C-412). Rules 1 and 2 both key on
 #      `.tag_name` — existence — so a published Release whose assets are missing is invisible to
-#      both, and `/releases/latest` happily points at it. v0.47.0 shipped exactly that: the Release
-#      object was created by the FIRST job of the Release workflow (`dist host --steps=create`,
-#      before a single artifact existed), every build job then skipped, and the run still concluded
-#      `success`. The result was a published Release carrying one asset — `dist-manifest.json` — and
-#      a `/releases/latest` whose every advertised download 404'd. The response at the time was an
-#      allowlist entry; rule 3 is the guard.
+#      both, and `/releases/latest` happily points at it. v0.47.0 shipped exactly that. Its build
+#      jobs all skipped (the plan job's manifest output was discarded by Actions for matching a
+#      masked secret) and the run still concluded `success`; the tag run's `host` job then ran
+#      `gh release create` against an artifact directory holding only `dist-manifest.json`, and
+#      only afterwards ran the verifier that noticed. Result: a published Release with one asset
+#      and a `/releases/latest` whose every advertised download 404'd. The response at the time was
+#      an allowlist entry; rule 3 is the guard, and release.yml now checks the artifact set before
+#      publishing rather than after.
 #
 # So: audit the whole tag/release fleet on every push to main, not just the tag being cut.
 #
@@ -84,9 +86,10 @@ TAB="$(printf '\t')"
 #            this tag now genuinely has no Release and the entry is load-bearing rather than
 #            decorative.                                        -> superseded by v0.47.1
 #            ⚠ KEPT DELIBERATELY (C-412), not because the hole is open: the mechanism is closed at
-#            source in `.github/workflows/release.yml` — the Release object is no longer created
-#            before artifacts exist, a preparation run that builds nothing now fails instead of
-#            reporting `success`, and rule 3 below detects the published-but-assetless result. What
+#            source in `.github/workflows/release.yml` — the artifact set is verified before
+#            `gh release create` publishes it, a preparation run that builds nothing now fails
+#            instead of reporting `success`, and rule 3 below detects an already-published
+#            assetless Release fleet-wide. What
 #            an entry cannot undo is history: v0.47.0's binaries were never built and its tag is
 #            permanently undownloadable, which is precisely what this list is for.
 #
@@ -111,6 +114,18 @@ v0.47.0'
 REQUIRED_INSTALL_ASSETS='flux-cli-installer.sh
 flux-cli-installer.ps1
 sha256.sum'
+
+# ...and how many platform archives it must carry. "At least one Unix archive plus one Windows zip"
+# is the rule `verify-github-release.sh` applies at cut time, and it is the right rule THERE: that
+# script guards one release against a closed set and cannot know how many targets a future config
+# declares. Applied fleet-wide it is too weak — a release that lost four of its five platforms would
+# still read as installable, which is most of the defect this rule exists to catch.
+#
+# 5 is measured, not chosen: of the 107 `vX.Y.Z` Releases in this repo, 99 carry exactly five
+# `flux-cli-<target>.{tar.xz,zip}` archives and the other eight carry zero — and all eight are below
+# INSTALLABLE_SINCE. If a target is ever deliberately dropped, this floor moves and the reason is
+# recorded here; it must not be lowered to make a broken release pass.
+REQUIRED_PLATFORM_ARCHIVES=5
 
 # Releases older than this predate the shipped line: `v0.1.0`, `v0.2.0` and six other pre-0.3 dev-era
 # tags carry Release objects with zero assets, created before cargo-dist hosting existed. They are
@@ -158,15 +173,18 @@ at_least_version() {
 # optional at cut time too (`verify-github-release.sh:57`), and the 16-asset releases before it
 # existed are installable.
 install_asset_gaps() {
-  local names="$1" gaps='' want
+  local names="$1" gaps='' want archives
   while IFS= read -r want; do
     [ -n "$want" ] || continue
     printf '%s\n' "$names" | grep -Fxq "$want" || gaps="$gaps, $want"
   done <<<"$REQUIRED_INSTALL_ASSETS"
-  printf '%s\n' "$names" | grep -Eq '^flux-cli-.+\.tar\.xz$' ||
-    gaps="$gaps, a flux-cli-*.tar.xz archive"
   printf '%s\n' "$names" | grep -Eq '^flux-cli-.+\.zip$' ||
-    gaps="$gaps, a flux-cli-*.zip archive"
+    gaps="$gaps, a flux-cli-*.zip archive (no Windows build)"
+  # Counted, not merely present: losing four of five platforms leaves a release that installs on one
+  # machine and 404s on the rest, and a "has at least one" rule calls that healthy.
+  archives="$(printf '%s\n' "$names" | grep -Ec '^flux-cli-.+\.(tar\.xz|zip)$')"
+  [ "$archives" -ge "$REQUIRED_PLATFORM_ARCHIVES" ] ||
+    gaps="$gaps, platform archives ($archives of $REQUIRED_PLATFORM_ARCHIVES flux-cli targets)"
   printf '%s' "${gaps#, }"
 }
 
@@ -387,26 +405,35 @@ flux-cli-x86_64-pc-windows-msvc.zip.sha256'
       exit 1; }
   done <<<"$REQUIRED_INSTALL_ASSETS"
 
-  # The archive rules are "at least one", deliberately: the target list has changed across releases
-  # and `verify-github-release.sh` requires one of each kind too, so losing a single platform is not
-  # this audit's business — losing the whole platform class is.
+  # The platform archives are COUNTED. Losing a single target is a broken release for everyone on
+  # that platform, and an "at least one archive" rule would have called this healthy.
   got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -Fxv 'flux-cli-x86_64-unknown-linux-gnu.tar.xz')")"
-  [ -z "$got" ] || { fail "self-test: dropping one of five Unix archives reported '$got'"; exit 1; }
+  case "$got" in
+    *"4 of 5"*) ;;
+    *) fail "self-test: dropping one of five platform archives reported '$got', want a 4-of-5 count"; exit 1 ;;
+  esac
   got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -v '^flux-cli-.*\.tar\.xz$')")"
   case "$got" in
-    *tar.xz*) ;;
-    *) fail "self-test: a release with no flux-cli Unix archive at all reported '$got'"; exit 1 ;;
+    *"1 of 5"*) ;;
+    *) fail "self-test: a release with only the Windows archive reported '$got'"; exit 1 ;;
   esac
   got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -Fxv 'flux-cli-x86_64-pc-windows-msvc.zip')")"
   case "$got" in
     *zip*) ;;
     *) fail "self-test: a release with no Windows zip reported '$got'"; exit 1 ;;
   esac
+  # flux-lsp archives must not be counted towards the flux-cli platform floor — they are optional,
+  # and counting them would let a release ship the LSP for five targets and the CLI for one.
+  got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -v '^flux-cli-.*\.tar\.xz$' | grep -v '^flux-cli-.*\.zip$')")"
+  case "$got" in
+    *"0 of 5"*) ;;
+    *) fail "self-test: flux-lsp archives satisfied the flux-cli platform floor (got '$got')"; exit 1 ;;
+  esac
   # A `.sha256` sidecar must never be mistaken for the archive it shadows — that would let a release
   # carrying only checksums pass as installable.
   got="$(install_asset_gaps "$(printf '%s\n' "$v046_assets" | grep -v '\.tar\.xz$' | grep -v '\.zip$')")"
   case "$got" in
-    *tar.xz*) ;;
+    *"0 of 5"*) ;;
     *) fail "self-test: checksum sidecars satisfied the archive requirement (got '$got')"; exit 1 ;;
   esac
 

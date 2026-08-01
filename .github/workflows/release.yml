@@ -106,14 +106,20 @@ jobs:
       # functionality based on whether this is a pull_request, and whether it's from a fork.
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
-      # C-412: this job PLANS. It does not create the GitHub Release.
+      # C-412: this job PLANS, and holds no hosting verb.
       #
-      # It used to run `dist host --steps=create` here, which publishes the Release object in the
-      # first job of the workflow — before a single artifact exists — leaving every job after it
-      # free to fail or skip while a published Release advertises downloads that 404. v0.47.0 is
-      # what that looks like: a Release carrying only `dist-manifest.json`, with `/releases/latest`
-      # pointing at it. Creation now happens in `host`, after the artifacts are downloaded and
-      # attested, immediately before they are uploaded.
+      # ⚠ Read this before assuming the old `dist host --steps=create` here was what published
+      # v0.47.0 — it was not, and that mistake is easy to make twice. In the pinned dist 0.32.0 the
+      # `HostingStyle::Github` arm for `create` is empty, so the call was inert: locally,
+      # `dist host --steps=create --tag=X` and `dist plan --tag=X` emit byte-identical manifests
+      # apart from the build-id string, and running the former against the live repo left v0.47.1's
+      # Release untouched. The Release is created by `gh release create` in the `host` job, and the
+      # real defect is that it published before the artifact set was checked — closed there, not
+      # here.
+      #
+      # `dist plan` is used anyway, for two smaller reasons: a planning job should not hold a verb
+      # that asks to create a public object, and `create` is inert only by an upstream implementation
+      # detail that a future dist version may fill in.
       - id: plan
         env:
           CANDIDATE_VERSION: ${{ inputs.version }}
@@ -405,15 +411,18 @@ jobs:
       id-token: write
     runs-on: "ubuntu-22.04"
     outputs:
-      val: ${{ steps.host.outputs.manifest }}
+      val: ${{ steps.host.outputs.summary }}
     steps:
       # C-412: the first thing this job does is refuse to publish nothing. `if:` above admits
       # `skipped` builds because promoting a prepared candidate legitimately skips them — but with
       # no candidate to promote, `skipped` means this run compiled nothing, and every step below
       # would then create a Release out of an empty artifact directory. That is how v0.47.0 shipped:
       # the builds skipped, `host` ran anyway, and `gh release create` published a Release whose one
-      # asset was `dist-manifest.json`. `verify-github-release.sh` caught it at the very last step,
-      # by which point the Release was public and `/releases/latest` already pointed at it.
+      # asset was `dist-manifest.json`.
+      #
+      # This is the cheap outer check — it reads job results, so it fails in seconds without a
+      # checkout. The `Verify the artifact set before publishing` step below is the one that
+      # inspects the actual bytes; this one exists so the common case fails early and legibly.
       - name: Refuse to publish a release with nothing built
         env:
           CANDIDATE_RUN_ID: ${{ needs.resolve-release-candidate.outputs.run-id }}
@@ -467,19 +476,27 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
-      # `--steps=create` moved here from the `plan` job (C-412). It runs in the same invocation as
-      # `upload` and `release`, after the artifacts above have been fetched — so the Release object
-      # comes into existence at the moment there is something to put in it, instead of at the start
-      # of the workflow. Everything that can fail between planning and publishing now fails with no
-      # Release object created at all, which is the outcome C-47 asked for: no Release is strictly
-      # better than a Release whose downloads 404.
+      # NOTE `--steps` is inert on the GitHub hosting backend in the pinned dist 0.32.0: its
+      # `HostingStyle::Github` arm for `create` is empty ("implemented in CI backend"), and `upload`
+      # and `release` are never read at all. Verified locally — `dist host --steps=create --tag=X`
+      # and `dist plan --tag=X` emit byte-identical manifests apart from the build-id string, and
+      # running it against the live repo left v0.47.1's Release untouched. What this step actually
+      # produces is the manifest the announcement title and body below are read from. The Release is
+      # created by the `gh release create` step further down; do not read these flags as the thing
+      # that publishes.
       - id: host
         shell: bash
         run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --allow-dirty --steps=create --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host ${{ needs.plan.outputs.tag-flag }} --allow-dirty --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          # The job output gets a prose-free projection, for the reason the plan job's does: the full
+          # manifest embeds the release body, and Actions silently discards a job output that matches
+          # a masked secret. This one was voided on the 0.47.0 run too. Nothing consumes it today —
+          # the announcement steps below read the *step* output, which is not subject to that rule —
+          # but leaving a second instance of the hazard in place only waits for a first consumer.
+          echo "summary=$(jq -c '{announcement_tag, announcement_is_prerelease}' dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -522,6 +539,20 @@ jobs:
           # The `dist host` step above wrote the release's own manifest to the workspace root; it
           # is a required release asset, so put it where `gh release create artifacts/*` sees it.
           cp dist-manifest.json artifacts/dist-manifest.json
+      # C-412 — the fix, at the one place that decides whether a broken Release becomes public.
+      #
+      # `Create GitHub Release` below publishes `artifacts/*`, and `Verify GitHub Release` at the end
+      # of this job checks what came out. That order is the defect: on v0.47.0's tag run (attempt 1,
+      # host 12:54:47 → 12:55:08) the create step SUCCEEDED at 12:55:07 with an artifact directory
+      # holding only `dist-manifest.json`, and the verify step then failed — against a Release that
+      # was already public with `/releases/latest` pointing at it. A check after publication can only
+      # report the damage.
+      #
+      # This is the same script, the same asset-set rules, run against the local directory before
+      # anything is uploaded. It sits ahead of the attestation too, so an incomplete set is not
+      # attested either.
+      - name: Verify the artifact set before publishing
+        run: scripts/verify-github-release.sh --staged artifacts
       - name: Attest core release artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:

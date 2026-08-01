@@ -6,7 +6,7 @@ status: in-progress
 priority: 5
 epic: release-trust-residuals
 areas: [ci, docs]
-note: "F6 of the 2026-08-01 security-posture review at 0.47.1, with live proof. `dist host --steps=create` creates the Release in the FIRST job, before any artifact exists; the asset check runs in the LAST. Anything that skips in between leaves a published Release advertising 404s — which is exactly what v0.47.0 shipped"
+note: "F6 of the 2026-08-01 security-posture review at 0.47.1, with live proof. `gh release create` publishes the Release and the asset check runs one step LATER in the same job, so a run that built nothing publishes first and discovers it afterwards — which is exactly what v0.47.0 shipped. (The review's `dist host --steps=create` mechanism was measured during implementation and is inert on dist 0.32.0's GitHub backend.)"
 ---
 
 # A Release is created before anything is built
@@ -20,6 +20,18 @@ Make an asset-less published Release impossible, or detected — not allowlisted
 artifact exists**. `verify-github-release.sh`, which does check the asset set and the attestations,
 runs only in the **host** job at the very end (`release.yml:479`). Anything that fails or skips in
 between leaves a published Release advertising downloads that 404.
+
+> ⚠ **CORRECTION, measured during implementation — the paragraph above is wrong about the
+> mechanism, and the conclusion survives it.** `dist host --steps=create` does **not** create the
+> Release: in the pinned dist 0.32.0 its `HostingStyle::Github` arm is empty, and `--steps=upload`
+> and `--steps=release` are never read at all. `dist host --steps=create --tag=v0.47.1` and
+> `dist plan --tag=v0.47.1` emit manifests differing by two lines, both the build-id string, and
+> running the former against the live repo left v0.47.1's Release untouched. The Release is created
+> by **`gh release create` inside the `host` job**, which then verifies the result in the *same job,
+> one step later* — so the ordering defect is real but sits one level down. v0.47.0's tag run has
+> `run_attempt: 2`; attempt 1's `host` ran 12:54:47 → 12:55:08 and the Release published at 12:55:07
+> inside it. Everything the Goal asks for still holds: a published Release must not be able to
+> advertise 404s. See Progress.
 
 ⚠ **This is not hypothetical — v0.47.0 shipped exactly that.** Candidate run `30700607303` concluded
 **success** with `build-local-artifacts`, `build-global-artifacts`, `record-release-candidate` and
@@ -48,10 +60,11 @@ nothing.
       PASSes when the same tag is given v0.46.0's 28.
 - [x] `check-release-tags.sh` compares **asset counts**, not just tag existence, so an already-published
       assetless Release is detected fleet-wide.
-      → `install_asset_gaps` (`scripts/check-release-tags.sh:160`) compares asset *names*, and
-      reports the count in the failure text. Names rather than a count because the shipped set has
-      been 16, 27 and 28 assets across history and all three are installable; the failure line still
-      leads with "1 asset(s)", which is the fact a human recognises.
+      → `install_asset_gaps` (`scripts/check-release-tags.sh:174`) compares asset *names* for the
+      exactly-named requirements and *counts* the platform archives (`5 of 5`, measured: 99 of the
+      107 Releases carry exactly five and the other eight carry zero, all below the floor). Names
+      rather than one total count because the shipped set has been 16, 27 and 28 assets and all
+      three install; the failure line still leads with "1 asset(s)".
 - [x] A candidate run that builds nothing cannot report a usable `success`: either the workflow fails
       when its build jobs skip while `preparing`, or the receipt is the only signal anything trusts.
       → `record-release-candidate` now runs whenever the workflow is preparing and fails if either
@@ -59,9 +72,13 @@ nothing.
       on those builds, so a run that built nothing skipped it and concluded `success`.
 - [x] ⚠ Decide whether the Release object should be created **after** artifacts exist rather than in
       the first job. That is the root cause; the checks above are detection.
-      → **Decided: yes, moved.** `--steps=create` is gone from `plan` (`release.yml:122`) and joins
-      `upload`/`release` in the `host` job (`release.yml:479`), after the artifacts are fetched and
-      attested. See Progress for the reasoning and the residual risk.
+      → **The premise was wrong, and the answer is better than the one it asked for.** The Release
+      was never created in the first job: `dist host --steps=create` is inert on dist 0.32.0's GitHub
+      backend. It is created by `gh release create` in `host` — which already ran after the artifact
+      download, and then verified the result *afterwards*. So the ordering defect is one level down,
+      inside `host`, and the fix is to verify the artifact set **before** publishing it:
+      `scripts/verify-github-release.sh --staged artifacts` now runs ahead of both the attestation
+      and the create step. See Progress for the evidence and for the earlier wrong answer.
 - [x] `v0.47.0`'s allowlist entry is revisited — kept with a stated reason, or removed once the guard
       makes it unnecessary.
       → **Kept, and given the reason it never had.** The entry was undocumented; the comment block
@@ -70,9 +87,11 @@ nothing.
       that were never compiled.
 - [x] The check has a `--self-test`, like its siblings, and is verified to fire.
       → `check-release-tags.sh --self-test` gains rule 3's fixtures, all taken from real listings
-      (v0.47.0's 1, v0.3.0's 16, v0.27.0's 27, v0.46.0's 28). `check-release-integrity.sh --self-test`
-      gains three bad fixtures that revert each half of the workflow fix; each was run standalone and
-      shown to abort with its own message, not on incidental YAML damage.
+      (v0.47.0's 1, v0.3.0's 16, v0.27.0's 27, v0.46.0's 28). `verify-github-release.sh --self-test`
+      gains staged-mode fixtures driven through the real entry point against real directories on
+      disk. `check-release-integrity.sh --self-test` gains five bad fixtures; each was run standalone
+      and shown to abort with **its own** message over a YAML file that still parses, changing 2, 4,
+      8, 27 and 2 lines respectively — no incidental damage.
 
 ## Notes
 
@@ -95,34 +114,62 @@ nothing.
   Consequence for this story: **the trigger is arbitrary prose in a CHANGELOG entry.** No targeted
   fix to the plan step could be trusted, which is why the fix is four independent layers rather
   than one.
-- The tag run (`30700632185`) then did the rest: plan created/refreshed the Release again, builds
-  skipped again, `host` ran because its `if:` tolerates `skipped`, downloaded nothing, and step 13
-  `Create GitHub Release` **succeeded** — publishing the Release with `dist-manifest.json` as its
-  only asset. Step 14, `verify-github-release.sh`, failed. The last line of defence fired exactly
-  as designed and was still too late by one step.
-- **The call on creating the Release after artifacts exist: yes.** `--steps=create` moved out of
-  `plan` and into the `host` job's existing `dist host` invocation, beside `upload` and `release`.
-  Reasoning: nothing on either path needs hosting state before `host` — the build matrix comes from
-  the manifest, the build jobs take `--tag` directly, `record-release-candidate` only writes a
-  receipt, and the installer download URLs are derived from the tag (github hosting), not from the
-  Release object. Detection alone was rejected because it leaves the object published: a check can
-  tell you `/releases/latest` is broken, it cannot un-point it.
-  ⚠ **Residual risk, stated rather than hidden: this path cannot be executed without cutting a
-  release.** What is verified is that `dist plan --tag=vX.Y.Z` yields the same 5-target
-  `artifacts_matrix` the build matrix consumes, and that it keeps the tag/version validation
-  (`--tag=v9.9.9` fails with *"This workspace doesn't have anything for dist to Release!"*). What is
-  **not** verified is `dist host --steps=create --steps=upload --steps=release` as a single
-  invocation. If dist rejects it, the failure mode is a red `host` job with **no Release object
-  created at all** — the safe direction, and the one C-47 asks for.
+- ⚠ **The first attempt at this story blamed the wrong mechanism, and the correction is the useful
+  part of the record.** It claimed the Release was created in the `plan` job by
+  `dist host --steps=create` and "fixed" it by moving that flag. **In dist 0.32.0 that call creates
+  nothing**: its `HostingStyle::Github` arm is empty, and `upload`/`release` are never read at all.
+  Measured on this branch — `dist host --steps=create --tag=v0.47.1` and `dist plan --tag=v0.47.1`
+  emit manifests that differ by **two lines, both the build-id string** (`plan:all:` vs
+  `host:create:all:`); hosting URLs, `artifacts_matrix` and the announcement block are identical.
+  Running it against the live repo left v0.47.1's Release untouched (28 assets, `published_at`
+  unchanged). Moving an inert flag fixed nothing, and asserting otherwise in a permanent gate would
+  have misled the next person to trip it.
+- **The real publisher is `gh release create` in the `host` job, and it runs before the verifier.**
+  The v0.47.0 tag run (`30700632185`) has `run_attempt: 2`; attempt 1's `host` ran 12:54:47 →
+  12:55:08, and the Release published at **12:55:07 — inside it**. So the sequence is: `host`
+  downloads artifacts, `gh release create` publishes them, and *then* `verify-github-release.sh`
+  checks what came out. On that run the artifact directory held only `dist-manifest.json`; the
+  create step **succeeded**, the verify step failed, and the Release was already public with
+  `/releases/latest` pointing at it. The later "already exists; refreshing assets with `--clobber`"
+  log is attempt 2, a manual re-run, not the publisher.
+- **The fix is therefore at that step, not at the job boundary.**
+  `scripts/verify-github-release.sh` gains a `--staged <dir>` mode that applies the same asset-set
+  rules to the local directory about to be uploaded, and `host` runs it ahead of both the
+  attestation and the create step. Same script, same rules, moved to where it can prevent rather
+  than report. Proven both ways against real data: a staged directory holding v0.46.0's real 28
+  filenames is *publishable: 28 file(s), 14 executable*; one holding only `dist-manifest.json` fails
+  with *missing required asset(s): flux-cli-installer.sh flux-cli-installer.ps1 sha256.sum*.
+  The core-asset list is now one function called by both modes, so the pre- and post-publication
+  checks cannot drift apart.
+- `dist plan --tag=` is kept in the planning job, but for the smaller reasons only, now stated as
+  such: a planning job should not hold a verb asking to create a public object, and `create` is
+  inert by an upstream implementation detail a future dist may fill in. `--steps=create` was
+  **reverted** out of the `host` invocation — adding an ignored flag bought nothing and asserted a
+  false mechanism.
 - The `plan` job's `val` output now carries only `ci.github.artifacts_matrix` and
   `ci.github.pr_run_mode` — the only two fields any consumer reads — instead of the whole manifest.
   20884 bytes of manifest including the release prose becomes 1826 bytes with none, so it cannot
   collide with a secret mask again. The full manifest is still uploaded as the
   `artifacts-plan-dist-manifest` artifact, which is how the build jobs actually consume it.
-- `scripts/check-release-integrity.sh` locks the new shape structurally. release.yml is
-  cargo-dist-generated and `dist generate` writes `--steps=create` back into `plan`, so the ordering
-  is a gate rather than a comment.
+- The same hazard had a **second instance**: `host.outputs.val` was fed the unfiltered manifest and
+  was voided by the same rule on the 0.47.0 run. Nothing consumes it today — the announcement steps
+  read the *step* output, which job-output masking does not touch — so it is filtered to
+  `{announcement_tag, announcement_is_prerelease}` rather than left as a trap for a first consumer.
+- `scripts/check-release-integrity.sh` locks the shape structurally, because release.yml is
+  cargo-dist-generated and `dist generate` rewrites it. The invariant it now asserts is the true
+  one: **the pre-publication asset check exists, is unconditional, and sits above both the
+  attestation and the create step** — plus the post-publication verifier still sits below it. The
+  earlier version asserted `--steps=create/upload/release` on the host invocation, i.e. flags dist
+  0.32.0 ignores entirely; that assertion is gone. The plan-job rule is narrowed from "no
+  `dist host` at all" to "no `--steps=create`", so a legitimate `--steps=check` preflight stays
+  possible, and its abort text says outright that this is forward-defence and not the mechanism
+  that published v0.47.0.
 - Rule 3 has a version floor, `INSTALLABLE_SINCE=v0.3.0`, not an allowlist: eight pre-0.3 dev-era
   Release objects (v0.1.0, v0.1.1, v0.2.0, v0.2.5–v0.2.8, v0.2.16) carry zero assets and predate
   cargo-dist hosting. Every `vX.Y.Z` at or after v0.3.0 is held to the full rule with no exceptions
   and nowhere to add one; the live audit passes over all 107 released version tags.
+- Rule 3 counts platform archives rather than requiring "at least one of each kind". The looser rule
+  is right for `verify-github-release.sh`, which guards one release against a closed set and cannot
+  know how many targets a future config declares — but fleet-wide it would call a release that lost
+  four of its five platforms installable. `REQUIRED_PLATFORM_ARCHIVES=5` is measured from the fleet,
+  not chosen, and the self-test pins that `flux-lsp` archives do not count towards it.
