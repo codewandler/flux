@@ -72,8 +72,13 @@ abort "attestation subject must be artifacts/*" unless attest_step.fetch("with",
 release_index = steps.index { |step| step["name"] == "Create GitHub Release" }
 abort "host has no Create GitHub Release step" unless release_index
 abort "artifacts are attested only after publication" unless attest_index < release_index
+# The post-publication verifier specifically: it is the mode that checks provenance attestations,
+# which only exist once the assets are downloadable. `--staged` is the same script in its
+# pre-publication mode and is asserted separately below — matching it here would satisfy this check
+# with a step that never verifies an attestation at all.
 verify_index = steps.index do |step|
-  step.fetch("run", "").include?("scripts/verify-github-release.sh")
+  run = step.fetch("run", "")
+  run.include?("scripts/verify-github-release.sh") && !run.include?("--staged")
 end
 abort "host has no post-publication provenance verifier" unless verify_index && verify_index > release_index
 
@@ -84,6 +89,54 @@ install_jobs.each do |name|
   step = install_steps.fetch(0)
   abort "#{name} bypasses the verified release-tooling installer" unless step["run"] == "scripts/install-release-tooling.sh"
 end
+
+# C-412 — the asset set is verified BEFORE it is published, not only after.
+#
+# `Create GitHub Release` publishes `artifacts/*` and the post-publication verifier then reports on
+# what came out. On v0.47.0's tag run the create step succeeded with a directory holding only
+# `dist-manifest.json` and the verifier failed afterwards, against a Release that was already public
+# with `/releases/latest` pointing at it. The pre-publication check is what makes that unreachable,
+# so its position relative to the create step is the invariant — a check that drifts below the create
+# step is the defect, not a style regression.
+staged_index = steps.index do |step|
+  step.fetch("run", "").match?(/scripts\/verify-github-release\.sh\s+--staged/)
+end
+abort "host does not verify the artifact set before publishing it (C-412)" unless staged_index
+abort "the pre-publication asset check runs after the Release is created" unless staged_index < release_index
+abort "the pre-publication asset check runs after the attestation" unless staged_index < attest_index
+abort "the pre-publication asset check may not be conditional or disabled" if steps.fetch(staged_index).key?("if")
+
+# The planning job may inspect hosting (`--steps=check`) but may not ask to create it. In the pinned
+# dist 0.32.0 `--steps=create` is inert on the GitHub backend — it is NOT what published v0.47.0, and
+# anyone reading this check should not conclude that it was. It is forbidden because a planning job
+# should not hold a verb that asks to create a public object, and because `create` is inert only by
+# an upstream implementation detail that a future dist may fill in.
+jobs.fetch("plan").fetch("steps").each do |step|
+  next unless step.fetch("run", "").match?(/dist\s+host\b[^\n]*--steps=create/)
+  abort "the plan job asks dist to create hosting; planning may inspect it (--steps=check) but not create it (C-412)"
+end
+
+# ...and no job may publish without first establishing that the builds ran. `host`'s own `if:`
+# tolerates skipped build jobs because promoting a prepared candidate legitimately skips them, so
+# "skipped" has to be told apart from "nothing was built" inside the job, before publication.
+build_results = %w[build-local-artifacts build-global-artifacts].map { |job| "needs.#{job}.result" }
+checks_build_results = lambda do |step|
+  text = [step.fetch("run", ""), step.fetch("env", {}).values.join("\n")].join("\n")
+  build_results.all? { |reference| text.include?(reference) }
+end
+guard_index = steps.index { |step| checks_build_results.call(step) }
+abort "host never checks whether the build jobs actually ran" unless guard_index
+abort "host checks the build results only after publishing" unless guard_index < release_index
+
+# The preparation half of the same defect: a candidate run whose builds skipped must FAIL, not skip
+# its way to a green `success` that a human then reads as "ready to tag".
+candidate = jobs.fetch("record-release-candidate")
+build_results.each do |reference|
+  next unless candidate.fetch("if", "").include?(reference)
+  abort "record-release-candidate gates itself on #{reference}, so a run that builds nothing skips silently (C-412)"
+end
+abort "record-release-candidate does not fail when the build jobs did not run" unless
+  candidate.fetch("steps").any? { |step| checks_build_results.call(step) }
 RUBY
 }
 
@@ -112,8 +165,55 @@ if [ "${1:-}" = "--self-test" ]; then
     echo "self-test accepted an attestation that existed only as a decoy comment" >&2
     exit 1
   fi
+
+  # C-412. Each fixture below reverts one part of the fix.
+  #
+  # 1. The pre-publication asset check removed, leaving only the post-publication one — the ordering
+  #    that let v0.47.0 become public before anything checked what was in it.
+  grep -v 'verify-github-release.sh --staged' "$semantic_good" |
+    grep -v 'name: Verify the artifact set before publishing' >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a host job that publishes before checking the artifact set" >&2
+    exit 1
+  fi
+  # 1b. ...and the same check present but demoted below the create step, which is the way this
+  #     regresses in practice: a step gets moved, not deleted.
+  awk '
+    /- name: Verify the artifact set before publishing/ { hold=1; buf=$0 "\n"; next }
+    hold==1 { buf=buf $0 "\n"; hold=2; next }
+    /- name: Verify GitHub Release/ { printf "%s", buf; buf="" }
+    { print }
+  ' "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a pre-publication asset check demoted below the create step" >&2
+    exit 1
+  fi
+  # 2. The planning job asking dist to create hosting again.
+  sed 's/dist plan --tag=/dist host --steps=create --tag=/' "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a hosting-create verb in the plan job" >&2
+    exit 1
+  fi
+  # 3. The host job publishing without first distinguishing "candidate promoted" from "nothing built".
+  awk '
+    /- name: Refuse to publish a release with nothing built/ { in_guard=1 }
+    in_guard && /^      - uses: actions\/checkout@/ { in_guard=0 }
+    !in_guard { print }
+  ' "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a host job that publishes without checking the build results" >&2
+    exit 1
+  fi
+  # 4. The candidate receipt gating itself on the builds, so a run that builds nothing skips quietly.
+  sed "s/^    if: \${{ always() && needs.plan.outputs.preparing == 'true' && needs.plan.result == 'success' }}/    if: \${{ always() \&\& needs.plan.outputs.preparing == 'true' \&\& needs.build-local-artifacts.result == 'success' \&\& needs.build-global-artifacts.result == 'success' }}/" \
+    "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a candidate receipt that skips instead of failing when nothing built" >&2
+    exit 1
+  fi
+
   scripts/verify-github-release.sh --self-test
-  echo "PASS self-test: unauthenticated bootstrap and structural attestation regressions rejected"
+  echo "PASS self-test: unauthenticated bootstrap and structural attestation/release-ordering regressions rejected"
   exit 0
 fi
 
