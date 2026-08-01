@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The credential boundary now covers the endpoint broker's discovery path** (C-403). C-312 put the
+  boundary on the projected-tool path and `flux plugin call`; the broker reached `call_with_host`
+  twice with no check on the result. Proven by a test where the credential arrives through the broker
+  unfiltered at the merge base — the literal bearer token in an `EndpointCandidate`'s `reasons`
+  string, not a proxy assertion. The session redactor is now wired through, so the registered-value
+  pass can catch the deployment's own session bearer echoed back as shapeless prose that no shape
+  recogniser would see; its test asserts both directions, a fresh redactor accepting and the session
+  redactor refusing, so the refusal cannot be a heuristic that would have fired anyway.
+  **The scope statement is now a census, not a summary** — all five non-test `call_with_host` sites
+  are named, exempt ones included, because an unlisted site is indistinguishable from a forgotten
+  one. The first attempt at this claimed four and omitted the `plugin.validate` preflight, which is
+  precisely the site the `internal: true` carve-out exists to excuse; that carve-out is load-bearing
+  for exactly one call site, not for none.
+  ⚠ `secret.read` stays exempt **by purpose**: a credential-shaped response is its success case, so
+  checking it would fire on success and pass on failure. What bounds it is the value's disposition —
+  operator grants, first-use approval, and a result that never reaches a transcript or the endpoint
+  registry — not its shape.
+  ⚠ A refused provider yields **zero endpoints and a log line**; the broker logs-and-skips a failing
+  provider by design. Pinning the census with a lint rather than prose is filed as C-404.
+
 - **`each x in "a->b"` now parses** (L-115). The `each` header was lowered by scanning *reconstructed
   header text*, so a `->` inside a string literal was read as the collect arrow and the statement was
   refused with a misleading ``unexpected text after `each collect` ``. Any `each` whose source

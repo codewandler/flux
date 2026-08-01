@@ -2,8 +2,7 @@
 id: C-403
 title: "The endpoint broker calls `call_with_host` without the credential boundary, and the boundary's scope statement does not cover it"
 pillar: Core
-status: in-progress
-priority: 9
+status: done
 epic: connector-platform
 areas: [flux-capabilities, flux-plugin]
 note: "found by C-312's review. C-312 puts the boundary on the projected-tool path and on `flux plugin call`, and its module header excuses only a host-dispatched `internal: true` op — but `kubernetes.endpoint.discover` is declared with `read_op_typed`, not `internal_op`, so the carve-out does not actually cover the site that skips the check. Scope-statement gap, not a demonstrated leak"
