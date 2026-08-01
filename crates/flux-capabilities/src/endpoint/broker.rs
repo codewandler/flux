@@ -392,8 +392,18 @@ impl CredentialReader for HostCredentialReader {
         // location only, and hands the value to host code and the redactor — never to a tool
         // result, a transcript or the endpoint registry. A weak `EndpointRef` never carries it.
         //
-        // If you arrived here to make this symmetrical with `discover`: don't. Tighten
+        // If you arrived here to make the RESULT frame symmetrical with `discover`: don't. Tighten
         // `resolve_credential_for`'s gate instead.
+        //
+        // **The error frame is a different question, and the argument above does not cover it.** A
+        // vendor 401 body is not "the credential material this op exists to return" — it is the
+        // same out-of-jail text `discover` runs `scrub_error` over, and it lands in the string
+        // `resolve_credential_for` propagates. It is left unscrubbed here only because doing so
+        // would be unobservable: `scrub_error` no-ops unless the op declares `platform`, and no op
+        // in the tree declares `platform` on a `secret.read` (nor is one a coherent thing to ship —
+        // a platform-sourced op by definition does not hand flux credentials). If one ever appears,
+        // wrap this `map_err` in `credential_boundary::scrub_error`, which needs a redactor on
+        // `HostCredentialReader` that it does not have today. That is the whole change.
         let result = {
             let mut host = entry.host.lock().await;
             host.call_with_host(&op, payload, entry.caps.as_ref())

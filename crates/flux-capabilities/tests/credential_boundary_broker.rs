@@ -1,10 +1,11 @@
 //! C-403 — the endpoint broker is a **second** plugin-response ingest surface.
 //!
 //! C-312 put the credential boundary where `call_with_host` returns on the projected-tool path and
-//! on `flux plugin call`. Two other call sites reach `call_with_host`, and both live here in L5:
-//! [`HostProviderInvoker::discover`] and `HostCredentialReader::read`. The boundary's scope
-//! statement excused exactly one class — a host-dispatched `internal: true` op — which does not
-//! describe either of them.
+//! on `flux plugin call`. Two of the tree's remaining `call_with_host` sites live here in L5 —
+//! [`HostProviderInvoker::discover`] and `HostCredentialReader::read` — and the boundary's scope
+//! statement excused exactly one class, a host-dispatched `internal: true` op, which describes
+//! neither. (The full five-site census is in that module's header; the third unlisted site was
+//! `flux plugin call --dry-run`'s `plugin.validate` preflight, which the carve-out does cover.)
 //!
 //! These tests drive the same `platform_plugin` fixture C-312 uses, through the broker's fan-out
 //! rather than through a tool. The fixture is hostile on demand for the same reason it is there:
@@ -30,6 +31,10 @@ use serde_json::Value;
 const VENDOR_TOKEN: &str = concat!("xoxb", "-3141592653-2718281828-abcdefghijklmnopqrstuvwx");
 /// The prefix-less 40-character form, identified only by the property name it sits under.
 const UNMARKED_VENDOR_SECRET: &str = "wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY0";
+/// The deployment session bearer the fixture echoes back in its `leak-discover-bearer` mode.
+/// Shapeless on purpose — see the fixture, and
+/// [`the_session_bearer_is_refused_only_by_a_redactor_that_has_it_registered`].
+const SESSION_BEARER: &str = "connectors-session-bearer-0a1b2c3d4e5f";
 
 /// The product the fixture declares in its manifest `discovers`.
 const PRODUCT: &str = "zendesk";
@@ -140,7 +145,13 @@ impl Provider {
     /// Fan a discovery query at the fixture through the production invoker — the exact seam
     /// `EndpointBroker::discover` drives.
     async fn discover(&self) -> Result<String, String> {
-        let invoker = HostProviderInvoker::new(self.registry.clone());
+        self.discover_with(HostProviderInvoker::new(self.registry.clone()))
+            .await
+    }
+
+    /// The same query through a caller-built invoker, so a test can choose which redactor the
+    /// boundary is evaluated against.
+    async fn discover_with(&self, invoker: HostProviderInvoker) -> Result<String, String> {
         invoker
             .discover("platform", PRODUCT, &Value::Null, None, None, 10)
             .await
@@ -208,6 +219,55 @@ async fn a_platform_sourced_discovery_carrying_a_vendor_credential_is_refused() 
             "mode `{mode}`: a refused discovery still forwarded its candidates: {refusal}"
         );
     }
+}
+
+/// **The one production behaviour `HostProviderInvoker::with_redactor` exists for.**
+///
+/// The deployment's own session bearer is the single secret flux holds on this seam. Echoed back
+/// inside a vendor response it has no business being there — and it is the case *no shape heuristic
+/// can see*: the fixture emits it as free prose in a match `reason`, with no vendor prefix and no
+/// secret-naming property above it. Only the redactor's registered-value pass can refuse it, and
+/// that pass can only fire on a redactor that carries the session's registrations.
+///
+/// Both halves are asserted, and the first is what gives the second its meaning:
+///
+/// 1. with the `HostProviderInvoker::new` default — a **fresh** redactor, nothing registered — the
+///    response is accepted. That is the control proving the refusal below is the registered pass
+///    doing the work rather than a shape recogniser that would have caught it either way;
+/// 2. with the session redactor installed via `with_redactor`, the same response is refused.
+///
+/// Delete the `with_redactor` call in `flux-cli`'s `assemble_integrations` and the production path
+/// silently becomes case 1. This test is what makes that a red gate rather than a quiet downgrade.
+#[tokio::test]
+async fn the_session_bearer_is_refused_only_by_a_redactor_that_has_it_registered() {
+    let provider = Provider::load("bearer", "leak-discover-bearer").await;
+
+    let fresh = provider
+        .discover_with(HostProviderInvoker::new(provider.registry.clone()))
+        .await
+        .expect("a fresh redactor has nothing registered, so nothing here can see the bearer");
+    assert!(
+        fresh.contains(SESSION_BEARER),
+        "the fixture did not emit the bearer this test asserts about, so the refusal below would \
+         prove nothing: {fresh}"
+    );
+
+    let redactor = flux_secret::Redactor::new();
+    redactor
+        .try_add_secret(SESSION_BEARER)
+        .expect("the fixture bearer must clear the registration floor");
+    let refusal = provider
+        .discover_with(HostProviderInvoker::new(provider.registry.clone()).with_redactor(redactor))
+        .await
+        .expect_err("the session bearer coming back must be refused");
+    assert!(
+        !refusal.contains(SESSION_BEARER),
+        "the refusal leaked the bearer: {refusal}"
+    );
+    assert!(
+        !refusal.contains("example.zendesk.com"),
+        "a refused discovery still forwarded its candidates: {refusal}"
+    );
 }
 
 /// The positive control: an honest deployment's candidates still reach the broker. A boundary that

@@ -72,18 +72,25 @@
 //!   defeats shape matching. The seam's answer to a hostile deployment is not this check — it is
 //!   that the operator started the deployment and holds its credentials; see
 //!   `../flux-connectors/docs/designs/connectors-app.md` on the carve-out.
+//!
 //! # Where the check runs — every call site, named (C-403)
 //!
-//! Four places in the tree call `PluginHost::call_with_host`. The scope statement lists all four,
-//! because C-312's original wording ("the projected-tool path and `flux plugin call`") described
-//! less than the tree contained, and its one carve-out did not cover the site it left out.
+//! C-312's wording ("the projected-tool path and `flux plugin call`") described less than the tree
+//! contained, and its one carve-out did not cover the site it left out. So this is a census rather
+//! than a summary. **Five** non-test call sites reach `PluginHost::call_with_host`; the table lists
+//! all five, exempt ones included, because an unlisted site is indistinguishable from a forgotten
+//! one.
 //!
 //! | Call site | Boundary |
 //! |---|---|
-//! | `host/loading.rs` — the projected-tool path | **runs** |
+//! | `flux-plugin`'s `host/loading.rs` — the projected-tool path | **runs** |
 //! | `flux-cli`'s `plugin_cmd.rs` — `flux plugin call` | **runs** (fresh redactor; see there) |
+//! | `flux-cli`'s `plugin_cmd.rs` — the `plugin.validate` preflight | **exempt**, `internal: true` |
 //! | `flux-capabilities`' `broker.rs` — `endpoint.discover` fan-out | **runs** (C-403) |
 //! | `flux-capabilities`' `broker.rs` — `secret.read` | **exempt, by purpose** |
+//!
+//! `PluginHost::call` (`loading.rs`) delegates to `call_with_host` with `DenyHostCaps`; it is a
+//! self-delegation with no non-test caller, not a sixth surface.
 //!
 //! **`secret.read` is exempt because its purpose is the thing this boundary refuses.** It is how a
 //! discovered endpoint's `credential_ref` becomes a usable value, so a credential-shaped response
@@ -96,14 +103,27 @@
 //!
 //! **The `internal: true` carve-out, re-checked against the ops that exist.** C-312 excused a
 //! host-dispatched `internal: true` op on the grounds that it is never advertised to the model and
-//! its result goes to host code. That carve-out is currently **load-bearing for nothing**: the only
-//! `internal: true` op anywhere in the tree is `plugin.validate`, which `host-kit`'s builder
-//! auto-injects into every plugin manifest and which answers `{operation, valid, problems}`. No
-//! shipped plugin declares one of its own. `internal_op` is public, so a plugin *could* — the
-//! credential-returning `aws-bedrock.auth` shape `host-kit`'s docs describe is a design sketch, not
-//! a plugin in this repository. Stated as a fact about today's tree rather than as a standing
-//! excuse: if a plugin ever ships a platform-sourced `internal: true` op, this carve-out is the
-//! first thing to re-derive rather than to inherit.
+//! its result goes to host code, "not to a log or a transcript". That carve-out is **load-bearing
+//! for exactly one call site**: the `plugin.validate` preflight in `flux plugin call --dry-run`.
+//!
+//! Half of C-312's stated grounds does not hold there, and pretending otherwise is what this census
+//! exists to prevent: the preflight's result does *not* stay inside host code. Its plugin-authored
+//! `problems`/`warnings` strings are lifted into the `--dry-run` verdict and printed to stdout, and
+//! its error frame is printed to stderr — the same operator-scrollback surface C-312 cites forty
+//! lines further down as the reason `flux plugin call` needs the check at all. What holds is the
+//! other half: it is never advertised to the model, so nothing there reaches a transcript.
+//!
+//! **Why that is not a live hole, stated as a mechanism rather than a hope.** `plugin.validate` is
+//! injected by `host-kit`'s builder via `internal_op`, which takes `..OperationSpec::default()` and
+//! therefore `PlatformSourcing::None` — so this boundary would be a no-op on that site even if it
+//! ran. The gap is narrower than the carve-out and worth naming precisely: a plugin that speaks the
+//! raw NDJSON protocol without `host-kit` may declare its own `plugin.validate` with `platform`
+//! set, and *that* response would print unchecked. Nothing in the tree does; nothing prevents it.
+//!
+//! `internal_op` is public, so a plugin could also ship a credential-returning internal op of its
+//! own — the `aws-bedrock.auth` shape `host-kit`'s docs describe is a design sketch, not a plugin
+//! in this repository. If one ever ships, this carve-out is the first thing to re-derive rather
+//! than to inherit.
 
 use super::*;
 use flux_secret::{is_opaque_material, names_a_secret, Redactor};

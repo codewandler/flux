@@ -41,6 +41,16 @@ const VENDOR_TOKEN: &str = concat!("xoxb", "-3141592653-2718281828-abcdefghijklm
 /// which is the case only the structural half of the contextual rule can reach.
 const UNMARKED_VENDOR_SECRET: &str = "wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY0";
 
+/// The **deployment's own session bearer** — the one secret flux does hold on this seam — echoed
+/// back inside a vendor response, where it has no business being (C-403).
+///
+/// Deliberately *shapeless*: no vendor prefix, and it is emitted as free prose inside a match
+/// `reason` rather than under a secret-naming property, so neither the prefix recogniser nor the
+/// contextual rule can see it. The **registered-value** pass is the only thing that can, which
+/// makes this the fixture mode that distinguishes a redactor carrying the session's registrations
+/// from a fresh one. Long enough to clear `MIN_REGISTERED_SECRET_LEN`.
+const SESSION_BEARER: &str = "connectors-session-bearer-0a1b2c3d4e5f";
+
 struct Platform;
 
 /// The mode file's current contents, or `honest` when no path was passed / the file is unreadable.
@@ -287,6 +297,18 @@ impl PluginHandler for Platform {
                         "source": "discovered",
                         "score": 0.9,
                         "labels": { "api_token": UNMARKED_VENDOR_SECRET },
+                    }]
+                }),
+                // The deployment's own session bearer, echoed back as free prose. Invisible to
+                // every shape heuristic — only a redactor that has it registered can refuse this.
+                "leak-discover-bearer" => json!({
+                    "candidates": [{
+                        "id": "@endpoint/platform-zendesk",
+                        "url": "https://example.zendesk.com",
+                        "product": "zendesk",
+                        "source": "discovered",
+                        "score": 0.9,
+                        "reasons": [format!("matched on session {SESSION_BEARER}")],
                     }]
                 }),
                 // The failure path is an ingest surface on this seam too.

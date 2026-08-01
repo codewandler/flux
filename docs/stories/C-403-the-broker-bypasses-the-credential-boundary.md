@@ -46,16 +46,20 @@ wider than its enforcement is exactly the thing that decays into a real hole.
       scope statement is corrected to name this site and say precisely why it is exempt. Whichever is
       chosen, the reason is recorded at the definition, not in a commit message.
       → **Both.** The boundary runs (`crates/flux-capabilities/src/endpoint/broker.rs`, in
-      `HostProviderInvoker::discover`) *and* the scope statement now names all four
-      `call_with_host` call sites in a table (`crates/flux-plugin/src/host/credential_boundary.rs`).
+      `HostProviderInvoker::discover`) *and* the scope statement now names all **five** non-test
+      `call_with_host` call sites in a table, exempt ones included
+      (`crates/flux-plugin/src/host/credential_boundary.rs`).
 - [x] **`secret.read` is decided separately and explicitly.** It is the one op whose *purpose* is to
       return credential material to host code, so refusing a credential-shaped response there would
       be wrong. Say so at the call site, so the next reader does not "fix" it.
       → `HostCredentialReader::read` in `broker.rs`, and mirrored in the boundary's scope statement.
 - [x] The `internal: true` carve-out is re-checked against the ops that actually exist — if no
       shipped op relies on it, the carve-out should say that rather than describe a hypothetical.
-      → It relies on nothing: the only `internal: true` op in the tree is `plugin.validate`,
-      auto-injected by `host-kit`. The carve-out now says so.
+      → The Acceptance's conditional turns out **not** to hold: one shipped site does rely on it —
+      `flux plugin call --dry-run`'s `plugin.validate` preflight
+      (`crates/flux-cli/src/plugin_cmd.rs:517`). The carve-out now says that, and says which half of
+      C-312's stated grounds fails there (the result is printed to operator scrollback, so it is not
+      "host code only"; it is still never model-advertised).
 - [x] Full gate green in both workspaces.
 
 ## Notes
@@ -97,6 +101,30 @@ wider than its enforcement is exactly the thing that decays into a real hole.
   only `internal: true` op in the tree is `plugin.validate`, which `host-kit`'s builder auto-injects
   into every manifest and which answers `{operation, valid, problems}`. No shipped plugin declares
   one of its own; `host-kit`'s `aws-bedrock.auth` example is a design sketch, not a plugin here.
+- **REWORK round, 2026-08-01 — the census I wrote was wrong and is corrected.** The first pass
+  claimed four `call_with_host` call sites and that the `internal: true` carve-out was "load-bearing
+  for nothing". Both were false, and the falsification is the same fact: `plugin_cmd.rs:517`
+  dispatches `plugin.validate` in the `--dry-run` path and I had omitted it. It is production code
+  (that file's only `#[cfg(test)]` is at :2196) and its result is not confined to host code —
+  plugin-authored `problems`/`warnings` are lifted at :533-534 and printed to stdout at :558, and
+  its error frame is printed at :536-541. So the carve-out is load-bearing for exactly one live
+  site, and the boundary's scope statement now says so, including *which* half of C-312's grounds
+  fails there. This is the story's own defect class reproduced inside the fix: a written scope that
+  disagrees with the tree — narrower this time, which is worse, because it drops a site silently.
+  The correction states the residual reach as a mechanism, not a hope: `host_kit::internal_op` takes
+  `..OperationSpec::default()`, so `PlatformSourcing::None`, so the check would no-op on that site
+  even if it ran; only a plugin bypassing `host-kit` and declaring its own platform-sourced
+  `plugin.validate` could print unchecked, and nothing in the tree does.
+  (`loading.rs:197` is `PluginHost::call` self-delegating with `DenyHostCaps` — no non-test caller,
+  not a sixth surface.)
+- **Also in the rework round:** `with_redactor` gained the coverage it was missing
+  (`the_session_bearer_is_refused_only_by_a_redactor_that_has_it_registered`), built on a new
+  `leak-discover-bearer` fixture mode that emits a *shapeless* session bearer as free prose — so the
+  registered-value pass is the only recogniser that can catch it, and the fresh-redactor half of the
+  test is the control that proves so. And `secret.read`'s exemption comment now states explicitly
+  that it covers the **result** frame only, why the error frame is nonetheless left unscrubbed today
+  (`scrub_error` would no-op — no op declares `platform` on a `secret.read`), and what to change if
+  one ever appears.
 - The C-312 fixture (`crates/flux-plugin/src/bin/platform_plugin.rs`) was extended rather than
   duplicated: it now declares `discovers: ["zendesk"]` and a platform-sourced `endpoint.discover`,
   with `leak-discover` / `leak-discover-unmarked` / `leak-discover-error` modes and a
