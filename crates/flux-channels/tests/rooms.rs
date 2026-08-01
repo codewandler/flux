@@ -237,6 +237,96 @@ fn the_xmpp_backend_builds_from_a_decl_and_needs_an_endpoint() {
     );
 }
 
+/// D-208 — **the no-sidecar path, and what keeps that claim honest.**
+///
+/// "Text and presence work with the media sidecar absent" is, on its own, an assertion nothing can
+/// fail: no room channel ever spawned a browser. What makes it a test is the second half — a
+/// declared `media` block is answered *by name*, never silently discarded — because the way this
+/// invariant actually breaks is not "text stopped working", it is "media was configured, text kept
+/// working, and nobody was told the media half went nowhere". Before D-208 `RoomSettings` carried
+/// no `media` field at all, so serde dropped the whole block and the channel built clean.
+///
+/// No browser is involved on either arm, and none is on `PATH` for either: the undeclared arm never
+/// reaches a spawn seam at all, and the declared arm only *builds* a channel — nothing is executed,
+/// and the sidecar argv below names a path that does not exist.
+#[tokio::test]
+async fn room_text_works_without_media_sidecar() {
+    /// Answers every delivery with one line, so the reply path is observable in `room.said()`.
+    struct Answering;
+    #[async_trait]
+    impl Deliverer for Answering {
+        async fn deliver(&self, _label: &str, _payload: Value) -> anyhow::Result<Vec<JourneyRun>> {
+            Ok(vec![JourneyRun {
+                journey: "answer".into(),
+                result: "the build is green".into(),
+                steps: 1,
+                usage: None,
+                model: "mock".into(),
+            }])
+        }
+    }
+
+    // --- the half that must keep working: presence in, text in, text out, leave ------------------
+    let (timo, ada) = occupants();
+    let room = Arc::new(
+        MockRoom::new("standup@rooms.example")
+            .with_occupant(timo.clone())
+            .with_occupant(ada.clone())
+            .script(vec![
+                said(&ada, "morning"),
+                said(&timo, "flux: is the build green?"),
+                RoomEvent::Ended,
+            ]),
+    );
+    let channel = RoomChannel::with_room(
+        &decl(json!({ "backend": "mock", "room": "standup@rooms.example" })),
+        room.clone(),
+    )
+    .expect("a room channel with no `media` declared builds");
+    let d: Arc<dyn Deliverer> = Arc::new(Answering);
+    channel
+        .start(d, CancellationToken::new())
+        .await
+        .expect("the text session runs to Ended with no sidecar anywhere");
+
+    assert_eq!(
+        room.said(),
+        vec!["the build is green".to_string()],
+        "the addressed turn was answered back into the room"
+    );
+    assert!(room.has_left(), "the session left the room");
+    let present = room.occupants().await.unwrap();
+    assert!(
+        present.iter().any(|o| o.id == timo.id) && present.iter().any(|o| o.id == ada.id),
+        "presence survived the whole session: {present:?}"
+    );
+
+    // --- the half that keeps the first half honest ------------------------------------------------
+    let with_media = decl(json!({
+        "backend": "mock",
+        "room": "standup@rooms.example",
+        "media": { "sidecar": ["/nonexistent/flux-room-media"] },
+    }));
+
+    #[cfg(not(feature = "room-media"))]
+    {
+        // Built without the feature: the declaration is refused by name. Silently ignoring it would
+        // leave an operator believing a sidecar is running because text is.
+        let err = build_error(with_media);
+        assert!(err.contains("standup"), "names the channel: {err}");
+        assert!(
+            err.contains("room-media"),
+            "names the cargo feature the operator has to build with: {err}"
+        );
+    }
+    #[cfg(feature = "room-media")]
+    {
+        // Built with the feature: the declaration is accepted and validated, and still nothing is
+        // spawned until the channel starts.
+        build_channels(&[with_media]).expect("a declared sidecar builds with the feature on");
+    }
+}
+
 #[tokio::test]
 async fn a_room_that_dies_mid_meeting_ends_its_channel_but_not_the_host() {
     // The posture D-205 decided, asserted at the seam that implements it: `flux_channels::serve` ends

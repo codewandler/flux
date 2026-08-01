@@ -32,7 +32,12 @@ use tokio_util::sync::CancellationToken;
 use flux_flow::voice::{RoomTranscript, Speaker, VoiceReply, VoiceTurnHandler};
 use flux_lang::program::ChannelDecl;
 
+#[cfg(feature = "room-media")]
+use flux_system::System;
+
 use crate::config::{RoomSettings, DEFAULT_ROOM_NICK};
+#[cfg(feature = "room-media")]
+use crate::rooms::media::{MediaPeer, MediaSidecarConfig, MediaStream, SidecarMediaPeer};
 use crate::rooms::{
     AddressRule, BraveTalkTokens, JaasConfig, JaasRoom, MockRoom, ReplyBudget, Room, RoomIdentity,
     RoomSessionEnd, RoomTurnDriver, XmppConfig, XmppMucRoom, DEFAULT_ROOM_REPLY_BUDGET,
@@ -47,6 +52,10 @@ pub struct RoomChannel {
     address_rule: AddressRule,
     reply_budget: usize,
     reply_window: Duration,
+    /// The optional media sidecar (D-208), `None` unless the declaration opted in. Validated at
+    /// load; nothing is spawned until [`Channel::start`].
+    #[cfg(feature = "room-media")]
+    media: Option<MediaSidecarConfig>,
 }
 
 impl RoomChannel {
@@ -118,6 +127,19 @@ impl RoomChannel {
             Some(secs) => Duration::from_secs(secs),
             None => DEFAULT_ROOM_REPLY_WINDOW,
         };
+        // D-208's opt-in, and the reason it is *two* gates rather than one. The cargo feature says
+        // this flux can drive a media sidecar at all; the declaration says this room should. A
+        // declaration the build cannot honour is refused by name here rather than dropped, because
+        // the way this fails in the wild is an operator watching text work and concluding media is
+        // working too.
+        #[cfg(not(feature = "room-media"))]
+        if settings.media.is_some() {
+            anyhow::bail!(
+                "channel `{}`: `media` is declared but this flux was built without the \
+                 `room-media` cargo feature — text and presence still work, media does not",
+                decl.name
+            );
+        }
         Ok(Self {
             name: decl.name.clone(),
             identity: RoomIdentity::agent(nick),
@@ -125,7 +147,71 @@ impl RoomChannel {
             address_rule,
             reply_budget: settings.reply_budget.unwrap_or(DEFAULT_ROOM_REPLY_BUDGET),
             reply_window,
+            #[cfg(feature = "room-media")]
+            media: settings
+                .media
+                .as_ref()
+                .map(|media| {
+                    MediaSidecarConfig::from_settings(media)
+                        .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", decl.name))
+                })
+                .transpose()?,
         })
+    }
+
+    /// The media sidecar this channel would start, or `None` when the declaration did not opt in.
+    #[cfg(feature = "room-media")]
+    pub fn media(&self) -> Option<&MediaSidecarConfig> {
+        self.media.as_ref()
+    }
+
+    /// Start the media sidecar, if one was declared, and join it to the room.
+    ///
+    /// **Returns `None` on every failure, and that is the contract** (D-208): a sidecar that would
+    /// not start, would not handshake, or would not join is a media outage, not a room outage. It is
+    /// reported under the channel's name and the meeting continues with text and presence — the same
+    /// posture this adapter already takes for a failed delivery, and for the same reason: there are
+    /// people in the room.
+    ///
+    /// The peer is returned so it stays alive for the session; dropping it kills the sidecar.
+    #[cfg(feature = "room-media")]
+    async fn start_media(&self) -> Option<(Arc<SidecarMediaPeer>, MediaStream)> {
+        let config = self.media.as_ref()?.clone();
+        let program = config.argv.first().cloned().unwrap_or_default();
+        // The workspace this flux is already confined to. `spawn_interactive` pins the child's cwd
+        // to it and clears the environment — see `rooms::media::sidecar` for what that means for a
+        // sidecar that needs to find the host's audio server.
+        let system = match std::env::current_dir()
+            .map_err(|e| flux_core::Error::Other(e.to_string()))
+            .and_then(System::from_env)
+        {
+            Ok(system) => system,
+            Err(e) => {
+                eprintln!("channel `{}`: room media is off — {e}", self.name);
+                return None;
+            }
+        };
+        let peer = match SidecarMediaPeer::spawn(&system, config).await {
+            Ok(peer) => Arc::new(peer),
+            Err(e) => {
+                eprintln!("channel `{}`: room media is off — {e}", self.name);
+                return None;
+            }
+        };
+        match peer.join(self.room.id(), &self.identity).await {
+            Ok(stream) => {
+                eprintln!(
+                    "channel `{}`: room media sidecar `{program}` joined {}",
+                    self.name,
+                    self.room.id()
+                );
+                Some((peer, stream))
+            }
+            Err(e) => {
+                eprintln!("channel `{}`: room media is off — {e}", self.name);
+                None
+            }
+        }
     }
 }
 
@@ -142,6 +228,11 @@ impl Channel for RoomChannel {
             deliverer: d,
             overheard: Mutex::new(RoomTranscript::new()),
         };
+        // Media first, and deliberately *before* the text session rather than inside it: whatever it
+        // returns, the session below runs. `None` is a media outage that has already been reported.
+        // The peer is held for the whole session — dropping it kills the sidecar (`kill_on_drop`).
+        #[cfg(feature = "room-media")]
+        let media = self.start_media().await;
         // The posture, decided explicitly (D-205). `crate::serve` treats a channel error as fatal to
         // the whole process, so the two failures are separated here rather than collapsed:
         //
@@ -152,18 +243,53 @@ impl Channel for RoomChannel {
         //   nothing else is: a schedule and a webhook in the same program must not go down with it.
         //   Logged under the channel's name and ended, the same posture this adapter already takes
         //   for a failed delivery.
-        match RoomTurnDriver::new(self.room.clone(), self.identity.clone())
+        let ended = RoomTurnDriver::new(self.room.clone(), self.identity.clone())
             .with_address_rule(self.address_rule.clone())
             .with_reply_budget(ReplyBudget::new(self.reply_budget, self.reply_window))
             .run(&handler, &cancel)
-            .await
-        {
+            .await;
+
+        #[cfg(feature = "room-media")]
+        self.stop_media(media).await;
+
+        match ended {
             Err(e) => Err(anyhow::anyhow!("channel `{}`: {e}", self.name)),
             Ok(RoomSessionEnd::Failed(e)) => {
                 eprintln!("channel `{}`: the room session ended: {e}", self.name);
                 Ok(())
             }
             Ok(RoomSessionEnd::Ended) => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "room-media")]
+impl RoomChannel {
+    /// Leave the media plane and report what the session shed.
+    ///
+    /// A failure here is logged, never returned: the text session has already ended, and a sidecar
+    /// that cannot say goodbye is not a reason to fail a channel. The peer is dropped afterwards,
+    /// which kills the process whatever it decided about `leave`.
+    async fn stop_media(&self, media: Option<(Arc<SidecarMediaPeer>, MediaStream)>) {
+        let Some((peer, stream)) = media else {
+            return;
+        };
+        // D-208 ships the seam, not a consumer — D-209 (audio in) is what reads this stream. Until
+        // it does, inbound audio is shed by the bounded queue exactly as designed, and saying so is
+        // more useful than a silence an operator would read as "no audio arrived".
+        let dropped = stream.dropped_audio_frames();
+        if dropped > 0 {
+            eprintln!(
+                "channel `{}`: room media shed {dropped} inbound audio frames — nothing consumes \
+                 them yet (D-209)",
+                self.name
+            );
+        }
+        if let Err(e) = peer.leave().await {
+            eprintln!(
+                "channel `{}`: the media sidecar did not leave: {e}",
+                self.name
+            );
         }
     }
 }
