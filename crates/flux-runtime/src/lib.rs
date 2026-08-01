@@ -711,6 +711,51 @@ impl TurnIdentity {
         Self { caller, trust }
     }
 
+    /// The identity of an **unauthenticated participant** on a surface that names its principals
+    /// without verifying them — a meeting-room occupant, and any future surface where the only
+    /// thing flux knows about the speaker is a stable handle the surface minted (C-408).
+    ///
+    /// # The trust level is decided here, and it is `Untrusted`
+    ///
+    /// This is the one place the level is assigned, so the reasoning lives with it rather than at
+    /// each call site. A participant on such a surface presented no credential: the surface can say
+    /// *which* stranger spoke, never that the stranger is anyone in particular. `Untrusted` is the
+    /// floor of [`TrustLevel`](flux_policy::TrustLevel) and the only honest level for that claim —
+    /// and it is emphatically not the [`Privileged`](flux_policy::TrustLevel::Privileged) an
+    /// executor's assembly-time local identity carries, which is what a plain `run_turn` would have
+    /// handed a room stranger.
+    ///
+    /// **`kind` stays [`User`](flux_policy::CallerKind::User)** — the participant is a person, and
+    /// downgrading it to `Agent` would silently change which grants match
+    /// (`flux_policy::subject_matches` keys on `principal.kind` alongside the id). Against
+    /// `flux_policy::default_local_grants`, whose subject is `User`/`*` at `required_trust:
+    /// Untrusted`, this identity therefore authorizes exactly what the local profile already did:
+    /// today the change is **attribution only**. The point is the first grant that keys on a
+    /// principal or a trust level — it will see a stranger as a stranger instead of as the operator.
+    ///
+    /// `name` is deliberately the id again, not the surface's display name: a room nick is
+    /// non-unique and speaker-chosen, and an identity record is the wrong place to carry a value
+    /// two principals can both claim. Surfaces that want the display name put it in the payload.
+    pub fn unauthenticated_participant(id: impl Into<String>, source: impl Into<String>) -> Self {
+        let id = id.into();
+        Self {
+            caller: Caller {
+                principal: flux_policy::Principal {
+                    name: id.clone(),
+                    id,
+                    kind: PolicyCallerKind::User,
+                },
+                groups: Vec::new(),
+                source: source.into(),
+            },
+            trust: Trust {
+                kind: flux_policy::TrustKind::Invocation,
+                level: flux_policy::TrustLevel::Untrusted,
+                scopes: Vec::new(),
+            },
+        }
+    }
+
     pub fn caller(&self) -> &Caller {
         &self.caller
     }
@@ -6632,6 +6677,48 @@ mod tests {
         async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
             Ok(ToolResult::ok("read"))
         }
+    }
+
+    /// C-408 — the trust level an unauthenticated participant receives is a decision, and this pins
+    /// it. A remote occupant arriving at `Privileged` is the bug the constructor exists to prevent,
+    /// and `Untrusted` is not merely "not privileged": it is the floor, so no future `required_trust`
+    /// above the floor is satisfied by a principal nobody authenticated.
+    ///
+    /// The `kind` assertion is here for the opposite reason — it must NOT change. `subject_matches`
+    /// discriminates on `principal.kind`, so flipping it to `Agent` would silently move a room turn
+    /// out of every `user`-subject grant, which is a capability change wearing an attribution
+    /// change's clothes.
+    #[test]
+    fn an_unauthenticated_participant_is_named_but_never_trusted() {
+        let ada = TurnIdentity::unauthenticated_participant("standup@rooms.example/ada", "room");
+
+        assert_eq!(ada.caller().principal.id, "standup@rooms.example/ada");
+        assert_eq!(ada.caller().source, "room");
+        assert_eq!(ada.caller().principal.kind, CallerKind::User);
+        assert!(ada.caller().groups.is_empty(), "a stranger holds no groups");
+
+        assert_eq!(ada.trust().level, TrustLevel::Untrusted);
+        // Enumerated rather than asserted against `Privileged` alone: `Untrusted` has to be below
+        // *every* other level, or some future `required_trust` is satisfied by a stranger.
+        for higher in [
+            TrustLevel::Verified,
+            TrustLevel::Privileged,
+            TrustLevel::System,
+        ] {
+            assert!(
+                ada.trust().level < higher,
+                "an unauthenticated participant sits below {higher:?}"
+            );
+        }
+        assert!(
+            ada.trust().scopes.is_empty(),
+            "an unauthenticated participant holds no scopes"
+        );
+
+        // Two occupants are two principals — the whole point of a request-owned identity.
+        let mallory =
+            TurnIdentity::unauthenticated_participant("standup@rooms.example/mallory", "room");
+        assert_ne!(ada.caller().principal.id, mallory.caller().principal.id);
     }
 
     /// A lexical turn identity governs policy and approval context without mutating the executor's

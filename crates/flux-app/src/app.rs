@@ -34,6 +34,7 @@ use flux_provider::{Effort, Provider};
 use flux_runtime::{
     scope_runtime_turn, AllowApprover, Approver, DenyApprover, ExecutionAuthorization,
     ExecutionEnvironment, Executor, PermissionManager, Tool, ToolContext, ToolRegistry, ToolResult,
+    TurnIdentity,
 };
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
@@ -1588,10 +1589,19 @@ impl Engine {
             _ => event_context(label, payload),
         };
         let mut sink = RecordingSink::default();
-        engine
-            .run_turn(&session_id, &input, &mut sink)
-            .await
-            .map_err(other)?;
+        // C-408: a room is a multi-principal surface, so the turn runs under the *speaker's*
+        // request-owned identity rather than under whatever identity the executor was assembled
+        // with. Every other event source names no principal and keeps the assembly-time identity —
+        // the same `Some`/`None` shape `flux-server` uses for its authenticated vs. open modes.
+        match room_participant_identity(payload) {
+            Some(identity) => {
+                engine
+                    .run_turn_as(&session_id, &input, &mut sink, identity)
+                    .await
+            }
+            None => engine.run_turn(&session_id, &input, &mut sink).await,
+        }
+        .map_err(other)?;
         // C-33: the engine's own provider + model IS the driving engine spec for this run — unlike a
         // plain journey, an agent-bound trigger has exactly one engine, so there is no aggregation
         // question here.
@@ -1992,6 +2002,82 @@ const MANDATORY_LINE_BREAKS: [char; 7] = [
     '\u{2028}', // LINE SEPARATOR — likewise
     '\u{2029}', // PARAGRAPH SEPARATOR — likewise
 ];
+
+/// The request-owned caller identity for one delivery — `Some` for a room message, `None` for every
+/// event source that names no principal (C-408).
+///
+/// # Why the room path needs one
+///
+/// `AGENTS.md`'s identity invariant: *caller identity is immutable for a live turn, and
+/// multi-principal surfaces pass a request-owned [`TurnIdentity`] through
+/// `run_turn_as`/`run_turn_cancellable_as`.* A meeting room is the most multi-principal surface flux
+/// has — N occupants, the agent addressed by almost none of them — and until C-408 it used plain
+/// `run_turn`, which snapshots the executor's assembly-time identity. Under `flux app run` that is
+/// `ExecutionAuthorization::local()`: `local` at `Privileged`. Every occupant's turn was therefore
+/// attributed to the operator, and two strangers were indistinguishable in the evidence record.
+///
+/// # What identifies a participant
+///
+/// [`flux_flow::voice::Speaker`]'s id — the stable, surface-owned handle (an XMPP occupant JID),
+/// which the room adapter puts in the payload's `speaker`. Not the `nick`: a MUC nick is
+/// speaker-chosen and explicitly non-unique, so two occupants can claim one, and it is the very
+/// value C-407 had to fence out of flux's framing.
+///
+/// # The boundary is the payload, and what that costs
+///
+/// A channel wakes the program through `Deliverer::deliver(label, payload)`; the payload is the only
+/// thing that crosses. Carrying the identity **out of band** — a second `deliver` parameter threaded
+/// through the bus and the cascade — would be the stronger boundary, because the payload is
+/// untrusted on the surfaces that build it from a request body. It is also a change to a trait with
+/// a dozen implementors and to `App::deliver`'s signature, which C-408 does not sanction; the story
+/// asks for the identity the invariant already requires, derived from the `speaker` that is already
+/// there.
+///
+/// So the residual, stated plainly: the principal id here is **asserted by the payload**. Another
+/// surface can present this shape — the webhook adapter decodes a request body straight into a
+/// `Value`, and a journey can `emit` a cascade event with fields of its own choosing. Which is
+/// precisely why the level is [`Untrusted`](flux_runtime::TurnIdentity::unauthenticated_participant)
+/// and the source says `room`: **this id is an attribution, not an authentication**, and a grant
+/// that ever keys on a principal id must read the trust level beside it before believing the name.
+///
+/// What that residual does and does not guarantee, in the two dimensions separately — because
+/// "strictly less authority, never more" is true in one of them and **false** in the other:
+///
+/// - **Trust: strictly less, always.** `Untrusted` is the floor of `TrustLevel`, so no grant's
+///   `required_trust` is newly satisfied by anything that arrives through here. A forgery can only
+///   lose a turn authority it would have had as the assembly-time `Privileged` identity.
+/// - **Subject: not less, and it can be *different*.** `flux_policy::subject_matches`
+///   (`crates/flux-policy/src/lib.rs:276`) compares a `user` subject against `principal.id` by
+///   wildcard, so a grant `subjects = [user "alice"]` at `required_trust: Untrusted` **is**
+///   satisfied by a payload claiming `speaker: "alice"` and is **not** satisfied by `local`. That
+///   is authority the assembly-time identity did not hold.
+///
+/// Nothing in this tree is reachable that way: `flux app run` is hardwired to
+/// `ExecutionAuthorization::local()`, whose grants are subject `user "*"` at `required_trust:
+/// Untrusted`, so every principal authorizes identically — which is the same fact that makes C-408
+/// attribution-only today. It becomes reachable for an embedder that installs an id-keyed grant
+/// through [`App::try_with_execution_environment`], because a model-chosen `emit` payload reaches
+/// `run_agent` through the bus. **The fix for that embedder is out-of-band identity, not a narrower
+/// payload rule** — no predicate over an untrusted payload can make an asserted id an authenticated
+/// one.
+fn room_participant_identity(payload: &Value) -> Option<TurnIdentity> {
+    // Both fields, not just `speaker`: this is the room adapter's payload shape (`crates/
+    // flux-channels/src/adapters/room.rs`), and matching it structurally keeps a future surface that
+    // happens to name a `speaker` from silently inheriting a `room` attribution. The room-side half
+    // — that these two fields are emitted, and that two occupants sharing a nick still get two
+    // speakers — is pinned in `crates/flux-channels/tests/rooms.rs`, since flux-channels depends on
+    // flux-app and not the other way round.
+    let field = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let speaker = field("speaker")?;
+    field("room")?;
+    Some(TurnIdentity::unauthenticated_participant(speaker, "room"))
+}
 
 /// Synthesize a turn input for an `agent`-bound trigger whose event carries no user `text` (a `startup`
 /// or a schedule tick, vs. a Slack mention). The agent's system prompt says what to do per event; this
@@ -3838,6 +3924,205 @@ trigger t
             after.contains("Act according to your instructions"),
             "flux's own imperative is outside the fence, after it: {turn}"
         );
+    }
+
+    /// C-408 (F2 of the 2026-08-01 security-posture review). A room is a multi-principal surface:
+    /// `AGENTS.md`'s identity invariant says such a surface passes a **request-owned**
+    /// `TurnIdentity` through `run_turn_as`. Before C-408 the room path used plain `run_turn`, which
+    /// snapshots the executor's assembly-time identity — so every occupant's turn was attributed to
+    /// the local operator (`local`, `Privileged`) in the evidence record, and two different
+    /// strangers were one principal.
+    ///
+    /// The assertion is deliberately about *two* speakers rather than about one id: a single
+    /// delivery could be made to read the right thing by any per-turn label, whereas "two speakers
+    /// are two principals" is the property the record has to carry.
+    #[tokio::test]
+    async fn two_room_speakers_are_two_caller_identities_in_the_evidence_record() {
+        const ADA: &str = "standup@rooms.example/ada";
+        const MALLORY: &str = "standup@rooms.example/mallory";
+
+        let src = "\
+agent host
+  description \"run the standup\"
+  tools []
+
+trigger t
+  on \"standup\"
+  run _
+  agent host
+";
+        let provider: Arc<dyn Provider> = Arc::new(EchoProvider);
+        let app = App::with_options(program(src), Some(provider), "mock", false);
+        for speaker in [ADA, MALLORY] {
+            let runs = app
+                .deliver(
+                    "standup",
+                    json!({
+                        "room": "standup@rooms.example",
+                        "text": "what is the status?",
+                        "speaker": speaker,
+                        // The nick is explicitly non-unique in a MUC — both occupants claim it, so a
+                        // record keyed on the display name would collapse them back into one.
+                        "nick": "ada",
+                        "name": "standup",
+                    }),
+                )
+                .await
+                .expect("deliver");
+            assert_eq!(runs.len(), 1);
+        }
+
+        // Both deliveries woke the same cached agent engine, so its executor's evidence log holds
+        // both turns' `turn.identity` observations.
+        let identities = turn_identities(&app, "host").await;
+        assert_eq!(identities.len(), 2, "one identity per turn: {identities:?}");
+
+        assert_ne!(
+            identities[0]["caller"], identities[1]["caller"],
+            "two room speakers are two callers in the evidence record: {identities:?}"
+        );
+        assert_eq!(identities[0]["caller"], json!(ADA), "{identities:?}");
+        assert_eq!(identities[1]["caller"], json!(MALLORY), "{identities:?}");
+
+        // The trust level is a decision, not an inheritance: an occupant of a room anyone can join
+        // is unauthenticated, and must not arrive holding the local operator's `privileged`.
+        for identity in &identities {
+            assert_eq!(
+                identity["trust"]["level"],
+                json!("untrusted"),
+                "a room occupant is unauthenticated: {identity:?}"
+            );
+            assert_eq!(
+                identity["source"],
+                json!("room"),
+                "the record says where the attribution came from: {identity:?}"
+            );
+        }
+    }
+
+    /// The `turn.identity` observations one agent engine recorded, oldest first. This log *is* the
+    /// evidence record C-408's contract is written against, so every identity pin below reads it
+    /// through here rather than asserting on a turn's reply text.
+    async fn turn_identities(app: &App, agent: &str) -> Vec<Value> {
+        app.agent_engine(agent)
+            .await
+            .expect("agent engine")
+            .executor
+            .evidence()
+            .by_kind("turn.identity")
+            .map(|o| o.data.clone())
+            .collect()
+    }
+
+    /// The two-line program every identity pin below drives: one agent, one trigger on `label`.
+    fn identity_program(agent: &str, label: &str) -> Program {
+        program(&format!(
+            "agent {agent}\n  description \"watch\"\n  tools []\n\ntrigger t\n  on \"{label}\"\n  run _\n  agent {agent}\n"
+        ))
+    }
+
+    /// The other half of C-408's contract: only a surface that *names* a principal gets a
+    /// request-owned identity. A schedule tick names nobody, so its turn keeps the executor's
+    /// immutable assembly-time identity — `ExecutionAuthorization::local()` — exactly as before.
+    /// Without this pin, "derive an identity from the payload" could quietly become "derive one from
+    /// every payload", and a `startup` trigger would start reporting a principal nobody asserted.
+    #[tokio::test]
+    async fn an_event_that_names_no_principal_keeps_the_assembly_time_identity() {
+        let provider: Arc<dyn Provider> = Arc::new(EchoProvider);
+        let app = App::with_options(
+            identity_program("monitor", "schedule"),
+            Some(provider),
+            "mock",
+            false,
+        );
+        app.deliver("schedule", json!({ "at": "2026-08-01T09:00:00Z" }))
+            .await
+            .expect("deliver");
+
+        let identities = turn_identities(&app, "monitor").await;
+        assert_eq!(identities.len(), 1, "{identities:?}");
+        assert_eq!(identities[0]["caller"], json!("local"), "{identities:?}");
+        assert_eq!(
+            identities[0]["trust"]["level"],
+            json!("privileged"),
+            "{identities:?}"
+        );
+    }
+
+    /// `room_participant_identity` matches the room adapter's payload **shape** — `room` *and*
+    /// `speaker`, both non-empty strings — and this enumerates the near-misses that must not be
+    /// mistaken for it. Each case is here because deleting one clause of that function leaves the
+    /// two tests above green:
+    ///
+    /// - **`speaker` with no `room`** is the pin for requiring both. Without it, dropping the `room`
+    ///   check is invisible, and any future surface that happens to name a `speaker` would silently
+    ///   inherit a `room` attribution — an identity asserting a provenance it does not have.
+    /// - **A malformed `speaker`** (absent, non-string, empty, whitespace-only) is the pin for the
+    ///   *fail-open direction*, and it is the uncomfortable one. Every other bad input here loses a
+    ///   turn authority; this one **gains** it, because falling back to plain `run_turn` means
+    ///   falling back to the operator's `local`/`Privileged`. Failing closed instead — refusing the
+    ///   delivery — would let one malformed field silence a live meeting, which D-205's posture
+    ///   rejects for rooms. So the direction is accepted and pinned rather than left to be
+    ///   rediscovered.
+    ///
+    /// The room surface cannot produce a malformed `speaker` today: on the XMPP/JaaS backends an
+    /// `OccupantId` is minted only from a stanza whose `from` parses as a bare JID equal to the room's
+    /// (`crates/flux-channels/src/rooms/xmpp/session.rs:476`), so it is non-empty by construction.
+    /// If that ever stops holding, this test is where the consequence is written down.
+    #[tokio::test]
+    async fn a_payload_that_is_not_the_room_shape_gets_no_participant_identity() {
+        let cases = [
+            (
+                "a speaker with no room is not a room participant",
+                json!({ "speaker": "standup@rooms.example/ada", "text": "hi" }),
+            ),
+            (
+                "a room with no speaker names nobody",
+                json!({ "room": "standup@rooms.example", "text": "hi" }),
+            ),
+            (
+                "a non-string speaker is not an id",
+                json!({ "room": "standup@rooms.example", "speaker": 42, "text": "hi" }),
+            ),
+            (
+                "an empty speaker is not an id",
+                json!({ "room": "standup@rooms.example", "speaker": "", "text": "hi" }),
+            ),
+            (
+                "a whitespace-only speaker is not an id",
+                json!({ "room": "standup@rooms.example", "speaker": "   ", "text": "hi" }),
+            ),
+            (
+                "an empty room is not a surface",
+                json!({ "room": "", "speaker": "standup@rooms.example/ada", "text": "hi" }),
+            ),
+        ];
+
+        for (what, payload) in cases {
+            let provider: Arc<dyn Provider> = Arc::new(EchoProvider);
+            let app = App::with_options(
+                identity_program("host", "standup"),
+                Some(provider),
+                "mock",
+                false,
+            );
+            app.deliver("standup", payload.clone())
+                .await
+                .expect("deliver");
+
+            let identities = turn_identities(&app, "host").await;
+            assert_eq!(identities.len(), 1, "{what}: {identities:?}");
+            assert_eq!(
+                identities[0]["caller"],
+                json!("local"),
+                "{what} — the turn keeps the assembly-time identity: {identities:?}"
+            );
+            assert_eq!(
+                identities[0]["trust"]["level"],
+                json!("privileged"),
+                "{what} — and its assembly-time trust with it: {identities:?}"
+            );
+        }
     }
 
     /// Splits on **every** mandatory Unicode line break, not just the LF and CRLF that
