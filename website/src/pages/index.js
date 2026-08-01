@@ -6,16 +6,17 @@ import ThemedImage from '@theme/ThemedImage';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 
 const HERO_FLOW = `flow triage-failures -> String
-  $status = git_status()
-  $tests  = cargo_test({args: ["--workspace"]})
+  status = git_status()
+  tests = cargo_test(args: ["--workspace"])
 
-  ctx $pack
+  ctx pack
     purpose "explain the failing tests"
     budget 9000
-    include $status, $tests
+    include status, tests
 
-  $diagnosis = ai.reason({ask: "Likely cause?", ctx: $pack})
-  return $diagnosis`;
+  diagnosis = ai.reason(ask: "Likely cause?", ctx: pack)
+  return diagnosis
+`;
 
 function Card({title, children, to}) {
   return (
@@ -52,8 +53,10 @@ export default function Home() {
                 />
               </h1>
               <p className="hero-copy">
-                The model compiles a request into a typed Flux-Lang plan. A Rust runtime executes
-                that plan through authorization, approval, and guarded IO.
+                Provider-native typed stages interpret intent and propose literal calls inside an
+                authored Flux-Lang loop. The host freezes effects into action batches and runs them
+                through authorization, approval, and guarded IO. The default loop never asks the
+                model for per-turn executable Flux.
               </p>
               <div className="hero-actions">
                 <Link className="button button--primary button--lg" to="/docs/tutorial">

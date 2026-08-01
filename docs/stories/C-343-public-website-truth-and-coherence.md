@@ -110,7 +110,7 @@ product behavior as part of the copy edit.
   The final corpus contains 125 parser/formatter-fixed-point Flux fences; the Docusaurus build emits
   74 unique sidebar documents; and Lychee 0.24.2 reports 678/678 links healthy.
 - 2026-08-01 — verified `cargo build --workspace`, clippy with warnings denied, formatting,
-  `flux-codegate`, all 23 website contracts, both guarded language sync suites, and the production
+  `flux-codegate`, all 25 website contracts, both guarded language sync suites, and the production
   site build. `cargo test --workspace` passed the C-343 suite and stopped only on the independently
   introduced `flux-lsp` root-example census (16 current examples versus its committed expectation of
   15); C-343 does not touch that example or test.

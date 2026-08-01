@@ -5,8 +5,9 @@ description: "Reuse deterministic Flux-Lang behavior through project/global flow
 
 # Saved flows and custom operations
 
-Saved flows let people and agents reuse a reviewed Flux-Lang plan without asking a model to compile
-it again. Composite operations let a module give a meaningful name to a reusable sub-flow.
+Saved flows let people and agents invoke reviewed, authored Flux-Lang control flow without inferring
+its structure again on every turn. Composite operations let a module give a meaningful name to a
+reusable sub-flow.
 
 ## The flows home
 
@@ -29,7 +30,7 @@ op repo-state -> String
   return git_status()
 
 flow release-note(version: String) -> String
-  $status = repo-state()
+  status = repo-state()
   return fmt("release {version}\n\n{status}")
 ```
 
@@ -62,8 +63,10 @@ flow unavailable.
 
 ## Register an operation during a turn
 
-`op.register({source, scope, replace?, expose?})` accepts source containing exactly one top-level
-composite `op`, analyzes it against the live operation catalog, and installs it only if valid.
+`op.register` is the explicit, narrow source-generation seam in the conversational agent. An agent
+may propose source for exactly one top-level composite `op`; the host does not execute that source on
+receipt. `op.register({source, scope, replace?, expose?})` parses and analyzes the definition against
+the live operation catalog, then installs it only if it is valid for the requested scope.
 
 | Scope | Lifetime / storage |
 |---|---|
@@ -72,10 +75,11 @@ composite `op`, analyzes it against the live operation catalog, and installs it 
 | `project` | persisted as `.flux/ops/<name>.flux` |
 | `global` | persisted in the configured global ops root (`~/.flux/ops`) |
 
-Session scope is the safe default for agent-created vocabulary. Project/global scopes are guarded
+Session scope is the safe default for agent-proposed vocabulary. Project/global scopes are guarded
 filesystem writes. `replace` must be explicit when a name already exists. `expose` overrides the
-declaration's `expose` metadata: exposed ops enter model-stage catalogs; unexposed ops remain callable by
-other declarations that already know their name.
+declaration's `expose` metadata: exposed ops enter model-stage catalogs; unexposed ops remain callable
+by other declarations that already know their name. Wherever the definition lives, each inner call
+still crosses authorization, approval, and guarded IO.
 
 For authored, reviewed definitions, prefer committing them under `.flux/flows/`; reserve
 `op.register` for vocabulary created as part of an active session.

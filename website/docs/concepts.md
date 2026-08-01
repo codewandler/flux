@@ -11,14 +11,20 @@ before the agent, language, or security guides; the rest of the docs use this vo
 
 ## Authored control, not model-generated code
 
-A flux turn is driven by an authored Flux-Lang outer loop. Models perform bounded semantic work
-inside typed stages and call capability-scoped native operations; they do not generate executable
-Flux. The host captures proposed effects into an action batch, and the runtime records and executes
-only an approved batch.
+A flux turn is driven by an authored Flux-Lang outer loop. Inside provider-native typed stages, the
+model interprets intent, gathers evidence, and proposes literal calls to visible operations. The host
+captures effectful proposals and freezes them into an immutable action batch; only an approved batch
+is recorded and executed.
+
+The default conversational loop does not ask the model for per-turn executable Flux. A separate,
+explicit [`op.register`](./agent/saved-flows.md#register-an-operation-during-a-turn) operation may
+accept exactly one agent-proposed composite operation, but the host analyzes, scopes, and guards that
+source before installing it. It extends the available vocabulary; it does not replace the authored
+outer loop.
 
 ## Symbols, not raw output
 
-Flux-Lang flows refer to symbols such as `$src` or `$tests`. A symbol names an immutable stored value.
+Flux-Lang flows refer to symbols such as `src` or `tests`. A symbol names an immutable stored value.
 The runtime owns the value store. The model sees summaries, transcripts, and explicit context packs
 instead of every raw tool output being replayed into the prompt.
 
@@ -61,8 +67,11 @@ summary rather than dropping history. You can always explain what the agent did 
 
 ## Local-first
 
-flux is designed to run on your machine first. Secrets stay local, provider credentials are explicit,
-and plugins receive only the host capabilities declared in their manifests.
+flux keeps runtime state and credential storage local by default. When you choose a remote model
+provider, flux intentionally sends it the prompt, conversation, and selected context or workspace
+excerpts needed for that call; local-first is not a zero-egress guarantee. Provider credentials stay
+at the host boundary, and plugin host callbacks are limited to the capabilities declared in their
+manifests. Trusted native plugins still carry the [plugin trust boundary](./security/plugin-trust.md).
 
 ## Related docs
 

@@ -6,9 +6,10 @@ description: "Complete .flux/config.toml reference: precedence, permissions, net
 # Configuration
 
 flux works without a config file. User defaults live in `~/.flux/config.toml`; a project can add
-`.flux/config.toml` at its workspace root. An operator can additionally pin an organization-wide
-floor ahead of both — see [Managed configuration tier](#managed-configuration-tier-operator-floor)
-below.
+`.flux/config.toml` in the directory where flux is launched. flux reads that exact directory and
+does not search parent directories for a repository root. An operator can additionally pin an
+organization-wide floor ahead of both — see
+[Managed configuration tier](#managed-configuration-tier-operator-floor) below.
 
 The broad precedence is CLI flags > project config > user config > managed config > built-in
 defaults, but merging is intentional rather than simple replacement:
@@ -171,8 +172,9 @@ invocation but cannot restore an operation the app source removed.
 
 `[[policy.grants]]` adds fine-grained authorization grants to the built-in policy floor. Permission
 rules cannot widen past that floor, and destructive operations always re-fire the approval gate.
-Interactive runs prompt; `--yes` answers every gate “yes,” including destructive ones. See
-[Safety & approvals](../agent/safety.md).
+Interactive runs prompt; `--yes` answers every approval gate reached by an admitted operation “yes,”
+including destructive ones, but does not widen the policy or an app/agent ceiling. See [Safety &
+approvals](../agent/safety.md).
 
 ## Private-network egress
 
@@ -190,8 +192,8 @@ The former `[private_net] web_fetch = …` key is gone, and `[private_net]` reje
 old config still carrying it fails to load with `unknown field \`web_fetch\`` rather than starting
 with the grant quietly dropped. Migrate it to `web`.
 
-For a one-off invocation, global `--allow-private-net` temporarily opens native web to every private
-range and supplies the operator side of plugin grants:
+For a one-off invocation, global `--allow-private-net` temporarily opens native web and outbound
+fleet worker calls to every private range, and supplies the operator side of plugin grants:
 
 ```bash
 flux --allow-private-net plugin call gitlab gitlab.test
@@ -288,23 +290,25 @@ containment, usage attribution).
 
 ## OS-level process sandbox
 
-`[sandbox]` turns on opt-in OS-level confinement (bubblewrap on Linux, Seatbelt on macOS) for every
-process flux spawns — shell/exec ops and plugin subprocesses alike — as defense-in-depth
-underneath the safety envelope. Off by default:
+`[sandbox]` turns on OS-level confinement (bubblewrap on Linux, Seatbelt on macOS) for ordinary
+shell/exec and plugin subprocess paths, as defense-in-depth underneath the safety envelope. It is off
+by default unless configured. The CLI selects `require` automatically for the specific
+auto-approved and `--serve` forms listed below. A small, documented set of trusted host/browser
+paths remains exempt:
 
 ```toml
 [sandbox]
 enabled = true      # turn on OS sandboxing for spawned processes
 require = false     # fail closed instead of warn-and-continue when no backend is usable (implies enabled)
-network = true       # omit for the unrestricted default; false closes the sandbox's network namespace/profile
+network = true       # default is open; the CLI unattended profile defaults closed unless explicitly true
 writable = ["../shared-output"]   # extra writable paths beyond the workspace root and toolchain caches
 ```
 
 | `[sandbox]` key | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Turn on OS sandboxing for spawned processes. |
+| `enabled` | `false` | Turn on OS sandboxing for spawned processes. The CLI forms listed below select `require` automatically. |
 | `require` | `false` | Fail closed (refuse to spawn) instead of warning when no sandbox backend is usable. Implies `enabled`. |
-| `network` | unset (unrestricted) | Whether sandboxed processes may reach the network. `false` closes the sandbox's network namespace/profile. |
+| `network` | unset (open unless the CLI unattended profile applies) | Whether sandboxed processes may reach the network. `false` closes the sandbox's network namespace/profile. The CLI unattended profile requires an explicit `true` to open it. |
 | `writable` | `[]` | Extra writable paths, beyond the workspace root, named/Git-worktree roots, `/tmp`/`$TMPDIR`, and the toolchain caches. A leading `~/` expands to the home directory. Missing configured paths are created as directories before launch; `/` is rejected (use the explicit `--allow-all-paths` hatch instead). |
 
 Merge is security-directional, not the ordinary "project wins" rule: `enabled`/`require` are OR'd
@@ -320,6 +324,15 @@ explicit kill switch — `--no-sandbox` or `FLUX_SANDBOX=off` — which forces s
 An unrecognized or empty `FLUX_SANDBOX` value is ignored (it never downgrades a configured posture),
 and a config file that fails to parse is a hard startup error rather than silently dropping a
 configured `require`.
+`--yes` on `run`, `fork`, `record`, `flow run`, or `app run`; `preset --run --yes`; the
+auto-approved `review` flow; and `flux app run --serve` all contribute `require` with network closed
+unless `[sandbox] network = true` (or `FLUX_SANDBOX_NET` is truthy). `--no-sandbox`/
+`FLUX_SANDBOX=off` remains the explicit, prominently warned escape for a deployment that supplies
+equivalent isolation in an outer container or VM.
+This automatic floor belongs to CLI assembly. An unflagged `flux app run <program>` may still serve
+program-declared HTTP/A2A channels, but it is not the `--serve` form. Direct `flux-sdk`/`flux-server`
+embedders likewise receive no automatic serving posture: both inherit an injected or environment
+posture and otherwise default to sandbox off with process networking open.
 The CLI exports the resolved posture so a child flux invocation (`app run`, an eval sub-agent,
 `plugin call`) inherits it. See [OS process sandboxing](../security/os-sandbox.md) for the full
 reference — platform coverage, the posture matrix, the browser exemption, and what v1 does not
@@ -453,15 +466,15 @@ Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values su
 | `FLUX_EVAL_BINARY` | Trusted-host path to the flux executable evaluated by `eval_run` and `flux eval` (default: the running executable). This selector is intentionally not accepted as an `eval_run` tool argument; relative paths resolve against the host workspace before the child enters its temporary task directory. |
 | `FLUX_TERMINAL_BENCH_BINARY` | Trusted-host command/path for the terminal-bench driver used by the `terminal-bench` eval adapter (default: `tb` from the host `PATH`). Model-facing eval input cannot override it. |
 | `FLUX_TERMINAL_BENCH_DATASET` | Trusted-host terminal-bench dataset selector (default: `terminal-bench-core`). It is host-owned because selecting a dataset may fetch and execute benchmark material. |
-| `FLUX_TERMINAL_BENCH_REBUILD` | Truthy values allow terminal-bench preparation to run the fixed host-side musl `cargo build` before evaluation (default: off). This unsandboxed trusted-host build cannot be enabled through `eval_run` input. |
+| `FLUX_TERMINAL_BENCH_REBUILD` | Truthy values allow terminal-bench preparation to run the fixed host-side musl `cargo build` before evaluation (default: off). Model-facing `eval_run` input cannot enable it. This operator-selected preparation step is deliberately unsandboxed; task runners and evaluated child agents use their ordinary sandbox posture. |
 
 ### Safety and permissions
 
 | Variable | Effect |
 |---|---|
-| `FLUX_ALLOW_ALL` | Auto-approves every action — the environment form of `--allow-all-paths`/`--yes`. Do not set it on a shared or non-interactive host without an explicit policy. |
+| `FLUX_ALLOW_ALL` | Lifts filesystem read and write confinement, like `--allow-all-paths` or `[workspace] allow_all = true`. It does **not** approve actions, change network policy, or act as an environment form of `--yes`. |
 | `FLUX_ENABLE_BASH` | Surfaces the high-risk shell group, like `enable_shell`. |
-| `FLUX_ALLOW_PRIVATE_NET` | Grants private-network egress to native web ops. Prefer `[private_net] web`. |
+| `FLUX_ALLOW_PRIVATE_NET` | Blanket private-network override for native web ops and outbound fleet worker calls; also supplies the operator side of plugin grants (the plugin's manifest declaration still bounds it). Prefer scoped `[private_net]` grants for recurring access. |
 | `FLUX_ALLOW_SOURCE_BUILD` | Permits installing a plugin by building it from source, bypassing the signed-pack channel. See [Plugin trust](../security/plugin-trust.md). |
 | `FLUX_SANDBOX` | `off` / `on` / `require`. With `FLUX_SANDBOX_NET`, `FLUX_SANDBOX_WRITABLE`, `FLUX_BWRAP_BIN`, `FLUX_SANDBOX_EXEC_BIN` — see [OS process sandboxing](../security/os-sandbox.md). |
 | `FLUX_MANAGED_CONFIG` | Path to the managed config file, overriding the `/etc/flux/config.toml` convention. |
@@ -522,7 +535,7 @@ See [Datasources](../agent/datasources.md).
 | `FLUX_MODEL_TRACE` | Traces model requests and responses. |
 | `FLUX_TRANSPORT_DEBUG` | Logs provider transport detail. |
 | `FLUX_AUTO_RESURRECT` | Automatically resurrects an interrupted session on restart. |
-| `FLUX_VAULT_MOUNT` / `FLUX_VAULT_PREFIX` | HashiCorp Vault mount and path prefix for credential lookup. See [Credentials](../security/credentials.md). |
+| `FLUX_VAULT_MOUNT` / `FLUX_VAULT_PREFIX` | Optional constructor inputs read by `VaultCredentialStore::from_env()` in an embedding host. They do not switch the stock CLI/server credential backend. See [Credentials](../security/credentials.md). |
 
 The diagnostic variables are for troubleshooting, not for normal operation — see
 [Troubleshooting](../troubleshooting.md).
@@ -536,5 +549,5 @@ The diagnostic variables are for troubleshooting, not for normal operation — s
 - [OS process sandboxing](../security/os-sandbox.md) — the full `[sandbox]` reference.
 - [Security overview](../security/overview.md) — the honest-posture summary this doc's managed
   tier and sandbox sections both back.
-- `flux doctor` (C-128) — its "config provenance" check answers "why can't I enable this" with the
-  effective value and layer of every pinnable key.
+- `flux doctor` — its "config provenance" check answers "why can't I enable this" with the effective
+  value and layer of every pinnable key.

@@ -37,7 +37,7 @@ Nothing else needs resetting; the stored credential is replaced in place.
 
 ## I want to try flux without credentials
 
-Use the offline `mock` provider — it drives the full plan/execute pipeline with no network, returning
+Use the offline `mock` provider — it drives the adaptive loop and guarded execution with no network, returning
 **canned** output (it writes `flux-mock.txt` and prints `Finished.`). It's a wiring smoke test, not a
 real agent response:
 
@@ -49,19 +49,39 @@ Any flow that never reaches a model op also runs without credentials.
 
 ## Where does flux keep its state?
 
-Everything lives under `~/.flux/`:
+There is no single state directory for every surface. The default user-wide locations are:
 
 | Path | What it is |
 | --- | --- |
-| `~/.flux/events.db` | the append-only event log (sessions, run traces, usage) |
-| `~/.flux/flow.db` | stored flow values, symbols, suspensions |
-| `~/.flux/flows/` | reusable flows + composite ops (`.flux` files, auto-loaded; `flow_list`/`flow_run`) |
-| `~/.flux/config.toml` | user-wide config (a project `.flux/config.toml` overrides it) |
+| `~/.flux/events.db` | append-only sessions, run traces, usage, and cross-session memory |
+| `~/.flux/flow.db` | stored flow values, symbols, and suspensions |
+| `~/.flux/credentials.toml` | plaintext provider and plugin tokens, protected with mode `0600` |
+| `~/.flux/endpoints.toml` | imported weak endpoint references (credential locations, never values) |
+| `~/.flux/flows/` | reusable flows and composite ops (`.flux` files) |
+| `~/.flux/config.toml` | user-wide configuration defaults |
 | `~/.flux/pricing.toml` | optional price overrides (see [Usage & cost](./agent/cost.md)) |
-| `~/.flux/plugins/` | installed plugin manifests |
+| `~/.flux/plugins/` | plugin descriptors, versioned binaries, and source-install cache |
+| `~/.flux/connectors/` | installed connector manifests |
 
-Deleting `events.db` discards history; it does not corrupt anything. See
-[Storage & persistence](./reference/storage.md) for the backend details.
+A project can also carry `.flux/config.toml`, `.flux/flows/`, `.flux/agents/`, `.flux/skills/`,
+`.flux/commands/`, and `.flux/hooks/` in the exact directory where flux starts. Project configuration
+and definitions are not copied into `~/.flux`, and flux does not walk upward to find a parent
+repository.
+
+`flux --store <dir> …` relocates that invocation's `events.db` and `flow.db`; it exports the same
+choice as `FLUX_STORE_DIR` to child flux processes. It does not relocate credentials, endpoints,
+plugins, project files, or the global store read by `flux usage`.
+
+Do not delete an open SQLite database to troubleshoot it. The safest clean-room test is a new store:
+
+```bash
+flux --store ./tmp-flux-state run -m mock --yes "write a quick note"
+```
+
+If you intentionally reset persistent history, stop every flux process and back up the database
+together with any `-wal` and `-shm` sidecars first. Removing `events.db` loses sessions and memory;
+removing `flow.db` separately loses flow-engine state. See
+[Storage & persistence](./reference/storage.md) for relocation, retention, and backend details.
 
 ## The server refuses to start
 
@@ -73,8 +93,9 @@ FLUX_SERVER_TOKEN to require `Authorization: Bearer <token>` (or configure
 `[server] introspect_url` for per-request principal auth), or bind 127.0.0.1
 ```
 
-The daemon auto-approves tools, so an open listener would be remote code execution. Either supply a
-shared secret, configure principal auth, or bind loopback:
+The daemon auto-approves admitted tool calls within its configured ceilings, so an open listener with
+effectful authority would be remote code execution. Either supply a shared secret, configure
+principal auth, or bind loopback:
 
 ```bash
 export FLUX_SERVER_TOKEN=$(openssl rand -hex 32)
@@ -124,12 +145,13 @@ enable_shell = true
 ## A destructive step prompts even though I allow-listed the tool
 
 Destructive operations (`rm -rf`, `git push --force`, …) re-fire the approval gate even under a
-permissive `[permissions] allow` rule, and even inside an already-approved plan scope — a
-destructive op that wasn't visible in the approved plan prompts again at dispatch. This is
-intentional and covered by tests; see [Safety & approvals](./agent/safety.md).
+permissive `[permissions] allow` rule and inside an already-approved action batch. A destructive op
+that was not visible in the approved batch prompts again at dispatch. This is intentional and
+covered by tests; see [Safety & approvals](./agent/safety.md).
 
-Passing `--yes` auto-approves everything, including destructive steps, so use it only in trusted,
-non-interactive contexts (CI, the server daemon).
+Passing `--yes` auto-approves every admitted step, including destructive ones, but does not widen a
+policy, app, or agent ceiling. Use it only in trusted, non-interactive contexts (CI, the server
+daemon).
 
 ## My context keeps getting compacted
 
@@ -156,13 +178,15 @@ Use `-m <provider>/<model>`, e.g. `-m anthropic/claude-sonnet-4-6` or
 `-m openrouter/anthropic/claude-sonnet-4.5`. The bare aliases `opus` / `sonnet` / `haiku` / `fable`
 resolve to Anthropic; `claude`, `codex` and `aws` are bare aliases for their own providers. The
 rejection message lists the accepted bare aliases, so trust it over this page if the two ever
-disagree. The string after the provider is forwarded verbatim, so any model that provider
-serves works — a typo surfaces as a provider-side error, not a flux one.
+disagree. The string after the provider is forwarded verbatim, so an unknown id usually surfaces as
+a provider-side error. Routing acceptance is not a compatibility guarantee: the adaptive agent needs
+a model and endpoint that reliably implement the provider's structured tool-call contract. A served
+text-only model may route successfully and still be unsuitable for an agent turn.
 
 ## Plugin install fails verification
 
 The install is fail-closed: the pack index is minisign-checked against the key embedded in flux,
-and each archive's sha256 is checked against that index. A signature or checksum mismatch aborts
+and each archive's SHA-256 is checked against that index. A signature or checksum mismatch aborts
 the install rather than proceeding. If you're building plugins from a source tree, use the
 unverified local path instead:
 

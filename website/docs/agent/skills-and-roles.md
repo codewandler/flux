@@ -7,7 +7,8 @@ description: "Teach an agent project knowledge with explicitly enabled skills an
 
 Skills and roles change different parts of an agent:
 
-- A **skill** is contextual knowledge you explicitly enable for an agent.
+- A **skill** is contextual knowledge that is inactive until a human enables it or one of the
+  documented model/agent invocation opt-ins loads it.
 - A **role** defines a sub-agent persona, optional model override, and tool allow-list used by `task`.
 
 Neither grants new host capabilities. Skill prose can guide a plan; role tools can only narrow the
@@ -28,8 +29,9 @@ triggers: [rust, cargo, clippy]
 Use `cargo fmt --all` and keep clippy clean with warnings denied.
 ```
 
-Discovery reads frontmatter only. Skills are inactive by default: user-message keywords, names,
-descriptions, and `triggers` do not alter the prompt. Enable one or more by name:
+Discovery reads and parses the whole skill file, but discovery alone does not put its body in the
+prompt. Skills are inactive by default: user-message keywords, names, descriptions, and `triggers`
+do not activate one. Enable one or more by name:
 
 ```bash
 flux run --skill rust-style "fix the parser"
@@ -80,10 +82,11 @@ Review the diff for correctness and style. Do not modify files.
 
 ### Model-invoked skills (opt-in)
 
-The default above — nothing surfaced until you `--skill` it by name — is a deliberate,
-measured-cheaper divergence from Claude Code's progressive disclosure. If you'd rather have Claude
-Code's ergonomics (surface every skill's name+description, let the model load a body on demand) and
-accept the extra tokens, opt in:
+By default, flux does not advertise the general discovered-skill catalog to the model; explicit
+`--skill`/`AgentSpec.skills` activation is the baseline. The narrower `agent-triggerable: true` path
+described above remains a separate per-skill opt-in. If you want Claude Code's progressive-disclosure
+ergonomics—surface every eligible skill's name and description, then let the model load a body on
+demand—and accept the extra tokens, opt in:
 
 ```bash
 flux run --skills-model-invoked "find and use the right skill for this"

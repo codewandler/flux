@@ -8,10 +8,9 @@ description: An example-driven walk through Flux-Lang — flows, calls, pure dat
 This tour builds one small Flux-Lang vocabulary at a time: flows, calls, pure values, branches,
 iteration, concurrency, guard rails, and context packs. Every snippet parses as-is; complete
 flows run as-is in a `.flux` file, and the shorter fragments show a flow body (wrap them in a `flow`
-header to run standalone). The snippets use the `$`-sigil spelling, which the parser still accepts —
-the formatter's canonical output now drops the sigil and writes named arguments brace-free. See
-[Symbols](./flows-and-syntax.md#symbols) and
-[Named arguments](./flows-and-syntax.md#named-arguments) for both spellings.
+header to run standalone). Every snippet uses the formatter's canonical bare symbols, brace-free
+named arguments, named headers, and duration units. See [Symbols](./flows-and-syntax.md#symbols) and
+[Named arguments](./flows-and-syntax.md#named-arguments) for details.
 
 ## A minimal flow
 
@@ -20,39 +19,39 @@ sequence of statements, indented two spaces.
 
 ```flux
 flow hello -> String
-  $when = now()
-  $utc  = $when.utc
-  $greeting = fmt("hello — the time is {utc}")
-  return $greeting
+  clock = now()
+  utc = clock.utc
+  greeting = fmt("hello — the time is {utc}")
+  return greeting
 ```
 
 ```bash
 flux flow run hello.flux
 ```
 
-`$when = now()` **binds** the result of the `now` operation — an object with `unix` and `utc`
-fields — to a symbol. `$utc = $when.utc` reads one field; symbols are immutable named values, and
-`{utc}` inside a string interpolates the bound value at evaluation time. `return` ends the flow
-with a value. This flow never touches a model, so it runs without any API credentials.
+`clock = now()` **binds** the result of the `now` operation — an object with `unix` and `utc`
+fields — to a symbol. `utc = clock.utc` reads one field. Each binding creates an immutable value;
+the symbol names the version currently in scope. `{utc}` inside a string interpolates that bound
+value at evaluation time. `return` ends the flow. This example never touches a model, so it runs
+without API credentials.
 
 ## Calls and named arguments
 
-Operations take **named arguments**, written brace-free (`grep(pattern: "x", glob: "*.rs")`) or as an
-explicit object — both lower to the same single object argument. An op with one required parameter
-accepts a bare value as sugar:
+Operations take **named arguments**, written brace-free (`grep(glob: "*.rs", pattern: "x")`). They
+lower to the AST's single named-input object. An op with one required parameter accepts a bare value:
 
 ```flux
 flow todo-scan
-  $readme = read("README.md")
-  $hits   = grep({pattern: "TODO", glob: "*.rs", max_results: 50})
-  return $hits
+  readme = read("README.md")
+  hits = grep(glob: "*.rs", max_results: 50, pattern: "TODO")
+  return hits
 ```
 
 A bare call without a bind runs an operation for its side effects:
 
 ```flux
-  git_stage(["."])
-  git_commit("chore: update generated docs")
+git_stage(["."])
+git_commit("chore: update generated docs")
 ```
 
 ## Pure data shaping — no shell required
@@ -62,16 +61,16 @@ approval pause, no shelling out to `bash`.
 
 ```flux
 flow price-check
-  $raw   = web.fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
-  $price = $raw.bitcoin.usd
-  $label = fmt("BTC is at {price} USD")
-  return { price: $price, label: $label }
+  raw = web.fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+  price = raw.bitcoin.usd
+  label = fmt("BTC is at {price} USD")
+  return { label, price }
 ```
 
-`$raw.bitcoin.usd` is field access into a JSON value (`$list.0` indexes a list). Access is
+`raw.bitcoin.usd` is field access into a JSON value (`list[0]` indexes a list). Access is
 **strict** — a missing field or out-of-range index is a loud error, not a silent empty — so a
-typo fails fast; add a trailing `?` (`$raw.bitcoin.usd?`) to read `null` when a field may be
-absent. `fmt("…")` interpolates bound symbols. `{ price: $price, label: $label }` is a **value
+typo fails fast; add a trailing `?` (`raw.bitcoin.usd?`) to read `null` when a field may be
+absent. `fmt("…")` interpolates bound symbols. `{ label, price }` is a **value
 template** — a record assembled from computed symbols. More in [Pure data](./pure-data.md).
 
 ## Branching
@@ -80,24 +79,25 @@ template** — a record assembled from computed symbols. More in [Pure data](./p
 
 ```flux
 flow check-tree
-  $status = git_status()
-  when $status
-    $verdict = fmt("tree is dirty:\n{status}")
+  status = git_status()
+  when status
+    verdict = fmt("""tree is dirty:
+{status}""")
   else
-    $verdict = "tree is clean"
-  return $verdict
+    verdict = "tree is clean"
+  return verdict
 ```
 
 ```flux
 flow triage(ticket: Ticket)
-  $sev = $ticket.severity
-  match $sev
+  sev = ticket.severity
+  match sev
     case "critical"
-      do page_oncall $ticket
+      page_oncall(ticket)
     case "low"
-      do backlog_add $ticket
+      backlog_add(ticket)
     default
-      do triage_queue $ticket
+      triage_queue(ticket)
 ```
 
 `match` compares by JSON equality and errors on an unmatched subject with no `default` — the
@@ -105,14 +105,14 @@ exhaustiveness guard-rail.
 
 ## Iteration
 
-`each` maps a list through a body. `-> $collect` gathers each iteration's last expression into
+`each` maps a list through a body. `-> collected` gathers each iteration's last expression into
 a list:
 
 ```flux
 flow read-sources(files: List<String>)
-  each $f in $files -> $contents
-    read($f)
-  return $contents
+  each f in files -> contents
+    read(f)
+  return contents
 ```
 
 Loops are always bounded: `each` by its list, `repeat` by a required count, `loop` by a
@@ -127,11 +127,11 @@ branch name after the join:
 ```flux
 flow survey
   parallel
-    branch $readme
-      $readme = read("README.md")
-    branch $todos
-      $todos = grep({pattern: "TODO", glob: "*.rs"})
-  return { readme: $readme, todos: $todos }
+    branch readme
+      readme = read("README.md")
+    branch todos
+      todos = grep(glob: "*.rs", pattern: "TODO")
+  return { readme, todos }
 ```
 
 Results merge in declaration order, so output is deterministic. See
@@ -143,19 +143,18 @@ Reliability constraints are nodes, not prompt instructions:
 
 ```flux
 flow careful-fetch(url: String)
-  retry 3 backoff exponential delay 500 -> $page
-    web.fetch($url)
-  assert $page, "fetch returned nothing"
-  return $page
+  retry 3, backoff: exponential, delay: 500ms -> page
+    web.fetch(url)
+  assert page, "fetch returned nothing"
+  return page
 ```
 
 ```flux
-  timeout 30000 -> $out
-    $out = bash("slow-build.sh")
-
-  budget 10 -> $summary
-    $hits    = grep({pattern: "FIXME", glob: "*.rs"})
-    $summary = ai.reason({ask: "Group these FIXMEs: {hits}"})
+timeout 30s -> out
+  out = bash("slow-build.sh")
+budget 10 -> summary
+  hits = grep(glob: "*.rs", pattern: "FIXME")
+  summary = ai.reason(ask: "Group these FIXMEs: {hits}")
 ```
 
 `retry` backs off on transient failures (policy denials are never retried), `timeout` bounds
@@ -169,16 +168,14 @@ op sees:
 
 ```flux
 flow explain-failure
-  $src   = read("crates/flux-lang/src/runtime.rs")
-  $tests = cargo_test({args: ["-p", "flux-lang"]})
-
-  ctx $debug
+  src = read("crates/flux-lang/src/runtime.rs")
+  tests = cargo_test(args: ["-p", "flux-lang"])
+  ctx debug
     purpose "explain a failing flux-lang test"
     budget 9000
-    include $src, $tests
-
-  $answer = ai.reason({ask: "What is the most likely cause?", ctx: $debug})
-  return $answer
+    include src, tests
+  answer = ai.reason(ask: "What is the most likely cause?", ctx: debug)
+  return answer
 ```
 
 The runtime enforces the character budget when the pack is built, and records anything it had
@@ -191,13 +188,13 @@ model-backed op) picks **which** declared branch runs — it can never invent a 
 
 ```flux
 flow handle-ticket(ticket: String)
-  route classify($ticket)
+  route classify(ticket)
     case "bug"
-      do file_bug $ticket
+      file_bug(ticket)
     case "billing"
-      do file_billing $ticket
+      file_billing(ticket)
     default
-      do triage $ticket
+      triage(ticket)
 ```
 
 The case set is fixed and validated before the flow runs. The model chooses among them; the
@@ -210,17 +207,18 @@ A flow's result is a value like any other — assemble it from what you computed
 ```flux
 flow repo-report
   parallel
-    branch $status
-      $status = git_status()
-    branch $log
-      $log = git_log({limit: 10})
-  return { status: $status, recent: $log, ok: true }
+    branch status
+      status = git_status()
+    branch log
+      log = git_log(limit: 10)
+  return { ok: true, recent: log, status }
 ```
 
 ## What the tour skipped
 
 - **Durability** — cross-turn caching (`memo`), suspension (`await`), resume points
-  (`checkpoint`), at-most-once effects (`once`), cleanup and rollback (`scope`, `saga`):
+  (`checkpoint`), durable effect de-duplication after successful completion has been recorded
+  (`once`), cleanup and rollback (`scope`, `saga`):
   [Durability & cross-turn state](./durability.md).
 - **First-success races** and the finer points of `parallel`:
   [Concurrency](./concurrency.md).

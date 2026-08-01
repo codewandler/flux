@@ -1,6 +1,6 @@
 ---
 title: Kubernetes plugin
-description: "Step-by-step setup for the kubernetes plugin: install, point kubectl at a cluster, verify, read inventory, and use the guarded mutations."
+description: "Step-by-step setup for the Kubernetes plugin: install, point kubectl at a cluster, verify, read inventory, and use guarded mutations."
 ---
 
 # Kubernetes plugin
@@ -22,16 +22,15 @@ flux plugin install kubernetes
 ```
 
 This resolves the newest signed `plugins-v*` pack release, verifies the index signature and the
-archive's sha256, and unpacks the binary into the versioned store. Confirm it landed:
+archive's SHA-256, and unpacks the binary into the versioned store. Confirm it landed:
 
 ```bash
 flux plugin status kubernetes
 ```
 
-```text
-kubernetes       ~/.flux/plugins/bin/kubernetes/0.1.2/flux-plugin-kubernetes   v0.1.2  [ok]  [verified]
-    manifest:  v0.1.2  24 op(s)  ·  1 datasource(s)  ·  discovers: kubernetes, prometheus, loki, grafana, alertmanager, postgres, mysql  ·  caps: process(8)
-```
+`status` reads the installed version and operation total from the live manifest. For setup, check
+the `kubernetes.inventory` datasource, discovery for `kubernetes`, `prometheus`, `loki`, `grafana`,
+`alertmanager`, `postgres`, and `mysql`, and the eight process prefixes listed below.
 
 Unlike the HTTP integrations there are no `auth:` or `endpoint:` lines — the manifest declares
 neither. What it *does* declare is `process(8)`: eight argv prefixes, and nothing else.
@@ -56,7 +55,7 @@ config the way it always does: `KUBECONFIG` if set, otherwise `~/.kube/config`.
 kubectl config get-contexts        # what you already have
 ```
 
-flux spawns the plugin through the guarded process path, which clears the environment and re-adds
+Flux spawns the plugin through the guarded process path, which clears the environment and re-adds
 only a minimal non-secret allow-list. `KUBECONFIG` is on that list, alongside `PATH` and `HOME`, so
 a kubeconfig at a non-default path resolves for the plugin exactly as it does in your own shell.
 What is forwarded is the *path* — the plugin opens the file itself, through `kubectl`. The rest of
@@ -67,7 +66,7 @@ plugin.
 
 Every operation takes an optional `context` naming a kubeconfig context; omitting it uses the
 current one. The cluster inventory is available without any further grant — the plugin reaches the
-cluster through `kubectl`, not through flux's HTTP stack, so a private API server needs no
+cluster through `kubectl`, not through Flux's HTTP stack, so a private API server needs no
 `[private_net.plugins]` entry.
 
 ## 3. Verify
@@ -85,9 +84,11 @@ cheapest end-to-end check that the kubeconfig, the network, and your credentials
 { "context": "prod", "ok": true, "server_version": "v1.30.4", "platform": "linux/amd64" }
 ```
 
-A failure is reported as `"ok": false` with kubectl's own stderr in `error`, rather than as a
-flux-side error — that tells you the wiring reached `kubectl` and `kubectl` could not reach the
-cluster. `kubectl: command not found` in that field means step 2 is the problem, not the plugin.
+If `kubectl` starts but exits non-zero, `kubernetes.test` returns `{"ok": false, "error": "…"}`
+with its captured stderr. If Flux cannot spawn `kubectl` at all — for example because it is absent
+from `PATH` — the plugin call itself fails with a `process.run` spawn error; there is no `ok: false`
+result in that case. Other operations such as `kubernetes.cluster.list` also surface non-zero
+`kubectl` exits as operation errors because they require valid JSON output.
 
 ## 4. Read the cluster
 
@@ -132,7 +133,8 @@ flux plugin call kubernetes kubernetes.deployment.history --arg namespace=prod -
 client-side. `kubernetes.deployment.history` lists a deployment's ReplicaSet revisions, newest
 first, with images and replica counts.
 
-Three operations carry a higher declared risk and go through approval when an agent calls them:
+The following operations carry a higher declared risk and go through approval when an agent calls
+them:
 
 | Operation | Input | Declared |
 |---|---|---|
@@ -145,15 +147,19 @@ code. `kubernetes.secret.read` decodes a Secret's values and is meant for piping
 secret store, not for display — prefer endpoint discovery (step 7 below), which returns a credential
 *location* and never reads the value at all.
 
-## 6. Port-forward something
+## 6. Manage a port-forward in a live session
 
-Port-forwards are held by the host's managed-process registry, so they outlive the call that started
-them:
+Port-forwards are held by the host's managed-process registry, so they outlive the operation call
+that started them **within the same live Flux session**. They are intended for a long-running agent
+or app session, not a sequence of separate one-shot CLI processes.
 
 ```bash
+# Validate the input shape without starting a process:
 flux plugin call kubernetes kubernetes.portforward.start \
-  '{"namespace": "monitoring", "resource": "service/prometheus", "remote_port": 9090}'
+  '{"namespace": "monitoring", "resource": "service/prometheus", "remote_port": 9090}' --dry-run
 ```
+
+When an agent invokes that operation in a live session, the result has this shape:
 
 ```json
 {
@@ -165,14 +171,16 @@ flux plugin call kubernetes kubernetes.portforward.start \
 }
 ```
 
-Omit `local_port` and kubectl picks a free one, recovered from its readiness line — `start` waits for
-that line and fails loudly if kubectl exits first, so a returned `id` means the forward is actually
-up. `duration_seconds` defaults to one hour and is capped at eight.
+Omit `local_port` and kubectl picks a free one, recovered from its readiness line. A spawn failure is
+an immediate `process.spawn` operation error. If `kubectl` starts but exits before its readiness
+line, the operation fails with `kubectl port-forward … did not become ready` plus captured output.
+A returned `id` therefore means the forward is up. `duration_seconds` defaults to one hour and is
+capped at eight hours.
 
-```bash
-flux plugin call kubernetes kubernetes.portforward.list --arg namespace=monitoring
-flux plugin call kubernetes kubernetes.portforward.stop --arg id=kpf-4242
-```
+In that same live session, `kubernetes.portforward.list` reports the forward's liveness and
+`kubernetes.portforward.stop` accepts its `id`. Separate `flux plugin call` invocations each start a
+fresh plugin host; dropping that host also drops and kills its managed child, so those invocations do
+not form a persistent start/list/stop sequence.
 
 `list` probes each forward for liveness and reports `alive`. It only knows about forwards **this**
 plugin instance started — it is the plugin's own view, not a query of every managed process on the
@@ -224,7 +232,7 @@ First use still crosses approval and is audited. See [Endpoints](../agent/endpoi
 | Step | Command | Failure mode if skipped |
 |---|---|---|
 | Install | `flux plugin install kubernetes` | ``no such plugin `kubernetes` `` |
-| kubectl + `~/.kube/config` | `kubectl config get-contexts` | `kubectl version` fails; `kubernetes.test` returns `"ok": false` |
+| kubectl + `~/.kube/config` | `kubectl config get-contexts` | Missing `kubectl` → spawn error; bad context/auth/network after spawn → `kubernetes.test` returns `"ok": false`. |
 | Verify | `flux plugin call kubernetes kubernetes.test` | (this *is* the verification step) |
 | Cross-plugin credential grant | `[endpoint] cross_plugin_credentials` | a discovered credential is refused to the consumer plugin |
 

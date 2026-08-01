@@ -11,20 +11,20 @@ every operation in every branch still crosses the safety envelope.
 
 ## `parallel` — concurrent fan-out
 
-Each branch is introduced by a `branch $name` arm; the branch body's last expression becomes
-the value bound to `$name` after the join:
+Each branch is introduced by a `branch name` arm; the branch body's last expression becomes the
+value bound to that name after the join:
 
 ```flux
 parallel
-  branch $readme
-    $readme = read("README.md")
-  branch $todos
-    $todos = grep({pattern: "TODO", glob: "*.rs"})
-
-$report = fmt("readme: {readme}\ntodos: {todos}")
+  branch readme
+    readme = read("README.md")
+  branch todos
+    todos = grep(glob: "*.rs", pattern: "TODO")
+report = fmt("""readme: {readme}
+todos: {todos}""")
 ```
 
-After the block, `$readme` and `$todos` are ordinary bound symbols.
+After the block, `readme` and `todos` are ordinary bound symbols.
 
 **Deterministic output.** Branches execute concurrently, but each writes to a buffering sink;
 after the join, results and events are merged in **declaration order**. Output never
@@ -47,13 +47,13 @@ A `parallel` with one branch is valid and degenerates to a sequential bind.
 ## `race` — first success wins
 
 `race` starts all branches together and completes as soon as one branch **succeeds**. The header
-reads `race <timeout_ms> [-> $bind]`, followed by the same `branch` arms as `parallel`:
+reads `race <duration> [-> result]`, followed by the same `branch` arms as `parallel`:
 
 ```flux
-race 5000 -> $result
-  branch $fast
+race 5s -> result
+  branch fast
     bash("fast-path.sh")
-  branch $slow
+  branch slow
     bash("slow-path.sh")
 ```
 

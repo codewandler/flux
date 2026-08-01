@@ -1,6 +1,6 @@
 ---
 title: Evaluation and improvement
-description: "Where harness benchmarking lives (flux-bench), what `flux eval` is for now, and the honest status of the repository self-improvement loop."
+description: "How `flux eval`, the optional standalone benchmark, and the repository self-improvement loop differ."
 ---
 
 # Evaluation and improvement
@@ -8,8 +8,9 @@ description: "Where harness benchmarking lives (flux-bench), what `flux eval` is
 Two different things used to share this page. They have been separated, because only one of them
 moved:
 
-- **Benchmarking a harness** — measuring whether one build of flux is better than another. That is
-  [flux-bench](https://github.com/codewandler/flux-bench)'s job now, in its own repository.
+- **Benchmarking a harness** — measuring whether one build of flux is better than another. The
+  maintainers use a separate, optional `flux-bench` project for that work. Its repository is not
+  currently published; the public interface available from this repository is [`flux eval`](#flux-eval--still-shipped-still-supported).
 - **The repository self-improvement loop** — flux editing its own harness under a keep-or-revert
   gate. That stays here, because it edits *this* tree. It is real, shipped, runnable, and
   [on hold](#the-repository-self-improvement-loop).
@@ -25,15 +26,10 @@ difference inside that floor as `INCONCLUSIVE` rather than as a win; and it grad
 arguments* on flux's `--stream-json` wire. That turns "did not hijack the user's audio device" into
 a measurable outcome instead of a code-review note.
 
-→ **[codewandler/flux-bench](https://github.com/codewandler/flux-bench)** — the supported answer to
-"how do I measure this agent".
-
-It has no documentation site by design: its
-[`README.md`](https://github.com/codewandler/flux-bench/blob/main/README.md) and
-[`docs/`](https://github.com/codewandler/flux-bench/tree/main/docs) are the reference, and
-[`docs/from-flux-eval.md`](https://github.com/codewandler/flux-bench/blob/main/docs/from-flux-eval.md)
-carries the measurement practice that used to live on this page — how many trials a claim needs, when
-a task is unscoreable, and how to audit a score back to the run that produced it.
+`flux-bench` is maintained in a separate repository that is not currently published, so this site
+does not link to source or documentation that public readers cannot access. If you have access to
+that repository, its `README.md` and `docs/` directory are the reference. For the shipped,
+publicly documented scoring surface, use [`flux eval`](#flux-eval--still-shipped-still-supported).
 
 Because flux-bench runs the binary flux *ships*, it follows flux releases and not the other way
 round. Nothing in flux depends on it.
@@ -57,9 +53,10 @@ flux eval terminal-bench -m sonnet --trials 3 --report report.md
 flux eval multi --members synthetic,terminal-bench --trials 3
 ```
 
-Every adapter and flag is documented by `flux eval --help`, which cannot drift from the binary; that
-help also names flux-bench. Running the command prints the same pointer **on stderr**, so a caller
-parsing the summary on stdout or diffing a `--report` file is unaffected.
+Every adapter and flag is documented by `flux eval --help`, which cannot drift from the binary.
+The help and command output also name the separately maintained benchmark; the repository they
+currently name is not public. The runtime pointer is written **on stderr**, so a caller parsing the
+summary on stdout or diffing a `--report` file is unaffected.
 
 One calibration result is worth keeping in view: `synthetic` is **saturated** for current frontier
 models — a 2026-07-02 run scored 1000/1000 twice, with two different models. It remains a useful
@@ -149,7 +146,7 @@ roles and the `strict_review` flow are embedded in the binary, so it works in an
 
 ## Related docs
 
-- [flux-bench](https://github.com/codewandler/flux-bench) — the supported harness benchmark.
+- `flux eval --help` — the authoritative adapter and flag reference for the shipped scoring engine.
 - [Operations → Improvement loop](../language/ops.md#improvement-loop) — every eval, mining, and round-guard op with its arguments.
 - [Time Machine](./time-machine.md) — replay, fork, and diff an individual eval session.
 - [Usage & cost](./cost.md) — price a run alongside its score.

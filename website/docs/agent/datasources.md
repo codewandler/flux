@@ -6,20 +6,21 @@ description: "The agent's governed data layer: indexed knowledge and async live 
 # Datasources
 
 A **datasource** is a governed data boundary the agent reaches through
-[operations](../language/ops.md). Flux supports three complementary forms:
+[operations](../language/ops.md). Flux supports two complementary read forms:
 
-| | Indexed knowledge | Live system of record | [Work board](#work-boards) |
-|---|---|---|---|
-| Data lives | In a flux-owned index of records | In an external API, database, or in-process backend | In a board backend flux writes to |
-| Best for | Searchable docs and contributed knowledge | Current tickets, customers, inventory, and similar domain data | Work the agent hands out, claims, and finishes |
-| Read shape | Search, address lookup, relations, offset paging | Typed entity filters, cursor paging, stable-id lookup | State-filtered item paging, stable-id lookup |
-| Writes | No | No | Yes—`create`, `transition`, `claim`, `comment`, `record_dispatch`, `reassign`, `record_evidence` |
-| Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` | eleven, [enumerated below](#work-boards) |
+| | Indexed knowledge | Live system of record |
+|---|---|---|
+| Data lives | In a flux-owned index of records | In an external API, database, or in-process backend |
+| Best for | Searchable docs and contributed knowledge | Current tickets, customers, inventory, and similar domain data |
+| Read shape | Search, address lookup, relations, offset paging | Typed entity filters, cursor paging, stable-id lookup |
+| Writes | No | No |
+| Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` |
 
 The split is intentional. A stable local snapshot benefits from indexing and ranked search; a
-changing system of record needs async calls and backend-owned continuation cursors; work that is
-claimed and moved needs an enforced state machine. No form is a side channel: all three are projected
-into the ordinary operation catalog and cross authorization → approval → guarded IO.
+changing system of record needs async calls and backend-owned continuation cursors. Work that is
+claimed and moved is a separate [work-board](#work-boards) contract with an enforced state machine.
+None is a side channel: datasource reads and board operations enter the ordinary operation catalog
+and cross authorization → approval → guarded IO.
 
 ## Datasources vs. operations
 
@@ -28,7 +29,8 @@ into the ordinary operation catalog and cross authorization → approval → gua
   envelope.
 - A **datasource** defines the data and access contract. An indexed datasource owns records; a live
   datasource owns an entity/filter/page schema and a host-side backend.
-- The agent reaches either form **through operations**. Indexed retrieval uses the six common ops;
+- The agent reaches either form **through operations**. Indexed retrieval uses the common operations
+  listed below;
   registering a live domain named `support` generates `support.list` and `support.get`.
 
 Plugins can participate on both sides: they may project callable operations and contribute records
@@ -72,7 +74,8 @@ Three routes feed the index:
 
    ```flux
    datasource docs
-     kind "markdown"     // a directory of docs—or "openapi" for an API spec file
+     # Use "markdown" for a directory of docs, or "openapi" for an API spec file.
+     kind "markdown"
      path "./docs"
    ```
 
@@ -89,7 +92,7 @@ Three routes feed the index:
 
 ### Reading the index
 
-The indexed contract exposes six read operations:
+The indexed contract exposes these read operations:
 
 | op | arguments | description |
 |---|---|---|
@@ -104,8 +107,11 @@ Call `sources` first when the available sources are unknown; it returns every re
 the entities it contains. A Flux-Lang plan can then mix retrieval with other operations:
 
 ```flux
-$hits = search({ query: "rate limiting", source: "docs" })
-$answer = ai.reason({ ask: "how do we rate-limit?", ctx: $hits })
+hits = search(query: "rate limiting", source: "docs")
+ctx evidence
+  purpose "answer from the indexed documentation"
+  include hits
+answer = ai.reason(ask: "How do we rate-limit?", ctx: evidence)
 ```
 
 These operations are declared read-only and low risk, but the active authorization policy remains
@@ -192,13 +198,15 @@ For embedding code and the indexed `try_register_pack` recipe, see
 
 ## Work boards
 
-A **work board** is the write-capable third form: a typed item state machine—`ready`, `claimed`,
-`in_progress`, `review`, `done`, `blocked`, `failed`—behind a swappable backend. The full spine, and
-which transitions are legal, is in [Work boards and the fleet](./fleet.md#the-item-lifecycle). A read-only knowledge index cannot express work that is
-claimed, moved, retried, and commented on, which is what a coordinator agent needs in order to hand
-tasks out and reconcile them after a crash.
+A **work board** is not a third datasource read model. It is a write-capable work registry with a
+typed item state machine—`ready`, `claimed`, `in_progress`, `review`, `done`, `blocked`,
+`failed`—behind a swappable backend. The full spine, and which transitions are legal, is in
+[Work boards and the fleet](./fleet.md#the-item-lifecycle). Indexed knowledge and live read domains
+cannot express work that is claimed, moved, retried, and commented on, which is what a coordinator
+agent needs in order to hand tasks out and reconcile them after a crash.
 
-A program declares one the same way it declares knowledge, with a `board:` kind:
+Flux-Lang currently places boards in the program's `datasource` declaration slot, distinguished by a
+`board:` kind:
 
 ```flux
 datasource board
@@ -215,7 +223,7 @@ needs a name that cannot be confused with it. A knowledge kind is never promoted
 kind is never ingested as knowledge, and a `board:` kind naming a backend that does not exist is an
 error rather than a fall-through.
 
-Two backends exist today:
+Available backends:
 
 | Kind | Storage | Use |
 |---|---|---|
@@ -229,11 +237,12 @@ its own.
 `board:memory` cannot outlive the process that created it, so a Program relying on crash recovery
 wants `board:markdown`.
 
-Two of the four reads are for a program rather than for a person: `board.query` returns a page as
-typed JSON rows (every field present, absent optionals as `null`) so a flow can `each` over items and
-`match` on their state, and it accepts a `depends_on` filter that keeps only items whose dependencies
-are all `done`. `board.comments` returns one item's notes as an array. `board.list` and `board.get`
-render prose for reading. See [Work boards and the fleet](./fleet.md#reading-the-board-as-data).
+The machine-oriented reads are `board.query`, which returns a page as typed JSON rows (every field
+present, absent optionals as `null`) so a flow can `each` over items and `match` on their state, and
+`board.comments`, which returns one item's notes as an array. `board.query` also accepts a
+`depends_on` filter that keeps only items whose dependencies are all `done`. `board.list` and
+`board.get` render prose for reading. See
+[Work boards and the fleet](./fleet.md#reading-the-board-as-data).
 
 The seven mutating operations are gated like any other write: each reports a concrete
 `<name>/item/<id>` approval subject—`<name>/item/new` for `create`, since no id exists yet—so a grant
@@ -242,7 +251,7 @@ scoped to one item can never move another. `transition` validates the edge again
 
 ## Related docs
 
-- [Operations](../language/ops.md)—the catalog both datasource forms use.
+- [Operations](../language/ops.md)—the catalog both datasource forms and work boards use.
 - [Endpoints](./endpoints.md)—discover and consume live service connections as weak references.
 - [Multi-agent programs](./programs.md)—declare indexed knowledge in a program file.
 - [Plugin authoring](../plugins/authoring.md)—contribute records from an integration.

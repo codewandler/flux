@@ -52,8 +52,8 @@ appear where you might expect it.
 
 For deployments that embed the flux crates and run **several processes or replicas against one
 shared store**, `flux-events` ships a Postgres backend behind the `postgres` cargo feature. The
-default build is entirely DB-free — no Postgres driver is compiled unless you enable the feature —
-and the `flux` CLI binary always uses embedded SQLite.
+default build is **Postgres-driver-free**: it includes embedded SQLite, but no Postgres driver unless
+you enable the feature. The `flux` CLI binary always uses embedded SQLite.
 
 Selection is programmatic: enable the feature and open the store over a connection handle instead
 of a file path. There is no environment variable or config key.

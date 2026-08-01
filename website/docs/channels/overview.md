@@ -22,13 +22,13 @@ A channel **fires a bus event under its own name**, and a [`trigger`](../agent/p
 that name to something that does work:
 
 ```flux
-channel slack                    # the event source, named `slack`
+channel slack  # the event source, named `slack`
   bot_token secret "SLACK_BOT_TOKEN"
   app_token secret "SLACK_APP_TOKEN"
 
-trigger on_message               # the route
-  on "slack"                     # matches the channel's name, exactly
-  agent assistant                # what runs: an agent (model-driven) or `run <journey>` (fixed flow)
+trigger on_message  # the route
+  on "slack"  # matches the channel's name, exactly
+  agent assistant  # what runs: an agent (model-driven) or `run <journey>` (fixed flow)
 ```
 
 That separation is the whole design. The channel is transport; the trigger is policy; the agent or
@@ -56,9 +56,12 @@ Two small traits carry the entire mechanism, in the `flux-channels` crate:
 The interesting part is the **return value**. `deliver` hands back the runs it caused, and what a
 channel does with them is exactly what distinguishes the kinds:
 
-- a **webhook** writes them into the HTTP response,
+- a synchronous **webhook** writes them into the HTTP response; an asynchronous one acknowledges
+  the request first,
 - **Slack** posts them back into the originating thread,
-- **cron** discards them — nobody is waiting.
+- **cron** discards them — nobody is waiting,
+- a **connector** acknowledges an accepted event with `202` and does not put journey results in the
+  HTTP response.
 
 So "does this channel have a reply path, and where does the reply go?" is a per-kind property, not a
 framework-wide one. The [inventory](./inventory.md) states it for each.
@@ -67,16 +70,26 @@ The event payload is seeded into the run's store, so a flow reads it with ordina
 (`{field}`), and an agent-bound trigger receives it in scope (for example `$text` for an incoming
 message).
 
-## Deliveries are serialized, deliberately
+## Deliveries are concurrent, isolated, and bounded
 
-`AppDeliverer` holds a mutex gate and runs **one delivery at a time**. This is not an oversight. A
-delivery subscribes to the broadcast event bus to drain the cascade its journeys emit; two concurrent
-deliveries would each *also* receive the other's cascade events and double-process them.
+Deliveries from different channels can run at the same time. The app keeps each delivery's event
+cascade and nesting budget isolated, so a slow scheduled sweep does not make an unrelated webhook or
+Slack message wait behind it.
 
-Journeys themselves run on independent per-run stores, so this gate is the only serialization point —
-but it does mean a busy channel processes its backlog in order rather than in parallel. Per-delivery
-bus isolation is tracked as future work (story A-112); until it lands, treat a channel as an ordered
-queue of one.
+Concurrency is bounded. An app admits **64 deliveries at once by default**; set the positive-integer
+environment variable `FLUX_MAX_INFLIGHT_DELIVERIES` to choose another process-wide default. SDK
+callers can instead use `App::with_max_inflight_deliveries`, and can inspect `App::delivery_load()` to
+distinguish admitted work from deliveries waiting for a slot.
+
+At the bound, a delivery **waits**. flux neither drops it nor rejects it, and the wait propagates back
+to the task calling `deliver`. A synchronous webhook therefore takes longer to answer under pressure.
+Adapters that acknowledge first — asynchronous webhooks and connector channels — may already have
+returned `202` while their delivery task waits.
+
+Isolation does not make all app state private. Agent sessions, parked asks, and the recorded-send log
+are shared, so deliveries addressing the same conversation can interleave. There is also no
+unbounded mode: if your own flows hold deliveries open while waiting on other deliveries, set the
+limit above that fan-out width or the mutually dependent work can deadlock.
 
 ## Channels grant no authority
 
@@ -112,13 +125,16 @@ same program also speaks **outbound**, and the two are worth keeping distinct in
 A complete integration usually needs both halves — a vendor's API to call, *and* a way for that
 vendor to notify you. flux covers outbound richly (plugins, `http.request`, and
 [flux-connectors](https://github.com/codewandler/flux-connectors) generating typed ops from vendor
-specs). Inbound is the `webhook` kind below, and it is deliberately generic: it hands you the POST
-body and checks an optional bearer token. It does **not** verify vendor webhook signatures — see the
-[inventory](./inventory.md#known-limits) for what that means in practice.
+specs). For inbound traffic, a generic `webhook` passes the parsed JSON body through under one label.
+A [`connector`](./connector.md) instead loads a named manifest binding that selects event labels and
+maps vendor fields into payload symbols. Both can check a static bearer token; neither currently
+serves a vendor HMAC-signed webhook.
 
 ## Next
 
 - **[Channel inventory and capabilities](./inventory.md)** — every kind that exists, what it can do,
   and what it cannot.
+- **[Connector channels](./connector.md)** — install a manifest, select a binding, and understand the
+  current verification and reply limits.
 - **[Multi-agent programs](../agent/programs.md)** — the file format channels are declared in.
 - **[Slack channel setup](../agent/slack-channel.md)** — a full worked example, tokens included.

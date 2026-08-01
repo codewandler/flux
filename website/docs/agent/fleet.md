@@ -12,16 +12,17 @@ The two exist together for one reason: a coordinator that hands work out has to 
 restarted. If the record of "who is running item 42" lives in the coordinator's memory, a crash loses
 the fleet. If it lives on the board, recovery is just reading the board again.
 
-## Why not a datasource?
+## Why not an indexed or live datasource?
 
-A [datasource](./datasources.md) is read-only knowledge: you index documents and the agent retrieves
-from them. That cannot express work that is *claimed*, *moved*, *retried* and *commented on*. A board
-is the write-capable sibling — same governed shape, same concrete permission subjects, but the items
-have a lifecycle.
+A [datasource](./datasources.md) is a governed read boundary: either indexed knowledge or a typed
+live view of a system of record. Neither contract expresses work that is *claimed*, *moved*,
+*retried*, and *commented on*. A board is a separate write-capable work registry whose items have a
+lifecycle; its operations still use the same authorization, approval, and guarded-IO envelope.
 
 ## Declaring a board
 
-A board is declared like a datasource, with a `board:` kind:
+Flux-Lang currently declares a board in its `datasource` slot, using a `board:` kind to select the
+distinct board contract:
 
 ```flux
 datasource board
@@ -92,10 +93,12 @@ machine-readable sibling**: the same page as typed JSON rows, so a flow can loop
 branch on their fields instead of parsing text.
 
 ```flux
-$ready = board.query({ filters: { state: "ready", depends_on: "satisfied" } })
-
-each $item in $ready
-  $run = fleet.dispatch({ worker: $worker, task: $item.title, item: $item.id })
+ready_filters = { "depends_on": "satisfied", "state": "ready" }
+ready = board.query(filters: ready_filters)
+each item in ready
+  item_id = item.id
+  task_title = item.title
+  run = fleet.dispatch(item: item_id, task: task_title, worker)
 ```
 
 Filters go inside a `filters` object, and paging (`page`, `limit`) stays at the top level — the same
@@ -105,10 +108,10 @@ first rather than calling it in the `in` position.
 Each row carries `id`, `title`, `state`, `assignee`, `runner`, `task_id`, `depends_on`, `repo` and
 `attempts`.
 **Every row carries every field** — an optional that is not set comes back as `null` rather than
-being absent — so a sweep over a half-dispatched board can read `$item.runner` on every item without
+being absent — so a sweep over a half-dispatched board can read `item.runner` on every item without
 erroring on the ones nobody has picked up. The `state` values are the same spellings
-`board.transition` accepts, so `match $item.state` and a later transition cannot disagree about what
-a state is called.
+`board.transition` accepts. Bind `state = item.state` before matching it; expression fields are not
+available directly in the `match` header.
 
 `board.query` takes the same paging and filters as `board.list`, plus one more that only it accepts:
 
@@ -126,7 +129,7 @@ first. A flow that leaves a note on an item can therefore read back what previou
 
 ## Handing work to a worker
 
-Three operations talk to a remote flux agent over A2A:
+The fleet operations used to talk to a remote flux agent over A2A are:
 
 | Operation | What it does |
 |---|---|
@@ -156,11 +159,11 @@ trigger on_line
 
 journey hand_out
   flow
-    $claimed = board.claim({ id: "item-0001", assignee: "worker-a" })
-    $started = board.transition({ id: "item-0001", to: "in_progress" })
-    $run = fleet.dispatch({ worker: "http://127.0.0.1:9101", task: "index the repo", item: "item-0001" })
-    send({ channel: "cli", message: fmt("dispatched: {run}") })
-    return $run
+    claimed = board.claim(assignee: "worker-a", id: "item-0001")
+    started = board.transition(id: "item-0001", to: "in_progress")
+    run = fleet.dispatch(item: "item-0001", task: "index the repo", worker: "http://127.0.0.1:9101")
+    send(channel: "cli", message: fmt("dispatched: {run}"))
+    return run
 ```
 
 After that call the item on disk carries the two fields that were not there before:
@@ -189,10 +192,12 @@ started. A recovering *program* wants `board.query` for this — the rows alread
 `task_id`, so the sweep needs no follow-up call per item:
 
 ```flux
-$in_flight = board.query({ filters: { state: "in_progress" } })
-
-each $item in $in_flight
-  $state = fleet.status({ worker: $item.runner, task_id: $item.task_id })
+in_flight_filters = { "state": "in_progress" }
+in_flight = board.query(filters: in_flight_filters)
+each item in in_flight
+  runner = item.runner
+  task_id = item.task_id
+  state = fleet.status(task_id, worker: runner)
 ```
 
 `board.list` plus `board.get` is the equivalent for a person reading the board by hand.
@@ -230,10 +235,10 @@ Worth knowing before you build on this:
   items for you.
 - **Workers behind authentication are not reachable yet.** There is no configuration for a worker
   bearer token, so a worker served with authentication required cannot be dispatched to.
-- **Two backends exist.** Issue-tracker-backed boards are not shipped.
+- **Issue-tracker-backed boards are not shipped.** The available backends are listed above.
 
 ## See also
 
-- [Datasources](./datasources.md) — the read-only knowledge sibling
+- [Datasources](./datasources.md) — indexed and live governed read surfaces
 - [A2A](./a2a.md) — the protocol workers speak, and how to serve one
 - [Safety](./safety.md) — how egress and approval gating work in general

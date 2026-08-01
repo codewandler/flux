@@ -11,37 +11,132 @@ offline smoke test first so you can verify the runtime without provider credenti
 
 ## Install
 
-**Prebuilt binary** — choose a version and target from the
-[release page](https://github.com/codewandler/flux/releases), then verify that the archive was
-produced by that tag's official release workflow before extracting it:
+### Convenience installer
+
+The release page publishes installers for Linux, macOS, and Windows. Download the script first so
+you can inspect the code you are about to run.
+
+On Linux or macOS:
 
 ```bash
-release=vX.Y.Z
-archive=flux-cli-<target>.tar.xz
-gh release download "$release" --repo codewandler/flux --pattern "$archive"
-source_digest="$(gh api "repos/codewandler/flux/commits/$release" --jq .sha)"
-gh attestation verify "$archive" --repo codewandler/flux \
-  --signer-workflow codewandler/flux/.github/workflows/release.yml \
-  --source-ref "refs/tags/$release" --source-digest "$source_digest" \
-  --deny-self-hosted-runners
-tar -xJf "$archive"
+curl --proto '=https' --tlsv1.2 -LsSf -o flux-installer.sh \
+  https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.sh
+sh flux-installer.sh
 ```
 
-The `.zip` archive is the equivalent verified path on Windows. Convenience installer scripts remain
-attached to each release, but inspect/download them separately if you choose that path; executing a
-`latest` installer directly from the network trusts the release origin without binding it to a
-specific tag and workflow.
+The installer writes to `${CARGO_HOME:-$HOME/.cargo}/bin`. Open a new shell after it finishes. If
+that directory is not already on `PATH`, add it to your shell startup file; for the current shell:
 
-**From source** — requires Rust 1.87+ (`rustup update stable`):
+```bash
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+```
+
+On Windows PowerShell:
+
+```powershell
+Invoke-WebRequest `
+  https://github.com/codewandler/flux/releases/latest/download/flux-cli-installer.ps1 `
+  -OutFile flux-installer.ps1
+powershell -ExecutionPolicy Bypass -File .\flux-installer.ps1
+```
+
+Open a new PowerShell window after installation. For the current window, if needed:
+
+```powershell
+$env:Path = "$HOME\.cargo\bin;$env:Path"
+```
+
+These moving `latest` URLs trust the GitHub release origin. For a version- and workflow-bound
+installation, use the manual path below.
+
+### Attestation-verified manual install
+
+The following Linux/macOS commands select a real target from `uname`, verify the archive against the
+official release workflow and exact tag commit, and install the binary into `~/.local/bin`. Set
+`FLUX_RELEASE` to the tag you reviewed (the first command resolves the latest published tag; replace
+it with an explicit tag when your deployment pins one):
+
+```bash
+set -euo pipefail
+export FLUX_RELEASE="$(gh release view --repo codewandler/flux --json tagName --jq .tagName)"
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+  Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-gnu ;;
+  Darwin/x86_64) target=x86_64-apple-darwin ;;
+  Darwin/arm64) target=aarch64-apple-darwin ;;
+  *) printf 'No prebuilt flux archive for %s/%s\n' "$(uname -s)" "$(uname -m)" >&2; exit 1 ;;
+esac
+archive="flux-cli-$target.tar.xz"
+work_dir="$(mktemp -d)"
+trap 'rm -r "$work_dir"' EXIT
+gh release download "$FLUX_RELEASE" --repo codewandler/flux \
+  --pattern "$archive" --dir "$work_dir"
+source_digest="$(gh api "repos/codewandler/flux/commits/$FLUX_RELEASE" --jq .sha)"
+gh attestation verify "$work_dir/$archive" --repo codewandler/flux \
+  --signer-workflow codewandler/flux/.github/workflows/release.yml \
+  --source-ref "refs/tags/$FLUX_RELEASE" --source-digest "$source_digest" \
+  --deny-self-hosted-runners
+tar -xJf "$work_dir/$archive" -C "$work_dir"
+install -d "$HOME/.local/bin"
+install -m 0755 "$work_dir/flux-cli-$target/flux" "$HOME/.local/bin/flux"
+trap - EXIT
+rm -r "$work_dir"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Windows releases currently target x64. This PowerShell equivalent installs to your local programs
+directory and adds it to your user `PATH`:
+
+```powershell
+$ErrorActionPreference = "Stop"
+function Assert-NativeSuccess([string] $step) {
+  if ($LASTEXITCODE -ne 0) { throw "$step failed with exit code $LASTEXITCODE" }
+}
+$release = gh release view --repo codewandler/flux --json tagName --jq .tagName
+Assert-NativeSuccess "Resolve release"
+$target = "x86_64-pc-windows-msvc"
+$archive = "flux-cli-$target.zip"
+$workDir = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
+New-Item -ItemType Directory -Path $workDir | Out-Null
+try {
+gh release download $release --repo codewandler/flux --pattern $archive --dir $workDir
+Assert-NativeSuccess "Download release"
+$sourceDigest = gh api "repos/codewandler/flux/commits/$release" --jq .sha
+Assert-NativeSuccess "Resolve source commit"
+gh attestation verify (Join-Path $workDir $archive) --repo codewandler/flux `
+  --signer-workflow codewandler/flux/.github/workflows/release.yml `
+  --source-ref "refs/tags/$release" --source-digest $sourceDigest `
+  --deny-self-hosted-runners
+Assert-NativeSuccess "Verify attestation"
+Expand-Archive (Join-Path $workDir $archive) -DestinationPath $workDir
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\flux\bin"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item (Join-Path $workDir "flux.exe") `
+  (Join-Path $installDir "flux.exe") -Force
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($userPath -split ';') -notcontains $installDir) {
+  [Environment]::SetEnvironmentVariable("Path", "$installDir;$userPath", "User")
+}
+$env:Path = "$installDir;$env:Path"
+} finally {
+  Remove-Item -Recurse -Force $workDir
+}
+```
+
+The current target names and downloadable archives are listed on the
+[release page](https://github.com/codewandler/flux/releases/latest).
+
+### Install from source
+
+This requires Rust 1.87 or newer (`rustup update stable`):
 
 ```bash
 cargo install --git https://github.com/codewandler/flux --package flux-cli
 ```
 
-Prebuilt binaries, installers, and checksums are attached to every
-[tagged release](https://github.com/codewandler/flux/releases/latest).
+### Verify and update
 
-Verify which executable and release you are using:
+On Linux or macOS, verify which executable and release you are using:
 
 ```bash
 command -v flux
@@ -49,8 +144,12 @@ flux --version
 flux changelog
 ```
 
-To update a prebuilt installation, rerun the installer—it resolves the latest published release and
-replaces the existing binary. For a source installation, rerun the Cargo command with `--force`:
+On Windows, use `Get-Command flux`, followed by the same `flux --version` and `flux changelog`
+commands.
+
+To update a convenience installation, download and run the installer again. To update a manually
+verified installation, repeat the matching manual block with the newer reviewed release tag. For a
+source installation, rerun Cargo with `--force`:
 
 ```bash
 cargo install --force --git https://github.com/codewandler/flux --package flux-cli
@@ -74,7 +173,7 @@ Point flux at a provider, then run a turn. The full provider matrix and credenti
 [Providers and models](./agent/providers.md).
 
 ```bash
-# Adaptive turn. Risky action batches prompt for approval; --yes auto-approves.
+# Adaptive turn. Risky batches prompt; --yes approves admitted actions within active ceilings.
 flux run "add a test for the parser"
 
 # Reveal intent, scoped exploration, and batch machinery
@@ -92,8 +191,8 @@ flux auth status
 
 Every operation crosses the same [safety envelope](./agent/safety.md). Evidence reads are pre-allowed;
 writes and commands are captured into an action batch and prompt; destructive effects remain forced
-through approval. `--yes` auto-approves every action, including destructive ones, so reserve it for
-trusted automation.
+through approval. `--yes` auto-approves every admitted action, including destructive ones, but never
+widens policy, app, or agent ceilings. Reserve it for trusted automation.
 
 ## Run a stored Flux-Lang flow
 
@@ -102,10 +201,10 @@ as `hello.flux`:
 
 ```flux
 flow hello -> String
-  $when = now()
-  $utc  = $when.utc
-  $greeting = fmt("hello — the time is {utc}")
-  return $greeting
+  clock = now()
+  utc = clock.utc
+  greeting = fmt("hello — the time is {utc}")
+  return greeting
 ```
 
 ```bash

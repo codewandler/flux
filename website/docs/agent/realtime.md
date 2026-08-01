@@ -13,7 +13,8 @@ an authored flow owns the call and the realtime model is only the acoustic front
 [Flow-driven voice](#flow-driven-voice) below).
 
 The public shape is `RealtimeProvider`, a sibling of the half-duplex [`Provider`](./providers.md).
-The concrete OpenAI implementation is behind the `realtime` cargo feature on `flux-providers`.
+The concrete OpenAI implementation is behind the `realtime` cargo feature on the published
+`codewandler-flux-providers` package (imported as `flux_providers`).
 
 ## What exists
 
@@ -46,27 +47,43 @@ with your ops and policies as usual, then hand it a realtime provider, a config,
 
 ```toml
 [dependencies]
-flux-sdk = "*"
-flux-providers = { version = "*", features = ["realtime"] }
+codewandler-flux-sdk = "0.44"
+codewandler-flux-providers = { version = "0.44", features = ["realtime"] }
 ```
 
 ```rust
-use flux_flow::VoiceSink;
-use flux_provider::RealtimeConfig;
+use flux_sdk::voice::{RealtimeConfig, VoiceSink};
+use flux_sdk::{CancellationToken, FlowClient};
 use flux_providers::realtime::openai_realtime_from_env;
-use tokio_util::sync::CancellationToken;
 
-let provider = openai_realtime_from_env()?; // OPENAI_KEY / OPENAI_API_KEY
-let config = RealtimeConfig::voice_agent("gpt-realtime", "You book appointments. Be brief.");
+async fn run_voice(
+    client: &FlowClient,
+    sink: &mut impl VoiceSink,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let provider = openai_realtime_from_env()?; // OPENAI_KEY / OPENAI_API_KEY
+    let config = RealtimeConfig::voice_agent(
+        "gpt-realtime",
+        "You book appointments. Be brief.",
+    );
+    let cancel = CancellationToken::new(); // cancel to end the session, for example on hangup
 
-let cancel = CancellationToken::new();      // trigger to end the session (e.g. hangup)
-// `client` is an assembled FlowClient; `sink` is your VoiceSink implementation.
-client.run_voice_session(&provider, config, &mut sink, &cancel).await?;
+    client
+        .run_voice_session(&provider, config, sink, &cancel)
+        .await?;
+    Ok(())
+}
 ```
 
 `run_voice_session` declares the client's registered ops to the model, builds the executor, and
-drives the session until `cancel` fires or the connection ends. Your `VoiceSink` receives the output
-half; you push caller audio through the session handle.
+drives the session until `cancel` fires or the connection ends. Your `VoiceSink` receives audio,
+transcript, tool, and lifecycle output.
+
+The high-level SDK methods do **not** return or expose the connected `RealtimeSession`, so
+`run_voice_session` does not currently give the caller a handle for `send_audio`. If your transport
+must push microphone or telephony frames, use the lower-level provider/driver seam and retain a clone
+of `RealtimeConnection::session` before handing the connection to `VoiceSessionDriver::run` (or
+`run_flow_turns`). Treat an input adapter above these SDK methods as future work; their `Result<()>`
+is not an audio-input handle.
 
 ## Flow-driven voice
 
@@ -74,8 +91,8 @@ Since 0.15.0 an **authored flow can drive the call** instead of the model: the d
 flow's authored prompts (TTS via the realtime channel), the caller's reply resumes the flow's
 suspension, and the model does cognition only where the flow explicitly delegates a bounded
 segment (`ai_segment` — see [durability and sessions](../language/durability.md)). Classic-IVR
-determinism over the same voice stack: the deterministic skeleton makes **zero** model planning
-calls, and when the flow completes the driver speaks the final line, fires
+determinism over the same voice stack: the deterministic skeleton makes **zero** model calls, and
+when the flow completes the driver speaks the final line, fires
 `VoiceSink::session_ended` (your hangup/handoff hook), and ends the session.
 
 The SDK entry point is `Session::run_voice_flow(provider, config, flow, sink, cancel)` — the voice

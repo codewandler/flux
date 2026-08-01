@@ -21,13 +21,14 @@ handle a **reference** to one. A reference is an address:
 - `plugin/<plugin>/<instance>/<slot>` — a plugin-scoped credential,
 - `kubernetes/<ns>/<name>/<key>` — a cluster secret.
 
-The model plans against these **names**. Only the host, at the moment of an actual IO call, resolves
-a reference into the real value, uses it, and discards it. A resolved credential is modelled so it
-can't leak by accident: it redacts itself in debug output, and the resolved-endpoint form the host
-builds to make a request has **no serialization at all** — there is no code path that could turn it
-back into text the model could see.
+Model-visible calls carry these **names**. The host resolves a reference only at an IO boundary. On a
+host-mediated HTTP path it injects the value without returning it to the plugin. An explicitly
+declared `secret` or `credential` callback can instead materialize the value into trusted native
+plugin code, while `conn.authenticate` keeps it host-side for a supported database handshake. None
+of those paths returns the value to the model. Resolved credentials redact themselves in debug
+output, and the resolved-endpoint form used for host-mediated requests has no serialization at all.
 
-> The model plans against secret *names*. It never receives a secret *value*.
+> Model-visible calls carry secret *names*. They never receive a secret *value*.
 
 ## The redactor
 
@@ -61,24 +62,29 @@ token, an expiry, and an optional account id.
 The default store is **plaintext, protected by file permissions — not encrypted at rest.** The file
 is written `0600` (owner-only) by creating a temp file at that mode and atomically renaming it over
 the target, so there is never a world-readable window and a crash can't truncate your other tokens.
-Filesystem permissions are the whole at-rest protection under the default backend. If you need
-encryption or centralized storage, use the Vault backend below.
+Filesystem permissions are the whole at-rest protection under the default backend. An embedding
+host that needs centralized storage can inject the Vault backend described below; the stock CLI and
+server do not select it automatically.
 :::
 
 ## Storage backends
 
-Credential storage is a pluggable backend (`CredentialStore`), so a deployment can move tokens off
-local disk without changing anything else:
+Credential storage is a pluggable library boundary (`CredentialStore`), so an embedding application
+can move tokens off local disk:
 
 | Backend | Where tokens live | When to use |
 |---|---|---|
 | File (default) | `~/.flux/credentials.toml`, `0600` | Local, single-user development |
-| Vault | HashiCorp Vault KV-v2 at `<addr>/v1/<mount>/data/<prefix>/<key>` | Multi-tenant / server deployments where per-customer tokens must not sit in a file on a pod |
+| Vault (embedder-provided) | HashiCorp Vault KV-v2 at `<addr>/v1/<mount>/data/<prefix>/<key>` | Host applications where per-customer tokens must not sit in a file on a pod |
 
-The Vault backend reads standard Vault environment (`VAULT_ADDR`, `VAULT_TOKEN`) plus optional
-`FLUX_VAULT_MOUNT` (default `secret`) and `FLUX_VAULT_PREFIX` (default `flux`); it authenticates with
-an `X-Vault-Token` header and maps the `:` separators in a key to Vault path segments. Pair it with
-[Principal-mode server auth](./server-auth.md) for the hardened multi-tenant profile.
+`VaultCredentialStore::from_env()` reads standard Vault environment (`VAULT_ADDR`, `VAULT_TOKEN`)
+plus optional `FLUX_VAULT_MOUNT` (default `secret`) and `FLUX_VAULT_PREFIX` (default `flux`). It
+authenticates with an `X-Vault-Token` header and maps `:` separators in a key to Vault path segments.
+An embedder must construct the store and inject it into its plugin host with
+`SystemHostCaps::with_credential_store`; `from_env()` is a constructor helper, not automatic CLI or
+server configuration. The stock `flux auth` commands and server assembly continue to use the file
+store even when those variables are set. Pair an injected store with
+[principal-mode server auth](./server-auth.md) for a multi-tenant deployment.
 
 ## Logging in a provider
 
@@ -103,10 +109,9 @@ flux auth login <plugin> --password  # resource-owner password grant instead
 flux plugin login <plugin>           # equivalent alias
 ```
 
-:::note No shipped plugin declares OAuth2 yet
-Every plugin in the signed pack authenticates with a plain bearer token, so this path is for
-third-party plugins today. Against a token-only plugin the command refuses with
-`plugin <name> declares no OAuth2 auth method` — use `flux auth set <plugin> <purpose>` instead.
+:::note Token-only manifests use `auth set`
+Against a plugin that declares no OAuth2 auth method, the command refuses with
+`plugin <name> declares no OAuth2 auth method`. Use `flux auth set <plugin> <purpose>` instead.
 :::
 
 The security-relevant part is **who runs the OAuth flow**: flux does, not the plugin. The plugin only
@@ -119,9 +124,10 @@ The host:
 3. stores the resulting token under `plugin:<name>:<purpose>` and **refreshes it automatically** near
    expiry.
 
-The plugin never touches the `/oauth/token` endpoint and never sees the resulting token — at call
-time the host injects a fresh bearer on the plugin's behalf. The declaration side of this
-(`oauth2` manifest fields) lives on the [Plugin capability sandbox](./plugin-sandbox.md) page.
+The plugin never handles the `/oauth/token` exchange itself. At call time, a host-mediated
+`http.do` request can inject the fresh bearer without returning it to the plugin. A trusted plugin
+that explicitly asks for its declared auth purpose through `secret` does receive the raw bearer;
+that distinction is documented under [Plugin capability sandbox](./plugin-sandbox.md).
 
 ## Storing a plain plugin token (`flux auth set`)
 
@@ -143,8 +149,10 @@ secrets in its environment.
 
 Resolution order for a plugin purpose: a **stored token wins**, the declared **env keys are the
 fallback** — the same order OAuth-backed purposes use. `flux plugin status <name>` always shows
-which source is active, without printing a value. Like every host-resolved secret, a stored token
-is registered with the redactor and reaches the wire only as a host-injected header.
+which source is active, without printing a value. Like every host-resolved secret, a stored token is
+registered with the redactor. It may reach the wire as host-injected HTTP auth, be materialized into
+trusted plugin code through a declared `secret`/`credential` callback, or remain host-side for
+`conn.authenticate`; it never becomes model-visible context.
 
 ## Related docs
 

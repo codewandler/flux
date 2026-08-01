@@ -16,8 +16,8 @@ All ten guard rails have native text spellings: `assert`, `retry`, `timeout`, `b
 ## `assert` — abort on a falsey condition
 
 ```flux
-$hits = grep({pattern: "ERROR", glob: "*.log"})
-assert $hits, "no ERROR lines found"
+hits = grep(glob: "*.log", pattern: "ERROR")
+assert hits, "no ERROR lines found"
 assert len($hits) > 0, "no ERROR lines found"
 ```
 
@@ -26,18 +26,18 @@ assert len($hits) > 0, "no ERROR lines found"
 ## `retry` — retry transient failures
 
 ```flux
-retry 3 backoff exponential delay 500 -> $health
+retry 3, backoff: exponential, delay: 500ms -> health
   web.fetch("https://api.example.com/health")
 ```
 
-The header uses space-keyword tokens in a fixed order:
+The maximum is positional; the remaining header options are named:
 
 | token | required | meaning |
 |---|---|---|
 | `<max>` | yes | maximum attempts, including the first |
-| `backoff none / linear / exponential` | no | inter-attempt delay strategy (default `none`) |
-| `delay <duration>` | no | base delay — `250ms` / `5s` / `1m`, or a bare integer read as milliseconds. **Defaults to 500 ms**, so a `retry` with no `delay` still waits between attempts |
-| `-> $bind` | no | binds the body's last expression on success |
+| `backoff: none / linear / exponential` | no | inter-attempt delay strategy (default `none`) |
+| `delay: <duration>` | no | base delay — `250ms` / `5s` / `1m`, or a bare integer read as milliseconds. **Defaults to 500 ms**, so a `retry` with no `delay` still waits between attempts |
+| `-> result` | no | binds the body's last expression on success |
 
 The backoff schedule, where `k` counts retries (`k = 1` is the wait before the second attempt):
 
@@ -51,15 +51,12 @@ Semantics to keep in mind:
 
 - **Fatal errors are never retried.** A policy denial, an unknown op, or a type error propagates immediately — retrying cannot fix them.
 - **A denied `confirm` is not retried.** A human "no" inside the body is an answer, not a transient failure.
-- **Bind through the header, not inside the body.** The `-> $bind` captures the body's last expression on success; do not also bind the same result inside the body.
+- **Bind through the header, not inside the body.** `-> result` captures the body's last expression on success; do not also bind the same result inside the body.
 - After `max` failed attempts, the node errors with the last attempt's error message.
 
 ```flux
-# correct: the header captures the result
-retry 3 -> $out
+retry 3 -> out
   bash("flaky.sh")
-
-# also correct: side effects only, nothing bound
 retry 3
   bash("flaky.sh")
 ```
@@ -67,41 +64,41 @@ retry 3
 ## `timeout` — bound wall-clock time
 
 ```flux
-timeout 5000 -> $page
-  $page = web.fetch("https://example.com")
+timeout 5s -> page
+  web.fetch("https://example.com")
 ```
 
-`timeout <ms>` runs its body under a wall-clock deadline. If the body finishes in time, `-> $bind` names its result. If the deadline expires, the node errors — and that error is catchable by an enclosing `try` or `retry`, so a slow path can degrade instead of killing the flow.
+`timeout <duration>` runs its body under a wall-clock deadline. If the body finishes in time, `-> result` names its result. If the deadline expires, the node errors — and that error is catchable by an enclosing `try` or `retry`, so a slow path can degrade instead of killing the flow.
 
 Dispatches that completed before the deadline stay counted and traced; a timeout does not erase the work that already happened, it only stops what comes after.
 
 ## `budget` — cap op dispatches
 
 ```flux
-budget 10 -> $notes
-  $hits  = grep({pattern: "TODO", glob: "*.rs"})
-  $notes = ai.reason({ask: "Cluster these TODOs: {hits}"})
+budget 10 -> notes
+  hits = grep(glob: "*.rs", pattern: "TODO")
+  ai.reason(ask: "Cluster these TODOs: {hits}")
 ```
 
 `budget <n>` caps the number of **op dispatches** inside its body — calls that go through the runtime's dispatch gate. Pure nodes (`fmt`, `jq`, `expr`, value templates) dispatch nothing and are free.
 
 The cap is checked at statement boundaries. A single nested statement — an `each` over a long list, say — can consume several dispatches before the next check, so a scope can overshoot its limit by the width of one statement. Treat the budget as a firm brake, not an exact meter.
 
-v1 counts dispatches, not tokens or money. `-> $bind` names the body's result.
+The current budget counts dispatches, not tokens or money. `-> result` names the body's result.
 
 ## `with_tools` — capability scope
 
 ```flux
-with_tools ["read", "grep"] -> $hits
-  $src  = read("src/lib.rs")
-  $hits = grep({pattern: "unwrap", glob: "*.rs"})
+with_tools ["read", "grep"] -> hits
+  src = read("src/lib.rs")
+  grep(glob: "*.rs", pattern: "unwrap")
 ```
 
 `with_tools [...]` restricts op dispatch inside its body to the named tools. A call to anything outside the allowlist **fails closed** at the runtime's dispatch gate — even when the surrounding session policy would have allowed it. This is a runtime-enforced capability boundary, not an advisory hint.
 
 - **Capabilities only narrow on descent.** Nested `with_tools` scopes are intersected: an inner block can never re-grant a tool an outer block removed.
 - **The analyzer echoes the rule statically.** A literal call to a tool that is provably absent from the list is flagged before the flow runs; dynamic dispatch is still caught at runtime.
-- `-> $bind` names the body's result.
+- `-> result` names the body's result.
 
 Use it to hand a sub-plan read-only capabilities, or to guarantee a model-influenced section cannot reach `bash` or `write` no matter what it emits. See [Safety & approvals](../agent/safety.md) for the session-level policy this composes with.
 
@@ -110,19 +107,19 @@ Use it to hand a sub-plan read-only capabilities, or to guarantee a model-influe
 ```flux
 try
   bash("might-fail.sh")
-catch $err
+catch err
   bash("echo fallback: {err}")
 ```
 
 - The body runs first. If it succeeds, the handler never runs.
-- On failure, the error **string** is bound to the `catch` symbol (here `$err`) and the handler runs — the handler can interpolate `{err}` or branch on it.
+- On failure, the error **string** is bound to the `catch` symbol (here `err`) and the handler runs — the handler can interpolate `{err}` or branch on it.
 - If the handler itself errors, that error propagates.
-- The `catch $err` arm (and its handler block) is optional. A `try` with no handler suppresses errors **silently** — use that deliberately, or not at all.
+- The `catch err` arm (and its handler block) is optional. A `try` with no handler suppresses errors **silently** — use that deliberately, or not at all.
 
 ## `confirm` — human approval gate
 
 ```flux
-confirm "Delete all temporary files?" risk high
+confirm "Delete all temporary files?", risk: high
   bash("rm -rf tmp/")
 ```
 
@@ -145,22 +142,22 @@ verify bash("cargo test --workspace 2>&1") contains "test result: ok": "workspac
 ## `throttle` — rate-limit dispatches
 
 ```flux
-throttle "fetches" 5 per 60000
-  web.fetch($url)
+throttle "fetches", max: 5, per: 1m
+  web.fetch(url)
 ```
 
-- The header reads `throttle "<name>" <max> per <window_ms>`: at most `max` op dispatches inside the body per sliding `window_ms` window.
+- The header reads `throttle "<name>", max: <count>, per: <duration>`: at most `max` op dispatches inside the body per sliding window.
 - The token bucket is keyed by `(session, name)` and updated **atomically**, and it survives across turns. Two `throttle` nodes with distinct names never share a bucket; reusing a `name` deliberately shares one.
 - When the limit is exceeded the node **errors instead of blocking**, so the plan stays responsive. Wrap it in `try` or `retry` (with a delay) if waiting is the right response.
 
 ## `debounce` — coalesce bursts across turns
 
 ```flux
-debounce "rebuild" 300
+debounce "rebuild", wait: 300ms
   bash("rebuild.sh")
 ```
 
-- The header reads `debounce "<name>" <wait_ms>`. Each time the node is reached, a last-trigger timestamp for its `name` is recorded in the session store. The body runs only once `wait_ms` has elapsed since that key's last trigger.
+- The header reads `debounce "<name>", wait: <duration>`. Each time the node is reached, a last-trigger timestamp for its `name` is recorded in the session store. The body runs only once the wait duration has elapsed since that key's last trigger.
 - Re-arrivals inside the window re-arm the timer, so a burst of triggers coalesces into a single body run after things settle.
 - Because the timestamp lives in the session store keyed by `(session, name)`, the settling window spans turns — not just one plan execution.
 
@@ -168,5 +165,6 @@ debounce "rebuild" 300
 
 - Ordered graceful degradation with `fallback` — [Control flow](./control-flow.md)
 - First-success `race` and fan-out `parallel` — [Concurrency](./concurrency.md)
-- Guaranteed cleanup (`scope`), rollback (`saga`), and at-most-once effects (`once`) — [Durability & cross-turn state](./durability.md)
+- Guaranteed cleanup (`scope`), rollback (`saga`), and durable effect de-duplication after successful
+  completion has been recorded (`once`) — [Durability & cross-turn state](./durability.md)
 - The session policy and approval chain every dispatch passes through — [Safety & approvals](../agent/safety.md)

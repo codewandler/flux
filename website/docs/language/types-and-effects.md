@@ -5,9 +5,11 @@ description: Flux-Lang's lightweight type surface — built-in types, effect tag
 
 # Types & effects
 
-Flux-Lang has lightweight structural annotations. They document intent, feed analyzer checks, and stay
-visible in the AST. They are optional today; runtime values are still JSON-like values owned by the
-value store.
+Flux-Lang has a deliberately small annotation system, not a structural type system. `TypeRef`
+distinguishes primitives, lists, and named types. Annotations stay visible in the AST and let the
+analyzer reject concrete argument mismatches against registered operation signatures; they do not
+recursively prove the shape of every runtime value. Values themselves remain JSON-like data owned by
+the value store.
 
 ## Built-in types
 
@@ -27,26 +29,28 @@ In the JSON wire form these correspond to the `TypeRef` tags `any`, `bool`, `num
 
 ```flux
 flow build-report(repo: String, branch: String) -> TestResult
-  $tests: TestResult = cargo_test({args: ["--workspace"]})
-  return $tests
+  tests: TestResult = cargo_test(args: ["--workspace"])
+  return tests
 ```
 
 - **Flow parameters** — `name: Type` in the header.
 - **Return types** — `-> Type` on the header.
-- **Typed binds** — `$x: Type = …` in the body.
+- **Typed binds** — `x: Type = …` in the body.
 
 Named types come from the registered prelude (below) or host-registered schemas; a flow
 references them by name.
 
 ## Effects
 
-`FlowEffect` is the semantic effect declared on a bind — it drives risk scoring and approval
-decisions in the safety envelope. Declare one with an `@effect(tag)` annotation on the line
-before the bind:
+`FlowEffect` is the semantic consequence declared on a bind. It contributes to the analyzer's
+whole-flow and per-node risk view, so tooling can explain the intended consequence before execution.
+It does not replace the operation's host-registered effects, lower its risk, or grant authority: the
+dispatcher still enforces the operation's own policy and approval contract. Declare one with an
+`@effect(tag)` annotation on the line before the bind:
 
 ```flux
 @effect(send_external)
-$sent = send_report($report)
+sent = send_report(report)
 ```
 
 | tag | meaning |
@@ -67,17 +71,17 @@ undone — never an application domain: booking a meeting or updating a CRM reco
 `send_external` (or `write_db`), not a tag of its own. (A legacy `calendar` tag still parses for
 compatibility but is deprecated and slated for removal.)
 
-Operations also declare their own effects host-side; the annotation is the plan author's
-declaration of intent on a specific bind. See [Safety & approvals](../agent/safety.md) for how
-effects feed the approval chain.
+Operations also declare their own effects host-side; the annotation is the plan author's additional
+declaration of intent on a specific bind. See [Safety & approvals](../agent/safety.md) for the
+authoritative dispatch-time approval chain.
 
-Tooling can ask **where** a flow's risk lives, per node: since 0.15.0,
+Tooling can ask **where** a flow's risk lives, per node:
 `flux_lang::analyze::annotate_effects(&ast, &ops)` returns, for every `call` node (keyed by the
 same node path diagnostics use, e.g. `body[3].then[1]`), its combined effects — the op's own
 host-declared effects plus the `@effect(tag)` on its enclosing bind — with a risk tier and
-idempotency. It is the per-node, attributed sibling of the flow-level effects union the approval
-envelope consumes, so a visual editor or reviewer can pin exactly which call moves money instead
-of only knowing that something in the flow does.
+idempotency. It is the per-node, attributed sibling of the flow-level effects union, so a visual
+editor or reviewer can pin exactly which call moves money instead of only knowing that something in
+the flow does.
 
 ## Prelude artifact types
 

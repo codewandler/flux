@@ -9,14 +9,15 @@ flux records model usage per call and rolls it up by session and provider. Use t
 what the CLI summary means, where the numbers come from, and how to price models the built-in table
 does not know yet.
 
-Usage is stored in the session event log (`~/.flux/events.db`) with the canonical `provider/model`
-spec that served the call. Dollar costs come from a built-in price table unless the provider reports
-the actual charge; provider-reported cost wins.
+Usage is stored in the active session event log (the CLI default is `~/.flux/events.db`; `--store`
+can select another store) with the canonical `provider/model` spec that served the call. Dollar costs
+come from a built-in price table unless the provider reports the actual charge; provider-reported
+cost wins.
 
 ## Per-turn cost
 
 Every agent turn — in the REPL, `flux run`, and `flux app run`'s interactive console — ends with a
-summary rule carrying the token breakdown and the turn's dollar cost; the [TUI](./cli.md) header shows
+summary rule carrying the token breakdown and the turn's dollar cost; the [TUI](./tui.md) header shows
 a running total instead:
 
 ```text
@@ -61,8 +62,10 @@ note: no pricing entry for `openrouter/some/model` — add one to ~/.flux/pricin
 ```
 
 The marker fires only for known metered cloud providers, where a missing row hides real spend. Local
-`ollama*` and unknown providers stay silent. OpenRouter models usually price even without a table row,
-because the provider-reported cost is used directly (a `:free` model correctly shows as zero cost).
+`ollama*` providers stay silent because flux does not assign them a token bill. Unrecognized provider
+prefixes also stay silent because flux cannot infer their billing posture; add an override if that
+provider is metered. OpenRouter models usually price even without a table row because the
+provider-reported cost is used directly (a `:free` model correctly shows as zero cost).
 
 ## Overriding prices: `~/.flux/pricing.toml`
 

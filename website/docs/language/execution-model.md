@@ -53,7 +53,7 @@ operations through their provider-native schemas and never emits an AST.
 
 Symbols are names; values are immutable records in a value store the runtime owns.
 
-- A `bind` (`$x = op(…)`) stores the operation's result and points the symbol at it.
+- A bind (`x = op(…)`) stores the operation's result and points the symbol at it.
 - Rebinding a symbol stores a *new* value — the old value is not mutated and stays addressable
   in the audit trail.
 - An unbound symbol reference is a hard error at evaluation time.
@@ -113,10 +113,8 @@ Conditions can be a symbol, literal, call, or native expression:
 ```flux
 when $count > 3 && $state == "ready"
   return "go"
-
-repeat 10
-  until len($queue) == 0
-  do poll
+repeat 10, until: len($queue) == 0
+  poll()
 ```
 
 Native expression conditions lower to pure `expr` nodes; no tool is dispatched to evaluate them.
@@ -141,9 +139,10 @@ Two nodes make flows outlive a single execution:
   prefix is **not** re-executed.
 - **`checkpoint`** is a durable resume marker: re-running the same flow in the same session
   fast-forwards past the completed prefix — its symbols are still bound and its side effects
-  are not repeated.
+  are not repeated. The flow's declared name and canonical body identity form the resume key, so an
+  edited flow does not inherit the old cursor; the checkpoint label is descriptive event metadata.
 
-Both are top-level only, because v1 keeps resume cursors simple and stable. The full
+Both are top-level only so resume cursors stay simple and stable. The full
 cross-turn story — including `memo`, `once`, `scope`, and `saga` — is in
 [Durability & cross-turn state](./durability.md).
 

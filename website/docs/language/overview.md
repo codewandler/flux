@@ -7,7 +7,11 @@ description: What Flux-Lang is, the mental model behind it, and a map of the lan
 
 Flux-Lang is the authored workflow language at the center of flux. It places deterministic control
 flow around model judgment and runtime authority: typed stages may interpret or propose, while the
-runtime analyzes the authored program, approves effects, and executes it. Models do not emit Flux.
+runtime analyzes the authored program, approves effects, and executes it. The default conversational
+loop does not ask the model to emit per-turn executable Flux. The explicit
+[`op.register`](../agent/saved-flows.md#register-an-operation-during-a-turn) exception lets a model
+propose source for exactly one composite operation; the host parses, analyzes, scopes, and guards it
+before installation rather than executing it on receipt.
 
 Start here if you want the mental model before reading syntax or node reference pages.
 
@@ -16,17 +20,17 @@ A flow is a small, readable program over named values:
 ```flux
 flow release-check
   parallel
-    branch $status
-      $status = git_status()
-    branch $tests
-      $tests = cargo_test({args: ["--workspace"]})
-  assert $tests, "test run produced no output"
-  ctx $evidence
+    branch status
+      status = git_status()
+    branch tests
+      tests = cargo_test(args: ["--workspace"])
+  assert tests, "test run produced no output"
+  ctx evidence
     purpose "decide whether this tree is releasable"
     budget 8000
-    include $status, $tests
-  $verdict = ai.reason({ask: "Is this tree ready to release? Answer with reasons.", ctx: $evidence})
-  return { verdict: $verdict, status: $status }
+    include status, tests
+  verdict = ai.reason(ask: "Is this tree ready to release? Answer with reasons.", ctx: evidence)
+  return { status, verdict }
 ```
 
 Two operations run concurrently, a guard aborts early if the evidence is missing, a budgeted context
@@ -45,10 +49,12 @@ runtime safety envelope before it touches the world.
 
 ## What Flux-Lang is not
 
-- **Not a shell script.** There is no ambient environment to mutate; values live in immutable
-  symbols, and data shaping happens in pure nodes rather than shell-outs.
-- **Not model output.** The conversational agent uses native tool calling inside typed stages; an
-  author, SDK, or app supplies the Flux program.
+- **Not a shell script.** There is no ambient environment to mutate; values are immutable records
+  reached through versioned symbol bindings, and data shaping happens in pure nodes rather than
+  shell-outs.
+- **Not the default model output.** The conversational agent uses native tool calling inside typed
+  stages; an author, SDK, or app supplies the outer Flux program. The narrow `op.register` exception
+  above extends its operation vocabulary without replacing that authored control flow.
 - **Not a general-purpose language.** Loops are bounded, recursion is rejected, and the analyzer
   refuses plans it cannot reason about. The language is deliberately small.
 
@@ -71,8 +77,8 @@ same flow, two of the three ways:
 
 ```flux
 flow check-readme
-  $src = read("README.md")
-  return $src
+  src = read("README.md")
+  return src
 ```
 
 ```json

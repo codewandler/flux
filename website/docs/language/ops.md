@@ -16,8 +16,8 @@ The catalog is also **evidence-gated**: tool groups surface when the workspace s
 signal (the `cargo_*` ops appear in Rust workspaces, `go_*` alongside Go modules), and the
 generic `bash` op is opt-in — plans are steered toward dedicated, accurately-gated ops.
 
-Arguments below are named; pass them as a single object (`read({path: "…", limit: 100})`), or
-bare for a sole required parameter (`read("README.md")`). Optional arguments are in
+Arguments below are named; pass them directly (`read(path: "…", limit: 100)`), or use the bare
+form for a sole required parameter (`read("README.md")`). Optional arguments are in
 `[brackets]`. Ops marked **approval** may pause for user approval depending on the active
 policy.
 
@@ -44,7 +44,7 @@ policy.
 | `web.fetch` | `url[, raw]` | medium | Read a URL as a document: HTML becomes condensed Markdown, PDFs become extracted text; `raw` preserves the body |
 | `web.crawl` | `url[, max_pages, max_depth, max_total_bytes]` | medium | Crawl a small site or section: from a seed, follow same-host links breadth-first (bounded by `max_pages`/`max_depth`, and optionally a total-content `max_total_bytes` budget that stops the crawl early), returning each page as condensed Markdown |
 | `html_to_markdown` | `html` | low | Pure conversion of an HTML string to condensed Markdown; no network access |
-| `http.request` | `url[, method, query, headers, body, timeout]` | medium, approval | Arbitrary HTTP request returning the record `{status, headers, body}` — select a field with `$resp.body.data.id`. `body` is the parsed JSON when the response is a JSON object or array, and the raw capped text otherwise; non-2xx remains a result. Pass parameters as the `query` record — each value is percent-encoded, so a value carrying `&` or `=` cannot add a parameter |
+| `http.request` | `url[, method, query, headers, body, timeout]` | medium, approval | Arbitrary HTTP request returning the record `{status, headers, body}` — select a field with `resp.body.data.id`. `body` is the parsed JSON when the response is a JSON object or array, and the raw capped text otherwise; non-2xx remains a result. Pass parameters as the `query` record — each value is percent-encoded, so a value carrying `&` or `=` cannot add a parameter |
 | `browser.open` | `[url]` | medium, approval | Start a headless-Chromium session and return a non-visual page digest |
 | `browser.goto` | `session, url` | medium, approval | Navigate an existing browser session and return a delta |
 | `browser.snapshot` | `session[, view]` | low | Re-observe a session (`full`, `actions`, or `content`) |
@@ -100,9 +100,9 @@ commit it reverts stays in the log and nothing already pushed is invalidated.
 `git_revert` used to name the [improvement loop](#improvement-loop)'s snapshot op, which hard-resets
 the working tree and **discards** uncommitted changes. That op is now called **`git_reset`**, and
 `git_revert` is the true revert described above. There is no alias: a flow that calls
-`git_revert($snapshot)` must be changed to `git_reset($snapshot)`.
+`git_revert(snapshot)` must be changed to `git_reset(snapshot)`.
 
-The rename matters because the call still looks valid. `git_revert($snapshot)` now asks git to append
+The rename matters because the call still looks valid. `git_revert(snapshot)` now asks git to append
 the inverse of that commit instead of resetting to it — a different outcome, and one that errors on a
 dirty tree rather than clearing it. If you have a flow that restored a snapshot, rename the call.
 
@@ -158,41 +158,28 @@ arrays, and `regex_extract` with `all: true` still returns an array of matches.
 **Examples:**
 
 ```flux
-// Deterministic list transforms
-$authors = map({items: $issues, path: "author.username"})
-$open = filter({items: $issues, where: "it.state == 'opened' && it.upvotes > min", vars: {min: 2}})
-$all_pages = flatten($pages)
-$rest = skip({items: $candidates, n: 1})
-$report = join({items: $lines, sep: "\n"})
-$hosts = split({s: $raw_hosts, sep: ",", trim: true})
-$total = sum({items: $invoices, path: "amount"})
-$by_status = count_by({items: $issues, path: "state"})
-$grouped = group_by({items: $issues, path: "author.username"})
-$has_bug = has({items: $labels, value: "bug"})
-$all_green = all({items: $checks, where: "it.status == 'ok'"})
-$slim_issues = pick({items: $issues, keys: ["iid", "title", "state", "web_url"]})
-$public_issue = omit({items: $issue, keys: ["author_email", "raw_payload"]})
-$merged = merge_obj([ $defaults, $overrides ])
-$assignee = coalesce({values: [$issue.assignee.username?, $issue.author.username?], default: "unassigned"})
-$field_names = keys($issue)
-$field_values = values($issue)
-
-// Check if a log line contains ERROR
-$has_error = regex_match({s: $log_line, pattern: "ERROR"})
-when $has_error
-  alert({msg: "Error detected"})
-
-// Extract SemVer from a version string
-$version = regex_extract({
-  s: "flux-cli v1.2.3", pattern: r"v(\d+\.\d+\.\d+)", group: 1
-})  // $version is the 5-character string 1.2.3 — no quote characters around it
-
-// Extract all email addresses from text
-$emails = regex_extract({
-  s: $body_text,
-  pattern: r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-  all: true
-})  // returns an array of strings
+authors = map(items: issues, path: "author.username")
+open = filter(items: issues, vars: { "min": 2 }, where: "it.state == 'opened' && it.upvotes > min")
+all_pages = flatten(pages)
+rest = skip(items: candidates, n: 1)
+report = join(items: lines, sep: " | ")
+hosts = split(s: raw_hosts, sep: ",", trim: true)
+total = sum(items: invoices, path: "amount")
+by_status = count_by(items: issues, path: "state")
+grouped = group_by(items: issues, path: "author.username")
+has_bug = has(items: labels, value: "bug")
+all_green = all(items: checks, where: "it.status == 'ok'")
+slim_issues = pick(items: issues, keys: ["iid", "title", "state", "web_url"])
+public_issue = omit(items: issue, keys: ["author_email", "raw_payload"])
+merged = merge_obj([defaults, overrides])
+assignee = coalesce(default: "unassigned", values: [issue.assignee.username?, issue.author.username?])
+field_names = keys(issue)
+field_values = values(issue)
+has_error = regex_match(pattern: "ERROR", s: log_line)
+when has_error
+  alert(msg: "Error detected")
+version = regex_extract(group: 1, pattern: "v(\\d+\\.\\d+\\.\\d+)", s: "flux-cli v1.2.3")
+emails = regex_extract(all: true, pattern: "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b", s: body_text)
 ```
 
 Model-backed:
@@ -266,9 +253,10 @@ behind `flux serve`'s bearer token is not reachable yet.
 the point of a status call.
 
 **Work board operations are not in this catalog**, because they do not exist until a program asks for
-them. A `datasource` with a `board:` kind generates eleven operations named after *that declaration*,
-so a board declared as `board` yields `board.list` … `board.record_evidence` while one declared as
-`queue` yields `queue.list` … `queue.record_evidence`. Nothing is callable without the declaration.
+them. A `datasource` with a `board:` kind generates the board operations named after *that
+declaration*, so a board declared as `board` yields `board.list` … `board.record_evidence` while one
+declared as `queue` yields `queue.list` … `queue.record_evidence`. Nothing is callable without the
+declaration.
 They are documented with the declaration that creates them, in
 [Work boards and the fleet](../agent/fleet.md).
 
@@ -483,8 +471,9 @@ leaves is local, and the existing tag-triggered workflows promote it.
 
 ## The loop itself
 
-flux's own agent turn loop is a Flux-Lang flow, driven by reflexive planning and evidence ops
-that are never advertised to the model — see [The agent loop](../agent/agent-loop.md).
+flux's own agent turn loop is a Flux-Lang flow. Its hidden adaptive stages are `detect_intent`,
+`explore`, `approve_batch`, `execute_batch`, and `present_results`; they are never advertised to the
+model. See [The agent loop](../agent/agent-loop.md).
 
 Whatever the op, the rule is the same: **every** call crosses authorization, approval, and
 guarded IO. There is no trusted shortcut for any operation on this page.

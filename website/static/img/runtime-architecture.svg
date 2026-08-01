@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Flux conversational runtime architecture</title>
+  <desc id="desc">A surface enters an authored Flux-Lang outer loop. Provider-native typed stages interpret intent and propose literal calls. The host freezes effects into an immutable action batch. A deterministic executor runs approved calls through authorization, approval, and guarded IO, then returns an execution report to the typed stage ledger. The default loop does not ask the model for executable Flux; op.register is a separate analyzed and scoped composite-operation seam.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 10 5 0 10z" fill="#36695a"/>
+    </marker>
+    <marker id="arrow-muted" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 10 5 0 10z" fill="#71827c"/>
+    </marker>
+    <style>
+      .ink { fill: #141a18; }
+      .muted { fill: #52645e; }
+      .eyebrow { fill: #187458; font: 700 16px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 1.2px; }
+      .title { font: 700 32px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .subtitle { font: 400 18px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .box-title { font: 700 21px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .body { font: 400 17px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .small { font: 500 15px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .layer { font: 700 14px Inter, ui-sans-serif, system-ui, sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="900" rx="28" fill="#f6f9f8"/>
+  <rect x="24" y="24" width="1392" height="852" rx="22" fill="none" stroke="#d5e1dd" stroke-width="2"/>
+
+  <text x="72" y="75" class="eyebrow">ONE CONVERSATIONAL TURN</text>
+  <text x="72" y="116" class="title ink">The model proposes; authored control flow governs; the runtime executes.</text>
+  <text x="72" y="148" class="subtitle muted">Every literal effect crosses the same host-owned boundary before it can reach the world.</text>
+
+  <rect x="72" y="182" width="1296" height="72" rx="14" fill="#141a18"/>
+  <text x="104" y="211" fill="#8ee8c7" class="eyebrow">SURFACES</text>
+  <text x="104" y="237" fill="#ffffff" class="body">CLI · TUI · SDK · HTTP · channels · sub-agents</text>
+  <text x="1334" y="226" fill="#ffffff" text-anchor="end" class="small">request + identity + policy</text>
+  <path d="M720 254V286" fill="none" stroke="#36695a" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <rect x="72" y="288" width="1296" height="350" rx="20" fill="#ffffff" stroke="#36695a" stroke-width="3"/>
+  <rect x="72" y="288" width="1296" height="64" rx="18" fill="#dff6ee"/>
+  <path d="M72 334h1296v18H72z" fill="#dff6ee"/>
+  <text x="104" y="328" class="box-title ink">Authored Flux-Lang outer loop</text>
+  <text x="1336" y="328" text-anchor="end" class="small muted">owns order · bounds · branches · await/resume · approval · stopping</text>
+
+  <rect x="108" y="382" width="350" height="174" rx="16" fill="#e9faf4" stroke="#0b9d6e" stroke-width="2"/>
+  <text x="136" y="418" class="eyebrow">BOUNDED MODEL JUDGMENT</text>
+  <text x="136" y="453" class="box-title ink">Provider-native typed stages</text>
+  <text x="136" y="486" class="body muted">interpret intent · gather evidence</text>
+  <text x="136" y="514" class="body muted">propose literal operation calls</text>
+  <text x="136" y="542" class="small muted">exact live schemas; no authority granted</text>
+
+  <path d="M458 469H536" fill="none" stroke="#36695a" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <rect x="548" y="382" width="344" height="174" rx="16" fill="#edf4ff" stroke="#5279ad" stroke-width="2"/>
+  <text x="576" y="418" fill="#315f99" class="eyebrow">HOST-OWNED CONTRACT</text>
+  <text x="576" y="453" class="box-title ink">Immutable action batch</text>
+  <text x="576" y="486" class="body muted">validate each captured {op, input}</text>
+  <text x="576" y="514" class="body muted">freeze identity + aggregate risk</text>
+  <text x="576" y="542" class="small muted">approval returns a one-shot receipt</text>
+
+  <path d="M892 469H970" fill="none" stroke="#36695a" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <rect x="982" y="382" width="350" height="174" rx="16" fill="#fff6e5" stroke="#b47710" stroke-width="2"/>
+  <text x="1010" y="418" fill="#8a5900" class="eyebrow">DETERMINISTIC EXECUTION</text>
+  <text x="1010" y="453" class="box-title ink">Consume receipt, dispatch calls</text>
+  <text x="1010" y="489" class="body ink">authorization → approval</text>
+  <text x="1010" y="517" class="body ink">→ guarded IO</text>
+  <text x="1010" y="545" class="small muted">filesystem · process · network</text>
+
+  <path d="M1157 556C1157 608 283 608 283 556" fill="none" stroke="#71827c" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arrow-muted)"/>
+  <rect x="524" y="576" width="392" height="32" rx="16" fill="#ffffff"/>
+  <text x="720" y="598" text-anchor="middle" class="small muted">execution report returns to the same native ledger</text>
+
+  <rect x="72" y="672" width="620" height="94" rx="16" fill="#141a18"/>
+  <text x="102" y="707" fill="#8ee8c7" class="eyebrow">DEFAULT LOOP</text>
+  <text x="102" y="739" fill="#ffffff" class="body">No per-turn model-generated executable Flux.</text>
+
+  <rect x="720" y="672" width="648" height="94" rx="16" fill="#f1edff" stroke="#7a65ae" stroke-width="2" stroke-dasharray="7 6"/>
+  <text x="750" y="707" fill="#655099" class="eyebrow">EXPLICIT SEAM · op.register</text>
+  <text x="750" y="738" class="body ink">Exactly one composite op · analyzed · scoped · guarded</text>
+
+  <text x="72" y="809" class="eyebrow">DEPENDENCIES POINT INWARD</text>
+  <text x="1368" y="809" text-anchor="end" class="small muted">outer surfaces may depend only on their layer or lower</text>
+
+  <g transform="translate(72 828)">
+    <rect width="185" height="42" rx="8" fill="#141a18"/>
+    <text x="92.5" y="27" text-anchor="middle" fill="#ffffff" class="layer">L6 · surfaces</text>
+    <rect x="185" width="185" height="42" fill="#244f43"/>
+    <text x="277.5" y="27" text-anchor="middle" fill="#ffffff" class="layer">L5 · capabilities</text>
+    <rect x="370" width="185" height="42" fill="#33705f"/>
+    <text x="462.5" y="27" text-anchor="middle" fill="#ffffff" class="layer">L4 · extensibility</text>
+    <rect x="555" width="185" height="42" fill="#4b8a77"/>
+    <text x="647.5" y="27" text-anchor="middle" fill="#ffffff" class="layer">L3 · agent + flow</text>
+    <rect x="740" width="185" height="42" fill="#70a693"/>
+    <text x="832.5" y="27" text-anchor="middle" fill="#10211c" class="layer">L2 · runtime</text>
+    <rect x="925" width="185" height="42" fill="#9cc7b8"/>
+    <text x="1017.5" y="27" text-anchor="middle" fill="#10211c" class="layer">L1 · providers</text>
+    <rect x="1110" width="186" height="42" rx="8" fill="#cce7de"/>
+    <text x="1203" y="27" text-anchor="middle" fill="#10211c" class="layer">L0 · contracts</text>
+  </g>
+</svg>

@@ -89,6 +89,59 @@ function sectionsFromSidebar() {
   return sections;
 }
 
+/** Every Markdown doc id below `docs/`, in deterministic path order. */
+function docIdsOnDisk(dir = DOCS_DIR) {
+  const ids = [];
+  const entries = fs
+    .readdirSync(dir, {withFileTypes: true})
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      ids.push(...docIdsOnDisk(file));
+    } else if (entry.isFile() && /\.mdx?$/.test(entry.name)) {
+      ids.push(
+        path
+          .relative(DOCS_DIR, file)
+          .split(path.sep)
+          .join('/')
+          .replace(/\.mdx?$/, ''),
+      );
+    }
+  }
+  return ids;
+}
+
+/** Fail the build when the public corpus and its hand-authored navigation drift apart. */
+function validateSidebarCorpus(sections) {
+  const sidebarIds = sections.flatMap((section) => section.ids);
+  const listed = new Set(sidebarIds);
+  const missing = [...listed].filter((id) => !readDoc(id));
+  const unlisted = docIdsOnDisk().filter((id) => !listed.has(id));
+  if (missing.length || unlisted.length) {
+    const details = [];
+    if (missing.length) details.push(`missing docs referenced by sidebar: ${missing.join(', ')}`);
+    if (unlisted.length) details.push(`docs absent from sidebar: ${unlisted.join(', ')}`);
+    throw new Error(`[llms-txt] sidebar corpus mismatch: ${details.join('; ')}`);
+  }
+  return listed.size;
+}
+
+/** Keep intentional navigation cross-links while emitting each doc only once. */
+function deduplicateSections(sections) {
+  const seen = new Set();
+  return sections
+    .map((section) => ({
+      ...section,
+      ids: section.ids.filter((id) => {
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      }),
+    }))
+    .filter((section) => section.ids.length > 0);
+}
+
 /** @returns {import('@docusaurus/types').Plugin} */
 module.exports = function llmsTxtPlugin() {
   return {
@@ -96,17 +149,20 @@ module.exports = function llmsTxtPlugin() {
     async postBuild({siteConfig, outDir}) {
       const base = siteConfig.url + siteConfig.baseUrl.replace(/\/$/, ''); // e.g. https://…/flux
       const docUrl = (id) => `${base}/docs/${id}`;
-      const sections = sectionsFromSidebar();
+      const sidebarSections = sectionsFromSidebar();
+      const docCount = validateSidebarCorpus(sidebarSections);
+      const sections = deduplicateSections(sidebarSections);
 
       // ---- llms.txt (curated index) ----
       const idx = [];
       idx.push(`# ${siteConfig.title}`, '');
       idx.push(`> ${siteConfig.tagline}`, '');
       idx.push(
-        'flux compiles each request into a typed Flux-Lang plan (a small graph) that a deterministic',
-        'Rust runtime executes through one mandatory safety envelope (authorization → approval →',
-        'guarded IO). The documentation below covers the agent, the language, the SDK, plugins, and',
-        'operations.',
+        'Provider-native typed stages interpret intent and propose literal calls inside an authored',
+        'Flux-Lang loop. The host freezes effects into action batches and runs them through one',
+        'mandatory safety envelope (authorization → approval → guarded IO). The default',
+        'conversational loop never asks the model for per-turn executable Flux. The documentation',
+        'below covers the agent, the language, the SDK, plugins, and operations.',
         '',
       );
       idx.push(`Full documentation as a single file: [llms-full.txt](${base}/llms-full.txt)`, '');
@@ -143,7 +199,7 @@ module.exports = function llmsTxtPlugin() {
       }
       fs.writeFileSync(path.join(outDir, 'llms-full.txt'), full.join('\n'));
 
-      console.log('[llms-txt] wrote llms.txt and llms-full.txt to', outDir);
+      console.log(`[llms-txt] wrote ${docCount} unique docs to llms.txt and llms-full.txt in`, outDir);
     },
   };
 };

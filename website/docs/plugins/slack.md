@@ -1,6 +1,6 @@
 ---
 title: Slack plugin
-description: "Step-by-step setup for the slack plugin: install, provide bot/user tokens (env or stored), verify, and call an operation."
+description: "Step-by-step setup for the Slack plugin: install, provide bot/user tokens from the environment or credential store, verify, and call an operation."
 ---
 
 # Slack plugin
@@ -10,11 +10,6 @@ files, bookmarks, presence, and emoji against the Slack Web API. This page walks
 sequence using only the `flux` CLI. For the general plugin mechanics (capability grants, trust
 model, everyday commands), see [Using plugins](./using-plugins.md).
 
-:::note
-Requires flux **0.14.7 or newer** — earlier versions composed Slack API URLs incorrectly (every
-operation returned a 404), and `flux auth set` (step 2, option B) first shipped in 0.14.7.
-:::
-
 ## 1. Install
 
 ```bash
@@ -22,19 +17,17 @@ flux plugin install slack
 ```
 
 This resolves the newest signed `plugins-v*` pack release, verifies the index signature and the
-archive's sha256, and unpacks the binary into the versioned store. Confirm it landed:
+archive's SHA-256, and unpacks the binary into the versioned store. Confirm it landed:
 
 ```bash
 flux plugin status slack
 ```
 
-```text
-slack            ~/.flux/plugins/bin/slack/0.1.1/flux-plugin-slack   v0.1.1  [ok]  [verified]
-    manifest:  v0.1.1  30 op(s)  ·  2 auth purpose(s)  ·  1 endpoint(s)  ·  2 datasource(s)  ·  caps: http, secret(2), blob
-    auth:      · bot_token — not configured (env: SLACK_BOT_TOKEN, or `flux auth set slack bot_token`)
-    auth:      · user_token — not configured (env: SLACK_USER_TOKEN, or `flux auth set slack user_token`)
-    endpoint:  · slack.endpoint — env not set, defaults to https://slack.com/api
-```
+`status` reads the installed version and operation total from the live manifest. For setup, check
+the `bot_token` and `user_token` auth purposes, the `slack.endpoint` endpoint, the `slack.channels`
+and `slack.users` datasources, and the HTTP, declared-secret, and blob capabilities. With no
+configuration it reports each purpose's declared environment key or stored-token command, plus the
+endpoint's `https://slack.com/api` default.
 
 `ok`/`verified` only proves the binary launched and its hash matches the signed descriptor. The
 `auth:` lines are the wiring itself: how each declared purpose would resolve right now (never the
@@ -61,8 +54,7 @@ export SLACK_BOT_TOKEN="xoxb-…"
 export SLACK_USER_TOKEN="xoxp-…"   # optional; search/mentions/unreads/presence only
 ```
 
-**Option B — store them once with `flux auth set`** (no env vars needed in any later session;
-requires flux ≥ 0.14.7):
+**Option B — store them once with `flux auth set`** (no env vars needed in later sessions):
 
 ```bash
 flux auth set slack bot_token      # hidden prompt — or pipe it in:
@@ -120,7 +112,7 @@ Any of the plugin's declared operations works the same way — `flux plugin call
 
 ```bash
 flux plugin call slack slack.channel.list --arg limit=10
-flux plugin call slack slack.message.send '{"channel": "C0123456789", "text": "hello from flux"}'
+flux plugin call slack slack.message.send '{"channel": "C0123456789", "text": "hello from Flux"}'
 flux plugin call slack slack.search '{"query": "deploy failed"}'        # needs user_token
 flux plugin call slack slack.message.send '{"channel": "…"}' --dry-run  # validate input, send nothing
 ```

@@ -49,9 +49,9 @@ product. A newly persisted endpoint is picked up automatically by later sessions
 
 ```flux
 flow inspect-database(endpoint_id: String)
-  $endpoint = endpoint.select($endpoint_id)
-  $rows = sql.query({endpoint: $endpoint, query: "SELECT current_database() AS name", max_rows: 1})
-  return $rows
+  selected = endpoint.select(endpoint_id)
+  rows = sql.query(endpoint: selected, max_rows: 1, query: "SELECT current_database() AS name")
+  return rows
 ```
 
 The `sql` plugin performs read-only PostgreSQL queries. For discovered credentials, the host can

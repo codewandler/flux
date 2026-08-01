@@ -17,6 +17,13 @@
 
 ### Improved
 
+- **The documentation is more accurate and easier to navigate.** The website now explains the
+  authored agent loop, approvals, channels, plugins, credentials, recovery, SDK, and Flux-Lang using
+  the behavior and syntax that ship today. Installation steps and examples are runnable, limitations
+  are stated where they matter, and the sidebar is organized around common tasks. Automated checks
+  now catch stale channel lists, conflicting runtime explanations, noncanonical Flux examples,
+  missing pages, and broken documentation links before they are published.
+
 - **The terminal interface is easier to read and navigate in long sessions.** Selection remains visible
   without color, narrow panes hide nonessential previews before they crowd out the conversation, and
   the composer, scrollbar, queued-message count, turn separators, and cancelled actions all have clear

@@ -13,9 +13,10 @@ Flow-driven voice selects an explicit authored flow and shares the same durable 
 runtime. The experimental model-driven realtime SDK mode is deliberately separate: the provider
 owns that loop, while every effect still crosses the executor envelope.
 
-The important boundary is stronger than “the model is not the runtime”: **the model does not generate
-Flux code**. Models participate inside typed stages and make provider-native operation calls. The
-authored loop owns order, bounds, decisions, approval, execution, and stopping.
+The important boundary is stronger than “the model is not the runtime”: **the default conversational
+loop never asks the model for per-turn executable Flux**. Models interpret intent and propose literal
+calls inside provider-native typed stages. The authored Flux-Lang loop owns order, bounds, decisions,
+approval, execution, and stopping.
 
 ## The default adaptive loop
 
@@ -69,6 +70,17 @@ Flux now places determinism at the useful seams:
 | action-batch identity and receipt | host runtime |
 | effects | authorization → approval → guarded IO |
 | replay and audit | event and flow stores |
+
+### The explicit `op.register` seam
+
+The model-facing `op.register` operation is a deliberate, narrower exception. An agent may propose
+source containing **exactly one composite `op`**; the host parses and analyzes it against the live
+catalog before installing it at `turn`, `session`, `project`, or `global` scope. Project and global
+installation are guarded filesystem writes, replacement must be explicit, and every inner operation
+still dispatches through the normal envelope.
+
+This extends the agent's reusable vocabulary; it does not replace the authored outer loop or make
+generated source executable on receipt. See [Saved flows and custom operations](./saved-flows.md).
 
 ## Questions and local repair
 
@@ -176,10 +188,10 @@ Apps may define and select a loop in the same source file:
 
 ```flux
 agent_loop support
-  $intent = detect_intent()
-  $step = explore({state: $intent.state})
-  $answer = present_results({step: $step})
-  return $answer
+  intent = detect_intent()
+  stage = explore(state: intent.state)
+  answer = present_results(step: stage)
+  return answer
 
 agent guide
   model "openrouter/google/gemini-2.5-flash"

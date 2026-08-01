@@ -15,7 +15,9 @@ support prompt caching or subscription credentials.
 ## Routing
 
 Select a provider and model with `-m <provider>/<model>`, or set `model` in `.flux/config.toml`. The
-model string after the provider is forwarded verbatim, so any model that provider serves works.
+model string after the provider is forwarded verbatim. That makes new model ids addressable without
+a flux release; it does not make every model compatible with the agent loop. The selected model must
+support the provider's structured function/tool-calling contract reliably.
 
 ```bash
 flux run -m sonnet "fix the failing test"          # bare alias -> Anthropic
@@ -29,13 +31,13 @@ Bare aliases resolve to Anthropic and track the current generation of each tier:
 `claude-haiku-4-5`. The default model is `sonnet`. Bare `claude` is shorthand for `claude/sonnet`
 (the [Claude Code subscription](./claude-code.md) provider).
 
-flux gates the optional Messages-API fields per model, so every alias and id works: adaptive
-thinking and `output_config.effort` are only sent to models that accept them (the 4.6 family and
-newer — Haiku 4.5 and older reject them with HTTP 400), and `temperature`/`top_p` are omitted for
-the generations that reject sampling params (Fable 5, Opus ≥ 4.7, Sonnet ≥ 5). Unknown or future
-ids default to the newest shape, so a new Anthropic generation works on day one. The gating
-applies wherever an Anthropic model is served: `anthropic`, `claude`, `aws` (Bedrock
-inference-profile ids), and `openrouter` (`anthropic/…` slugs).
+flux gates optional Messages-API fields for recognized model families: adaptive thinking and
+`output_config.effort` are only sent to models that accept them (the 4.6 family and newer — Haiku
+4.5 and older reject them with HTTP 400), and `temperature`/`top_p` are omitted for generations that
+reject sampling params (Fable 5, Opus ≥ 4.7, Sonnet ≥ 5). Unknown or future ids use the newest
+request shape. That avoids rewriting ids, but provider availability and reliable tool calling remain
+requirements. The field gating applies wherever an Anthropic model is served: `anthropic`,
+`claude`, `aws` (Bedrock inference-profile ids), and `openrouter` (`anthropic/…` slugs).
 
 ## Supported providers
 
@@ -46,14 +48,14 @@ inference-profile ids), and `openrouter` (`anthropic/…` slugs).
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | full streaming + tool calls |
 | `codex` | OpenAI Responses | ChatGPT/Codex OAuth | opt-in: `flux auth login codex` |
 | `aws` | Anthropic Messages (Bedrock) | AWS chain (env / SSO / IRSA / EKS) | Claude via Bedrock; no `aws` CLI; region-aware ids; metered |
-| `openrouter` | Anthropic Messages | `OPENROUTER_API_KEY` | proxy to hundreds of models; native `tool_use`, and prompt caching on `anthropic/…` slugs |
+| `openrouter` | Anthropic Messages | `OPENROUTER_API_KEY` | proxy to many models; use a model with reliable tool calling; prompt caching on `anthropic/…` slugs |
 | `ollama` | OpenAI Chat | none (local) | `OLLAMA_HOST` overrides `localhost:11434`; needs a tool-capable model |
 | `ollama-anthropic` | Anthropic Messages | none (local) | recent Ollama builds; native `tool_use` |
 | `mock` | — | none | offline test provider; exercises the full pipeline |
 
-Because flux's loop is tool-driven, prefer models with reliable function/tool calling. For OpenRouter
-and Ollama, the `*-anthropic` variants return structured `tool_use` blocks instead of risking inline
-text-leaked tool calls.
+Because flux's loop is tool-driven, use models with reliable function/tool calling. An Anthropic-
+Messages transport can preserve structured `tool_use` blocks, but it cannot add tool capability to a
+model that does not have it.
 
 ## Model capability floor
 

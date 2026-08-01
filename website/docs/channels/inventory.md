@@ -1,13 +1,13 @@
 ---
 title: Channel inventory and capabilities
-description: "Every channel kind flux ships — cli, schedule, webhook, a2a, slack, room — with its settings, payload, reply path, auth model, and limits."
+description: "Every shipped channel kind, with its settings, payload, reply path, auth model, and limits."
 ---
 
 # Channel inventory and capabilities
 
-Six channel kinds ship in the stock `flux` binary. This page is the reference for what each one can
-actually do. For the model behind them — how a channel wakes a program and why deliveries are ordered
-— read [what a channel is](./overview.md) first.
+The stock `flux` binary ships the channel kinds listed below. This page is the reference for what each
+one can actually do. For the model behind them — how a channel wakes a program and how concurrent
+deliveries are isolated and bounded — read [what a channel is](./overview.md) first.
 
 An unknown `kind` is a **load error**, not a warning: a program naming a channel flux does not
 recognize refuses to start.
@@ -19,6 +19,7 @@ recognize refuses to start.
 | [`cli`](#cli) | — | the operator, at a prompt | stdout | no | local process | always |
 | [`schedule`](#schedule) | `cron` | the clock | none — result discarded | no | n/a | always |
 | [`webhook`](#webhook) | `http` | any HTTP caller | the HTTP response | yes, if remote | optional bearer (**required** off-loopback) | always |
+| [`connector`](#connector) | — | a vendor webhook | `202`; no automatic vendor reply | yes, if remote | manifest verification posture + optional bearer (**required** off-loopback for the currently servable posture) | always |
 | [`a2a`](#a2a) | — | an agent or API client | response + SSE stream | yes, if remote | bearer, or per-request principal (RFC 7662) | always |
 | [`slack`](#slack) | — | a Slack user | posted into the thread | **no** — outbound socket | Slack bot + app tokens | default feature |
 | [`room`](#room) | — | any occupant of the room | said back into the room | **no** — outbound WebSocket to the room server | none (`mock`), or SASL + optional room password (`xmpp`) | always |
@@ -43,7 +44,7 @@ Self-clocked. Fires under its own name on a cron expression, or once at boot.
 
 ```flux
 channel nightly
-  schedule "0 9 * * *"          # 5-field crontab
+  schedule "0 9 * * *"  # 5-field crontab
 ```
 
 - `schedule` — a **5-field** crontab (`"0 9 * * *"`), or a **6/7-field seconds-first** expression
@@ -74,11 +75,53 @@ channel hook
   has no interactive approver; an open public listener would be an unauthenticated way to spend your
   model budget and touch your tools.
 
-**Payload:** the POST body, verbatim.
+**Payload:** the parsed JSON POST body. A request that is not valid JSON is rejected before a
+delivery starts.
 
 **Reply:** synchronously, the journey results as JSON —
 `{ "runs": [ { "journey": …, "result": …, "steps": … } ] }`. With `async: true` you get `202` and no
 result.
+
+## `connector`
+
+A manifest-driven webhook listener. The channel selects a connector manifest and one named
+`[[channels]]` binding; that binding defines event discrimination, payload mapping, verification
+posture, and optional reply metadata without adding vendor-specific adapter code to flux.
+
+```flux
+channel widget_events
+  kind "connector"
+  connector "widget"
+  service "hooks"
+  binding "hooks"
+  addr "127.0.0.1:8790"
+  path "/widget"
+```
+
+- `connector` — the connector id declared by the manifest (required).
+- `binding` — the exact `[[channels]].name` to serve (required).
+- `service` — selects a named service and its `<connector>-<service>.connector.toml` manifest.
+- `manifest` — optional explicit manifest path instead of the default under
+  `~/.flux/connectors/`.
+- `addr` — the listener address (required for the currently supported webhook transport).
+- `path` — the POST path; defaults to `/`.
+- `credentials` — maps credential names from the manifest to deployment secrets.
+- `token` — optional static bearer token; required on a non-loopback address for the currently
+  servable `verification.kind = "none"` posture.
+
+**Payload:** a JSON object built from the binding's dotted body-path map, plus `delivery_id` when the
+binding selects one. Missing or `null` fields are omitted. A discriminator can produce
+`<channel>.<event>` labels; an undeclared event is acknowledged with `204` and does not trigger a
+run.
+
+**Reply:** accepted events receive `202` immediately. flux validates reply metadata and requires its
+named operation to be registered, but it does not yet invoke that operation automatically or turn a
+journey result into a vendor reply.
+
+Only webhook-transport bindings with explicit `verification.kind = "none"` can currently start.
+HMAC bindings are validated and then refused because raw-body signature verification is not
+implemented. See [Connector channels](./connector.md) for manifest placement, routing, authentication,
+and the full limitation checklist.
 
 ## `a2a`
 
@@ -216,18 +259,19 @@ These are channels in spirit but are not `channel` kinds, and are documented sep
 
 Stated plainly, because each one changes how you would deploy a channel:
 
-1. **No webhook signature verification.** The `webhook` kind checks an optional *static bearer token*.
-   It does **not** verify vendor webhook signatures — the HMAC-over-raw-body schemes that GitHub,
-   Stripe, Slack's Events API and Zendesk each implement differently. So a vendor that signs but
-   cannot send a custom `Authorization` header has no authenticated path in today's `webhook` channel.
-   Typed, verified inbound events are being designed in
-   [flux-connectors](https://github.com/codewandler/flux-connectors) as the reverse direction of the
-   connector spec.
-2. **One delivery at a time.** `AppDeliverer` serializes deliveries to keep concurrent bus cascades
-   from double-processing each other. A busy channel is an ordered queue of one until per-delivery bus
-   isolation lands.
-3. **Trigger matching is exact.** `on "<name>"` is an exact label match against the channel's name —
-   no globbing, no prefixes.
+1. **No webhook signature verification.** The generic `webhook` kind checks only an optional static
+   bearer token. Connector manifests can describe HMAC verification, but flux refuses those bindings
+   at startup until it can verify a signature over the raw request body. Do not edit a signed
+   binding's manifest to say `none`: that would turn an authenticated vendor surface into an
+   unauthenticated one.
+2. **Concurrency has a bound and shared state.** Deliveries run concurrently, with isolated event
+   cascades and nesting budgets, up to 64 at once by default. Set
+   `FLUX_MAX_INFLIGHT_DELIVERIES` to a positive integer to change the process default. Additional
+   deliveries wait rather than being dropped or rejected. Agent sessions and other app state remain
+   shared, so events for the same conversation can interleave.
+3. **Trigger matching is exact.** `on "<label>"` is an exact label match — normally the channel name,
+   or `<channel>.<event>` for a connector binding with a discriminator. There is no globbing or
+   prefix match.
 4. **Headless means no approver.** Anything that would prompt for approval cannot be confirmed in a
    channel-driven run. Set an explicit `permissions` ceiling; do not rely on `--yes`, which can only
    auto-approve *within* the ceiling and never widens it.

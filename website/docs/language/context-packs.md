@@ -13,27 +13,25 @@ runtime enforces.
 
 ```flux
 flow explain-failure
-  $src   = read("crates/flux-lang/src/runtime.rs")
-  $tests = cargo_test({args: ["-p", "flux-lang"]})
-
-  ctx $debug
+  src = read("crates/flux-lang/src/runtime.rs")
+  tests = cargo_test(args: ["-p", "flux-lang"])
+  ctx debug
     purpose "explain a failing flux-lang test"
     budget 9000
-    include $src, $tests
-
-  $answer = ai.reason({ask: "What is the most likely cause?", ctx: $debug})
-  return $answer
+    include src, tests
+  answer = ai.reason(ask: "What is the most likely cause?", ctx: debug)
+  return answer
 ```
 
-The `ctx` block binds a `Ctx` value (see [Types & effects](./types-and-effects.md)) to
-`$debug`. Its lines:
+The `ctx` block binds a `Ctx` value (see [Types & effects](./types-and-effects.md)) to `debug`. Its
+lines:
 
 | line | required | meaning |
 |---|---|---|
 | `purpose "…"` | no | why the pack exists — seeds the audit trail and any consuming prompt |
 | `budget N` | no | character budget the runtime shrinks the pack to (a `0` budget is rejected) |
-| `include $a, $b` | no | symbols selected into the pack |
-| `exclude $c` | no | symbols removed from the include set |
+| `include a, b` | no | symbols selected into the pack |
+| `exclude c` | no | symbols removed from the include set |
 
 `ctx` is **pure**: it selects and labels existing values. No IO happens, and nothing is copied
 to a model until a consuming op (here `ai.reason`) actually runs.
@@ -60,14 +58,14 @@ The consuming model op receives the bounded pack — never more than the plan de
 Packs are extended with the append marker:
 
 ```flux
-$more = read("crates/flux-lang/src/analyze.rs")
-$debug += $more
+more = read("crates/flux-lang/src/analyze.rs")
+debug += more
 ```
 
-`+=` immutably rebinds the pack to a **new** `Ctx` value with the added members, then
-re-applies the budget. The prior pack value stays addressable, so the audit chain records each
-version of what the model was allowed to see. Multiple symbols append in one line:
-`$debug += $more, $extra`.
+`+=` creates a **new** immutable `Ctx` value with the added members, updates `debug` to resolve to
+that version, then re-applies the budget. The prior value remains in the audit trail, so each version
+records what the model was allowed to see. Multiple symbols append in one line: `debug += more,
+extra`.
 
 ## Why this matters
 

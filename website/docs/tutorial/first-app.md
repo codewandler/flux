@@ -39,7 +39,7 @@ trigger questions
 
 journey show-welcome
   flow
-    send({"channel": "cli", "message": "Northstar handbook assistant ready. Ask a question."})
+    send(channel: "cli", message: "Northstar handbook assistant ready. Ask a question.")
     return ""
 ```
 
@@ -61,11 +61,11 @@ should report Monday–Friday, 09:00–17:00 Central European Time. Your run may
 It may also skip `search`, claim the handbook lacks a fact that is present, or answer from prior model
 knowledge. Repeat a question if you want to probe that behavior.
 
-That variability is the experiment, not a tutorial failure. The adaptive loop makes schema use much
-more reliable than a generated plan, and `tools [search]` plus the datasource declaration give it a
-narrow live capability. But the description still expresses an application invariant as prompt
-advice: the model decides whether the question needs `search`. A successful answer does not change
-that structure.
+That variability is the experiment, not a tutorial failure. The built-in authored adaptive loop
+routes model judgment through provider-native operation schemas and host-frozen action batches, and
+`tools [search]` plus the datasource declaration give it a narrow live capability. But the
+description still expresses an application invariant as prompt advice: the model decides whether
+the question needs `search`. A successful answer does not change that structure.
 
 ```text
 terminal line
@@ -108,19 +108,19 @@ trigger questions
 
 journey show-welcome
   flow
-    send({"channel": "cli", "message": "Northstar handbook assistant ready. Ask a question."})
+    send(channel: "cli", message: "Northstar handbook assistant ready. Ask a question.")
     return ""
 
 journey answer-question
   agent guide
   flow
-    $hits = search({"query": "{text}", "source": "handbook"})
-    ctx $grounding
+    hits = search(query: "{text}", source: "handbook")
+    ctx grounding
       purpose "answer one question from the Northstar handbook"
       budget 6000
-      include $hits
-    $answer = ai.reason({"ctx": $grounding, "ask": "Question: {text}\nAnswer only from the handbook results. If they do not contain the answer, say so."})
-    send({"channel": "cli", "message": "{answer}"})
+      include hits
+    answer = ai.reason(ask: "Question: {text}\nAnswer only from the handbook results. If they do not contain the answer, say so.", ctx: grounding)
+    send(channel: "cli", message: "{answer}")
     return ""
 ```
 

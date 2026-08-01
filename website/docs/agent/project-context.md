@@ -5,9 +5,9 @@ description: "What flux tells the agent about your repository before the first t
 
 # Project context
 
-Before your first message, flux assembles a picture of the repository and folds it into the agent's
-system prompt, so the agent isn't cold-starting. That picture comes from an ordered chain of
-providers:
+Before your first message, flux assembles a picture of the exact directory where the session starts
+and folds it into the agent's system prompt, so the agent isn't cold-starting. That picture comes
+from an ordered chain of providers:
 
 | Source | What it contributes |
 |---|---|
@@ -17,9 +17,11 @@ providers:
 | Conventions files | `CLAUDE.md`, `AGENTS.md`, `.flux/context.md` — read in full |
 | Guidance fragments | `.flux/context.d/*.md` — read only when they apply (see below) |
 
-Everything here is read through a workspace confined to the project root. Widening the agent's tool
-paths (`--add-dir`, `--allow-all-paths`) deliberately does **not** widen what project context can
-read.
+Everything here is rooted at the launch/workspace directory. Flux does not walk upward to find a
+parent repository root or parent conventions file. Git itself may still recognize that the directory
+is inside a larger worktree, but repo-shape inspection, conventions files, and guidance-fragment
+discovery stay at the directory you launched from. Widening the agent's tool paths (`--add-dir`,
+`--allow-all-paths`) deliberately does **not** widen what project context can read.
 
 :::info Assembled once per session
 The whole block is built at startup and stays fixed for the session, which is what keeps it in the
@@ -29,9 +31,10 @@ restart.
 
 ## Conventions files
 
-Drop a `CLAUDE.md`, `AGENTS.md`, or `.flux/context.md` at the project root and its full contents
-join the prompt. This is the right place for rules that apply to the whole repository — code style,
-the test command, things never to do.
+Drop a `CLAUDE.md`, `AGENTS.md`, or `.flux/context.md` in the directory where you launch flux and its
+full contents join the prompt. If those files live at the repository root, launch from that root;
+starting in a nested directory does not discover the parent copies. This is the right place for rules
+that apply to the whole workspace — code style, the test command, things never to do.
 
 Because they are read in full on every session, they cost tokens whether or not they are relevant.
 In a large repository that forces an unhappy choice: keep them short and lose subsystem detail, or

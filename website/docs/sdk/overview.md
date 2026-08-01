@@ -55,7 +55,11 @@ println!("{}", out.text); // TurnOutput: text, tool_calls, usage
 
 Each `Client` turn runs the same `FlowEngine` as the CLI. Typed stages detect intent and call exact
 provider-native operation schemas; `agent-loop.flux` owns evidence gathering, decisions, action-batch
-approval/execution, repair, and presentation. The model never emits executable Flux.
+approval/execution, repair, and presentation. The default client loop does not ask the model to emit
+per-turn executable Flux. The explicit
+[`op.register`](../agent/saved-flows.md#register-an-operation-during-a-turn) exception lets a model
+propose source for exactly one composite operation; the host parses, analyzes, scopes, and guards it
+before installation rather than executing it on receipt.
 
 The builder carries `allow`/`deny` permission rules, `auto_approve(true)` for trusted headless use,
 an optional system prompt and context blocks, model/token/iteration limits, explicit

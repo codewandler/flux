@@ -1,42 +1,84 @@
 ---
 title: Using plugins
-description: "Installing and running trusted plugins, including signatures, capability grants, and host-enforced safety."
+description: "Installing and running trusted Flux plugins, including source choices, signatures, capability grants, and host-enforced safety."
 ---
 
 # Using plugins
 
-Plugins are trusted subprocess binaries that extend flux with new operations. Each declared
+Plugins are trusted subprocess binaries that extend Flux with new operations. Each declared
 operation is projected as a policy-gated tool, so the same authorization, approval, and guarded-IO
 chain that protects built-ins also protects plugin calls.
 
 First-party plugins follow a host-callback contract: HTTP, subprocess, connection, filesystem, and
-secret operations are requested from flux, which checks the manifest and performs the operation.
+secret operations are requested from Flux, which checks the manifest and performs the operation.
 The process also starts with a cleared, minimal environment, so it does not inherit provider or host
 secrets.
 
 That capability contract is **not an OS sandbox**. A plugin is a trusted native executable and could
-make direct system calls outside flux if it were malicious. Install plugins as dependencies you
-trust; the manifest gates constrain what conforming plugin code can reach *through flux*.
+make direct system calls outside Flux if it were malicious. Install plugins as dependencies you
+trust; the manifest gates constrain what conforming plugin code can reach *through Flux*.
+
+## Choose an install source
+
+The install source determines what Flux can verify:
+
+| Source | Command | Verification label | Trust boundary |
+|---|---|---|---|
+| Signed pack | `flux plugin install <name>` or `--all` | `verified` | A minisign-verified index selects an archive whose SHA-256 is checked before install; the installed binary's SHA-256 is then checked at every spawn. |
+| Git source build | `flux plugin install --git <url> …` | `from-source (unverified)` | Flux shows the resolved commit and requires explicit consent before running `cargo build`; the descriptor records Git URL + commit, not a signed-pack hash. |
+| Local binary | `flux plugin install --dir[=<path>]` or `flux plugin add …` | `unverified (local)` | Flux registers a binary you already built; no version or hash is recorded. |
+
+These modes are mutually exclusive. A signature proves release provenance, while a source commit or
+local path only tells you what you chose to trust.
 
 ## Install from the signed pack
 
-The integration plugins ship separately from flux as the signed **plugin pack**
+The integration plugins ship separately from Flux as the signed **plugin pack**
 (`plugins-v*` releases). No source tree needed:
 
 ```bash
 flux plugin install gitlab slack     # newest pack release
-flux plugin install gitlab@0.1.1     # exact version
 flux plugin install --all            # the whole pack
 ```
 
+To select a pack version explicitly, append the version published in the pack index, using
+`<name>@<version>`.
+
 Every install is verified end-to-end, fail-closed (there is no bypass flag):
 
-1. The release's `plugins-index.json` is **minisign-verified** against the public key embedded in flux.
-2. Each archive's **sha256** is checked against that verified index before unpacking.
+1. The release's `plugins-index.json` is **minisign-verified** against the public key embedded in Flux.
+2. Each archive's **SHA-256** is checked against that verified index before unpacking.
 3. Binaries land in the versioned store `~/.flux/plugins/bin/<name>/<version>/`; re-installing a
    version already present is an idempotent no-op.
 
-Bare `flux plugin install` (no names, no `--all`, no `--dir`) is an error — it never guesses.
+Bare `flux plugin install` (no names, no `--all`, no `--dir`, and no `--git`) is an error — it never
+guesses.
+
+## Install from Git source
+
+Use `--git` for a third-party or privately hosted plugin that is not in the signed pack:
+
+```bash
+flux plugin install --git https://gitlab.example/team/flux-plugin-acme.git --tag v1.0.0
+```
+
+Choose at most one of `--tag`, `--rev`, or `--branch`. Use `--bin flux-plugin-<name>` when a
+repository contains several matching binaries, and `--force` to rebuild a commit already installed.
+Flux clones into `~/.flux/plugins/src/`, resolves the selected ref to a commit, builds with
+`cargo build --release --locked`, and copies the result into the versioned plugin store.
+
+:::danger A source install executes unverified code
+Cargo builds can execute build scripts and procedural macros. Before building, Flux displays the Git
+URL and resolved commit and asks for explicit confirmation, defaulting to **no**. For unattended
+installation, `FLUX_ALLOW_SOURCE_BUILD=1` is the explicit consent signal; it is not a verification or
+sandboxing switch.
+:::
+
+The descriptor records the Git URL and resolved commit, but no signed-pack SHA-256. Flux therefore
+labels the install `from-source (unverified)` and does not make the signed pack's spawn-time
+hash-integrity claim. Review the repository and pin `--rev` when you need the requested source ref
+itself to be immutable. Reinstalling the same resolved commit is an idempotent no-op unless you pass
+`--force`.
 
 ## What's in the pack
 
@@ -70,7 +112,8 @@ Notes:
 - `call` merges repeatable `--arg key=value` flags (coerced to the op's input schema) over the JSON
   input. With `--dry-run`, the plugin process is still spawned once to read its manifest and schema,
   but the selected operation is never invoked and no operation-level network or write occurs.
-- `pin` records the binary's sha256 and re-checks it at every spawn — drift refuses to run.
+- `pin` records the signed-pack binary's SHA-256 and re-checks it at every spawn — drift refuses to
+  run.
 - The versioned store keeps versions side by side, so `rollback` needs no network and a second
   `rollback` flips forward again.
 - `refresh` is for plugins whose operation set depends on remote state. A plugin answers `manifest`
@@ -97,7 +140,7 @@ with them. Two things may not:
 
 Either refusal leaves the catalog exactly as it was — a refresh never half-applies, and neither does
 a dead subprocess or an unreadable manifest frame. To adopt a genuinely changed capability set,
-restart flux so the grant is made again against the new manifest.
+restart Flux so the grant is made again against the new manifest.
 
 An operation the plugin withdraws stops being callable. A call already running against it finishes
 under the specification it was authorized with; withdrawal governs the next dispatch, not the one in
@@ -117,7 +160,7 @@ and authored app/flow operation lists are unchanged.
 
 ## Local / dev install
 
-Building from a flux source checkout registers local binaries directly — unverified, with no
+Building from a Flux source checkout registers local binaries directly — unverified, with no
 version or hash recorded. From the repo root:
 
 ```bash
@@ -144,7 +187,7 @@ The grant is **intersected** with what the plugin itself declares — you cannot
 manifest never named, and without a grant the private network is unreachable through host
 capabilities. See [Configuration](../reference/config.md).
 
-A plugin that talks to an OAuth-protected API is logged in with `flux auth login <name>` — flux runs
+A plugin that talks to an OAuth-protected API is logged in with `flux auth login <name>` — Flux runs
 the OAuth flow host-side and the plugin never sees the token. A plain bearer token (the common case:
 Slack, GitLab) resolves from the env vars the manifest declares, or store it once with
 `flux auth set <name> <purpose>` and no env var is needed in any later session. For the whole
@@ -152,12 +195,16 @@ capability model, references-only IO, and the manifest fields behind these grant
 [Plugin capability sandbox](../security/plugin-sandbox.md); for login and token storage, see
 [Credentials & secrets](../security/credentials.md).
 
+Host-terminated connection handshakes are different: the SQL plugin's static endpoint path reads
+its declared password environment variables directly and does not consult `flux auth set` storage.
+
 ## Trust model
 
 The capability gates above are enforced on the **host** side; the plugin binary itself is trusted,
-pinned code — not OS-sandboxed by default. Review installed plugins the way you review
-dependencies. The signed pack, sha256 pinning, and spawn-time hash re-check tell you *which* code
-runs; the manifest gates and env-cleared spawn bound what conforming code can reach through flux.
+native code — not OS-sandboxed by default. Review installed plugins the way you review
+dependencies. For verified pack installs, SHA-256 pinning and the spawn-time hash re-check tell you
+*which* code runs; the manifest gates and env-cleared spawn bound what conforming code can reach
+through Flux.
 Opt-in [OS process sandboxing](../security/os-sandbox.md) (`[sandbox]`) additionally confines what
 the raw plugin binary's syscalls can reach on disk and network.
 
@@ -173,5 +220,5 @@ See [Plugin authoring](./authoring.md).
 
 - [Plugin authoring](./authoring.md) — write a plugin and manifest.
 - [Plugin trust & signing](../security/plugin-trust.md) — signed index, hashes, and spawn-time checks.
-- [Plugin capability sandbox](../security/plugin-sandbox.md) — what a plugin may reach through flux.
+- [Plugin capability sandbox](../security/plugin-sandbox.md) — what a plugin may reach through Flux.
 - [OS process sandboxing](../security/os-sandbox.md) — opt-in confinement of the raw plugin process.

@@ -5,11 +5,14 @@ description: Every Flux-Lang node kind — the JSON wire shape, fields, semantic
 
 # Node reference
 
-This is the precise JSON AST reference for Flux-Lang. Planners emit this shape, sessions store it,
-and SDKs pass it around. Text and JSON are semantically identical: every `.flux` construct lowers to
+This is the precise JSON AST reference for Flux-Lang. Authors write native `.flux` text, while SDK
+callers and host tooling may construct this shape directly and sessions store it. Text and JSON are
+semantically identical: every `.flux` construct lowers to
 these nodes, every node kind has a native text spelling, and `@json` remains as the escape for rare
-shapes the text grammar cannot express (non-identifier symbol names, non-invertible `expr` formulas,
-bracket-path `jq`).
+AST shapes the text grammar cannot preserve exactly. Native array indexing is ordinary source —
+`response.results[0]` lowers to the dot-segment path `.results.0` and formats back with brackets.
+Only a hand-built `jq` whose `path` string itself contains brackets needs `@json`, alongside shapes
+such as non-identifier symbol names and non-invertible `expr` formulas.
 
 ## Top-level shape
 
@@ -48,7 +51,7 @@ which is produced from the interpreter's own AST definitions.
 | `assert` | A boolean guard: aborts the flow with an error if the condition is falsey. |
 | `pipe` | A chain of calls where each step's output is fed as the first argument of the next. |
 | `seq` | A sequential block; runs its body in order. Optionally binds the block's final result. |
-| `memo` | Like `bind`, but pinned across turns: if the symbol is already resolved for this session, skip execution and reuse the cached value (compute-once-per-session, keyed on symbol name). |
+| `memo` | Cache a call result across turns in one session. The cache identity is the operation plus its canonical argument AST, not the destination symbol name. On a hit, rebind `name` to the cached immutable value; changing the operation or arguments recomputes. Unlike `bind`, `value` must be a `call`. |
 | `parallel` | Concurrent fan-out: run independent branches, binding each branch's result to its name. |
 | `await` | Pause until an external event/input arrives. |
 | `retry` | Retry a body on failure with optional backoff. Fatal errors (policy denial, unknown op) are never retried. `backoff` may be `"none"` \| `"linear"` \| `"exponential"`. |
@@ -63,15 +66,15 @@ which is produced from the interpreter's own AST definitions.
 | `return` | End the flow with a value. |
 | `peek` | Read the current in-session value of a named symbol without any filesystem IO. Returns the symbol's stored value, or an empty string if the symbol is not yet bound. |
 | `var` | Reference a bound symbol. |
-| `lit` | A literal value (raw JSON, as written in the AST by the compiler front-end). |
+| `lit` | A literal JSON value carried directly in the AST. |
 | `thing` | A reference to an external thing. |
-| `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min`, `max`, `sum`), comparison (`== != < <= > >=`), boolean (`&& \|\| !`, `true`/`false`, `any`, `all`, `has`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat/join/split`), list helpers (`first`/`last`), string literals (`'…'`/`"…"`), lists, and objects. Dotted names such as `it.author.name` descend object fields leniently (missing/null/non-object hops read as `""`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("it.state == 'ok' && len(tags) > 0", …)`. |
+| `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min`, `max`, `sum`), comparison (`== != < <= > >=`), boolean (`&& \|\| !`, `true`/`false`, `any`, `all`, `has`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat/join/split`), list helpers (`first`/`last`), string literals (`'…'`/`"…"`), lists, and objects. Dotted names such as `it.author.name` descend object fields leniently (missing/null/non-object hops read as `""`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps formula identifiers to `Lit` or `Var` nodes. No IO, no approval gate. Native source writes an invertible formula directly, for example `doubled = $price * 2`. |
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} \| Double: {doubled}")`. |
-| `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.  `optional` selects the traversal-through-missing-data policy. When `false` — the default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `$x.field?` sugar, or a legacy JSON AST that omitted the flag — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
-| `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`, `"form"`. `"json"` and `"form"` also run the other way, serializing a record as canonical JSON or as `application/x-www-form-urlencoded` text. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
-| `ctx` | Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by visibility tier then declared order until within the char budget, recording any dropped members in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing values, performing no IO (the load-bearing elevation of PRD §13 explicit context management). |
-| `ctx_append` | Accrete more symbols into an existing context pack (the `+=` marker). Immutably rebinds `ctx` to a *new* `Ctx` value (preserving the audit chain `$pack@1 → @2`) with `add` appended, then re-applies the pack's budget. Pure. |
-| `match` | Multi-way **exhaustive** branch: evaluate `subject` (a literal or bound symbol), then run the body of the first `case` whose `value` equals it — by JSON equality, so a *string* subject does not equal a *numeric* literal. If none match, run `default`. A deterministic replacement for chains of `when`. To branch on an op's result, bind it first (`$s = call(); match $s {…}`) or use `route`. The analyzer requires at least one case; at runtime an unmatched subject with no `default` is an error — the exhaustiveness guard-rail. |
+| `jq` | Pure JSON path extraction. `path` is a dot-segment path (for example `".bitcoin.usd"` or `".results.0.value"`) applied to the JSON content of a `Var`, `Lit`, `Obj`, or `List` input. Native `first = response.results[0].value` source lowers its bracket index to the `.0` AST segment and formats back with brackets; an AST path string that itself contains brackets uses `@json` to preserve that exact shape. No IO, no approval gate.  `optional` selects the traversal-through-missing-data policy. When `false` — the default for native `x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `x.field?` sugar, or a legacy JSON AST that omitted the flag — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
+| `parse` | Pure type coercion over a literal, bound symbol, or object/list template. Bind a computed `jq` or `fmt` result before parsing it. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`, or `"form"`. `"json"` also serializes a structured value as canonical JSON; `"form"` serializes a flat record as `application/x-www-form-urlencoded` text. No IO, no approval gate. Example: `number = parse(price_text, as: "f64")`. |
+| `ctx` | Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by visibility tier then declared order until within the char budget, recording any dropped members in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing values, performing no IO. |
+| `ctx_append` | Accrete more symbols into an existing context pack (the `+=` marker). Creates a new immutable `Ctx` value, updates `ctx` to resolve to that version, preserves the earlier version in the audit trail, then re-applies the pack's budget. Pure. |
+| `match` | Multi-way **exhaustive** branch: evaluate `subject` (a literal or bound symbol), then run the body of the first `case` whose `value` equals it — by JSON equality, so a *string* subject does not equal a *numeric* literal. If none match, run `default`. A deterministic replacement for chains of `when`. To branch on an op result or field access, bind it first, then `match` the resulting symbol; use `route` for a model-selected label. The analyzer requires at least one case; at runtime an unmatched subject with no `default` is an error — the exhaustiveness guard-rail. |
 | `route` | Model-routed branch — the signature *bounded non-determinism* primitive. Run `selector` (typically a `!model` op) to produce a label, then run the `case` whose `label` it names. The cases are fixed and analyzer-validated: the model chooses *which* declared branch runs, never *what*. Falls back to `default` when the label matches no case (an error if `default` is empty). |
 | `fallback` | Ordered "first that succeeds wins" selector: run each branch in `branches` in turn; the first that completes without error and yields a non-empty result wins and becomes the node's result. On a branch error (or empty result) the next is tried — so a *side-effecting* branch that returns empty will still fall through and the next branch also runs (attempts stream live, as in `try`/`retry`). If every branch errors, the last error propagates. Lighter than `try` for graceful degradation (cheap path → else expensive path). `bind` names the winning result. |
 | `timeout` | Bound the wall-clock of a sub-flow: run `body` with a `ms` deadline. If it does not finish in time the node errors (an enclosing `try`/`retry` may catch it). A general reliability guard-rail you can wrap around anything. `bind` names the body's result. |
@@ -79,18 +82,19 @@ which is produced from the interpreter's own AST definitions.
 | `cap_scope` | **Capability scope**: run `body`, but restrict op dispatch to the tool names in `tools` — a call to anything outside that allowlist fails closed at the runtime's dispatch gate, even when the outer session policy would allow it. Capabilities only ever narrow on descent: a nested `with_tools` is intersected with the scope it's nested in, so an inner block can never re-grant a tool an outer one removed. This is the runtime-enforced counterpart of an advisory tool restriction — the analyzer also flags a literal-op `call` here that provably names a tool absent from `tools` (a static echo of the same rule dispatch enforces dynamically). `bind` names the body's result. Native text: `with_tools ["read", "grep"]` + an indented body. |
 | `scope` | RAII-style **acquire → use → release** with guaranteed cleanup. Optionally run `acquire` first (binding its result to `bind`, so `body` and `finally` can name the resource), then run `body`; `finally` **always** runs afterward — on normal completion, an early `return`, or an error — so a lock is freed / a handle closed / a temp removed no matter how the body exits. The body's result, `return`, or error then propagates; a `finally` failure surfaces only when the body itself succeeded (it never masks the body's own error). If `acquire` errors the resource was never taken, so `finally` does not run. The deterministic resource-lifecycle guard-rail (RAII for flows). |
 | `saga` | Saga / **compensating transaction**: run each `step` in order; after a step's `body` succeeds, its `undo` is registered. If a *later* step fails, the runtime unwinds by running the registered `undo` bodies in **reverse** order (best-effort — an `undo` failure is recorded but does not stop the unwind), then propagates the original error. The strongest guard-rail for non-transactional external side effects (charge→refund, create→delete, reserve→release): partial work is rolled back rather than left dangling. A `return` inside a step is a successful early exit and does not compensate (use `scope` for guaranteed cleanup on every exit). |
-| `once` | **At-most-once side effect** across re-runs — an effect-level `memo`. `label` is an explicit idempotency key: the first time the body runs to success in a session its result is recorded durably; later re-runs in the same session skip the body and reuse the stored result. A failed body records nothing and is retried. `bind` optionally names the body's result. Safety under re-execution (`send_email`/`charge` never fire twice). With no durable store wired (a throwaway interpreter) it degrades to running every time. Requires a non-empty literal label. |
-| `checkpoint` | **Durable resume point** for long-running / resumable flows. A **top-level-only** marker (like `await`): the first time a run reaches it, the position is recorded durably; a later re-run of the *same* flow in the *same* session fast-forwards past the already-completed prefix (its symbols are still durably bound and its side effects are not repeated) and continues from here. `label` is a human-readable name for the phase it closes. Pairs with `once` for finer-grained idempotency; a no-op when no durable store is wired. Requires a non-empty literal label. |
-| `obj` | Build an **object value** from sub-expressions — the record constructor `{ k: expr, … }`. Each field value is itself a node, so a record can mix literals and variables: `{ ok: true, n: $count, intent: $extract.intent }`. Pure: it assembles a value, performing no IO and no op dispatch. Leaves must be pure value nodes (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/ `list`); a call or control-flow leaf is rejected by the analyzer so templates stay side-effect free. This is what lets `return { … }` assemble a result from computed symbols. |
-| `list` | Build a **list value** from sub-expressions — the list constructor `[ expr, … ]`. Each item is itself a node (`[ $a, $b, 3 ]`). Pure, same leaf rules as [`Node::Obj`]; the array twin of the record constructor. |
+| `once` | **Durable de-duplication after completion is recorded** — an effect-level `memo`. The durable identity combines the session, explicit `label`, and canonical body identity: an identical labeled body is skipped after its successful `OnceCompleted` record, while two different bodies may safely reuse a human label. A crash after an external effect succeeds but before that completion record is appended can repeat the effect on re-run; use an externally idempotent operation or transaction when duplicates are unacceptable. A failed body records nothing and is retried. `bind` optionally names the stored result. With no durable store wired (a throwaway interpreter) it degrades to running every time. Requires a non-empty literal label. |
+| `checkpoint` | **Durable resume point** for long-running / resumable flows. A **top-level-only** marker (like `await`): the first time a run reaches it, the position is recorded durably; a later re-run of the *same* flow in the *same* session fast-forwards past the already-completed prefix (its symbols are still durably bound and its side effects are not repeated) and continues from here. The resume key is the session plus flow identity (declared name and canonical body hash); the `label` is human-readable event metadata for the phase it closes, not the key. Pairs with `once` for finer-grained idempotency; a no-op when no durable store is wired. Requires a non-empty literal label. |
+| `obj` | Build an **object value** from sub-expressions — the record constructor `{ k: expr, … }`. Each field value is itself a node, so a record can mix literals and symbols: `{ ok: true, count, intent: extract.intent }`. Pure: it assembles a value, performing no IO and no op dispatch. Leaves may be `var`/`lit`/`jq`/`expr`/`fmt`/`parse`/`obj`/`list`; a call or control-flow leaf is rejected by the analyzer so templates stay side-effect free. This is what lets `return { … }` assemble a result from computed symbols. |
+| `list` | Build a **list value** from sub-expressions — the list constructor `[ expr, … ]`. Each item is itself a node (`[a, b, 3]`). Pure, same leaf rules as [`Node::Obj`]; the array twin of the record constructor. |
 <!-- END generated:node-kinds -->
 
 ---
 
 ## Primitive and expression nodes
 
-These produce a value without side effects and appear in argument position, conditions, and
-`return` expressions — not as standalone statements.
+These produce values without side effects. The exact positions each node supports differ: for
+example, a `var` or literal can be a call argument or condition, while a computed `jq`, `fmt`, or
+`parse` value usually needs to be bound first. None is executable as a standalone statement.
 
 ### `lit`
 
@@ -107,8 +111,7 @@ A literal JSON value. String literals support `{symbol}` interpolation at evalua
 
 ### `var`
 
-A reference to a bound symbol, resolved to its stored value. Text form: `name` — bare. `$name` is the
-retained escape spelling, required only when the name collides with a contextual keyword.
+A reference to a bound symbol, resolved to its stored value. Canonical text form: bare `name`.
 
 ```json
 {"kind": "var", "name": "draft"}
@@ -141,10 +144,10 @@ A reference to an external object, resolved before execution begins. Text form:
 
 ### `call`
 
-Invoke a registered operation. Arguments are named: a multi-param op takes a single object
-argument; a sole-required-param op accepts one bare value. Text form: `op(name: value, …)` — the
-canonical brace-free spelling for named inputs — or the equivalent `op({name: value})`, or `do op
-args`.
+Invoke a registered operation. In the AST, a multi-parameter op receives one object node naming its
+inputs; a sole-required-parameter op may receive one bare value. Canonical text projects that object
+as brace-free named inputs: `op(name: value, …)`. A standalone call may use `do op` when it has no
+arguments.
 
 ```json
 {"kind": "call", "op": "write", "args": [
@@ -162,8 +165,9 @@ the symbol table but still traced.
 
 ### `bind`
 
-Store a call's result as a symbol. Text form: `$name = …` (optionally `$name: Type = …`,
-optionally preceded by `@effect(tag)`).
+Evaluate an expression and bind its result to a symbol. Text form: `name = expression` (optionally
+`name: Type = expression`, and optionally preceded by `@effect(tag)`). Unlike `memo`, a regular bind
+may contain any valid bind-value expression, not only an operation call.
 
 ```json
 {"kind": "bind", "name": "draft",
@@ -238,8 +242,9 @@ Abort with an error if the condition is falsey. Text form: `assert <cond>[, "mes
 
 ### `match`
 
-Deterministic multi-way branch by JSON equality. Text form: `match $x` + `case <value>` /
-`default` arms.
+Deterministic multi-way branch by JSON equality. Text form: `match x` + `case <value>` / `default`
+arms. The subject must be a literal or a bound symbol; bind an operation result or field access
+before matching it.
 
 ```json
 {"kind": "match", "subject": {"kind": "var", "name": "status"},
@@ -273,7 +278,7 @@ Bounded model routing: a selector produces a label; the matching `case` runs. Te
 
 ### `fallback`
 
-Ordered first-useful-success selector. Text form: `fallback -> $bind` + bare `branch` arms.
+Ordered first-useful-success selector. Text form: `fallback -> result` + bare `branch` arms.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -304,7 +309,7 @@ Bounded counter loop. Text form: `repeat N` with optional `until` as the first b
 
 ### `each`
 
-List-driven loop. Text form: `each $x in $list [-> $collect | -> flat $collect]`.
+List-driven loop. Text form: `each x in list [-> collected | -> flat collected]`.
 
 ```json
 {"kind": "each", "in": {"kind": "var", "name": "files"}, "as": "f",
@@ -321,8 +326,8 @@ List-driven loop. Text form: `each $x in $list [-> $collect | -> flat $collect]`
 
 ### `loop`
 
-Time-bounded iteration. Text form: `loop for <ms> every <ms> [-> $bind]` with optional
-`until` first body line.
+Time-bounded iteration. Text form: `loop for 30s, every: 2s, until: done -> result`; `every`,
+`until`, and the result binding are optional.
 
 ```json
 {"kind": "loop", "for_ms": 10000, "every_ms": 1000,
@@ -346,7 +351,7 @@ resilience.
 
 ### `seq`
 
-Sequential block, optionally binding its final result. Text form: `seq [-> $bind]`.
+Sequential block, optionally binding its final result. Text form: `seq [-> result]`.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -356,7 +361,7 @@ Sequential block, optionally binding its final result. Text form: `seq [-> $bind
 ### `pipe`
 
 Chain calls, each step's output fed as the next step's first argument. Text form:
-`pipe [-> $bind]` + one indented call per line.
+`pipe [-> result]` + one indented call per line.
 
 ```json
 {"kind": "pipe", "bind": "hits", "steps": [
@@ -372,8 +377,11 @@ Chain calls, each step's output fed as the next step's first argument. Text form
 
 ### `memo`
 
-Like `bind`, but compute-once-per-session keyed on `(session, name)`. Text form:
-`memo $name[: Type] = <call>` (optionally preceded by `@effect(tag)`).
+Like `bind`, but caches a call result across turns in one session. The cache identity is the called
+operation plus its canonical argument AST, not the destination symbol name. On a cache hit the
+stored value is bound to the authored name again. Text form: `memo name[: Type] = <call>` (optionally
+preceded by `@effect(tag)`). `memo` accepts only a call expression; use an ordinary bind for other
+pure expressions.
 
 ```json
 {"kind": "memo", "name": "survey",
@@ -382,7 +390,7 @@ Like `bind`, but compute-once-per-session keyed on `(session, name)`. Text form:
 
 | field | type | required | description |
 |---|---|---|---|
-| `name` | string | yes | symbol / cache key |
+| `name` | string | yes | symbol that receives the cached value |
 | `value` | Node (call) | yes | the call to run on a cache miss |
 | `ty` | TypeRef | no | type hint |
 | `effect` | FlowEffect | no | declared effect |
@@ -394,7 +402,7 @@ Like `bind`, but compute-once-per-session keyed on `(session, name)`. Text form:
 ### `parallel`
 
 Concurrent fan-out; each branch's result binds to its name; results merge in declaration
-order. Text form: `parallel` + `branch $name` arms. See [Concurrency](./concurrency.md).
+order. Text form: `parallel` + `branch name` arms. See [Concurrency](./concurrency.md).
 
 | field | type | required | description |
 |---|---|---|---|
@@ -402,8 +410,8 @@ order. Text form: `parallel` + `branch $name` arms. See [Concurrency](./concurre
 
 ### `race`
 
-First-success concurrency under a required deadline. Text form: `race <timeout_ms> [-> $bind]` +
-`branch $name` arms. See [Concurrency](./concurrency.md).
+First-success concurrency under a required deadline. Text form: `race 5s [-> result]` + `branch
+name` arms. See [Concurrency](./concurrency.md).
 
 | field | type | required | description |
 |---|---|---|---|
@@ -418,7 +426,7 @@ First-success concurrency under a required deadline. Text form: `race <timeout_m
 ### `try`
 
 Run `body`; on failure bind the error string to `catch` and run `handler`. Text form: `try` +
-body, then an optional `catch [$err]` + handler block. See
+body, then an optional `catch [err]` + handler block. See
 [Reliability & guard rails](./reliability.md).
 
 | field | type | required | description |
@@ -430,7 +438,7 @@ body, then an optional `catch [$err]` + handler block. See
 ### `retry`
 
 Retry a body on transient failure. Text form:
-`retry <max> [backoff <strategy>] [delay <ms>] [-> $bind]`.
+`retry <max>, backoff: <strategy>, delay: <duration> [-> result]`.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -456,7 +464,7 @@ Run a command node and assert its output contains a substring. Text form:
 
 ### `confirm`
 
-Explicit human approval gate. Text form: `confirm "message" [risk <level>]` + optional body. See
+Explicit human approval gate. Text form: `confirm "message", risk: <level>` + optional body. See
 [Reliability & guard rails](./reliability.md).
 
 | field | type | required | description |
@@ -471,7 +479,7 @@ Explicit human approval gate. Text form: `confirm "message" [risk <level>]` + op
 
 ### `timeout`
 
-Wall-clock deadline on a body. Text form: `timeout <ms> [-> $bind]`.
+Wall-clock deadline on a body. Text form: `timeout 5s [-> result]`.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -481,7 +489,7 @@ Wall-clock deadline on a body. Text form: `timeout <ms> [-> $bind]`.
 
 ### `budget`
 
-Dispatch cap on a body, checked at statement boundaries. Text form: `budget <n> [-> $bind]`.
+Dispatch cap on a body, checked at statement boundaries. Text form: `budget <n> [-> result]`.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -492,7 +500,7 @@ Dispatch cap on a body, checked at statement boundaries. Text form: `budget <n> 
 ### `cap_scope`
 
 Runtime-enforced tool allowlist for a body; nested scopes intersect. Text form:
-`with_tools ["a", "b"] [-> $bind]`.
+`with_tools ["a", "b"] [-> result]`.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -503,7 +511,7 @@ Runtime-enforced tool allowlist for a body; nested scopes intersect. Text form:
 ### `throttle`
 
 At most `max` dispatches per sliding window, keyed per session by `name`; errors instead of
-blocking. Text form: `throttle "name" <max> per <window_ms>` + body.
+blocking. Text form: `throttle "name", max: <count>, per: <duration>` + body.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -515,7 +523,7 @@ blocking. Text form: `throttle "name" <max> per <window_ms>` + body.
 ### `debounce`
 
 Cross-turn coalescing: the body runs only after `wait_ms` of quiet for the key. Text form:
-`debounce "name" <wait_ms>` + body.
+`debounce "name", wait: <duration>` + body.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -529,7 +537,7 @@ Cross-turn coalescing: the body runs only after `wait_ms` of quiet for the key. 
 
 ### `peek`
 
-Read a symbol's in-session value without IO (empty if unbound). Text form: `peek $name` — an
+Read a symbol's in-session value without IO (empty if unbound). Text form: `peek name` — an
 expression, valid as a bind value or condition.
 
 | field | type | required | description |
@@ -539,7 +547,7 @@ expression, valid as a bind value or condition.
 ### `await`
 
 Suspend until an external event; resume binds the received value. Top-level only. Text form:
-`await [$bind[: Type] =] "source"`. See [Durability & cross-turn state](./durability.md).
+`await [received[: Type] =] "source"`. See [Durability & cross-turn state](./durability.md).
 
 | field | type | required | description |
 |---|---|---|---|
@@ -549,9 +557,9 @@ Suspend until an external event; resume binds the received value. Top-level only
 
 ### `scope` / `saga` / `once` / `checkpoint`
 
-The durability quartet — guaranteed cleanup, compensation, at-most-once effects, and durable
-resume. Text forms: `scope [$res = <acquire>]` + body + `finally` + cleanup; `saga` with `step` /
-`undo` arms; `once "label" [-> $bind]` + body; `checkpoint "label"`. Semantics, examples, and
+The durability quartet — guaranteed cleanup, compensation, completed-effect de-duplication, and
+durable resume. Text forms: `scope [resource = <acquire>]` + body + `finally` + cleanup; `saga` with
+`step` / `undo` arms; `once "label" [-> result]` + body; `checkpoint "label"`. Semantics, examples, and
 field-by-field behavior are on [Durability & cross-turn state](./durability.md). Field summary:
 
 | kind | fields |
@@ -574,8 +582,8 @@ The pure computation nodes — full semantics, whitelists, and examples on
 |---|---|
 | `expr` | `formula` (string), `vars` (map name → `lit`/`var` node) — every formula variable must be declared |
 | `fmt` | `template` (string with `{name}` placeholders) — text form `fmt("…")` |
-| `jq` | `path` (dot-path string), `input` (`var`/`lit` node) — text sugar `$var.path` for dotted paths |
-| `parse` | `value` (Node), `as` (`"f64"`/`"i64"`/`"bool"`/`"json"`/`"string"`) |
+| `jq` | `path` (dot-path string), `input` (`var`/`lit`/`obj`/`list` node) — native `value.items[0]` lowers the index to the AST path `.items.0`; a path string that itself uses brackets retains the `@json` form |
+| `parse` | `value` (`var`/`lit`/`obj`/`list` node), `as` (`"f64"`/`"i64"`/`"bool"`/`"json"`/`"string"`/`"form"`) |
 
 ### `obj` / `list`
 
@@ -594,13 +602,13 @@ when not plain JSON.
 | `obj` | `fields` — map of field name → pure value node |
 | `list` | `items` — ordered pure value nodes |
 
-Leaves may only be `var`/`lit`/`jq`/`expr`/`fmt`/`obj`/`list`; effectful leaves are rejected.
+Leaves may only be `var`/`lit`/`jq`/`expr`/`fmt`/`parse`/`obj`/`list`; effectful leaves are rejected.
 As bare top-level statements they error — a value by itself is not executable.
 
 ### `ctx` / `ctx_append`
 
 The context-pack nodes — full budget semantics on [Context packs](./context-packs.md). Text
-forms: the `ctx $name` block and `$pack += $more`.
+forms: the `ctx name` block and `pack += more`.
 
 | kind | fields |
 |---|---|
@@ -615,8 +623,8 @@ forms: the `ctx $name` block and `$pack += $more`.
   non-bypassable regardless of which node kind triggers the call.
 - **`return` inside `parallel` is rejected** by the analyzer — bind inside the branch, read
   the symbol after the join.
-- **`memo` is session-scoped** — the cache key is `(session, symbol)`; a new session always
-  recomputes.
+- **`memo` is session-scoped** — identical operation-and-argument provenance reuses the cached
+  value; a changed call or a new session recomputes.
 - **`retry` does not retry fatal errors** — policy denial, unknown op, and type errors
   propagate immediately.
 - **`throttle` errors instead of blocking** — the plan stays responsive; wrap with `try` or

@@ -1,24 +1,32 @@
 ---
 title: Agent-to-agent (A2A)
-description: "How flux both serves and consumes A2A agents, including CLI usage and server behavior."
+description: "How flux serves and calls A2A v0.3 agents over JSON-RPC/HTTP, including CLI usage, server behavior, and security."
 ---
 
 # Agent-to-agent (A2A)
 
-flux speaks the [A2A protocol](https://a2a-protocol.org/) in both directions. It can expose a local
-flux agent to other clients, and it can call a remote A2A agent from the CLI.
+flux implements the JSON-RPC-over-HTTP binding of the
+[A2A v0.3.0 specification](https://a2a-protocol.org/v0.3.0/specification/) in both directions. It
+can expose a local flux agent to a compatible v0.3 client, and it can call a compatible v0.3 agent
+from the CLI.
 
 A2A is an agent protocol, not a model protocol. One request becomes one remote task, and the remote
-agent runs its own loop with its own tools. flux handles the wire, continuity, streaming, and security
-checks around that task.
+agent runs its own loop with its own tools. flux handles the wire, continuity, streaming, and
+security checks around that task.
 
-- **Server** — `flux app run --serve` exposes a flux agent so any A2A client (Claude Code, other
-  agents, custom scripts) can call flux as a first-class agent.
-- **Client** — `flux a2a <URL>` connects out to any spec-conformant A2A agent and drives it from the
-  CLI, exactly like a local agent.
+:::info Version boundary
+The wire formats and method names on this page are A2A v0.3.0. flux does not currently implement
+A2A v1.0, gRPC, HTTP+JSON, or automatic cross-version negotiation. A2A v1.0 changed message parts,
+roles, task states, agent cards, and other wire details; see the official
+[v0.3-to-v1.0 migration and status page](https://a2a-protocol.org/latest/whats-new-v1/).
+:::
 
-Both directions use the current spec: `message/send` (blocking) and `message/stream` (Server-Sent
-Events), with message parts keyed by `kind`.
+- **Server** — `flux app run --serve` exposes a flux agent to clients that use the compatible v0.3
+  JSON-RPC methods and message shapes documented below.
+- **Client** — `flux a2a <URL>` connects to a v0.3 JSON-RPC agent and drives it from the CLI.
+
+Both directions use `message/send` and `message/stream` (Server-Sent Events), with v0.3 message
+parts discriminated by `kind`.
 
 ## Client — `flux a2a <URL>`
 
@@ -41,8 +49,9 @@ name and whether it streams, then:
 
 - Streams the reply live when the agent advertises `capabilities.streaming` (`message/stream`),
   otherwise blocks on `message/send`.
-- In the REPL, **Ctrl-C** interrupts a turn (dropping the SSE connection cancels the remote turn),
-  **Ctrl-D** exits, and `/card` prints the remote agent card.
+- In the REPL, **Ctrl-C** stops waiting for the current turn, **Ctrl-D** exits, and `/card` prints
+  the remote agent card. When flux is the server, dropping its SSE connection also cancels the
+  in-flight flux turn; another server may handle disconnects differently.
 
 The `<URL>` may be a base origin (`http://host:port` targets `<origin>/a2a`) or a full JSON-RPC
 endpoint URL; the client adopts the endpoint advertised by the card when present.
@@ -122,13 +131,14 @@ streams `status-update` events as SSE: working events carry incremental text del
 event (`"final": true`) carries the terminal state. Closing the connection mid-stream cancels the
 in-flight turn cleanly between plan rounds.
 
-### Calling flux from Claude Code
+### Calling flux from another v0.3 client
 
 1. Start flux with a token: `FLUX_SERVER_TOKEN=mytoken flux app run --serve 0.0.0.0:3000 --yes`.
-2. In Claude Code, add flux as an A2A agent pointing at `http://<your-host>:3000`. The card at
-   `/.well-known/agent-card.json` is fetched automatically to learn flux's capabilities.
-3. Pass the bearer token as the connection credential.
-4. Use `message/stream` for a streaming experience, or `message/send` for a single blocking call.
+2. Fetch `http://<your-host>:3000/.well-known/agent-card.json` and use its `url` as the JSON-RPC
+   endpoint.
+3. Send the bearer token in `Authorization: Bearer <token>`.
+4. Use the v0.3 `message/stream` method for SSE, or `message/send` with
+   `configuration.blocking: true` for a synchronous response.
 
 ## Security
 
@@ -153,7 +163,7 @@ Whenever auth is enabled the discovery card **declares** its bearer scheme (`sec
 structural (registered outside the middleware), not a path-string comparison, so encoding tricks
 cannot bypass it.
 
-**Stateful sessions (A-48).** A request whose `contextId` matches a live A2A session continues it
+**Stateful sessions.** A request whose `contextId` matches a live A2A session continues it
 (multi-turn memory); a request without one gets a fresh session per task. Sessions are pruned by a
 TTL (`[server] a2a_session_ttl_secs`, default 1h). In principal mode continuity is realm-keyed — the
 same `contextId` under two tenants is two isolated conversations (`contextId` is a grouping key, not

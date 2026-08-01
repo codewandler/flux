@@ -42,7 +42,7 @@ and [Safety & approvals](./safety.md).
 | `flux export <run> -o run.html` | render a recorded run — plan tree, per-op results/diffs, cost, timeline, nested sub-agents — as one self-contained, redacted static HTML file; the read-only, shareable sibling of `replay`/`fork`/`diff` |
 | `flux record <name> "…"` | record one live turn as a committed-safe scenario fixture — see the [Agent Lab](../sdk/agent-lab.md) |
 | `flux test [name]` | replay recorded fixtures offline as a test gate ($0, no key, no network; exit 1 on a regression) |
-| `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) — the in-repo scoring engine; harness benchmarking is [flux-bench](https://github.com/codewandler/flux-bench) |
+| `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) — the public, in-repo scoring engine; an optional standalone harness benchmark is maintained separately and is not currently published |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
@@ -120,12 +120,18 @@ check `FAIL`s.
 
 ## Crash recovery and resurrection
 
-With durable session storage, entering a conversation that was killed mid-turn first finishes the
-interrupted predecessor from its recorded plan, then runs the new input — every turn-entry point
-does this, the same step: a one-shot `flux run` turn, the interactive REPL (at startup and on
-`/resume`), and the TUI. Completed statements are fast-forwarded, recorded op results are served
-from the cassette, and only the remaining live tail runs through the normal approval envelope. Set
-`FLUX_AUTO_RESURRECT=0` to opt out.
+With durable session storage, entering a conversation that was killed after accepting a plan first
+finishes that interrupted turn, then runs the new input. A one-shot `flux run` turn, the interactive
+REPL (at startup and on `/resume`), and the TUI all use the same step. Completed statements are
+fast-forwarded, op results that reached the durable cassette are served without re-dispatch, and the
+remaining tail runs live through the normal approval envelope. Set `FLUX_AUTO_RESURRECT=0` to opt
+out.
+
+This is at-least-once recovery, not a blanket exactly-once guarantee. If an effect happened but the
+process died before its cassette cell was appended, that op can run again. A crash before any plan
+was accepted has no durable plan to resume and is reported instead of being reconstructed. Recovery
+also covers only durable session events: REPL/TUI drafts and queued-but-unconsumed follow-ups are
+process memory, not session state.
 
 `flux sessions` is intentionally read-only: it marks interrupted sessions in the listing, but never
 resurrects a turn as a side effect of listing sessions.

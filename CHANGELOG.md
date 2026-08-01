@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Improved
 
+- **The public website now matches the product that ships** (C-343). Runtime explanations now use
+  the authored Flux-Lang loop and host-frozen action-batch model; channel, security, setup, SDK,
+  plugin, A2A, Wasm, durability, and recovery guidance states its real boundary; all public Flux
+  examples use canonical parser/formatter output; and task-oriented navigation replaces the old
+  product-history layout. New contracts pin the runtime story, registered channel inventory, and
+  all 125 public Flux fences, while the site build rejects missing pages and broken Markdown links.
+
 - **The terminal UI now stays readable in monochrome, narrow panes, and long-running sessions**
   (C-341). Selected queue and session rows have a visible marker, the composer has a focus rail,
   overflow keeps its scrollbar, and intermediate widths deliberately shed previews and descriptions.

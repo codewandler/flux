@@ -24,40 +24,47 @@ prompt.
 
 ## What that means for you
 
-- **Nothing destructive happens silently.** Deleting files, overwriting work, or running risky
-  commands always pauses to ask you first. Reading a file usually just works; changing one asks.
-- **You approve before anything big runs.** You can say yes once, always allow a routine action, or
-  say no. No is always the safe default.
-- **Your passwords and API keys stay hidden.** flux remembers *where* a key is stored, not the key
-  itself, and it scrubs secrets out of anything shown on screen. The AI only ever sees a name for
-  the secret, never the value.
-- **Add-ons can't snoop.** Plugins (integrations for things like GitLab or Slack) only get the exact
-  permissions you grant — they can't read your passwords or wander the network on their own.
-- **flux won't quietly send your data somewhere it shouldn't.** It blocks connections to private and
-  internal network addresses unless you explicitly allow them, and it won't trust a site just
-  because its *name* looks safe.
-- **It stays on track.** If a run gets interrupted or hits a limit, flux picks up cleanly instead of
-  leaving a half-finished mess or a corrupted conversation.
-- **There's a record.** flux keeps a log of what it did, so you can always look back and see exactly
-  what happened.
+- **Interactive runs pause before destructive work.** Deleting files, overwriting work, or running
+  risky commands asks for approval in the normal interactive modes. If you deliberately use
+  `--yes`, flux answers those prompts for admitted actions, including destructive ones. It does not
+  authorize anything excluded by policy or by an app/agent ceiling.
+- **You approve before anything big runs in interactive mode.** You can say yes once, always allow a
+  routine action, or say no. No is always the safe default.
+- **The AI does not receive your passwords and API keys.** The default login store does contain token
+  values, as a plaintext owner-only file. The model receives references such as a key name instead;
+  flux resolves values at the IO boundary and scrubs known secrets from captured output.
+- **Plugin access through flux is narrow.** Host callbacks are limited to the programs, files,
+  secrets, connections, and network hosts declared by the plugin. A plugin is still a trusted native
+  program and is not OS-sandboxed by default in interactive use; malicious code could make its own
+  system calls. Install only plugins you trust, and turn on the OS sandbox for defense in depth.
+- **Host-mediated network access is guarded.** flux resolves destinations and blocks private and
+  internal addresses unless you grant them. A trusted native plugin can bypass its host callbacks
+  when it is not OS-sandboxed, which is why plugin trust still matters.
+- **Interrupted sessions remain usable.** Cancellation and limits leave valid conversation history
+  that can be resumed. Effects that already completed are not rolled back automatically.
+- **Host-mediated work leaves a record.** flux logs the operations, approvals, and destructive
+  markers that cross its runtime. Direct system calls made by an unsandboxed native plugin are
+  outside that audit trail.
 
 ## What you still own
 
 No tool removes all risk, and flux won't pretend to. A few things stay in your hands:
 
-- **Be thoughtful about auto-approve.** There's a mode that says yes to everything for unattended
-  runs. It's convenient, but it means no one is double-checking. Use it only when you trust the task
-  completely.
-- **Only install add-ons you trust.** A plugin is a real program. flux checks that it's the genuine
-  article and limits what it's allowed to do, but it can't make a malicious add-on safe. Install
-  plugins the way you'd install any software — from sources you trust.
+- **Be thoughtful about auto-approve.** There's a mode that says yes to every admitted action for
+  unattended runs. It is convenient, but it means no one is double-checking within the configured
+  ceilings. Use it only when you trust the task completely.
+- **Only install add-ons you trust.** A plugin is a real program. The signed pack is signature- and
+  checksum-verified; local and source installs are explicitly unverified paths. Capability checks
+  cannot make malicious native code safe, so treat every plugin like any other dependency you run.
 - **Keep your login file private.** On your own computer, flux stores your sign-in tokens in a file
-  that only your account can read. Don't share it or loosen its permissions. (Teams can keep tokens
-  in a proper vault instead.)
+  that only your account can read. Don't share it or loosen its permissions. (An embedding host can
+  inject a Vault-backed store for a team deployment.)
 
 ## Where to go next
 
-- **Just using flux?** You're done — the defaults above are on out of the box.
+- **Just using flux?** The runtime checks and private-network guard are active out of the box. The OS
+  process sandbox is off for ordinary interactive use; see the overview before running unfamiliar
+  native plugins.
 - **Want the how and why?** Start with the [Security overview](./overview.md).
 - **Running flux for a team or exposing it on a network?** Read
   [Server authentication & tenancy](./server-auth.md).

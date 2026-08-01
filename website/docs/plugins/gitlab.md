@@ -1,6 +1,6 @@
 ---
 title: GitLab plugin
-description: "Step-by-step setup for the gitlab plugin: install, authenticate, wire a self-hosted instance, and call an operation."
+description: "Step-by-step setup for the GitLab plugin: install, authenticate, wire a self-hosted instance, and call an operation."
 ---
 
 # GitLab plugin
@@ -17,18 +17,17 @@ flux plugin install gitlab
 ```
 
 This resolves the newest signed `plugins-v*` pack release, verifies the index signature and the
-archive's sha256, and unpacks the binary into the versioned store. Confirm it landed:
+archive's SHA-256, and unpacks the binary into the versioned store. Confirm it landed:
 
 ```bash
 flux plugin status gitlab
 ```
 
-```text
-gitlab           ~/.flux/plugins/bin/gitlab/0.1.1/flux-plugin-gitlab   v0.1.1  [ok]  [verified]
-    manifest:  v0.1.1  79 op(s)  ·  1 auth purpose(s)  ·  1 endpoint(s)  ·  3 datasource(s)  ·  caps: http, secret(2), blob
-    auth:      · personal_token — not configured (env: GITLAB_PERSONAL_TOKEN, GITLAB_PERSONAL_ACCESS_TOKEN)
-    endpoint:  · gitlab.endpoint — env not set, defaults to https://gitlab.com
-```
+`status` reads the installed version and operation total from the live manifest. For setup, check
+the `personal_token` auth purpose, the `gitlab.endpoint` endpoint, the `gitlab.projects`,
+`gitlab.merge_requests`, and `gitlab.issues` datasources, and the HTTP, declared-secret, and blob
+capabilities. With no configuration it reports the declared token environment variables and the
+endpoint's `https://gitlab.com` default.
 
 `ok`/`verified` only proves the binary launched and its hash matches the signed descriptor — it does
 **not** mean authentication or network access has been checked. The `auth:`/`endpoint:` lines below it
@@ -59,7 +58,7 @@ resolved base URL (endpoints are not secret — `flux endpoint show`/`resolve` p
 ```
 
 Note what `status` never shows: the token value itself. These env vars never need to be written into
-`.flux/config.toml` or read by anything flux-side other than the host process. The plugin subprocess
+`.flux/config.toml` or read by anything Flux-side other than the host process. The plugin subprocess
 never sees them as OS environment variables at all — it is spawned with a cleared environment and
 requests the token by name over an IPC capability call, which the host resolves from its own env and
 hands back only because the plugin's manifest declared these exact keys as a granted secret. See
@@ -102,7 +101,7 @@ the token and endpoint are both wired correctly:
 }
 ```
 
-An auth failure surfaces as a `401` from GitLab, not a flux-side error — that tells you the token is
+An auth failure surfaces as a `401` from GitLab, not a Flux-side error — that tells you the token is
 wrong or lacks scope, not that the wiring is broken. A private-network refusal (step 3) means the
 wiring reached the network guard but not GitLab yet.
 

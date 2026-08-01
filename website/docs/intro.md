@@ -9,28 +9,27 @@ description: "Public entry point for flux docs: what flux is, what is new, and w
 flux is a deterministic agent platform for building and running tool-using agents without giving the
 model direct control of the machine.
 
-The thesis is simple: **the LLM is not the runtime**. The model compiles a request into a typed,
-readable Flux-Lang plan. A deterministic Rust runtime then executes that plan through one mandatory
-safety envelope:
+The thesis is simple: **the LLM is not the runtime**. Provider-native typed stages interpret intent,
+gather evidence, and propose literal operation calls inside an authored Flux-Lang outer loop. The
+host freezes effectful proposals into action batches, then a deterministic runtime executes approved
+calls through one mandatory safety envelope:
 
 ```text
 authorization -> approval -> guarded IO
 ```
 
-The result is an agent run you can inspect, replay, and reason about. The model proposes work; the
-runtime decides what is allowed and performs the work.
+The default conversational loop never asks the model to generate per-turn executable Flux. Authored
+control flow owns order, bounds, approval, and stopping; the model supplies bounded judgment. The
+result is a run you can inspect, replay, and reason about. There is one explicit source-generation
+seam for reusable vocabulary: [`op.register`](./agent/saved-flows.md#register-an-operation-during-a-turn)
+accepts exactly one agent-proposed composite operation, then analyzes, scopes, and guards it before
+installation.
 
-## The three pillars
+## The core product
 
 - **Agent**: the local coding agent — CLI/TUI, an embeddable Rust SDK, an HTTP/[A2A](./agent/a2a.md)
   server, and [multi-agent programs](./agent/programs.md).
-- **Flux-Lang**: the plan language and reference interpreter.
-- **[Improvement loop](./agent/improvement.md)**: the self-improvement harness that lets flux edit
-  its own harness under a keep-or-revert gate. Unlike the other two, this pillar is
-  **de-prioritized and on hold** — the harness runs and its evidence is trustworthy, but a
-  repeatable grader-confirmed gain is unproven. Treat it as a measurement tool, not a shipped
-  capability. Benchmarking a harness build against another is a separate tool,
-  [flux-bench](https://github.com/codewandler/flux-bench).
+- **Flux-Lang**: the authored workflow language and reference interpreter.
 
 ## Public docs vs project docs
 
@@ -48,24 +47,20 @@ The repository also contains internal contributor docs under `docs/` and crate-l
 directories. Those are design records, story boards, roadmap notes, and implementation references.
 They are useful when contributing, but they are more detailed and more volatile than this site.
 
-## Start here
+## Choose your path
 
-- New to flux: [build your first Flux app](./tutorial.md) in the guided beginner tutorial.
-- Need only installation and command examples: read [Getting started](./getting-started.md).
-- How a turn works: read [Concepts](./concepts.md) and [The agent loop](./agent/agent-loop.md).
-- How the pieces fit together: see [Infrastructure](./infrastructure.md).
-- What flux is allowed to do: read [Safety & approvals](./agent/safety.md).
-- Interested in the language: read [Flux-Lang overview](./language/overview.md).
-- Embedding flux: read the [SDK overview](./sdk/overview.md).
-- Measuring and improving behavior: read [Evaluation and improvement](./agent/improvement.md), which
-  points at [flux-bench](https://github.com/codewandler/flux-bench) for benchmarking a harness.
-- Replay, fork, and diff past runs: read [Time Machine](./agent/time-machine.md).
-- Something not working: check [Troubleshooting](./troubleshooting.md).
-
-## Related docs
-
-- [Build your first Flux app](./tutorial.md) — go from a guarded agent run to a local docs assistant.
-- [Getting started](./getting-started.md) — install flux and run the mock provider.
-- [Concepts](./concepts.md) — understand plans, symbols, evidence, and the safety envelope.
-- [Infrastructure](./infrastructure.md) — see the runtime, safety boundary, and crate layers at a glance.
-- [What's new](./whats-new.md) — see release-by-release user-visible changes.
+- **Try flux:** [install it and run the mock provider](./getting-started.md), then
+  [build your first Flux app](./tutorial.md).
+- **Use the coding agent:** start with the [CLI](./agent/cli.md), choose a
+  [model provider](./agent/providers.md), and add [project context](./agent/project-context.md).
+- **Understand execution:** read [Concepts](./concepts.md), [Infrastructure](./infrastructure.md), and
+  [The agent loop](./agent/agent-loop.md).
+- **Build and integrate an app:** define a [multi-agent program](./agent/programs.md), learn
+  [Flux-Lang](./language/overview.md), then connect [channels](./channels/overview.md) or
+  [plugins](./plugins/using-plugins.md).
+- **Embed or serve an agent:** use the [Rust SDK](./sdk/overview.md), the
+  [HTTP API](./agent/http-api.md), or [A2A](./agent/a2a.md).
+- **Deploy safely:** set the [approval and permission boundary](./agent/safety.md), then review the
+  [security model](./security/overview.md).
+- **Diagnose or update:** check [Troubleshooting](./troubleshooting.md) and
+  [What's new](./whats-new.md).

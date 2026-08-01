@@ -33,7 +33,7 @@ const config = {
   ],
   markdown: {
     hooks: {
-      onBrokenMarkdownLinks: 'warn',
+      onBrokenMarkdownLinks: 'throw',
     },
   },
 
@@ -49,7 +49,7 @@ const config = {
         docs: {
           sidebarPath: require.resolve('./sidebars.js'),
           routeBasePath: 'docs',
-          editUrl: 'https://github.com/codewandler/flux/tree/main/website/',
+          editUrl: 'https://github.com/codewandler/flux/edit/main/website/',
         },
         blog: {
           path: 'blog',
@@ -100,9 +100,9 @@ const config = {
       {
         name: 'description',
         content:
-          'flux is a deterministic agent platform: the model compiles a request into a typed ' +
-          'Flux-Lang plan, and a Rust runtime executes it through authorization, approval, and ' +
-          'guarded IO.',
+          'flux is a deterministic agent platform: provider-native typed stages propose literal ' +
+          'calls inside an authored Flux-Lang loop; the host freezes effects into action batches ' +
+          'and runs them through authorization, approval, and guarded IO.',
       },
       {name: 'keywords', content: 'flux, Flux-Lang, agent platform, Rust agent SDK, deterministic agents'},
     ],
@@ -155,7 +155,7 @@ const config = {
             { label: 'Getting started', to: '/docs/getting-started' },
             { label: 'Flux-Lang', to: '/docs/language/overview' },
             { label: 'SDK', to: '/docs/sdk/flow-client' },
-            { label: 'Improvement', to: '/docs/agent/improvement' },
+            { label: 'Channels', to: '/docs/channels/overview' },
             { label: "What's new", to: '/docs/whats-new' },
             { label: 'Blog', to: '/blog' },
           ],

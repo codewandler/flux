@@ -93,8 +93,10 @@ a role declared with `tools: []` gets **zero** tools.
 
 > No model-stage operation, built-in tool, sub-agent operation, app operation, or plugin host
 > callback reaches real IO without traversing this envelope. Trusted native plugin code remains
-> outside that guarantee: it is not OS-sandboxed by default, though opt-in OS-level sandboxing
-> (`[sandbox]`) closes that gap — see [OS process sandboxing](../security/os-sandbox.md).
+> outside that guarantee: it is not OS-sandboxed by default. When an OS backend is active,
+> `[sandbox]` reduces that raw-syscall bypass risk by constraining writes and optionally disabling
+> network access; v1 still permits filesystem reads, and networking remains open unless
+> configuration or the CLI's unattended profile closes it — see [OS process sandboxing](../security/os-sandbox.md).
 
 This is enforced by construction, not by convention — see [Concepts](../concepts.md) for how it fits
 the typed-stage/authored-flow model, and the [source on GitHub](https://github.com/codewandler/flux) for the

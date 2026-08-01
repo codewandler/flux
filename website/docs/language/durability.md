@@ -1,6 +1,6 @@
 ---
 title: Durability & cross-turn state
-description: Session caching, suspension, durable resume, at-most-once effects, guaranteed cleanup, and compensating transactions in Flux-Lang.
+description: Session caching, suspension, durable resume, completed-effect deduplication, guaranteed cleanup, and compensating transactions in Flux-Lang.
 ---
 
 # Durability & cross-turn state
@@ -15,26 +15,30 @@ Two kinds of state are in play:
 
 - **Session state** — the value store (`memo`, `peek`) and rate/coalescing keys. Scoped to the
   session; a new session starts clean.
-- **Durable state** — `once` results and `checkpoint` positions, scoped to
-  `(session, flow)` and folded from an append-only event log. History is never rewritten.
-  With no durable store wired (a throwaway interpreter), `once` runs every time and
+- **Durable state** — `once` and `checkpoint` deliberately use different identities. A `once`
+  completion is keyed by session, its explicit label, and the canonical body identity. A checkpoint
+  position is keyed by session and flow identity (declared name plus canonical body hash); its label
+  is descriptive event metadata. Both are folded from an append-only event log, so history is never
+  rewritten. With no durable store wired (a throwaway interpreter), `once` runs every time and
   `checkpoint` is a no-op.
 
 ## `memo` — compute once per session
 
-Like `bind`, but pinned across turns: if the symbol is already resolved for this session, the
-op is skipped and the cached value reused.
+Like `bind`, but pinned across turns. `memo` accepts a call expression and caches its result by the
+operation plus canonical argument AST within the session. Reusing that call skips the operation and
+binds the cached immutable value to the authored symbol again; changing the operation or arguments
+recomputes even if the destination name is unchanged.
 
 ```flux
-memo $survey = read("big.log")
+memo survey = read("big.log")
 ```
 
 Like `bind`, a `memo` accepts an optional type annotation and an `@effect(tag)` line above it:
-`memo $schema: String = read("schema.sql")`.
+`memo schema: String = read("schema.sql")`.
 
-The cache key is `(session, symbol name)` — a different session always recomputes. Use it for
-expensive deterministic work (large reads, slow searches, model calls) that later turns will
-need again.
+A different session always recomputes. Use `memo` for expensive deterministic work (large reads,
+slow searches, model calls) that later turns will need again. Use an ordinary bind for `fmt`, field
+access, `parse`, and other non-call expressions.
 
 ## `peek` — read a symbol without IO
 
@@ -42,14 +46,14 @@ Returns a symbol's current in-session value, or an empty result if it is not yet
 pure lookup, no filesystem involved:
 
 ```flux
-$prev = peek $last_result
+prev = peek last_result
 ```
 
 `peek` pairs with `unless` for "skip if already computed" within a plan:
 
 ```flux
-unless peek $survey
-  $survey = read("big.log")
+unless peek survey
+  survey = read("big.log")
 ```
 
 For caching across turns, prefer `memo`; `peek` is the in-flow conditional check.
@@ -57,7 +61,7 @@ For caching across turns, prefer `memo`; `peek` is the in-flow conditional check
 ## `await` — suspend until an event
 
 ```flux
-await $push = "github.push"
+await push = "github.push"
 ```
 
 The binding is optional — `await "webhook"` suspends without naming the received value.
@@ -83,8 +87,7 @@ the caller's reply resumes the flow).
 Where the flow *does* want model judgment, it delegates a bounded segment:
 
 ```flux
-$slot = ai_segment({goal: "Find a free 30-minute slot the caller accepts",
-                    tools: ["calendar.read"], max_rounds: 3, until: "slot"})
+slot = ai_segment(goal: "Find a free 30-minute slot the caller accepts", max_rounds: 3, tools: ["calendar.read"], until: "slot")
 ```
 
 `ai_segment(goal, tools, max_rounds, until?)` starts a bounded native-schema stage, confined to
@@ -101,24 +104,29 @@ checkpoint "phase-1"
 
 A top-level marker (like `await`) for long or resumable flows. The first time a run reaches
 it, the position is recorded durably. A later re-run of the *same* flow in the *same* session
-fast-forwards past the already-completed prefix: its symbols are still durably bound and its
-side effects are not repeated — execution continues from the checkpoint. The label names the
-phase it closes and must be a non-empty literal.
+fast-forwards past the already-completed prefix: its symbols are still durably bound and its side
+effects are not repeated — execution continues from the checkpoint. Editing the flow changes its
+body hash, so a changed flow does not inherit a stale resume cursor. The label names the phase in the
+event log and must be a non-empty literal; it is not the resume key.
 
-## `once` — at-most-once side effects
+## `once` — deduplicate completed effects
 
-An effect-level `memo`. The explicit label is an idempotency key: the first time the body runs
-**to success**, its result is recorded durably; later re-runs in the same session skip the
-body and reuse the stored result. A failed body records nothing and is retried.
+An effect-level `memo`. The first time a labeled body runs **to success**, its result is recorded
+durably; later re-runs of that same labeled body in the session skip it and reuse the stored result.
+A failed body records nothing and is retried. Body identity is part of the key, so two different
+bodies may share a human label without suppressing one another.
 
 ```flux
 once "send-welcome"
-  send_email($welcome_msg)
+  send_email(welcome_msg)
 ```
 
-This is the guard for "never fire twice" effects — sending an email, charging a card — under
-re-execution, retries, or checkpoint fast-forwards. An optional `-> $bind` on the header names
-the stored result (`once "charge" -> $receipt`). The label must be a non-empty literal.
+`once` is not a transaction with the external system. If an effect succeeds and the process crashes
+before the runtime appends `OnceCompleted`, the next run sees no completion record and executes the
+body again. Its crash window is therefore **at least once**, even though every recorded completion is
+deduplicated on later runs. For a strict no-duplicate requirement such as charging a card, also use
+the external operation's idempotency key or transactional guarantee. An optional `-> result` on the
+header names the stored result (`once "charge" -> receipt`). The label must be a non-empty literal.
 
 ## `scope` — guaranteed cleanup
 
@@ -127,13 +135,13 @@ the resource), then run `body`; `finally` **always** runs afterward — on norma
 early `return`, or an error.
 
 ```flux
-scope $h = lock.get("deploy")
+scope h = lock.get("deploy")
   deploy()
 finally
-  lock.release($h)
+  lock.release(h)
 ```
 
-The `$bind = <acquire>` part of the header is optional — a bare `scope` still guarantees its
+The `resource = <acquire>` part of the header is optional — a bare `scope` still guarantees its
 `finally` block runs.
 
 - The body's result, `return`, or error propagates after `finally` runs.
@@ -172,12 +180,12 @@ saga
 | Skip recomputation within a flow | `peek` + `unless` |
 | Wait for external input mid-flow | `await` |
 | Resume a long flow without repeating work | `checkpoint` |
-| Guarantee an effect fires at most once | `once` |
+| Deduplicate an effect after its completion is recorded | `once` |
 | Guarantee cleanup on every exit path | `scope` |
 | Roll back completed external effects on failure | `saga` |
 
-These compose: a long flow checkpoints between phases, wraps irreversible effects in `once`,
-and guards resources with `scope` — and every op inside still crosses the
+These compose: a long flow checkpoints between phases, uses `once` to deduplicate recorded
+completions, and guards resources with `scope` — and every op inside still crosses the
 [safety envelope](../agent/safety.md).
 
 ## Related docs

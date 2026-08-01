@@ -28,6 +28,22 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+fn normalized_prose(source: &str) -> String {
+    source
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -49,17 +65,162 @@ fn markdown_files(root: &Path) -> Vec<PathBuf> {
     files_with_extension(root, "md")
 }
 
-fn fenced_blocks<'a>(markdown: &'a str, language: &str) -> Vec<&'a str> {
-    let open = format!("```{language}\n");
-    let mut rest = markdown;
+fn fenced_blocks(markdown: &str, language: &str) -> Vec<String> {
     let mut blocks = Vec::new();
-    while let Some(start) = rest.find(&open) {
-        rest = &rest[start + open.len()..];
-        let end = rest.find("\n```").expect("closed markdown code fence");
-        blocks.push(&rest[..end]);
-        rest = &rest[end + 4..];
+    let mut open: Option<(usize, usize, Vec<String>)> = None;
+
+    for line in markdown.lines() {
+        if let Some((indent, ticks, body)) = &mut open {
+            let (line_indent, rest) = split_markdown_indent(line);
+            let close_ticks = rest.bytes().take_while(|byte| *byte == b'`').count();
+            if line_indent == *indent
+                && close_ticks >= *ticks
+                && rest[close_ticks..].trim().is_empty()
+            {
+                blocks.push(body.join("\n"));
+                open = None;
+                continue;
+            }
+
+            body.push(strip_markdown_indent(line, *indent).to_string());
+            continue;
+        }
+
+        let (indent, rest) = split_markdown_indent(line);
+        if indent > 3 {
+            continue;
+        }
+        let ticks = rest.bytes().take_while(|byte| *byte == b'`').count();
+        if ticks >= 3 && rest[ticks..].trim() == language {
+            open = Some((indent, ticks, Vec::new()));
+        }
     }
+
+    assert!(open.is_none(), "closed markdown `{language}` code fence");
     blocks
+}
+
+fn split_markdown_indent(line: &str) -> (usize, &str) {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    (indent, &line[indent..])
+}
+
+fn strip_markdown_indent(line: &str, width: usize) -> &str {
+    let present = line
+        .bytes()
+        .take(width)
+        .take_while(|byte| *byte == b' ')
+        .count();
+    &line[present..]
+}
+
+#[test]
+fn fenced_block_scanner_handles_commonmark_indentation() {
+    let markdown = r#"1. Nested example:
+
+   ```flux
+   flow nested
+     return "ok"
+   ```
+
+Outside the list.
+
+```flux
+flow root
+  return "ok"
+```
+"#;
+
+    assert_eq!(
+        fenced_blocks(markdown, "flux"),
+        ["flow nested\n  return \"ok\"", "flow root\n  return \"ok\"",]
+    );
+}
+
+fn significant_flux_tokens(source: &str) -> Vec<String> {
+    use flux_lang::syntax::SyntaxKind;
+
+    let parsed = flux_lang::parser::parse_cst(source);
+    assert!(
+        parsed.errors.is_empty(),
+        "tokenize strictly parsed Flux source: {:?}",
+        parsed.errors
+    );
+    parsed
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| {
+            !matches!(
+                token.kind(),
+                SyntaxKind::WHITESPACE
+                    | SyntaxKind::COMMENT
+                    | SyntaxKind::NEWLINE
+                    | SyntaxKind::INDENT
+                    | SyntaxKind::DEDENT
+            )
+        })
+        .filter(|token| !token.text().is_empty())
+        .map(|token| token.text().to_string())
+        .collect()
+}
+
+fn is_complete_flux_module(source: &str) -> bool {
+    const DECLARATIONS: &[&str] = &[
+        "permissions",
+        "agent_loop ",
+        "agent ",
+        "channel ",
+        "datasource ",
+        "flow ",
+        "journey ",
+        "op ",
+        "trigger ",
+    ];
+
+    source.lines().any(|line| {
+        line.len() == line.trim_start().len()
+            && DECLARATIONS
+                .iter()
+                .any(|declaration| line.starts_with(declaration))
+    })
+}
+
+fn as_parseable_flux_module(source: &str) -> String {
+    let source = format!("{}\n", source.trim_end());
+    if is_complete_flux_module(&source) {
+        return source;
+    }
+
+    let mut wrapped = String::from("flow __website_fragment\n");
+    let mut in_multiline_string = false;
+    for line in source.lines() {
+        // The wrapper is test scaffolding, not published source. Keep blank lines genuinely blank
+        // and preserve triple-quoted content byte-for-byte instead of injecting indentation that
+        // changes the literal's value. Otherwise correctly formatted fragments fail because of
+        // whitespace invented by this helper rather than by the documentation.
+        if !line.is_empty() && !in_multiline_string {
+            wrapped.push_str("  ");
+        }
+        wrapped.push_str(line);
+        wrapped.push('\n');
+        if line.matches("\"\"\"").count() % 2 == 1 {
+            in_multiline_string = !in_multiline_string;
+        }
+    }
+    wrapped
+}
+
+fn javascript_template_constant(source: &str, name: &str) -> String {
+    let marker = format!("const {name} = `");
+    source
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("JavaScript source declares `{name}` as a template constant"))
+        .1
+        .split_once("`;")
+        .unwrap_or_else(|| panic!("JavaScript template constant `{name}` is terminated"))
+        .0
+        .to_string()
 }
 
 fn test_dir(label: &str) -> PathBuf {
@@ -210,38 +371,51 @@ fn cli_reference_covers_every_public_subcommand() {
 #[test]
 fn tui_page_documents_the_bound_keys_and_themes() {
     let tui_src = read("crates/flux-tui/src/lib.rs");
-    let help_table = tui_src
-        .split_once("const HELP_KEYS:")
-        .expect("HELP_KEYS table")
-        .1
-        .split_once("];")
-        .expect("terminated HELP_KEYS table")
-        .0;
+    let syntax = syn::parse_file(&tui_src).expect("parse flux-tui source");
+    let help_table = syntax
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Const(item) if item.ident == "HELP_KEYS" => Some(item.expr.as_ref()),
+            _ => None,
+        })
+        .expect("HELP_KEYS table");
+
+    fn peel(expr: &syn::Expr) -> &syn::Expr {
+        match expr {
+            syn::Expr::Group(group) => peel(&group.expr),
+            syn::Expr::Paren(paren) => peel(&paren.expr),
+            syn::Expr::Reference(reference) => peel(&reference.expr),
+            _ => expr,
+        }
+    }
+
+    let entries = match peel(help_table) {
+        syn::Expr::Array(array) => &array.elems,
+        _ => panic!("HELP_KEYS must be an array reference"),
+    };
 
     // The chord spellings out of the overlay table, minus the prose glosses. Each entry may list
     // alternatives ("Ctrl-J / Alt-↵ / Shift-↵"); requiring the first is enough to prove the
     // binding is on the page, without pinning the page to the overlay's exact typography.
-    let mut chords: Vec<String> = Vec::new();
-    for (idx, _) in help_table.match_indices("        (\"") {
-        let after = &help_table[idx + "        (\"".len()..];
-        let literal = after.split('"').next().expect("terminated chord literal");
-        if let Some(first) = literal.split('/').next() {
-            let first = first.trim();
-            if !first.is_empty() {
-                chords.push(first.to_string());
-            }
-        }
-    }
-    for (idx, _) in help_table.match_indices("    (\"") {
-        let after = &help_table[idx + "    (\"".len()..];
-        let literal = after.split('"').next().expect("terminated chord literal");
-        if let Some(first) = literal.split('/').next() {
-            let first = first.trim();
-            if !first.is_empty() && !chords.iter().any(|c| c == first) {
-                chords.push(first.to_string());
-            }
-        }
-    }
+    let chords: Vec<String> = entries
+        .iter()
+        .map(|entry| match peel(entry) {
+            syn::Expr::Tuple(tuple) => tuple.elems.first().expect("HELP_KEYS tuple chord"),
+            _ => panic!("HELP_KEYS entry must be a tuple"),
+        })
+        .map(|chord| match peel(chord) {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(literal),
+                ..
+            }) => literal.value(),
+            _ => panic!("HELP_KEYS chord must be a string literal"),
+        })
+        .filter_map(|literal| {
+            let first = literal.split('/').next()?.trim();
+            (!first.is_empty()).then(|| first.to_string())
+        })
+        .collect();
     assert!(
         chords.len() >= 10,
         "expected to recover the F1 overlay's chords, found {chords:?}"
@@ -332,6 +506,59 @@ fn http_api_reference_covers_every_served_route() {
             "website/docs/agent/http-api.md omits the served route `{path}`"
         );
     }
+}
+
+/// The channel inventory is a public mirror of the production dispatcher, not a hand-maintained
+/// count. Reading the accepted string literals from `build_channels` means adding an adapter or an
+/// alias makes the docs gate fail in the same change, including host-built kinds such as `a2a` and
+/// the host-served `cli` kind whose match arms deliberately do not construct a background task.
+#[test]
+fn public_channel_inventory_covers_every_registered_kind() {
+    let adapters = read("crates/flux-channels/src/adapters/mod.rs");
+    let dispatcher = adapters
+        .split_once("match d.kind.as_str() {")
+        .expect("channel-kind dispatcher")
+        .1
+        .split_once("other => anyhow::bail!")
+        .expect("unknown-kind arm")
+        .0;
+
+    let mut kinds = Vec::new();
+    for arm in dispatcher.lines().filter_map(|line| line.split_once("=>")) {
+        let patterns = arm.0;
+        let mut rest = patterns;
+        while let Some(start) = rest.find('"') {
+            rest = &rest[start + 1..];
+            let end = rest.find('"').expect("terminated channel-kind literal");
+            kinds.push(rest[..end].to_string());
+            rest = &rest[end + 1..];
+        }
+    }
+    kinds.sort();
+    kinds.dedup();
+    assert!(
+        kinds.len() >= 9,
+        "expected every production channel kind and alias, recovered {kinds:?}"
+    );
+
+    let inventory = read("website/docs/channels/inventory.md");
+    let table = inventory
+        .split_once("## At a glance")
+        .expect("channel inventory summary")
+        .1
+        .split_once("Every kind's `settings`")
+        .expect("end of channel inventory table")
+        .0;
+    let missing: Vec<&String> = kinds
+        .iter()
+        .filter(|kind| !table.contains(&format!("`{kind}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "website/docs/channels/inventory.md omits {} production channel kind(s) or aliases from \
+         its at-a-glance table: {missing:?}",
+        missing.len()
+    );
 }
 
 #[test]
@@ -598,7 +825,7 @@ fn public_config_examples_deserialize_and_have_effect() {
     ] {
         let markdown = read(rel);
         for (index, block) in fenced_blocks(&markdown, "toml").into_iter().enumerate() {
-            let cfg: flux_config::Config = toml::from_str(block)
+            let cfg: flux_config::Config = toml::from_str(&block)
                 .unwrap_or_else(|e| panic!("{rel} TOML block {}: {e}", index + 1));
             if block.contains("[private_net]") {
                 assert!(
@@ -662,7 +889,7 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
                     && declarations.iter().any(|decl| line.starts_with(decl))
             });
             if complete {
-                flux_lang::parse::parse_program(block)
+                flux_lang::parse::parse_program(&block)
                     .unwrap_or_else(|e| panic!("{} Flux block {}: {e}", path.display(), index + 1));
                 checked += 1;
             }
@@ -672,6 +899,214 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
         checked >= 25,
         "expected a representative Flux example corpus"
     );
+}
+
+/// Public Flux examples are source, including the short body fragments that omit only their flow
+/// header. Parse every `flux` fence across the complete public documentation corpus with the real
+/// module parser, wrap fragments in a throwaway flow, and require both formatter contracts: the
+/// lossless CST formatter must have no whitespace edit, and a bare flow's significant tokens must
+/// already match the semantic formatter's canonical projection. Shell, Rust, JSON, and other fences
+/// never enter this scan.
+#[test]
+fn public_flux_examples_are_canonical_formatter_fixed_points() {
+    let docs_root = repo_path("website/docs");
+    let mut checked = 0;
+    for path in markdown_files(&docs_root) {
+        let markdown = fs::read_to_string(&path).expect("read website doc");
+        for (index, block) in fenced_blocks(&markdown, "flux").into_iter().enumerate() {
+            let source = as_parseable_flux_module(&block);
+            let module = flux_lang::parse::parse_program(&source).unwrap_or_else(|e| {
+                panic!(
+                    "{} Flux block {} is neither a valid module nor a valid flow-body fragment: \
+                     {e}",
+                    path.display(),
+                    index + 1
+                )
+            });
+
+            if let Some(formatted) = flux_lang::format_cst::format_source(&source) {
+                panic!(
+                    "{} Flux block {} is not a CST-formatter fixed point. Canonical source:\n{}",
+                    path.display(),
+                    index + 1,
+                    formatted
+                );
+            }
+
+            match module {
+                flux_lang::program::Module::Flow(ast) => {
+                    let canonical = flux_lang::format::format(&ast);
+                    assert_eq!(
+                        significant_flux_tokens(&source),
+                        significant_flux_tokens(&canonical),
+                        "{} Flux block {} uses an accepted compatibility spelling instead of the \
+                         semantic formatter's canonical syntax. Canonical source:\n{}",
+                        path.display(),
+                        index + 1,
+                        canonical
+                    );
+                }
+                flux_lang::program::Module::Program(_) => {
+                    // The semantic formatter intentionally formats one DraftAst rather than a
+                    // declaration module (which would reorder authored declarations). Its two most
+                    // pervasive compatibility spellings remain unambiguous at the lossless-token
+                    // layer, so keep them out of the few multi-declaration examples as well.
+                    let parsed = flux_lang::parser::parse_cst(&source);
+                    let tokens: Vec<_> = parsed
+                        .syntax()
+                        .descendants_with_tokens()
+                        .filter_map(|element| element.into_token())
+                        .filter(|token| {
+                            !matches!(
+                                token.kind(),
+                                flux_lang::syntax::SyntaxKind::WHITESPACE
+                                    | flux_lang::syntax::SyntaxKind::COMMENT
+                                    | flux_lang::syntax::SyntaxKind::NEWLINE
+                                    | flux_lang::syntax::SyntaxKind::INDENT
+                                    | flux_lang::syntax::SyntaxKind::DEDENT
+                            )
+                        })
+                        .collect();
+                    assert!(
+                        tokens
+                            .iter()
+                            .all(|token| token.kind() != flux_lang::syntax::SyntaxKind::VAR),
+                        "{} Flux block {} uses legacy `$` symbol spelling",
+                        path.display(),
+                        index + 1
+                    );
+                    assert!(
+                        !tokens.windows(2).any(|pair| {
+                            pair[0].kind() == flux_lang::syntax::SyntaxKind::L_PAREN
+                                && pair[1].kind() == flux_lang::syntax::SyntaxKind::L_BRACE
+                        }),
+                        "{} Flux block {} wraps named arguments in legacy object braces",
+                        path.display(),
+                        index + 1
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 120,
+        "expected the full public website example corpus, checked {checked} fences"
+    );
+}
+
+/// The homepage hero is public Flux source too, but it lives in JSX rather than a Markdown fence.
+/// Exercise it against the live built-in/cognition catalog so parser-only compatibility spellings
+/// and analyzer-invalid argument shapes cannot become the first example readers see.
+#[test]
+fn homepage_flux_example_is_canonical_and_analyzes_against_the_live_catalog() {
+    let homepage = read("website/src/pages/index.js");
+    let source = javascript_template_constant(&homepage, "HERO_FLOW");
+    let module = flux_lang::parse::parse_program(&source)
+        .unwrap_or_else(|e| panic!("homepage HERO_FLOW must parse: {e}"));
+    let flux_lang::program::Module::Flow(ast) = module else {
+        panic!("homepage HERO_FLOW must be one flow");
+    };
+
+    assert_eq!(
+        flux_lang::format_cst::format_source(&source),
+        None,
+        "homepage HERO_FLOW must be a CST-formatter fixed point"
+    );
+    let canonical = flux_lang::format::format(&ast);
+    assert_eq!(
+        significant_flux_tokens(&source),
+        significant_flux_tokens(&canonical),
+        "homepage HERO_FLOW uses a compatibility spelling; canonical source:\n{canonical}"
+    );
+
+    let mut registry = ToolRegistry::new();
+    flux_tools::register_builtins(&mut registry);
+    CognitionPack::new(Arc::new(NullProvider), "mock").register(&mut registry);
+    let catalog = flux_flow::registry::OpRegistry::new(&registry);
+    flux_lang::analyze::analyze_flow(&ast, &catalog, &std::collections::HashSet::new())
+        .unwrap_or_else(|diagnostics| {
+            panic!("homepage HERO_FLOW must analyze against the live catalog: {diagnostics:?}")
+        });
+
+    let concepts = read("website/docs/concepts.md");
+    assert!(
+        concepts.contains("symbols such as `src` or `tests`")
+            && !concepts.contains("symbols such as `$src` or `$tests`"),
+        "the Concepts symbol examples must use the formatter's canonical bare spelling"
+    );
+}
+
+/// The endpoint walkthrough is duplicated deliberately between the operator overview and the SQL
+/// plugin guide. Parse and analyze both copies with the published operation shapes: a formatter
+/// fixed point alone does not reject a positional value mixed with named arguments.
+#[test]
+fn public_endpoint_examples_analyze_as_named_multi_argument_calls() {
+    use flux_lang::opspec::{OpCatalog, OpSignature};
+
+    struct EndpointCatalog(Vec<OpSignature>);
+    impl OpCatalog for EndpointCatalog {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            self.0
+                .iter()
+                .find(|signature| signature.name == name)
+                .cloned()
+        }
+    }
+
+    let signature = |name: &str, schema: serde_json::Value| {
+        OpSignature::from_spec(&flux_spec::ToolSpec::read_only(
+            name,
+            "website contract",
+            schema,
+        ))
+    };
+    let catalog = EndpointCatalog(vec![
+        signature(
+            "endpoint.select",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }),
+        ),
+        signature(
+            "sql.query",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "endpoint": {"type": "object"},
+                    "endpoint_ref": {"type": "string"},
+                    "driver": {"type": "string"},
+                    "database": {"type": "string"},
+                    "timeout": {"type": "number"},
+                    "query": {"type": "string"},
+                    "max_rows": {"type": "integer"}
+                },
+                "required": ["query"]
+            }),
+        ),
+    ]);
+
+    for rel in [
+        "website/docs/agent/endpoints.md",
+        "website/docs/plugins/sql.md",
+    ] {
+        let markdown = read(rel);
+        let block = fenced_blocks(&markdown, "flux")
+            .into_iter()
+            .find(|block| block.contains("flow inspect-database"))
+            .unwrap_or_else(|| panic!("{rel} must contain the inspect-database flow"));
+        let module = flux_lang::parse::parse_program(&block)
+            .unwrap_or_else(|e| panic!("{rel} inspect-database flow must parse: {e}"));
+        let flux_lang::program::Module::Flow(ast) = module else {
+            panic!("{rel} inspect-database example must be one flow");
+        };
+        flux_lang::analyze::analyze_flow(&ast, &catalog, &std::collections::HashSet::new())
+            .unwrap_or_else(|diagnostics| {
+                panic!("{rel} inspect-database flow must analyze: {diagnostics:?}")
+            });
+    }
 }
 
 /// The syntax page must document the `"""` string form, and the form it documents must be real.
@@ -708,7 +1143,7 @@ fn syntax_page_documents_multiline_strings_and_the_examples_parse() {
                 .lines()
                 .any(|line| line.len() == line.trim_start().len() && line.starts_with("flow "));
             if complete {
-                flux_lang::parse::parse_program(block).unwrap_or_else(|e| {
+                flux_lang::parse::parse_program(&block).unwrap_or_else(|e| {
                     panic!(
                         "{} Flux block {}: multi-line-string example does not parse: {e}",
                         path.display(),
@@ -723,6 +1158,126 @@ fn syntax_page_documents_multiline_strings_and_the_examples_parse() {
         demonstrated >= 1,
         "no complete Flux example on the site demonstrates a `\"\"\"` string"
     );
+}
+
+/// First-reader surfaces must all describe the shipped authored outer loop, rather than reviving
+/// the removed per-turn model-to-Flux compiler story in one hero, metadata string, or generated LLM
+/// index. `op.register` is the deliberate narrow seam: one composite operation's source may be
+/// proposed, then the host analyzes, scopes, and gates its persistence like any other effect.
+#[test]
+fn public_runtime_story_matches_the_authored_loop_contract() {
+    let core_surfaces = [
+        "website/src/pages/index.js",
+        "website/docusaurus.config.js",
+        "website/plugins/llms-txt/index.js",
+        "website/docs/intro.md",
+        "website/docs/concepts.md",
+        "website/docs/infrastructure.md",
+        "website/docs/agent/agent-loop.md",
+        "website/docs/tutorial/first-agent.md",
+    ];
+    let retired_claims = [
+        "model compiles",
+        "llm compiles",
+        "compiler front-end",
+        "typed flux-lang plan",
+        "returns either prose or a typed flux-lang plan",
+        "planners emit this shape",
+        "asking a model to compile it again",
+    ];
+
+    for rel in core_surfaces {
+        let docs = read(rel);
+        // JS strings are often wrapped across adjacent literals; compare their prose words rather
+        // than making source layout part of the public architecture contract.
+        let lower = normalized_prose(&docs);
+        let present: Vec<&&str> = retired_claims
+            .iter()
+            .filter(|claim| lower.contains(**claim))
+            .collect();
+        assert!(
+            present.is_empty(),
+            "{rel} revives the retired per-turn model-generated Flux plan story: {present:?}"
+        );
+        assert!(
+            lower.contains("authored flux-lang") || lower.contains("authored flow"),
+            "{rel} must say that authored Flux-Lang owns control flow"
+        );
+        assert!(
+            lower.contains("provider-native") || lower.contains("native schemas"),
+            "{rel} must place model judgment inside provider-native typed stages/operation schemas"
+        );
+        assert!(
+            lower.contains("action batch"),
+            "{rel} must name the host-frozen action-batch boundary"
+        );
+    }
+
+    for rel in [
+        "website/docs/agent/saved-flows.md",
+        "website/docs/language/node-reference.md",
+    ] {
+        let source = read(rel);
+        // Node-kind prose is generated from AST doc comments and has its own guarded regeneration
+        // contract. This test owns the hand-written runtime preamble, not that generated block.
+        let hand_written = source
+            .split("<!-- BEGIN generated:node-kinds -->")
+            .next()
+            .expect("text before an optional generated node table");
+        let docs = normalized_prose(hand_written);
+        let present: Vec<&&str> = retired_claims
+            .iter()
+            .filter(|claim| docs.contains(**claim))
+            .collect();
+        assert!(
+            present.is_empty(),
+            "{rel} revives the retired per-turn model-generated Flux plan story: {present:?}"
+        );
+    }
+
+    let registration = read("website/docs/agent/saved-flows.md");
+    let registration_lower = normalized_prose(&registration);
+    for boundary in ["exactly one top-level", "analyz", "scope", "guarded"] {
+        assert!(
+            registration_lower.contains(boundary),
+            "website/docs/agent/saved-flows.md must document `{boundary}` as part of the explicit \
+             op.register seam"
+        );
+    }
+    assert!(
+        registration.contains("`op.register`") && registration_lower.contains("agent-proposed"),
+        "saved-flow guidance must identify op.register as the scoped seam for agent-proposed \
+         composite-operation source"
+    );
+
+    // The language and SDK entry points used to compress the default-loop rule into the absolute
+    // claim that models "never emit Flux". That erases the explicit op.register seam documented
+    // above. Keep both pages precise: no per-turn executable Flux in the default loop, but exactly
+    // one proposed composite operation may cross the analyzed/scoped/guarded registration boundary.
+    for rel in [
+        "website/docs/language/overview.md",
+        "website/docs/sdk/overview.md",
+    ] {
+        let source = read(rel);
+        let docs = normalized_prose(&source);
+        assert!(
+            docs.contains("default") && docs.contains("per-turn executable flux"),
+            "{rel} must scope the no-model-generated-Flux claim to the default per-turn loop"
+        );
+        assert!(
+            source.contains("`op.register`")
+                && docs.contains("exactly one")
+                && docs.contains("analyz")
+                && docs.contains("scope")
+                && docs.contains("guard"),
+            "{rel} must name the analyzed, scoped, guarded op.register exception"
+        );
+        assert!(
+            !docs.contains("models do not emit flux")
+                && !docs.contains("model never emits executable flux"),
+            "{rel} must not replace the qualified default-loop rule with an absolute claim"
+        );
+    }
 }
 
 #[test]
@@ -784,7 +1339,7 @@ async fn tutorial_flow_materializes_handbook_context_for_ai_reason() {
         .auto_approve(true)
         .build(provider, &root)
         .unwrap();
-    let ast = client.parse(flow).unwrap();
+    let ast = client.parse(&flow).unwrap();
     let mut inputs = serde_json::Map::new();
     inputs.insert(
         "question".into(),
@@ -825,7 +1380,7 @@ fn tutorial_app_declares_forced_scoped_retrieval() {
         .find(|block| block.contains("journey answer-question"))
         .expect("deterministic tutorial app fence");
     let flux_lang::program::Module::Program(program) =
-        flux_lang::parse::parse_program(source).expect("parse tutorial app")
+        flux_lang::parse::parse_program(&source).expect("parse tutorial app")
     else {
         panic!("tutorial app fence must be a Program")
     };
@@ -871,7 +1426,7 @@ async fn tutorial_owned_journey_searches_before_every_reasoning_call() {
         .find(|block| block.contains("journey answer-question"))
         .expect("deterministic tutorial app fence");
     let flux_lang::program::Module::Program(program) =
-        flux_lang::parse::parse_program(source).expect("parse tutorial app")
+        flux_lang::parse::parse_program(&source).expect("parse tutorial app")
     else {
         panic!("tutorial app fence must be a Program")
     };

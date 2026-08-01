@@ -1,6 +1,6 @@
 ---
 title: SQL plugin
-description: "Step-by-step setup for the sql plugin: install, configure a DSN, grant private-network egress, verify, and run bounded read-only queries."
+description: "Step-by-step setup for the SQL plugin: install, configure a DSN, grant private-network egress, verify, and run bounded read-only queries."
 ---
 
 # SQL plugin
@@ -22,26 +22,26 @@ flux plugin install sql
 ```
 
 This resolves the newest signed `plugins-v*` pack release, verifies the index signature and the
-archive's sha256, and unpacks the binary into the versioned store. Confirm it landed:
+archive's SHA-256, and unpacks the binary into the versioned store. Confirm it landed:
 
 ```bash
 flux plugin status sql
 ```
 
-```text
-sql              ~/.flux/plugins/bin/sql/0.1.2/flux-plugin-sql   v0.1.2  [ok]  [verified]
-    manifest:  v0.1.2  6 op(s)  ·  1 auth purpose(s)  ·  1 endpoint(s)  ·  1 datasource(s)  ·  caps: conn(2)
-    auth:      · password — not configured (env: SQL_PASSWORD, MYSQL_PASSWORD, or `flux auth set sql password`)
-    endpoint:  · sql.endpoint — not configured (env: SQL_DSN, SQL_URL)
-```
+`status` prints the installed version and operation total from the live manifest rather than from a
+fixed documentation snapshot. For setup, the stable declarations to check are the `password` auth
+purpose (`SQL_PASSWORD`, then `MYSQL_PASSWORD`), the `sql.endpoint` endpoint (`SQL_DSN`, then
+`SQL_URL`), and connection capabilities limited to the declared database ports.
 
-`caps: conn(2)` is the whole capability set: raw TCP to port 5432 and port 3306, and nothing else.
+Those connection entries are the whole capability set: raw TCP to port 5432 and port 3306, and
+nothing else.
 There is no `http`, no `process`, and — notably — no `secret(…)`. The plugin holds a credential
 *location*, never a value.
 
 ## 2. Configure the endpoint
 
-Two environment variables, both read by the **host**, never by the plugin:
+Configure the endpoint and password through environment variables read by the **host**, never by
+the plugin:
 
 | What | Env vars (first one set wins) | Read by |
 |---|---|---|
@@ -66,15 +66,16 @@ Re-run `flux plugin status sql` and both lines flip to `✓`:
     endpoint:  ✓ sql.endpoint — postgres://app@db.example.com:5432/warehouse (env $SQL_DSN)
 ```
 
-The status line also offers `flux auth set sql password` as an alternative. On this static-endpoint
-path the host resolves the handshake credential from the **declared environment keys only**, so use
-`SQL_PASSWORD` here; stored tokens apply to the plugins that authenticate over HTTP.
+On this static-endpoint path, the host resolves the handshake credential from the **declared
+environment keys only**. Stored plugin tokens are not consulted for `conn.authenticate`, so set
+`SQL_PASSWORD` or `MYSQL_PASSWORD` in the environment that starts Flux.
 
 The plugin never dials a URL it parsed. It asks the host to dial `sql.endpoint` *by name*; the host
 resolves the reference, applies the egress guard, opens the socket, speaks the PostgreSQL
-StartupMessage / SCRAM-SHA-256 (or MySQL Handshake v10) exchange, and returns a connection that is
-already authenticated. See [Plugin capability sandbox](../security/plugin-sandbox.md) for why this
-path exists and what it replaced.
+StartupMessage and SCRAM-SHA-256 or MD5 authentication (or MySQL Handshake v10), and returns a
+connection that is already authenticated. See
+[Plugin capability sandbox](../security/plugin-sandbox.md) for why this path exists and what it
+replaced.
 
 ## 3. Database on a private network? Grant egress
 
@@ -121,7 +122,8 @@ server's own authentication error, which tells you the wiring is fine and the cr
 
 ## 5. Query and introspect
 
-Six operations, all read-only. Every one accepts the shared connection fields
+The current manifest exposes the following read-only operations. Every one accepts the shared
+connection fields
 `{endpoint?, endpoint_ref?, driver?, database?, timeout?}` in addition to its own.
 
 | Operation | Own arguments | Returns |
@@ -167,8 +169,8 @@ at a read-only role anyway.
 
 ## 6. Dialects
 
-- **PostgreSQL** — the primary target; all six operations work. Only `sql.query` runs SQL you
-  supplied, behind the read-only statement guard above. The four introspection ops
+- **PostgreSQL** — the primary target; all listed operations work. Only `sql.query` runs SQL you
+  supplied, behind the read-only statement guard above. The introspection operations
   (`sql.database.list`, `sql.table.list`, `sql.table.show`, `sql.index.list`) run per-dialect SQL the
   plugin wrote, and `sql.test` runs `SELECT 1`.
 - **MySQL / MariaDB** — supported, with per-dialect introspection SQL. Note that
@@ -189,9 +191,9 @@ plugin such as [`kubernetes`](./kubernetes.md) returns a credential-free weak re
 
 ```flux
 flow inspect-database(endpoint_id: String)
-  $endpoint = endpoint.select($endpoint_id)
-  $rows = sql.query({endpoint: $endpoint, query: "SELECT current_database() AS name", max_rows: 1})
-  return $rows
+  selected = endpoint.select(endpoint_id)
+  rows = sql.query(endpoint: selected, max_rows: 1, query: "SELECT current_database() AS name")
+  return rows
 ```
 
 Pass the reference as the `endpoint` **object**. A bare `@endpoint/<id>` string in `endpoint_ref` is

@@ -1,28 +1,39 @@
 ---
 title: Infrastructure
-description: How flux separates planning from execution, routes every effect through one safety envelope, and keeps the Rust workspace strictly layered.
+description: How authored control flow, provider-native typed stages, action batches, and one safety envelope fit together.
 ---
 
 # Infrastructure
 
-flux is built around one boundary: **the LLM is not the runtime**. The model proposes a typed,
-readable Flux-Lang plan; deterministic Rust code decides what is allowed and performs the work.
+flux is built around one boundary: **the LLM is not the runtime**. Provider-native typed stages
+interpret intent and propose literal operation calls inside an authored Flux-Lang outer loop. The
+host freezes effects into action batches; deterministic Rust code decides what is allowed and
+performs the work.
 
-![flux architecture: the planner, deterministic runtime, safety envelope, guarded IO, providers, surfaces, three pillars, and strict crate layers](/img/architecture_v0.png)
+![Flux runtime architecture: surfaces enter an authored Flux-Lang loop, provider-native typed stages propose literal calls, the host freezes an action batch, and approved calls cross authorization, approval, and guarded IO](/img/runtime-architecture.svg)
 
-The diagram combines two views. The arrows show how a turn executes, while the bottom strip shows
-which workspace layers may depend on which others.
+The arrows show ownership during one conversational turn. The bottom strip shows the workspace's
+inward dependency direction, from user-facing surfaces to pure contracts.
 
 ## How a turn moves through the system
 
-1. A surface such as the CLI, TUI, SDK, or HTTP server assembles an agent and sends the request to
-   the flow engine.
-2. The model acts as a compiler front-end. Through a provider-neutral wire layer, it returns either
-   prose or a typed Flux-Lang plan.
-3. `flux-flow` analyzes and executes that plan. Every effectful plan node is dispatched through the
-   same runtime gateway; the model never calls filesystem, process, or network APIs directly.
-4. Results and evidence return to the session and become grounded feedback for the next pass through
-   the loop.
+1. A surface such as the CLI, TUI, SDK, or HTTP server assembles a `FlowEngine` around the authored
+   agent loop and sends it the request.
+2. A typed intent stage narrows the live, wired, permitted operation catalog. Provider-native
+   exploration then uses those operations' exact schemas: safe reads gather evidence through the
+   executor, while effectful calls are captured as literal `{op, input}` data.
+3. The host validates the captured inputs and freezes them into an immutable action batch. Approval
+   binds a one-shot receipt to that exact batch and its caller, session, policy, and authority.
+4. The executor consumes a matching receipt and sends each call through authorization, approval,
+   and guarded IO. Its execution report returns to the same native ledger, where the authored loop
+   can present the result, ask a question, or make a bounded correction.
+
+The default conversational loop never asks the model to produce per-turn executable Flux. Models
+supply bounded semantic judgment; authored Flux-Lang owns order, branches, iteration limits,
+suspension, approval, and stopping. [`op.register`](./agent/saved-flows.md#register-an-operation-during-a-turn)
+is the narrow exception for reusable vocabulary: it accepts exactly one agent-proposed composite
+operation, then the host analyzes it against the live catalog, applies its requested scope, and
+guards any persistent write. The registered operation's inner calls still cross the same envelope.
 
 ## One safety envelope
 
@@ -50,16 +61,17 @@ its own layer or a lower one, and `flux-codegate` enforces the rule in CI. The s
 and inner; user-facing surfaces, capabilities, and extensions cannot become alternate paths around
 the runtime.
 
-The same shared machinery supports flux's three co-equal pillars: the **Agent**, **Flux-Lang**, and
-the **Improvement loop**.
+This shared machinery underpins the **Agent**, **Flux-Lang**, and SDK. The experimental Improvement
+loop remains on hold and is documented under Direction rather than treated as a co-equal product
+pillar.
 
 ## Go deeper
 
-- [Concepts](./concepts.md) explains plans, symbols, evidence, and the agent loop.
+- [Concepts](./concepts.md) explains typed stages, symbols, evidence, and the authored agent loop.
 - [Safety & approvals](./agent/safety.md) describes policy, approval, and guarded IO in detail.
 - [OS process sandboxing](./security/os-sandbox.md) describes the opt-in bubblewrap/Seatbelt layer
   underneath the envelope.
-- [Flux-Lang execution model](./language/execution-model.md) follows a plan from analysis through
+- [Flux-Lang execution model](./language/execution-model.md) follows an authored flow from analysis through
   deterministic execution.
 - The repository's [contributor architecture](https://github.com/codewandler/flux/blob/main/docs/architecture.md)
   contains the complete crate map and implementation invariants.

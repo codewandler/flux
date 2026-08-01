@@ -5,7 +5,7 @@ description: "Attach indexed knowledge or an async live system of record to an e
 
 # Datasources
 
-The SDK supports two complementary datasource shapes:
+The SDK supports the complementary datasource shapes below:
 
 | | Indexed knowledge | Live system of record |
 |---|---|---|
@@ -52,9 +52,9 @@ assert!(client
 live backend therefore needs the SDK, but not a direct dependency on flux's internal capability
 crate.
 
-The trait itself is four methods — `schema()` and `access()` describe the backend once, at
-registration, and `list(ctx, entity, page, filters)` / `get(ctx, entity, id)` do the async work with
-already-validated arguments:
+The trait methods divide declaration from execution: `schema()` and `access()` describe the backend
+once at registration, while `list(ctx, entity, page, filters)` and `get(ctx, entity, id)` do the async
+work with already-validated arguments:
 
 ```rust
 #[async_trait]
@@ -67,7 +67,7 @@ pub trait LiveDatasource: Send + Sync {
 }
 ```
 
-Registration generates exactly two operations:
+Registration generates the operations below:
 
 - **`<domain>.list { entity, page?, limit?, filters? }`** validates the entity and filters, applies
   the entity's default/maximum page size, invokes the async backend, and returns compact rows plus
@@ -110,8 +110,8 @@ returned from registration precisely so a host cannot advertise the tools withou
 the evidence that makes them available. `FLUX_SURFACE_ALL` remains the explicit catalog-debug
 override; it does not widen authorization.
 
-The no-key reference implementation exercises two entities, typed filters, cursor paging, get,
-not-found, and real executor dispatch:
+The no-key reference implementation exercises ticket and customer entities, typed filters, cursor
+paging, get, not-found, and real executor dispatch:
 
 - [`examples/live_datasource.rs`](https://github.com/codewandler/flux/blob/main/crates/flux-sdk/examples/live_datasource.rs)
 - [`examples/support/live_datasource.rs`](https://github.com/codewandler/flux/blob/main/crates/flux-sdk/examples/support/live_datasource.rs)
@@ -132,8 +132,8 @@ Add the capabilities crate alongside the SDK — keep both on the same version, 
 cargo add codewandler-flux-sdk codewandler-flux-capabilities
 ```
 
-Build a backend, index documents, and attach the six retrieval operations through the fallible pack
-seam:
+Build a backend, index documents, and attach the indexed retrieval operations through the fallible
+pack seam:
 
 ```rust
 use std::sync::Arc;

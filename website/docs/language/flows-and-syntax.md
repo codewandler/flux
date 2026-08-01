@@ -16,21 +16,20 @@ A `.flux` file is a sequence of one or more named flow definitions. The `flow` h
 into a larger file.
 
 ```flux
-# single-flow file
 flow check-readme
-  $content = read("README.md")
-  return $content
+  content = read("README.md")
+  return content
 ```
 
 ```flux
 # multi-flow file (a module)
 flow fetch-and-grep
-  $hits = grep({pattern: "TODO", glob: "*.rs"})
-  return $hits
+  hits = grep(glob: "*.rs", pattern: "TODO")
+  return hits
 
 flow summarize(text: String) -> String
-  $summary = task({role: "summarizer", task: "Summarize:\n{text}"})
-  return $summary
+  summary = task(role: "summarizer", task: "Summarize:\n{text}")
+  return summary
 ```
 
 Each flow header starts at column 0. Blank lines and comments between flows are allowed. A file
@@ -65,13 +64,13 @@ semicolons; a block ends when the next non-blank line returns to the parent inde
 `else` sits at the same indent as its matching `when`:
 
 ```flux
-when $a
-  when $b
+when a
+  when b
     bash("both true")
   else
-    bash("a true, b false")   # else of the inner when
+    bash("a true, b false")
 else
-  bash("a false")             # else of the outer when
+  bash("a false")
 ```
 
 ## Comments
@@ -80,8 +79,7 @@ Line comments start with `#` and run to end of line. There are no block comments
 special meaning inside string literals.
 
 ```flux
-# a full-line comment
-$x = read("a.txt")   # an inline comment
+x = read("a.txt")
 ```
 
 ## Symbols
@@ -90,17 +88,26 @@ All runtime values live in named symbols (lowercase, underscores allowed). A sym
 
 ```flux
 flow read-notes
-  result = read("some/file.txt")   # bind: result now holds the file contents
-  return result                    # reference
+  result = read("some/file.txt")
+  return result
 ```
 
-The `$` sigil is an accepted **escape**, not a requirement. Write `$name` when the name collides with
-a contextual keyword, or when you prefer the older spelling — most examples on this site still use it
-and parse identically. The formatter emits the bare form for every name that can be spelled bare, so
-that is the canonical surface.
+The formatter emits the bare form for every name that can be spelled bare. Operator formulas are the
+exception: their embedded expression grammar uses `$name` to distinguish symbol reads from its own
+identifiers and function names.
 
-Symbols are immutable once bound on a single execution path; rebinding stores a new value.
-Parameters are declared without a sigil in the header and referenced the same way in the body.
+Each binding creates a new immutable value. Binding the same symbol name later updates which value
+that name resolves to; the earlier value remains in the session's versioned audit trail. Parameters
+are declared without a sigil in the header and referenced the same way in the body.
+
+For migration, the parser still accepts the older sigil and object-wrapped argument spellings. This
+is the only compatibility-form example in the language guide; format the file to obtain canonical
+source:
+
+```text
+# Compatibility spelling — accepted input, not canonical formatter output.
+$result = read({path: "README.md"})
+```
 
 ## Literals
 
@@ -130,8 +137,8 @@ Any string literal may embed `{symbol}` placeholders, substituted from bound sym
 evaluation time. Unbound names are left verbatim. Double the braces to emit a literal brace:
 
 ```flux
-$msg     = "built {sha} in {elapsed}ms"
-$example = "use {{key: value}} syntax"   # outputs: use {key: value} syntax
+msg = "built {sha} in {elapsed}ms"
+example = "use {{key: value}} syntax"
 ```
 
 ### Multi-line strings
@@ -143,16 +150,14 @@ escapes), no comment stripping (a `#` inside the block is content), and no inden
 
 ```flux
 flow review-diff -> String
-  $diff = git_diff()
-
-  $prompt = """Analyse this diff and suggest improvements.
+  diff = git_diff()
+  prompt = """Analyse this diff and suggest improvements.
 Focus on correctness, not style.
 
 Diff:
 {diff}"""
-
-  $notes = ai.reason({ask: $prompt})
-  return $notes
+  notes = ai.reason(ask: prompt)
+  return notes
 ```
 
 Its terminator is found by scanning for the next `"""` rather than by tracking indentation, so a
@@ -183,8 +188,8 @@ spelling.
 Both call forms are equivalent — inline `op(args)` and the statement form `do <op> <args>`:
 
 ```flux
-$hits = grep({pattern: "TODO", glob: "*.rs"})
-do git_status
+hits = grep(glob: "*.rs", pattern: "TODO")
+git_status()
 ```
 
 A bare call (no bind) runs the operation for its side effects; the result is discarded from
@@ -192,14 +197,13 @@ the symbol table but still appears in the run trace.
 
 ### Named arguments
 
-A multi-parameter operation takes **named arguments** — one object of parameter names, written either
-brace-free or braced. Both spellings lower to the same single object argument; the brace-free one is
-what the formatter emits, so it is canonical:
+A multi-parameter operation takes **named arguments**, written brace-free in text. They lower to one
+object node of parameter names in the AST:
 
 ```flux
 flow named-arguments
-  hits = grep(pattern: "ERROR", glob: "*.log", max_results: 50)
-  page = read({path: "large.txt", limit: 100, offset: 200})
+  hits = grep(glob: "*.log", max_results: 50, pattern: "ERROR")
+  page = read(limit: 100, offset: 200, path: "large.txt")
   src = read("README.md")
   return src
 ```
@@ -211,40 +215,39 @@ positional arguments is rejected by the analyzer: there is no positional convent
 
 ## Binds
 
-`$name = <expr>` stores a result. The expression may be a call, a pure node, a value template,
+`name = <expr>` stores a result. The expression may be a call, a pure node, a value template,
 another symbol, or a literal. An optional type annotation documents the expected type:
 
 ```flux
-$tests: TestResult = cargo_test({args: ["--workspace"]})
-$ok = $score >= 0.8
-$scaled = $base * 1.2
+tests: TestResult = cargo_test(args: ["--workspace"])
+ok = $score >= 0.8
+scaled = $base * 1.2
 ```
 
 Operator formulas in bind RHS positions lower to pure `expr` nodes. `$name` references become the
 `expr.vars` map automatically, and dotted `$issue.state` reads object fields leniently inside the
 formula. Annotations are preserved in the AST and used by analysis; they are optional everywhere.
 
-One bind variant is spelled differently: prefixing a bind with `memo` caches its value for the whole
-session, so the op does not re-execute on later turns. It takes the same optional type annotation
-and `@effect(tag)` line as an ordinary bind:
+One bind variant is spelled differently: prefixing a **call bind** with `memo` caches that operation
+and canonical argument AST for the session, so the same call does not re-execute on later turns.
+Changing the operation or arguments recomputes; non-call expressions use ordinary binds. `memo`
+takes the same optional type annotation and `@effect(tag)` line as an ordinary bind:
 
 ```flux
-memo $schema = read("schema.sql")
+memo schema = read("schema.sql")
 ```
 
 See [Durability](./durability.md#memo--compute-once-per-session) for when the cache is invalidated.
 
-## Native Conditions
+## Native conditions
 
 Condition positions accept the same native expression syntax:
 
 ```flux
 when $count > 3
   return "enough"
-
-repeat 10
-  until all({items: $checks, where: "it.status == 'ok'"})
-  do poll
+repeat 10, until: all(items: checks, where: "it.status == 'ok'")
+  poll()
 ```
 
 For structured arrays, prefer pure `map`/`filter` projection over an `each` loop when no per-item IO
@@ -253,15 +256,15 @@ sub-agents.
 
 ### Effect annotations
 
-An optional `@effect(tag)` line annotates the bind that follows it with a declared semantic
-effect, which drives risk scoring and approval:
+An optional `@effect(tag)` line annotates the bind that follows it with an additional declared
+semantic consequence. It feeds the analyzer's risk view but cannot replace or reduce the called
+operation's host-declared effects and dispatch-time approval contract:
 
 ```flux
 @effect(send_external)
-$report = generate_pdf($data)
-
+report = generate_pdf(data)
 @effect(delete)
-$gone = bash("rm -rf tmp/")
+gone = bash("rm -rf tmp/")
 ```
 
 Valid tags: `pure`, `read`, `model`, `network`, `write_file`, `write_db`, `send_external`,
@@ -271,18 +274,17 @@ Valid tags: `pure`, `read`, `model`, `network`, `write_file`, `write_db`, `send_
 ## return
 
 ```flux
-return $hits      # end the flow with a value
-return "done"     # literal return value
-return            # return null
+return hits
+return "done"
+return null
 ```
 
 `return` is an unconditional early exit from the **entire flow** — execution after it is
 unreachable. To exit conditionally, put the `return` inside a branch:
 
 ```flux
-when $done
-  return $result
-# reached only when $done was falsey
+when done
+  return result
 bash("continue working")
 ```
 
@@ -293,11 +295,12 @@ branch and return after the join instead.
 
 Every AST node kind has a native text spelling. The one-line `@json` escape — carrying a node's
 compact JSON form — remains for the rare *shapes* the text grammar cannot express: a symbol name
-that is not an identifier, a non-invertible `expr` formula, or a `jq` with a bracket path or
-non-symbol input:
+that is not an identifier, a non-invertible `expr` formula, or a `jq` AST whose path string itself
+uses brackets (native `items[0]` lowers to the canonical `.items.0` AST path) or whose input cannot
+use field-access sugar:
 
 ```flux
-@json {"kind": "bind", "name": "report.v2", "value": {"kind": "var", "name": "draft"}}
+@json { "kind": "bind", "name": "report.v2", "value": { "kind": "var", "name": "draft" } }
 ```
 
 Treat `@json` as an escape hatch, not a preferred style — a plan written natively round-trips

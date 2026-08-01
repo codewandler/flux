@@ -1,106 +1,93 @@
 ---
-title: Running Flux in a WebAssembly sandbox
-description: A proposed second execution substrate for Flux — compile the runtime to WebAssembly so a program submitted by someone else can be executed with no ambient authority at all.
+title: Portable WebAssembly runtime status
+description: What Flux's model-free WebAssembly core proves today, and which pieces of a production sandboxed runtime are still unbuilt.
 ---
 
-# Running Flux in a WebAssembly sandbox
+# Portable WebAssembly runtime status
 
-:::danger This is a direction, not a feature
-**Nothing on this page is implemented.** It is a published design record so the reasoning is
-reviewable before any code exists, and so nobody builds against it by accident. There is no Wasm
-build of Flux, no browser runtime, and no way to submit a program for sandboxed execution today.
-
-Tracked as epic **C-268** with stories C-269 – C-273. The full design record lives in the repository
-at [`docs/designs/portable-wasm-runtime.md`](https://github.com/codewandler/flux/blob/main/docs/designs/portable-wasm-runtime.md).
+:::info Status as of August 1, 2026
+The repository contains a working WebAssembly proof for the portable, model-free `flux-lang` core
+and enforces native/Wasm parity in CI. It does **not** contain a production sandboxed runtime for
+running submitted `.flux` programs.
 :::
 
-## The problem it addresses
+## What exists today
 
-Flux runs `.flux` on one substrate: a native process with the operating system's ambient authority,
-confined after the fact by an OS sandbox and by Flux's own authorization → approval → guarded-IO
-envelope. That is the right shape for a Flux **you** installed and trust.
+The [`flux_portable`
+example](https://github.com/codewandler/flux/blob/main/crates/flux-lang/examples/portable/wasm_abi.rs)
+compiles the `flux-lang` parser and reference interpreter to `wasm32-unknown-unknown`. Its small
+evaluation ABI accepts UTF-8 `.flux` source and returns a JSON result through three exports:
+`flux_alloc`, `flux_eval`, and `flux_dealloc`.
 
-It does not answer a different question: **what if the program came from someone else?** If a customer
-submits a `.flux` program for us to execute, that program is arbitrary code aimed at our capability
-set. The honest options today are "run it in a container we manage" or "don't".
+That module is deliberately model-free and host-free:
 
-## Why WebAssembly specifically
+- It evaluates the pure language fragment: values, expressions, formatting, field access,
+  constructors, and control flow.
+- Its operation catalog is empty. Model calls, filesystem access, process execution, network
+  access, and every other operation are refused.
+- It declares no Wasm imports, so this proof module receives no clock, filesystem, network,
+  process, model, or other ambient capability.
 
-A WebAssembly module starts with **no ambient authority at all**. No filesystem, no network, no
-process spawning, no clock — not "restricted", but absent, unless the embedder explicitly hands the
-module an import.
+The [`wasm_parity`
+test](https://github.com/codewandler/flux/blob/main/crates/flux-lang/tests/wasm_parity.rs) runs the
+same checked-in source through the same reference-interpreter core compiled once for the native host
+and once for Wasm. It checks for byte-identical results, verifies the Wasm import list is empty, and
+verifies that an operation call is refused on both targets. A dedicated
+[CI job](https://github.com/codewandler/flux/blob/main/.github/workflows/ci.yml) builds the module
+and requires those checks to run rather than silently skip when the artifact is absent.
 
-That is the same posture Flux's [plugin host](/docs/plugins/authoring) already takes on purpose:
-capabilities are deny-by-default and scoped to what a manifest declares. The difference is where the
-enforcement lives. For plugins, Flux constructs the restriction around a subprocess that *does* have
-its own authority. For a Wasm module, the runtime provides it, and there is nothing to construct.
+## Implementation boundary
 
-A second benefit is reach. The same module runs in a browser, in an edge worker, and in any embedder
-with a Wasm runtime — so running a Flux program would not require installing Flux.
+| Area | Current status |
+|---|---|
+| Portable `flux-lang` parser and reference interpreter | Implemented for a model-free language fragment. |
+| Native/Wasm parity check | Implemented and run in CI. |
+| `flux_flow::FlowEngine` in Wasm | Not built. The proof module contains the `flux-lang` reference interpreter, not the production agent engine. |
+| Guarded host-import ABI | Not built. The current module has an evaluation **export** ABI and zero host imports. |
+| Model calls and built-in operations | Not available. Every operation is denied. |
+| Fuel, memory, and wall-clock limits | Not built. The portable evaluator's poll ceiling is not an embedder resource limit. |
+| CLI, server, browser package, or API for submitted programs | Not built. The build script and module are a developer and CI proof, not a supported product surface. |
 
-## The design decision
+This distinction matters: native/Wasm parity proves that one model-free program has the same
+language result on both targets. It does not prove parity with `FlowEngine`, the tool dispatcher,
+approval handling, provider calls, or native session behavior.
 
-"Compile `.flux` to WebAssembly" can mean two things, and the design picks one:
+## Intended production boundary
 
-| | Generate a module per program | **Port the interpreter** (chosen) |
-|---|---|---|
-| Flux semantics | Re-implemented in a compiler backend | Reused exactly — one engine |
-| `retry`, `parallel`, budgets, approval | Must be regenerated correctly every time | Already correct, already tested |
-| Long-term risk | Two implementations that must agree forever | None by construction |
+The longer-term design keeps every security decision on the trusted host side of the sandbox:
 
-Flux's core claim is that the *runtime* decides what happens, not the program. A per-program compiler
-pushes those decisions into generated code, which points the wrong way. So the plan is to make the
-existing engine portable and feed it the parsed program — the parser and AST layer already performs no
-IO, which is the part that makes this plausible at all.
+> The guard runs outside the sandbox. The module never receives a raw capability.
 
-## The property that carries the security argument
+If host operations are added, they must be narrow, already-authorized imports. For example, the
+host would resolve and guard a named HTTP endpoint, pin the vetted address, and inject credentials;
+the module would never receive a general `fetch(url)` primitive or the credential itself. The same
+rule applies to files, processes, clocks, and model providers.
 
-> The guard runs **outside** the sandbox. The module never receives a raw capability.
+That host-import boundary is still design work. The current zero-import module demonstrates the
+starting posture but does not implement guarded capabilities.
 
-This is easy to get backwards, and getting it backwards produces something that looks safe and is not.
-If the embedder exports a general `fetch(url)` and the module is *expected* to call a safety check
-first, then a hostile program simply does not call it. The module controls its own control flow; a
-check it can skip is not a check.
+## What WebAssembly would not solve by itself
 
-So the imports a module receives are narrow, already-decided operations rather than primitives:
+Even after host imports exist, the embedder still has to enforce explicit limits and policy:
 
-- not `fetch(url)`, but a request against a named endpoint where the **host** resolves the endpoint,
-  applies the private-network egress guard, connects to the exact vetted address, and injects
-  credentials the module never sees
-- not `open(path)`, but scoped reads where both the permitted scope and the requested path are reduced
-  to their physical identity before being compared, so a symlink cannot leave the scope
-- a host-supplied clock, because an unrestricted clock is both a side channel and a fingerprint
+- **CPU, memory, and time:** a Wasm sandbox does not automatically stop an infinite computation or
+  allocation bomb. Fuel or epoch interruption, a memory ceiling, and a deadline remain required.
+- **Authorized exfiltration:** a destination grant can constrain where data goes, not what the
+  program sends there.
+- **Secret hygiene:** secrets stay protected only if the host never passes their raw values into
+  the module.
+- **Native-process confinement:** a future Wasm boundary would complement, not replace, Flux's OS
+  sandbox for native execution.
+- **Side channels:** timing and memory-growth observations remain outside this design.
 
-Credentials never cross the boundary. That is the same reasoning that lets Flux run plugins without
-exposing host secrets to them.
+## Reproducing the current proof
 
-## What the sandbox does not do
+For repository development, install the `wasm32-unknown-unknown` Rust target and run:
 
-Stated plainly, because this is where such designs usually stop being honest:
+```bash
+./scripts/build-portable-wasm.sh
+```
 
-- **It does not bound resources.** A module can loop forever or allocate until the embedder dies.
-  CPU, memory and wall-clock limits are the embedder's job and have to be built — they are not
-  inherited from the sandbox.
-- **It does not prevent authorized exfiltration.** If a program is granted access to a destination, it
-  can send whatever it holds there. The boundary constrains *which* destinations, never *what* is sent.
-- **It does not replace the OS sandbox.** For the Flux you run yourself, the existing fail-closed
-  requirement still applies. This is an additional inner boundary for untrusted programs — defence in
-  depth, not a substitute.
-- **It does not address side channels.** Timing and memory-growth observation are out of scope.
-
-## Open questions
-
-Genuinely undecided, and listed so the gaps are visible rather than implied:
-
-- **Would a first version run models at all?** A submitted program that calls an AI operation needs a
-  provider, and the credential has to stay on the host. A deliberately **model-free** first version —
-  deterministic authored flows only — is much smaller and much easier to defend, and covers most of the
-  submitted-program use case.
-- **Which flavour of WebAssembly**: a plain module with hand-written imports, or the Component Model
-  with typed, versioned interfaces.
-- **Determinism as a product.** A module plus a recorded set of import responses is a reproducible run,
-  which is close to what [the Time Machine](/docs/agent/time-machine) and the
-  [Agent Lab](/docs/sdk/agent-lab) already provide. Whether those unify is worth asking later.
-
-If you have a use case that depends on this, the design record in the repository is the place to argue
-with it while it is still cheap to change.
+The script builds the module and then runs the required native/Wasm parity tests. The full rationale
+and remaining architecture are recorded in the
+[portable runtime design](https://github.com/codewandler/flux/blob/main/docs/designs/portable-wasm-runtime.md).

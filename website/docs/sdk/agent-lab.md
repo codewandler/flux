@@ -1,40 +1,53 @@
 ---
 title: Agent Lab
-description: "Test, tune, and crash-proof an embedded agent against its own recorded runs: golden scenarios in cargo test, counterfactual what-ifs, and transparent resurrection."
+description: "Test and tune an embedded agent against recorded runs, then recover durable accepted work with an explicit at-least-once boundary."
 ---
 
 # Deterministic Agent Lab — test, tune, resurrect
 
-Because a flux run is a deterministic artifact — every accepted plan is canonical, re-parseable
-Flux-Lang text and every leaf-op result is a redacted cassette cell — flux is the only agent SDK
-where your agent is **testable**, **tunable against a frozen world**, and **crash-proof**. The
-Agent Lab is three doors on that one substrate:
+A recorded flux run contains canonical accepted-plan text, durable usage, and redacted cassette
+cells for leaf-op results. The accepted-plan terminology names the durable replay contract: on the
+adaptive loop, its Flux-Lang text is host-derived replay metadata, not control flow emitted by the
+model. The Agent Lab exposes three distinct uses of that substrate:
 
 | Door | Surface | What it buys you |
 |---|---|---|
-| **Test** | `flux_sdk::test::Scenario` (feature `test-kit`) | Record a run once, commit it, re-run the *real* agent offline in `cargo test` — $0, no key, no flakes |
+| **Test** | `flux_sdk::test::Scenario` (feature `test-kit`) | Replay the recorded plan offline, or use `check` to re-drive the current agent loop against the recorded model and op world |
 | **Tune** | `Session::what_if()` / `Client::what_if_over()` | Re-run a recorded session under exactly one changed variable, the rest of the world byte-frozen |
-| **Resurrect** | `Session::resurrect()` / `ClientBuilder::auto_resurrect` | Finish a crashed turn with zero model re-spend and no duplicate side effects |
+| **Resurrect** | `Session::resurrect()` / `ClientBuilder::auto_resurrect` | Finish an accepted durable plan without calling the model again; an effect can repeat if the process died before recording its result |
 
 All three build on the same recordings that power the [Time Machine](../agent/time-machine.md)
 verbs (`flux replay` / `fork` / `diff`) — the Lab doesn't replace them, it turns them into a
 product for embedders.
 
+### Replay and check are different tests
+
+| | `Scenario::replay` | `Scenario::check` |
+|---|---|---|
+| Runs the current agent loop? | No — re-executes the already accepted plan | Yes — starts the current loop with the recorded input |
+| Model behavior | Never calls a model | Serves matching requests from `model.jsonl`; a miss falls through to the configured provider and is counted in `model_live` |
+| Operation behavior | Serves every leaf result from the recorded cassette | Pins operation dispatches to the recorded world and halts on an off-tape request |
+| Best for | Plan/cassette integrity and assertions about the recorded run | Detecting whether prompt, model, tool, or loop changes alter behavior |
+| Offline guarantee | Fully offline | Offline only when every model request is covered (`model_live == 0`) |
+
 ## Test — golden scenarios in `cargo test`
 
-Every other agent SDK forces a choice between calling the live model in tests (nondeterministic,
-costs money, flaky) or hand-mocking it (you test your mocks, not your agent). flux persists the
-canonical plan and a redacted op cassette, so it alone can re-run the real agent offline and assert
-on *how it reasoned*.
+Replay validates the stored host-derived flow and recorded world without starting a new turn or
+calling the model. Use `check` when you want to exercise today's agent loop and compare its behavior
+with the golden.
 
-The test kit lives behind a default-off `test-kit` cargo feature, so the default build stays
-dependency-free:
+The test kit lives behind a default-off `test-kit` Cargo feature. Keep the feature on the SDK entry
+in `dev-dependencies`: ordinary production builds do not compile the test API or its extra `toml`
+dependency, while subsequent test commands are plain `cargo test`:
 
 ```bash
 cargo add --dev codewandler-flux-sdk --features test-kit
+cargo add --dev codewandler-flux-provider
+cargo add --dev tokio --features macros,rt-multi-thread
 ```
 
-**Record once**, against a live provider — this is the only step that spends money:
+**Record once**, normally against a live provider. Recording spends model tokens; later live
+`check` misses, judge updates, and `OffTape::Live` counterfactuals can spend too:
 
 ```rust
 use flux_sdk::test::Scenario;
@@ -43,16 +56,16 @@ use flux_sdk::test::Scenario;
 Scenario::record(&client, "triage the failing build", "tests/scenarios/triage").await?;
 ```
 
-**Replay forever**, offline. `replay` re-executes the recorded plans hermetically: no model call,
+**Replay offline.** `replay` re-executes the recorded plans hermetically: no model call,
 no live IO, side effects never re-fire. It is safe — and recommended — to run it under a deny-all
-approver and a provider that panics if called, which proves your test never touches the network:
+approver and the network-free `NullProvider`; replay never consults that provider:
 
 ```rust
 use flux_provider::NullProvider;
 use flux_sdk::{Client, test::Scenario};
 
 #[tokio::test]
-async fn triage_agent_stays_on_rails() -> anyhow::Result<()> {
+async fn triage_recording_stays_valid() -> Result<(), Box<dyn std::error::Error>> {
     // No auto_approve: the default approver denies everything. The provider is never called.
     let client = Client::builder().build(Box::new(NullProvider), ".")?;
 
@@ -61,22 +74,29 @@ async fn triage_agent_stays_on_rails() -> anyhow::Result<()> {
 
     outcome.assert_faithful();                     // zero divergence from the recording
     outcome.assert_plan_snapshot();                // canonical Flux-Lang vs plan.flux.snap
-    outcome.assert_calls(&["fs.read", "shell.exec"]);
-    outcome.assert_never_calls("fs.write");        // a safety property, not a transcript grep
+    outcome.assert_calls(&["read", "bash"]);
+    outcome.assert_never_calls("write");           // a property of the recorded accepted plan
     outcome.assert_text_contains("root cause");
-    outcome.assert_cost_under(0.01);               // replay is ~$0 by construction
+    outcome.assert_cost_under(0.05);                // prices usage captured by the recorded run
     Ok(())
 }
 ```
 
 `replay` takes the `&Client` because hermetic re-execution still needs the client's op catalog —
-and because the deny-all/never-called posture above *is* client configuration.
+and because the deny-all/network-free posture above *is* client configuration.
 
-A failing assertion doesn't dump an opaque transcript: it renders the canonical plan source plus a
-world diff, so the failure message tells you whether the *reasoning* changed or the *world* did.
+The replay itself spends $0. `assert_cost_under` is deliberately different: it prices the
+`CallUsage` stored by the original run, so it can enforce a production-cost budget without claiming
+that replay generated those tokens.
 
-`assert_never_calls` is the headline: "my agent never runs `shell.exec`" becomes a committed,
-offline regression test on the plan itself.
+A failing replay assertion renders the canonical plan and cassette-divergence detail. It tells you
+whether the recorded artifact can still be replayed faithfully; it cannot tell you whether today's
+agent loop would make the same calls and record the same host-derived flow, because replay never
+drives a new turn or calls the model. Use `check` for that question.
+
+`assert_never_calls` makes a precise statement about the committed run: for example, "this accepted
+plan never called `write`." Pair it with `check` if you also need to prove that current configuration
+still produces that plan.
 
 ### Fault injection
 
@@ -103,10 +123,11 @@ assert!(!report.plan_changed, "this config change altered the agent's plan");
 assert!(!report.left_world, "the re-run stepped off the recorded world");
 ```
 
-Recorded model calls are served from the fixture's model cassette (deterministic, $0); only a
-genuinely new model request falls through to your provider, and the report counts both
-(`model_served` / `model_live`). A `plan_changed` report is a reasoning regression; `left_world`
-means an op read something the recording can't explain — a world regression.
+Recorded model calls are served from the fixture's model cassette (deterministic, $0); a new request
+falls through to your configured provider, can incur cost, and is counted in `model_live`.
+`plan_changed` means the current loop produced different plan content; whether that is a regression
+is your policy decision. `left_world` means the re-drive requested or observed something the frozen
+operation world cannot explain. `Report::is_clean()` also requires `model_live == 0`.
 
 ### Re-baselining
 
@@ -114,12 +135,14 @@ When a change is intentional, re-baseline the same way you'd use `cargo insta`, 
 tool is needed:
 
 ```bash
-FLUX_GOLDEN=update cargo test --features test-kit
+FLUX_GOLDEN=update cargo test
 ```
 
-`FLUX_GOLDEN=update` rewrites `plan.flux.snap` from the new run, and lets `Scenario::record`
-overwrite an existing fixture (recording against a live client). Without it, snapshots fail loudly
-and `record` refuses to clobber a committed golden.
+For a replay assertion, `FLUX_GOLDEN=update` rewrites `plan.flux.snap` from the fixture's replayed
+plan; it does not make a model call. It also lets `Scenario::record` overwrite an existing fixture,
+and makes `Scenario::check` re-record the fixture through the live client. Those latter two paths can
+spend money. Without the variable, snapshots fail loudly and `record` refuses to clobber a committed
+golden.
 
 ### Judge assertions — grading text output
 
@@ -147,7 +170,7 @@ changes the hash. `FLUX_GOLDEN=update` records a fresh verdict against a live ju
 same re-baseline convention as everything else in this crate:
 
 ```bash
-FLUX_GOLDEN=update cargo test --features test-kit
+FLUX_GOLDEN=update cargo test
 ```
 
 `rubric.model` is always explicit — there is no default judge model, so no assertion can spend
@@ -258,10 +281,13 @@ let report = client.what_if_over(session_ids, spec).await?;
 
 ## Resurrect — transparent crash recovery
 
-Long-running agents get OOM-killed and redeployed mid-task. An LLM-as-runtime SDK re-calls the
-model on restart (re-spend, and a *different* plan) and re-fires side effects. flux has the plan as
-durable source, every completed op in the cassette, and a deterministic substrate — so an
-interrupted turn can simply be **finished**:
+Resurrection applies only after a plan was accepted and stored. It never calls the model again for
+that accepted plan. Its side-effect guarantee depends on the durable boundary: an eligible crash-tail
+op with a matching recorded cassette cell is not dispatched again, while an effect that happened
+before its cell was appended can run again. A crash before the runtime stores an accepted plan has
+nothing to resume and is reported as an error.
+
+With that boundary explicit, an interrupted accepted plan can be continued:
 
 ```rust
 let client = Client::builder()
@@ -294,24 +320,26 @@ if let Some(turn) = session.interrupted()? {
 }
 ```
 
-Resurrection re-parses the interrupted turn's accepted plan (no model call — the plan is durable
-source), fast-forwards every completed statement, serves every op with a recorded cassette cell
-from tape (its side effect does **not** re-fire), and runs only the crash tail live — through the
-real approval envelope, exactly like any live run. If a served cell's re-derived input hash doesn't
-match, resurrection stops with a loud divergence error rather than improvising.
+Resurrection re-parses the interrupted turn's accepted plan, fast-forwards completed statements,
+serves eligible ops with recorded cassette cells from tape, and runs the remaining crash tail live
+through the real approval envelope. If a served cell's re-derived input hash doesn't match,
+resurrection stops with a loud divergence error rather than improvising.
 
-### Exactly-once, honestly
+### The at-least-once boundary
 
-The guarantee mirrors Temporal's activity semantics, and is stated rather than hand-waved:
-**exactly-once for every op with a recorded cassette cell; at-least-once for an op interrupted
-during dispatch** — one whose side effect fired but whose process died before the cell was
-appended. That one op re-fires live on resume. Ops whose results were recorded never re-fire, and
-the model is never re-invoked for a plan that was already accepted.
+The common crash-tail guarantee mirrors Temporal's activity semantics: **a cassette-served op is not
+re-dispatched; an op interrupted during dispatch is at-least-once**. If its side effect fired but the
+process died before the cell was appended, it re-fires live on resume.
 
-## The CLI surface
+There is a wider conservative case. If the turn died before completing its first top-level statement,
+there is no statement boundary from which to anchor a safe cassette tail. Resurrection then runs the
+unanchored window live and reports `unanchored_cells`; more than one op can repeat. The model is still
+not re-invoked for the already accepted plan.
 
-The same doors are exposed through the CLI (the reference app built on the SDK), **shipping with
-the same release** as the SDK surfaces above:
+## The CLI replay surface
+
+The CLI exposes scenario recording and hermetic plan replay. `Scenario::check`, what-if tuning, and
+explicit resurrection reports remain SDK surfaces:
 
 ```bash
 flux record triage "triage the failing build"   # writes tests/scenarios/triage/ (live, once)
@@ -320,9 +348,11 @@ flux test                                       # replay every scenario offline:
 flux test triage --json                         # one scenario, machine-readable
 ```
 
-`--dir <DIR>` relocates the scenarios root (default `tests/scenarios`) for both commands, and
-`FLUX_GOLDEN=update flux test` re-baselines a fixture exactly as it does under `cargo test`.
-`flux test` with no fixtures at all is an error, not a green gate.
+`--dir <DIR>` relocates the scenarios root (default `tests/scenarios`) for both commands.
+`FLUX_GOLDEN=update flux test` rewrites `plan.flux.snap` from the same recorded plan; it does not
+re-drive the current loop or re-record the fixture. To replace the full recording intentionally, run
+`FLUX_GOLDEN=update flux record <name> "<prompt>"` with a live provider. `flux test` with no fixtures
+at all is an error, not a green gate.
 
 Fixtures are plain `Storage::dir` directories, and the Time Machine verbs gain a `--store <DIR>`
 flag to open them (and any other store directory) in place:
@@ -335,13 +365,13 @@ flux sessions --store ./agent-state             # interrupted turns are marked i
 
 `--store` is a global flag, so it may appear before or after the subcommand.
 
-Entering a session a crash killed mid-turn — a one-shot `flux run` turn, the interactive REPL, or the
-TUI, and on the SDK side `Session::send`/`send_with`/`stream`/`start_flow` — finishes that turn
-first, printing (or reporting, for the SDK) what was fast-forwarded, served from the cassette, and
-re-run live (`FLUX_AUTO_RESURRECT=0` opts out). `flux sessions` *flags* an interrupted session
-rather than resurrecting it — finishing a turn runs its live tail through the approval envelope,
-which must not be a side effect of asking what sessions exist. See the
-[CLI reference](../agent/cli.md) for the full flag surface.
+Entering a session killed after plan acceptance — through a one-shot `flux run` turn, the
+interactive REPL, or the TUI, and on the SDK side
+`Session::send`/`send_with`/`stream`/`start_flow` — attempts recovery first, reporting what was
+fast-forwarded, served from the cassette, and re-run live (`FLUX_AUTO_RESURRECT=0` opts out). The
+same at-least-once window described above applies. `flux sessions` only *flags* an interrupted
+session: finishing a turn can dispatch a live tail and must not be a side effect of listing sessions.
+See the [CLI reference](../agent/cli.md) for the full flag surface.
 
 ## Limits (v1)
 
@@ -351,10 +381,13 @@ which must not be a side effect of asking what sessions exist. See the
   checked, or resurrected — the same rule as the [Time Machine](../agent/time-machine.md#limits).
 - **Redactor parity matters.** Fixtures record redacted cells; the fixture pins its redaction
   marker so a drifted redactor config is a loud diagnostic, not a silent mismatch.
-- **This is not an eval service.** The Lab tests *your* agent, local-first, no telemetry, no
-  multi-model bake-offs or dashboards — test doubles are ordinary registered ops, not a mocking
-  framework. `Scenario::judge` is a narrow, per-fixture rubric assertion, not a corpus-wide eval
-  harness (the internal `flux-eval` crate covers that ground for flux's own benchmark loop).
+- **This is not an eval service.** Fixtures and ordinary replay stay in your selected local store,
+  and flux adds no telemetry. Recording, a `check` model-cassette miss, judge recording, or an
+  `OffTape::Live` run still sends the configured request data to your chosen model provider or live
+  operation, exactly as that explicit live action implies. There are no hosted dashboards or
+  multi-model bake-offs: `Scenario::judge` is a narrow per-fixture rubric assertion, not a
+  corpus-wide eval harness (the internal `flux-eval` crate covers that ground for flux's own
+  benchmark loop).
 
 ## Related docs
 

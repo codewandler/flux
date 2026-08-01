@@ -13,7 +13,7 @@ running so you can write the next message (or steer the current one) without wai
 ```bash
 flux tui                       # start in the current workspace
 flux tui -m opus               # pick a model for the session
-flux tui --yes                 # auto-approve every tool call (no approval sheet)
+flux tui --yes                 # auto-approve every admitted tool call (no approval sheet)
 flux tui -c                    # continue the most recent session
 ```
 
@@ -40,6 +40,7 @@ runs.
 | `PgUp` / `PgDn` | Scroll the transcript by a page. `PgDn` re-attaches follow mode when it reaches the bottom. |
 | Mouse wheel | Scroll the transcript three lines at a time. |
 | `Ctrl-End` | Jump to the latest activity and re-attach follow mode. |
+| `Ctrl-G` / `Ctrl-Shift-G` | Jump to the next / previous failed tool card. |
 | `Ctrl-E` | Expand/collapse tool and thinking details on **all** cards at once. |
 | `Shift-↑` / `Shift-↓` | Move the transcript entry focus. With an entry focused: `Enter` expands/collapses that one card, `y` copies the entry to the system clipboard, `Esc` clears the focus. |
 | `Ctrl-T` | Toggle mouse capture. With capture off, your terminal's native select-and-copy works again; wheel scrolling stops, `PgUp`/`PgDn` keep working, and the footer shows `mouse off (Ctrl-T)`. |
@@ -81,9 +82,9 @@ lazily on first use and cached for the session: it skips hidden entries, `target
 Pressing `Enter` while a turn is running does not interrupt it. The message goes onto a
 **steering queue** shared with the engine, and one of two things happens:
 
-- The adaptive loop drains the queue at the head of its next planner consultation and folds the
-  text into the running turn as attributed steering — no cancelled operations, no disturbed
-  approval prompt. The transcript records `↪ steering delivered: …`.
+- The adaptive loop drains the queue before the next consultation in its provider-native exploration
+  stage and folds the text into the running turn as attributed steering — no cancelled operations,
+  no disturbed approval prompt. The transcript records `↪ steering delivered: …`.
 - If the turn finishes first, the next queued message starts as its own turn.
 
 Consumption is the commit point: once the engine has drained an item you can no longer edit or
@@ -113,7 +114,8 @@ silently deny a batch.
 | `d` | Deny **with a reason** — type it, `Enter` sends the denial carrying the reason, `Esc` returns to the sheet with the approval still pending |
 | `↑` / `↓` | Scroll the sheet's subject list |
 
-`flux tui --yes` skips the sheet entirely and auto-approves. See
+`flux tui --yes` skips the sheet for admitted calls and auto-approves them within the active policy,
+app, and agent ceilings. See
 [Safety and approvals](./safety.md#approving-a-prompt) for what prompts and why.
 
 ## Slash commands
@@ -138,7 +140,7 @@ These are the TUI's built-ins. A command file discovered from `.flux/commands`, 
 | `/new` · `/clear` | Start a fresh session |
 | `/compact` | Compact older conversation history now |
 | `/queue` | Manage queued follow-ups (see [Queue and steering](#queue-and-steering)) |
-| `/quit` · `/exit` | Leave the TUI (a running turn finishes first) |
+| `/quit` · `/exit` | Clear queued follow-ups, cancel a running turn, then leave once cancellation finishes |
 
 While a turn is running, only the read-only commands (`/help`, `/tools`, `/evidence`, `/session`,
 `/sessions`, `/queue`, `/theme`, bare `/effort`) and `/quit` run — anything that mutates the session
@@ -175,12 +177,15 @@ too small to draw it.
   never drops you out of the session.
 
 `Ctrl-D` exits directly, but only from an idle session with an empty composer. `/quit` and
-`/exit` also leave; if a turn is running, it is cancelled and the TUI exits once it finishes.
+`/exit` have one meaning in every state: clear queued follow-ups, cancel a running turn, and leave
+once cancellation finishes.
 
-Sessions are durable, so leaving loses nothing — `flux tui -c`, `/resume <id>`, or the `/sessions`
-picker brings a conversation back. If a session was killed mid-turn, the next entry into it finishes
-the interrupted predecessor from its recorded plan before running new input; see
-[Crash recovery](./cli.md#crash-recovery-and-resurrection).
+Recorded conversation and accepted-plan progress are durable. The current composer draft and
+queued-but-unconsumed follow-ups are not: they live only in the TUI process and are discarded when
+you leave. `flux tui -c`, `/resume <id>`, or the `/sessions` picker restores the recorded session. If
+that session was killed after accepting a plan, the next entry attempts to finish the durable turn
+before running new input; an effect interrupted before its cassette record can run again. See
+[Crash recovery](./cli.md#crash-recovery-and-resurrection) for the boundary.
 
 ## Related docs
 

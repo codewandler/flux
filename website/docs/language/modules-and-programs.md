@@ -16,12 +16,12 @@ and comments between flows are allowed:
 
 ```flux
 flow fetch-and-grep
-  $hits = grep({pattern: "TODO", glob: "*.rs"})
-  return $hits
+  hits = grep(glob: "*.rs", pattern: "TODO")
+  return hits
 
 flow summarize(text: String) -> String
-  $summary = task({role: "summarizer", task: "Summarize:\n{text}"})
-  return $summary
+  summary = task(role: "summarizer", task: "Summarize:\n{text}")
+  return summary
 ```
 
 Because the `flow` header is always required, any single-flow snippet is valid in a multi-flow
@@ -41,13 +41,13 @@ op repo-health(path: String, prior: Ctx) -> Health
   effects [read, process, local_system]
   expose true
 
-  $status = git_status()
-  $tests = cargo_test({args: ["--workspace"]})
-  ctx $pack
+  status = git_status()
+  tests = cargo_test(args: ["--workspace"])
+  ctx pack
     purpose "repo-health"
     budget 8000
-    include $prior, $status, $tests
-  return {status: $status, tests: $tests}
+    include prior, status, tests
+  return { status, tests }
 ```
 
 The metadata lines, all optional:
@@ -103,11 +103,11 @@ adaptive preset.
 
 ```flux
 agent_loop triage
-  $intent = detect_intent()
-  $found  = explore({intent: $intent})
-  $ok     = approve_batch({batch: $found.batch})
-  $done   = execute_batch({batch: $found.batch, receipt: $ok})
-  return present_results({stage: $done})
+  intent = detect_intent()
+  found = explore(intent: intent)
+  ok = approve_batch(batch: found.batch)
+  done = execute_batch(batch: found.batch, receipt: ok)
+  return present_results(stage: done)
 
 agent responder
   model "sonnet"

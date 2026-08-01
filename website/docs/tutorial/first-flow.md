@@ -15,25 +15,24 @@ Create a file named `brief.flux` at the root of `flux-tutorial`:
 
 ```flux
 flow answer-handbook(question: String) -> String
-  $product = read("docs/product.md")
-  $policies = read("docs/policies.md")
-
-  ctx $handbook
+  product = read("docs/product.md")
+  policies = read("docs/policies.md")
+  ctx handbook
     purpose "answer a question from the Northstar handbook"
     budget 5000
-    include $product, $policies
-
-  $answer = ai.reason({ask: "Question: {question}\nAnswer only from the handbook. If the handbook does not say, say so.", ctx: $handbook})
-  return $answer
+    include product, policies
+  answer = ai.reason(ask: """Question: {question}
+Answer only from the handbook. If the handbook does not say, say so.""", ctx: handbook)
+  return answer
 ```
 
 Flux-Lang uses two-space indentation. The flow declares one required `String` input and a `String`
 result. Its body then makes every important boundary explicit:
 
-- `read(...)` is an operation; its result is stored in an immutable symbol such as `$product`.
-- `ctx $handbook` selects exactly which values the reasoning model may see and caps their combined
+- `read(...)` is an operation; its result is stored as an immutable value bound to `product`.
+- `ctx handbook` selects exactly which values the reasoning model may see and caps their combined
   materialized size. The pack retains the selected values themselves, labelled by symbol name — not
-  merely the names `$product` and `$policies`.
+  merely the names `product` and `policies`.
 - `ai.reason(...)` is the one model-backed step. The model receives the question and the context
   pack, not ambient access to your filesystem.
 - `return` makes the flow's result explicit.

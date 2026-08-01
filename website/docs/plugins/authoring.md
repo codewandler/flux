@@ -5,14 +5,14 @@ description: "Author a capability-scoped plugin: the manifest, the process lifec
 
 # Plugin authoring
 
-A plugin is a **subprocess binary** that speaks flux's framed `flux.plugin.v1` NDJSON protocol over
+A plugin is a **subprocess binary** that speaks Flux's framed `flux.plugin.v1` NDJSON protocol over
 stdin/stdout. It advertises a **manifest** — a name, a set of operations, and the capabilities, auth
-purposes, and endpoints it needs — and implements each operation. flux projects every declared
+purposes, and endpoints it needs — and implements each operation. Flux projects every declared
 operation as a policy-gated tool, so a plugin op traverses the same
 [safety envelope](../agent/safety.md) as a built-in: authorization, approval, guarded IO. There are
 no bypass paths.
 
-"Native" here means a Rust subprocess built on flux's own `host-kit` crate. Not an MCP bridge, not a
+"Native" here means a Rust subprocess built on Flux's own `host-kit` crate. Not an MCP bridge, not a
 wrapper that shells out to a vendor CLI of its own accord.
 
 This page is the public contract. The in-repo source guide is
@@ -29,19 +29,20 @@ own socket.
 
 Two consequences follow, and they are what makes the manifest meaningful:
 
-- **The process starts with a cleared environment.** flux spawns every plugin through its single
+- **The process starts with a cleared environment.** Flux spawns every plugin through its single
   guarded process path, which clears the environment and re-adds only a minimal non-secret
-  allow-list (`PATH`, `HOME`, `LANG`, `TERM`, `TZ`, `RUST_LOG`, …). A token in flux's own
+  allow-list (`PATH`, `HOME`, `LANG`, `TERM`, `TZ`, `RUST_LOG`, …). A token in Flux's own
   environment is simply not present in the plugin's, so `std::env` is not a route to it.
 - **Capabilities are deny-by-default.** A fresh host grants nothing; each callback is checked
   against what this plugin's manifest declared. Ask for nothing and you get nothing.
 
-That contract is enforced on the **host** side. The plugin binary itself is trusted, pinned native
+That contract is enforced on the **host** side. The plugin binary itself is trusted native
 code and is not OS-sandboxed by default — a malicious binary could issue direct syscalls rather than
 honoring the protocol. Vet a plugin like any other native dependency, and keep every privileged
 effect on a host callback so the gates below actually apply. Opt-in
-[OS process sandboxing](../security/os-sandbox.md) closes that remaining gap underneath the
-capability model.
+[OS process sandboxing](../security/os-sandbox.md) reduces that raw-syscall bypass risk underneath
+the capability model: it constrains writes, but v1 still permits filesystem reads and leaves
+networking open unless configuration or the CLI's unattended profile closes it.
 
 ## The manifest
 
@@ -98,7 +99,7 @@ What the host reads on the wire is the same thing as JSON:
 ```json
 {
   "name": "websearch",
-  "version": "0.1.2",
+  "version": "<plugin-version>",
   "capabilities": {
     "http": true,
     "http_hosts": ["api.tavily.com", "api.duckduckgo.com"],
@@ -131,14 +132,23 @@ counts, the capability flags, and whether each declared auth purpose and endpoin
    sources with three trust models, and `flux plugin ls` labels which one you have: the
    minisign-signed pack (`verified`), a local `--dir` scan of binaries you built yourself
    (`unverified (local)`), and a `--git` source build (`from-source (unverified)`). Only the signed
-   pack carries a per-archive checksum, and only it is re-checked at every spawn. See
+   pack verifies the archive and records the installed binary's SHA-256 for re-checking at every
+   spawn. See
    [Plugin trust & signing](../security/plugin-trust.md).
+   A Git-source install accepts `--tag`, `--rev`, or `--branch` (one at a time), plus `--bin` when
+   the repository has several plugin binaries. Flux resolves the commit and asks for confirmation
+   **before** running `cargo build --release --locked`, because building source is arbitrary code
+   execution. `FLUX_ALLOW_SOURCE_BUILD=1` is the explicit non-interactive consent signal. The
+   descriptor records URL + commit, not a signed-pack SHA-256.
 2. **Configure.** A plugin reads no config file at runtime. Configuration means "set the environment
    the *host* resolves on the plugin's behalf" — the declared secret env keys and endpoint URLs from
    the manifest, or a token stored once with `flux auth set <plugin> <purpose>`. If an endpoint
    resolves to a private or loopback address, the operator must additionally grant that plugin under
    `[private_net.plugins]` in `.flux/config.toml`; the grant is intersected with the manifest's own
    `private_hosts`.
+   Stored bearer tokens apply to ordinary auth-purpose resolution. A host-terminated
+   `conn.authenticate` handshake instead resolves the declared environment keys directly; the SQL
+   plugin's static password path is the reference example.
 3. **Call.** `flux plugin call <name> <op> '<json>'` for debugging and scripting, or let the agent
    path (`flux run`, the REPL, `flux app run`) discover installed plugins and project their
    operations as tools.
@@ -292,11 +302,14 @@ The plugin workspace is nested and excluded from the root gate, so build and tes
 
 ```bash
 cd plugins
-cargo build  -p flux-plugin-<name>
-cargo test   -p flux-plugin-<name>
-cargo clippy -p flux-plugin-<name> --all-targets -- -D warnings
-cargo fmt    -p flux-plugin-<name>
+cargo build  -p gitlab
+cargo test   -p gitlab
+cargo clippy -p gitlab --all-targets -- -D warnings
+cargo fmt    -p gitlab
 ```
+
+Replace `gitlab` with the plugin's Cargo **package** name. The executable is named
+`flux-plugin-<name>`, but that binary name is not the `cargo -p` selector.
 
 Guest binaries depend on the protocol SDK only —
 `flux-plugin = { default-features = false, features = ["guest"] }`, which `host-kit` already

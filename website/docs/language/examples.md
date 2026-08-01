@@ -1,12 +1,14 @@
 ---
 title: Examples
-description: A cookbook of complete, runnable Flux-Lang flows — from a two-line summarizer to a self-improvement loop.
+description: A cookbook of complete Flux-Lang flows plus clearly labeled illustrative case studies.
 ---
 
 # Examples
 
-These examples are complete flows you can paste into a `.flux` file and run with `flux flow run`.
-They are intentionally small: each one highlights one pattern before the final program-scale example.
+The first examples are complete, parser- and formatter-checked flows. You can paste one into a
+`.flux` file and run it once the named operations and any required provider or credentials are
+configured. Each stays small enough to highlight one pattern. The final two sections are explicitly
+illustrative case studies; their current blockers are stated where they appear.
 
 ## Read and summarize
 
@@ -14,13 +16,13 @@ One read, one budgeted context pack, one model call:
 
 ```flux
 flow summarize-readme
-  $src = read("README.md")
-  ctx $brief
+  src = read("README.md")
+  ctx brief
     purpose "summarize the project README"
     budget 6000
-    include $src
-  $summary = ai.reason({ask: "Summarize the project in five bullets.", ctx: $brief})
-  return $summary
+    include src
+  summary = ai.reason(ask: "Summarize the project in five bullets.", ctx: brief)
+  return summary
 ```
 
 ## Fetch, extract, format
@@ -29,10 +31,10 @@ Pure field access and formatting — no shell, no approval pauses:
 
 ```flux
 flow latest-release
-  $raw = web.fetch("https://api.github.com/repos/codewandler/flux/releases/latest")
-  $tag = $raw.tag_name
-  $msg = fmt("latest flux release: {tag}")
-  return { tag: $tag, message: $msg }
+  raw = web.fetch("https://api.github.com/repos/codewandler/flux/releases/latest")
+  tag = raw.tag_name
+  msg = fmt("latest flux release: {tag}")
+  return { message: msg, tag }
 ```
 
 ## Bounded routing
@@ -41,15 +43,15 @@ A selector picks among declared branches; the case set is fixed before anything 
 
 ```flux
 flow route-ticket(ticket: String)
-  route classify($ticket)
+  route classify(ticket)
     case "bug"
-      $queue = "engineering"
+      queue = "engineering"
     case "billing"
-      $queue = "finance"
+      queue = "finance"
     default
-      $queue = "support"
-  $msg = fmt("routed to {queue}")
-  return $msg
+      queue = "support"
+  msg = fmt("routed to {queue}")
+  return msg
 ```
 
 ## Resilient fetch
@@ -59,14 +61,14 @@ result wins:
 
 ```flux
 flow cached-page(url: String)
-  fallback -> $page
+  fallback -> page
     branch
-      $page = read("cache/page.html")
+      page = read("cache/page.html")
     branch
-      retry 3 backoff exponential delay 500 -> $page
-        web.fetch($url)
-  assert $page, "no cached copy and the fetch failed"
-  return $page
+      retry 3, backoff: exponential, delay: 500ms -> page
+        web.fetch(url)
+  assert page, "no cached copy and the fetch failed"
+  return page
 ```
 
 ## Fan out, then reason once
@@ -76,20 +78,18 @@ Independent reads run concurrently; one model call sees a budgeted pack of all t
 ```flux
 flow repo-survey
   parallel
-    branch $readme
-      $readme = read("README.md")
-    branch $todos
-      $todos = grep({pattern: "TODO", glob: "*.rs", max_results: 100})
-    branch $status
-      $status = git_status()
-
-  ctx $pack
+    branch readme
+      readme = read("README.md")
+    branch todos
+      todos = grep(glob: "*.rs", max_results: 100, pattern: "TODO")
+    branch status
+      status = git_status()
+  ctx pack
     purpose "assess repository state"
     budget 8000
-    include $readme, $todos, $status
-
-  $assessment = ai.reason({ask: "What needs attention first?", ctx: $pack})
-  return { assessment: $assessment, todos: $todos }
+    include readme, todos, status
+  assessment = ai.reason(ask: "What needs attention first?", ctx: pack)
+  return { assessment, todos }
 ```
 
 ## Poll until done
@@ -99,10 +99,9 @@ plugs straight into truthiness:
 
 ```flux
 flow wait-for-artifact
-  loop for 60000 every 2000 -> $found
-    until $found
-    $found = path_exists("target/release/flux")
-  assert $found, "artifact did not appear within 60s"
+  loop for 1m, every: 2s, until: found -> found
+    found = path_exists("target/release/flux")
+  assert found, "artifact did not appear within 60s"
   return "artifact ready"
 ```
 
@@ -112,71 +111,72 @@ flow wait-for-artifact
 
 ```flux
 flow rust-files(dirs: List<String>)
-  each $dir in $dirs -> flat $files
-    glob({pattern: "*.rs", path: $dir})
-  each $f in $files -> $stats
-    file_stat($f)
-  return { files: $files, stats: $stats }
+  each dir in dirs -> flat files
+    glob(path: dir, pattern: "*.rs")
+  each f in files -> stats
+    file_stat(f)
+  return { files, stats }
 ```
 
-## A real program: the improvement loop
+## Illustrative case study: the improvement loop
 
-An abridged version of the flow flux uses to improve itself — eval, mine pain points in
-parallel, implement candidates, keep what measures better, revert what does not:
+This abridged flow shows the shape of flux's improvement loop — evaluate, mine pain points in
+parallel, implement candidates, keep what measures better, and revert what does not. It is not
+runnable verbatim: `adapter: "local"` is a narrative placeholder rather than a shipped eval adapter,
+and the production flows include additional protected-path and audit steps omitted here. Use the
+checked-in flows linked below when running an improvement round.
 
 ```flux
 flow improve -> EvalReport
-  $baseline = eval_run({adapter: "local", dir: "suites", trials: 3})
-  $sessions = eval_sessions($baseline)
-  $digest   = sessions_digest($sessions)
-
+  baseline = eval_run(adapter: "local", dir: "suites", trials: 3)
+  sessions = eval_sessions(baseline)
+  digest = sessions_digest(sessions)
   parallel
-    branch $mined
-      $mined = painpoints_collect($sessions)
-    branch $reviewed
-      $reviewed = task({role: "reviewer", task: "Review these eval sessions for failure modes.\nSessions:\n{digest}\n\nReturn ONLY a JSON array of findings."})
+    branch mined
+      mined = painpoints_collect(sessions)
+    branch reviewed
+      reviewed = task(role: "reviewer", task: """Review these eval sessions for failure modes.
+Sessions:
+{digest}
 
-  $candidates = improvements_aggregate({mined: $mined, reviewed: $reviewed})
-
-  repeat 3
-    until $done
-    $tasks    = task({role: "planner", task: "Turn these candidates into AT MOST 2 tasks:\n{candidates}"})
-    $snapshot = git_snapshot()
-    change_implement({tasks: $tasks, limit: 2})
-    $gate     = gate_check()
-
-    when $gate
-      $candidate = eval_run({adapter: "local", dir: "suites", trials: 3})
-      when score_compare({baseline: $baseline, candidate: $candidate})
+Return ONLY a JSON array of findings.""")
+  candidates = improvements_aggregate(mined, reviewed)
+  repeat 3, until: done
+    tasks = task(role: "planner", task: """Turn these candidates into AT MOST 2 tasks:
+{candidates}""")
+    snapshot = git_snapshot()
+    change_implement(limit: 2, tasks)
+    gate = gate_check()
+    when gate
+      candidate = eval_run(adapter: "local", dir: "suites", trials: 3)
+      when score_compare(baseline, candidate)
         git_stage(["."])
         git_commit("improve: adopt candidate")
-        $baseline = eval_adopt($candidate)
+        baseline = eval_adopt(candidate)
       else
-        git_reset($snapshot)
+        git_reset(snapshot)
     else
-      git_reset($snapshot)
-
-    $done       = candidates_empty($candidates)
-    $candidates = candidates_advance($candidates)
-
-  return $baseline
+      git_reset(snapshot)
+    done = candidates_empty(candidates)
+    candidates = candidates_advance(candidates)
+  return baseline
 ```
 
 Everything here is ordinary language surface: `parallel` fan-out, a bounded `repeat` with an
 `until` guard, nested `when`/`else`, and every op — including the sub-agent `task` calls —
 crossing the safety envelope.
 
-## A third-party workflow: Zendesk triage
+## Blocked case study: Zendesk triage
 
 [`examples/zendesk.triage.flux`](https://github.com/codewandler/flux/blob/main/examples/zendesk.triage.flux)
 is a multi-flow module with four one-shot entrypoints. Authored control flow owns retry, concurrency,
 timeouts, context budgets, and fallback; the model only analyzes bounded ticket evidence.
 
-:::note These operations now come from a connector pack, and two gaps remain
+:::caution Not runnable against a live Zendesk account yet
 The `zendesk` plugin these flows called was removed before its first release. The operations are now
 served by flux-connectors' connector pack, which a host registers when it builds its client — and the
 operation names did not have to change, because the pack was authored to this flow's shape. The
-commands below still cannot reach a live account: the Zendesk connector declares no credential
+commands below are future invocation examples and currently cannot reach a live account: the Zendesk connector declares no credential
 address, and its `https://{subdomain}.zendesk.com` base URL is not yet resolved from config. Both
 refuse rather than sending a broken request. The module remains a worked example of the
 authored-control-flow shape, which is what this page is illustrating.
