@@ -19,16 +19,32 @@ what the `Redactor` can and cannot do.
 
 ## Why both halves are wrong today
 
-**flux undersells the connector path.** [C-312](C-312-connector-credential-boundary.md) asserts, with a
-test, that *"flux holds exactly ONE secret on this path — the deployment session bearer. A response
-carrying credential-shaped material is refused, not merely redacted."* The vendor credential never
-enters the process. That is the same property Anthropic's Vaults sells as its headline — *"the agent
-never sees the secret value"* — and flux says it only inside a story file.
+**flux undersells prevention — and a survey found it does this in THREE places, not one:**
+
+1. **The connector boundary** ([C-312](C-312-connector-credential-boundary.md)) — *"flux holds exactly
+   ONE secret on this path… a response carrying credential-shaped material is refused, not merely
+   redacted."* The vendor credential never enters the process.
+2. **`conn.authenticate` (D-31)** — for Postgres, **the host speaks the SCRAM handshake itself so the
+   plugin never receives the password at all** (`crates/flux-plugin/src/host.rs:986+`). That is
+   prevention by protocol, and it is a better story than any redaction claim.
+3. **`ResolvedEndpoint` has no `Serialize` impl at all** (`crates/flux-secret/src/endpoint.rs:145`) — a
+   **compile-time** guarantee that a materialized credential cannot be serialized toward the model,
+   while `EndpointRef` carries only a *location*.
+
+⚠ All three are the property Vaults sells as its headline — *"the agent never sees the secret value"* —
+and flux states them only in story files and module headers.
 
 **flux oversells the local path by omission.** `secret "NAME"` resolves to plaintext in process
-(`crates/flux-app/src/secrets.rs:35-41`) and relies on the `Redactor` afterwards. That is a real
-defence and a **containment** one, with a failure mode worth knowing: three shipped bugs, one of which
-([C-339](C-339-redaction-falls-back-to-the-unredacted-value.md)) failed **open**.
+(`crates/flux-app/src/secrets.rs:35-41`, substituted in place at `:52`) and relies on the `Redactor`
+afterwards. That is a real defence and a **containment** one, with a failure mode worth knowing: three
+shipped bugs, one of which ([C-339](C-339-redaction-falls-back-to-the-unredacted-value.md)) failed
+**open**.
+
+⚠ **And one gap is structural rather than a bug, already documented in the tree and nowhere a user
+looks**: `crates/flux-cli/src/export_cmd.rs:21-28` states that conversation `Message` text and
+`TurnSummary.user_input`/`answer` are written **with the raw prompt and no redactor in the path** — the
+only control for those fields is the shape-based pass at export time. That is exactly C-432's mechanism,
+and it is the single most important sentence for a user to read.
 
 ## Acceptance
 
@@ -42,8 +58,13 @@ defence and a **containment** one, with a failure mode worth knowing: three ship
 - [ ] ⚠ **No overclaiming.** *"Secrets are redacted from model-visible output"* is true and incomplete;
       unqualified, it invites the belief that pasting a key into a prompt is safe. The repo's register is
       `vision.md`'s — it calls a pillar *"currently aspirational, and this document says so honestly."*
-- [ ] Where flux is genuinely behind, say so and link the story — no destination scoping (C-459), no
-      rotation-without-restart or audit of use (C-460).
+- [ ] Where flux is genuinely behind, say so and link the story — no **destination** scoping (C-459;
+      ⚠ note flux *does* scope which secret may be *named*, via `http.request`'s `allowed_secrets` and
+      plugin `grants.secrets`), no rotation-without-restart, and audit of use covering exactly one hop
+      (C-460).
+- [ ] ⚠ The **documented, structural** exception is stated: raw prompt text and turn summaries reach the
+      durable log with no redactor in the path. A page that lists the guarantees without this one is the
+      overclaim it exists to prevent.
 - [ ] Full gate green including website checks.
 
 ## Notes

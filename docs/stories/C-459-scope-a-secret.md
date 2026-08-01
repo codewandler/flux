@@ -7,7 +7,7 @@ priority: 5
 design: docs/designs/secrets-the-agent-never-sees.md
 epic: secrets-the-agent-never-sees
 areas: [flux-secret, flux-app, flux-policy]
-note: "⚠ applies to EVERY secret whatever the transport, so it is worth taking independently of C-458. flux guards egress per CALLER, never per SECRET. And per-principal scoping is newly expressible — C-408/C-415 established per-speaker TurnIdentity"
+note: "⚠ CORRECTED after a survey: flux DOES scope which secret may be NAMED (http.request's allowed_secrets, C-76; plugin grants.secrets), it does not scope WHERE a named secret may GO. Two different axes, and only the first exists. Per-principal scoping is newly expressible after C-408/C-415"
 ---
 
 # Which destinations, and on whose behalf
@@ -19,10 +19,27 @@ cause it to be used.
 
 ## The two gaps
 
-**1. Destination.** flux's egress guard (`guard_url_scoped`) decides whether *this caller* may reach
-*this host*. It knows nothing about *which secret* is in the request. So once
-`crates/flux-app/src/secrets.rs`'s `resolve_in` has substituted a plaintext value, that value can
-travel to **any** host the caller is already permitted to reach.
+**1. Destination.** ⚠ **flux already scopes one axis and not the other, and the distinction is the
+story.**
+
+*What exists* — flux scopes **which secret may be named**:
+- `http.request`'s `$secret` **allowlist** (`crates/flux-web/src/http.rs:50`, enforced in
+  `resolve_secret_env` at `:407-413` **before the value is read**), from `[web] allowed_secrets` or
+  `FLUX_WEB_SECRET_ALLOW`. C-76's point exactly: a prompt-injected model cannot name
+  `AWS_SECRET_ACCESS_KEY` and exfiltrate it in one call.
+- Plugin manifest grants: `grants.secrets` is a per-plugin **key list** and `grants.credential` a
+  per-plugin boolean, both deny-by-default.
+- Cross-plugin use is gated by an operator config grant per `(consumer, provider)` pair, then optional
+  first-use approval, then audit — **before** materialization (`broker.rs:665-702`).
+
+*What does not exist* — flux scopes nothing about **where a named secret may go**. `guard_url_scoped`
+decides whether *this caller* may reach *this host*; it knows nothing about which secret is in the
+request. Once `resolve_in` has substituted plaintext into the settings bag
+(`crates/flux-app/src/secrets.rs:52`), that value is an ordinary string usable by anything holding
+those settings, bound for any host the caller may already reach.
+
+⚠ Also dangling: `Sensitivity` (`crates/flux-secret/src/lib.rs:124`) is **defined and read by nothing**.
+Either it becomes the carrier for this scope or it should go.
 
 Vaults scopes per credential — `networking.allowed_hosts`, described as preventing *"your key from ever
 being shared with unauthorized hosts"* — and pairs it with `injection_location` (header, body, or both)

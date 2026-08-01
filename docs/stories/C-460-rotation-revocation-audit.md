@@ -19,7 +19,9 @@ was used where*.
 
 ## The two gaps
 
-**1. Resolution happens once.** `crates/flux-app/src/secrets.rs`'s `resolve_in` runs at config load and
+**1. ⚠ Revocation is structurally impossible today, not merely absent.** The `Redactor`'s store is an
+`Arc<Mutex<Vec<String>>>` with **no removal or clear API** (`crates/flux-secret/src/lib.rs:250`) —
+registration is monotonic for the process lifetime. And resolution happens once. `crates/flux-app/src/secrets.rs`'s `resolve_in` runs at config load and
 substitutes plaintext. Nothing re-reads it. So rotating a credential means restarting the agent, and
 **revoking one has no effect at all on a run already in flight** — the value it resolved is in memory.
 
@@ -27,9 +29,17 @@ Vaults: *"Credentials are re-resolved periodically, both during a session and du
 lifecycle. This ensures that credential rotation, archival, or deletion propagates to running sessions
 without a restart."*
 
-**2. Nothing records which secret was used.** flux's evidence chain records the operation, the caller
-and the outcome — but not that *this credential* was spent. So after an incident there is no way to
-answer "was that key used, and where."
+**2. Audit exists for one hop and nowhere else.** ⚠ **Corrected after a survey** — flux *does* record
+one case: `EventKind::CrossPluginResolve { consumer, provider, reference_location }`
+(`crates/flux-events/src/kind.rs:128-132`, appended by `EventStoreCrossPluginAudit`) records which
+consumer resolved which provider's credential **by location, never by value** (D-27). That is the right
+shape and the right precedent.
+
+What has no record: `secret "NAME"` resolution, a `$secret` header/query use in `http.request`, a
+plugin's `secret`-capability read, and `env/KEY` seeding. The only output on those paths is a
+`warning:` when the redactor **declines** a value for being too short
+(`crates/flux-cli/src/execution.rs:757-765`). So after an incident, "was that key used, and where"
+is answerable for exactly one hop.
 
 Vaults distinguishes archive from delete for exactly this: *"Secrets are purged; records are retained
 for auditing."*
