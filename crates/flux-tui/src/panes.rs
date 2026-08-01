@@ -165,7 +165,26 @@ const MAX_PENDING_COMMANDS: usize = 1024;
 /// cannot be drawn without having been filtered.
 #[derive(Debug, Default)]
 pub struct PaneQueue {
-    pending: std::sync::Mutex<std::collections::VecDeque<PaneCommand>>,
+    pending: std::sync::Mutex<Pending>,
+}
+
+/// The queued commands and the tally of the ones the queue refused, behind **one** lock.
+///
+/// They live together rather than as a `VecDeque` plus an atomic because `emit` decides to drop and
+/// records the drop in the same critical section: a drain can therefore never take the commands and
+/// miss a refusal that happened alongside them, nor report a refusal twice.
+#[derive(Debug, Default)]
+struct Pending {
+    commands: std::collections::VecDeque<PaneCommand>,
+    /// Commands refused since the last [`PaneQueue::drain`], reset by it.
+    dropped: usize,
+}
+
+/// What one [`PaneQueue::drain`] took: the commands to apply, and how many the channel refused
+/// while they were waiting.
+pub(crate) struct Drained {
+    pub(crate) commands: Vec<PaneCommand>,
+    pub(crate) dropped: usize,
 }
 
 impl PaneQueue {
@@ -175,22 +194,44 @@ impl PaneQueue {
         Arc::new(Self::default())
     }
 
-    /// Take everything queued so far, leaving the channel empty and open.
-    pub(crate) fn drain(&self) -> Vec<PaneCommand> {
-        self.pending.lock().unwrap().drain(..).collect()
+    /// Take everything queued so far — and everything refused so far — leaving the channel empty
+    /// and open.
+    pub(crate) fn drain(&self) -> Drained {
+        let mut pending = self.pending.lock().unwrap();
+        Drained {
+            commands: pending.commands.drain(..).collect(),
+            dropped: std::mem::take(&mut pending.dropped),
+        }
     }
 }
 
 impl flux_runtime::SurfaceSink for PaneQueue {
     fn emit(&self, command: PaneCommand) {
         let mut pending = self.pending.lock().unwrap();
-        if pending.len() >= MAX_PENDING_COMMANDS {
-            // A surface-side drop, exactly like an `update` for an id that is not open: the channel
-            // is send-only, so there is nothing to report back through, and dropping the *newest*
-            // keeps the panes the user is already looking at rather than the flood behind them.
+        if pending.commands.len() >= MAX_PENDING_COMMANDS {
+            // Drop the *newest*: it keeps the panes the user is already looking at rather than the
+            // flood behind them, and evicting the oldest would throw away an `Open` while leaving
+            // `Update`s that `PaneStore` then discards anyway — strictly worse.
+            //
+            // **C-324: the drop is counted, not silent.** The `pane.*` op that pushed this command
+            // has already been told it succeeded, and there is no way to un-tell it: `SurfaceSink`
+            // is send-only by construction (L2 cannot know a surface exists, let alone wait on
+            // one), so the model's view of this call is fixed before we get here. The surface is
+            // still the party that knows, so the surface is the party that reports — to the
+            // **operator**, through the transcript, in `ChatState::apply_pending_panes`. That is
+            // the same posture `flux-tools`' surface module already states for this seam's sibling
+            // failure ("a clear op failure, never a silent success"), honoured on the one channel
+            // this failure actually has.
+            //
+            // Telling the *model* was considered and rejected as disproportionate: it would mean
+            // `SurfaceSink::emit` reporting acceptance back, which is a breaking change to a
+            // published L2 trait and every implementor of it, to close a hole that needs 1024
+            // pending commands inside one 62 ms frame. The operator can see the pane is missing and
+            // now learns why; the model can already re-check reality with `pane.list`.
+            pending.dropped = pending.dropped.saturating_add(1);
             return;
         }
-        pending.push_back(command);
+        pending.commands.push_back(command);
     }
 }
 
@@ -939,9 +980,88 @@ mod tests {
             });
         }
         assert_eq!(
-            queue.drain().len(),
+            queue.drain().commands.len(),
             MAX_PENDING_COMMANDS,
             "the pending channel must be capped by the surface, not by its caller"
+        );
+    }
+
+    /// **C-324.** Overflowing the channel drops the newest command — and the operator is told, in
+    /// the transcript and on the frame.
+    ///
+    /// The drop is what makes this worth a test at all: the `pane.*` op has already returned ok by
+    /// the time the queue refuses, so nothing about the op's *return value* differs before and
+    /// after this story. The observable is the surface's own record of the refusal, which is why
+    /// the assertions are on the transcript and the drawn frame rather than on a `Result`.
+    #[test]
+    fn a_dropped_pane_command_is_reported_to_the_operator() {
+        use flux_runtime::SurfaceSink;
+
+        let queue = PaneQueue::new();
+        let sink: Arc<dyn SurfaceSink> = queue.clone();
+        let mut state = ChatState::for_session("m".into(), "s".into()).with_pane_queue(queue);
+
+        for index in 0..(MAX_PENDING_COMMANDS + 3) {
+            sink.emit(PaneCommand::Close {
+                id: format!("p{index}"),
+            });
+        }
+        assert_eq!(
+            state.apply_pending_panes(),
+            MAX_PENDING_COMMANDS,
+            "drop-newest is preserved: the queue still delivers exactly its cap"
+        );
+
+        let notices: Vec<&String> = state
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::Entry::Notice { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "an overflowing pane channel is reported exactly once, not per dropped command: \
+             {notices:?}"
+        );
+        assert!(
+            notices[0].contains('3'),
+            "the notice names how many commands were dropped: {:?}",
+            notices[0]
+        );
+
+        // A sustained flood is one condition, not one notice per frame — the operator is told when
+        // it starts and is not drowned while it lasts.
+        for index in 0..(MAX_PENDING_COMMANDS + 7) {
+            sink.emit(PaneCommand::Close {
+                id: format!("q{index}"),
+            });
+        }
+        state.apply_pending_panes();
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|e| matches!(e, crate::Entry::Notice { .. }))
+                .count(),
+            1,
+            "a still-overflowing channel does not re-notify every frame"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(TRUST_W, TRUST_H)).unwrap();
+        terminal.draw(|f| crate::render(f, &state)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("dropped"),
+            "the drop reaches the frame the operator is looking at:\n{screen}"
         );
     }
 

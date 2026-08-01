@@ -1123,6 +1123,7 @@ impl ChatState {
             ctrl_c_armed_at: None,
             panes: PaneStore::default(),
             pane_queue: None,
+            panes_overflowing: false,
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
         }
@@ -1153,12 +1154,41 @@ impl ChatState {
         let Some(queue) = self.pane_queue.clone() else {
             return 0;
         };
-        let commands = queue.drain();
-        let applied = commands.len();
-        for command in commands {
+        let drained = queue.drain();
+        let applied = drained.commands.len();
+        for command in drained.commands {
             self.apply_pane_command(command);
         }
+        self.report_dropped_panes(drained.dropped);
         applied
+    }
+
+    /// Put a full pane channel in front of the operator (C-324).
+    ///
+    /// The drop itself happens in [`crate::panes::PaneQueue`] and cannot be reported back to the
+    /// caller — that seam is send-only, and the `pane.*` op has already answered the model by the
+    /// time the queue refuses. This is the one place that both knows a command was refused and has
+    /// somewhere to say it, so the operator is told here rather than nowhere.
+    ///
+    /// **Edge-triggered on purpose.** An overflow is a condition, not an event: a caller flooding
+    /// the channel would otherwise earn a notice on every 62 ms frame and bury the transcript under
+    /// the very symptom it is describing. The operator is told when the channel starts refusing and
+    /// again only after it has recovered.
+    fn report_dropped_panes(&mut self, dropped: usize) {
+        if dropped == 0 {
+            self.panes_overflowing = false;
+            return;
+        }
+        if std::mem::replace(&mut self.panes_overflowing, true) {
+            return;
+        }
+        self.push(Entry::Notice {
+            text: format!(
+                "pane channel full — {dropped} pane command(s) dropped. The agent was told they \
+                 succeeded, so a pane it believes is open may not be on screen."
+            ),
+            sev: Sev::Warn,
+        });
     }
 
     /// Every pane currently open, each labelled with who owns it (C-224).

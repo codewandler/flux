@@ -2,7 +2,7 @@
 id: C-324
 title: "A dropped pane command is a silent success, against the surface's own stated posture"
 pillar: Agent
-status: ready
+status: in-progress
 priority: 11
 areas: [flux-tui, flux-runtime]
 note: "found by C-305's review — PaneQueue::emit drops the newest command past MAX_PENDING_COMMANDS while the op still returns ok, but surface.rs's own posture is that the sibling failure (no sink) is 'a clear op failure (never a silent success)'; the channel is send-only so there is no evidence handle to report through, which is why this needs a posture decision rather than a patch"
@@ -39,18 +39,60 @@ That is a UX decision with consequences for what the model sees, not a mechanica
 
 ## Acceptance
 
-- [ ] **Pick the posture and write down what you rejected.** The three options above are the known
+- [x] **Pick the posture and write down what you rejected.** The three options above are the known
       candidates; the choice governs everything else in this story.
-- [ ] **Failing-first**: a test that overflows the queue and observes the drop is currently invisible
+- [x] **Failing-first**: a test that overflows the queue and observes the drop is currently invisible
       — no evidence record, no counter, nothing in the frame.
-- [ ] The chosen signal is reachable from where it matters. If the model is told the pane opened, the
+- [x] The chosen signal is reachable from where it matters. If the model is told the pane opened, the
       model is the one being misled; decide whether the signal goes to the operator, the model, or
       both, and justify it.
-- [ ] Drop-newest is preserved, or the reversal is argued explicitly against the reason above.
-- [ ] **Reachability is stated honestly in the story.** Overflow requires 1024 pending commands
+- [x] Drop-newest is preserved, or the reversal is argued explicitly against the reason above.
+- [x] **Reachability is stated honestly in the story.** Overflow requires 1024 pending commands
       inside one 62 ms frame, so this is a real-but-remote failure; if the fix costs more than the
       failure, say so and park it rather than building something elaborate.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
+
+## Progress
+
+**Posture: the drop is counted and reported to the *operator*, in the transcript. Drop-newest is
+kept unchanged, and the surface's stated promise is not weakened.** Which side moved: the
+behaviour, not the promise. `flux-tools`' surface module keeps saying the sibling failure is "a
+clear op failure (never a silent success)"; this story makes overflow stop being a silent success
+on the one channel it actually has.
+
+Options 1 and 2 were taken together and are the same mechanism: `PaneQueue` counts what it refuses
+(the counter), and `ChatState::apply_pending_panes` turns a non-zero count into a transcript
+`Notice` the operator reads and the frame draws. The counter alone would have been another
+unobserved number; the notice alone would have had nothing to count.
+
+**Option 3 — reversing to a genuine op failure — was rejected, and not for the reason the story
+gives.** The story's reason ("by then the command is already gone and the op has returned") does not
+hold under drop-newest: `SurfaceSink::emit` is called synchronously from inside the live `pane.*`
+op, so the op *could* be told. The real reason is cost. Telling the op means `SurfaceSink::emit`
+returning acceptance, which is a breaking change to a published L2 trait, every implementor of it,
+`SurfaceReporter::send`, and the three ops in `flux-tools` — a wide, cross-layer, version-bearing
+change to close a hole that needs 1024 pending commands inside one 62 ms frame. That is the fix
+costing more than the failure, so it is parked here rather than built.
+
+**So the model is not told, deliberately.** It is the party being misled, and that is not fully
+closed by this story — stated plainly rather than papered over. What it has instead: `pane.list`
+already reports the surface's real store, so a model that checks can see the pane it "opened" is not
+there. What the operator gains is the part that was missing entirely — when a pane the agent claims
+to have opened is absent, the surface now says why instead of leaving the operator to conclude it is
+broken.
+
+**Reachability, honestly.** Remote. The channel is drained at the top of every event-loop iteration,
+so overflow needs 1024 pane commands emitted between two frames. No legitimate turn comes close; the
+realistic causes are a looping tool and a bug. The fix is correspondingly small — a counter, one
+edge-triggered notice, no new types on any public seam.
+
+The notice is **edge-triggered**: reported when the channel starts refusing and again only after it
+has recovered. A per-frame notice would bury the transcript under the symptom it describes.
+
+Test: `panes::tests::a_dropped_pane_command_is_reported_to_the_operator`
+(`crates/flux-tui/src/panes.rs`). It asserts on the transcript and the drawn frame, not on a return
+value — the op's return is `ok` before and after this change, so a test that watched it would pass
+at the base and prove nothing.
 
 ## Notes
 
