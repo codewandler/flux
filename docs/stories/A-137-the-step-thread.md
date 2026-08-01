@@ -1,56 +1,112 @@
 ---
 id: A-137
-title: "The step thread — finished steps condensed to one line, the current one expanded"
+title: "The loop view becomes the TUI's main display, with view options — depth, condensing, detail, variables"
 pillar: Agent
 status: ready
-priority: 6
+priority: 5
 design: docs/designs/agent-loop-visibility.md
 epic: agent-loop-visibility
 areas: [flux-tui]
-note: "the whole feature at its most useful, shippable alone. The vocabulary is already on the wire — UiEvent carries Plan, Phase, Planning, Intent, ToolCall, ToolTiming, ToolResult, ToolProgress, CallUsage — so this is a VIEW problem, not instrumentation"
+note: "⚠ SCOPE CHANGED 2026-08-02, owner-directed: no longer a thread beside the transcript — the TUI's PRIMARY surface. Two things to decide before coding: where the conversation goes, and that `show variables` puts run state on the DEFAULT screen, escalating A-142's disclosure requirement from an opt-in pane to what is on screen during every demo"
 ---
 
-# One line per step, expanded where it matters
+# The main display is the program running
 
 ## Goal
 
-A live thread of the agent loop: each finished step condensed to one line, the current step expanded to
-show what is happening inside it.
+Make the loop view the TUI's primary surface, with view options controlling how much of it is shown:
+nesting depth, condensing of completed work, an optional detail pane, and optionally the variables a run
+is holding.
 
-## Why it stands alone
+## What changed
 
-The events already exist. `UiEvent` (`crates/flux-tui/src/controller.rs:8`) carries the loop's whole
-vocabulary — `Planning`, `Plan`, `Phase`, `Intent`, `ToolCall`, `ToolTiming`, `ToolResult`,
-`ToolProgress`, `CallUsage`. Nothing new needs recording. What is missing is the progressive-disclosure
-thread that makes them legible while a run is moving.
+This was filed as *"the step thread"* — one line per finished step, **beside** the existing transcript.
+The owner has since driven [A-144](A-144-five-tui-mocks-of-one-flow.md)'s rendered mocks and asked for
+something larger: **the loop view as the main display**, with the axes as user-facing view options.
+
+The axes are settled ([A-146](A-146-three-axes-not-five-pictures.md) proves the composition in the mocks
+first): **depth limit · condense completed · optional detail pane**. This story adds the fourth the
+owner named — **show variables** — and makes the whole thing primary rather than adjacent.
+
+## ⚠ Two things to decide before writing code
+
+**1. Where does the conversation go?** `flux tui` is documented today as *"the ratatui chat TUI"*.
+People type a message and read prose back. If the loop view is the main display, the assistant's actual
+*answer* needs a home — and "it scrolls past in a pane" is a downgrade of the thing most users came for.
+⚠ This is a product decision about what the TUI **is**: chat-with-an-agent, or watch-a-program-run with
+a conversation in it. Decide it explicitly; do not let the layout decide it by accident.
+
+**2. ⚠ `show variables` puts run state on the default screen, and that escalates a safety requirement.**
+[A-142](A-142-inspect-a-paused-run.md) treats inspection as a *debugger* surface — opt-in, deliberately
+entered — and already requires everything shown to route through the `Redactor` **with the failure path
+tested**, because [C-339](C-339-redaction-falls-back-to-the-unredacted-value.md) found redaction here
+failing *open*. As a view option on the main display it stops being a pane someone chooses to open and
+becomes **what is on screen during every demo and screenshare**. The requirement does not change; the
+cost of getting it wrong does. Reuse A-142's path — do not grow a second one.
+
+## ⚠ What the real run corrected, and it reshapes this story
+
+[A-145](A-145-a-real-run-as-the-mock-fixture.md) drove the mocks from a real 191-step session instead of
+a hand-authored flow. It **confirmed** the headline (condense first, then the split) and corrected three
+things that change what to build:
+
+- **Condensing's win is concentrated, not uniform.** Of 55 real phases, **36 are exactly one step** —
+  where condensing saves nothing — while **one is 57 steps**, where the whole win lives. The
+  hand-authored fixture's even 3–6-step phases made the saving look smooth. ⚠ A condensing design tuned
+  for the even case will underperform on a real run; the payoff is bursty.
+- **The split and the flat thread hide the *same* 166 of 191 steps.** The split's advantage is
+  **coverage** (all nine turns plus the current one in full), not capacity. *"The only one that still
+  shows the whole run"* was an artifact of a fixture that was one run rather than nine turns.
+- **Real nesting is three levels, not eight.** The indentation tax that cost the tree its ranking was
+  charged against a depth this log has never recorded. At 100 columns the tree is the most legible and
+  still shows each op's *argument*, which the split's rail cannot.
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test driving a scripted sequence of `UiEvent`s and asserting the rendered
-      thread — one line per finished step, the current step expanded — failing at the merge base.
-- [ ] A finished step's line says what it was, how it went, and how long it took. ⚠ Timing is already
-      carried (`ToolTiming`, `ModelCallTiming`); do not re-measure it in the view, or the number the
-      audience sees will disagree with the one the evidence log holds.
-- [ ] The current step expands to show what is inside it, and collapses when it completes.
-- [ ] ⚠ **Elision is visible.** If steps are dropped or collapsed to fit, the view says so. A view that
-      silently drops steps is worse than one that admits it is behind — and this is the surface most
-      likely to be watched by someone deciding whether to trust flux.
-- [ ] Works with the existing transcript rather than replacing it; a user who does not want the thread
-      is not forced into it.
+- [ ] **Failing-first**: a test asserting the loop view is what the TUI renders by default, and that each
+      view option changes what is drawn — failing at the merge base.
+- [ ] The four view options are real, independent and discoverable: **depth limit · condense completed ·
+      detail pane · show variables**. Built on the axes A-146 validates, not re-derived.
+- [ ] ⚠ **Defaults are stated and justified** — with the axes composable, the defaults *are* the design.
+      Every axis defaults to showing more than it hides. ⚠ Set the depth default against **three** real
+      levels, not the fixture's eight.
+- [ ] ⚠ **Elision stays visible at every setting.** A-144's rework made this unconditional via
+      `Tally::finish`; four ways to hide things must not create a way around it. A depth limit says how
+      many levels are withheld; condensing says what it collapsed.
+- [ ] ⚠ **Condensing never swallows a failure.** A completed step that errored or was retried is exactly
+      what a reader needs. The A-145 capture contains a real failed `git_stage` — use it.
+- [ ] ⚠ **Variables route through the `Redactor`, and the failure path is tested** — not just the happy
+      one. Reuse A-142's path.
+- [ ] The conversation's home is decided, implemented, and written down.
+- [ ] Timing and usage come from what is already carried (`ToolTiming`, `ModelCallTiming`, `CallUsage`) —
+      do not re-measure in the view, or the number on screen will disagree with the evidence log.
+- [ ] A user who wants today's behaviour can still get it. ⚠ Changing the main display of the daily
+      driver needs an escape hatch, at least for one release.
 - [ ] Full gate green.
 
 ## Notes
 
-- [A-138](A-138-expand-a-step-into-its-graph.md) adds the graph expansion on top; do not build it here,
-  but do not make it a rewrite either.
-- ⚠ A pause hotkey ([run-control](../designs/run-control.md)) and a debugger
-  ([interactive-debugger](../designs/interactive-debugger.md)) both want to attach controls to a step in
-  this thread. Leave the seam; build neither.
-- `crates/flux-tui/src/panes.rs` and `toolview.rs` are the incumbents — extend rather than growing a
-  third way to draw a running tool.
-- Sub-agent activity already has a home in `fleet.rs`'s `FleetProjection`. Decide whether the thread
-  shows it or defers to that pane; do not duplicate the projection.
+- ⚠ **Sequencing**: A-146 proves the composition in the mocks first. Building this before it means
+  committing the main display to a shape validated only by argument.
+- ⚠ **`crates/flux-tui/src/lib.rs` is 410 KB in one file**, `mod tests` starting around line 4803 — the
+  largest module in the workspace, and the reason A-144's mocks live in their own directory. Making the
+  loop view primary means working in it. Splitting it is not this story's job; budget the friction or
+  file it first.
+- ⚠ **A real session has no present tense.** A-145 found the log carries no `Running` status — a replay
+  must choose and disclose a cursor. Live, this story *has* the present tense the log lacks, which is
+  the one place the live view is strictly better than any replay of it.
+- The loop vocabulary is already on the wire: `UiEvent` carries `Planning`, `Plan`, `Phase`, `Intent`,
+  `ToolCall`, `ToolTiming`, `ToolResult`, `ToolProgress`, `CallUsage`, `SpawnActivity`.
+- ⚠ [A-138](A-138-expand-a-step-into-its-graph.md) may need re-scoping before it is worth building — see
+  its own note. A-145 found the captured session accepted **127 plans, every one a single op**, and that
+  `plan_ast` is never persisted, so there was no DAG to draw.
+- [A-140](A-140-pause-a-live-run.md)'s pause wants a home on a step here, and A-142's inspection is the
+  `show variables` option. Leave the seams; build neither.
+- Sub-agent activity has a home in `fleet.rs`'s `FleetProjection` — decide whether the view shows it or
+  defers, and do not duplicate the projection.
 
 ## Progress
 
 - Filed 2026-08-01 with the agent-loop-visibility epic.
+- 2026-08-02 — scope changed to "the TUI's main display with view options", owner-directed after driving
+  A-144's mocks; A-145's real-run corrections folded in.
