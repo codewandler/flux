@@ -21,6 +21,32 @@ fn matrix() -> Vec<(Mock, LoadCase, Viewport)> {
     out
 }
 
+/// A-145's headline: the cases that carry the comparison are **reconstructed from a recorded run**,
+/// not invented by the same context that then picks a layout from them. The proof is that they
+/// contain the recorded run's own vocabulary — `detect_intent`, `explore`, `approve_batch` are the
+/// agent loop's top-level ops as they appear in `~/.flux/events.db`, and no hand-authored fixture
+/// contains them.
+#[test]
+fn the_load_bearing_cases_are_reconstructed_from_a_recorded_run() {
+    let fx = loopmock::fixture(LoadCase::LongRun);
+    assert!(
+        fx.title.contains("s_1477"),
+        "the long-run case is not the recorded session: {:?}",
+        fx.title,
+    );
+    let labels: Vec<&str> = fx
+        .flatten()
+        .iter()
+        .map(|f| f.step.label.as_str())
+        .collect();
+    for op in ["detect_intent", "explore", "approve_batch", "git_commit"] {
+        assert!(
+            labels.contains(&op),
+            "the recorded run's `{op}` is missing — this is a hand-authored flow, not a capture",
+        );
+    }
+}
+
 #[test]
 fn every_mock_renders_every_hard_case_within_its_viewport_and_names_what_it_elides() {
     let theme = Theme::MONO;

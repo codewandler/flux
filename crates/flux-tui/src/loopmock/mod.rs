@@ -29,9 +29,10 @@
 //! says so instead of drawing a mangled version of itself, which is the interesting behaviour to
 //! compare — every layout has a floor, and what it does there is a design decision.
 //!
-//! ⚠ The fixture is hand-written data, not a captured run. That is the point (it costs a fraction
-//! of A-137), and it is also the thing to be honest about: these are drawings of plausible load,
-//! not measurements of real load.
+//! ⚠ **Provenance (A-145).** Two of the four load cases are now reconstructed from a real recorded
+//! session ([`capture`]); two are still hand-authored, because the durable log cannot currently
+//! produce them. Which is which is drawn in every header, never left to a doc comment — a
+//! comparison that silently mixes measured and invented load is worse than either kind alone.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -39,6 +40,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
+pub mod capture;
 pub mod fixture;
 mod graph;
 mod split;
@@ -46,7 +48,10 @@ mod thread;
 mod timeline;
 mod tree;
 
-pub use fixture::{fixture, Fixture, Flat, LoadCase, Status, Step, StepKind, Usage, LOAD_CASES};
+pub use capture::{Fidelity, FidelityRow, FIDELITY};
+pub use fixture::{
+    fixture, Fixture, Flat, LoadCase, Provenance, Status, Step, StepKind, Usage, LOAD_CASES,
+};
 pub use graph::{graph_gutter_len, graph_plan_line_count};
 
 /// The `what` of an [`Elision`] that withheld whole steps — the one the accounting test checks.
@@ -437,9 +442,14 @@ pub(crate) fn tokens(v: u64) -> String {
 }
 
 /// The run header every mock draws, so the comparison is of the layout and not of its chrome.
+///
+/// The right-hand side carries the fixture's [`Provenance`] badge as well as its elapsed time. That
+/// is deliberate and it is A-145's rule: the recorded cases are replayed to a chosen cursor, which
+/// is the one structural thing the projection invents, so it is stated **on screen** in every
+/// drawing rather than in a doc comment somewhere the reader will not be.
 pub(crate) fn header(fx: &Fixture, vp: Viewport, theme: &Theme, sub: &str) -> Line<'static> {
+    let right = format!("{} · {} elapsed", fx.provenance.badge(), ms(fx.elapsed_ms));
     let left = format!("◆ {}  {sub}", fx.title);
-    let right = format!("{} elapsed", ms(fx.elapsed_ms));
     let gap = vp.cols.saturating_sub(width(&left) + width(&right)).max(1);
     clip(
         Line::from(vec![
