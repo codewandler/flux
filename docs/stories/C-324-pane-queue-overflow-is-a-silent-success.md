@@ -69,17 +69,26 @@ unobserved number; the notice alone would have had nothing to count.
 gives.** The story's reason ("by then the command is already gone and the op has returned") does not
 hold under drop-newest: `SurfaceSink::emit` is called synchronously from inside the live `pane.*`
 op, so the op *could* be told. The real reason is cost. Telling the op means `SurfaceSink::emit`
-returning acceptance, which is a breaking change to a published L2 trait, every implementor of it,
-`SurfaceReporter::send`, and the three ops in `flux-tools` — a wide, cross-layer, version-bearing
-change to close a hole that needs 1024 pending commands inside one 62 ms frame. That is the fix
-costing more than the failure, so it is parked here rather than built.
+returning acceptance — a breaking change to a trait published in `codewandler-flux-runtime`, plus
+`SurfaceReporter::send`, `PaneQueue`, three test sinks and all three `pane.*` op bodies, and a MINOR
+bump under this repo's pre-1.0 SemVer rule. A wide, cross-layer, version-bearing change to close a
+hole that needs 1024 pending commands inside one 62 ms frame. That is the fix costing more than the
+failure, so it is parked here rather than built.
 
-**So the model is not told, deliberately.** It is the party being misled, and that is not fully
-closed by this story — stated plainly rather than papered over. What it has instead: `pane.list`
-already reports the surface's real store, so a model that checks can see the pane it "opened" is not
-there. What the operator gains is the part that was missing entirely — when a pane the agent claims
-to have opened is absent, the surface now says why instead of leaving the operator to conclude it is
-broken.
+**So the model is not told, deliberately — and it has no compensating recourse.** It is the party
+being misled, and this story does not close that; stated plainly rather than papered over. There is
+**no read-back on this surface at all**: `pane.list` is not registered anywhere
+(`PANE_OPS` in `crates/flux-tools/src/surface.rs` is the three write ops) and
+`docs/designs/agent-authored-surface.md` says it does not ship. Settling that is exactly what
+[C-306](C-306-pane-read-back-contract.md) exists for, and until C-306 lands there is nothing a model
+can call to discover that a pane it "opened" is absent. What C-324 buys is the operator's half —
+previously missing entirely: when a pane the agent claims to have opened is not there, the surface
+now says why instead of leaving the operator to conclude it is broken.
+
+⚠ An earlier draft of this section, and of the comment at the drop site, claimed `pane.list` gave
+the model that recourse. It does not exist. The claim is recorded here because inventing a
+compensating control is the same defect class this story exists to close, and C-306's Acceptance is
+specifically about deleting comments that assert wiring which will never exist.
 
 **Reachability, honestly.** Remote. The channel is drained at the top of every event-loop iteration,
 so overflow needs 1024 pane commands emitted between two frames. No legitimate turn comes close; the
@@ -87,7 +96,10 @@ realistic causes are a looping tool and a bug. The fix is correspondingly small 
 edge-triggered notice, no new types on any public seam.
 
 The notice is **edge-triggered**: reported when the channel starts refusing and again only after it
-has recovered. A per-frame notice would bury the transcript under the symptom it describes.
+has recovered. A per-frame notice would bury the transcript under the symptom it describes. The
+consequence is that the number in the notice is *that frame's* count, not a running total of a
+sustained flood — so the text says "dropped in this frame, and more will be for as long as it stays
+full" rather than a figure that would quietly understate by orders of magnitude.
 
 Test: `panes::tests::a_dropped_pane_command_is_reported_to_the_operator`
 (`crates/flux-tui/src/panes.rs`). It asserts on the transcript and the drawn frame, not on a return

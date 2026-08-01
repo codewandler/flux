@@ -214,20 +214,25 @@ impl flux_runtime::SurfaceSink for PaneQueue {
             // `Update`s that `PaneStore` then discards anyway — strictly worse.
             //
             // **C-324: the drop is counted, not silent.** The `pane.*` op that pushed this command
-            // has already been told it succeeded, and there is no way to un-tell it: `SurfaceSink`
-            // is send-only by construction (L2 cannot know a surface exists, let alone wait on
-            // one), so the model's view of this call is fixed before we get here. The surface is
-            // still the party that knows, so the surface is the party that reports — to the
-            // **operator**, through the transcript, in `ChatState::apply_pending_panes`. That is
-            // the same posture `flux-tools`' surface module already states for this seam's sibling
-            // failure ("a clear op failure, never a silent success"), honoured on the one channel
-            // this failure actually has.
+            // is still on the stack — `SurfaceReporter::send` calls this synchronously — but it
+            // cannot be told, because `SurfaceSink` is **send-only by construction** (C-220: L2
+            // must be able to address a surface without any crate below L6 knowing one exists, so
+            // `emit` has no return channel). The surface is the party that knows, so the surface is
+            // the party that reports — to the **operator**, through the transcript, in
+            // `ChatState::apply_pending_panes`. That is the same posture `flux-tools`' surface
+            // module already states for this seam's sibling failure ("a clear op failure, never a
+            // silent success"), honoured on the one channel this failure actually has.
             //
-            // Telling the *model* was considered and rejected as disproportionate: it would mean
-            // `SurfaceSink::emit` reporting acceptance back, which is a breaking change to a
-            // published L2 trait and every implementor of it, to close a hole that needs 1024
-            // pending commands inside one 62 ms frame. The operator can see the pane is missing and
-            // now learns why; the model can already re-check reality with `pane.list`.
+            // Telling the *model* was considered and rejected as disproportionate: giving `emit` a
+            // return channel is a breaking change to a published L2 trait, every implementor of it,
+            // `SurfaceReporter::send` and all three `pane.*` op bodies — to close a hole that needs
+            // 1024 pending commands inside one 62 ms frame.
+            //
+            // **So the model is not told, and it has no way to find out either.** There is no
+            // read-back on this surface at all: `pane.list` is not registered and does not ship
+            // (`docs/designs/agent-authored-surface.md`), which is precisely what C-306 exists to
+            // settle. Until it does, the operator is the only party who learns that a pane the
+            // agent believes it opened is not on screen.
             pending.dropped = pending.dropped.saturating_add(1);
             return;
         }
@@ -1027,8 +1032,15 @@ mod tests {
              {notices:?}"
         );
         assert!(
-            notices[0].contains('3'),
-            "the notice names how many commands were dropped: {:?}",
+            notices[0].contains("3 pane command(s) dropped"),
+            "the notice names how many commands were dropped — the whole phrase, so the assertion \
+             cannot pass on a stray digit from 13 or 300: {:?}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("in this frame"),
+            "the count is this drain's, not a running total, and the notice must not read as one: \
+             {:?}",
             notices[0]
         );
 
