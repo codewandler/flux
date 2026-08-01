@@ -10,7 +10,9 @@
 //! It also reproduces the JaaS case asymmetry on purpose: the client is configured with
 //! [`ROOM_JID_CONFIGURED`] and the double answers presence from [`ROOM_JID_SERVER`].
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +45,7 @@ pub struct XmppDouble {
     addr: SocketAddr,
     sent: Arc<Mutex<Vec<String>>>,
     connections: Arc<Mutex<Vec<String>>>,
+    hold: Arc<AtomicBool>,
     push: broadcast::Sender<String>,
     /// Kept so [`XmppDouble::push`] never fails for want of a subscriber. Never drained: a new
     /// connection subscribes at the tail, so it sees only what is pushed after it arrives.
@@ -62,10 +65,21 @@ impl XmppDouble {
         let recorded = sent.clone();
         let dialled = connections.clone();
         let pushes = push.clone();
+        let occupancy: Occupancy = Arc::new(Mutex::new(HashMap::new()));
+        let hold = Arc::new(AtomicBool::new(false));
+        let held = hold.clone();
         let accept = tokio::spawn(async move {
+            let mut next_id = 0usize;
             loop {
                 let Ok((sock, _)) = listener.accept().await else {
                     return;
+                };
+                next_id += 1;
+                let conn = Conn {
+                    id: next_id,
+                    occupancy: occupancy.clone(),
+                    opens: 0,
+                    holds: None,
                 };
                 let seen = dialled.clone();
                 // The `Err` type is tungstenite's `ErrorResponse` and is not ours to shrink.
@@ -76,11 +90,18 @@ impl XmppDouble {
                 };
                 let recorded = recorded.clone();
                 let outbound = pushes.subscribe();
+                let held = held.clone();
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(sock, hook).await else {
                         return;
                     };
-                    serve(&mut ws, outbound, &recorded).await;
+                    // Parked *after* the WebSocket handshake, so the client is connected and waiting
+                    // for stream features — the middle of `connect_and_join`. That is the window a
+                    // test needs in order to make something else happen during a join.
+                    while held.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    serve(&mut ws, outbound, &recorded, conn).await;
                 });
             }
         });
@@ -89,10 +110,22 @@ impl XmppDouble {
             addr,
             sent,
             connections,
+            hold,
             push,
             _retain,
             _accept: accept,
         }
+    }
+
+    /// Park every connection accepted from now on just after its WebSocket handshake — the client
+    /// sits inside `connect_and_join` waiting for stream features until [`Self::release`].
+    pub fn hold_new_connections(&self) {
+        self.hold.store(true, Ordering::SeqCst);
+    }
+
+    /// Let held connections proceed.
+    pub fn release(&self) {
+        self.hold.store(false, Ordering::SeqCst);
     }
 
     /// The `ws://` endpoint to configure a room with.
@@ -160,10 +193,8 @@ async fn serve(
     ws: &mut WebSocketStream<TcpStream>,
     mut outbound: broadcast::Receiver<String>,
     recorded: &Arc<Mutex<Vec<String>>>,
+    mut conn: Conn,
 ) {
-    // RFC 7395's SASL restart replays `<open/>`, and the two get different feature sets — so this
-    // counts per connection, not for the double's lifetime.
-    let mut opens = 0usize;
     loop {
         tokio::select! {
             pushed = outbound.recv() => match pushed {
@@ -175,21 +206,23 @@ async fn serve(
                 // Lagged: this connection missed pushes it was never the target of. Closed: the
                 // double is gone.
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Closed) => { conn.release(); return }
             },
             inbound = ws.next() => {
                 let frame = match inbound {
                     Some(Ok(WsMessage::Text(t))) => t.to_string(),
-                    // A close, an error, or the end of the socket ends this session. (A binary or
-                    // whitespace frame would be a protocol error on a real server; the keepalive
-                    // regression test asserts the client never sends one.)
-                    Some(Ok(WsMessage::Close(_))) | None => return,
-                    Some(Err(_)) => return,
+                    // A close, an error, or the end of the socket ends this session — and frees the
+                    // nick, as it would on a real service. (A binary or whitespace frame would be a
+                    // protocol error on a real server; the keepalive regression test asserts the
+                    // client never sends one.)
+                    Some(Ok(WsMessage::Close(_))) | None => { conn.release(); return }
+                    Some(Err(_)) => { conn.release(); return }
                     Some(Ok(_)) => continue,
                 };
                 recorded.lock().unwrap().push(frame.clone());
-                for reply in replies_to(&frame, &mut opens) {
+                for reply in replies_to(&frame, &mut conn) {
                     if ws.send(WsMessage::Text(reply.into())).await.is_err() {
+                        conn.release();
                         return;
                     }
                 }
@@ -215,18 +248,65 @@ fn negotiate(req: &WsRequest, mut resp: WsResponse) -> Result<WsResponse, WsErro
     Ok(resp)
 }
 
-/// The server's answer to one client frame. `opens` counts stream opens, because RFC 7395's SASL
-/// restart replays `<open/>` and the two get different feature sets.
-fn replies_to(frame: &str, opens: &mut usize) -> Vec<String> {
+/// Who currently holds which nick in the room, shared across connections.
+///
+/// **This is the double's occupancy model, and it exists because without one the double is more
+/// permissive than the vendor.** Under SASL `ANONYMOUS` every connection is a *different* anonymous
+/// JID, so two overlapping sessions asking for the same nick is XEP-0045 §7.2.9's nickname-conflict
+/// case — a real MUC answers `<error type='cancel'><conflict/></error>` and refuses the join. A
+/// backend that overlaps its sessions therefore passes against a double with no occupancy and fails
+/// against the vendor, which is the "guards tested against their own assumptions" trap.
+type Occupancy = Arc<Mutex<HashMap<String, usize>>>;
+
+/// One connection's view of the double: its id (so the occupancy map can tell whose nick is whose)
+/// and the shared room.
+struct Conn {
+    id: usize,
+    occupancy: Occupancy,
+    /// Stream opens on *this* connection: RFC 7395's SASL restart replays `<open/>` and the two get
+    /// different feature sets.
+    opens: usize,
+    /// The nick this connection successfully claimed, released when it goes away.
+    holds: Option<String>,
+}
+
+impl Conn {
+    /// Claim `nick` for this connection. `false` when someone else already holds it.
+    fn claim(&mut self, nick: &str) -> bool {
+        let mut occupancy = self.occupancy.lock().unwrap();
+        match occupancy.get(nick) {
+            Some(&owner) if owner != self.id => false,
+            _ => {
+                occupancy.insert(nick.to_string(), self.id);
+                self.holds = Some(nick.to_string());
+                true
+            }
+        }
+    }
+
+    /// Release whatever this connection holds — on `<presence type='unavailable'/>`, and on the way
+    /// out, because a dropped socket frees a nick on a real service too.
+    fn release(&mut self) {
+        if let Some(nick) = self.holds.take() {
+            let mut occupancy = self.occupancy.lock().unwrap();
+            if occupancy.get(&nick) == Some(&self.id) {
+                occupancy.remove(&nick);
+            }
+        }
+    }
+}
+
+/// The server's answer to one client frame.
+fn replies_to(frame: &str, conn: &mut Conn) -> Vec<String> {
     const FRAMING: &str = "urn:ietf:params:xml:ns:xmpp-framing";
     const STREAMS: &str = "http://etherx.jabber.org/streams";
 
     if frame.starts_with("<open") {
-        *opens += 1;
+        conn.opens += 1;
         let open = format!(
             "<open xmlns='{FRAMING}' from='example.org' id='s1' version='1.0' xml:lang='en'/>"
         );
-        let features = if *opens == 1 {
+        let features = if conn.opens == 1 {
             format!(
                 "<stream:features xmlns:stream='{STREAMS}'>\
                  <mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>\
@@ -249,19 +329,39 @@ fn replies_to(frame: &str, opens: &mut usize) -> Vec<String> {
 
     if frame.starts_with("<iq") && frame.contains("urn:ietf:params:xml:ns:xmpp-bind") {
         let id = attr(frame, "id").unwrap_or_default();
+        // A *distinct* anonymous JID per connection — which is exactly why two overlapping sessions
+        // asking for one nick is a conflict rather than a reconnect.
         return vec![format!(
             "<iq xmlns='jabber:client' type='result' id='{id}'>\
              <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>\
-             <jid>guest-9f3c@example.org/flux</jid></bind></iq>"
+             <jid>guest-{}@example.org/flux</jid></bind></iq>",
+            conn.id
         )];
     }
 
+    // Leaving the room frees the nick, so the next session may take it.
+    if frame.starts_with("<presence") && frame.contains("type='unavailable'") {
+        conn.release();
+        return Vec::new();
+    }
+
     if frame.starts_with("<presence") && frame.contains("http://jabber.org/protocol/muc") {
-        // The MUC join. Existing occupants first, our own self-presence (status 110) last — the order
-        // a real service produces, and the marker a backend must key `is_self` on.
         let nick = attr(frame, "to")
             .and_then(|to| to.rsplit_once('/').map(|(_, n)| n.to_string()))
             .unwrap_or_else(|| "flux".to_string());
+
+        // XEP-0045 §7.2.9: the nick is taken by someone who is not us. This is what a real MUC does
+        // to a backend that opens its replacement session before closing the one it is replacing.
+        if !conn.claim(&nick) {
+            return vec![format!(
+                "<presence xmlns='jabber:client' type='error' from='{ROOM_JID_SERVER}/{nick}'>\
+                 <error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>\
+                 </error></presence>"
+            )];
+        }
+
+        // The MUC join. Existing occupants first, our own self-presence (status 110) last — the order
+        // a real service produces, and the marker a backend must key `is_self` on.
         return vec![
             format!(
                 "<presence xmlns='jabber:client' from='{ROOM_JID_SERVER}/timo'>\

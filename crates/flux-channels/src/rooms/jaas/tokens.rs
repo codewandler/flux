@@ -325,20 +325,29 @@ impl JaasTokens for BraveTalkTokens {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
             struct Allocated {
-                #[serde(default)]
-                ready: bool,
+                // `Option`, not a defaulted `bool`: a response that *omits* `ready` is a changed
+                // response shape, and must say so rather than masquerade as "not ready yet" and
+                // burn the retry budget on a diagnosis that points at the wrong thing.
+                ready: Option<bool>,
                 #[serde(default)]
                 room: Option<String>,
                 #[serde(default)]
                 focus_jid: Option<String>,
             }
             let body: Allocated = read_json(response, "focus allocation").await?;
+            let ready = body.ready.ok_or_else(|| {
+                Error::Http(
+                    "jaas: focus allocation answered without a `ready` field — the vendor's \
+                     response shape has changed"
+                        .into(),
+                )
+            })?;
 
             // VENDOR ASSUMPTION, and the *inferred* one: the spike only ever observed
             // `ready: true`. `ready: false` is Jitsi's documented "focus is still allocating"
             // state, so it is retried on a fixed backoff rather than keyed on a response field
             // this repo has never seen.
-            if !body.ready {
+            if !ready {
                 if attempt == CONFERENCE_READY_ATTEMPTS {
                     return Err(Error::Http(format!(
                         "jaas: focus allocation still reported the conference as not ready after \
@@ -399,21 +408,32 @@ fn cookie_jar(response: &Response) -> String {
         .join("; ")
 }
 
-/// Read a JSON body, capped. The body is never quoted into an error: a vendor response can contain
-/// our own token echoed back.
-async fn read_json<T: serde::de::DeserializeOwned>(response: Response, what: &str) -> Result<T> {
+/// Read a JSON body, **incrementally** capped at [`MAX_RESPONSE_BYTES`].
+///
+/// Chunk by chunk, refusing as soon as the cap is passed — no whole-body `bytes()`/`text()`
+/// allocation happens first, so a hostile or broken vendor cannot make flux buffer an arbitrary
+/// response before the limit is noticed. Same posture as `flux-web`'s `read_body_capped`.
+///
+/// The body is never quoted into an error: a vendor response can contain our own token echoed back.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    mut response: Response,
+    what: &str,
+) -> Result<T> {
     let url = endpoint_for_display(response.url().as_str()).to_string();
-    let bytes = response
-        .bytes()
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| Error::Http(format!("jaas: reading {what} from {url} failed: {e}")))?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(Error::Http(format!(
-            "jaas: {what} from {url} answered {} bytes, over the {MAX_RESPONSE_BYTES}-byte cap",
-            bytes.len()
-        )));
+        .map_err(|e| Error::Http(format!("jaas: reading {what} from {url} failed: {e}")))?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(Error::Http(format!(
+                "jaas: {what} from {url} answered more than the {MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
+        body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|e| {
+    serde_json::from_slice(&body).map_err(|e| {
         // `e` names the offending field and offset, never the input.
         Error::Http(format!(
             "jaas: {what} from {url} did not answer the expected JSON ({e}) — the vendor's \

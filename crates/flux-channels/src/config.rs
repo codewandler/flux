@@ -266,10 +266,15 @@ pub struct A2aSettings {
 #[non_exhaustive]
 pub struct RoomSettings {
     /// Which [`Room`](crate::rooms::Room) backend to join with. `"mock"` is the in-process one,
-    /// `"xmpp"` the portable standards-compliant one (D-205). `"jaas"` (D-206) exists as a type
-    /// ([`JaasRoom`](crate::rooms::JaasRoom)) but is not declarable until its vendor token service
-    /// lands — a host wires one through `RoomChannel::with_room`. An unrecognized backend is a load
-    /// error, exactly like an unrecognized channel `kind`.
+    /// `"xmpp"` the portable standards-compliant one (D-205), and `"jaas"`
+    /// ([`JaasRoom`](crate::rooms::JaasRoom), D-206) is Brave Talk and any 8x8 JaaS tenant — the
+    /// same MUC machinery as `xmpp`, plus guest-token acquisition and refresh. An unrecognized
+    /// backend is a load error, exactly like an unrecognized channel `kind`.
+    ///
+    /// The `xmpp` credential settings below (`domain`, `user`, `password`, `muc_password`) are
+    /// **refused** by `jaas` rather than ignored: its stream domain comes from the
+    /// conference-request response and its SASL is `ANONYMOUS`, so accepting them would drop a
+    /// declared secret on the floor while the operator believed it was in play.
     pub backend: String,
     /// The room address, as the server spells it (an XMPP MUC JID).
     pub room: String,

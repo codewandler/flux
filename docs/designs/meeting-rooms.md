@@ -223,13 +223,29 @@ implementor inherits:
   the same reason: two operations scoped to `(room, token)` rather than to a caller-supplied URL, so
   the own-room posture holds *structurally* — there is no shape of the trait that enumerates rooms —
   and so `crates/flux-channels/tests/jaas_room.rs` never reaches Brave or 8x8.
-- **The refresh re-joins rather than re-authenticating in place.** The token rides the WebSocket URL,
-  so a fresh token means a fresh socket. A forwarding task mints ahead of the expiry, joins a second
-  `XmppMucRoom`, swaps it in and only then leaves the old one — so a `say` never addresses a session
-  that is on its way out. Transparency is achieved by suppressing the new session's replayed
-  `Joined` events for occupants the consumer already knows, and by the deliberate `leave` emitting no
+- **The refresh re-joins rather than re-authenticating in place, and it closes before it opens.** The
+  token rides the WebSocket URL, so a fresh token means a fresh socket. The tempting order — open the
+  replacement first, swap under it, then close the old — **a real MUC refuses**: SASL is `ANONYMOUS`,
+  so every connection is a *different* anonymous JID, and two overlapping sessions asking for one
+  nick is XEP-0045 §7.2.9's nickname conflict, answered `<conflict/>`. So the order is mint (pure
+  HTTP, touching neither the MUC nor the nick) → release the old session → take the nick back. Three
+  consequences, none hidden: `say` fails with "not joined" during the gap rather than writing to a
+  socket on its way out; a replacement join that keeps failing ends the room with `Ended`, because
+  once the nick is released there is nothing to fall back on; and the handover is not atomic, so the
+  replacement can meet its own predecessor and is retried. Transparency for the consumer comes from
+  suppressing the replacement's replayed `Joined` events and from the deliberate `leave` emitting no
   `Ended`. Known gap: an occupant who leaves *between* sessions produces no `Left` (they are simply
   absent from `Room::occupants`, which reads the live session).
+- **Leaving and refreshing race, and the pairing that settles it is explicit.** `JaasRoom::leave`
+  cancels the pump's token and *then* takes the session out; the pump re-checks that token while
+  holding the same lock before installing a replacement. Without that pairing a `leave` landing
+  mid-refresh returns `Ok(())` while the replacement is installed behind it — joined, never left, and
+  every later `join` answering "already joined", i.e. the room permanently un-rejoinable. That is the
+  ordinary shutdown path (`RoomTurnDriver` breaks on cancellation, then leaves), and it is pinned by
+  `tests/jaas_room.rs::leaving_while_a_replacement_join_is_in_flight_does_not_strand_it`.
+- **The outgoing session's buffered events are drained before its stream is dropped**, so a refresh
+  does not silently discard up to `DEFAULT_ROOM_EVENT_BUFFER` events — human messages among them —
+  with no replay path (the replacement's MUC history arrives `<delay/>`-marked and is dropped).
 - **A guest JWT is a secret that rides a query string.** `GuestToken`'s `Debug` redacts it, and the
   D-205 backend now renders an endpoint *without its query* in every error and `Debug` that names one
   (`xmpp::endpoint_for_display`) — a failed connect would otherwise publish the token to a log.
@@ -342,11 +358,17 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
    RFC 7395 traps are regressed on the raw bytes:
    `every_stanza_the_xmpp_backend_emits_is_jabber_client_qualified` and
    `the_xmpp_keepalive_is_a_ping_iq_and_never_whitespace`.
-7. **Token refresh is transparent.** ✅ **Met (D-206).** A session crossing the 3 h guest-token expiry
-   re-mints and stays joined — `crates/flux-channels/tests/jaas_room.rs::jaas_session_survives_token_expiry`
-   drives it against a fake token service with a 3-second TTL and the in-process XMPP double, and
-   asserts the re-join carried a *different* token, that a message said afterwards still lands, and
-   that the consumer saw neither `Ended` nor a duplicate `Joined`.
+7. **Token refresh is transparent.** ✅ **Met (D-206), and the double it rests on now models the case
+   that would have made it false.** `crates/flux-channels/tests/jaas_room.rs::jaas_session_survives_token_expiry`
+   drives a 3-second TTL against a fake token service and the in-process XMPP double, asserting the
+   re-join carried a *different* token, that a message said afterwards still lands, and that the
+   consumer saw neither `Ended` nor a duplicate `Joined`. The claim is only worth as much as the
+   double: an earlier version had no occupancy model, answered every MUC presence identically, and so
+   would have passed a refresh that overlapped its sessions — which a real service refuses with
+   `<conflict/>` (XEP-0045 §7.2.9), leaving the session dead against the vendor while the suite
+   stayed green. The double now tracks nick ownership per connection and refuses a held nick;
+   `tests/xmpp_room.rs::a_second_session_cannot_take_a_nick_the_first_still_holds` pins that arm so
+   it cannot rot back into a permissive one.
 8. **Published media carries signal.** A published track whose source is silence is reported as a failure,
    not as success — asserted with a level probe, because the spike watched the bridge elect a silent bot
    dominant speaker.

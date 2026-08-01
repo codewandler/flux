@@ -60,6 +60,7 @@ pub use tokens::{BraveTalkTokens, DEFAULT_BRAVE_TOKEN_SERVICE, DEFAULT_JAAS_CONF
 
 use std::collections::HashSet;
 use std::fmt;
+use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -95,6 +96,27 @@ pub const MIN_JAAS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// the session and `Ended` reaches the consumer, which is the honest outcome — a room flux is no
 /// longer authorized for is not a room it is in.
 pub const JAAS_REFRESH_RETRY: Duration = Duration::from_secs(30);
+
+/// How many times the *replacement join* is retried before the room is declared over.
+///
+/// Unlike a failed mint, this cannot fall back on "keep the session we have": the old session's nick
+/// had to be released before the new one could take it (see [`SessionPump::run`]), so by this point
+/// there is nothing to fall back to.
+///
+/// The first attempt is *expected* to fail sometimes: the handover is not atomic. A MUC frees a nick
+/// when it processes our departure, which can be after our replacement has already asked for it, so
+/// the replacement meets its own predecessor and is refused `<conflict/>`. That is transient by
+/// construction, which is why this retries rather than giving up.
+pub const JAAS_REJOIN_ATTEMPTS: usize = 5;
+
+/// Backoff between replacement-join attempts. Short: the room is empty of us meanwhile, and the
+/// usual cause is a departure the service has not finished processing.
+const JAAS_REJOIN_BACKOFF: Duration = Duration::from_millis(250);
+
+/// How long the outgoing session's buffered events are drained for before its stream is dropped.
+/// It has already been left, so its socket task has exited and this returns at once; the budget is
+/// belt and braces against a task that has not finished unwinding.
+const JAAS_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // The token, and the seam it comes from
@@ -388,7 +410,11 @@ impl Room for JaasRoom {
     }
 
     async fn leave(&self) -> Result<()> {
-        // The refresh task first: a re-mint racing our departure would rejoin a room we just left.
+        // **Cancel before taking `inner`, and never the other way round.** A refresh may be
+        // mid-flight; `SessionPump::rejoin` re-checks this token while holding the same lock, and
+        // that pairing is what stops a replacement session from being installed into a room we have
+        // already left — which would leave it joined forever and make every later `join` answer
+        // "already joined".
         if let Some(cancel) = self.cancel.lock().unwrap().take() {
             cancel.cancel();
         }
@@ -412,16 +438,35 @@ struct Joined {
     refresh_after: Duration,
 }
 
-/// Mint a guest token, allocate focus, and join the MUC the response named.
+/// Mint a guest token and allocate focus. **Pure HTTP** — it touches neither the MUC nor our nick,
+/// which is what lets the refresh do it *before* giving up the session it is replacing.
+async fn mint(
+    config: &JaasConfig,
+    tokens: &Arc<dyn JaasTokens>,
+) -> Result<(GuestToken, Conference)> {
+    let token = tokens.guest_token(&config.room).await?;
+    let conference = tokens.conference(&config.room, &token).await?;
+    Ok((token, conference))
+}
+
+/// Mint and join in one step — the first join, where there is no session to keep alive.
 async fn mint_and_join(
     config: &JaasConfig,
     tokens: &Arc<dyn JaasTokens>,
     identity: &RoomIdentity,
 ) -> Result<Joined> {
-    let token = tokens.guest_token(&config.room).await?;
-    let conference = tokens.conference(&config.room, &token).await?;
+    let (token, conference) = mint(config, tokens).await?;
+    join_minted(config, &token, conference, identity).await
+}
 
-    let mut xmpp = XmppConfig::new(endpoint(config, &token)?, conference.room_jid.clone());
+/// Join the MUC that focus allocation named, with an already-minted token.
+async fn join_minted(
+    config: &JaasConfig,
+    token: &GuestToken,
+    conference: Conference,
+    identity: &RoomIdentity,
+) -> Result<Joined> {
+    let mut xmpp = XmppConfig::new(endpoint(config, token)?, conference.room_jid.clone());
     // Deliberately **no** `user`/`password`: that selects SASL `ANONYMOUS`, the only mechanism JaaS
     // offers. `PLAIN` with the JWT as the password is refused `<invalid-mechanism/>` — authorization
     // rides the endpoint URL and happens at focus.
@@ -482,9 +527,31 @@ struct SessionPump {
 impl SessionPump {
     /// Pump until the consumer goes away, the session ends, or we are told to leave.
     ///
-    /// The refresh is *transparent* by construction: the new session's presence replay repeats every
-    /// occupant already known, and a `Joined` for someone we already have is not news. The deliberate
-    /// `leave` of the old session emits no `Ended`, so the consumer sees an uninterrupted room.
+    /// ## Why the refresh closes before it opens
+    ///
+    /// It would be nicer to open the replacement session first and swap under it, so a `say` never
+    /// meets a gap. **A real MUC refuses that.** SASL is `ANONYMOUS` here, so every connection is a
+    /// *different* anonymous JID, and two overlapping sessions asking for one nick is XEP-0045
+    /// §7.2.9's nickname conflict: the service answers `<conflict/>` and refuses the join
+    /// (`xmpp/session.rs` turns that into a join error). So the order is: mint first — pure HTTP,
+    /// touching neither the MUC nor the nick — then release the old session, then take the nick back
+    /// with the fresh token. The gap is one leave plus one handshake rather than three HTTP requests
+    /// plus a handshake.
+    ///
+    /// Two consequences the consumer can observe, and neither is hidden:
+    ///
+    /// - **`say` fails during the gap** with "not joined", rather than writing to a socket that is
+    ///   on its way out. The driver logs a failed send and stays in the room.
+    /// - **A replacement join that keeps failing ends the room.** There is no session left to fall
+    ///   back on once the nick has been released, so after [`JAAS_REJOIN_ATTEMPTS`] the consumer
+    ///   gets `Ended` — which is true, and better than a room flux is silently absent from.
+    ///
+    /// The handover is also not atomic: a service frees the nick when it *processes* our departure,
+    /// which can land after the replacement has already asked for it, so the replacement can meet
+    /// its own predecessor and be refused `<conflict/>`. Transient, and retried.
+    ///
+    /// What the consumer does *not* see is the refresh itself: the replacement's presence replay
+    /// repeats occupants it already knows, and a `Joined` for one of those is not news.
     async fn run(self, mut stream: RoomStream, mut refresh_after: Duration) {
         // Occupants the consumer has already been told about, so a re-join's replay is not a second
         // arrival. Note the honest limit: someone who left while we were between sessions is dropped
@@ -509,24 +576,109 @@ impl SessionPump {
                 }
             }
 
-            match mint_and_join(&self.config, &self.tokens, &self.identity).await {
-                Ok(joined) => {
-                    // Swap first, leave second: the old session must not be the current one for any
-                    // moment in which a `say` could reach it.
-                    let previous = { self.inner.lock().unwrap().replace(joined.room) };
-                    stream = joined.stream;
-                    refresh_after = joined.refresh_after;
-                    if let Some(previous) = previous {
-                        let _ = previous.leave().await;
-                    }
-                }
-                // The vendor is unreachable or refused. Keep the session we have — it is still valid
-                // until the expiry — and try again. If it does expire first the server ends the
-                // session and `Ended` reaches the consumer through the branch above.
+            // 1. Mint. Abandonable: it holds nothing, so a departure mid-flight just drops it.
+            let minted = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return,
+                minted = mint(&self.config, &self.tokens) => minted,
+            };
+            let (token, conference) = match minted {
+                Ok(minted) => minted,
+                // The vendor is unreachable or refused. Nothing has been given up yet — the session
+                // we have is still valid until the expiry — so keep it and try again. If it does
+                // expire first, the server ends it and `Ended` reaches the consumer above.
                 Err(e) => {
                     eprintln!("jaas: could not refresh the guest token, retrying: {e}");
                     refresh_after = JAAS_REFRESH_RETRY;
+                    continue;
                 }
+            };
+
+            // 2. Release the old session and its nick, then drain whatever it had buffered before
+            //    its stream is dropped.
+            let previous = { self.inner.lock().unwrap().take() };
+            if let Some(previous) = previous {
+                let _ = previous.leave().await;
+            }
+            if !self.drain(&mut stream, &mut known).await {
+                return;
+            }
+
+            // 3. Take the nick back with the fresh token.
+            let Some(joined) = self.rejoin(&token, conference).await else {
+                return;
+            };
+            stream = joined.stream;
+            refresh_after = joined.refresh_after;
+        }
+    }
+
+    /// The replacement join, retried while it fails. `None` once the room is over — because we were
+    /// told to leave, because the consumer went away, or because the join kept failing.
+    async fn rejoin(&self, token: &GuestToken, conference: Conference) -> Option<Joined> {
+        for attempt in 1..=JAAS_REJOIN_ATTEMPTS {
+            if self.cancel.is_cancelled() {
+                return None;
+            }
+            // Not raced against cancellation: a join that has completed owns a live socket, and
+            // dropping the future would leave cleaning it up to `Drop`. Letting it finish and then
+            // checking is deterministic, and `handshake_timeout` bounds how long that takes.
+            match join_minted(&self.config, token, conference.clone(), &self.identity).await {
+                Ok(joined) => {
+                    // Install it — unless we were told to leave while the handshake was in flight.
+                    // `JaasRoom::leave` cancels the token and *then* takes `inner`, so either signal
+                    // means the room is gone and this session is ours to close rather than to store.
+                    // Without this check it would sit in `inner` never left, and every later `join`
+                    // would answer "already joined" — the room permanently un-rejoinable.
+                    let departed = {
+                        let mut current = self.inner.lock().unwrap();
+                        if self.cancel.is_cancelled() {
+                            true
+                        } else {
+                            *current = Some(joined.room.clone());
+                            false
+                        }
+                    };
+                    if departed {
+                        let _ = joined.room.leave().await;
+                        return None;
+                    }
+                    return Some(joined);
+                }
+                Err(e) if attempt < JAAS_REJOIN_ATTEMPTS => {
+                    eprintln!("jaas: the replacement join failed, retrying: {e}");
+                    tokio::time::sleep(JAAS_REJOIN_BACKOFF).await;
+                }
+                Err(e) => {
+                    // The nick is already released; there is nothing to fall back to, so say so
+                    // rather than pretend the room is still ours.
+                    eprintln!("jaas: could not rejoin after refreshing the guest token: {e}");
+                    let _ = self.events.send(RoomEvent::Ended).await;
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Forward whatever the outgoing session had already buffered, before its stream is dropped.
+    ///
+    /// Without this, up to `DEFAULT_ROOM_EVENT_BUFFER` events — human messages among them — would go
+    /// silently missing at every refresh, and there is no replay path: the replacement session's MUC
+    /// history arrives `<delay/>`-marked and is dropped as history. `false` once the consumer is gone.
+    async fn drain(&self, stream: &mut RoomStream, known: &mut HashSet<OccupantId>) -> bool {
+        let deadline = tokio::time::Instant::now() + JAAS_DRAIN_BUDGET;
+        loop {
+            match tokio::time::timeout_at(deadline, stream.recv()).await {
+                // We ended that session on purpose; its ending is not news to the consumer.
+                Ok(Some(RoomEvent::Ended)) => continue,
+                Ok(Some(event)) => {
+                    if !self.forward(event, known).await {
+                        return false;
+                    }
+                }
+                Ok(None) => return true,
+                Err(_) => return true,
             }
         }
     }
@@ -559,13 +711,31 @@ impl JaasConfig {
     /// Build from the channel declaration's settings. `url`, when given, is the **signalling** base
     /// (`wss://8x8.vc`); the token service and conference service have their own fields, because on
     /// this backend they are three different hosts' worth of configuration rather than one endpoint.
-    pub(crate) fn from_settings(settings: &crate::config::RoomSettings) -> Self {
+    pub(crate) fn from_settings(settings: &crate::config::RoomSettings) -> StdResult<Self, String> {
+        // Refuse the `xmpp` backend's settings rather than accepting and dropping them. A declared
+        // `password secret "K"` that this backend silently ignores is worse than a load error: the
+        // operator believes a credential is in play and it never was.
+        for (name, declared) in [
+            ("domain", settings.domain.is_some()),
+            ("user", settings.user.is_some()),
+            ("password", settings.password.is_some()),
+            ("muc_password", settings.muc_password.is_some()),
+        ] {
+            if declared {
+                return Err(format!(
+                    "the `jaas` room backend does not take `{name}` — the stream domain comes from \
+                     the conference-request response, and SASL is ANONYMOUS with authorization on \
+                     the endpoint URL, so it would be silently ignored (use `backend = \"xmpp\"` \
+                     for a MUC that authenticates)"
+                ));
+            }
+        }
         let mut config = Self::new(settings.room.clone());
         if let Some(url) = settings.url.clone() {
             config.signalling = url;
         }
         config.private_net = PrivateNetAllow::from_legacy_bool(settings.allow_private_net);
-        config
+        Ok(config)
     }
 }
 

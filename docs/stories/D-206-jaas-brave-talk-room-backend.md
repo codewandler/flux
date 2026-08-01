@@ -87,7 +87,30 @@ zero-setup path for a human who already runs Brave Talk.
   never sees it. It is held out of logs structurally — redacting `Debug`, query-trimmed endpoints, no
   bodies in errors, `set_sensitive` on the Bearer header — but a tool that echoed it would not be
   scrubbed. Closing it needs `flux-secret` in the manifest and a redactor threaded to the channel.
-- **Next step:** own-tenant RS256 signing, as its own story and its own `JaasTokens` implementation.
+- **2026-08-01 — rework after review.** Two findings, both real:
+  - **`leave()` could strand a freshly joined session.** The pump only watched its cancellation token
+    inside the forwarding `select!`, so a `leave` landing during a refresh returned `Ok(())` and the
+    replacement was then installed into a room already left — joined, never left, and every later
+    `join` answering "already joined". Reachable on the *ordinary* shutdown path. Fixed by pairing
+    `leave`'s cancel-then-take with a re-check under the same lock before installing, and pinned by
+    `leaving_while_a_replacement_join_is_in_flight_does_not_strand_it` (verified to fail with the
+    guard removed, reporting exactly "a session was stranded in the room — jaas: already joined")
+    plus `leaving_while_a_token_mint_is_in_flight_abandons_it`.
+  - **The refresh overlapped two sessions on one nick, which a real MUC refuses.** Under SASL
+    `ANONYMOUS` each connection is a distinct anonymous JID, so the overlap is XEP-0045 §7.2.9's
+    nickname conflict. The suite could not see it because the double had no occupancy model. The
+    double now tracks nick ownership per connection and answers `<conflict/>` for a held nick
+    (pinned by `xmpp_room.rs::a_second_session_cannot_take_a_nick_the_first_still_holds`), and the
+    refresh was reordered to mint → release → re-take. Also learned from that: the handover is not
+    atomic — the service frees the nick when it *processes* the departure, so the replacement can
+    meet its own predecessor and is retried.
+- **Minor review items, all addressed:** the outgoing session's buffered events are now drained
+  rather than dropped; `read_json` caps incrementally instead of buffering the whole body first;
+  `config.rs`'s backend doc no longer says `jaas` is undeclarable; `ready` is `Option<bool>` so a
+  missing field reports a changed response shape rather than burning the retry budget; and `jaas`
+  now **refuses** `domain`/`user`/`password`/`muc_password` instead of silently dropping a declared
+  secret.
+- **Next step:** own-tenant RS256 signing (D-223), as its own `JaasTokens` implementation.
 
 ## Notes
 - **Acceptable use is an open question and gates this story's scope.** The endpoint is public and

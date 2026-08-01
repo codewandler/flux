@@ -62,7 +62,8 @@ impl RoomChannel {
             // `xmpp` underneath — all this adds is where the guest token comes from and what
             // happens when it expires three hours later.
             "jaas" => Arc::new(JaasRoom::new(
-                JaasConfig::from_settings(&settings),
+                JaasConfig::from_settings(&settings)
+                    .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", decl.name))?,
                 Arc::new(BraveTalkTokens::from_settings(&settings)),
             )),
             other => anyhow::bail!(

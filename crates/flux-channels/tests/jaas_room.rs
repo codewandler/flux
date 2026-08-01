@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine;
+use tokio::sync::Semaphore;
 
 use flux_channels::rooms::{
     Conference, GuestToken, JaasConfig, JaasRoom, JaasTokens, Room, RoomEvent, RoomIdentity,
@@ -72,9 +73,16 @@ fn rand_ish() -> usize {
 
 /// The token service, faked. Records every JWT it minted so a test can assert which one was dialled
 /// with, and mints with a short TTL so the 3 h refresh path is exercised in seconds.
+///
+/// `gate`, when set, holds every mint *after the first* until a test releases it. That is how the
+/// departure race is opened deliberately — a token service that answers instantly never opens it,
+/// which is exactly why that race shipped unnoticed.
 struct FakeTokens {
     ttl: Duration,
     minted: Mutex<Vec<String>>,
+    gate: Option<Arc<Semaphore>>,
+    /// How many mints have entered the gate. A test polls this to know the window is open.
+    blocked: Arc<AtomicUsize>,
 }
 
 impl FakeTokens {
@@ -82,7 +90,17 @@ impl FakeTokens {
         Self {
             ttl,
             minted: Mutex::new(Vec::new()),
+            gate: None,
+            blocked: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Hold every mint after the first until the returned gate is released.
+    fn gated(mut self) -> (Self, Arc<Semaphore>, Arc<AtomicUsize>) {
+        let gate = Arc::new(Semaphore::new(0));
+        self.gate = Some(gate.clone());
+        let blocked = self.blocked.clone();
+        (self, gate, blocked)
     }
 
     fn minted(&self) -> Vec<String> {
@@ -93,6 +111,13 @@ impl FakeTokens {
 #[async_trait]
 impl JaasTokens for FakeTokens {
     async fn guest_token(&self, room: &str) -> Result<GuestToken> {
+        if let Some(gate) = &self.gate {
+            let first = self.minted.lock().unwrap().is_empty();
+            if !first {
+                self.blocked.fetch_add(1, Ordering::SeqCst);
+                let _permit = gate.acquire().await.expect("the gate outlives the mint");
+            }
+        }
         let jwt = guest_jwt(room, self.ttl);
         self.minted.lock().unwrap().push(jwt.clone());
         GuestToken::parse(jwt)
@@ -159,8 +184,19 @@ async fn jaas_session_survives_token_expiry() {
         dialled[1]
     );
 
-    // Still joined: a message said after the expiry reaches the room over the new session.
-    room.say("still here").await.unwrap();
+    // Still joined: a message said after the expiry reaches the room over the new session. The
+    // replacement is joined a moment after its socket appears — and `say` refuses rather than
+    // writing into the gap, which is the documented behaviour — so this retries briefly.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match room.say("still here").await {
+            Ok(()) => break,
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                panic!("the room never became usable again after the refresh: {e}")
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
     double.wait_for(|f| f.contains("still here")).await;
 
     // And the consumer never noticed. A transparent refresh emits neither `Ended` nor a second
@@ -171,6 +207,125 @@ async fn jaas_session_survives_token_expiry() {
         "the refresh leaked an event to the consumer: {quiet:?}"
     );
 
+    room.leave().await.unwrap();
+}
+
+/// Poll until `f` holds, or panic. Used for the states that are settled by a background task.
+async fn until(what: &str, f: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !f() {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// How many MUC joins the room has been asked for — one per session that got as far as presence.
+fn muc_joins(double: &XmppDouble) -> usize {
+    double
+        .sent()
+        .iter()
+        .filter(|f| {
+            f.starts_with("<presence")
+                && f.contains("http://jabber.org/protocol/muc")
+                && !f.contains("type='unavailable'")
+        })
+        .count()
+}
+
+/// Join, tolerating the transient `<conflict/>` a not-yet-processed departure causes — but **never**
+/// `already joined`, which is the stranded-session bug and can never resolve by waiting.
+async fn join_eventually(room: &JaasRoom, what: &str) -> flux_channels::rooms::RoomStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match room.join(&RoomIdentity::agent("flux")).await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                let message = e.to_string();
+                assert!(
+                    !message.contains("already joined"),
+                    "{what}: a session was stranded in the room — {message}"
+                );
+                assert!(tokio::time::Instant::now() < deadline, "{what}: {message}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn leaving_while_a_token_mint_is_in_flight_abandons_it() {
+    let double = XmppDouble::start().await;
+    let (tokens, gate, blocked) = FakeTokens::with_ttl(Duration::from_secs(3)).gated();
+    let tokens = Arc::new(tokens);
+    let room = room_for(&double, tokens.clone(), Duration::from_secs(2));
+
+    let mut stream = room.join(&RoomIdentity::agent("flux")).await.unwrap();
+    drain_replay(&mut stream).await;
+
+    // The refresh has fired and is inside the token service, which is not going to answer yet.
+    until("the refresh to reach the token service", || {
+        blocked.load(Ordering::SeqCst) > 0
+    })
+    .await;
+
+    // `leave()` here is `RoomTurnDriver`'s ordinary shutdown path: it breaks on cancellation and
+    // then leaves the room.
+    room.leave().await.unwrap();
+    gate.add_permits(10);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A mint we no longer need is abandoned rather than joined with.
+    assert_eq!(
+        tokens.minted().len(),
+        1,
+        "the abandoned mint must not have produced a session"
+    );
+    assert_eq!(double.connections().len(), 1, "nothing else was dialled");
+    let _ = join_eventually(&room, "after leaving mid-mint").await;
+    room.leave().await.unwrap();
+}
+
+#[tokio::test]
+async fn leaving_while_a_replacement_join_is_in_flight_does_not_strand_it() {
+    let double = XmppDouble::start().await;
+    let tokens = Arc::new(FakeTokens::with_ttl(Duration::from_secs(3)));
+    let room = room_for(&double, tokens.clone(), Duration::from_secs(2));
+
+    let mut stream = room.join(&RoomIdentity::agent("flux")).await.unwrap();
+    drain_replay(&mut stream).await;
+
+    // The window the review found: the token has been minted, the old session released, and the
+    // replacement join is in flight — held here, mid-handshake, so `leave()` lands inside it.
+    double.hold_new_connections();
+    until("the replacement join to reach the server", || {
+        double.connections().len() == 2
+    })
+    .await;
+
+    room.leave().await.unwrap();
+    double.release();
+
+    // Wait for the replacement to actually finish joining before asking anything of the room.
+    // Without this the test races the pump: it could re-join *before* the stranded session was
+    // installed, and pass while the bug is present.
+    until("the replacement join to complete", || {
+        muc_joins(&double) == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // The replacement completes into a room that no longer wants it. It must be left, not installed:
+    // installed, it would sit in `inner` never left, and every later `join` would answer
+    // "already joined" — the room permanently un-rejoinable.
+    let mut rejoined = join_eventually(&room, "after leaving mid-join").await;
+    drain_replay(&mut rejoined).await;
+
+    // And the nick really is ours again rather than held by something nobody left: a full
+    // leave/join round-trip only completes if no stranded session is still occupying it.
+    room.leave().await.unwrap();
+    let _ = join_eventually(&room, "after a clean leave").await;
     room.leave().await.unwrap();
 }
 
