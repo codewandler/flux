@@ -34,7 +34,7 @@ pub use datasource::{
     HarnessHistory, HarnessIngestReport, HarnessSelector, LiveAccess, LiveDatasource,
     LiveDatasourceSurface, MarkdownBoard, MemoryBackend, MemoryBoard, MemoryVectorStore,
     SemanticIndex, SqliteBackend, VectorStore, WorkBoard, WorkBoardSurface, HARNESS_MESSAGE_ENTITY,
-    HARNESS_SESSION_ENTITY, HARNESS_SESSION_REL, HARNESS_SOURCE,
+    HARNESS_SESSION_ENTITY, HARNESS_SESSION_REL, HARNESS_SOURCE, MAX_LIVE_SESSION_ENVELOPES,
 };
 pub use endpoint::{
     endpoint_tools, register_endpoint_ops, try_register_endpoint_ops, CredentialReader,

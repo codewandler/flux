@@ -737,6 +737,10 @@ fn every_message_record_carries_the_harness_it_came_from() {
 struct RecordingBackend {
     inner: MemoryBackend,
     batches: std::sync::Mutex<Vec<usize>>,
+    /// Per upsert call, the `(entity, session address)` of every record in it — the raw material
+    /// for measuring live envelope retention from *outside* ingest (C-316). A message's session
+    /// address is the link it carries; an envelope's is its own id.
+    addressed: std::sync::Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl RecordingBackend {
@@ -744,6 +748,7 @@ impl RecordingBackend {
         Self {
             inner: MemoryBackend::new(),
             batches: std::sync::Mutex::new(Vec::new()),
+            addressed: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -760,11 +765,49 @@ impl RecordingBackend {
     fn batches(&self) -> Vec<usize> {
         self.batches.lock().unwrap().clone()
     }
+
+    /// The most session envelopes ingest can be shown to have held live at one moment, replayed
+    /// from the upsert stream alone.
+    ///
+    /// An envelope is live from the moment its session's first message is projected until the
+    /// envelope record is handed over. Both events are visible here — messages and envelopes drain
+    /// through the same buffer — so `sessions seen − envelopes released`, maximized over the stream,
+    /// is that count. Measured rather than self-reported on purpose: a number ingest keeps about
+    /// itself can drift from the set it describes, and that drift is precisely how C-215's
+    /// materialize-everything bug survived a flush-count test.
+    fn peak_live_session_envelopes(&self) -> usize {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut released: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut peak = 0usize;
+        for call in self.addressed.lock().unwrap().iter() {
+            for (entity, address) in call {
+                if entity == HARNESS_MESSAGE_ENTITY {
+                    seen.insert(address.clone());
+                } else if entity == HARNESS_SESSION_ENTITY {
+                    released.insert(address.clone());
+                }
+            }
+            peak = peak.max(seen.difference(&released).count());
+        }
+        peak
+    }
 }
 
 impl DatasourceBackend for RecordingBackend {
     fn upsert(&self, records: &[Record]) -> flux_core::Result<()> {
         self.batches.lock().unwrap().push(records.len());
+        self.addressed.lock().unwrap().push(
+            records
+                .iter()
+                .map(|r| {
+                    let address = match r.links.first() {
+                        Some(link) if r.entity == HARNESS_MESSAGE_ENTITY => link.target_id.clone(),
+                        _ => r.id.clone(),
+                    };
+                    (r.entity.clone(), address)
+                })
+                .collect(),
+        );
         self.inner.upsert(records)
     }
     fn search(&self, input: &SearchInput) -> flux_core::Result<Vec<Match>> {
@@ -852,6 +895,126 @@ fn ingest_never_holds_more_than_one_batch_of_records() {
     );
 
     let _ = fs::remove_dir_all(home);
+}
+
+/// An opencode database in the **drifted** schema C-216 found: a `message` table with no
+/// `session_id` column, no `session` table, and no `sessionID` in `message.data`. Every message
+/// therefore falls back to its own id as its session id, and sessions scale 1:1 with messages.
+///
+/// One transaction, because `count` is deliberately larger than the envelope cap.
+fn degenerate_opencode_home(name: &str, count: usize) -> (PathBuf, HarnessEnv) {
+    let home = scratch(name);
+    let opencode = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode).unwrap();
+    let conn = rusqlite::Connection::open(opencode.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "create table message (id text primary key, time_created integer, data text not null);
+         create table part (id text primary key, message_id text, time_created integer,
+                            data text not null);
+         begin;",
+    )
+    .unwrap();
+    for i in 0..count {
+        conn.execute(
+            "insert into message values (?1, ?2, ?3)",
+            rusqlite::params![
+                format!("m-{i:06}"),
+                i as i64,
+                json!({"role": "user"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into part values (?1, ?2, 0, ?3)",
+            rusqlite::params![
+                format!("p-{i:06}"),
+                format!("m-{i:06}"),
+                json!({"type": "text", "text": format!("message {i} about the retry wrapper")})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("commit;").unwrap();
+    let env = HarnessEnv::empty().with("HOME", &home);
+    (home, env)
+}
+
+fn ingest_degenerate(env: &HarnessEnv) -> Arc<RecordingBackend> {
+    let backend = Arc::new(RecordingBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    ingest_harness_history(
+        &*dynamic,
+        &HarnessHistory::enabled_for([HarnessKind::Opencode]).with_env(env.clone()),
+        &Redactor::new(),
+    )
+    .unwrap();
+    backend
+}
+
+/// C-316's acceptance: **envelope retention is a constant of ingest, not a function of the
+/// transcript** — on the one schema where "one session" means "one message".
+///
+/// C-215 held one envelope per session for a whole scan and justified it with a ratio (sessions are
+/// orders of magnitude rarer than messages). The ratio belongs to the harness *schema*; this is the
+/// schema that does not have it, and before the cap the retained set was the whole transcript. That
+/// is C-215's own shipped defect in a second place: a memory bound asserted in a comment that no
+/// code enforced.
+///
+/// The statement is made **without naming the cap**, on purpose: doubling the messages must not move
+/// the peak at all. A build with no cap answers 5 000 and 10 000 here; a build whose cap is a
+/// different number than this test expects still passes, because the property is the absence of
+/// scaling, not the value of the constant.
+#[test]
+fn session_envelope_retention_does_not_scale_with_message_count() {
+    const SMALL: usize = 5_000;
+    const LARGE: usize = 10_000;
+
+    let (small_home, small_env) = degenerate_opencode_home("envelope-cap-small", SMALL);
+    let small = ingest_degenerate(&small_env);
+    let (large_home, large_env) = degenerate_opencode_home("envelope-cap-large", LARGE);
+    let large = ingest_degenerate(&large_env);
+
+    // The fallback really fired: every message is its own session, in both scans.
+    assert_eq!(
+        records_of(&small, HARNESS_SESSION_ENTITY),
+        SMALL,
+        "the drifted schema gives one session per message"
+    );
+    assert_eq!(records_of(&large, HARNESS_SESSION_ENTITY), LARGE);
+
+    let small_peak = small.peak_live_session_envelopes();
+    let large_peak = large.peak_live_session_envelopes();
+    assert_eq!(
+        small_peak, large_peak,
+        "twice the messages, twice the retention: peak envelopes went {small_peak} -> {large_peak}"
+    );
+    assert!(
+        large_peak < LARGE,
+        "retention must be bounded by ingest, not by the transcript: {large_peak}"
+    );
+    // Flushed, not dropped: bounding retention must not cost a session its record.
+    assert_eq!(
+        large.len(),
+        LARGE * 2,
+        "every message and every session envelope is still in the index"
+    );
+
+    let _ = fs::remove_dir_all(small_home);
+    let _ = fs::remove_dir_all(large_home);
+}
+
+/// How many records of `entity` the backend holds.
+fn records_of(backend: &RecordingBackend, entity: &str) -> usize {
+    backend
+        .list(&ListInput {
+            source: HARNESS_SOURCE.to_string(),
+            entity: Some(entity.to_string()),
+            limit: Some(usize::MAX),
+            ..Default::default()
+        })
+        .unwrap()
+        .len()
 }
 
 // ---------------------------------------------------------------------------------------------

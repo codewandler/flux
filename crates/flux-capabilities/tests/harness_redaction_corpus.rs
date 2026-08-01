@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 use codewandler_flux_capabilities::datasource::{
     datasource_tools_with_history, ingest_harness_history, DatasourceBackend, HarnessHistory,
     MemoryBackend, HARNESS_MESSAGE_ENTITY, HARNESS_SESSION_ENTITY, HARNESS_SOURCE,
+    MAX_LIVE_SESSION_ENVELOPES,
 };
 use codewandler_flux_capabilities::harness::{
     claude_messages, codex_messages, opencode_messages, HarnessEnv, HarnessKind, HarnessMessage,
@@ -2041,35 +2042,27 @@ fn the_per_message_byte_ceiling_is_enforced_on_every_adapter() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// C-215's lesson, as far as the corpus *can* observe it: ingest holds one session envelope per
-/// session for the whole scan, and there is a real schema in which "one session" means "one
-/// message".
-///
-/// opencode with no `session_id` column and no `sessionID` in `message.data` falls back to the
-/// message's own id, so envelopes scale with messages rather than with sessions. The corpus states
-/// the ratio rather than asserting an OOM — the retention is real, the bound the ingest's own
-/// comment claims ("three to five orders of magnitude fewer") is a property of the *schema*, not of
-/// the code.
-#[test]
-fn session_envelope_retention_is_bounded_by_sessions_only_when_the_schema_has_them() {
-    let home = scratch("envelopes");
+/// An opencode database in the **drifted** schema: a `message` table with neither a `session_id`
+/// column nor a `session` table, and no `sessionID` in `message.data`. Every message falls back to
+/// its own id as its session id. Everything about opencode's schema is probed rather than assumed
+/// for exactly this reason.
+fn drifted_opencode_home(name: &str, messages: usize) -> (PathBuf, HarnessEnv) {
+    let home = scratch(name);
     let opencode = home.join(".local").join("share").join("opencode");
     fs::create_dir_all(&opencode).unwrap();
     let conn = rusqlite::Connection::open(opencode.join("opencode.db")).unwrap();
-    // The drifted schema: a `message` table with neither a `session_id` column nor a `session`
-    // table. Everything about opencode's schema is probed rather than assumed for this reason.
     conn.execute_batch(
         "create table message (id text primary key, time_created integer, data text not null);
          create table part (id text primary key, message_id text, time_created integer,
-                            data text not null);",
+                            data text not null);
+         begin;",
     )
     .unwrap();
-    const MESSAGES: usize = 40;
-    for i in 0..MESSAGES {
+    for i in 0..messages {
         conn.execute(
             "insert into message values (?1, ?2, ?3)",
             rusqlite::params![
-                format!("m-{i:03}"),
+                format!("m-{i:06}"),
                 i as i64,
                 json!({"role": "user"}).to_string()
             ],
@@ -2078,15 +2071,91 @@ fn session_envelope_retention_is_bounded_by_sessions_only_when_the_schema_has_th
         conn.execute(
             "insert into part values (?1, ?2, 0, ?3)",
             rusqlite::params![
-                format!("p-{i:03}"),
-                format!("m-{i:03}"),
+                format!("p-{i:06}"),
+                format!("m-{i:06}"),
                 json!({"type": "text", "text": format!("message {i}")}).to_string()
             ],
         )
         .unwrap();
     }
-
+    conn.execute_batch("commit;").unwrap();
     let env = HarnessEnv::empty().with("HOME", &home);
+    (home, env)
+}
+
+/// C-316: the retention this corpus found is now **bounded by ingest**, on the very schema that used
+/// to make it scale with the transcript.
+///
+/// This test used to *state* the ratio: opencode with no session identity falls back to the message's
+/// own id, so envelopes scaled 1:1 with messages, and the bound C-215's comment claimed ("three to
+/// five orders of magnitude fewer sessions than messages") was a property of the harness schema
+/// rather than of any code. It now asserts the bound instead. The schema property is still asserted —
+/// the fallback must really fire, or the bound would hold for the wrong reason — but it is the
+/// *premise* here, not the conclusion.
+#[test]
+fn session_envelope_retention_is_bounded_by_ingest_not_by_the_harness_schema() {
+    // Deliberately over the cap: a limit no test overflows is a declaration, not a bound.
+    const MESSAGES: usize = MAX_LIVE_SESSION_ENVELOPES + 900;
+    let (home, env) = drifted_opencode_home("envelopes", MESSAGES);
+
+    let backend = Arc::new(MemoryBackend::new());
+    let dynamic: Arc<dyn DatasourceBackend> = backend.clone();
+    let report = ingest_harness_history(
+        &*dynamic,
+        &HarnessHistory::enabled_for([HarnessKind::Opencode]).with_env(env),
+        &Redactor::new(),
+    )
+    .unwrap();
+
+    // The premise: the fallback fired, so this really is one session per message.
+    assert_eq!(report.records(), MESSAGES);
+    assert_eq!(
+        report.sessions(),
+        MESSAGES,
+        "on a schema with no session identity every message is its own session"
+    );
+
+    // The conclusion: ingest never held more than the cap of them at once.
+    assert_eq!(
+        report.peak_session_envelopes(),
+        MAX_LIVE_SESSION_ENVELOPES,
+        "the cap is reached (so it is genuinely overflowed here) and never passed"
+    );
+    assert_eq!(
+        report.sessions_evicted(),
+        MESSAGES - MAX_LIVE_SESSION_ENVELOPES,
+        "every session past the cap was flushed early, and the report says so"
+    );
+
+    // Flushed, not dropped: bounding retention costs no session its record. Each of the evicted
+    // envelopes is still addressable, including the first one out.
+    assert_eq!(
+        records_of(&backend, HARNESS_SESSION_ENTITY).len(),
+        MESSAGES,
+        "an evicted envelope reaches the index rather than being discarded"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+/// The retention C-316's cap does **not** cover, stated rather than assumed away — C-216's own
+/// discipline applied to the story that came out of it.
+///
+/// Each adapter keeps a `session id -> ordinal` map for the length of a scan, to give a message its
+/// index within its session (`harness::opencode`'s `ordinals`, and the same in the claude-code and
+/// codex adapters). It is keyed by exactly the identifier this schema degenerates, so on this input
+/// it grows one entry per *message* — which `MAX_LIVE_SESSION_ENVELOPES` does nothing about, because
+/// it bounds ingest's map and not the adapter's.
+///
+/// The ratio is what is observable from out here: `report.sessions()` is the number of distinct
+/// session ids the adapter fed in, and therefore the size its ordinal map reached. Bounding *that*
+/// trades a memory bound for silently colliding record ids — an evicted ordinal restarts at 0, so
+/// two different messages address the same record — so it belongs in its own story, with C-214's
+/// blast radius, not in a quiet edit here.
+#[test]
+fn the_adapter_ordinal_map_is_a_retention_this_cap_does_not_cover() {
+    const MESSAGES: usize = 40;
+    let (home, env) = drifted_opencode_home("adapter-ordinals", MESSAGES);
     let dynamic: Arc<dyn DatasourceBackend> = Arc::new(MemoryBackend::new());
     let report = ingest_harness_history(
         &*dynamic,
@@ -2095,12 +2164,15 @@ fn session_envelope_retention_is_bounded_by_sessions_only_when_the_schema_has_th
     )
     .unwrap();
 
-    assert_eq!(report.records(), MESSAGES);
     assert_eq!(
         report.sessions(),
         MESSAGES,
-        "on a schema with no session identity, envelope retention scales with messages — the one \
-         retention in `ingest_harness_history` that the scan budget does not bound"
+        "one distinct session id per message is one adapter ordinal entry per message"
+    );
+    assert!(
+        report.peak_session_envelopes() <= MAX_LIVE_SESSION_ENVELOPES,
+        "ingest's own retention is the half that is bounded: {}",
+        report.peak_session_envelopes()
     );
 
     let _ = fs::remove_dir_all(home);
