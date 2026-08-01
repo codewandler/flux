@@ -48,10 +48,10 @@ compile or infrastructure failure in whatever diff is being merged.
   running concurrently: `cargo test --workspace` exited 101 having run 46 tests, with a truncated log
   and no error line. A clean re-run gave 3392 passed / 0 failed. Two independent hits in one session
   is not a curiosity; it is a tax on every merge in a multi-session repo.
-- ⚠ This is the same family as
-  [`tmp-git-flaky-sticky-test`](../../CLAUDE.md) — a test whose result depends on machine state
-  outside the repository. The general rule worth stating in the fix: a unit test may not read the
-  operator's home.
+- ⚠ This is the same family as the `/tmp/.git` sticky-test flake — a test whose result depends on
+  machine state outside the repository. (That one is an operator-machine note, not a repo artifact;
+  this repo has no root `CLAUDE.md`, so the link that used to point at one is gone — C-332.) The
+  general rule worth stating in the fix: a unit test may not read the operator's home.
 - Related: [C-213](C-213-extract-harness-adapters.md) found it and named the fix shape.
 
 ## The scan (Acceptance 3) — plainly: yes, there are many others

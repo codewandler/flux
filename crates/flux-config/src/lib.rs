@@ -1036,9 +1036,13 @@ impl Config {
     }
 }
 
+/// The user config under an *explicitly passed* home (C-332). `None` means "this fixture has no
+/// user layer" — which is what every test that only exercises the project layer wants, and what
+/// reading process `HOME` silently failed to give it: the operator's real `~/.flux/config.toml`
+/// merged under every fixture, so the verdict depended on the machine rather than the fixture.
 #[cfg(test)]
-fn home_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".flux").join("config.toml"))
+fn home_config_path(home: Option<&Path>) -> Option<PathBuf> {
+    home.map(|h| h.join(".flux").join("config.toml"))
 }
 
 /// Resolve the project config's lexical path against the canonical workspace and reject any
@@ -1481,10 +1485,18 @@ fn merge_static_endpoints(
     out
 }
 
-/// Load and merge `~/.flux/config.toml` (user) then `<cwd>/.flux/config.toml` (project).
+/// Load and merge the project config at `<cwd>/.flux/config.toml` with **no** user layer.
 #[cfg(test)]
 fn load(cwd: &Path) -> Result<Config> {
-    let user = match home_config_path() {
+    load_in(cwd, None)
+}
+
+/// [`load`] with an explicitly pinned home (C-332): merges `<home>/.flux/config.toml` (user) then
+/// `<cwd>/.flux/config.toml` (project). Mirrors `flux_runtime::metadata::load_config_in`, whose
+/// `DiscoveryEnv` this crate (L0) cannot depend on — the idiom is the same value-held home.
+#[cfg(test)]
+fn load_in(cwd: &Path, home: Option<&Path>) -> Result<Config> {
+    let user = match home_config_path(home) {
         Some(p) => read_optional(&p)?.unwrap_or_default(),
         None => Config::default(),
     };
@@ -1573,9 +1585,10 @@ pub fn groups_from_sources(
     Ok(merge_groups(parse(user)?, parse(project)?))
 }
 
+/// The user group manifest under an *explicitly passed* home — see [`home_config_path`] (C-332).
 #[cfg(test)]
-fn home_groups_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".flux").join("groups.toml"))
+fn home_groups_path(home: Option<&Path>) -> Option<PathBuf> {
+    home.map(|h| h.join(".flux").join("groups.toml"))
 }
 
 #[cfg(test)]
@@ -1588,8 +1601,14 @@ fn project_groups_path(cwd: &Path) -> PathBuf {
 /// malformed file is skipped (a warning is printed) rather than failing the session.
 #[cfg(test)]
 fn load_groups(cwd: &Path) -> Vec<flux_evidence::ToolGroup> {
+    load_groups_in(cwd, None)
+}
+
+/// [`load_groups`] with an explicitly pinned home (C-332) — see [`load_in`].
+#[cfg(test)]
+fn load_groups_in(cwd: &Path, home: Option<&Path>) -> Vec<flux_evidence::ToolGroup> {
     let mut out: Vec<flux_evidence::ToolGroup> = Vec::new();
-    let paths = home_groups_path()
+    let paths = home_groups_path(home)
         .into_iter()
         .chain(std::iter::once(project_groups_path(cwd)));
     for p in paths {
@@ -1632,6 +1651,14 @@ pub fn merge_groups(
 
 /// Serializes the tests that repoint `HOME` — the process env is shared across parallel test
 /// threads, so two concurrent `set_var("HOME", …)` tests race and flake.
+///
+/// C-332 left exactly **three** holders, and only for the one thing a value cannot express here:
+/// `Config::skill_dir_paths` / `workspace_add_dirs` / `sandbox_writable` expand a leading `~/`
+/// against process `HOME` in *production*, so the tests asserting that expansion must repoint it.
+/// Every other config test now pins its user layer by value through [`load_in`] and takes no lock.
+/// If that production expansion ever grows its own seam (C-392), this lock goes with it — a lock
+/// nobody takes is worse than none, because the next test copies the pattern from a test that no
+/// longer needs it.
 #[cfg(test)]
 static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1657,9 +1684,7 @@ surface_when = [{ kind = "project.signal", signal = "custom" }]
 "#,
         )
         .unwrap();
-        // HOME points elsewhere so only the project file is read.
-        let _home = crate::HOME_LOCK.lock().unwrap();
-        std::env::set_var("HOME", dir.join("nohome"));
+        // No user layer at all, pinned by value — so only the project file is read (C-332).
         let cfg = load_groups(&dir);
         assert!(cfg
             .iter()
@@ -2149,8 +2174,6 @@ actions = ["workspace.read"]
     fn scoped_private_net_grants_parse_and_merge() {
         let project = temp_dir();
         let home = temp_dir();
-        let _home = crate::HOME_LOCK.lock().unwrap();
-        std::env::set_var("HOME", &home);
         std::fs::write(
             home.join(".flux").join("config.toml"),
             r#"
@@ -2175,7 +2198,7 @@ gitlab = true
 "#,
         );
 
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         assert_eq!(cfg.web_private_hosts(), vec!["localhost", "127.0.0.1"]);
         assert_eq!(
             cfg.plugin_private_hosts("prometheus"),
@@ -2192,8 +2215,6 @@ gitlab = true
     fn per_endpoint_grant_merges_with_plugin_level() {
         let project = temp_dir();
         let home = temp_dir();
-        let _home = crate::HOME_LOCK.lock().unwrap();
-        std::env::set_var("HOME", &home);
         write_project(
             &project,
             r#"
@@ -2205,7 +2226,7 @@ gitlab = ["gitlab.internal"]
 "#,
         );
 
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         // The declared endpoint merges its own grant on top of the plugin-level grant.
         assert_eq!(
             cfg.endpoint_private_hosts("gitlab", "api.endpoint"),
@@ -2233,8 +2254,6 @@ gitlab = ["gitlab.internal"]
 
         let project = temp_dir();
         let home = temp_dir();
-        let _home = crate::HOME_LOCK.lock().unwrap();
-        std::env::set_var("HOME", &home);
         std::fs::write(
             home.join(".flux").join("config.toml"),
             "[server]\na2a_session_ttl_secs = 120\n",
@@ -2242,13 +2261,13 @@ gitlab = ["gitlab.internal"]
         .unwrap();
 
         // User-only: the user value beats the default.
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         assert_eq!(cfg.a2a_session_ttl_secs(), 120);
 
         // Project sets the disable value 0: it overrides the user's 120 (an explicit 0 is a
         // real setting, not "absent" — `Some(0)` must survive the merge).
         write_project(&project, "[server]\na2a_session_ttl_secs = 0\n");
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         assert_eq!(cfg.server.a2a_session_ttl_secs, Some(0));
         assert_eq!(cfg.a2a_session_ttl_secs(), 0, "0 = never prune");
 
@@ -2260,8 +2279,6 @@ gitlab = ["gitlab.internal"]
     fn daemon_resource_budgets_merge_project_over_user() {
         let project = temp_dir();
         let home = temp_dir();
-        let _home = crate::HOME_LOCK.lock().unwrap();
-        std::env::set_var("HOME", &home);
         std::fs::write(
             home.join(".flux").join("config.toml"),
             "[server]\nrequests_per_minute = 10\nmax_inflight_per_principal = 2\n\
@@ -2273,7 +2290,7 @@ gitlab = ["gitlab.internal"]
             "[server]\nrequests_per_minute = 20\nprovider_spend_usd_per_day = 1.5\n",
         );
 
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         assert_eq!(cfg.server.requests_per_minute, Some(20));
         assert_eq!(cfg.server.max_inflight_per_principal, Some(2));
         assert_eq!(cfg.server.provider_calls_per_day, Some(100));
@@ -2299,7 +2316,7 @@ gitlab = ["gitlab.internal"]
         .unwrap();
         write_project(&project, "[skills]\ndirs = [\"team-skills\", \"shared\"]\n");
 
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         assert_eq!(
             cfg.skills.dirs,
             vec!["team-skills", "shared", "~/global-skills"],
@@ -2334,7 +2351,7 @@ gitlab = ["gitlab.internal"]
             "[workspace]\nadd_dirs = [\"/data/shared\"]\nallow_all = true\n",
         );
 
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         assert_eq!(
             cfg.workspace.add_dirs,
             vec!["/data/shared", "~/refs"],
@@ -2371,7 +2388,7 @@ gitlab = ["gitlab.internal"]
             "[sandbox]\nenabled = true\nnetwork = false\nwritable = [\"/data/out\"]\n",
         );
 
-        let cfg = load(&project).unwrap();
+        let cfg = load_in(&project, Some(&home)).unwrap();
         // The user's `require` survives even though the project only set `enabled`.
         assert!(cfg.sandbox_enabled());
         assert!(cfg.sandbox_require(), "user require is not lost");

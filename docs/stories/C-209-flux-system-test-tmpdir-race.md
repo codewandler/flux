@@ -101,8 +101,10 @@ Observed victims so far (the set is open, which is itself the symptom):
 - The `COUNTER`/PID naming scheme is fine and is **not** the problem — names do not collide. The
   problem is the *root* the names hang off, which is why it presents as a vanishing directory rather
   than as a clash.
-- Not to be confused with [[tmp-git-flaky-sticky-test]] (a stray `/tmp/.git` making a flux-flow test
-  sticky) or with ENOSPC-masquerading-as-cargo-errors under disk pressure. Both were separately ruled
+- Not to be confused with the `/tmp/.git` sticky-test flake (a stray `/tmp/.git` making a flux-flow
+  test sticky — an operator-machine note, not a repo artifact; the wiki-style link that used to
+  appear here resolved to nothing in this repo, C-332) or with
+  ENOSPC-masquerading-as-cargo-errors under disk pressure. Both were separately ruled
   out on 2026-07-29: `/tmp/.git` did not exist, and the failures reproduced with ample free disk.
 - Related evidence: C-207's implementor measured 1 failure in 15 runs on its branch and 1 in 20 on
   the merge base — different tests each time, which is what pointed at a shared-environment race

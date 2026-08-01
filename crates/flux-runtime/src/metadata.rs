@@ -15,8 +15,8 @@ use flux_system::{System, Workspace};
 const PROJECT_CONFIG: &str = ".flux/config.toml";
 const PROJECT_GROUPS: &str = ".flux/groups.toml";
 
-/// The environment user-global discovery reads: just `HOME`, the root under which the well-known
-/// `~/.flux`, `~/.agents` and `~/.claude` trees live.
+/// The environment user-global discovery **and** user-global configuration read: just `HOME`, the
+/// root under which the well-known `~/.flux`, `~/.agents` and `~/.claude` trees live.
 ///
 /// Held as a value rather than read from `std::env` at each site, mirroring `flux-capabilities`'
 /// `HarnessEnv` (C-213). The reason is the same: process-global env is shared across parallel test
@@ -70,6 +70,19 @@ impl DiscoveryEnv {
             .flat_map(|home| [home.join(".flux/commands"), home.join(".claude/commands")])
             .collect()
     }
+
+    /// The home directory itself, when there is one. Needed by the surfaces that write back into
+    /// it (`persist_user_theme`) rather than merely reading a well-known subtree.
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    /// The trusted user-global state root, `~/.flux` — where `config.toml` and `groups.toml` live.
+    /// `None` when there is no home, which is what makes an empty [`DiscoveryEnv`] a *config*
+    /// fixture too: [`load_config_in`] then consults the managed and project layers only (C-332).
+    fn flux_root(&self) -> Option<PathBuf> {
+        self.home.as_ref().map(|home| home.join(".flux"))
+    }
 }
 
 /// Build the deliberately non-widened system used for automatic repository metadata.
@@ -81,11 +94,10 @@ fn trusted_root(path: &Path) -> Result<Option<System>> {
     Ok(Workspace::new_optional(path)?.map(System::new))
 }
 
-fn trusted_flux_root() -> Result<Option<(PathBuf, System)>> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+fn trusted_flux_root(env: &DiscoveryEnv) -> Result<Option<(PathBuf, System)>> {
+    let Some(root) = env.flux_root() else {
         return Ok(None);
     };
-    let root = home.join(".flux");
     Ok(trusted_root(&root)?.map(|system| (root, system)))
 }
 
@@ -136,10 +148,13 @@ fn managed_config_text() -> Result<Option<String>> {
 /// parsing or merging them. Shared by [`load_config`] (which merges) and [`config_layers`] (which
 /// hands back the raw per-layer texts for provenance reporting — e.g. `flux doctor`'s "config
 /// provenance" check, C-165).
-fn read_config_texts(cwd: &Path) -> Result<(Option<String>, Option<String>, Option<String>)> {
+fn read_config_texts(
+    cwd: &Path,
+    env: &DiscoveryEnv,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
     let project = project_system(cwd)?;
     let project_text = project.read_optional_text(PROJECT_CONFIG)?;
-    let trusted = trusted_flux_root()?;
+    let trusted = trusted_flux_root(env)?;
     let user_text = trusted
         .as_ref()
         .map(|(_, system)| system.read_optional_text("config.toml"))
@@ -154,7 +169,18 @@ fn read_config_texts(cwd: &Path) -> Result<(Option<String>, Option<String>, Opti
 /// narrows what user/project may do further — see `flux_config::from_sources_with_managed`).
 /// Missing files are harmless; guard, parse, and pin-violation failures are loud.
 pub fn load_config(cwd: &Path) -> Result<flux_config::Config> {
-    let (managed_text, user_text, project_text) = read_config_texts(cwd)?;
+    load_config_in(cwd, &DiscoveryEnv::from_process())
+}
+
+/// [`load_config`] against an explicit [`DiscoveryEnv`] rather than the process's own (C-332).
+///
+/// The user layer is `<env home>/.flux/config.toml`, so a test pins an empty or fixture home here
+/// instead of depending on — or mutating — process-global `HOME`. Without this seam a config test's
+/// verdict is a function of the operator's `~/.flux/config.toml`: an operator who sets `model`
+/// there flips `load_config_reads_flux_managed_config_env_override` from green to red, and the
+/// failure looks exactly like a real regression in whatever diff is in flight.
+pub fn load_config_in(cwd: &Path, env: &DiscoveryEnv) -> Result<flux_config::Config> {
+    let (managed_text, user_text, project_text) = read_config_texts(cwd, env)?;
 
     flux_config::from_sources_with_managed(
         managed_text
@@ -178,7 +204,20 @@ pub fn config_layers(
     flux_config::Config,
     flux_config::Config,
 )> {
-    let (managed_text, user_text, project_text) = read_config_texts(cwd)?;
+    config_layers_in(cwd, &DiscoveryEnv::from_process())
+}
+
+/// [`config_layers`] against an explicit [`DiscoveryEnv`] rather than the process's own — the same
+/// seam, and for the same reason, as [`load_config_in`] (C-332).
+pub fn config_layers_in(
+    cwd: &Path,
+    env: &DiscoveryEnv,
+) -> Result<(
+    flux_config::Config,
+    flux_config::Config,
+    flux_config::Config,
+)> {
+    let (managed_text, user_text, project_text) = read_config_texts(cwd, env)?;
     let parse = |source: Option<(&str, &str)>| -> Result<flux_config::Config> {
         source
             .map(|(name, text)| flux_config::parse_source(name, text))
@@ -215,13 +254,20 @@ pub fn persist_allow_rules(cwd: &Path, rules: &[String]) -> Result<()> {
 /// preference, so user-level rather than project-level), round-tripping every other setting via
 /// `flux-config`'s pure serializer. Creates `~/.flux` on first use.
 pub fn persist_user_theme(theme: &str) -> Result<()> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    persist_user_theme_in(theme, &DiscoveryEnv::from_process())
+}
+
+/// [`persist_user_theme`] against an explicit [`DiscoveryEnv`] rather than the process's own
+/// (C-332) — the write counterpart of [`load_config_in`], so a test can point the write at a
+/// fixture home instead of creating `~/.flux` in the operator's real one.
+pub fn persist_user_theme_in(theme: &str, env: &DiscoveryEnv) -> Result<()> {
+    let Some(home) = env.home().map(PathBuf::from) else {
         return Err(Error::Config("HOME is not set".into()));
     };
     // First use (`~/.flux` absent, so `trusted_flux_root` is None): write through a `System`
     // confined to `$HOME` — `write_file_atomic` creates the `.flux` parent inside the guarded
     // resolve, so this path performs no raw filesystem IO.
-    let (system, rel) = match trusted_flux_root()? {
+    let (system, rel) = match trusted_flux_root(env)? {
         Some((_, system)) => (system, "config.toml"),
         None => (System::new(Workspace::new(&home)?), ".flux/config.toml"),
     };
@@ -236,9 +282,16 @@ pub fn persist_user_theme(theme: &str) -> Result<()> {
 /// Load guarded project and trusted user-global group manifests. Callers decide how to present a
 /// malformed optional manifest, but an escaping path is never converted to absence here.
 pub fn load_groups(cwd: &Path) -> Result<Vec<flux_evidence::ToolGroup>> {
+    load_groups_in(cwd, &DiscoveryEnv::from_process())
+}
+
+/// [`load_groups`] against an explicit [`DiscoveryEnv`] rather than the process's own — the same
+/// seam, and for the same reason, as [`load_config_in`] (C-332). The user layer is
+/// `<env home>/.flux/groups.toml`.
+pub fn load_groups_in(cwd: &Path, env: &DiscoveryEnv) -> Result<Vec<flux_evidence::ToolGroup>> {
     let project = project_system(cwd)?;
     let project_text = project.read_optional_text(PROJECT_GROUPS)?;
-    let trusted = trusted_flux_root()?;
+    let trusted = trusted_flux_root(env)?;
     let user_text = trusted
         .as_ref()
         .map(|(_, system)| system.read_optional_text("groups.toml"))
@@ -722,7 +775,7 @@ mod tests {
         std::fs::write(outside.join("secret"), "OUTSIDE SECRET").unwrap();
 
         symlink(outside.join("secret"), root.join(".flux/config.toml")).unwrap();
-        assert!(load_config(&root).is_err());
+        assert!(load_config_in(&root, &DiscoveryEnv::empty()).is_err());
         std::fs::remove_file(root.join(".flux/config.toml")).unwrap();
 
         symlink(outside.join("secret"), root.join(".flux/skills/escaped.md")).unwrap();
@@ -1085,7 +1138,7 @@ mod tests {
         )
         .unwrap();
         persist_allow_rules(&root, &["write".into()]).unwrap();
-        let config = load_config(&root).unwrap();
+        let config = load_config_in(&root, &DiscoveryEnv::empty()).unwrap();
         assert_eq!(config.model.as_deref(), Some("mock"));
         assert_eq!(config.permissions.allow, ["read", "write"]);
 
@@ -1115,7 +1168,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_config(&root).unwrap();
+        let config = load_config_in(&root, &DiscoveryEnv::empty()).unwrap();
         let roots = configured_skill_roots(&config);
         assert!(matches!(roots.as_slice(), [SkillRoot::Project(path)] if path == &outside));
         assert!(discover_skills_in(&root, &roots, &DiscoveryEnv::empty()).is_err());
@@ -1127,8 +1180,10 @@ mod tests {
     #[test]
     fn missing_optional_metadata_is_harmless_on_every_platform() {
         let root = temp_dir("missing");
-        assert!(load_config(&root).is_ok());
-        assert!(load_groups(&root).unwrap().is_empty());
+        assert!(load_config_in(&root, &DiscoveryEnv::empty()).is_ok());
+        assert!(load_groups_in(&root, &DiscoveryEnv::empty())
+            .unwrap()
+            .is_empty());
         assert!(discover_skills_in(&root, &[], &DiscoveryEnv::empty()).is_ok());
         std::fs::remove_dir_all(root).ok();
     }
@@ -1339,7 +1394,7 @@ mod tests {
 
         let root = temp_dir("managed-root");
         std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
-        let result = load_config(&root);
+        let result = load_config_in(&root, &DiscoveryEnv::empty());
         std::env::remove_var("FLUX_MANAGED_CONFIG");
 
         let cfg = result.unwrap();
@@ -1356,14 +1411,13 @@ mod tests {
     #[test]
     fn load_config_managed_layer_precedes_user_and_project_for_defaults() {
         let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
-        let _home_guard = HOME_LOCK.lock().unwrap();
 
         let managed_dir = temp_dir("managed-prec");
         let managed_path = managed_dir.join("managed.toml");
         std::fs::write(&managed_path, "theme = \"dark\"\n").unwrap();
 
         let home = temp_dir("managed-prec-home");
-        std::env::set_var("HOME", &home);
+        let env = DiscoveryEnv::empty().with_home(&home);
 
         let root = temp_dir("managed-prec-root");
         std::fs::create_dir_all(root.join(".flux")).unwrap();
@@ -1374,7 +1428,7 @@ mod tests {
         .unwrap();
 
         std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
-        let with_project_override = load_config(&root).unwrap();
+        let with_project_override = load_config_in(&root, &env).unwrap();
         std::env::remove_var("FLUX_MANAGED_CONFIG");
         assert_eq!(
             with_project_override.theme.as_deref(),
@@ -1384,7 +1438,7 @@ mod tests {
 
         let bare_root = temp_dir("managed-prec-bare");
         std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
-        let bare = load_config(&bare_root).unwrap();
+        let bare = load_config_in(&bare_root, &env).unwrap();
         std::env::remove_var("FLUX_MANAGED_CONFIG");
         assert_eq!(
             bare.theme.as_deref(),
@@ -1421,7 +1475,7 @@ mod tests {
         .unwrap();
 
         std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
-        let result = load_config(&root);
+        let result = load_config_in(&root, &DiscoveryEnv::empty());
         std::env::remove_var("FLUX_MANAGED_CONFIG");
 
         let err = result.unwrap_err();
@@ -1438,7 +1492,7 @@ mod tests {
         let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
         std::env::remove_var("FLUX_MANAGED_CONFIG");
         let root = temp_dir("no-managed");
-        assert!(load_config(&root).is_ok());
+        assert!(load_config_in(&root, &DiscoveryEnv::empty()).is_ok());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1449,7 +1503,6 @@ mod tests {
     #[test]
     fn config_layers_returns_each_raw_unmerged_layer() {
         let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
-        let _home_guard = HOME_LOCK.lock().unwrap();
 
         let managed_dir = temp_dir("layers-managed");
         let managed_path = managed_dir.join("managed.toml");
@@ -1460,7 +1513,7 @@ mod tests {
         .unwrap();
 
         let home = temp_dir("layers-home");
-        std::env::set_var("HOME", &home);
+        let env = DiscoveryEnv::empty().with_home(&home);
 
         let root = temp_dir("layers-root");
         std::fs::create_dir_all(root.join(".flux")).unwrap();
@@ -1471,7 +1524,7 @@ mod tests {
         .unwrap();
 
         std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
-        let (managed, user, project) = config_layers(&root).unwrap();
+        let (managed, user, project) = config_layers_in(&root, &env).unwrap();
         std::env::remove_var("FLUX_MANAGED_CONFIG");
 
         assert!(managed.managed.pins.iter().any(|p| p == "private_net.web"));
@@ -1484,6 +1537,101 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&managed_dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // C-332: the config half of the discovery seam — a config test's verdict is
+    // a function of its fixture, never of the operator's `~/.flux/config.toml`.
+    // -----------------------------------------------------------------------
+
+    /// The user layer comes from the passed [`DiscoveryEnv`], not from process `HOME`.
+    ///
+    /// This is the regression the whole seam exists for. Before C-332 every `load_config` test read
+    /// the operator's real `~/.flux/config.toml` as the user layer, so an operator who sets `model`
+    /// there flipped `load_config_reads_flux_managed_config_env_override` from green to red —
+    /// indistinguishable, at the point of failure, from a real regression in whatever diff was in
+    /// flight. Both directions are asserted here so the seam cannot be "fixed" by making the user
+    /// layer unreadable: an *explicitly pinned* home is still read, an empty one is still ignored,
+    /// and neither answer depends on the machine the gate runs on.
+    #[test]
+    fn load_config_in_reads_the_pinned_home_and_never_the_process_home() {
+        let home = temp_dir("pinned-home");
+        std::fs::create_dir_all(home.join(".flux")).unwrap();
+        std::fs::write(
+            home.join(".flux").join("config.toml"),
+            "model = \"from-the-pinned-home\"\n",
+        )
+        .unwrap();
+
+        let root = temp_dir("pinned-home-root");
+
+        let pinned = load_config_in(&root, &DiscoveryEnv::empty().with_home(&home)).unwrap();
+        assert_eq!(
+            pinned.model.as_deref(),
+            Some("from-the-pinned-home"),
+            "the pinned home supplies the user layer"
+        );
+
+        let unpinned = load_config_in(&root, &DiscoveryEnv::empty()).unwrap();
+        assert_eq!(
+            unpinned.model, None,
+            "an empty env consults no user layer at all — not the pinned home, and not the \
+             operator's real one"
+        );
+
+        // The same seam, and the same guarantee, for the two sibling readers.
+        std::fs::write(
+            home.join(".flux").join("groups.toml"),
+            "[[group]]\nname = \"pinned\"\nops = [\"read\"]\n",
+        )
+        .unwrap();
+        let groups = load_groups_in(&root, &DiscoveryEnv::empty().with_home(&home)).unwrap();
+        assert!(
+            groups.iter().any(|g| g.name == "pinned"),
+            "the pinned home supplies the user group manifest: {groups:?}"
+        );
+        assert!(
+            load_groups_in(&root, &DiscoveryEnv::empty())
+                .unwrap()
+                .is_empty(),
+            "an empty env consults no user group manifest"
+        );
+
+        let (_, user, _) = config_layers_in(&root, &DiscoveryEnv::empty()).unwrap();
+        assert_eq!(
+            user.model, None,
+            "config_layers_in reports an empty user layer for an empty env"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The write counterpart: `persist_user_theme_in` writes into the *pinned* home, so a test of
+    /// the theme-persistence path never creates `~/.flux/config.toml` in the operator's real home
+    /// (C-332 — the same class as the `~/.flux/worktrees` leak, which is filed separately).
+    #[test]
+    fn persist_user_theme_in_writes_into_the_pinned_home() {
+        let home = temp_dir("theme-home");
+        let env = DiscoveryEnv::empty().with_home(&home);
+
+        persist_user_theme_in("dracula", &env).unwrap();
+        let written = std::fs::read_to_string(home.join(".flux").join("config.toml")).unwrap();
+        assert!(written.contains("dracula"), "{written}");
+
+        let root = temp_dir("theme-root");
+        assert_eq!(
+            load_config_in(&root, &env).unwrap().theme.as_deref(),
+            Some("dracula")
+        );
+
+        assert!(
+            persist_user_theme_in("dracula", &DiscoveryEnv::empty()).is_err(),
+            "an env with no home has nowhere to persist to"
+        );
+
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&root).ok();
     }
