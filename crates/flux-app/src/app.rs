@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use flux_agent::{AgentSpec, Permissions, DEFAULT_COMPACT_THRESHOLD_CHARS};
 use flux_core::{Error, Result, Usage};
 use flux_events::EventStore;
+use flux_evidence::{Observation, Phase};
 use flux_flow::engine::FlowEngine;
 use flux_flow::registry::analyze_composites;
 use flux_flow::state::FlowStore;
@@ -48,6 +49,22 @@ use crate::supervisor::DeliverySupervisor;
 /// How deep `spawn`-within-`spawn` may recurse before the engine refuses (cheap guard against a
 /// journey that spawns itself unboundedly).
 const MAX_SPAWN_DEPTH: u32 = 16;
+
+/// The durable [`EventStore`] stream every journey run's caller attribution is written to (C-415).
+///
+/// A journey has no engine turn, so nothing writes it a `turn.identity` the way
+/// `FlowEngine::begin_turn_lifecycle` does for an agent; and its [`Executor`] — evidence log
+/// included — is built per run and dropped when the run ends. This stream is the replacement: one
+/// `journey.identity` observation per run, naming the journey, its run session, the principal it
+/// authorized and audited as, and how that principal was obtained. Read it back with
+/// `EventStore::observations(JOURNEY_AUDIT_STREAM)`.
+///
+/// **One shared stream rather than one per run**, deliberately: a journey run session (`<name>#<n>`)
+/// is not a registered store session, so it never appears in `EventStore::list` and an operator
+/// would have no way to enumerate the runs to read. A single well-known name is enumerable by
+/// definition, and it keeps a cascade of a hundred spawned journeys from minting a hundred session
+/// rows nobody asked for.
+pub const JOURNEY_AUDIT_STREAM: &str = "journey-audit";
 
 /// Legacy grants for a journey in a program which declares no capability policy. Kept byte-for-byte
 /// compatible; a declared policy replaces this implicit set with an explicit app/agent ceiling.
@@ -1111,7 +1128,13 @@ impl Engine {
             // the thread's persistent session); otherwise it runs a journey (a fixed DAG), unchanged.
             let run = match trigger.agent.as_deref() {
                 Some(agent) => self.run_agent(agent, label, payload).await?,
-                None => self.run_journey(&trigger.run, payload, sink).await?,
+                // C-415: this payload arrived over the bus, so it may name the principal on exactly
+                // the terms C-408 settled for the agent path — see [`JourneyOrigin::Delivery`],
+                // which also states what that does and does not buy a forger.
+                None => {
+                    self.run_journey(&trigger.run, payload, sink, JourneyOrigin::Delivery)
+                        .await?
+                }
             };
             runs.push(run);
         }
@@ -1162,11 +1185,15 @@ impl Engine {
     }
 
     /// Execute one named journey to completion, reusing flux-flow's engine path (full envelope).
+    ///
+    /// `origin` decides whether `payload` may name the principal this run authorizes and audits as
+    /// — the whole of C-415's rule lives on [`JourneyOrigin`]'s variants.
     async fn run_journey(
         &self,
         name: &str,
         payload: &Value,
         sink: &mut dyn AgentSink,
+        origin: JourneyOrigin,
     ) -> Result<JourneyRun> {
         let (mut ast, owner) = match self
             .program
@@ -1216,10 +1243,40 @@ impl Engine {
         )?;
         // Preserve any outer cancellation/reporter while making this journey the immediate parent
         // lineage. The snapshot is scoped around the drive below, never retained on the executor.
-        let runtime_turn = executor
+        //
+        // C-415: this snapshot also carries the identity every op in the run authorizes and audits
+        // under. `runtime_turn_context()` reads the *active* lexical scope first, so a run nested
+        // inside a live turn already arrives holding that turn's identity — which is what makes
+        // `JourneyOrigin::Spawn`'s rule below a property rather than an omission.
+        let inherited = executor.context().runtime_turn_context().identity();
+        let derived = origin.identity_from(payload);
+        // The request-owned identity for this run: the one the payload was allowed to name, else
+        // the enclosing turn's. `None` means no principal was ever named and the run stays on the
+        // executor's immutable assembly-time fallback.
+        let request_identity = derived.clone().or_else(|| inherited.clone());
+        let mut runtime_turn = executor
             .context()
             .runtime_turn_context()
             .with_session(&session_id);
+        if let Some(identity) = derived.clone() {
+            runtime_turn = runtime_turn.with_identity(identity);
+        }
+        // The attribution as the dispatcher will see it — `Executor::effective_identity` resolves
+        // exactly this order. Recorded before the drive, so a run that dies mid-flow (or parks and
+        // never resumes) is still attributed.
+        self.record_journey_identity(
+            name,
+            &session_id,
+            &executor,
+            &request_identity
+                .clone()
+                .unwrap_or_else(|| executor.effective_identity()),
+            match (&derived, &inherited) {
+                (Some(_), _) => "delivery",
+                (None, Some(_)) => "inherited",
+                (None, None) => "assembly",
+            },
+        );
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
         // L-123: the journey's own body gets the static gate too, not just its composite ops — a
@@ -1274,6 +1331,7 @@ impl Engine {
             0,
             usage.clone(),
             model.clone(),
+            request_identity,
         )? {
             return Ok(parked);
         }
@@ -1285,6 +1343,62 @@ impl Engine {
             usage,
             model,
         })
+    }
+
+    /// Record **where a journey run's authority came from**, durably (C-415).
+    ///
+    /// # Why this exists at all
+    ///
+    /// The agent path needs no equivalent: [`FlowEngine`] opens a turn, and `begin_turn_lifecycle`
+    /// writes a `turn.identity` observation that its own evidence flush persists. A journey has
+    /// neither — no turn gate, no `turn.identity`, and an [`Executor`] (with its
+    /// [`flux_evidence::EvidenceLog`]) that is built per run and dropped when the run ends. So every
+    /// `tool_call` the run wrote, `caller` field and all, dies with it. Without this write, "who
+    /// caused this journey's effects" would be answerable only while the run was still in flight,
+    /// which is not an audit trail.
+    ///
+    /// # Where it lands, and how an operator reads it back
+    ///
+    /// One observation per run on [`JOURNEY_AUDIT_STREAM`], in the App's [`EventStore`] — the same
+    /// durable store the agent path's turns flush into — read back with
+    /// `EventStore::observations(JOURNEY_AUDIT_STREAM)`. It names the `journey`, its run `session`,
+    /// the `caller`/`source`/`trust` it ran as, and an `attribution` saying how that principal was
+    /// obtained: `delivery` (derived from the bus payload), `inherited` (the enclosing turn's —
+    /// every `spawn`), or `assembly` (the executor's immutable local fallback; nobody but the
+    /// operator was ever named). A copy also goes to the executor's own log so it sits beside that
+    /// run's `tool_call` records while the run is live.
+    ///
+    /// Written through the same total redaction walk the engine's evidence flush uses
+    /// ([`flux_core::redact_json_total`]) — this is a durable seam, and the principal id is an
+    /// untrusted payload string. The store write is best-effort (`let _ =`), matching every other
+    /// audit write in the tree: telemetry never breaks a run.
+    fn record_journey_identity(
+        &self,
+        journey: &str,
+        session_id: &str,
+        executor: &Executor,
+        identity: &TurnIdentity,
+        attribution: &str,
+    ) {
+        let mut observation = Observation::new(
+            "journey.identity",
+            Phase::Turn,
+            json!({
+                "journey": journey,
+                "session": session_id,
+                "caller": identity.caller().principal.id.as_str(),
+                "source": identity.caller().source.as_str(),
+                "trust": identity.trust(),
+                "attribution": attribution,
+            }),
+        );
+        let redactor = executor.context().redactor.clone();
+        flux_core::redact_json_total(&mut observation.data, &|text| redactor.redact(text));
+        executor.observe(observation.clone());
+        // `-1`: a journey has no turn id, so the observation is recorded unscoped on the stream.
+        let _ = self
+            .events
+            .record_observation(JOURNEY_AUDIT_STREAM, -1, &observation);
     }
 
     /// The canonical `provider/model` spec of the app's default model (C-33) — the "driving engine
@@ -1315,6 +1429,7 @@ impl Engine {
         prior_steps: usize,
         usage: Option<Usage>,
         model: String,
+        identity: Option<TurnIdentity>,
     ) -> Result<Option<JourneyRun>> {
         let Some(susp) = &outcome.suspension else {
             return Ok(None);
@@ -1349,6 +1464,7 @@ impl Engine {
             session_id: session_id.to_string(),
             store: store.clone(),
             steps,
+            identity,
         });
         Ok(Some(JourneyRun {
             journey: journey.to_string(),
@@ -1398,6 +1514,7 @@ impl Engine {
             session_id,
             store,
             steps: prior_steps,
+            identity,
             ..
         } = park;
         let Some((flow_name, body, node, _source)) =
@@ -1420,10 +1537,31 @@ impl Engine {
             &self.host_permissions,
             self.execution.clone(),
         )?;
-        let runtime_turn = executor
+        let mut runtime_turn = executor
             .context()
             .runtime_turn_context()
             .with_session(&session_id);
+        // C-415: the continuation runs as the principal the pre-park segment ran as, NOT as the
+        // speaker of the reply that woke it. A park is a pause in one logical turn, and the identity
+        // invariant forbids swapping a live turn's caller from the outside — so the reply event's
+        // own `speaker` is deliberately never consulted here. `identity` is `None` only when the
+        // original run named no principal either, in which case both segments sit on the executor's
+        // assembly-time fallback and nothing changes.
+        if let Some(identity) = identity.clone() {
+            runtime_turn = runtime_turn.with_identity(identity);
+        }
+        self.record_journey_identity(
+            &journey,
+            &session_id,
+            &executor,
+            &identity
+                .clone()
+                .unwrap_or_else(|| executor.effective_identity()),
+            match &identity {
+                Some(_) => "resumed",
+                None => "assembly",
+            },
+        );
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
         // L-123: no `analyze_journey` here, and that is deliberate rather than an omission. `body`
@@ -1488,6 +1626,8 @@ impl Engine {
             prior_steps,
             usage.clone(),
             model.clone(),
+            // A continuation that asks again keeps carrying the run's original principal.
+            identity,
         )? {
             return Ok(parked);
         }
@@ -1620,7 +1760,13 @@ impl Engine {
 impl JourneyHost for Engine {
     async fn run_journey_for_spawn(&self, name: &str, payload: Value) -> Result<String> {
         let mut sink = RecordingSink::default();
-        Ok(self.run_journey(name, &payload, &mut sink).await?.result)
+        // C-415: `payload` is the `spawn` op's `input` — authored by whatever produced the calling
+        // flow's arguments, which on an agent-driven path is the MODEL. It never names a principal;
+        // see [`JourneyOrigin::Spawn`].
+        Ok(self
+            .run_journey(name, &payload, &mut sink, JourneyOrigin::Spawn)
+            .await?
+            .result)
     }
 }
 
@@ -2002,6 +2148,59 @@ const MANDATORY_LINE_BREAKS: [char; 7] = [
     '\u{2028}', // LINE SEPARATOR — likewise
     '\u{2029}', // PARAGRAPH SEPARATOR — likewise
 ];
+
+/// How a journey run was reached, and therefore whether its payload is allowed to name the
+/// principal it authorizes and audits as (C-415).
+///
+/// C-408 closed the identity gap on the **agent** side of a room delivery, and deliberately left the
+/// journey side open for one reason: [`Engine::run_journey`] has a second caller that the agent path
+/// does not have — [`Engine::run_journey_for_spawn`]. "Same code path, so same behaviour" is not an
+/// answer when one caller's payload crosses a channel boundary and the other's is written by the
+/// model mid-turn. This type is where the two are told apart, so the rule is readable at both call
+/// sites instead of inferred from a `payload` that looks identical in each.
+#[derive(Clone, Copy, Debug)]
+enum JourneyOrigin {
+    /// A trigger fired for an event routed through the bus — `App::deliver`, a channel adapter's
+    /// external event, or a journey's own `emit` cascade.
+    ///
+    /// Such a payload **may** name a principal, on exactly the terms C-408 settled for the agent
+    /// path: [`room_participant_identity`] derives one only from the room adapter's `room` +
+    /// `speaker` shape, at [`TrustLevel::Untrusted`](flux_policy::TrustLevel::Untrusted), through
+    /// the single [`TurnIdentity::unauthenticated_participant`] constructor. The residual — that a
+    /// bus payload is *asserted*, not authenticated, including the `emit` case where a model chose
+    /// its fields — is analyzed once, on [`room_participant_identity`], and is not restated here so
+    /// the two paths cannot drift to different answers.
+    Delivery,
+
+    /// A `spawn` op re-entering the engine from inside a live turn, with the `input` that op was
+    /// called with.
+    ///
+    /// **Such a payload never names a principal.** `spawn`'s arguments are ordinary flow values,
+    /// and on an agent-driven path they are chosen by the model — so honouring a `speaker` here
+    /// would let a model mint a principal by writing one into a JSON object. That is a strictly
+    /// worse forgeability profile than the bus case above: a bus payload at least has to arrive
+    /// through a channel, whereas this one is authored inside the turn that would benefit.
+    ///
+    /// What the run gets instead is the identity it already inherits.
+    /// [`ToolContext::runtime_turn_context`] reads the **active lexical scope** first, and
+    /// `SpawnOp::execute` is awaited inline inside the spawning turn's [`scope_runtime_turn`] — no
+    /// `tokio::spawn`, no task-local boundary — so the child's snapshot is the parent's, minus the
+    /// session id it overwrites. That
+    /// is the story's "provably no stronger than the turn that spawned it", and it is a property of
+    /// the scope's nesting rather than a check that could be forgotten: to widen its own authority a
+    /// spawned journey would have to install an identity, and this variant installs none.
+    Spawn,
+}
+
+impl JourneyOrigin {
+    /// The principal `payload` is allowed to name for a run reached this way, if any.
+    fn identity_from(self, payload: &Value) -> Option<TurnIdentity> {
+        match self {
+            Self::Delivery => room_participant_identity(payload),
+            Self::Spawn => None,
+        }
+    }
+}
 
 /// The request-owned caller identity for one delivery — `Some` for a room message, `None` for every
 /// event source that names no principal (C-408).
