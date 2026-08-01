@@ -6,6 +6,7 @@
 //! that the L1 session seam and the L2 executor meet at — the seam itself never names a runtime type.
 
 mod driver;
+mod room_transcript;
 mod sink;
 mod speaker;
 #[cfg(test)]
@@ -15,6 +16,7 @@ mod transcript;
 pub use driver::{
     EngineVoiceHandler, UsageRecording, VoiceReply, VoiceSessionDriver, VoiceTurnHandler,
 };
+pub use room_transcript::{HeardLine, RoomTranscript, DEFAULT_ROOM_CONTEXT_LINES};
 pub use sink::VoiceSink;
 pub use speaker::{Speaker, SOLE_SPEAKER_ID};
 pub use transcript::TranscriptAccumulator;

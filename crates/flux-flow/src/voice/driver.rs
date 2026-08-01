@@ -65,6 +65,18 @@ pub trait VoiceTurnHandler: Send + Sync {
     /// a handler decide whether it was addressed at all instead of answering every sentence in the
     /// room.
     async fn turn(&self, speaker: &Speaker, user_text: &str) -> VoiceReply;
+
+    /// A message the agent heard but was **not** addressed by (D-207) — the other N-1 sides of a
+    /// many-party conversation.
+    ///
+    /// This is not a turn: it must not reach a model, and a handler that treats it as one has
+    /// reintroduced the cost the address rule exists to remove — a silent-but-thinking agent still
+    /// burns spend. It exists so an unaddressed line is *accumulated* rather than dropped, which is
+    /// what lets the eventual answer refer to "what Timo asked" (see
+    /// [`RoomTranscript`](super::RoomTranscript)).
+    ///
+    /// Default: nothing. A 1:1 surface has no unaddressed turns to hear.
+    async fn overheard(&self, _speaker: &Speaker, _text: &str) {}
 }
 
 /// Drives a realtime voice session: forwards audio/transcripts to a [`VoiceSink`] and routes the

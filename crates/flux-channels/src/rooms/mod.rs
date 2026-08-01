@@ -4,8 +4,9 @@
 //! did not have: flux is *one participant among several*, it hears everything, it is addressed by
 //! only some of it, and every inbound event therefore has to say **who** produced it. That is why
 //! [`RoomEvent`] carries an [`OccupantId`] on every variant a participant can cause — attribution is
-//! not a feature of the room, it is the precondition for deciding whether to answer at all
-//! (D-207 turns that decision into an address rule).
+//! not a feature of the room, it is the precondition for deciding whether to answer at all. D-207
+//! turns that decision into the [`AddressRule`] the [`RoomTurnDriver`] applies, bounded by a
+//! per-room [`ReplyBudget`] for the case the rule cannot see.
 //!
 //! ## The port, and what is behind it
 //!
@@ -30,11 +31,17 @@
 //!
 //! Design: [`docs/designs/meeting-rooms.md`](https://github.com/codewandler/flux/blob/main/docs/designs/meeting-rooms.md).
 
+mod address;
+mod budget;
 mod driver;
 mod jaas;
 mod mock;
 mod xmpp;
 
+pub use address::{
+    is_a2a_envelope, AddressRule, AddressRuleError, Addressing, DEFAULT_ADDRESS_RULE,
+};
+pub use budget::{ReplyBudget, DEFAULT_ROOM_REPLY_BUDGET, DEFAULT_ROOM_REPLY_WINDOW};
 pub use driver::{RoomSessionEnd, RoomTurnDriver};
 pub use jaas::{
     BraveTalkTokens, Conference, GuestToken, JaasConfig, JaasRoom, JaasTokens,

@@ -45,8 +45,8 @@ pub use agent_sink::AgentSink;
 pub use engine::{DEFAULT_AGENT_LOOP_ITERATIONS, MAX_AGENT_LOOP_ITERATIONS};
 pub use steering::{SteeringItem, SteeringQueue};
 pub use voice::{
-    tool_defs_from_registry, Speaker, TranscriptAccumulator, UsageRecording, VoiceSessionDriver,
-    VoiceSink, VoiceTurnHandler,
+    tool_defs_from_registry, HeardLine, RoomTranscript, Speaker, TranscriptAccumulator,
+    UsageRecording, VoiceSessionDriver, VoiceSink, VoiceTurnHandler,
 };
 
 // Facade: the language core + reference interpreter live in `flux-lang`. Re-export them so the

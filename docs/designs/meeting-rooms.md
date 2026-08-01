@@ -279,6 +279,33 @@ implementor inherits:
   scrubbed. Closing this needs `flux-secret` in the manifest and a redactor handed down to the
   channel.
 
+**As landed (D-207)** — the address rule and the reply budget, `crates/flux-channels/src/rooms/`
+(`address.rs`, `budget.rs`) applied in `driver.rs`. Three filters stand between an inbound message
+and a handler turn, and they are three because each covers a case the others cannot:
+
+- **The rule governs public text; a whisper is always addressed.** Nobody whispers to the agent and
+  does not mean it, which is what `MessageScope` was carried through the port for. `address_rule` is
+  a comma-separated list of `mention` (default), `wake: <phrase>`, `always` or `never`, and a token
+  outside that vocabulary is a **load error** — D-204 carried the field unvalidated because the
+  vocabulary was unchosen, and a typo degrading to "answer everything" is the failure the rule exists
+  to prevent. Mention matching is boundary-checked against *our own* nick, so an "influx of tickets"
+  is not an address; it never identifies a *speaker* by nick, which stays `OccupantId`'s job (C-408).
+- **An unaddressed line is overheard, not dropped and not thought about.** `VoiceTurnHandler` gained
+  a defaulted `overheard`, and the room adapter accumulates those lines in an attributed, bounded
+  `flux_flow::voice::RoomTranscript` that rides the *next* addressed turn as the payload's `context`.
+  Zero deliveries and therefore zero planner calls is the assertion that matters: a
+  silent-but-thinking agent still burns spend.
+- **The agent-to-agent runaway is bounded twice, on purpose, because only one of the two is
+  structural.** A declared `OccupantKind::Agent`'s **plain text** is refused outright at any scope —
+  only a structured A2A envelope gets through, recognized in its JSON-RPC 2.0 shape as the D-212
+  seam. But XMPP presence carries no human-or-bot signal, so a real MUC reports `Unknown` for
+  everyone and that arm never fires there; the per-room `ReplyBudget` (a sliding window, 12 turns per
+  60 s by default) is what holds the case flux cannot see. It gates the **turn**, and an exhausted
+  budget is silent — announcing exhaustion is itself a reply, and two agents announcing it at each
+  other is the same runaway one layer up.
+- **Known gap: this is the *channel* path only.** `run_journey`'s room path still runs as
+  `local`/Privileged (C-415), and nothing here widens or narrows that.
+
 **The L3 turn seam changed with it (breaking):** `VoiceTurnHandler::turn` is now
 `turn(&self, speaker: &Speaker, user_text: &str)`. `flux_flow::voice::Speaker` is a surface-owned id
 plus an optional display name; a 1:1 surface passes `Speaker::sole()`, which is how a phone line's
@@ -287,7 +314,8 @@ single caller becomes *named* rather than absent.
 Backends: **`XmppMucRoom`** (generic prosody/ejabberd MUC — the portable one), **`JaasRoom`** (Brave Talk
 and any own-tenant JaaS: the guest-JWT + conference-request handshake above), and **`MockRoom`** for
 tests. A room is a new `ChannelDecl` `kind` — `room`, with
-`settings { backend, room, nick, address_rule }` — so it enters through `build_channels` and needs no new
+`settings { backend, room, nick, address_rule, reply_budget, reply_window_secs }` — so it enters
+through `build_channels` and needs no new
 host, exactly as D-04 established.
 
 **Every inbound event carries an `OccupantId`.** That is the one change the existing turn seams needed: a
@@ -344,10 +372,16 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
 
 1. **Joining grants no authority.** An op requiring approval, triggered from a room message, is *denied*
    absent approval — the test asserts denial, not an approval prompt rendered into the room.
-2. **The agent answers only when addressed.** A replayed transcript of two humans talking, N messages, none
-   addressed to the agent → **zero** outbound messages and **zero** planner calls.
-3. **Reply is bounded.** Two mock agents mentioning each other converge under a per-room reply budget
-   instead of running to the agent cap.
+2. **The agent answers only when addressed.** ✅ **Met (D-207).** A replayed transcript of two humans
+   talking, N messages, none addressed to the agent → **zero** outbound messages and **zero**
+   deliveries, which is where planner spend begins:
+   `crates/flux-channels/tests/rooms.rs::unaddressed_room_chatter_stays_silent`.
+3. **Reply is bounded.** ✅ **Met (D-207).** `crates/flux-channels/tests/rooms.rs::agent_pair_chatter_converges`
+   drives a room whose other occupant answers every line flux says, and asserts the exchange stops
+   well short of the double's own runaway cap. The peer's `OccupantKind` is `Unknown` on purpose —
+   that is what a real MUC reports (D-205), so the arm under test is the budget rather than the
+   agent-plain-text refusal, which is pinned separately in
+   `rooms/driver.rs::a_declared_agents_plain_text_is_never_a_turn`.
 4. **No unredacted publish.** A pane whose source text contains a credential shape publishes redacted
    (C-216 corpus, run against the render path).
 5. **Self-announcement is not optional.** Join emits an identifying room message *before* the first inbound

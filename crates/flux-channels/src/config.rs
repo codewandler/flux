@@ -281,15 +281,29 @@ pub struct RoomSettings {
     /// The nick to join under. Defaults to [`DEFAULT_ROOM_NICK`].
     #[serde(default)]
     pub nick: Option<String>,
-    /// When the agent should treat a turn as addressed to it — nick mention, private whisper, or a
-    /// wake phrase.
+    /// When the agent should treat a turn as addressed to it (D-207) — a comma-separated list of
+    /// `mention`, `wake: <phrase>`, `always` or `never`. Defaults to
+    /// [`DEFAULT_ADDRESS_RULE`](crate::rooms::DEFAULT_ADDRESS_RULE).
     ///
-    /// **Carried, not yet enforced.** D-207 owns the rule's vocabulary and its enforcement; the field
-    /// lives here so the declaration shape is stable and a program written for D-207 loads today. The
-    /// value is passed through unvalidated on purpose: validating it now would fix a vocabulary that
-    /// story has not chosen yet.
+    /// **Enforced**, and a value outside that vocabulary is a load error: an `address_rule` that
+    /// silently degraded to "answer everything" because of a typo is the exact failure the rule
+    /// exists to prevent. A private message is addressed whatever the rule says — the rule governs
+    /// public text. Full vocabulary: [`AddressRule`](crate::rooms::AddressRule).
     #[serde(default)]
     pub address_rule: Option<String>,
+    /// At most this many turns per [`reply_window_secs`](Self::reply_window_secs), per room.
+    /// Defaults to [`DEFAULT_ROOM_REPLY_BUDGET`](crate::rooms::DEFAULT_ROOM_REPLY_BUDGET).
+    ///
+    /// The ceiling that bounds two automated participants answering each other. It gates the
+    /// **turn**, not the outbound line: a silent-but-thinking agent still burns spend, so a message
+    /// past the ceiling never reaches the planner at all.
+    #[serde(default)]
+    pub reply_budget: Option<usize>,
+    /// The window [`reply_budget`](Self::reply_budget) is counted over, in seconds. Defaults to
+    /// [`DEFAULT_ROOM_REPLY_WINDOW`](crate::rooms::DEFAULT_ROOM_REPLY_WINDOW). Zero is refused at
+    /// load — a zero-length window is a budget that resets on every message, i.e. no budget.
+    #[serde(default)]
+    pub reply_window_secs: Option<u64>,
 
     // ── `backend = "xmpp"` (D-205) ──
     /// The RFC 7395 WebSocket endpoint, e.g. `wss://example.org/xmpp-websocket`. Required for the
