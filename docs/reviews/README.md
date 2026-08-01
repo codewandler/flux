@@ -75,6 +75,9 @@ triage:
   effect that skips the envelope?
 - [`2026-07-30-security-assurance-closure.md`](single/2026-07-30-security-assurance-closure.md) —
   the 2026-07-29 baseline re-verified against the shipped tree.
+- [`2026-08-01-concept-docs-review.md`](single/2026-08-01-concept-docs-review.md) — diff review of
+  the uncommitted concept-docs work (Concepts rewrite, Ecosystem page, sync script, CI gate);
+  10 confirmed findings, gate red at time of review.
 
 Tracked by C-186 (in progress) and C-267.
 

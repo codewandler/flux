@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **One written vocabulary for the three projects** (C-401). `docs/concepts.md` defines the terms the
+  documentation uses — including the pair most often confused, `flux-runtime` (whether something may
+  happen) and `flux-system` (where it happens), which are peers at L2 rather than layers — and
+  `docs/ecosystem.md` states the boundary test that separates flux, flux-connectors and flux-exchange
+  and marks what is proposed rather than shipped. Both are authored in `docs/` and mirrored into
+  `website/docs/` by the existing `website_in_sync` golden guard, so drift fails and a regenerating
+  run goes red (C-326) instead of quietly rewriting the site.
+
+- **`execution-substrate` epic filed** (C-394…C-399). `flux-system` gains a second, out-of-repo
+  consumer, so the port seam it was built with gets finished: the workspace-confined file surface
+  becomes a port (the condition C-269 deferred it on), `DialTarget` grows datagram and raw variants,
+  and a written contract states which guarantees travel with the substrate alone and which are
+  `flux-runtime`'s. No layer moves and no IO path is added.
+
 ## [0.45.0] - 2026-08-01
 
 ### Improved
