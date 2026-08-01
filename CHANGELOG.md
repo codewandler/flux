@@ -8,6 +8,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **`each x in "a->b"` now parses** (L-115). The `each` header was lowered by scanning *reconstructed
+  header text*, so a `->` inside a string literal was read as the collect arrow and the statement was
+  refused with a misleading ``unexpected text after `each collect` ``. Any `each` whose source
+  contained an arrow — a literal, or `split($text, "->")` — was unwritable. The header is now read
+  from CST structure (item, `in`, arrow, `flat`, collect) rather than half-structurally, so the next
+  reader is not invited to scan the rest again.
+  Caught independently by the round-trip property test, which reds at the merge base on seed 581 —
+  random ASTs had been generating the broken shape all along, and the pools now carry `->` strings
+  so it stays caught.
+  ⚠ **The lowerer now accepts three spellings it previously refused** — `each x in$items`,
+  `each$x in $items`, `each x in $xs -> flat$c`. All three were already accepted by the *parser*, so
+  this aligns the lowerer with the accepting grammar rather than widening the language; the formatter
+  normalizes each to its canonical spelling and `parse(format(ast)) == ast` holds for all of them.
+  Malformed headers still refuse, with a located message.
+
 - **Deeply nested statement blocks no longer abort the process** (L-114). The depth guard covered
   expressions and types only; block-owning statements recursed unbounded, so deep nesting killed the
   process with a stack overflow rather than returning a parse error. Proven failing-first by three

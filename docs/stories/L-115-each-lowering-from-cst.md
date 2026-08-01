@@ -2,8 +2,7 @@
 id: L-115
 title: "Lower `each` headers from CST structure, not reconstructed text"
 pillar: Language
-status: in-progress
-priority: 4
+status: done
 epic: flux-lang-hardening
 design: docs/designs/flux-lang-hardening.md
 areas: [flux-lang]
@@ -65,3 +64,16 @@ from the CST's token structure instead; the tree already knows whether a top-lev
 - Suggested fix: match on the header's token-level `ARROW` outside string tokens (the CST is
   lossless; `cst_decode.rs`'s own module header disclaims text reconstruction — make it true).
 - Review: docs/reviews/single/2026-08-01-flux-lang-subsystem-review.md F2.
+
+- **The accepted-grammar widening has three members, not one** (enumerated at review, by diffing
+  lowering over a 27-header matrix against the merge base). Every base-`ERR` → tip-`OK` flip:
+  `each x in$items`, `each$x in $items`, and `each x in $xs -> flat$c`. All three were **already
+  accepted by the parser** at the merge base (`CST-ERRS: []` in every case), so the lowerer was the
+  sole refuser and this aligns it with the accepting grammar rather than widening the language.
+  None is load-bearing: `format_cst::format_source` normalizes all three to their canonical spelling
+  and is guarded by a reparse-and-relower equivalence check, and `parse(format(ast)) == ast` held
+  for each. Recorded so the next reader does not have to rediscover it.
+- The retained `unexpected text after `each collect`` arm is **unreachable through `parse`/
+  `parse_program`** — the parser refuses a trailing token first, identically at base and tip.
+  Defensive, not wrong.
+
