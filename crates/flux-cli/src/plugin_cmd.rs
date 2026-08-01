@@ -518,6 +518,28 @@ pub(super) async fn run_plugin_in(
                         .await
                     {
                         Ok(verdict) => {
+                            // C-404 — the credential boundary, at INGEST, on the ONE op the host
+                            // dispatches itself. C-312 excused a host-dispatched `internal: true`
+                            // op because "its result goes to host code, not to a log or a
+                            // transcript"; half of that is false here. The `problems`/`warnings`
+                            // below are plugin-authored strings lifted into the printed verdict,
+                            // and they land in the same terminal scrollback and shell history that
+                            // is the stated reason `flux plugin call` is checked at all. So the
+                            // carve-out is gone and this site is checked like every other.
+                            //
+                            // A no-op for every plugin built with `host-kit`, whose builder injects
+                            // `plugin.validate` through `internal_op` and therefore with
+                            // `PlatformSourcing::None`. It is NOT a no-op for a plugin that speaks
+                            // the raw NDJSON protocol and declares its own `plugin.validate` with
+                            // `platform` set — see `tests/plugin_preflight_boundary.rs`.
+                            if let Some(refusal) = refuse_platform_response(
+                                &verdict,
+                                &manifest,
+                                flux_plugin::VALIDATE_OP,
+                            ) {
+                                let _ = host.shutdown().await;
+                                bail!("{refusal}");
+                            }
                             let take = |key: &str| -> Vec<String> {
                                 verdict
                                     .get(key)
@@ -533,10 +555,18 @@ pub(super) async fn run_plugin_in(
                             problems.extend(take("problems"));
                             warnings.extend(take("warnings"));
                         }
+                        // The `err` frame is the same ingest surface as the `result` frame, and
+                        // this one is printed raw. Scrubbed for the same reason the live call's is
+                        // (`scrub_plugin_error` at the dispatch below).
                         Err(e) => eprintln!(
                             "{}",
                             style::dim(&format!(
-                                "(plugin preflight unavailable — schema-only verdict: {e})"
+                                "(plugin preflight unavailable — schema-only verdict: {})",
+                                scrub_plugin_error(
+                                    &manifest,
+                                    flux_plugin::VALIDATE_OP,
+                                    e.to_string()
+                                )
                             ))
                         ),
                     }

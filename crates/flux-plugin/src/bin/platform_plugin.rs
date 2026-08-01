@@ -153,6 +153,33 @@ fn endpoint_discover() -> OperationSpec {
     }
 }
 
+/// The deployment's **preflight** op (D-88), the one op the host dispatches itself (C-404).
+///
+/// `internal: true` — never advertised to the model — *and* `platform`-sourced, a combination
+/// `host-kit`'s builder cannot produce: `internal_op` takes `..OperationSpec::default()`, so the
+/// auto-injected `plugin.validate` is always `PlatformSourcing::None`. This fixture speaks the raw
+/// NDJSON protocol, which is exactly the plugin shape the credential boundary's census named as
+/// the live gap the `internal: true` carve-out left open — `flux plugin call --dry-run` lifts this
+/// op's `problems`/`warnings` onto operator stdout and prints its error frame to stderr.
+fn platform_validate() -> OperationSpec {
+    OperationSpec {
+        name: flux_plugin::VALIDATE_OP.into(),
+        description: "Validate an operation input inside the deployment, without executing it"
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"operation": {"type": "string"}, "input": {"type": "object"}},
+            "required": ["operation"]
+        }),
+        effects: vec![Effect::Read],
+        risk: Some(Risk::Low),
+        idempotency: Some(Idempotency::Idempotent),
+        internal: true,
+        platform: PlatformSourcing::Operation,
+        ..OperationSpec::default()
+    }
+}
+
 /// The vendor host this deployment claims to reach on flux's behalf (C-311) — the fact the
 /// operator has to be told at the approval prompt, because `guard_url_scoped` never sees it.
 const VENDOR_HOST: &str = "api.zendesk.com";
@@ -277,6 +304,21 @@ fn manifest_for(mode: &str) -> PluginManifest {
     // the projected-tool tests drive. `local-discover` is the control: the same op, the same leak,
     // and NO `platform` declaration — the boundary must leave it alone, exactly as `echo` shows on
     // the projected-tool path.
+    // C-404 — the host-dispatched preflight. Present only in the `*-validate` modes so every other
+    // mode's manifest (and every test that asserts over it) is byte-identical to before: a
+    // `plugin.validate` in the manifest is what makes `flux plugin call --dry-run` dispatch it.
+    if mode.ends_with("-validate") {
+        operations.push(if mode == "local-validate" {
+            // The control: the same host-dispatched internal op with NO `platform` declaration —
+            // what `host-kit`'s `internal_op` produces. The boundary must leave it alone.
+            OperationSpec {
+                platform: PlatformSourcing::None,
+                ..platform_validate()
+            }
+        } else {
+            platform_validate()
+        });
+    }
     operations.push(if mode == "local-discover" {
         OperationSpec {
             platform: PlatformSourcing::None,
@@ -430,6 +472,31 @@ impl PluginHandler for Platform {
                         "score": 0.9,
                         "reasons": ["the deployment has a connector for this product"],
                     }]
+                }),
+            }),
+            // The host-dispatched preflight (C-404). `flux plugin call --dry-run` lifts `problems`
+            // and `warnings` into the verdict it prints, so every leak mode here puts the
+            // credential where the operator's terminal will render it.
+            op if op == flux_plugin::VALIDATE_OP => Ok(match mode.as_str() {
+                // The credential inside a preflight complaint — plugin-authored text the host
+                // prints verbatim.
+                "leak-validate" | "local-validate" => json!({
+                    "operation": input.get("operation").cloned().unwrap_or(Value::Null),
+                    "valid": false,
+                    "problems": [format!("the deployment rejected it: token {VENDOR_TOKEN} expired")],
+                    "warnings": [],
+                }),
+                // The failure path: the error frame is printed raw to stderr.
+                "leak-error-validate" => {
+                    return Err(format!(
+                        "the deployment could not preflight: token {VENDOR_TOKEN} expired"
+                    ))
+                }
+                _ => json!({
+                    "operation": input.get("operation").cloned().unwrap_or(Value::Null),
+                    "valid": true,
+                    "problems": [],
+                    "warnings": ["the deployment has not seen this vendor in 30 days"],
                 }),
             }),
             // Not platform-sourced: whatever it is handed comes back. The boundary must not touch
