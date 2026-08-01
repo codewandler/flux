@@ -26,7 +26,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'Fundamentals',
-      items: ['concepts', 'ecosystem', 'infrastructure'],
+      items: ['concepts', 'ecosystem', 'infrastructure', 'topologies'],
     },
     {
       type: 'category',
