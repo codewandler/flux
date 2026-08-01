@@ -2,8 +2,7 @@
 id: L-118
 title: "The tree-sitter grammar parses canonical Flux; the nightly red goes green"
 pillar: Language
-status: in-progress
-priority: 15
+status: done
 epic: flux-lang-hardening
 design: docs/designs/flux-lang-hardening.md
 areas: [flux-lang]

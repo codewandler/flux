@@ -8,6 +8,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The tree-sitter nightly lane states its green contract instead of announcing a fixed red**
+  (L-118). ⚠ **The story's premise was stale**: it was filed from a review that measured against
+  grammar pin `9ea9890`, but C-340 had already fixed the grammar upstream and moved the pin to
+  `2dbec53` before anyone picked the story up. Three of its four Acceptance items were already
+  satisfied — verified rather than assumed, including a clean 16/16 corpus parse at the current pin
+  and the last scheduled run at `success`. **No red was reproducible, and none was manufactured.**
+  What was genuinely still owed is the same failure class one level up: not "the pin does not reflect
+  the mirror" but **"the lane's own contract does not reflect the pin"**. The workflow preamble went
+  on describing a fixed red for months, because a nightly lane blocks no push, PR or cut — nothing
+  puts a reader in front of it, so a reader trusting it would either re-open finished work or dismiss
+  a genuinely new red as the known standing one. The preamble is now the green-state contract, and it
+  is **guarded rather than trusted**: a test asserts the lane names the revision `.helix/languages.toml`
+  actually pins, that the pin is a full 40-char sha so the substring match cannot silently weaken, and
+  that every story ID the lane cites resolves to a real story file. It runs on every PR, without the
+  network the nightly lane needs.
+  ⚠ Consequence worth knowing before it surprises someone: **moving the pin now requires updating the
+  workflow preamble in the same commit**, or `cargo test --workspace` reds. That is the intended
+  discipline, and the assertion message says exactly what to do.
+
 - **`detect_signals` gets an injection seam, so tests stop probing the operator's home** (C-393).
   `detect_signals_in` sits beside `detect_signals`, and both home-rooted checks take the env;
   `AgentSpec::try_with_default_skills_in`, `try_with_model_invoked_skills_in` and
