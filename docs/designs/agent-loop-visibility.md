@@ -60,6 +60,42 @@ variants**. The data is largely there; the projection is not.
 it can and cannot rebuild **is** the beginning of C-422's fidelity table, and anything the log cannot
 supply is a finding about the *record*, not a gap in a mock.
 
+## ⚠ The five are not five candidates — they are points in a space with three axes
+
+Owner-directed after driving the mocks, 2026-08-02, and it supersedes "pick one of five":
+
+> *"they are all quite good — what would be nice would be the option to \[choose\] nesting level to
+> display, and that things which happened already could be condensed. Then also an optional detail
+> view."*
+
+Three controls, and they are **orthogonal**:
+
+| axis | what it does | which mock it turns you into |
+|---|---|---|
+| **depth limit** | how many nesting levels are drawn | flat thread ↔ tree |
+| **condense completed** | finished work collapses to one row | the long-run win |
+| **detail pane** | optional, toggled — not always-on | tree ↔ split |
+
+Compose them and the mocks stop being rivals: **the flat thread with condensing and a depth limit and
+an optional pane *is* the split.** The tree is the same thing at depth ∞ with the pane off. So A-137
+should build the **axes**, not adopt a picture — and a user who wants any of the five can have it.
+
+⚠ **This converges with what the review independently found**, from the other direction. A-144's
+comparison was confounded because only mock 3 had phase-condensing, which forced the recommendation to
+*"condense finished phases first, then build the split"* — the two being separable was the finding.
+The owner's read says the same thing and goes further: **all three are separable**, and separating them
+is the design rather than a caveat on it.
+
+Two consequences worth stating, because they are what this buys:
+
+- **The floors move.** The split's cost was a 64-column, 10-row floor, nearly double the others'. With
+  the pane *optional*, that floor applies only when it is on — the fallback stops being a second layout
+  and becomes the same layout with a toggle off.
+- ⚠ **Defaults are now the real decision, and they are where honesty lives.** A default depth that hides
+  a sub-agent's work, or condensing that swallows a failed step, would make the view flatter than the
+  run. Every axis must default to showing *more* than it hides, and elision stays visible at every
+  setting — the property A-144's rework made unconditional.
+
 ## Approach
 
 Three stories, smallest first, each independently useful.
