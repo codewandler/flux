@@ -3,7 +3,7 @@ id: D-209
 title: Room audio in — attributed speech from many speakers into the turn seam
 pillar: Agent
 status: ready
-priority: 31
+priority: 3
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-flow, flux-audio]

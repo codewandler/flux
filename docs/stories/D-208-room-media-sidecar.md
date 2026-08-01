@@ -3,7 +3,7 @@ id: D-208
 title: The room media sidecar — a browser-grade WebRTC peer flux drives
 pillar: Agent
 status: ready
-priority: 30
+priority: 2
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels]

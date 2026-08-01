@@ -151,6 +151,61 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### Watch the agent think — the loop as a live thread, expandable down to the graph (epic) — 🔄 **PROPOSED (A-137…A-139 filed, none started)**
+
+flux's claim is that **the LLM is not the runtime** — and architecture is invisible, so everywhere else
+that lands as an assertion. A live view of the loop makes it observable: finished steps condensed to one
+line, the current step expanded, and expanding further shows the **actual execution graph** down to the
+Flux-Lang being run. At that point nobody has to be told the model is not driving; they can see the
+program it is called from.
+
+**Largely a view problem, not instrumentation.** `UiEvent` already carries the loop's whole vocabulary
+(`Planning`, `Plan`, `Phase`, `Intent`, `ToolCall`, `ToolTiming`, `ToolResult`, `ToolProgress`,
+`CallUsage`, `SpawnActivity`), and `crates/flux-tui/src/plan.rs` **already renders a `flow.plan`
+observation as a styled DAG**, preferring `plan_ast` so the tree is syntax-highlighted through
+`flux_flow::render::render_styled`. [A-137](stories/A-137-the-step-thread.md) is the thread and ships
+alone; [A-138](stories/A-138-expand-a-step-into-its-graph.md) reuses that renderer rather than growing a
+second one; [A-139](stories/A-139-the-loop-view-under-load.md) keeps it honest under a fast loop and
+sub-agent fan-out — ⚠ **a view that silently drops steps is worse than one that admits it is behind**,
+and in a demo it reads as flux having done less than it did. Design:
+[agent-loop-visibility.md](designs/agent-loop-visibility.md).
+
+### Pause and resume a live run (epic) — 🔄 **PROPOSED (A-140, A-141 filed, none started)**
+
+A view you can watch but not halt is a dashboard. This adds *stop* — read what it is about to do, think,
+show someone, intervene — and *continue*.
+
+⚠ **flux already suspends three ways, and none of them is this.** `await`/durable journeys, `ParkedAsk`,
+and the approval envelope are all **cooperative and declared in advance**: the program says where it
+stops. This epic adds an **operator-initiated** halt at a point nobody declared, and treating those as
+the same problem is how it ships broken. The good news is that approval is the right mechanism to
+extend — it already proves the runtime can hold a turn mid-flight without losing state.
+[A-141](stories/A-141-what-pause-means-for-an-effect-in-flight.md) is the story that makes it
+trustworthy: a pause pressed while an HTTP request is in flight cannot un-send it, and ⚠ **a pause that
+reports stopped while effects continue is worse than no pause** — it invites the operator to relax at
+exactly the wrong moment. Pause is also never a safety control; the envelope is, and it runs *before*
+the effect. Design: [run-control.md](designs/run-control.md).
+
+### The interactive debugger — stop, inspect, change a value, continue (epic) — 🔄 **PROPOSED (A-142, A-143 filed, none started)**
+
+Turning an agent from something you observe into something you work with — possible only because flux's
+runs are **programs rather than transcripts**: an agent whose contract is its conversation has no
+variables to inspect and no execution point to resume from.
+
+⚠ **And flux already does this offline — the machinery is shipped.** `flux fork <session> --at N --inject
+<json>` (A-46) replays a run hermetically to statement N, substitutes a different value for its result,
+and runs the rest live through the real approval envelope; `--edit`/`--replan`, `flux replay` and `flux
+diff` round it out. **Stop at a point · change a value · continue** already exists, for *recorded* runs.
+The gap is the live case, and it is sharper than "build a debugger": a forked replay holds **nothing**
+(hermetic prefix, no side effects, so injection is free), while a live paused run holds an open
+connection, a spawned process, a half-written file — and a changed value can contradict effects that
+already happened. [A-142](stories/A-142-inspect-a-paused-run.md) is read-only first (⚠ inspection is a
+**disclosure** surface, and C-339 found redaction failing *open* here, so the failure path needs a test);
+[A-143](stories/A-143-change-a-value-and-continue.md) adds the write half, with the ⚠ **intervention
+recorded in the evidence chain** — a run whose log does not show that a human altered its state has lost
+the property that makes flux auditable, which is worth more than the feature. Design:
+[interactive-debugger.md](designs/interactive-debugger.md).
+
 ### Explore, then freeze — ad-hoc browser testing that becomes a deterministic script (epic) — 🔄 **PROPOSED (C-430…C-434 filed, none started)**
 
 Ask an agent to log into a site and test a module's happy path. It explores — misreads a label,

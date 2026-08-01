@@ -3,6 +3,7 @@ id: D-211
 title: Agent screenshare — publish a rendered flux surface into the call
 pillar: Agent
 status: blocked
+priority: 4
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels, flux-tui]

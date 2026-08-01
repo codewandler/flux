@@ -3,6 +3,7 @@ id: D-210
 title: Room audio out — the agent speaks into the call, interruptibly
 pillar: Agent
 status: blocked
+priority: 3
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-flow, flux-audio]

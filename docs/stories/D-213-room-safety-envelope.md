@@ -3,7 +3,7 @@ id: D-213
 title: The room safety envelope — untrusted co-presence, consent, and approved publication
 pillar: Agent
 status: ready
-priority: 32
+priority: 5
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels, flux-policy]
