@@ -3,8 +3,7 @@ id: C-391
 title: "The test suite creates and abandons real directories in the operator's `~/.flux/worktrees`"
 pillar: Core
 epic: road-to-stable
-status: ready
-priority: 3
+status: done
 areas: [flux-tools, flux-system]
 note: "C-332's census, tranche C. Not merely a verdict hazard — five abandoned `flux-worktree-848868-*/checkout` trees were found in the operator's real ~/.flux/worktrees, dated to a test run three days earlier. `allocate_worktree_dir()` reads FLUX_WORKTREE_DIR else $HOME/.flux/worktrees, and no flux-tools test pins it"
 ---

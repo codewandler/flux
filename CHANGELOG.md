@@ -22,6 +22,18 @@ All notable changes to this project are documented in this file. The format is b
   single enforcement point. A scanner test fails on any ambient `router(`/`from_env(` call in a test,
   and was verified to fire before being trusted.
 
+- **7 `flux-tools` tests stopped writing into the operator's `~/.flux/worktrees`** (C-391). Not only
+  a verdict hazard: a unit test suite was creating real directory trees in the developer's home, and
+  five stale ones from a run that died between `enter` and `leave` were found on disk. `WorktreeBase`
+  makes the base a value — `from_process()` keeps the unchanged `$FLUX_WORKTREE_DIR` →
+  `$HOME/.flux/worktrees` → temp ladder, `pinned(dir)` is what tests hold — so the published crate's
+  API is purely additive and no test needs a racy `set_var`. The census found **7 allocating tests,
+  not the 5 the story named**: `fleet.isolate` reaches the same allocator from a different op. A
+  scanner test fails on any unpinned `System` construction in the crate, and was verified to fire
+  before being trusted. The story also records that a **production** leak exists on three paths —
+  nothing in flux lists or prunes `~/.flux/worktrees`, so a stranded worktree is silent and
+  unbounded (filed as C-402, not fixed here).
+
 ### Added
 
 - **The workspace-confined file surface is a port** (C-395). `GuardedWorkspaceFiles` states
