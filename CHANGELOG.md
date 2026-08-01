@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **0.47.1 re-ships 0.47.0's binaries, which never published.** 0.47.0's crate closure is live on
+  crates.io and is correct — but its GitHub Release was created carrying only `dist-manifest.json`,
+  with no binaries, installers or checksums, so every download link it advertised was a 404. The
+  cause was a release candidate that reported `success` while building nothing: a second candidate
+  dispatch raced the first, and every job after candidate resolution was skipped, including the one
+  that records the receipt. Matching the candidate's `headSha` to the tag — the documented check —
+  passed, because SHA equality is necessary and not sufficient.
+  `v0.47.0` is recorded in `check-release-tags.sh`'s `ALLOWED_WITHOUT_RELEASE`, alongside `v0.11.1`,
+  `v0.12.0` and `v0.17.0`, and its empty Release is deleted rather than left advertising downloads
+  that do not exist. **If you are on 0.47.0 from crates.io you are on the right code**; only the
+  prebuilt binaries were missing, and 0.47.1 is the same tree.
+  ⚠ The audit that exists for this class did not catch it: `check-release-tags.sh` verifies that every
+  tag *has* a Release and that `/releases/latest` is newest — both were true of the broken one. It
+  does not check asset counts.
+
 ## [0.47.0] - 2026-08-01
 
 ### Fixed

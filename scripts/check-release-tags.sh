@@ -73,7 +73,8 @@ TAB="$(printf '\t')"
 # investigated. Adding one means the version is permanently undownloadable.
 ALLOWED_WITHOUT_RELEASE='v0.11.1
 v0.12.0
-v0.17.0'
+v0.17.0
+v0.47.0'
 
 # Only `vX.Y.Z` tags are release tags. This deliberately excludes the `plugins-v*` pack line (cut by
 # a separate hand-driven workflow with its own assets) and pre-0.3 dev tags like
