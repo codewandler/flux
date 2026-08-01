@@ -151,6 +151,44 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### The secret the agent never sees — our redaction against their substitution (epic) — 🔄 **PROPOSED (C-458…C-461 filed, none started)**
+
+Anthropic's [Vaults](https://platform.claude.com/docs/en/managed-agents/vaults) solve flux's problem with
+a different strategy, and the difference explains a class of bug flux keeps finding. Their
+`environment_variable` credential is *"stored in the sandbox as an opaque placeholder… substituted with
+the real secret **at egress**. The agent never sees the secret value."*
+
+⚠ **Containment versus prevention, and the failure modes are asymmetric.** flux's local path resolves a
+secret to plaintext (`crates/flux-app/src/secrets.rs:35-41` — `resolve_in` reads `std::env::var` and
+substitutes into the config value) and relies on the `Redactor` afterwards. A missed scrub **publishes a
+credential, silently**. A missed substitution sends a placeholder, the third party rejects it, and you
+get an auth error. flux's three known secret bugs are all containment failures — C-339 (redaction fails
+**open**), C-432 (cannot redact what it was never told), D-234 (a `Debug` impl prints a resolved secret)
+— and **none of them is expressible in a substitution model**.
+
+⚠ **flux already built the stronger model, in one place, and does not advertise it.**
+[C-312](stories/C-312-connector-credential-boundary.md) asserts with a test that on the connector path
+*"flux holds exactly ONE secret… a response carrying credential-shaped material is refused, not merely
+redacted"* — the vendor credential never enters the process. That is the same property Vaults sells as
+its headline. So the gap is statable without reference to anyone else: **flux has both strategies and
+applies the strong one only to connectors.**
+
+[C-458](stories/C-458-substitute-at-egress.md) brings prevention to the local path. ⚠ Feasibility crux,
+verified before filing: flux has one egress **guard** but **not** one egress **sender** —
+`flux-web/src/egress.rs` is the model-facing family's single guarded, address-pinned sender, while
+providers, a2a, JaaS tokens and auth each build their own client. And ⚠ **substitution cannot be
+universal here**: flux secrets also feed XMPP MUC passwords, SIP registrar credentials and plugin argv,
+where there is no HTTP egress to splice at — so prevention is an addition, never a replacement for
+redaction, and an operator must be able to tell which of their secrets is which.
+[C-459](stories/C-459-scope-a-secret.md) is the win worth taking **regardless**, since it applies to
+every secret whatever the transport: flux guards egress **per caller, never per secret**, so a resolved
+value can travel anywhere that caller may already reach — and per-*principal* scoping is newly
+expressible now that C-408/C-415 established per-speaker `TurnIdentity`.
+[C-460](stories/C-460-rotation-revocation-audit.md) is the operational half — resolution happens once, so
+revoking a credential has no effect on a run in flight — and [C-461](stories/C-461-what-our-secret-model-is.md)
+writes the model down, since flux currently undersells the connector guarantee and overstates the local
+one by omission. Design: [secrets-the-agent-never-sees.md](designs/secrets-the-agent-never-sees.md).
+
 ### What the Pi comparison says to fix — and what to defend instead (epic) — 🔄 **PROPOSED (C-444…C-452 filed, none started)**
 
 `docs/reviews/single/2026-08-01-pi-flux-harness-comparison.md` is two isolated source-level reviews
