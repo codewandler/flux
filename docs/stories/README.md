@@ -102,6 +102,12 @@ _flux's central claim is that **the LLM is not the runtime** — authored contro
 ### Connector Platform
 - [C-405 — The plugin pack carries twelve private percent-encoders and one has already drifted](C-405-the-plugin-packs-twelve-encoders-have-started-to-drift.md) · Core · found by C-313's census — drift observed, not predicted. `plugins/gitlab`'s `enc` omits `~` from the unreserved set, so it emits %7E where the other eleven emit `~`. The nested workspace structurally cannot delegate to flux-core, so the fix is a shared encoder in host-kit — a protocol-line change owing a pack release
 
+### The docs are missing things a user expects to find — starting with context management
+_Someone evaluating an agent harness arrives with a checklist they did not write down. *How does it_
+- [C-441 — A context-management section — the question every user asks, answered nowhere](C-441-context-management-doc.md) · Core · ⚠ the mechanism is implemented and its entire user-facing documentation is ONE ROW in a config table: `FLUX_COMPACT_CHARS`. `context-packs.md` (the Flux-Lang ctx construct) and `project-context.md` are real and answer different questions, which is why the gap looks covered from the inside
+- [C-443 — Zero `Compacted` rows in 112,114 events — does compaction ever actually fire?](C-443-zero-compacted-rows.md) · Core · ⚠ found by A-145 while sweeping the event store for a real-run fixture. Not a docs problem: either the threshold is never reached, compaction is effectively disabled, or it fires without recording. Gates C-441, because a page describing behaviour nobody has observed is documentation of an intention
+- [C-442 — What do Codex, Claude Code, OpenCode and Pi document that we do not?](C-442-peer-docs-gap-audit.md) · Core · ⚠ verify against the LIVE docs; do not write this from recollection. A gap list assembled from memory of what a competitor's docs probably contain is exactly the confident-and-wrong artifact this repo keeps catching — leave a row empty rather than guess it
+
 ### the execution substrate — `flux-system` for a second consumer
 _`flux-system` has had exactly one consumer since it was written: flux. That is about to stop being_
 - [C-394 — flux-system as a shared execution substrate (epic)](C-394-execution-substrate-epic.md) · Core · EPIC — the port seam already exists and names 'a remote executor' as a target; what is missing is the file surface, datagram targets, and a written contract for consuming the substrate WITHOUT flux-runtime

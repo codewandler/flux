@@ -151,6 +151,37 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### The docs are missing things a user expects to find (epic) — 🔄 **PROPOSED (C-441…C-443 filed, none started)**
+
+Someone evaluating an agent harness arrives with a checklist they never wrote down — *how does it handle
+a long conversation? what happens when the context fills? can I control it?* — and flux's docs do not
+answer it. **The gap is concrete**: compaction is implemented (`compact_threshold_chars`, `maybe_compact`,
+and an `EventKind::Compacted { messages }` that **replaces** history in the durable log) and its entire
+user-facing documentation is **one row in a config table**. `context-packs.md` documents Flux-Lang's
+`ctx`, `project-context.md` documents project context — both real, both answering a different question,
+which is exactly why the gap is invisible from the inside.
+
+⚠ **And underneath the docs gap is a behaviour question.**
+[A-145](stories/A-145-a-real-run-as-the-mock-fixture.md), sweeping the event store for a real-run
+fixture, found **zero `Compacted` rows in 112,114 events**. Either the threshold is never reached,
+compaction is effectively disabled, or — the case that matters — **it fires and does not record**, which
+would mean history is being replaced with no durable evidence, silently corrupting every replay, export
+and reconstruction. [C-443](stories/C-443-zero-compacted-rows.md) settles which, and **gates**
+[C-441](stories/C-441-context-management-doc.md): a page describing behaviour nobody has observed is
+documentation of an intention.
+
+[C-442](stories/C-442-peer-docs-gap-audit.md) generalizes it — what do **Codex, Claude Code, OpenCode
+and Pi** document that we do not? Each row classified *missing page* · *covered but unfindable* (the
+`FLUX_COMPACT_CHARS` pattern — a real entry in a 500-line table where no reader will meet it) ·
+*deliberately absent* (which owes a sentence in the docs, since silence reads as oversight). ⚠ Two rules
+make it worth doing: **verify against the live docs rather than recollection** — a gap list written from
+memory of what a competitor "probably" documents is the confident-and-wrong artifact this repo keeps
+catching — and **compare topics, not tables of contents**, since copying a structure imports a shape
+flux does not have. The in-repo Pi comparison is a starting hypothesis, not a finding: it scores flux
+**8.0 vs 9.0 on Operator UX** and on **Embeddability**, reading flux as *"higher conceptual cost"* and
+*"asks more of the embedder"* — which is precisely what documentation exists to pay down, but it scored
+**code, not docs**. Design: [docs-completeness.md](designs/docs-completeness.md).
+
 ### Remote agents — run the agent here, land the effects there (epic) — 🔄 **PROPOSED (C-436…C-440 filed, none started)**
 
 Run an agent on your machine and your machine is what it touches. Sometimes that is the problem: you
