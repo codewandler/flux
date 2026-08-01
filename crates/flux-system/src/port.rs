@@ -48,11 +48,10 @@
 //!
 //! **Unsealed.** Any crate depending on published `codewandler-flux-system` can implement
 //! `GuardedProcess`, `GuardedHostFiles`, `GuardedWorkspaceFiles` or `GuardedEnv`. That is the point
-//! — an out-of-repo Wasm embedder serving these ports is the whole reason they exist. It is also
-//! not an escalation: a
-//! downstream crate that wanted to run an unguarded process could always just call `Command::new`
-//! itself. What these traits are is a *contract*, not a permission — implementing one grants no
-//! ability, it only claims to uphold the guarantees documented on each method.
+//! — an out-of-repo Wasm embedder serving these ports is the whole reason they exist. It is also not
+//! an escalation: a downstream crate that wanted to run an unguarded process could always just call
+//! `Command::new` itself. What these traits are is a *contract*, not a permission — implementing one
+//! grants no ability, it only claims to uphold the guarantees documented on each method.
 //!
 //! **The gate is in-repo only, and it enumerates three of the four ports.** `flux-codegate`'s
 //! `no_unreviewed_guarded_port_backend_outside_system` reports every production `impl` of
@@ -433,6 +432,63 @@ impl GuardedHostFiles for System {
     }
 }
 
+// Every operation, including the two the trait would otherwise default, so the native backend
+// answers each one through its own guarded method rather than through a reduction — the port and the
+// struct are then the same code path, not merely the same outcome.
+impl GuardedWorkspaceFiles for System {
+    fn read_file_bytes<'a>(&'a self, path: &'a str) -> Guarded<'a, Vec<u8>> {
+        Box::pin(System::read_file_bytes(self, path))
+    }
+
+    fn write_file_bytes<'a>(&'a self, path: &'a str, contents: &'a [u8]) -> Guarded<'a, ()> {
+        Box::pin(System::write_file_bytes(self, path, contents))
+    }
+
+    fn read_file<'a>(&'a self, path: &'a str) -> Guarded<'a, String> {
+        Box::pin(System::read_file(self, path))
+    }
+
+    fn write_file<'a>(&'a self, path: &'a str, contents: &'a str) -> Guarded<'a, ()> {
+        Box::pin(System::write_file(self, path, contents))
+    }
+
+    fn append_file<'a>(&'a self, path: &'a str, contents: &'a str) -> Guarded<'a, ()> {
+        Box::pin(System::append_file(self, path, contents))
+    }
+
+    fn read_file_bytes_capped<'a>(
+        &'a self,
+        path: &'a str,
+        max: usize,
+    ) -> Guarded<'a, (Vec<u8>, bool)> {
+        Box::pin(System::read_file_bytes_capped(self, path, max))
+    }
+
+    fn file_size<'a>(&'a self, path: &'a str) -> Guarded<'a, u64> {
+        Box::pin(System::file_size(self, path))
+    }
+
+    fn path_exists<'a>(&'a self, path: &'a str) -> Guarded<'a, bool> {
+        Box::pin(System::path_exists(self, path))
+    }
+
+    fn is_dir<'a>(&'a self, path: &'a str) -> Guarded<'a, bool> {
+        Box::pin(System::is_dir(self, path))
+    }
+
+    fn file_mtime<'a>(&'a self, path: &'a str) -> Guarded<'a, std::time::SystemTime> {
+        Box::pin(System::file_mtime(self, path))
+    }
+
+    fn list_dir<'a>(&'a self, path: &'a str) -> Guarded<'a, Vec<String>> {
+        Box::pin(System::list_dir(self, path))
+    }
+
+    fn walk_files<'a>(&'a self, base: &'a str, max: usize) -> Guarded<'a, Vec<String>> {
+        Box::pin(System::walk_files(self, base, max))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +651,35 @@ mod tests {
         std::fs::remove_dir_all(&outside).ok();
     }
 
+    /// C-395 — the native backend answers *every* file operation through the port, including the
+    /// optional ones. Without this the delegation could quietly lose an override and inherit the
+    /// trait's denial, which would look like a working port right up until a consumer asked.
+    #[tokio::test]
+    async fn the_native_system_serves_every_file_operation_through_the_port() {
+        let root = sandbox::fixture_dir("port-file-native");
+        let system = System::new(Workspace::new(&root).unwrap());
+        let port: &dyn GuardedWorkspaceFiles = &system;
+
+        port.write_file("dir/a.txt", "hello").await.unwrap();
+        port.append_file("dir/a.txt", " again").await.unwrap();
+
+        assert_eq!(port.read_file("dir/a.txt").await.unwrap(), "hello again");
+        assert_eq!(port.file_size("dir/a.txt").await.unwrap(), 11);
+        assert_eq!(
+            port.read_file_bytes_capped("dir/a.txt", 5).await.unwrap(),
+            (b"hello".to_vec(), true)
+        );
+        assert!(port.path_exists("dir/a.txt").await.unwrap());
+        assert!(!port.path_exists("dir/missing.txt").await.unwrap());
+        assert!(port.is_dir("dir").await.unwrap());
+        assert!(!port.is_dir("dir/a.txt").await.unwrap());
+        port.file_mtime("dir/a.txt").await.unwrap();
+        assert_eq!(port.list_dir("dir").await.unwrap(), vec!["a.txt"]);
+        assert_eq!(port.walk_files(".", 100).await.unwrap(), vec!["dir/a.txt"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// C-395 — the read/write asymmetry survives the port.
     ///
     /// A `read_root` (C-21) widens *reads* only. Through the trait, exactly as through the struct, a
@@ -667,7 +752,11 @@ mod tests {
                 })
             }
 
-            fn write_file_bytes<'a>(&'a self, path: &'a str, contents: &'a [u8]) -> Guarded<'a, ()> {
+            fn write_file_bytes<'a>(
+                &'a self,
+                path: &'a str,
+                contents: &'a [u8],
+            ) -> Guarded<'a, ()> {
                 Box::pin(async move {
                     self.0
                         .lock()
