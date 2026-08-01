@@ -29,9 +29,15 @@ chatter. This is what separates a usable meeting participant from a bot that tal
 - [x] A per-room reply budget per unit time. Failing-first test `agent_pair_chatter_converges`: two mock
       agents that both reply to mentions terminate instead of running to the agent cap.
 - [x] An agent never auto-replies to another agent's **plain text** — only to a structured A2A envelope
-      (the D-212 seam).
+      (the D-212 seam). — **with the caveat that this arm is unreachable today on every backend**:
+      `OccupantKind::Agent` is only ever assigned to *ourselves*, so no peer is currently classifiable
+      as an agent and the refusal cannot fire for one. The rule is correct and pinned, and the reply
+      budget is what actually bounds agent-to-agent chatter until a backend can tell peers apart
+      (D-205 for XMPP, D-212 for the declared case).
 - [x] Attributed context: the accumulated transcript records who said what, so an eventual answer can
-      refer to "what Timo asked" rather than a flat blob.
+      refer to "what Timo asked" rather than a flat blob. — **with the caveat that it reaches the
+      model on the journey path only**: `flux-app`'s `run_agent` collapses the payload to its `text`
+      field, so an `agent`-bound room drops the `context` before the turn. See the Progress note.
 
 ## Progress
 
@@ -58,13 +64,38 @@ with the attributed half in `crates/flux-flow/src/voice/room_transcript.rs`.
   `Unknown` arm on purpose, so it tests the bound that actually applies in production.
 - **Attributed context** — `VoiceTurnHandler` gained a defaulted `overheard`; the room adapter
   accumulates unaddressed lines in a bounded `RoomTranscript` and drains them onto the *next*
-  addressed delivery as the payload's `context` (`{speaker, nick, text}` per line). Inside C-407's
-  fence, which renders the whole payload, so nothing about that framing is unpicked.
+  addressed delivery as the payload's `context` (`{speaker, nick, text}` per line).
+- **Addressing follows the nick the *service* gave us**, not the configured one. A MUC may seat us
+  under a different nick on a collision, and `<status code='110'/>` is what names us afterwards
+  (D-205). The driver tracks our room-visible nick from self-presence — which necessarily precedes
+  our first message, the same ordering the echo check relies on — and passes that to `classify`.
+  Matching `RoomSettings.nick` after a reassignment made the agent **permanently silent**: occupants
+  type the name they can see. Pinned by `a_reassigned_nick_is_the_one_the_room_must_type`.
+- **A mention has to be shaped like an address, not merely contain the nick.** Our name turns up in
+  URLs, log paths, JIDs and prose about the product, so `addresses_by_name` requires `@nick`, or a
+  whitespace/line opening closed by end-of-line or `:,?!.;`, or a line-initial vocative. Pinned in
+  both directions (`our_nick_merely_occurring_in_a_line_is_not_an_address` and
+  `the_spellings_people_actually_use_to_address_a_bot_all_land`). Wake phrases stay match-anywhere on
+  purpose and say so: the operator picks those and can make them as distinctive as they like.
+- **Every silent refusal explains itself once per session** on stderr (the crate's logging
+  convention — `flux-channels` carries no `tracing` dependency, and adding one is a fenced change).
+  One line per distinct reason, so a busy room cannot turn the log into the spam D-207 removed from
+  the room itself, and it names the nick we are answering to — the value most often at fault.
 
 **Read before changing:** the "zero planner calls" assertion is spelled as **zero `Deliverer::deliver`
 calls**. That is the seam where a room message becomes a journey run and therefore spend, and it is
 reachable from `flux-channels`; counting model calls would mean reaching into `flux-app`'s
 provider. Anyone tightening this should tighten it there, not weaken it here.
+
+**Known gap, not fixed here — the context does not reach an `agent`-bound room turn.**
+`flux-app`'s `run_agent` (`crates/flux-app/src/app.rs:1586-1589`) uses the payload's `text` when it is
+non-empty and synthesizes an event context only otherwise; for an addressed room line the text is
+always non-empty, so the whole payload — `context` included — is dropped before the model. It
+survives on the **journey** path, which takes the payload whole. Acceptance item 5's stated purpose is
+therefore unreachable for a room bound to an agent. `flux-app` is outside this story's
+`areas: [flux-channels, flux-flow]`, and the fix is a judgement about how *every* channel's payload
+should reach an agent turn — not a room-specific patch — so it needs its own story rather than a
+drive-by widening here.
 
 **Not in scope, and still open:** the *journey* path (`run_journey`) is untouched — it remains
 `local`/Privileged (C-415), and no rule here widens or narrows it.

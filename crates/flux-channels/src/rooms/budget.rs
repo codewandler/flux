@@ -30,6 +30,9 @@ pub const DEFAULT_ROOM_REPLY_BUDGET: usize = 12;
 /// The window [`DEFAULT_ROOM_REPLY_BUDGET`] is counted over.
 pub const DEFAULT_ROOM_REPLY_WINDOW: Duration = Duration::from_secs(60);
 
+/// The most slots [`ReplyBudget::new`] will preallocate, whatever ceiling the operator configured.
+const PREALLOC_CAP: usize = 64;
+
 /// A per-room sliding-window ceiling on answered turns.
 ///
 /// One budget belongs to one [`RoomTurnDriver`](super::RoomTurnDriver), which is what makes it
@@ -56,7 +59,12 @@ impl ReplyBudget {
         Self {
             max,
             window,
-            granted: Mutex::new(VecDeque::with_capacity(max)),
+            // Capped, because `max` comes from operator configuration: `with_capacity(usize::MAX)`
+            // is a `capacity overflow` abort, and a channel declaration must never be able to kill
+            // the process. Capacity is only an allocation hint — the deque still grows to whatever
+            // the ceiling really is, one turn at a time, and a budget that large is "effectively
+            // unlimited", which is a thing an operator is allowed to ask for.
+            granted: Mutex::new(VecDeque::with_capacity(max.min(PREALLOC_CAP))),
         }
     }
 
@@ -154,6 +162,16 @@ mod tests {
         let budget = ReplyBudget::new(0, Duration::from_secs(60));
         assert!(!budget.try_take(Instant::now()));
         assert_eq!(budget.remaining(Instant::now()), 0);
+    }
+
+    #[test]
+    fn an_absurd_configured_ceiling_does_not_abort_the_process() {
+        // `max` arrives from the `reply_budget` channel setting, so `VecDeque::with_capacity(max)`
+        // put a `capacity overflow` abort behind a number in a declaration file. A ceiling nobody
+        // will reach still has to *work*, not take the host down at construction.
+        let budget = ReplyBudget::new(usize::MAX, Duration::from_secs(60));
+        assert!(budget.try_take(Instant::now()));
+        assert_eq!(budget.max(), usize::MAX);
     }
 
     #[test]

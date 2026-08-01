@@ -205,13 +205,23 @@ channel standup
   it: some hosts lowercase the room in its address while other identifiers keep the original case. Once
   joined, flux uses the address the server reported and ignores the case you wrote here.
 - `nick` — the name flux joins under. Defaults to `flux`. The server may hand back a different one on
-  a collision, and flux follows it.
+  a collision, and flux follows it — including for `mention` matching below, so the room only ever has
+  to type the name it can actually see.
 - `address_rule` — when the agent should treat a public line as aimed at it. A comma-separated list
-  of `mention` (the line names flux — the default), `wake: <phrase>` (the line carries that phrase),
-  `always` (every line) or `never` (no public line). A **private message is always addressed**,
-  whatever the rule says. Anything outside that vocabulary is a load error rather than a silent
-  widening. A line that does not address flux updates its context and produces no turn, no reply and
-  no model call.
+  of `mention` (the line **addresses** flux — the default), `wake: <phrase>` (the line carries that
+  phrase), `always` (every line) or `never` (no public line). A **private message is always
+  addressed**, whatever the rule says. Anything outside that vocabulary is a load error rather than a
+  silent widening. A line that does not address flux updates its context and produces no turn, no
+  reply and no model call.
+
+  `mention` asks whether somebody spoke *to* flux, not whether the word appeared: `@flux`, `flux: …`,
+  `any idea, flux?`, a line that opens with the nick, or one that ends with it. Talking *about* flux
+  is not addressing it, so `see https://flux.dev/docs` and `the flux 0.48 release notes` go
+  unanswered. A `wake:` phrase is looser on purpose — it matches anywhere in the line, since you
+  chose it and can make it as distinctive as your room needs.
+
+  When flux stays quiet it says why once per session on stderr, naming the rule and the nick it is
+  answering to — the first thing to check if a room agent seems to have stopped listening.
 - `reply_budget` / `reply_window_secs` — the ceiling on how often this room can make flux answer,
   default **12 turns per 60 seconds**. It gates the turn, not the outbound line, so a message past
   the ceiling costs nothing at all. This is what stops two agents in one room answering each other

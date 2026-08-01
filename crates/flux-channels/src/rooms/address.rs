@@ -11,9 +11,10 @@
 //! - **A private message always does.** Nobody whispers to the agent and does not mean it, so the
 //!   configured rule governs *public* text only. This is why [`MessageScope`] had to survive the trip
 //!   through the port (D-204).
-//! - **Public text** counts when the configured rule says so: our room-visible name was mentioned
-//!   ([`AddressRule::MENTION`]), or a configured wake phrase opened the line
-//!   ([`AddressRule::wake`]).
+//! - **Public text** counts when the configured rule says so: our room-visible name was *addressed*
+//!   ([`AddressRule::MENTION`]) — not merely present, see [`addresses_by_name`] for the difference
+//!   and why a line about `https://flux.dev` is not a question for us — or a configured wake phrase
+//!   appeared ([`AddressRule::wake`]).
 //!
 //! ## What can never count
 //!
@@ -30,8 +31,13 @@
 //!
 //! ## Identity
 //!
-//! Mention matching compares text against **our own** configured nick — the name a person types when
-//! they mean us. It never identifies a *speaker* by nick: occupants may share one
+//! Mention matching compares text against **our own room-visible nick** — the name a person types
+//! when they mean us. That is the nick the *service* seated us under, which is not always the one we
+//! asked for: a MUC may reassign it on a collision, and `<status code='110'/>` is what names us
+//! afterwards (D-205). The driver tracks it from presence and passes it in, because matching a stale
+//! configured value would make the agent permanently silent — occupants type the name they can see.
+//!
+//! It never identifies a *speaker* by nick: occupants may share one
 //! ([`Occupant::nick`](super::Occupant::nick)), and [`OccupantId`](super::OccupantId) is the stable
 //! id for that.
 
@@ -145,8 +151,14 @@ impl AddressRule {
         }
     }
 
-    /// Add a wake phrase. Matched case-insensitively anywhere in the line, at word boundaries — so
-    /// `wake: ok flux` fires on "ok flux, when is standup?" and not inside another word.
+    /// Add a wake phrase. Matched case-insensitively **anywhere** in the line, at word boundaries —
+    /// so `wake: ok flux` fires on "ok flux, when is standup?" and not inside another word.
+    ///
+    /// Deliberately looser than mention matching ([`addresses_by_name`]), and the asymmetry is the
+    /// point: our nick is forced on us by the room and turns up in URLs, paths and prose about the
+    /// product, so it needs the addressing shape to be trustworthy. A wake phrase is *chosen* by the
+    /// operator, who can make it as distinctive as the room requires — constraining where it may
+    /// appear would only stop it doing the job it was picked for.
     pub fn wake(mut self, phrase: impl Into<String>) -> Self {
         let phrase = phrase.into().trim().to_lowercase();
         if !phrase.is_empty() {
@@ -204,8 +216,9 @@ impl AddressRule {
         Ok(rule)
     }
 
-    /// Classify one inbound message. `nick` is **our** room-visible name; `kind` is what the backend
-    /// knows about the speaker.
+    /// Classify one inbound message. `nick` is **our** room-visible name — the one presence says the
+    /// service seated us under, not necessarily the configured one; `kind` is what the backend knows
+    /// about the speaker.
     pub fn classify(
         &self,
         nick: &str,
@@ -226,7 +239,7 @@ impl AddressRule {
             return Addressing::Always;
         }
         let lower = text.to_lowercase();
-        if self.mention && !nick.is_empty() && contains_token(&lower, &nick.to_lowercase()) {
+        if self.mention && !nick.is_empty() && addresses_by_name(&lower, &nick.to_lowercase()) {
             return Addressing::Mention;
         }
         if self.wake.iter().any(|p| contains_token(&lower, p)) {
@@ -314,32 +327,95 @@ pub fn is_a2a_envelope(text: &str) -> bool {
     }
 }
 
+/// Whether `haystack` **addresses** somebody called `nick` — both already lowercased.
+///
+/// Occurring in the line is not the same as being spoken to, and a nick is a word the room says for
+/// other reasons: it is in URLs, log paths, JIDs and ordinary prose about the product. A
+/// match-anywhere rule answers all of these —
+///
+/// ```text
+/// see https://flux.dev/docs for the answer
+/// the log is at /var/log/flux/agent.log
+/// did you see the flux 0.48 release notes?
+/// i pushed to git@github.com:codewandler/flux.git
+/// ```
+///
+/// — and an agent that replies to those is the same social failure D-207 exists to fix, just with a
+/// smaller blast radius. So the occurrence must be **shaped like an address**: on a word boundary
+/// (never inside `influx`), and then one of
+///
+/// - `@nick` anywhere — an explicit at-mention is unambiguous whatever surrounds it;
+/// - opened by whitespace or the start of the line **and** closed by end-of-line or address
+///   punctuation (`:` `,` `?` `!` `.` `;`) — `flux: when is standup?`, `any idea, flux?`,
+///   `let's ask flux`;
+/// - or line-initial, where the vocative needs no punctuation at all — `flux when is standup?`.
+///
+/// The opening test is what rejects all four lines above: in every one of them the nick is glued to
+/// a `/` or a `@…` that is part of some other token. Wake phrases deliberately do **not** go through
+/// this — see [`AddressRule::wake`].
+fn addresses_by_name(haystack: &str, nick: &str) -> bool {
+    for (start, end) in token_occurrences(haystack, nick) {
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[end..].chars().next();
+        if before == Some('@') {
+            return true;
+        }
+        let opened = before.is_none_or(char::is_whitespace);
+        let line_initial = haystack[..start].trim_end().is_empty();
+        let line_final = haystack[end..].trim_start().is_empty();
+        let closed = after.is_none_or(is_address_punct);
+        if opened && (line_initial || line_final || closed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Punctuation that closes a vocative — the marks that follow a name when somebody is being spoken
+/// to. Not `-` or `_`: those continue a word, and `flux-bot` is a different occupant.
+fn is_address_punct(c: char) -> bool {
+    matches!(c, ':' | ',' | '?' | '!' | '.' | ';')
+}
+
 /// Whether `needle` occurs in `haystack` at word boundaries — both already lowercased.
 ///
 /// Boundary-checked so a nick of `flux` is not matched inside `influx` or `fluxes`. A boundary is
-/// any character that is not alphanumeric and not `_`/`-`/`+`, which keeps `@flux` and `flux:` —
-/// the two spellings people actually type when addressing a room bot — matching.
+/// any character that is not alphanumeric and not `_`/`-`/`+`, so `flux-bot` is a *different* name
+/// and not a match on ours.
 fn contains_token(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let bytes_before = |i: usize| haystack[..i].chars().next_back();
+    token_occurrences(haystack, needle).next().is_some()
+}
+
+/// Every word-boundary occurrence of `needle` in `haystack`, as `(start, end)` byte offsets.
+fn token_occurrences<'a>(
+    haystack: &'a str,
+    needle: &'a str,
+) -> impl Iterator<Item = (usize, usize)> + 'a {
     let mut from = 0usize;
-    while let Some(offset) = haystack[from..].find(needle) {
-        let start = from + offset;
-        let end = start + needle.len();
-        let before_ok = bytes_before(start).is_none_or(|c| !is_word_char(c));
-        let after_ok = haystack[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !is_word_char(c));
-        if before_ok && after_ok {
-            return true;
+    std::iter::from_fn(move || {
+        if needle.is_empty() {
+            return None;
         }
-        // Advance one character, not one byte — `find` returns a char boundary, and so must this.
-        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
-    }
-    false
+        while let Some(offset) = haystack[from..].find(needle) {
+            let start = from + offset;
+            let end = start + needle.len();
+            let before_ok = haystack[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_word_char(c));
+            let after_ok = haystack[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_word_char(c));
+            // Advance one character, not one byte — `find` returns a char boundary, and so must
+            // this.
+            from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+            if before_ok && after_ok {
+                return Some((start, end));
+            }
+        }
+        None
+    })
 }
 
 /// A character that continues a word, for [`contains_token`]'s boundary test.
@@ -509,6 +585,62 @@ mod tests {
         assert!(!is_a2a_envelope("flux: send me a jsonrpc 2.0 method"));
         assert!(!is_a2a_envelope("[1,2,3]"));
         assert!(!is_a2a_envelope(""));
+    }
+
+    #[test]
+    fn our_nick_merely_occurring_in_a_line_is_not_an_address() {
+        // A nick is a word the room says for other reasons — it is in URLs, log paths, JIDs and
+        // ordinary prose about the product. Answering those is the same social failure as answering
+        // everything, just quieter, and every one of these lines is a plausible standup message.
+        let rule = AddressRule::default();
+        for line in [
+            "see https://flux.dev/docs for the answer",
+            "the log is at /var/log/flux/agent.log",
+            "did you see the flux 0.48 release notes?",
+            "i pushed to git@github.com:codewandler/flux.git",
+            "the flux release is cut, ship it",
+            "we should upgrade flux 0.47 to 0.48",
+        ] {
+            assert_eq!(
+                public(&rule, line),
+                Addressing::NotAddressed,
+                "the nick occurs, but nobody is speaking to us: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_spellings_people_actually_use_to_address_a_bot_all_land() {
+        // The other half of the rule above: tightening the match must not cost the shapes a person
+        // types when they *do* mean us.
+        let rule = AddressRule::default();
+        for line in [
+            "flux: when is standup?",       // the colon form
+            "@flux when is standup?",       // the at-mention, mid-sentence punctuation or not
+            "hey @flux can you summarize",  // ...anywhere in the line
+            "any idea, Flux?",              // a vocative, closed by punctuation
+            "flux when is standup?",        // line-initial, no punctuation at all
+            "someone should ask flux",      // line-final
+            "ok so flux, what do you say?", // mid-line vocative
+        ] {
+            assert_eq!(
+                public(&rule, line),
+                Addressing::Mention,
+                "this is somebody addressing us: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wake_phrase_is_matched_anywhere_on_purpose() {
+        // The asymmetry with mention matching, pinned so it reads as a decision and not an
+        // oversight: the operator chose this phrase and can make it as distinctive as they like, so
+        // it is not held to the addressing shape our forced-on-us nick is.
+        let rule = AddressRule::parse("wake: ok assistant").unwrap();
+        assert_eq!(
+            public(&rule, "and then — ok assistant — take a note"),
+            Addressing::Wake
+        );
     }
 
     #[test]

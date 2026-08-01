@@ -6,7 +6,7 @@
 //! one to the other. What it adds over the voice driver is the thing a room has and a phone line does
 //! not — a **speaker** on every turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -128,6 +128,18 @@ impl RoomTurnDriver {
     ) -> Result<()> {
         // Nick lookup for the turn's `Speaker`, and the set of ids that are *us*.
         let mut known: HashMap<OccupantId, Occupant> = HashMap::new();
+        // **Our room-visible name**, which is what addressing must match — not the configured one.
+        // A MUC may seat us under a different nick than we asked for (a collision, or a service
+        // policy), and XEP-0045's `<status code='110'/>` is what names us then (D-205). Occupants
+        // type the name they can *see*; matching the config file's value after a reassignment makes
+        // the agent permanently silent, which is the failure the address rule exists to prevent.
+        // The configured nick stands in only until self-presence arrives, and self-presence
+        // necessarily precedes our first message — the same ordering the echo check relies on.
+        let mut our_nick = self.identity.nick.clone();
+        // Refusals are silent by design, which makes a room that says nothing hard to diagnose from
+        // the outside. One line per *distinct* reason per session: enough to explain the silence,
+        // bounded so a busy room cannot turn the log into the spam D-207 removed from the room.
+        let mut explained: HashSet<&'static str> = HashSet::new();
 
         loop {
             let event = tokio::select! {
@@ -141,6 +153,10 @@ impl RoomTurnDriver {
 
             match event {
                 RoomEvent::Joined { occupant } => {
+                    // Presence naming *us* also settles what the room has to type to reach us.
+                    if self.is_us(&occupant) && !occupant.nick.is_empty() {
+                        our_nick = occupant.nick.clone();
+                    }
                     known.insert(occupant.id.clone(), occupant);
                 }
                 RoomEvent::Left { occupant } => {
@@ -163,10 +179,9 @@ impl RoomTurnDriver {
                     // Was this said *to us*? Everything else is overheard: it reaches the handler's
                     // context and stops there — no planner call, no line said (D-207).
                     let kind = occupant.map_or(OccupantKind::Unknown, |o| o.kind);
-                    let addressing =
-                        self.address_rule
-                            .classify(&self.identity.nick, kind, scope, &text);
+                    let addressing = self.address_rule.classify(&our_nick, kind, scope, &text);
                     if !addressing.should_answer() {
+                        self.explain_once(&mut explained, addressing.reason(), &our_nick);
                         handler.overheard(&speaker, &text).await;
                         continue;
                     }
@@ -174,6 +189,7 @@ impl RoomTurnDriver {
                     // and stay quiet — saying "I am rate limited" is itself a reply, and two agents
                     // saying it at each other is the runaway one layer up.
                     if !self.budget.try_take(Instant::now()) {
+                        self.explain_once(&mut explained, "the reply budget is spent", &our_nick);
                         handler.overheard(&speaker, &text).await;
                         continue;
                     }
@@ -207,6 +223,25 @@ impl RoomTurnDriver {
     /// call site for why this is two signals and not one.
     fn is_us(&self, occupant: &Occupant) -> bool {
         occupant.is_self || occupant.nick == self.identity.nick
+    }
+
+    /// Say once, on stderr, why this room went quiet. Every refusal below the turn seam is silent in
+    /// the room itself — deliberately, since announcing a refusal is a reply — so the operator's only
+    /// window onto "the bot stopped answering" is here. `nick` is the name the room actually has to
+    /// type, which is the value most often at fault when the reason is `not addressed to us`.
+    fn explain_once(
+        &self,
+        explained: &mut HashSet<&'static str>,
+        reason: &'static str,
+        nick: &str,
+    ) {
+        if explained.insert(reason) {
+            eprintln!(
+                "room `{}`: staying quiet — {reason} (rule `{}`, answering to `{nick}`)",
+                self.room.id().as_str(),
+                self.address_rule,
+            );
+        }
     }
 }
 
@@ -570,6 +605,95 @@ mod tests {
             ears.overheard.lock().unwrap().len(),
             3,
             "the three past the ceiling are still heard, just not answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reassigned_nick_is_the_one_the_room_must_type() {
+        // A MUC may hand back a nick other than the one we asked for — a collision, or a service
+        // policy — and XEP-0045's `<status code='110'/>` is what names us afterwards (D-205,
+        // `the_self_presence_is_recognized_by_status_110`). Addressing must follow that, because
+        // matching the *configured* nick after a reassignment makes the agent permanently silent:
+        // occupants type the name they can see, and it is not the one in the config file.
+        //
+        // `MockRoom` cannot stand in — it builds its self-occupant straight from `identity.nick`,
+        // so the two can never disagree there, which is precisely the bug's absence.
+        struct Reassigning {
+            id: crate::rooms::RoomId,
+            said: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl Room for Reassigning {
+            fn id(&self) -> &crate::rooms::RoomId {
+                &self.id
+            }
+            async fn join(&self, _i: &RoomIdentity) -> flux_core::Result<RoomStream> {
+                let (tx, stream) = crate::rooms::room_event_channel();
+                // We asked to join as `flux`; the service seated us as `agent-7`.
+                let me =
+                    Occupant::new("standup@x/agent-7", "agent-7", OccupantKind::Agent).as_self();
+                let timo = Occupant::new("standup@x/timo", "timo", OccupantKind::Human);
+                tokio::spawn(async move {
+                    let _ = tx.send(RoomEvent::Joined { occupant: me }).await;
+                    let _ = tx
+                        .send(RoomEvent::Joined {
+                            occupant: timo.clone(),
+                        })
+                        .await;
+                    // The name the room can actually see. This is the whole test.
+                    let _ = tx
+                        .send(RoomEvent::Message {
+                            from: timo.id.clone(),
+                            text: "agent-7: when is standup?".into(),
+                            scope: MessageScope::Groupchat,
+                        })
+                        .await;
+                    // The stale configured name now belongs to nobody in this room.
+                    let _ = tx
+                        .send(RoomEvent::Message {
+                            from: timo.id.clone(),
+                            text: "flux: when is standup?".into(),
+                            scope: MessageScope::Groupchat,
+                        })
+                        .await;
+                    let _ = tx.send(RoomEvent::Ended).await;
+                });
+                Ok(stream)
+            }
+            async fn occupants(&self) -> flux_core::Result<Vec<Occupant>> {
+                Ok(Vec::new())
+            }
+            async fn say(&self, text: &str) -> flux_core::Result<()> {
+                self.said.lock().unwrap().push(text.to_string());
+                Ok(())
+            }
+            async fn whisper(&self, _to: &OccupantId, _text: &str) -> flux_core::Result<()> {
+                Ok(())
+            }
+            async fn leave(&self) -> flux_core::Result<()> {
+                Ok(())
+            }
+        }
+
+        let room = Arc::new(Reassigning {
+            id: crate::rooms::RoomId::new("standup@x"),
+            said: Mutex::new(Vec::new()),
+        });
+        let ears = Ears::default();
+        RoomTurnDriver::new(room.clone(), RoomIdentity::agent("flux"))
+            .run(&ears, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *ears.turns.lock().unwrap(),
+            vec!["agent-7: when is standup?".to_string()],
+            "the room addressed the nick the service gave us, and that is an address"
+        );
+        assert_eq!(
+            ears.overheard.lock().unwrap().len(),
+            1,
+            "the stale configured nick names nobody here, so it is only overheard"
         );
     }
 
