@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-08-01
+
 ### Fixed
 
 - **`repeat` gets the loop budget discipline, and the loop budget is now per flow execution**

@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-08-01
+
 ### Improved
 
 - **Approval prompts now tell you which vendor a connector operation actually reaches.** When a
