@@ -6,6 +6,38 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **An approval now discloses which vendor an operation reaches, when flux is not the one dialing**
+  (C-311). The connectors seam has the deployment execute the vendor call, so `guard_url_scoped` only
+  ever sees `localhost:8000` and flux's per-vendor egress allowlist stops constraining which vendor is
+  reached. This is the compensating control: a platform-sourced op declares `reaches`, and the
+  operator is told at the moment they are asked to approve —
+  `approve \`platform.dispatch\` platform.dispatch, platform-reaches:api.zendesk.com`.
+  It rides the two existing approval channels (`permission_subjects` and `AuthorityRequirement`), so
+  every surface — plain CLI, REPL, TUI sheet, whole-plan prompt — picks it up with no surface code
+  changed.
+  The declaration is **re-verified against the manifest's own `http_hosts` allowlist using the same
+  matcher that gates real egress**, at load and at every refresh re-grant; a refresh may not shed or
+  re-point it, because the approval the session already carries was given about the old destination.
+  A URL is *unspellable* rather than stripped — the grammar admits only a bare `host`/`host:port` —
+  so a credential-bearing URL cannot reach the prompt at all, proven with a fixture that actually
+  offers `https://svc:<token>@api.zendesk.com/v2?api_token=<token>` and asserts the token is absent
+  from the refusal. "Undeclared" renders distinctly from "reaches nothing"; neither is silent.
+  ⚠ **Compat note for narrow operator policies.** Every platform-sourced op with no `reaches` — which
+  is every connectors manifest written before this change — now contributes
+  `network.fetch → platform-reaches:UNDECLARED`. Under the default policy this is inert
+  (`network.fetch` is granted on any Network resource). Under a grant scoped to specific hosts, such
+  an op is now **denied** where it previously ran. It fails closed, and partially restores the egress
+  control the seam gave up — but it is the most likely source of a "this used to work" report.
+  Separately, a *subject-scoped* allow rule like `platform.dispatch(platform.dispatch)` no longer
+  covers a platform-sourced op, so it asks instead of allowing. Bare rules — what "always" writes —
+  are unaffected, and no subject change can widen a grant: deny matching is `any()`, allow coverage is
+  `all()`, so `Ask → Allow` is unreachable.
+  ⚠ **This is a declaration, not a proof.** A deployment that declares one host and dials another is
+  not caught and cannot be. The bounds are the grammar and the manifest allowlist, and that limit is
+  stated at the definition rather than implied away.
+
 ### Fixed
 
 - **The tree-sitter nightly lane states its green contract instead of announcing a fixed red**

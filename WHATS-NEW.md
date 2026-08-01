@@ -15,6 +15,19 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **Approval prompts now tell you which vendor a connector operation actually reaches.** When a
+  connector platform makes the call on flux's behalf, flux itself only ever talks to the platform —
+  so until now the approval could not tell you where the request really went. It now shows the
+  vendor, checked against the connector's own declared host list and re-checked whenever the
+  connector reloads. A connector cannot quietly change or drop that answer after you have approved
+  it. This is disclosure, not a guarantee: a connector that names one destination and contacts
+  another is beyond what flux can see, so it does not replace trusting the deployment you started.
+  ⚠ If you run a **narrowly scoped network policy**, a connector operation that declares no
+  destination will now be refused where it previously ran. That is deliberate — it fails closed —
+  but you may need to widen the grant or ask the connector author to declare its destination.
+
 ### Fixed
 
 - **Deeply nested code no longer crashes the tools that read it.** A Flux program with very deeply

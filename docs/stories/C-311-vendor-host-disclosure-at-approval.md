@@ -2,8 +2,7 @@
 id: C-311
 title: "Vendor-host disclosure at approval — show what an op reaches when flux is not the one dialing"
 pillar: Core
-status: in-progress
-priority: 8
+status: done
 epic: connector-platform
 areas: [flux-plugin, flux-runtime]
 note: "the compensating control for the connectors seam's one real trade-off: when a platform dials the vendor, guard_url_scoped only ever sees localhost:8000, so flux's per-vendor egress allowlist stops constraining which vendor is reached"

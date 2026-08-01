@@ -148,7 +148,12 @@ This epic is done when all of the following hold — each is checkable, not a ju
 - [ ] An unattended run survives a provider transport failure. (C-227, C-228, epic C-229.)
 - [ ] No wiring line without an observing test. (C-328 ✅ shipped the census; C-313, C-314, C-332.)
 - [ ] The outstanding advisory is cleared. (C-205.)
-- [ ] Vendor-host egress holds when flux is not the one dialing. (C-311.)
+- [ ] Vendor-host reach is **disclosed** at approval when flux is not the one dialing, and bounded by
+      the manifest's own allowlist. (C-311 ✅ shipped.) ⚠ Deliberately *not* "egress holds": the
+      declaration is re-verified against the allowlist and cannot be shed at refresh, but a
+      deployment that declares one host and dials another is outside what any check on flux's side
+      can catch. Restoring an enforced bound needs flux to see the vendor URL, which the credential
+      boundary exists to prevent.
 - [ ] **C-337 is decomposed into stories and its breaking window is scheduled.** Until this, "stable"
       can mean "the runtime does the right thing" but not "the API you build against will not change."
 - [ ] **C-255's final bullet is ticked**: three fresh independent reviews against the exact resulting
