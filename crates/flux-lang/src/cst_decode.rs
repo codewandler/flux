@@ -203,7 +203,56 @@ fn lower_composite_decl(declaration: &SyntaxNode) -> DecodeResult<CompositeOpDec
     })
 }
 
+// L-114: statement blocks nest, and this lowerer follows them with one stack frame per level
+// (`lower_block` → `lower_statement` → `lower_when`/`lower_each`/… → `lower_block`). The parser's own
+// depth guard bounds the trees `parse_cst` builds, but [`crate::parser::Parse`] is a public struct
+// with public fields, so a caller can hand `cst_to_draft` a green tree the parser never produced —
+// and a deep enough one would overflow the stack and `SIGABRT` here rather than in the parser. Cap
+// the walk with the shape the `expr` evaluator uses: a shared counter with an RAII decrement, so it
+// can never leak across lowerings on the same thread. Sync-only path, so a thread-local is sound.
+//
+// The ceiling must admit every tree the parser accepts, so keep it above the parser's own
+// `MAX_PARSE_DEPTH` — no `.flux` source can trip this, only a hand-built tree.
+const MAX_LOWER_DEPTH: usize = 256;
+
+// Checked at compile time so the two ceilings can never drift into an order where a program the
+// parser accepts fails to lower: the guard must bound the adversary, not the author.
+const _: () = assert!(MAX_LOWER_DEPTH > crate::parser::MAX_PARSE_DEPTH);
+
+thread_local! {
+    static LOWER_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the shared block-nesting depth for its lifetime; decrement on drop (even on an early
+/// `?`/`return`), so the counter can never leak across lowerings on the same thread.
+struct DepthGuard {
+    over: bool,
+}
+
+impl DepthGuard {
+    fn enter() -> Self {
+        let n = LOWER_DEPTH.with(|cell| {
+            let n = cell.get() + 1;
+            cell.set(n);
+            n
+        });
+        DepthGuard {
+            over: n > MAX_LOWER_DEPTH,
+        }
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        LOWER_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
+}
+
 fn lower_block(block: &SyntaxNode) -> DecodeResult<Vec<Node>> {
+    let depth = DepthGuard::enter();
+    if depth.over {
+        return Err(error(block, "statement nesting too deep"));
+    }
     let mut body = Vec::new();
     let mut pending_effect = None;
     for child in block.children() {
@@ -2670,5 +2719,60 @@ fn error(at: &SyntaxNode, message: impl Into<String>) -> LowerError {
     LowerError {
         message: message.into(),
         range: Some(at.text_range()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::syntax::FluxLang;
+    use rowan::{GreenNodeBuilder, Language};
+
+    /// `depth` nested `when` blocks around a `return`, built straight onto a green-node builder so
+    /// the tree is deeper than any the parser's own guard would hand over.
+    fn nested_when_blocks(depth: usize) -> SyntaxNode {
+        let mut builder = GreenNodeBuilder::new();
+        let raw = FluxLang::kind_to_raw;
+        for _ in 0..depth {
+            builder.start_node(raw(SyntaxKind::BLOCK));
+            builder.start_node(raw(SyntaxKind::WHEN_STMT));
+            builder.start_node(raw(SyntaxKind::VAR_EXPR));
+            builder.token(raw(SyntaxKind::VAR), "$x");
+            builder.finish_node();
+        }
+        builder.start_node(raw(SyntaxKind::BLOCK));
+        builder.start_node(raw(SyntaxKind::RETURN_STMT));
+        builder.finish_node();
+        builder.finish_node();
+        for _ in 0..depth {
+            builder.finish_node(); // WHEN_STMT
+            builder.finish_node(); // BLOCK
+        }
+        SyntaxNode::new_root(builder.finish())
+    }
+
+    /// L-114 (failing-first): the block walk must bottom out in a bounded [`LowerError`] rather than
+    /// overflowing the stack. Before the guard this `SIGABRT`ed — the parser's L-81 cap sat one stage
+    /// upstream and `Parse`'s public fields let a tree in that never went through it.
+    ///
+    /// The fixture stops at 3,000 levels rather than the 20,000 the expression legs use because
+    /// **rowan's own green-node `Drop` is recursive** and aborts at ~4,000 levels: a deeper tree
+    /// would take the process down in the test's cleanup instead of in the code under test. 3,000 is
+    /// still an order of magnitude past the ~200 levels that overflow a 2 MiB tokio-worker stack.
+    #[test]
+    fn deeply_nested_blocks_are_bounded_not_aborting() {
+        let deep = nested_when_blocks(3_000);
+        let error = lower_block(&deep).expect_err("a 3,000-deep block walk must not recurse");
+        assert_eq!(error.message, "statement nesting too deep");
+
+        // The decrement-on-drop did not leak: a shallow block still lowers on this thread.
+        let shallow = nested_when_blocks(2);
+        assert_eq!(
+            lower_block(&shallow)
+                .expect("shallow nesting still lowers")
+                .len(),
+            1,
+            "the depth guard must not leak across lowerings"
+        );
     }
 }

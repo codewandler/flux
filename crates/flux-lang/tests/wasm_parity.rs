@@ -179,6 +179,41 @@ fn the_wasm_module_and_the_native_engine_agree() {
     );
 }
 
+/// L-114: the parser's depth ceiling is one compile-time constant, but the two substrates do not
+/// share a stack budget — a host thread gets 8 MiB where the `wasm32-unknown-unknown` shadow stack
+/// defaults to 1 MiB. So the axis worth asserting is not "deep input is refused" (the host tests
+/// cover that) but "the portable build survives the guard's own worst case": input that drives the
+/// parser all the way down to `MAX_PARSE_DEPTH` before bailing. A trap or a divergence here is the
+/// signal that the constant is too high for the portable build.
+///
+/// The fixture nests four times deeper than the ceiling; nesting further only lengthens the source,
+/// since the guard stops the recursion at a fixed depth regardless of how much input follows.
+#[test]
+fn deep_statement_nesting_is_refused_identically_on_both_substrates() {
+    let Some(bytes) = module_bytes() else { return };
+    let depth = 512;
+    let mut src = String::from("flow deep\n");
+    for level in 0..depth {
+        src.push_str(&"  ".repeat(level + 1));
+        src.push_str("when $x\n");
+    }
+    src.push_str(&"  ".repeat(depth + 1));
+    src.push_str("return 1\n");
+
+    let native = portable_core::eval_to_json(&src);
+    let wasm = PortableModule::instantiate(&bytes).eval(&src);
+
+    assert_eq!(
+        wasm, native,
+        "the two substrates disagreed on deeply nested statement blocks"
+    );
+    let v: serde_json::Value = serde_json::from_str(&native).unwrap();
+    assert_eq!(
+        v["ok"], false,
+        "deep statement nesting must be refused, not evaluated: {native}"
+    );
+}
+
 /// A program that reaches for an operation is refused on both substrates, identically — the
 /// model-free scope limit, asserted rather than merely documented.
 #[test]
