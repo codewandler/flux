@@ -2,7 +2,7 @@
 id: C-312
 title: "The credential boundary — prove a vendor credential never enters flux"
 pillar: Core
-status: ready
+status: in-progress
 priority: 9
 epic: connector-platform
 areas: [flux-plugin, flux-secret]
@@ -77,6 +77,11 @@ An invariant nobody tests is an invariant that decays at the next refactor. This
       session log is assembled a layer out in `flux-agent` from exactly these `ToolResult`s, and
       `flux-plugin` (L4) has no dependency on it, so pinning the result is what pins the log entry.
 - [x] Full gate green in both workspaces.
+      → Was ticked prematurely: the nested `plugins/` workspace did not compile, because
+      `OperationSpec`'s new `platform` field broke three exhaustive struct literals in
+      `plugins/host-kit/src/lib.rs` (and a fourth in `plugins/kubernetes/src/main.rs`, masked
+      because the build stopped at their shared dependency). Both workspaces now build, test, lint
+      and format clean; `scripts/check-crate-versions.sh` exits 0.
 
 ## Progress
 - Filed 2026-07-31 from the approved connectors-seam plan.
@@ -107,6 +112,37 @@ An invariant nobody tests is an invariant that decays at the next refactor. This
     release is owed for the host-kit half. Both lockfiles carry the one-line version move, and the
     nested one is not optional: `flux-codegate`'s `plugin_builds_exclude_host_only_crates` resolves
     `plugins/` metadata with `--locked`, so a stale `plugins/Cargo.lock` reds the gate.
+- 2026-08-01 — rework round, after the first implementor's session crashed. Two blocking findings,
+  both reproduced before being fixed:
+  - **The nested `plugins/` workspace did not compile.** The new `platform` field broke three
+    exhaustive `OperationSpec` literals in `plugins/host-kit/src/lib.rs`, and a fourth in
+    `plugins/kubernetes/src/main.rs` that the first error masked. Fixed with
+    `..OperationSpec::default()` rather than an explicit `platform: PlatformSourcing::None`: the
+    pack must not carry a *second* exhaustive-literal tripwire for wire additions. The designated
+    one is `wire_contract.rs` in the protocol crate, where it fires in the same workspace as the
+    change; a duplicate in the pack fires only in the separate `plugins:` CI job, after the author
+    has moved on. And `Default` is by construction the value a manifest omitting the field
+    deserializes to (every field carries `#[serde(default)]`), so the helpers cannot diverge from
+    the wire default.
+  - **Version decisions the branch owed.** `codewandler-flux-secret` 1.1.1 → **1.2.0** (additive:
+    `credential_shape`, `CredentialShape`, two predicates promoted to `pub`).
+    `codewandler-flux-host-kit` 1.0.1 → **1.1.0** — settled by the fix above, which changed its
+    source, and by the wire moving underneath it. Three dependency *requirements* were also too
+    loose to publish: the root `flux-secret` (`1` → `1.2`) and `flux-plugin-protocol`
+    (`1.1.0` → `1.2.0`), because `flux-plugin` now calls APIs that do not exist below those
+    versions and a caret floor would let a downstream consumer resolve a version that cannot
+    compile; and `plugins/Cargo.toml`'s protocol pin (`1.1` → `1.2`), which that file's own comment
+    requires to move with the protocol MINOR because `check-host-kit-protocol-drift.sh` reads it.
+  - **`PlatformSourcing` joined host-kit's re-exports.** It was new protocol vocabulary that the
+    plugin-side SDK did not pass through, so a pack plugin could not declare a platform-sourced op
+    through host-kit alone — which is that module's stated job ("so a plugin depends only on
+    host-kit").
+  - **The `flux plugin call` boundary no longer fails open on an unknown op.**
+    `refuse_platform_response` and `scrub_plugin_error` both returned "accept" when the op was
+    absent from the manifest. Unreachable today — `resolved_op` is resolved from that same manifest
+    — but that is a fact about the current caller, not about the functions, and it is the first
+    thing a refactor invalidates. Both miss branches now refuse, pinned by
+    `an_op_missing_from_the_manifest_is_refused_rather_than_skipped`.
 
 ## Notes
 - The one secret flux *does* hold on this path is the deployment session bearer, and it is stored like

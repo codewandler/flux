@@ -7,7 +7,12 @@ rust-version.workspace = true
 # against it speak?" — a question flux releases do not change the answer to. The former lockstep
 # (bumped by scripts/cut-release.sh on every cut) republished it unchanged every release and forced
 # a plugin-pack rebuild for wire-irrelevant reasons.
-version = "1.0.1"
+# 1.1.0 (C-312): the wire moved (protocol 1.1.1 -> 1.2.0, adding `OperationSpec::platform`), and
+# this is the version that answers "which wire does a plugin built against this speak?" — so it
+# moves with it. Additive on both counts: `PlatformSourcing` joins the re-exported protocol
+# vocabulary, and `read_op`/`write_op`/`internal_op` keep their signatures and produce the same
+# spec, now letting `OperationSpec`'s own `Default` fill what they do not name.
+version = "1.1.0"
 license.workspace = true
 description = "Shared SDK for flux integration plugins: typed host-capability calls (secret-by-purpose, http+bearer, endpoint, datasource records) + a manifest/op builder over the flux plugin wire protocol"
 repository = "https://github.com/codewandler/flux"

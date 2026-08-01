@@ -51,8 +51,8 @@ pub use preflight::schema_preflight;
 pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, Source};
 pub use flux_plugin_protocol::{
     AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OAuth2Spec, OAuthGrant,
-    OAuthRedirect, OperationSpec, PluginCapabilities as Caps, PluginHandler, PluginManifest,
-    SignalMatch, ToolGroup, KIND_TURN_INTENT, VALIDATE_OP,
+    OAuthRedirect, OperationSpec, PlatformSourcing, PluginCapabilities as Caps, PluginHandler,
+    PluginManifest, SignalMatch, ToolGroup, KIND_TURN_INTENT, VALIDATE_OP,
 };
 pub use flux_spec::{Effect, Idempotency, Risk, StagingDisposition};
 
@@ -1334,44 +1334,36 @@ impl PluginHandler for Plugin {
 }
 
 /// A simple read-only operation spec helper (Effect::Read, low risk, idempotent).
+///
+/// Everything this helper does not name takes [`OperationSpec`]'s own `Default`, which is by
+/// construction the same value a manifest omitting the field deserializes to (every field carries
+/// `#[serde(default)]`). The pack must not carry a second exhaustive-literal tripwire for wire
+/// additions: the designated one is `wire_contract.rs` in the protocol crate, where it fires at the
+/// author's desk instead of in the separate `plugins:` CI job.
 pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
     OperationSpec {
-        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema,
-        output_schema: None,
         effects: vec![Effect::Read],
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
-        staging: StagingDisposition::Infer,
-        secret_purposes: Vec::new(),
-        process: Vec::new(),
-        group: None,
-        internal: false,
-        semantic_effects: Vec::new(),
-        redact_fields: Vec::new(),
+        ..OperationSpec::default()
     }
 }
 
 /// A write/mutating operation spec helper (Effect::Write, medium risk, non-idempotent).
+///
+/// Unnamed fields take `Default` — see [`read_op`] for why the pack does not spell them out.
 pub fn write_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
     OperationSpec {
-        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema,
-        output_schema: None,
         effects: vec![Effect::Write, Effect::Network],
         risk: Some(Risk::Medium),
         idempotency: Some(Idempotency::NonIdempotent),
-        staging: StagingDisposition::Infer,
-        secret_purposes: Vec::new(),
-        process: Vec::new(),
-        group: None,
-        internal: false,
-        semantic_effects: Vec::new(),
-        redact_fields: Vec::new(),
+        ..OperationSpec::default()
     }
 }
 
@@ -1406,23 +1398,17 @@ pub fn write_op_typed<T: schemars::JsonSchema + 'static>(
 /// the shared `PluginHost` handle; [`flux_plugin_protocol::visible_ops`] excludes it from the projected tool
 /// catalog. Effects default to `Process`+`Network` (the conservative authorization floor
 /// [`flux_plugin_protocol::PluginTool::new`] applies to an undeclared op) — override via the returned spec.
+/// Unnamed fields take `Default` — see [`read_op`] for why the pack does not spell them out.
 pub fn internal_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
     OperationSpec {
-        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema,
-        output_schema: None,
         effects: Vec::new(),
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
-        staging: StagingDisposition::Infer,
-        secret_purposes: Vec::new(),
-        process: Vec::new(),
-        group: None,
         internal: true,
-        semantic_effects: Vec::new(),
-        redact_fields: Vec::new(),
+        ..OperationSpec::default()
     }
 }
 

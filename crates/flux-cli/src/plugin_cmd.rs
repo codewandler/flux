@@ -1258,12 +1258,27 @@ pub(super) fn redact_plugin_echo(
 /// the *vendor's*, which flux never sees and therefore could never have registered. The value the
 /// registered pass would add — catching the deployment session bearer echoed back — is genuinely
 /// missing on this path, and is recorded here rather than papered over.
+///
+/// **An op the manifest does not describe is refused, not skipped.** Today `resolved_op` is
+/// resolved out of this same manifest, so the miss is unreachable — but that is a property of the
+/// current caller, not of this function, and it is the first thing a refactor invalidates. The only
+/// safe reading of "no declaration" is that the op cannot be shown to be local, and a boundary that
+/// answers `None` there fails open silently: the response prints and nothing records that the check
+/// never ran.
 fn refuse_platform_response(
     value: &Value,
     manifest: &flux_plugin::PluginManifest,
     op: &str,
 ) -> Option<String> {
-    let spec = manifest.operations.iter().find(|o| o.name == op)?;
+    let Some(spec) = manifest.operations.iter().find(|o| o.name == op) else {
+        return Some(format!(
+            "plugin `{}` returned a response for operation `{op}`, which its manifest does not \
+             declare. Whether the credential boundary applies is read from that declaration, so an \
+             undeclared op cannot be shown to be a local one — the response was discarded rather \
+             than printed unchecked.",
+            manifest.name
+        ));
+    };
     flux_plugin::credential_boundary::refuse_response(
         spec.platform,
         &manifest.name,
@@ -1275,9 +1290,18 @@ fn refuse_platform_response(
 
 /// C-312 — the failure path of the same seam: a platform-sourced op's error message is discarded
 /// when it carries credential material, rather than being printed.
+///
+/// The undeclared op is discarded here too, for the reason given on [`refuse_platform_response`]:
+/// an error body is the ingest surface most likely to carry a raw vendor response, and passing it
+/// through because the op could not be found is the fail-open shape in its worst position.
 fn scrub_plugin_error(manifest: &flux_plugin::PluginManifest, op: &str, message: String) -> String {
     let Some(spec) = manifest.operations.iter().find(|o| o.name == op) else {
-        return message;
+        return format!(
+            "plugin `{}` operation `{op}` failed, and its manifest does not declare that operation \
+             — so whether the credential boundary applies to its error message could not be \
+             determined. The message was discarded rather than printed unchecked.",
+            manifest.name
+        );
     };
     flux_plugin::credential_boundary::scrub_error(
         spec.platform,
@@ -2217,6 +2241,49 @@ mod tests {
         let raw = format!("vendor said: token {vendor} expired");
         let scrubbed = scrub_plugin_error(&manifest, "dispatch", raw.clone());
         assert!(!scrubbed.contains(vendor), "{scrubbed}");
+        assert_eq!(scrub_plugin_error(&manifest, "whoami", raw.clone()), raw);
+    }
+
+    /// C-312 rework: the boundary's **miss** branch refuses rather than skips.
+    ///
+    /// An op the manifest does not describe is unreachable on today's call path — `resolved_op` is
+    /// resolved out of this same manifest a few lines earlier. That is an argument about the
+    /// current caller, not about the function, and it is exactly the argument that stops being true
+    /// after a refactor. A boundary whose "I could not tell" branch returns `None` fails open: the
+    /// response prints, and nothing anywhere says the check did not run. So the unknown op is
+    /// treated as maximally suspect — refused on the success path, and its error message discarded
+    /// on the failure path — because an op with no declaration cannot be shown to be local.
+    #[test]
+    fn an_op_missing_from_the_manifest_is_refused_rather_than_skipped() {
+        let manifest = flux_plugin::PluginManifest {
+            name: "connectors".into(),
+            operations: vec![flux_plugin::OperationSpec {
+                name: "whoami".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // Nothing credential-shaped in either payload: the refusal is about the *missing
+        // declaration*, not about the content.
+        let clean = serde_json::json!({ "ticket": { "id": 4711 } });
+        let refusal = refuse_platform_response(&clean, &manifest, "ghost")
+            .expect("an op absent from the manifest must be refused, not accepted");
+        assert!(
+            refusal.contains("ghost") && refusal.contains("connectors"),
+            "the refusal must name the plugin and the op: {refusal}"
+        );
+
+        let raw = "vendor said: 401 Unauthorized".to_string();
+        let scrubbed = scrub_plugin_error(&manifest, "ghost", raw.clone());
+        assert_ne!(
+            scrubbed, raw,
+            "an absent op's error message must be discarded, not passed through"
+        );
+        assert!(scrubbed.contains("ghost"), "{scrubbed}");
+
+        // The declared local op is still accepted — the refusal is scoped to the miss, and this is
+        // the control that keeps it from being a closed path.
+        assert_eq!(refuse_platform_response(&clean, &manifest, "whoami"), None);
         assert_eq!(scrub_plugin_error(&manifest, "whoami", raw.clone()), raw);
     }
 

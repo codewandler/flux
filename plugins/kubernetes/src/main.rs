@@ -576,21 +576,13 @@ fn op_spec_typed<T: JsonSchema + 'static>(
     idempotency: Idempotency,
 ) -> OperationSpec {
     OperationSpec {
-        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema: op_input_schema::<T>(),
-        output_schema: None,
         effects,
         risk: Some(risk),
         idempotency: Some(idempotency),
-        staging: StagingDisposition::Infer,
-        group: None,
-        secret_purposes: Vec::new(),
-        process: Vec::new(),
-        internal: false,
-        semantic_effects: Vec::new(),
-        redact_fields: Vec::new(),
+        ..OperationSpec::default()
     }
 }
 
