@@ -128,6 +128,11 @@ op's error text. All three were already redacted; they are now **pinned** by
 secret in every one of them and sweeps *every* attribute of *every* span in both spellings. Verified
 to bite: stubbing `redact_attr` to pass its value through reds it on `turn.model`.
 
+> Since [C-344](C-344-otel-metrics-attributes-skip-the-redactor.md) that guard is called
+> `no_exported_span_or_metric_attribute_carries_a_registered_secret` and sweeps both projections —
+> `build_metrics` takes a `&Redactor` now, so the spans-only boundary this story recorded is gone.
+> The rest of this section stands as written; it describes the tree as C-339 left it.
+
 ### …and the metrics half, which the first pass of this audit missed
 
 **Everything above is about `build_trace`. `build_metrics` is a separate projection and it is not

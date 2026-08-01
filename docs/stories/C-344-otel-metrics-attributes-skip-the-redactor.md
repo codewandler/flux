@@ -105,3 +105,42 @@ record excludes metrics on purpose; the module header simply overclaims.
   "the other **span** attributes" and corrected the module header, so the tree no longer asserts
   something untrue while this story is open. **That correction is the thing to undo here** — if
   metrics start redacting, the header should go back to covering both halves.
+
+## Progress
+
+**The fork, resolved: the code was wrong, not the header.** `build_metrics` now takes a `&Redactor`
+and routes its `model` attribute through `redact_attr`, and the module header's "span **or metric**"
+claim is restored as the whole truth about this module.
+
+Why that way round, and what was rejected:
+
+- **Documenting an exemption was the alternative, and it has no argument behind it.** To write "the
+  metrics half is exempt" you must be able to say why the *same string* — a model id — is dangerous
+  enough to scrub on a span and safe to ship verbatim on a metric point, when both leave the process
+  in the same export, to the same collector, over the same connection. There is no such reason; the
+  record (C-129's Progress note) shows an omission, not a decision. A documented exemption would also
+  freeze a shape where the one free-form value each projection emits is treated differently by each,
+  which is precisely the drift the guard now forbids.
+- **A second `build_metrics_redacted` was rejected** (and the story forbids it): a parallel path
+  leaves the unredacted function published and callable, which is the defect, not a fix for it.
+- **Over-redaction was the cost to check, and it is nil.** Only `model` changes. `session.id`,
+  `account`, `agent.id`, `op.name` and the literal `tier` stay verbatim — the same
+  structured-identifier verdict C-339 recorded for the span side, for the same reason (they are the
+  C-129 correlation keys). With no secret registered a plain `Redactor` is a pass-through, pinned by
+  a new assertion in `metrics_report_tokens_spend_and_op_error_rates_with_session_and_agent_attributes`
+  that the `model` attribute still reads `claude-sonnet-4-6`.
+
+**The API break, priced.** `pub fn build_metrics(stream, events, pricing)` becomes
+`pub fn build_metrics(stream, events, pricing, redactor: &Redactor)` — a breaking change to the
+published `codewandler-flux-events` (`pub mod otel;`), behind the non-default `otel` feature. Every
+call site in the tree is inside this module's own test suite (five), swept and updated; a full-tree
+grep for `build_metrics` finds nothing else. Pre-1.0 SemVer as `AGENTS.md` states it makes this a
+**minor** bump — the release coordinator owns `CHANGELOG.md` and the version, so the breaking note is
+handed off rather than written here.
+
+**Guard.** `no_exported_span_attribute_carries_a_registered_secret` is renamed to
+`no_exported_span_or_metric_attribute_carries_a_registered_secret` and now sweeps both projections
+from one fixture (the story's probe: the registered all-digit secret *is* the model id, and a
+`record_call_usage` keyed by it is what puts the `model` attribute on the token/spend points). A
+sibling, `neither_encoded_otlp_body_carries_a_registered_secret`, asserts at the wire level — the
+secret must appear in neither `encode_trace_json` nor `encode_metrics_json` output bytes.

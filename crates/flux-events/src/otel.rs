@@ -19,17 +19,18 @@
 //! collector, or a collector with a plaintext HTTP receiver (the common `4318` default). A TLS or
 //! gRPC transport is future work, not silently promised here.
 //!
-//! Every free-text value that lands in a **span** attribute is passed through the caller's
-//! [`Redactor`] first — the same scrub every other observation surface applies before content
-//! leaves the process (C-164's precedent). This exporter never reads the raw conversation; it only
-//! reads what other subsystems already redacted before persisting it, plus a handful of
+//! Every free-text value that lands in a **span or metric** attribute is passed through the
+//! caller's [`Redactor`] first — the same scrub every other observation surface applies before
+//! content leaves the process (C-164's precedent). This exporter never reads the raw conversation;
+//! it only reads what other subsystems already redacted before persisting it, plus a handful of
 //! provider/model/outcome strings that are redacted again here as defense in depth.
 //!
-//! ⚠ **The metrics half does not do this** (C-344). [`build_metrics`] takes no [`Redactor`] at all,
-//! so its `model` attribute ships verbatim — the one value the trace side scrubs and the metrics
-//! side does not. This paragraph used to claim "span/metric"; the claim was never true, and C-339's
-//! audit narrowed it rather than leave the module asserting a guarantee it does not provide.
-//! Closing the gap changes a published `pub fn`'s signature, which is why it is its own story.
+//! Both projections therefore take a [`Redactor`]: [`build_trace`] and [`build_metrics`]. That was
+//! not always true — C-129 gave `build_metrics` no redactor, so its `model` attribute shipped
+//! verbatim while the trace side scrubbed the same string; C-339 found the gap and narrowed this
+//! paragraph rather than leave the module asserting a guarantee it did not provide, and C-344 closed
+//! it for real by adding the parameter (a breaking change to a published `pub fn`). The claim above
+//! is once again the whole truth about this module.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -104,13 +105,15 @@ fn span_id_for(stream: &str, seq: i64, qualifier: &str) -> String {
     hex[..16].to_string()
 }
 
-/// Scrub a **free-form** span attribute — one whose content originates with the model, the provider
-/// or a tool, and can therefore carry credential material. The other **span** attributes are
+/// Scrub a **free-form** exported attribute — one whose content originates with the model, the
+/// provider or a tool, and can therefore carry credential material. The other attributes are
 /// deliberately not routed through here, and C-339 audited why:
 ///
-/// Scope, stated because the audit's boundary is load-bearing: this covers [`build_trace`] only.
-/// [`build_metrics`] takes no [`Redactor`] and is **not** audited clean — see C-344 and the ⚠ in
-/// the module header.
+/// Scope, stated because the audit's boundary is load-bearing: since C-344 this covers **both**
+/// projections — [`build_trace`]'s spans and [`build_metrics`]'s data points. The free-form set is
+/// the same on both sides and is exactly `turn.model` / `call.provider` / `call.model` / `op.error`
+/// on spans and `model` on metric points; the reasoning below applies verbatim to a metric
+/// attribute, because a metric point's attributes are drawn from the same schema fields.
 ///
 /// - **Numeric attributes are not the C-323 hole.** C-323's defect was a walker over *arbitrary*
 ///   vendor JSON that narrowed by node kind, so an all-digit credential the vendor happened to send
@@ -129,7 +132,8 @@ fn span_id_for(stream: &str, seq: i64, qualifier: &str) -> String {
 ///   they carry no vendor content — and over-redaction of identifiers is the failure mode C-315
 ///   chose its mechanisms to avoid.
 ///
-/// The free-form set is pinned by `no_exported_span_attribute_carries_a_registered_secret`.
+/// The free-form set is pinned by `no_exported_span_or_metric_attribute_carries_a_registered_secret`
+/// — one test sweeping both projections, so the two halves cannot drift apart again.
 fn redact_attr(redactor: &Redactor, value: &str) -> AttrValue {
     AttrValue::Str(redactor.redact(value))
 }
@@ -531,10 +535,16 @@ fn push_context_attrs(attributes: &mut Vec<(String, AttrValue)>, context: &Event
 /// (off [`projection::cost_summary`]), and op totals/errors (off the same `StepSucceeded`/
 /// `StepFailed` pairing [`build_trace`] uses) — every data point carries `session.id` plus
 /// `account`/`agent.id` when the stream is tagged (C-129 Acceptance: "session/agent attributes").
+///
+/// `redactor` scrubs the one free-form attribute this projection emits, `model`, exactly as
+/// [`build_trace`] scrubs `turn.model`/`call.model` (C-344). The parameter is not optional and there
+/// is no unredacted variant: an exporter half that can be called without a redactor is the defect
+/// this signature exists to make unrepresentable.
 pub fn build_metrics(
     stream: &str,
     events: &[StoredEvent],
     pricing: &PricingTable,
+    redactor: &Redactor,
 ) -> Vec<OtelMetric> {
     let context = events
         .first()
@@ -547,7 +557,7 @@ pub fn build_metrics(
     let base_attrs = |model: Option<&str>| {
         let mut attrs = vec![("session.id".to_string(), AttrValue::Str(stream.to_string()))];
         if let Some(m) = model {
-            attrs.push(("model".to_string(), AttrValue::Str(m.to_string())));
+            attrs.push(("model".to_string(), redact_attr(redactor, m)));
         }
         push_context_attrs(&mut attrs, &context);
         attrs
@@ -1187,16 +1197,29 @@ mod tests {
     /// the three fields. `saw_marker` is only a fixture-liveness check — it catches a fixture that
     /// stopped reaching any free-form attribute at all, so the sweep cannot pass vacuously.
     ///
-    /// ⚠ **Spans only.** This asserts over [`build_trace`]; [`build_metrics`] is a separate
-    /// projection with no [`Redactor`], and its `model` attribute does carry a registered secret
-    /// today (C-344). Extending this sweep to metrics is that story's job.
+    /// C-344 extended the sweep to the **metrics** projection: both halves of the exporter are
+    /// swept by this one test, so they cannot drift apart again. The fixture therefore also records
+    /// a call usage keyed by the secret model, which is what puts a `model` attribute on the
+    /// token/spend data points.
     #[test]
-    fn no_exported_span_attribute_carries_a_registered_secret() {
+    fn no_exported_span_or_metric_attribute_carries_a_registered_secret() {
         const SECRET: &str = "216216789";
 
         let store = EventStore::in_memory().unwrap();
         let session = store.create_session(SECRET).unwrap();
         let turn_id = store.begin_turn(&session, "go", SECRET).unwrap();
+        store
+            .record_call_usage(
+                &session,
+                turn_id,
+                SECRET,
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         store
             .record_observation(
                 &session,
@@ -1241,8 +1264,15 @@ mod tests {
         let redactor = Redactor::new();
         redactor.try_add_secret(SECRET).expect("above the floor");
         let spans = build_trace(&session, &events, &redactor);
+        let metrics = build_metrics(&session, &events, &PricingTable::builtin(), &redactor);
 
         assert!(!spans.is_empty(), "the fixture must produce spans to check");
+        let rendered = |value: &AttrValue| match value {
+            AttrValue::Str(s) => s.clone(),
+            AttrValue::Int(i) => i.to_string(),
+            AttrValue::Double(d) => d.to_string(),
+            AttrValue::Bool(b) => b.to_string(),
+        };
         let mut saw_marker = false;
         for span in &spans {
             for (key, value) in &span.attributes {
@@ -1251,12 +1281,7 @@ mod tests {
                 if key == "session.id" {
                     continue;
                 }
-                let rendered = match value {
-                    AttrValue::Str(s) => s.clone(),
-                    AttrValue::Int(i) => i.to_string(),
-                    AttrValue::Double(d) => d.to_string(),
-                    AttrValue::Bool(b) => b.to_string(),
-                };
+                let rendered = rendered(value);
                 assert!(
                     !rendered.contains(SECRET),
                     "registered secret exported in span {:?} attribute {key}: {rendered}",
@@ -1268,6 +1293,84 @@ mod tests {
         assert!(
             saw_marker,
             "no attribute was redacted at all — the fixture no longer reaches a free-form attribute"
+        );
+
+        // The metrics half, swept the same way (C-344).
+        let mut saw_metric_marker = false;
+        let mut saw_point = false;
+        for metric in &metrics {
+            for point in &metric.points {
+                saw_point = true;
+                for (key, value) in &point.attributes {
+                    if key == "session.id" {
+                        continue;
+                    }
+                    let rendered = rendered(value);
+                    assert!(
+                        !rendered.contains(SECRET),
+                        "registered secret exported in metric {:?} attribute {key}: {rendered}",
+                        metric.name
+                    );
+                    saw_metric_marker |= rendered.contains("[redacted]");
+                }
+            }
+        }
+        assert!(saw_point, "the fixture must produce metric points to check");
+        assert!(
+            saw_metric_marker,
+            "no metric attribute was redacted at all — the fixture no longer reaches the `model` \
+             attribute"
+        );
+    }
+
+    /// C-344's probe, at the wire level: neither encoded OTLP body may contain a registered secret.
+    /// The attribute sweep above is the structural guard; this one asserts over the exact bytes that
+    /// leave the process, so a future encoder that re-renders an attribute (or adds a field sourced
+    /// from the same strings) cannot slip past a per-attribute check.
+    #[test]
+    fn neither_encoded_otlp_body_carries_a_registered_secret() {
+        const SECRET: &str = "216216789";
+
+        let store = EventStore::in_memory().unwrap();
+        let session = store.create_session(SECRET).unwrap();
+        let turn_id = store.begin_turn(&session, "go", SECRET).unwrap();
+        store
+            .record_call_usage(
+                &session,
+                turn_id,
+                SECRET,
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .end_turn(&session, turn_id, "accepted", 1, "done", None)
+            .unwrap();
+
+        let events = store.load_stream(&session, None).unwrap();
+        let redactor = Redactor::new();
+        redactor.try_add_secret(SECRET).expect("above the floor");
+
+        let trace_body = encode_trace_json(&build_trace(&session, &events, &redactor));
+        let metrics_body = encode_metrics_json(&build_metrics(
+            &session,
+            &events,
+            &PricingTable::builtin(),
+            &redactor,
+        ));
+
+        assert!(
+            find_subslice(&metrics_body, SECRET.as_bytes()).is_none(),
+            "registered secret in the exported metrics body: {}",
+            String::from_utf8_lossy(&metrics_body)
+        );
+        assert!(
+            find_subslice(&trace_body, SECRET.as_bytes()).is_none(),
+            "registered secret in the exported trace body: {}",
+            String::from_utf8_lossy(&trace_body)
         );
     }
 
@@ -1341,7 +1444,10 @@ mod tests {
 
         let events = store.load_stream(&session, None).unwrap();
         let pricing = PricingTable::builtin();
-        let metrics = build_metrics(&session, &events, &pricing);
+        // No secret is registered, so the redactor must be a pass-through: an ordinary model id
+        // still reaches the `model` attribute verbatim (C-344 must not over-redact identifiers).
+        let redactor = Redactor::new();
+        let metrics = build_metrics(&session, &events, &pricing, &redactor);
 
         let has_attr = |point: &OtelMetricPoint, key: &str, want: &AttrValue| {
             point.attributes.iter().any(|(k, v)| k == key && v == want)
@@ -1357,6 +1463,11 @@ mod tests {
             .find(|p| has_attr(p, "tier", &AttrValue::Str("input".into())))
             .expect("an input-tier point");
         assert_eq!(input_point.value, 1000.0);
+        assert!(has_attr(
+            input_point,
+            "model",
+            &AttrValue::Str("claude-sonnet-4-6".into())
+        ));
         assert!(has_attr(
             input_point,
             "session.id",
@@ -1417,7 +1528,7 @@ mod tests {
         let redactor = Redactor::new();
         let spans = build_trace(&session, &events, &redactor);
         let pricing = PricingTable::builtin();
-        let metrics = build_metrics(&session, &events, &pricing);
+        let metrics = build_metrics(&session, &events, &pricing, &redactor);
 
         let stub = spawn_collector_stub();
         let exporter = OtlpHttpExporter::new(format!("http://{}", stub.addr));
@@ -1469,7 +1580,7 @@ mod tests {
         let redactor = Redactor::new();
         let spans = build_trace(&session, &before, &redactor);
         let pricing = PricingTable::builtin();
-        let metrics = build_metrics(&session, &before, &pricing);
+        let metrics = build_metrics(&session, &before, &pricing, &redactor);
         let stub = spawn_collector_stub();
         let exporter = OtlpHttpExporter::new(format!("http://{}", stub.addr));
         exporter.export_spans(&spans).unwrap();
