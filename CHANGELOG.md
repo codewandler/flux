@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A room-triggered journey authorizes and audits as the speaker, not as the local operator**
+  (C-415). A journey woken by a room message ran at the assembly-time identity — under `flux app run`
+  that is `local`/`Privileged` — so a stranger's message drove ops recorded as the operator's. The
+  identity now derives at the one place C-408 already established (`room_participant_identity`, the
+  sole caller of `TurnIdentity::unauthenticated_participant`), so there is exactly one trust decision
+  and `Untrusted` is what arrives at `Executor::dispatch`. Each run records one `journey.identity`
+  observation naming who it ran as and whether that was derived, inherited or assembly-time.
+  ⚠ **The `spawn` path deliberately derives nothing** and inherits the spawning turn: a forged
+  `speaker` in a model-shaped spawn payload is read by nothing.
+  **Also closes the park.** Beyond the stated scope, a parked `ask` now carries the run's identity —
+  without it the fix was cosmetic on any journey that asks a question, because the continuation fell
+  back to the operator. The *replier* is never adopted; taking it would be the outer-surface caller
+  swap `AGENTS.md` forbids.
+  ⚠ Two residuals stated rather than papered over: a model that can call `emit` can still present a
+  room/speaker shape to a journey trigger — an **audit-integrity** residual, not an escalation, since
+  every local grant already admits `Untrusted` so a forged principal changes no authorization
+  decision — and a parked ask has no correlation id, so a different principal can deliver the reply
+  that resumes another's park. Both pre-date this change and each wants its own story.
+
 ### Added
 
 - **UDP and raw ICMP dial targets, under the one egress guard** (C-396). `flux-system`'s

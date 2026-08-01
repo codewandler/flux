@@ -2,8 +2,7 @@
 id: C-415
 title: "A room-triggered journey still authorizes and audits as the local operator"
 pillar: Core
-status: in-progress
-priority: 7
+status: done
 epic: meeting-rooms
 areas: [flux-app, flux-runtime]
 note: "the other half of the review's F2. C-408 gave the AGENT path a request-owned identity; `run_journey` builds its context with no `.with_identity(…)`, so a room-triggered journey still runs as `local`/Privileged. Filed separately because `run_journey` is ALSO reached from `run_journey_for_spawn` — a model-chosen payload — which the agent path is not"
