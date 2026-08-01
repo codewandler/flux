@@ -151,6 +151,44 @@ no use for either. Deciding that is their first acceptance criterion, deliberate
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
 
+### Explore, then freeze — ad-hoc browser testing that becomes a deterministic script (epic) — 🔄 **PROPOSED (C-430…C-434 filed, none started)**
+
+Ask an agent to log into a site and test a module's happy path. It explores — misreads a label,
+backtracks, finds the right button, succeeds — and today that exploration is thrown away. **The
+valuable artifact is not the answer; it is the path that worked.** This epic makes flux able to keep
+it: drop the trial and error, emit a script that runs in CI. It is the thesis in its most legible form
+— the model explores, the runtime keeps the result — and an agent whose contract is its transcript can
+only re-narrate what it did, because it has no artifact to hand you.
+
+**Most of the machinery is already built.** `crates/flux-web/src/browser.rs` drives headless Chromium
+over an in-repo CDP client (`browser.open · goto · act · snapshot · close`), spawned through the
+guarded `spawn_debug_pipe` seam, with **every subrequest routed through the `web` egress guard via CDP
+`Fetch` interception** and the ops evidence-gated behind a Chromium-discoverable signal. The page model
+is semantic, not pixel: the digest is built purely from `Accessibility.getFullAXTree` — roles, names,
+states — in document order, which its own header calls *"replay/`flux diff` friendly"*, and it is
+testable against a scripted fake with **no Chrome in CI**. Since L-38 every accepted plan already
+records parseable `plan_source`. What is missing is narrow: nothing turns a recorded *session* into a
+saved *flow* — `flux flow` has `list` and `run`, no `save`. That is
+[C-430](stories/C-430-distil-an-exploration-into-a-flow.md).
+
+⚠ **Two stories are not polish; they are the two ways this fails.**
+[C-431](stories/C-431-durable-locators.md): `RefMap` (`crates/flux-web/src/digest.rs:53-72`) keys on
+`backendDOMNodeId` and assigns `next += 1` in first-encounter order **within one live session** — so
+`e17` is stable while the agent explores and **means nothing in a fresh session**. A distiller that
+emits refs produces scripts that break on the next deploy, which is exactly what made a generation of
+record-replay tools disposable; freezing must re-anchor to the AX role and name the digest already
+carries. [C-432](stories/C-432-browser-credentials-never-come-from-the-prompt.md): the motivating
+phrasing — *"log in as X with password Y"* — is a leak. The `Redactor` redacts values it has been
+**told about**; a password typed into a prompt was never registered, so nothing redacts it before it
+reaches the model context, the event log and `plan_source`. A compelling recipe that teaches users to
+paste production passwords into prompts would do more harm than the epic does good.
+
+Then [C-433](stories/C-433-a-frozen-script-asserts.md) — a frozen click sequence proves only that the
+clicks did not error, and a green suite that asserts nothing is worse than no suite because it is
+trusted — and [C-434](stories/C-434-the-e2e-recipe.md), the worked recipe, filed last precisely because
+it is the most demo-able thing here: a polished page over a distiller that emits brittle scripts would
+be actively harmful. Design: [explore-then-freeze.md](designs/explore-then-freeze.md).
+
 ### flux recipes — real programs that make the difference click (epic) — 🔄 **PROPOSED (C-425…C-429 filed, none started)**
 
 Someone evaluating flux sees a feature list and a folder of examples, and has no way to tell it is a
