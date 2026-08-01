@@ -60,6 +60,36 @@ align the budget-scope semantics.
   `a_long_repeat_keeps_the_transcript_a_bounded_ring`,
   `nested_loops_share_one_per_execution_budget`.
 
+### Review follow-ups (post-review pass)
+
+- **The concurrency seam is now pinned.** The `Arc` deviation exists precisely so `parallel`/`race`
+  branches share one counter, but nothing in the tree combined a loop with `parallel`/`race`, so
+  all three `budget.clone()` seam sites were correct wiring whose removal changed nothing
+  (AGENTS.md's pin-census class). Added `parallel_branches_charge_one_shared_budget`,
+  `race_branches_charge_one_shared_budget` and `parallel_plan_stages_charge_one_shared_budget` —
+  two branches of 60,000 rounds each, which fit *individually* under the 100,000 budget and exceed
+  it only when they charge the same counter. Verified by substituting `LoopBudget::default()` for
+  `budget.clone()` at all three sites: all three tests red, each with its own diagnosis; restored
+  and re-verified green.
+- **`DEFAULT_MAX_EACH_ITEMS` is tied to the loop budget at compile time.** The two constants were
+  equal with no structural relationship, so lowering the loop budget later would have let the
+  up-front `each` fan-out check accept a source the per-element charge then rejected *mid-iteration,
+  after side effects*. Added `const _: () = assert!(DEFAULT_MAX_EACH_ITEMS <=
+  DEFAULT_MAX_LOOP_ITERATIONS)`, the same shape as `cst_decode.rs`'s `MAX_LOWER_DEPTH` /
+  `MAX_PARSE_DEPTH` assert. Verified non-vacuous: raising the constant by one fails the build.
+- **The scope claim is corrected.** "The one boundary that starts a fresh counter is a composite op
+  call" is true only *inside flux-lang*. An op dispatched from a flow body re-enters the same way —
+  `task` (`flux-orchestrate`, used by `examples/strict_review.flux`), the `flux app` journey spawn
+  (`flux-app`, bounded by `MAX_SPAWN_DEPTH`), and `flow_run` (`flux-tools`). Same multiplication
+  shape as the composite boundary, bounded the same way by the outer execution's own budget; the
+  doc-comment now says "inside flux-lang" and names all three, so the budget is not misread as a
+  whole-process ceiling. Behaviour unchanged — a wording fix, not a hole to close.
+- **Blast radius, more precisely than the first pass stated it.** The built-in agent loop's
+  `repeat 50` is rewritten to `max_iterations` and then fully unrolled by
+  `lift_builtin_repeat_awaits` into top-level `when`-guarded statements, so it contains no `Repeat`
+  node and charges *zero* budget. The largest `repeat` bound anywhere in the tree is 50, three
+  orders of magnitude under the ceiling.
+
 ### Closing note — does any production path reach `execute_flow` without `lower()`?
 
 **Yes, several — but none of them are model- or remote-controlled, which caps the real-world

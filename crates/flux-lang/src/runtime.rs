@@ -52,9 +52,16 @@ pub const DEFAULT_MAX_COMPOSITE_DEPTH: u64 = 8;
 /// so the budget was really per *node activation* and nested loops multiplied past it —
 /// `repeat 400 { repeat 300 { … } }` ran 120,000 rounds under a budget documented as 100,000.
 ///
-/// The one boundary that starts a fresh counter is a **composite op call**: it is its own flow
-/// execution, with its own frame store, transcript and step count, and its nesting is bounded
-/// independently by [`DEFAULT_MAX_COMPOSITE_DEPTH`].
+/// **Inside flux-lang**, the one boundary that starts a fresh counter is a **composite op call**:
+/// it is its own flow execution, with its own frame store, transcript and step count, and its
+/// nesting is bounded independently by [`DEFAULT_MAX_COMPOSITE_DEPTH`]. Above this crate an *op*
+/// dispatched from a flow body can re-enter the interpreter the same way, and so also starts a
+/// fresh counter — `task` (`flux-orchestrate/src/lib.rs`, used by `examples/strict_review.flux`),
+/// the `flux app` journey spawn (`flux-app/src/app.rs`, bounded by its own `MAX_SPAWN_DEPTH`), and
+/// `flow_run` (`flux-tools/src/flows.rs`). Each is the same multiplication shape as the composite
+/// boundary and is bounded the same way: the *outer* execution still charges its own budget for
+/// every iteration that dispatches one of them, so the nesting cannot run away — but this budget
+/// alone is not a whole-process ceiling, and should not be read as one.
 ///
 /// Cost of exceeding it: the flow fails with a bounded error naming the construct that charged the
 /// last iteration. Nothing is killed mid-dispatch and the audit trail is intact; an explicit
@@ -93,7 +100,20 @@ impl LoopBudget {
 
 /// L-82: the default per-execution `each` fan-out budget — an `each` over an attacker-sized source
 /// (millions of elements) is rejected up front rather than materialising a value per element.
+///
+/// This is a *fan-out size* check, made before any element runs; the per-element charge against
+/// [`DEFAULT_MAX_LOOP_ITERATIONS`] is what actually bounds the iteration. The two must therefore
+/// stay ordered, and the assert below is what keeps them so.
 pub const DEFAULT_MAX_EACH_ITEMS: u64 = 100_000;
+
+// Checked at compile time so the two ceilings can never drift into an order where an `each` source
+// the up-front check ACCEPTS is one the per-element charge then rejects — which would fail the flow
+// mid-iteration, after an arbitrary prefix of the body's side effects had already happened, rather
+// than refusing the whole `each` up front. Today they are equal, which is the tightest legal
+// ordering: one full-size `each` fits a fresh execution exactly, with nothing to spare. Lowering
+// the loop budget without lowering this is the drift this catches. (L-116; same shape as
+// `cst_decode.rs`'s `MAX_LOWER_DEPTH` / `MAX_PARSE_DEPTH` assert.)
+const _: () = assert!(DEFAULT_MAX_EACH_ITEMS <= DEFAULT_MAX_LOOP_ITERATIONS);
 
 /// L-82: the transcript is fed back to the model each round; an unbounded `loop`/`each` would grow it
 /// without limit. Kept as a ring buffer — the oldest entries are dropped once it exceeds twice this
@@ -8915,6 +8935,93 @@ mod tests {
         assert!(
             err.to_string().contains("execution budget"),
             "nested repeats must share one execution budget, got: {err}"
+        );
+    }
+
+    /// Half the budget plus a slice — two of these fit *individually* under
+    /// `DEFAULT_MAX_LOOP_ITERATIONS` and exceed it only when they charge the SAME counter. That is
+    /// what makes the three concurrency-seam tests below observable: fork the budget per branch and
+    /// every one of them goes green again.
+    fn over_half_the_budget() -> Node {
+        unlowered_repeat(60_000, vec![flow_bind("x", flow_lit(json!("y")))])
+    }
+
+    /// L-116: the concurrency seam is the whole reason the budget is a shared handle and not a
+    /// `&mut` counter — concurrent branches cannot share a mutable borrow, so a `&mut` design has
+    /// to hand each branch its own, which reinstates one level up exactly the multiplication this
+    /// story closes. Nothing else in the tree combines a loop with `parallel`, so without this test
+    /// the deviation is unobservable: `budget.clone()` could become `LoopBudget::default()` in the
+    /// `parallel` arm and no test would notice (AGENTS.md's "correct wiring whose removal changes
+    /// nothing").
+    #[tokio::test]
+    async fn parallel_branches_charge_one_shared_budget() {
+        let host = CfHost::new();
+        let branch = |name: &str| crate::ast::Branch {
+            name: SymbolName(name.into()),
+            body: vec![over_half_the_budget()],
+        };
+        let body = vec![Node::Parallel {
+            branches: vec![branch("a"), branch("b")],
+        }];
+        let Err(err) = run(&host, body).await else {
+            panic!(
+                "2 x 60,000 concurrent rounds completed: each `parallel` branch was handed a \
+                 private budget, so together they spent 120,000 against a 100,000 ceiling"
+            );
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "parallel branches must charge one shared budget, got: {err}"
+        );
+    }
+
+    /// L-116: the same pin for the `race` arm's branch futures — a second `budget.clone()` site
+    /// that a per-branch fork would silently un-share. `race` joins every branch's failure into one
+    /// message, so the budget error surfaces through the join.
+    #[tokio::test]
+    async fn race_branches_charge_one_shared_budget() {
+        let host = CfHost::new();
+        let branch = |name: &str| crate::ast::Branch {
+            name: SymbolName(name.into()),
+            body: vec![over_half_the_budget()],
+        };
+        let body = vec![Node::Race {
+            timeout_ms: 60_000,
+            bind: None,
+            branches: vec![branch("a"), branch("b")],
+        }];
+        let Err(err) = run(&host, body).await else {
+            panic!(
+                "a `race` branch finished 60,000 rounds: the branches were handed private budgets, \
+                 so neither ever saw the 100,000 ceiling they jointly crossed"
+            );
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "race branches must charge one shared budget, got: {err}"
+        );
+    }
+
+    /// L-116: and the third `budget.clone()` site — `execute_plan`'s parallel *stage*, which is a
+    /// separate entry point from `execute_flow` and forks its own `steps`/transcript per stage.
+    #[tokio::test]
+    async fn parallel_plan_stages_charge_one_shared_budget() {
+        let host = CfHost::new();
+        let body = vec![over_half_the_budget(), over_half_the_budget()];
+        let plan = PhysicalPlan {
+            stages: vec![Stage::Parallel(vec![NodeId(0), NodeId(1)])],
+        };
+        let store = MemStore::new();
+        let mut sink = BufferSink::default();
+        let Err(err) = execute_plan(&store, &host, "s", &body, &plan, &mut sink).await else {
+            panic!(
+                "2 x 60,000 rounds completed across one parallel stage: each stage node was handed \
+                 a private budget instead of a handle to the execution's"
+            );
+        };
+        assert!(
+            err.to_string().contains("execution budget"),
+            "parallel plan stages must charge one shared budget, got: {err}"
         );
     }
 
