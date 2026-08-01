@@ -1796,3 +1796,209 @@ fn board_pages_enumerate_every_generated_board_operation_and_query_row_field() {
         row_fields.len()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// The topologies page (C-440)
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+const TOPOLOGIES: &str = "website/docs/topologies.md";
+
+/// `flux <path…> --help`, as the shipped binary renders it.
+///
+/// `FLUX_SANDBOX=off` is declared rather than inherited, per C-266: the subcommand path is forwarded
+/// in bulk, so the posture gate cannot see that every call renders help and executes nothing. Off is
+/// the honest declaration for a spawn that never reaches an effect.
+fn flux_help(path: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .env("FLUX_SANDBOX", "off")
+        .args(path)
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|e| panic!("run `flux {} --help`: {e}", path.join(" ")));
+    assert!(
+        output.status.success(),
+        "`flux {} --help` exited {}",
+        path.join(" "),
+        output.status
+    );
+    String::from_utf8(output.stdout).expect("UTF-8 help")
+}
+
+/// The subcommand names clap lists under `Commands:` for one help text.
+fn subcommand_names(help: &str) -> Vec<String> {
+    let Some((_, after)) = help.split_once("Commands:\n") else {
+        return Vec::new();
+    };
+    after
+        .split("\n\n")
+        .next()
+        .expect("Commands body")
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| *name != "help")
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every `flux …` line the topologies page prints as runnable is real CLI surface today.
+///
+/// The page's entire value is that a reader can copy a line and have it work, so a renamed
+/// subcommand or flag must break CI rather than quietly turn a documented topology into a lie. This
+/// resolves each line against the shipped binary's own `--help` — the same discipline as
+/// `cli_reference_covers_every_public_subcommand`, one level deeper: that test asks whether a
+/// command is *mentioned*, this one asks whether what is printed actually parses.
+///
+/// **The convention this shares with the page**: a `sh` fence holds commands that run *today*. A
+/// topology that has not landed shows its proposed spelling in a `text` fence instead, so neither a
+/// reader nor this check can confuse the two — see
+/// `topologies_page_does_not_present_unbuilt_surface_as_runnable`.
+#[test]
+fn topologies_page_runnable_commands_are_real_cli_surface() {
+    let page = read(TOPOLOGIES);
+    let blocks = fenced_blocks(&page, "sh");
+    assert!(
+        !blocks.is_empty(),
+        "{TOPOLOGIES} prints no runnable command — every shipping row owes the reader one"
+    );
+
+    let mut checked = 0;
+    for block in &blocks {
+        for line in block.lines() {
+            // Strip a trailing `# …` gloss; the page annotates several commands inline.
+            let line = line.split_once(" #").map_or(line, |(code, _)| code).trim();
+            let Some(rest) = line.strip_prefix("flux ") else {
+                continue;
+            };
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+
+            // Walk as far down the subcommand tree as the line actually goes. A token that is not a
+            // subcommand of the level reached is a positional (a prompt, a URL, a program path).
+            let mut path: Vec<&str> = Vec::new();
+            for token in tokens.iter().take_while(|t| !t.starts_with('-')) {
+                let names = subcommand_names(&flux_help(&path));
+                if names.iter().any(|name| name == token) {
+                    path.push(token);
+                } else {
+                    break;
+                }
+            }
+            assert!(
+                !path.is_empty(),
+                "{TOPOLOGIES} prints `{line}`, but `{}` is not a flux subcommand",
+                tokens.first().unwrap_or(&"")
+            );
+
+            let help = flux_help(&path);
+            for token in &tokens {
+                let Some(flag) = token.strip_prefix("--") else {
+                    continue;
+                };
+                let flag = flag.split('=').next().expect("flag name");
+                if flag.is_empty() {
+                    continue;
+                }
+                // Match the whole flag, not a prefix of one: a plain `contains` would accept a
+                // documented `--serv` because the help lists `--serve`.
+                let offered = help.match_indices(&format!("--{flag}")).any(|(at, text)| {
+                    help[at + text.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '-')
+                });
+                assert!(
+                    offered,
+                    "{TOPOLOGIES} prints `{line}`, but `flux {} --help` does not offer `--{flag}`",
+                    path.join(" ")
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 4,
+        "expected the page's runnable commands, found {checked}"
+    );
+}
+
+/// The page's honest-status column is only worth having if it cannot silently go stale in the
+/// *optimistic* direction — a topology that lands leaves the page understating what ships, and
+/// nobody gets a bug report for that. The remote-system row (C-436) is the one currently marked
+/// proposed and the one most likely to land next, so it is pinned to the CLI: when `flux tui
+/// --remote` exists, this fails, and the change that made it exist is the change that must update
+/// the row.
+///
+/// The second half enforces the fence convention: while a surface does not exist, no `sh` block may
+/// print it, because `sh` is what the page promises is runnable.
+#[test]
+fn topologies_page_does_not_present_unbuilt_surface_as_runnable() {
+    let page = read(TOPOLOGIES);
+
+    assert!(
+        !flux_help(&["tui"]).contains("--remote"),
+        "`flux tui --remote` now ships (C-436) — {TOPOLOGIES} still files the local-runtime / \
+         remote-system row as proposed. Update the row's status, move its command into an `sh` \
+         fence, and relax this pin."
+    );
+    for block in fenced_blocks(&page, "sh") {
+        assert!(
+            !block.contains("--remote"),
+            "{TOPOLOGIES} prints `--remote` in a runnable `sh` fence, but no such flag exists. \
+             Proposed spellings belong in a `text` fence."
+        );
+    }
+}
+
+/// The commitments that make this page a decision aid rather than a brochure, pinned so that
+/// deleting one is a red gate rather than an edit nobody notices.
+///
+/// - Every row of the summary table carries one of the three status words. A row with no status is
+///   the failure the story was written to prevent.
+/// - `ssh` is named. Running flux on the remote box over `ssh` works today and is the right answer
+///   for some readers; a page that hides the free alternative to make the product look necessary is
+///   not credible about anything else on it.
+/// - Both of the questions a reader actually has are column headings, so no row can answer one and
+///   skip the other.
+#[test]
+fn topologies_page_states_a_status_for_every_row_and_names_ssh() {
+    let page = read(TOPOLOGIES);
+
+    assert!(
+        page.contains("ssh"),
+        "{TOPOLOGIES} must name `ssh` as a legitimate option"
+    );
+
+    // The first contiguous run of table lines after the heading — not "everything up to the next
+    // blank line", which would be empty, and not "every `|` line on the page", which would sweep in
+    // the per-topology tables below it.
+    let table: Vec<&str> = page
+        .split_once("## At a glance")
+        .unwrap_or_else(|| panic!("{TOPOLOGIES} carries an at-a-glance table"))
+        .1
+        .lines()
+        .skip_while(|line| !line.starts_with('|'))
+        .take_while(|line| line.starts_with('|'))
+        .collect();
+
+    let header = table.first().copied().unwrap_or_default();
+    for question in ["Your files", "Approval prompt"] {
+        assert!(
+            header.contains(question),
+            "the at-a-glance table must answer `{question}` for every topology"
+        );
+    }
+
+    let rows = &table[2.min(table.len())..]; // past the header and its separator
+    assert!(
+        rows.len() >= 8,
+        "expected a row per topology, found {}",
+        rows.len()
+    );
+    for row in rows {
+        assert!(
+            ["**ships**", "**partial**", "**proposed**"]
+                .iter()
+                .any(|status| row.contains(status)),
+            "this topology row carries no status — ships, partial or proposed is mandatory:\n{row}"
+        );
+    }
+}
