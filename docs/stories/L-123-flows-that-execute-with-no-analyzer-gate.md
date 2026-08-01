@@ -2,7 +2,7 @@
 id: L-123
 title: "Three production paths execute a user flow with no analyzer gate at all, and `fork --edit` is the sharp one"
 pillar: Language
-status: ready
+status: in-progress
 priority: 11
 epic: flux-lang-hardening
 design: docs/designs/flux-lang-hardening.md
@@ -45,16 +45,16 @@ L-116's interpreter budget now backstops the *loop* case on all of these. Nothin
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test driving a flow through `fork --edit` that a `analyze_flow` pass would
+- [x] **Failing-first**: a test driving a flow through `fork --edit` that a `analyze_flow` pass would
       reject, showing it executes at the merge base.
-- [ ] Each of the three paths either runs the analyzer, or carries a comment at the call site saying
+- [x] Each of the three paths either runs the analyzer, or carries a comment at the call site saying
       why it is exempt and what backstops it instead. **No path is left silently inconsistent with
       its siblings** — that inconsistency is the story.
-- [ ] The SDK's opt-in `analyze()` is either made the default, or its being opt-in is documented as a
+- [x] The SDK's opt-in `analyze()` is either made the default, or its being opt-in is documented as a
       deliberate embedder choice at the public surface, so an embedder knows they own the check.
-- [ ] A note in the design doc records the invariant decided here: which entry points guarantee
+- [x] A note in the design doc records the invariant decided here: which entry points guarantee
       static analysis and which do not, so the next entry point added knows which side it is on.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -72,3 +72,34 @@ L-116's interpreter budget now backstops the *loop* case on all of these. Nothin
 
 - Filed 2026-08-01 from L-116's threat-model census, which enumerated these with file:line evidence
   rather than asserting the gate was universal.
+- Implemented 2026-08-01 on `impl/L-123`. The invariant settled — *a flow body this engine did not
+  itself produce is `analyze_flow`-gated; engine output (replayed / resumed / sliced) is exempt and
+  says so at its call site* — is written up in the design doc with a per-entry-point table.
+  - **Path 1, `fork --edit`** — gated. `fork::analyze_edited` runs ahead of `record_fork_plan`, so a
+    refused plan leaves no accepted-attempt record (the C-211 "a failed fork leaves no trace" rule).
+    `session_symbols` comes from the fork session's store, not an empty set, so an edit that drops
+    leading statements and reads what the replayed prefix bound still analyzes clean — pinned by its
+    own test.
+  - **Path 2, `flux app` journeys** — gated by `app::analyze_journey`, against the executor's own
+    narrowed registry plus the program's composites, on the post-`rewrite_asks` AST. **Symbol
+    definedness is excluded**, deliberately and documented: a journey's environment is payload-shaped
+    (`seed_payload` binds one symbol per event field), so definedness is a fact about a delivery, not
+    the program. Found the hard way — the strict version broke two `flux-channels` tests whose
+    journey reads a payload-only `$delivery`. Everything statically decidable stays enforced.
+  - **Path 3, the SDK** — documented, not defaulted. Forcing `analyze()` would break `execute_with`'s
+    seeding (seeded `$name`s read as unbound to plain `analyze`; only `analyze_seeded` sees them).
+    `FlowClient` carries a *"Static analysis is yours to run"* section and each of the four
+    `execute*` doors points at it.
+  - Sibling exemptions commented: `diverge_inject` + fork prefix replay (`fork.rs` module header and
+    call site) and the journey ask-resume (`app.rs`), each naming its backstop.
+- ⚠ **Behavioural consequence to call out at integration.** Gating journeys makes the *deprecated*
+  2+-positional call form (`send("cli", $reply)`) a startup error there, as it already is under
+  `flux flow run`. `map_args_to_input` still accepts it at run time, by design and only so a legacy
+  *stored* plan does not fail mid-flight after side effects. Repo-wide blast radius was one test
+  fixture (`flux-app/tests/integration.rs`'s `ECHO`); both shipped journey examples already used the
+  named-object form.
+- **Composite-call budget boundary: judged out of proportion, not done.** L-116's remaining
+  fresh-counter boundary needs a budget handle threaded through
+  `run_call`/`eval_cond`/`execute_composite_call` — the interpreter's hot call path, a different
+  subsystem from this story's call-site gates, with its own failing-first burden. Recorded as still
+  open in the design doc; wants its own story.

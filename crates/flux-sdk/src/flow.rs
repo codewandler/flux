@@ -255,6 +255,31 @@ impl FlowClientBuilder {
 
 /// A Flux-Lang lifecycle façade: holds the provider + model + the assembled registry, and exposes
 /// the `parse → analyze → execute` surface plus a registration surface for extra ops/packs.
+///
+/// # Static analysis is yours to run (L-123)
+///
+/// **No `execute*` method on this type calls [`analyze`](Self::analyze) for you.** Inside flux, a
+/// flow body the engine did not author is gated before it runs — the agent loop's AST at assembly,
+/// the model's `flow_run` AST inside `lower`, a `fork --edit` plan, an app journey. `FlowClient` is
+/// the one door that deliberately sits on the other side of that line, and the invariant is
+/// recorded in `docs/designs/flux-lang-hardening.md` so the next entry point knows which side it is
+/// on. **As an embedder you own the check**: call `analyze` (or
+/// [`analyze_seeded`](Self::analyze_seeded)) before `execute`, as the crate-level example does.
+///
+/// It is opt-in rather than automatic for two reasons that are properties of an SDK, not of the
+/// analyzer:
+///
+/// - **Seeding would break.** [`execute_with`](Self::execute_with) injects `$name` values that the
+///   AST never declares; plain `analyze` reports exactly those as unbound (L-15). Forcing it would
+///   reject the seeding pattern this type documents, and only `analyze_seeded` — which needs the
+///   input names the *caller* holds — gets it right.
+/// - **Repeated execution should not re-pay for it.** An embedder running one stored, already
+///   validated AST in a loop analyzes once at load, not once per call.
+///
+/// What still holds if you skip it: analysis is a *static contract* check, never the authorization
+/// boundary. Every op dispatches through `Executor::dispatch` under this client's permission rules
+/// and approver, and L-116's per-execution loop budget bounds iteration at run time. Skipping
+/// `analyze` costs you a clean pre-flight diagnostic, not the envelope.
 pub struct FlowClient {
     model: String,
     registry: ToolRegistry,
@@ -515,6 +540,10 @@ impl FlowClient {
 
     /// Execute a compiled [`DraftAst`] through the real safety envelope (`Executor::dispatch` under
     /// the client's permission rules + approver), returning an [`ExecutionResult`].
+    ///
+    /// Runs `ast` **as given** — [`analyze`](Self::analyze) is not called for you. See the
+    /// type-level *"Static analysis is yours to run"* note for why, and what still holds if you
+    /// skip it.
     pub async fn execute(&self, ast: &DraftAst) -> Result<ExecutionResult> {
         let executor = self.build_executor();
         let mut sink = ExecSink::default();
@@ -543,7 +572,9 @@ impl FlowClient {
     ///
     /// Its analysis partner is [`analyze_seeded`](Self::analyze_seeded) — pass the same input names
     /// so the flow analyzes clean without a flow-param declaration (plain [`analyze`](Self::analyze)
-    /// reports a seed-only, undeclared `$name` as unbound).
+    /// reports a seed-only, undeclared `$name` as unbound). Calling it is **your** step: this method
+    /// runs `ast` as given, and that pairing is precisely why the check cannot be made automatic
+    /// here — see the type-level *"Static analysis is yours to run"* note.
     pub async fn execute_with(
         &self,
         ast: &DraftAst,
@@ -574,7 +605,9 @@ impl FlowClient {
     /// Execute `ast` while **streaming** every dispatch to your own [`AgentSink`] as it happens — each
     /// op's `tool_call` **and** `tool_result`, text, and observations — and still returning the
     /// collected [`ExecutionResult`]. The observable counterpart of [`execute`](Self::execute), whose
-    /// private collector drops everything but op names. Same envelope, same one-shot `await` handling.
+    /// private collector drops everything but op names. Same envelope, same one-shot `await` handling
+    /// — and, like every `execute*` door here, it runs `ast` as given: see the type-level
+    /// *"Static analysis is yours to run"* note.
     pub async fn execute_with_sink(
         &self,
         ast: &DraftAst,
@@ -606,6 +639,11 @@ impl FlowClient {
     /// Execute `ast` as a [`FlowStream`] — a live stream of owned [`AgentEvent`](crate::AgentEvent)s
     /// plus `finish() -> ExecutionResult`. The flow runs on a spawned task, so events arrive as they
     /// happen whether or not you are polling (unlike the fully-buffered [`execute`](Self::execute)).
+    ///
+    /// Runs `ast` as given — [`analyze`](Self::analyze) is not called for you; see the type-level
+    /// *"Static analysis is yours to run"* note. Worth a second look on this door specifically: it
+    /// returns before the flow finishes, so a diagnostic `analyze` would have raised synchronously
+    /// instead surfaces as a mid-stream failure.
     ///
     /// # Panics
     /// Spawns the flow eagerly, so it must be called from within a Tokio runtime.

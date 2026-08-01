@@ -7,6 +7,13 @@
 //! prefix lands, [`replay_prefix`] swaps the store's scope to `CassetteScope::Record` for the fork
 //! session — so the live tail goes through the real `Executor::dispatch`
 //! (authorization/approval unchanged) AND the forked run is itself replayable.
+//!
+//! **Where the static gate sits in this module (L-123).** Of the three divergence modes only
+//! [`diverge_edit`] takes a body that is fresh operator input, and it is the one that runs
+//! `analyze_flow`. [`replay_prefix`]'s executions and [`diverge_inject`]'s tail replay or resume
+//! bodies this engine already produced and executed — re-analyzing a truncated or sliced body would
+//! reject valid forks over symbols bound outside the slice, so they are exempt by design rather
+//! than by omission. Each exemption states its own backstop at its call site.
 
 use flux_events::EventStore;
 use flux_lang::ast::{DraftAst, Node, RunEvent};
@@ -71,6 +78,45 @@ fn record_fork_plan(
 
 fn fork_err(msg: impl Into<String>) -> FlowError {
     FlowError::Runtime(msg.into())
+}
+
+/// L-123 — **the static gate for the one fork mode that takes fresh input.**
+///
+/// Which entry points guarantee static analysis is an invariant, not an accident (recorded in
+/// `docs/designs/flux-lang-hardening.md`): *a flow body that did not come out of this engine gets
+/// `analyze_flow` before it executes.* The agent loop's AST gets it at assembly
+/// ([`crate::engine`]'s `validate_agent_loop`) and the model's `flow_run` AST gets it inside
+/// [`flux_lang::analyze::lower`]. Mode C is the third such door: `flux session fork --edit <file>`
+/// parses an arbitrary operator-authored file, so it belongs on the same side of the line.
+///
+/// Note what the analyzer is and is not here. It is a *static contract* check — op resolution and
+/// arity, symbol definedness, structural legality — that fails the run before any statement
+/// dispatches. It is **not** the authorization boundary: every op still goes through
+/// `Executor::dispatch`, and a fork tail is no more privileged for having analyzed clean.
+///
+/// `session_symbols` is the fork session's live store rather than an empty set, because by the
+/// time mode C runs, [`replay_prefix`] has rehydrated the prefix's binds there. An edited plan
+/// that drops leading statements and reads what they bound is legal and must analyze clean.
+fn analyze_edited(
+    store: &FlowStore,
+    executor: &Executor,
+    fork_session: &str,
+    edited: &DraftAst,
+) -> Result<()> {
+    // No composites: `diverge_edit` executes with an empty composite set, so the catalog the
+    // analyzer sees is exactly the catalog the interpreter will resolve against.
+    let catalog = crate::registry::OpRegistry::new(executor.registry());
+    let bound = store.bound_symbol_names(fork_session)?;
+    flux_lang::analyze::analyze_flow(edited, &catalog, &bound).map_err(|diagnostics| {
+        fork_err(format!(
+            "--edit plan failed validation: {}",
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.message)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    })
 }
 
 /// Hermetically reconstruct the recorded run's state INTO the fork session, up to (excluding)
@@ -231,6 +277,14 @@ pub async fn replay_prefix(
 /// top-level `bind`), then run the remainder of the plan LIVE. Injection canonicalizes through
 /// [`flux_lang::runtime::lit_value`] (D-67) so the injected symbol is indistinguishable from a
 /// literal-bound one downstream.
+///
+/// **Deliberately not analyzed** (L-123), unlike [`diverge_edit`]: the body is a *slice* of a plan
+/// this engine already produced, executed and recorded — `prefix.plan.body[at + 1..]` behind a
+/// synthetic `bind` — not fresh input. A slice is not a standalone flow, so `analyze_flow` would
+/// reject valid forks on symbols the replayed prefix bound outside the slice. What stands in for it:
+/// the plan passed the gate when it was first produced, `value` is a literal (it names no op and
+/// binds no symbol the plan did not already declare), every dispatch still traverses
+/// `Executor::dispatch`, and L-116's per-execution loop budget bounds iteration at run time.
 pub async fn diverge_inject(
     store: &FlowStore,
     executor: &Executor,
@@ -286,6 +340,11 @@ pub async fn diverge_inject(
 /// Divergence mode C — edit: run an edited plan against the replayed prefix's ledger. Unchanged
 /// leading statements fast-forward (rehydrating the prefix's fresh values); the first edited
 /// statement and everything after run LIVE.
+///
+/// **`edited` is statically analyzed before anything dispatches** ([`analyze_edited`]) — it is the
+/// only fork body that is fresh operator input rather than a slice of an already-executed recorded
+/// plan, so it is the only one that gets the gate. A rejected plan runs *no* statement: the refusal
+/// lands ahead of the fast-forward, not partway through the tail.
 pub async fn diverge_edit(
     store: &FlowStore,
     executor: &Executor,
@@ -294,6 +353,9 @@ pub async fn diverge_edit(
     edited: &DraftAst,
     sink: &mut dyn AgentSink,
 ) -> Result<flux_lang::runtime::FlowOutcome> {
+    // Before `record_fork_plan`: a refused plan must leave no accepted-attempt record behind, the
+    // same "a failed fork leaves no trace" rule `Session::fork` follows (C-211).
+    analyze_edited(store, executor, fork_session, edited)?;
     record_fork_plan(
         &store.event_store(),
         executor,
@@ -311,4 +373,187 @@ pub async fn diverge_edit(
         sink,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use flux_runtime::{
+        AllowApprover, PermissionManager, Tool, ToolContext, ToolRegistry, ToolResult,
+    };
+    use flux_spec::ToolSpec;
+    use flux_system::{System, Workspace};
+    use serde_json::json;
+
+    use crate::state::FlowStore;
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// A side-effecting op: every dispatch bumps a shared counter, so a test can assert whether a
+    /// statement ran at all.
+    struct BumpTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for BumpTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("bump", "bump a counter", json!({"type": "object"}))
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> flux_core::Result<ToolResult> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(ToolResult::ok(format!("count={n}")))
+        }
+    }
+
+    struct NullSink;
+    impl AgentSink for NullSink {}
+
+    fn temp_executor(bumps: Arc<AtomicUsize>) -> Executor {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-fork-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(BumpTool(bumps)));
+        Executor::new(
+            reg,
+            PermissionManager::from_rules(&["bump".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        )
+    }
+
+    fn call(op: &str) -> Node {
+        Node::Call {
+            op: op.into(),
+            args: vec![],
+        }
+    }
+
+    /// L-123: `--edit` is the one fork mode whose body is a FRESH operator-authored flow, so it
+    /// carries the same static gate the agent loop and the model's lowered `flow_run` AST do. Before
+    /// the gate, an edited plan naming an operation the catalog has never heard of ran anyway —
+    /// executing every side effect ahead of the bad statement before the interpreter noticed.
+    #[tokio::test]
+    async fn fork_edit_refuses_an_edited_plan_the_analyzer_rejects() {
+        let store = FlowStore::in_memory().unwrap();
+        let bumps = Arc::new(AtomicUsize::new(0));
+        let executor = temp_executor(bumps.clone());
+        let prefix = ForkPrefix {
+            plan: DraftAst {
+                name: None,
+                params: vec![],
+                returns: None,
+                body: vec![call("bump")],
+            },
+            at: 0,
+            ledger: ResumeLedger::default(),
+            turn_id: 1,
+        };
+        // A real op, then one no catalog entry resolves: `analyze_flow` rejects the whole flow, the
+        // interpreter would happily run statement 0 first.
+        let edited = DraftAst {
+            name: None,
+            params: vec![],
+            returns: None,
+            body: vec![call("bump"), call("no_such_op")],
+        };
+
+        let err = diverge_edit(
+            &store,
+            &executor,
+            "fork-sess",
+            &prefix,
+            &edited,
+            &mut NullSink,
+        )
+        .await
+        .expect_err("an edited plan naming an unregistered op must be refused, not executed");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no_such_op"),
+            "the refusal names the offending op: {msg}"
+        );
+        assert_eq!(
+            bumps.load(Ordering::SeqCst),
+            0,
+            "the refusal lands BEFORE the first statement — nothing dispatched"
+        );
+    }
+
+    /// The false-positive edge the gate has to survive, and the reason `session_symbols` is read
+    /// from the store rather than left empty: a legitimate edit may DROP the leading statements and
+    /// read what they bound, since `replay_prefix` already rehydrated those symbols into the fork
+    /// session. Analyzed against an empty set, that plan would be rejected for an unbound `$var`
+    /// that demonstrably exists — turning this story's defence-in-depth into a regression.
+    #[tokio::test]
+    async fn fork_edit_accepts_a_plan_reading_a_symbol_only_the_replayed_prefix_bound() {
+        let store = FlowStore::in_memory().unwrap();
+        let bumps = Arc::new(AtomicUsize::new(0));
+        let executor = temp_executor(bumps.clone());
+
+        // Stand in for the replayed prefix: `$carried` lives in the fork session's store, bound by
+        // a statement the edited plan below no longer contains.
+        let value_id = store
+            .put_value("fork-sess", &flux_lang::ast::Value::String("kept".into()))
+            .unwrap();
+        store
+            .bind(
+                "fork-sess",
+                &flux_lang::ast::SymbolName("carried".into()),
+                &value_id,
+                None,
+                "kept",
+                flux_lang::ast::Visibility::Hidden,
+            )
+            .unwrap();
+
+        let prefix = ForkPrefix {
+            plan: DraftAst {
+                name: None,
+                params: vec![],
+                returns: None,
+                body: vec![call("bump")],
+            },
+            at: 1,
+            ledger: ResumeLedger::default(),
+            turn_id: 1,
+        };
+        let edited = DraftAst {
+            name: None,
+            params: vec![],
+            returns: None,
+            body: vec![Node::Return {
+                value: Box::new(Node::Var {
+                    name: flux_lang::ast::SymbolName("carried".into()),
+                }),
+            }],
+        };
+
+        let outcome = diverge_edit(
+            &store,
+            &executor,
+            "fork-sess",
+            &prefix,
+            &edited,
+            &mut NullSink,
+        )
+        .await
+        .expect("a plan reading a prefix-bound symbol must analyze clean");
+        assert!(
+            outcome.failure.is_none(),
+            "and it must then actually run: {:?}",
+            outcome.failure
+        );
+    }
 }
