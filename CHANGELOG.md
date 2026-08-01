@@ -6,6 +6,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A Brave Talk / JaaS room acquires and refreshes its own guest token** (D-206, guest-token half;
+  own-tenant RS256 signing is deferred to D-223, which needs a crypto dependency decision). Layers
+  vendor token acquisition on D-205's XMPP machinery: CSRF preflight, `PUT /api/v1/rooms/<room>` for
+  the JWT, then focus allocation — with the MUC JID taken from the conference response rather than
+  the JWT, because the response lowercases the room and the JWT does not.
+  Egress is stricter than the WebSocket path it sits beside: every request goes through
+  `guard_url_scoped_pinned` with `resolve_to_addrs`, an empty pin set failing closed, and **redirects
+  refused outright** — a redirect would carry `Authorization: Bearer <jwt>` off the vetted origin.
+  ⚠ **Two real defects were found and fixed on the way, both inherited rather than introduced.** A
+  guest JWT rides the endpoint's `?token=`, and the shipped XMPP session quoted that endpoint
+  verbatim in a connect error and a `Debug` impl — a failed connect would have published the token to
+  a log. Endpoints now render query-trimmed. Separately, `leave()` could return `Ok(())` while a
+  freshly-joined session was still live, leaving the room **permanently un-rejoinable** — reachable
+  on the ordinary shutdown path, and exactly the race the code's own comment claimed to have closed.
+  ⚠ **The refresh order changed, because the original could not work against a real MUC.** Giving the
+  test double a nick-occupancy model showed that opening the new session before closing the old is
+  the XEP-0045 §7.2.9 nickname-conflict case, since SASL `ANONYMOUS` gives each connection a distinct
+  JID. Refresh is now mint → release → re-take. Consequence, stated rather than hidden: a transient
+  vendor outage during a refresh now **ends the room** instead of limping on with the old token,
+  because once the nick is released there is nothing to fall back on. The handover is also not
+  atomic — a service frees a nick when it *processes* the departure, so a replacement can meet its
+  own predecessor; hence 5 attempts at 250 ms.
+  ⚠ The guest JWT is **not** registered with the `Redactor`: `flux-channels` does not depend on
+  `flux-secret`, and the token is minted at runtime so a declared-secret path would never see it. The
+  line is held structurally instead — redacted `Debug`, query-trimmed endpoints, no vendor response
+  body in any error, `set_sensitive` on the Bearer — and an independent review found no leak path.
+  Vendor wire shapes carry `VENDOR ASSUMPTION` comments; Brave publishes no API for this, and the
+  source is a single 2026-07-30 observation.
+
 ## [0.46.0] - 2026-08-01
 
 ### Fixed
