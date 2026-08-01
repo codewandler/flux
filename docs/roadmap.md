@@ -85,6 +85,35 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
 > the itemized history.
 
+### Flux syntax simplification — one way to write each thing (epic) — 🔄 **PROPOSED (L-102; L-103…L-112 filed, none started)**
+
+The canonical dialect the formatter emits is already the language we want — but it is one of
+several dialects the parser accepts, the docs teach both, and the flagship corpus (agent-loop.flux,
+every example) is written in the legacy one. Nine doubled spelling dimensions tax the parser, four
+editor grammars, and every model prior; the pinned tree-sitter grammar cannot even parse the
+canonical spellings today. This epic simplifies by subtraction: ship the missing `fluxlang fmt`
+migration tool (L-103), move the corpus and spec to one dialect (L-104/L-105), then deprecate and
+remove the legacy grammar (L-106/L-107), with targeted unifications behind it (one `key: value`
+vocabulary, a closed pure-builtin namespace, lit/template unification, match/when ergonomics —
+L-108…L-112). Done means: one way to write each construct, `fmt --check` in the gate, and a
+smaller grammar in every mirror. It also re-scopes the notation workbench — Tape (L-98) and S-Flux
+(L-99) are deprioritized in its favour. Design:
+[flux-syntax-simplification](designs/flux-syntax-simplification.md).
+
+### flux-lang hardening — remediate the 2026-08-01 subsystem review (epic) — 🔄 **PROPOSED (L-113; L-114…L-120 filed, none started)**
+
+An adversarial subsystem review of flux-lang
+([2026-08-01](reviews/single/2026-08-01-flux-lang-subsystem-review.md), 6/10) falsified the
+crate's two headline totality claims: the parser SIGABRTs on ~200–900 levels of statement nesting
+(the L-81 guard covers only expressions/types), and `each` string-splits its header on `->`,
+rejecting legal programs and breaking round-trip totality — both reproduced, both the fourth
+instance of the "guard tested against its own assumptions" pattern. Behind them: `repeat` lacks
+the loop budget/yield discipline its own doc-comments promise, `confirm` approvals carry an empty
+`IntentSet`, and the language surface has no raw-text fuzzing. One story per finding cluster
+(L-114…L-120), severest first, each fix required to ship its test on the previously untested
+axis. Done means the review's triage flips to `handled` with every finding owned. Design:
+[flux-lang-hardening](designs/flux-lang-hardening.md).
+
 ### The execution substrate — `flux-system` for a second consumer (epic) — 🔄 **PROPOSED (C-394; C-395…C-399 filed, none started)**
 
 `flux-system` has had exactly one consumer since it was written. That is about to stop being true:

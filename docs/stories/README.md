@@ -104,10 +104,26 @@ _`flux-system` has had exactly one consumer since it was written: flux. That is 
 ### Fleet coordinator — flux orchestrating flux across repos
 - [A-111 — Fleet coordinator — flux orchestrating flux across repos (epic)](A-111-fleet-coordinator-epic.md) · Agent · EPIC — the coordinator is a .flux Program on flux-app, not a new binary: a write-capable WorkBoard port (Jira/markdown/GitLab swappable), outbound A2A dispatch to remote workers, and per-delivery bus isolation as the blocker
 
+### flux-lang hardening — remediate the 2026-08-01 subsystem review
+_The 2026-08-01 adversarial subsystem review of `flux-lang`_
+- [L-114 — Statement-block nesting joins the L-81 depth guard (parser SIGABRT)](L-114-statement-depth-guard.md) · Language · Review F1, HIGH — ~200 nested when blocks (~9 KB on a 2 MiB stack) abort the process; the guard covers expressions/types only
+- [L-115 — Lower `each` headers from CST structure, not reconstructed text](L-115-each-lowering-from-cst.md) · Language · Review F2, HIGH — `each x in \"a->b\"` is a parse error and format emits un-reparseable output; header.split_once(\"->\") sees string content
+- [L-113 — flux-lang hardening — remediate the 2026-08-01 subsystem review (epic)](L-113-flux-lang-hardening-epic.md) · Language · EPIC — every finding of the 2026-08-01 flux-lang review owned: two parser totality bugs, interpreter budgets, confirm intents, mirror debt, fuzzing
+- [L-116 — `repeat` gets the loop budget discipline; budget scope is decided](L-116-repeat-and-loop-budgets.md) · Language · Review F3+F4, MEDIUM — repeat has no iteration budget/transcript cap/yield (timeout can never fire over a pure body); loop budgets are per-activation, doc says per-execution
+- [L-117 — `confirm` approvals carry a real IntentSet](L-117-confirm-carries-intents.md) · Language · Review F5, MEDIUM — request_approval always sends IntentSet::new(); the host can only policy-check a prose label with a user-supplied risk string
+- [L-118 — The tree-sitter grammar parses canonical Flux; the nightly red goes green](L-118-tree-sitter-canonical-dialect.md) · Language · Review F6, MEDIUM — 7/15 canonical examples fail at the pin (bare binds, typed binds, ctx, +=, goal); nightly-only red with no owner until now
+- [L-119 — Raw-text fuzzing for the parser front-end, and input-size bounds](L-119-parser-fuzz-and-input-bounds.md) · Language · Review F12 — every property test generates ASTs; the tolerant-recovery text paths (the LSP's value proposition) see only hand-written cases; no size bound before as-u32 casts
+- [L-120 — flux-lang drift & paper-cut batch from the 2026-08-01 review](L-120-doc-drift-and-paper-cuts.md) · Language · Review F9–F13 LOW/INFO — replace_ident byte/char mix, `_`-separator diagnostic, reference.md expr whitelist, ~HOME on the pure path, ledger count, Prism split_once
+
 ### Flux notation workbench — one AST, several readable projections
 _Flux has one honest execution model and one `DraftAst`, but different moments want different views:_
 - [L-98 — Flux Tape — a flat path-addressed transport notation](L-98-flux-tape-notation.md) · Language · Every line locates its AST node; indentation is cosmetic and malformed path structure fails closed
 - [L-99 — S-Flux — a self-delimiting Lisp projection of DraftAst](L-99-s-flux-notation.md) · Language · Data-only S-expressions with named fields and `(ast {...})` escape — no macros, eval, or embedded Lisp runtime
+
+### Flux syntax simplification — one way to write each thing
+- [L-102 — Flux syntax simplification — one way to write each thing (epic)](L-102-flux-syntax-simplification-epic.md) · Language · EPIC — simplify by subtraction: canonical dialect everywhere, a migration tool, then delete the legacy grammar; supersedes L-98/L-99's direction
+- [L-103 — `fluxlang fmt` — the canonical formatter as a CLI, comment-preserving](L-103-fluxlang-fmt.md) · Language · P1 — parse any accepted dialect, rewrite canonical, keep comments; --check mode for CI; everything else in the epic depends on it
+- [L-105 — docs/syntax.md teaches one dialect and stops contradicting itself](L-105-single-dialect-syntax-spec.md) · Language · P4 — fix the mandatory-$ contradiction, move aspirational sections to the evolution doc, document `?` and `do`, one legacy-spelling appendix
 
 ### Cross-harness session history as a datasource
 _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 2919 lines) locates,_
@@ -244,6 +260,16 @@ _`flux-system` has had exactly one consumer since it was written: flux. That is 
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
+
+### Flux syntax simplification — one way to write each thing
+- [L-104 — Migrate the corpus to the canonical dialect](L-104-canonical-corpus-migration.md) · Language · P2+P3 — agent-loop.flux, examples/*.flux, doc snippets, skill examples; plus the hand-fixes a formatter can't do (fmt(\"\") noise, fmt-pre-binds)
+- [L-106 — Deprecation diagnostics for every legacy spelling](L-106-legacy-spelling-deprecation.md) · Language · P5a — the strict parser warns (with the canonical replacement) on the nine legacy dimensions; the LSP offers a canonicalize quick-fix
+- [L-107 — Remove the legacy grammar (breaking ⇒ MINOR)](L-107-remove-legacy-grammar.md) · Language · P5b — one release after L-106: the strict parser rejects legacy spellings; the tolerant CST keeps recognizing them for the quick-fix only
+- [L-108 — One assignment vocabulary — `key: value` in module decls and ctx](L-108-one-assignment-vocabulary.md) · Language · P6 — retire the third `key value` spelling; rename ctx's `budget` to `chars:` to end the budget-block collision
+- [L-109 — A closed pure-builtin namespace — expr/jq/peek call-style lower to pure nodes](L-109-pure-builtin-namespace.md) · Language · P7 — deletes the spec's own 'Beware: parses as an op call named expr' trap; shrinks @json to genuinely pathological shapes
+- [L-110 — Braces are always a value — unify lit and obj/list templates](L-110-unify-lit-and-templates.md) · Language · P8 — node kind must not depend on whether the content happens to be valid JSON; gives all-literal/empty templates a native spelling
+- [L-111 — Hot-path ergonomics — match on expressions, else-when chains, multi-value cases](L-111-match-and-when-ergonomics.md) · Language · P9 — removes the `$kind = $step.kind` pre-bind, three-deep when nesting, and duplicated byte-identical case arms visible in agent-loop.flux
+- [L-112 — Syntax consistency batch — verify's message, durations everywhere, named-input order](L-112-syntax-consistency-fixes.md) · Language · P10 — verify grows assert's comma-message; bare-ms numbers deprecated in time positions; decide author-order vs alphabetical named inputs
 
 ### Habit Compiler
 - [L-84 — The habit compiler — an automation ratchet from session history to authored Flux (epic)](L-84-habit-compiler-epic.md) · Language · EPIC — mine recurring plan shapes across sessions into authored composite ops; report how much work migrated from model tokens to the deterministic runtime
