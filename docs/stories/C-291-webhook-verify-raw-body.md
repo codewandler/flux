@@ -2,7 +2,7 @@
 id: C-291
 title: "`channel webhook` — capture the raw body and verify a declared signature before parsing"
 pillar: Core
-status: backlog
+status: in-progress
 epic: verified-webhook-channel
 note: "the webhook channel authenticates with an optional STATIC BEARER TOKEN and has no signature path at all, so a vendor that signs its payloads and cannot send a custom Authorization header has no authenticated route into flux — and `Json<Value>` is an extractor, so there is no point in `handle` where the raw bytes still exist"
 ---
@@ -45,38 +45,57 @@ and none of them can start before it.
 
 ## Acceptance
 
-- [ ] `WebhookSettings` gains an optional nested `verify` record: `scheme`, `algorithm`, `encoding`,
+- [x] `WebhookSettings` gains an optional nested `verify` record: `scheme`, `algorithm`, `encoding`,
       `header`, optional `prefix`, a `signed` template over `{body}`/`{timestamp}`, an optional
       `timestamp` selector, optional `tolerance`, and `secret` written as a **host-resolved reference**
       (`secret: secret "GITHUB_WEBHOOK_SECRET"`), never a literal.
-- [ ] **Failing-first test `verify_uses_raw_body_not_reserialized`.** A body whose JSON keys are
+      → `crates/flux-channels/src/config.rs` (`VerifyDecl` / `VerifySpec` / `VerifySelector`);
+      lowering proven end-to-end by `tests/webhook.rs::a_verify_record_is_writable_in_a_program`,
+      which asserts the record reaches `ChannelDecl.settings` with `secret` as a `{"$secret":…}`
+      marker. ⚠ "never a literal" is *documented, not enforced*: `resolve_secrets` substitutes the
+      marker before these settings deserialize, so at this layer a resolved reference and a literal
+      are the same string. See the Progress note.
+- [x] **Failing-first test `verify_uses_raw_body_not_reserialized`.** A body whose JSON keys are
       reordered by a parse/re-serialize round trip fails verification, proving the raw bytes are what
       is checked. Any normalize-then-verify path is a bypass, not a convenience.
-- [ ] **Failing-first test `bad_signature_delivers_nothing`** asserts the recording deliverer's
-      delivery count is **`0`** — not merely that the response was `401`. A status assertion passes
-      against a handler that rejects *and* delivers, which is the defect worth testing for.
-      `crates/flux-channels/tests/e2e.rs:16-28` already has the `Tee`-over-`AppDeliverer` pattern.
-- [ ] **Verification precedes the `async` branch**, not the delivery inside it. `webhook.rs:99-108`
-      returns `202 Accepted` and spawns; a failure discovered after the 202 can neither report itself
-      nor stop the delivery it scheduled. Test `bad_signature_delivers_nothing_in_async_mode`.
-- [ ] The ordering is `headers → raw bytes → timestamp (header) → compare → tolerance → decode`, and
+      → `adapters/webhook.rs` unit tests; the body carries reordered keys, a duplicate key **and**
+      non-canonical whitespace, and the round trip is asserted to change it before anything else runs.
+- [x] **Failing-first test `bad_signature_delivers_nothing`** asserts the recording deliverer's
+      delivery count is **`0`** — not merely that the response was `401`.
+      → `adapters/webhook.rs` unit tests, over a `Counting` deliverer. Every negative case in this
+      story asserts the count.
+- [x] **Verification precedes the `async` branch**, not the delivery inside it.
+      → all three guards sit above `if state.is_async` in `handle`; test
+      `bad_signature_delivers_nothing_in_async_mode` sleeps past the `202` before asserting `0`.
+- [x] The ordering is `headers → raw bytes → timestamp (header) → compare → tolerance → decode`, and
       the `serde_json::from_slice` is textually after the comparison in one function.
-- [ ] What `Json<Value>` did implicitly is reproduced explicitly and **after** verification: a
+      → `handle` is `(State, HeaderMap, Bytes)` and its five numbered steps end in `from_slice`.
+      The `timestamp` / `compare` / `tolerance` sub-steps live inside `SignatureVerifier::verify`,
+      which is C-292's half of the seam; what this story fixes is that they are *reachable* over raw
+      bytes at all, and that the decode is downstream of them.
+- [x] What `Json<Value>` did implicitly is reproduced explicitly and **after** verification: a
       content-type rejection emitted before the signature check is a probe oracle. Malformed JSON is
       still a `400`.
-- [ ] `verify` and `token` compose: if both are declared, **both** must pass.
-- [ ] **Every failure mode returns one fixed response body**, matching the existing `"unauthorized"`
-      literal at `webhook.rs:95`. Not "signature mismatch" vs "stale timestamp" vs "missing header" —
-      a caller that can tell those apart has a probe for how far its forgery got.
-- [ ] **Load errors, not per-request failures** — a channel that cannot honour its own declaration
-      must not bind a port, consistent with an unknown channel kind being a hard error
-      (`crates/flux-channels/src/adapters/mod.rs:63`):
-      - an unknown `scheme`;
-      - a `signed` template interpolating `{timestamp}` with no `tolerance` (see C-292);
-      - a `timestamp` selector sourced from the **body** — honouring it would require parsing before
-        verifying, so it is unimplementable by construction rather than merely unimplemented;
-      - a resolved secret shorter than `Redactor`'s 6-character floor (see below).
-- [ ] **The secret cannot surface.** Three specific requirements, each with a verified cause:
+      → `json_content_type` at step 4, `from_slice` → `400` at step 5;
+      `every_authentication_failure_returns_one_fixed_body` asserts both are unreachable before
+      authentication and both still fire after it.
+- [x] `verify` and `token` compose: if both are declared, **both** must pass.
+      → `a_token_and_a_verify_scheme_must_both_pass`, all four combinations.
+- [x] **Every failure mode returns one fixed response body**, matching the existing `"unauthorized"`
+      literal. → `UNAUTHORIZED_BODY`, one `unauthorized()` helper, asserted on the response *body*
+      across four probes.
+- [x] **Load errors, not per-request failures** — a channel that cannot honour its own declaration
+      must not bind a port:
+      - an unknown `scheme` → `each_defect_in_a_verify_record_reports_itself`;
+      - a `signed` template interpolating `{timestamp}` with no `tolerance` →
+        `a_timestamped_template_without_a_usable_tolerance_is_a_load_error` (an unparseable
+        `tolerance` too);
+      - a `timestamp` selector sourced from the **body** → `a_body_sourced_timestamp_is_a_load_error`;
+      - a resolved secret shorter than `Redactor`'s 6-character floor →
+        `a_signing_secret_too_short_to_redact_is_refused_and_never_echoed`.
+      All of them run in `from_decl`, which `build_channels` calls before any listener —
+      `the_refusal_happens_in_build_channels_before_anything_binds` pins that.
+- [x] **The secret cannot surface.** Three specific requirements, each with a verified cause:
       - `Redactor::add_secret` silently drops values under 6 characters
         (`crates/flux-secret/src/lib.rs:195-201`, floor at `:198`), so a short secret is registered
         nowhere and redacted never — refuse it at load. No vendor issues a 5-character signing key,
@@ -91,17 +110,58 @@ and none of them can start before it.
         `webhook.rs:104` (`eprintln!`) and `webhook.rs:118` (error text into the HTTP response body).
         A computed digest is a function of the secret and an attacker-supplied body — printing it is an
         oracle, not a diagnostic.
-- [ ] **`verify "none"` is a distinct, deliberate declaration** — absent and explicitly-none must not
+- [x] **`verify "none"` is a distinct, deliberate declaration** — absent and explicitly-none must not
       normalise to the same thing. A webhook channel bound to a **non-loopback** address must state one
-      or the other, mirroring the existing rule that a non-loopback bind requires a `token`
-      (`webhook.rs:40-46`): the host auto-approves tools, so an open endpoint with no stated
-      verification decision is a remote-trigger surface. ⚠ This is breaking for any existing
-      non-loopback webhook program — weigh it, and if it is rejected, say so here and keep the
-      tri-state at the *declaration* level anyway (C-295 needs it visible to a flow).
+      or the other. ⚠ Breaking — **weighed and taken**; see the Progress note.
+      → `Verification::{Unstated, None, Scheme}` with `is_stated()`;
+      `a_non_loopback_bind_must_state_a_verification_decision` and
+      `an_absent_verification_and_a_stated_none_are_different_facts`.
 
 ## Progress
 
-- (not started)
+**Done (C-291). The seam is in; C-292 plugs into `verifier_for`.**
+
+- **The structural change.** `handle` is now `(State, HeaderMap, Bytes)`. `Json<Value>` was an
+  extractor, so the decode ran before the handler body — before even the *bearer* check. The order is
+  now `open-channel guard → bearer → signature → content-type → decode`, all in one function, with
+  `serde_json::from_slice` textually last.
+- **Where this story ends and C-292 begins.** `SignatureVerifier` (raw `&[u8]` in, one `bool` out) is
+  the whole interface. `verifier_for(&VerifySpec) -> Option<Arc<dyn SignatureVerifier>>` is the single
+  plug-in point; it returns `None` today and `build_verification` turns that `None` into a **load
+  error**, after every structural rule about the declaration has already been checked. No crypto
+  dependency was added — computing a digest is C-292's, and a manifest change this story was fenced
+  from.
+- **⚠ Breaking, deliberately.** A non-loopback `channel webhook` with a `token` and no `verify` used
+  to load and now does not. Weighed and taken: the fix is one line of program text, the error prints
+  it verbatim, the epic is the road to *stable* (so the break costs least now), and the alternative is
+  that the decision stays permanently unmade for every public webhook flux has ever run. The
+  *loopback* case is untouched — silence there is a local endpoint, not an exposure.
+- **The public-bind rule is now keyed on the property, not on `token.is_none()`** (C-321's lesson):
+  `is_effectively_open(token, verify)`. That is what lets a signature-verified channel face the
+  network with **no bearer at all**, which is the Goal — a vendor that signs its payloads and cannot
+  send a custom `Authorization` header now has an authenticated route in.
+- **Two independent refusal sites, proved independently.** Deleting the load-site guard reds
+  `non_loopback_requires_token` + `a_verifying_channel_needs_no_bearer_token_to_face_the_network`
+  while the whole unit suite stays green; deleting the handler-site guard reds
+  `an_effectively_open_non_loopback_channel_refuses_every_request` while the whole integration suite
+  stays green. Six further guards were mutation-tested the same way (missing-verifier refusal,
+  signature check, raw-body capture, auth-before-decode ordering, the redactor floor, the redacting
+  `Debug`).
+- **Not enforced, and it cannot be here: `secret` "never a literal".** `flux_app::resolve_secrets`
+  substitutes the `{"$secret":…}` marker before `WebhookSettings` deserializes, so by `from_decl` a
+  host-resolved reference and a plaintext literal are the same `String`. What *is* enforced is every
+  consequence that matters — the 6-character redactor floor, an empty secret, and a hand-written
+  `Debug` that prints `"<redacted>"`. Enforcing the spelling itself needs a marker that survives
+  resolution (a decl-level flag), which is a flux-lang change and its own story.
+- **`MIN_SECRET_LEN` is a restated `6`, not an import.** flux-channels does not depend on
+  `flux-secret` and adding it is a manifest change this story was fenced from, so the constant carries
+  a doc comment naming `flux_secret::MIN_REGISTERED_SECRET_LEN` instead of a compile-time link. A
+  one-line dev-dependency would let a test pin the two together.
+- **Adjacent, still open:** `WebhookChannel::router` attaches no `DefaultBodyLimit` (the story's own
+  closing note). After this change an *unauthenticated* caller's per-request cost will include an HMAC
+  over the whole body once C-292 lands, so that limit becomes a security parameter rather than a
+  hygiene default. Deliberately not fixed here — it is a separate decision with its own default to
+  choose.
 
 ## Notes
 
