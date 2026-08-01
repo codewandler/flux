@@ -2,7 +2,7 @@
 id: C-291
 title: "`channel webhook` — capture the raw body and verify a declared signature before parsing"
 pillar: Core
-status: in-progress
+status: done
 epic: verified-webhook-channel
 note: "the webhook channel authenticates with an optional STATIC BEARER TOKEN and has no signature path at all, so a vendor that signs its payloads and cannot send a custom Authorization header has no authenticated route into flux — and `Json<Value>` is an extractor, so there is no point in `handle` where the raw bytes still exist"
 ---

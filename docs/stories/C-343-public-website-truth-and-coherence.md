@@ -2,7 +2,7 @@
 id: C-343
 title: "Make the public website describe the product that actually ships"
 pillar: Core
-status: backlog
+status: done
 note: "Reconcile runtime, channel, security, language, SDK, and setup claims; repair the public information architecture and add drift guards"
 ---
 
@@ -21,7 +21,7 @@ product behavior as part of the copy edit.
 
 ## Acceptance
 
-- [ ] `public_runtime_story_matches_the_authored_loop_contract` fails first, then pins one canonical
+- [x] `public_runtime_story_matches_the_authored_loop_contract` fails first, then pins one canonical
       architecture description across the homepage, site metadata, `llms.txt` generator, Overview,
       Concepts, Infrastructure, saved-flow guidance, and related tutorial prose: models declare
       intent and make provider-native calls inside typed stages; authored Flux-Lang owns control
@@ -30,20 +30,20 @@ product behavior as part of the copy edit.
       `op.register` as the explicit analyzed, scoped, approval-gated seam where a model may propose
       one composite operation's source. Replace `architecture_v0.png`, whose
       `LLM / Planner -> typed Flux-Lang plan` and `plan -> match -> run_plan` path is no longer true.
-- [ ] The Channels section matches the registered surface and runtime: `connector` is documented and
+- [x] The Channels section matches the registered surface and runtime: `connector` is documented and
       linked from the sidebar; the inventory no longer says there are only six kinds; delivery is
       described as isolated, bounded concurrency (including its limit, backpressure, and shared-state
       caveat), not an ordered queue of one; and webhook input is described as parsed JSON rather than
       a verbatim body. `public_channel_inventory_covers_every_registered_kind` fails first and proves
       that the public inventory cannot silently omit another shipped kind.
-- [ ] Plain-language and technical security pages state the same guarantee without overclaiming it.
+- [x] Plain-language and technical security pages state the same guarantee without overclaiming it.
       In particular, distinguish manifest-scoped host callbacks from raw syscalls by trusted native
       plugins; distinguish host-injected auth, raw `secret`/`credential` materialization into trusted
       plugin code, and host-terminated `conn.authenticate`; state that OS confinement is opt-in for
       interactive use; describe every deliberate sandbox exemption; and stop claiming that the host
       stores only secret locations or that every stored token reaches the wire as a host-injected
       header. Repair the orphaned `fs` row in the plugin-capability table.
-- [ ] Configuration and installation guidance is executable and matches the shipped flags. The
+- [x] Configuration and installation guidance is executable and matches the shipped flags. The
       install path uses literal per-platform commands, actually puts `flux` on `PATH`, separates the
       convenience installer from attestation-verified manual extraction, and gives consistent update
       steps. `FLUX_ALLOW_ALL` is documented as filesystem-scope widening, never as `--yes`; the full
@@ -51,7 +51,7 @@ product behavior as part of the copy edit.
       the different interactive and unattended postures; and the troubleshooting state map includes
       credentials, endpoints, project-local state, and `--store` without saying that everything lives
       under `~/.flux`.
-- [ ] The language guide teaches the formatter's canonical syntax in its primary examples: bare
+- [x] The language guide teaches the formatter's canonical syntax in its primary examples: bare
       symbols, brace-free named arguments, named option headers, and duration units. Legacy spellings
       appear once as compatibility guidance rather than throughout the tour and reference. Invalid
       `//` comments and Rust raw strings in `ops.md` become valid Flux. The pure-data/control-flow
@@ -59,11 +59,11 @@ product behavior as part of the copy edit.
       template leaves, symbol rebinding, and the distinct `once` versus `checkpoint` keys.
       `public_flux_examples_are_canonical_formatter_fixed_points` fails first and checks fragments as
       well as complete declarations.
-- [ ] Generated language material is changed only at its source: update AST/prelude documentation and
+- [x] Generated language material is changed only at its source: update AST/prelude documentation and
       regenerate guarded website blocks where needed; do not hand-edit the generated node-kind or
       prelude tables. The Node reference says authors, SDK callers, and host tooling construct the AST,
       not a planner, and it no longer claims native bracket-path `jq` needs an `@json` escape.
-- [ ] Agent and SDK guides describe APIs and durability that exist. The Realtime dependency block and
+- [x] Agent and SDK guides describe APIs and durability that exist. The Realtime dependency block and
       Rust example compile against one released package set and do not promise an audio-input handle
       `run_voice_session` does not return. Agent Lab leads with an accurate replay-versus-check matrix,
       treats cost assertions as recorded-run cost, uses correct consumer feature commands, and states
@@ -73,26 +73,26 @@ product behavior as part of the copy edit.
       egress wording are consistent across their pages. Project-context guidance says that discovery
       starts at the exact launch/workspace directory and does not imply an upward repository-root
       search the implementation does not perform.
-- [ ] Versioned and directional claims are dated and explicit. A2A pages say Flux implements the
+- [x] Versioned and directional claims are dated and explicit. A2A pages say Flux implements the
       v0.3 contract rather than “the current spec” or universal peer compatibility, and link the
       versioned specification; the public Wasm page describes the portable model-free language core
       and CI parity that now exist while clearly naming the still-unbuilt host ABI, limits, and product
       surface. Remove internal story IDs from ordinary customer guidance; a Direction page may link a
       repository design record without making board bookkeeping part of the user explanation.
-- [ ] The public information architecture is simplified after a task-oriented pass: collapse the two
+- [x] The public information architecture is simplified after a task-oriented pass: collapse the two
       near-identical Overview navigation lists; keep the strong adaptive-turn -> authored-flow -> app
       tutorial progression; de-emphasize the on-hold Improvement loop instead of calling it co-equal
       on first-reader pages; group the twenty-page Agent section into discoverable subtopics; place
       setup, daily use, integrations, language, SDK, security, and reference in a defensible reading
       order; and remove or label duplicated guidance rather than maintaining two subtly different
       answers.
-- [ ] Site plumbing supports the improved prose: “Edit this page” opens GitHub's edit surface rather
+- [x] Site plumbing supports the improved prose: “Edit this page” opens GitHub's edit surface rather
       than the tree viewer; Markdown link failures are treated consistently with route/anchor
       failures; sidebar refs do not duplicate pages in `llms.txt`/`llms-full.txt`; mutable counts and
       plugin versions are generated or replaced with stable wording; and the customer changelog is
       edited only through `WHATS-NEW.md` plus its guarded website regeneration, never directly in the
       generated mirror.
-- [ ] Focused tests cover the high-risk drift seams above, every changed Rust/Flux example is compiled
+- [x] Focused tests cover the high-risk drift seams above, every changed Rust/Flux example is compiled
       or parsed by a real consumer, and `npm run build`, `cargo test -p flux-cli --test
       website_contract`, the guarded language website-sync tests, and the external-link workflow all
       pass. Purely subjective spelling/style normalization is limited to touched prose and follows one
@@ -105,6 +105,15 @@ product behavior as part of the copy edit.
   Docusaurus configuration, generated LLM-doc plugin, and current implementation seams in three
   parallel passes. `npm run build` is green: the defects below are semantic/editorial drift, not a
   currently broken route or anchor.
+- 2026-08-01 — reconciled all confirmed findings across 74 public pages and added failing-first
+  contracts for the authored runtime story, production channel inventory, and canonical Flux source.
+  The final corpus contains 125 parser/formatter-fixed-point Flux fences; the Docusaurus build emits
+  74 unique sidebar documents; and Lychee 0.24.2 reports 678/678 links healthy.
+- 2026-08-01 — verified `cargo build --workspace`, clippy with warnings denied, formatting,
+  `flux-codegate`, all 23 website contracts, both guarded language sync suites, and the production
+  site build. `cargo test --workspace` passed the C-343 suite and stopped only on the independently
+  introduced `flux-lsp` root-example census (16 current examples versus its committed expectation of
+  15); C-343 does not touch that example or test.
 
 ## Notes
 
