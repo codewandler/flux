@@ -69,7 +69,11 @@
 //!   it connects to the vetted addresses inside the guard — but the URL-returning guards hand back
 //!   only a `Url`, and a caller whose HTTP client re-resolves that hostname reopens the
 //!   DNS-rebinding TOCTOU. That is what [`net::guard_url_scoped_pinned`] is for: bind the client to
-//!   the addresses it returns.
+//!   the addresses it returns. The same one guard covers every IP [`net::DialTarget`] — TCP, UDP and
+//!   raw ICMP alike; a datagram target does not get a second, softer policy. Raw ICMP additionally
+//!   requires the privilege to open a raw socket (`CAP_NET_RAW` on Linux, root on macOS), refused at
+//!   construction and named in the error rather than discovered on the wire — see
+//!   [`net::SystemRawIcmp`].
 //! - **OS sandbox confinement where a backend is available.** [`sandbox::Backend::Bubblewrap`]
 //!   (Linux) / [`sandbox::Backend::Seatbelt`] (macOS), applied at the same single spawn choke point,
 //!   with [`sandbox::SandboxMode::Require`] refusing to spawn at all when no backend is usable.
