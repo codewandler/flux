@@ -1992,6 +1992,113 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-411 — an **in-memory** descriptor (the SDK's `load_tools`, a test fixture, any embedder
+    /// that builds one by hand) has no operator plugin store behind it, so there is nothing to
+    /// record the grant into and nothing to guard. It must still load — a refusal there would break
+    /// every embedder for a rule about a file they do not have — but it must say so, because the
+    /// next load is equally unguarded.
+    #[test]
+    fn an_in_memory_descriptor_reports_that_no_grant_could_be_recorded() {
+        let descriptor = PluginDescriptor {
+            program: "/bin/true".into(),
+            ..Default::default()
+        };
+        let declared = PluginCapabilities {
+            secrets: vec!["TOKEN".into()],
+            ..PluginCapabilities::default()
+        };
+        assert!(
+            matches!(
+                loading::adopt_capability_grant("p", &descriptor, &declared).unwrap(),
+                CapabilityGrant::NotRecorded(_)
+            ),
+            "no origin, no record — and no refusal either"
+        );
+
+        // But a descriptor that *does* carry a record is guarded whether it came from a file or not.
+        let pinned = PluginDescriptor {
+            capabilities: Some(GrantOfRecord(PluginCapabilities::default())),
+            ..descriptor
+        };
+        let err = loading::adopt_capability_grant("p", &pinned, &declared)
+            .expect_err("a widening beyond the recorded grant is refused");
+        assert!(err.to_string().contains("`secrets` gains `TOKEN`"), "{err}");
+    }
+
+    /// C-411 — a descriptor rewrite is not a re-grant. Every install/pin/rollback path funnels
+    /// through `add_descriptor`, so the carry-forward is asserted there rather than at each caller:
+    /// an upgrade that reset the grant of record would re-open exactly the widening this rule
+    /// closes, on the very path (`install`) the refusal message tells operators to use.
+    #[test]
+    fn a_descriptor_rewrite_carries_the_grant_of_record_forward() {
+        let dir = std::env::temp_dir().join(format!("flux-grant-carry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let granted = PluginCapabilities {
+            process: vec!["kubectl get".into()],
+            ..PluginCapabilities::default()
+        };
+        add_descriptor(
+            &dir,
+            "p",
+            &PluginDescriptor {
+                program: "/bin/true".into(),
+                version: Some("1.0.0".into()),
+                capabilities: Some(GrantOfRecord(granted.clone())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // An `install` onto a new version: a fresh descriptor that says nothing about capabilities.
+        add_descriptor(
+            &dir,
+            "p",
+            &PluginDescriptor {
+                program: "/bin/true".into(),
+                version: Some("2.0.0".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let stored = load_descriptor(&dir, "p").unwrap().expect("descriptor");
+        assert_eq!(stored.version.as_deref(), Some("2.0.0"), "the launch moved");
+        assert_eq!(
+            stored.capabilities,
+            Some(GrantOfRecord(granted)),
+            "the grant of record did not"
+        );
+        assert_eq!(
+            stored.origin.as_deref(),
+            Some(dir.join("p.toml").as_path()),
+            "a descriptor read from a store knows the file it came from"
+        );
+
+        // Uninstall is the deliberate re-grant: the record goes with the file.
+        assert!(remove_descriptor(&dir, "p").unwrap());
+        add_descriptor(
+            &dir,
+            "p",
+            &PluginDescriptor {
+                program: "/bin/true".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            load_descriptor(&dir, "p")
+                .unwrap()
+                .expect("descriptor")
+                .capabilities
+                .is_none(),
+            "uninstall clears the grant of record"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A plugin name with `..`, a path separator, or an absolute component must be rejected before
     /// any filesystem op — `remove_descriptor` is a destructive `remove_file`, so an escaped name
     /// would delete a file outside the plugins dir (D-35). One guard in `descriptor_path` covers

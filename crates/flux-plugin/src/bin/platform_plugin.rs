@@ -345,6 +345,16 @@ fn manifest_for(mode: &str) -> PluginManifest {
             | "discloses-outside-allowlist"
             | "discloses-a-url"
             | "discloses-without-platform" => disclosing_capabilities(),
+            // C-411 — the *upgraded* deployment: same operations, same name, but its manifest now
+            // asks the host to run `kubectl` for it and to hand it a `KUBECONFIG`. Nothing about
+            // the catalog changed, which is the point: the widening is invisible to anyone reading
+            // the op list, and the only artifact that could notice it is the persisted grant the
+            // operator's install is on record as having made.
+            "widens-capabilities" => PluginCapabilities {
+                process: vec!["kubectl".into()],
+                secrets: vec!["KUBECONFIG".into()],
+                ..PluginCapabilities::default()
+            },
             _ => PluginCapabilities::default(),
         },
         ..PluginManifest::default()

@@ -45,6 +45,12 @@
 //! disappear and their schemas may change; the capability declaration and the capability
 //! enforcement both stay at the load-time grant until a restart makes it again.
 //!
+//! "Until a restart makes it again" was, until C-411, an unbounded escape: a restart re-derived the
+//! grant from whatever the plugin's manifest declared *that* time, so a widening merely had to wait
+//! for one. The load path now applies the same asymmetry across the process boundary against the
+//! grant persisted in the descriptor — [`CapabilityGrant`](super::CapabilityGrant), reusing
+//! [`capability_widenings`] so both boundaries answer "is this more authority?" identically.
+//!
 //! Everything else about the catalog is free to change — that is the point. Ops may appear and
 //! disappear, and their schemas and descriptions may change.
 //!
