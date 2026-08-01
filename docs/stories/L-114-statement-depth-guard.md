@@ -2,8 +2,7 @@
 id: L-114
 title: "Statement-block nesting joins the L-81 depth guard (parser SIGABRT)"
 pillar: Language
-status: in-progress
-priority: 3
+status: done
 epic: flux-lang-hardening
 design: docs/designs/flux-lang-hardening.md
 areas: [flux-lang]

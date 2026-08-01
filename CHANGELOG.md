@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Deeply nested statement blocks no longer abort the process** (L-114). The depth guard covered
+  expressions and types only; block-owning statements recursed unbounded, so deep nesting killed the
+  process with a stack overflow rather than returning a parse error. Proven failing-first by three
+  genuine `SIGABRT`s at the merge base — `parse()`, the CST lowerer, and the WASM parity lane — plus
+  one assertion failure.
+  **The story's own headline was wrong, and measurement corrected it**: at the base `parse_cst`
+  alone *survives* 2,000 levels (253 ms, zero diagnostics — it just hands a 2,000-deep tree
+  downstream); `parse()` and `format_source()` are what abort, and the parser itself only goes over
+  at ~6,000. The lowerer, not the parser, fell first. So both are guarded: one cut at
+  `block_if_indented` covers every block-owning statement, and `cst_decode` gets its own
+  `MAX_LOWER_DEPTH` rather than trusting the parser's bound — necessary because `Parse` has public
+  fields, so a tree the parser never built can be handed to the lowerer. A compile-time assert keeps
+  the two ceilings from drifting into an order where a program the parser accepts fails to lower.
+  ⚠ The depth budget is **shared** between statements and expressions, because it is one stack: a
+  statement at block depth *d* leaves `128 − d` levels for its expressions. Measured against the real
+  corpus — deepest nesting in any shipped `.flux` file is **5**, and 4 across 301 fenced blocks in
+  the docs — so nothing real is within a factor of 25 of the ceiling.
+  Losslessness is preserved on every refusal path: the recovery loop drops only zero-width layout
+  markers, verified by a 4,000-case randomized indentation fuzz with zero lossy cases.
+
 - **Harness ingest's live session envelopes are bounded** (C-316). Ingest held one envelope per
   session for the whole scan, and a harness schema without session identity degenerates that to one
   per *message* — so retention scaled with transcript size rather than with session count. Proven by

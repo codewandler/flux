@@ -105,7 +105,6 @@ _`flux-system` has had exactly one consumer since it was written: flux. That is 
 
 ### flux-lang hardening — remediate the 2026-08-01 subsystem review
 _The 2026-08-01 adversarial subsystem review of `flux-lang`_
-- [L-114 — Statement-block nesting joins the L-81 depth guard (parser SIGABRT)](L-114-statement-depth-guard.md) · Language · Review F1, HIGH — ~200 nested when blocks (~9 KB on a 2 MiB stack) abort the process; the guard covers expressions/types only
 - [L-115 — Lower `each` headers from CST structure, not reconstructed text](L-115-each-lowering-from-cst.md) · Language · Review F2, HIGH — `each x in \"a->b\"` is a parse error and format emits un-reparseable output; header.split_once(\"->\") sees string content
 - [L-113 — flux-lang hardening — remediate the 2026-08-01 subsystem review (epic)](L-113-flux-lang-hardening-epic.md) · Language · EPIC — every finding of the 2026-08-01 flux-lang review owned: two parser totality bugs, interpreter budgets, confirm intents, mirror debt, fuzzing
 - [L-116 — `repeat` gets the loop budget discipline; budget scope is decided](L-116-repeat-and-loop-budgets.md) · Language · Review F3+F4, MEDIUM — repeat has no iteration budget/transcript cap/yield (timeout can never fire over a pure body); loop budgets are per-activation, doc says per-execution
@@ -1020,6 +1019,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-96 — Canonical control headers use call-like named options](L-96-canonical-named-option-headers.md) · Language · Complete L-93: emit `confirm \"…\", risk: medium` and consistent named options while accepting legacy space-keyword headers
 - [L-97 — Flux Glyph — an indented opcode projection for agents](L-97-flux-glyph-notation.md) · Language · F/= /^ /? /?= /?~ /| /|* /& /|| /?? /!? /!! /~= with `@{...}` as the raw-AST escape
 - [L-101 — Serialize a record as a form-encoded request body](L-101-form-urlencoded-body.md) · Language · authored Flux could build a JSON body and nothing else, so every OAuth2 token endpoint was unreachable
+- [L-114 — Statement-block nesting joins the L-81 depth guard (parser SIGABRT)](L-114-statement-depth-guard.md) · Language · Review F1, HIGH — ~200 nested when blocks (~9 KB on a 2 MiB stack) abort the process; the guard covers expressions/types only
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

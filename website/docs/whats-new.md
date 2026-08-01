@@ -12,6 +12,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Fixed
+
+- **Deeply nested code no longer crashes the tools that read it.** A Flux program with very deeply
+  nested blocks used to take the whole process down — the editor tooling and the formatter included —
+  instead of reporting an error. It now returns an ordinary "nesting too deep" message and keeps
+  going, and your source text is preserved exactly as written even in the part it refused. Nothing
+  you would plausibly write is affected: the limit sits about twenty-five times deeper than the most
+  deeply nested example that ships with flux.
+
 ### Improved
 
 - **A connector deployment can no longer hand flux one of your vendor credentials.** When a
