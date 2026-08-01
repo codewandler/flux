@@ -29,6 +29,33 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   visual cues. You can jump between failed actions with Ctrl-G, and a new empty session tells you when
   older sessions are available to resume.
 
+### Fixed
+
+- **Security: a webhook channel now checks who is calling before it reads what they sent.** If you
+  expose a webhook, flux authenticates the request first and only then decodes the body — and it
+  checks the signature against the exact bytes the sender signed, not a reformatted copy. Previously
+  a webhook channel had no way to verify a signature at all.
+
+- **Security: a credential that is only digits is now hidden in saved diagnostics too.** Several
+  places that scan saved data for registered credentials skipped plain numbers, and two of them also
+  skipped the *names* of fields — both write to storage that persists. All of them now look
+  everywhere. Ordinary numbers are untouched.
+
+- **A redaction that cannot be completed no longer hands back the original.** If hiding a credential
+  left a recorded request unreadable, the fallback returned the *unredacted* value. It now refuses
+  and stores a redaction marker instead.
+
+- **The limits you configure are now observed end to end when you run an app**, and a test that
+  claimed to check per-helper limits now says what it actually checks.
+
+### Action needed
+
+- **A webhook that listens beyond your own machine must now state its verification.** If it has a
+  token and no verification, add the line `verify "none"` to keep today's behaviour. flux refuses to
+  start otherwise, names the channel, and prints the exact line to add — rather than opening a port
+  whose protection you might have assumed. Webhooks that only listen on your own machine are
+  unaffected.
+
 ## [0.44.0] - 2026-07-31
 
 ## [0.43.0] - 2026-07-31
@@ -89,17 +116,6 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   an API echoes back to you — in a header or in the body — are still hidden.
 
 ### Fixed
-
-- **Security: a webhook channel now checks who is calling before it reads what they sent.** If you
-  expose a webhook, flux authenticates the request first and only then decodes the body — and it
-  checks the signature against the exact bytes the sender signed, not a reformatted copy. Previously
-  a webhook channel had no way to verify a signature at all.
-  **You may need to act:** a webhook that listens beyond your own machine must now say what it does
-  about verification. If it has a token and no verification, add the line `verify "none"` to keep
-  today's behaviour. flux refuses to start otherwise, names the channel, and prints the exact line to
-  add — rather than opening a port whose protection you might have assumed. Webhooks that only listen
-  on your own machine are unaffected.
-
 
 - **Security: a credential made only of digits is now hidden everywhere, including where it was
   slipping through.** flux hides credentials you have registered wherever they appear. But a
