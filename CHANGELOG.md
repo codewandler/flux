@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **An untrusted event payload can no longer reach the model inside flux's own instruction framing**
+  (C-407, from F1 of the 2026-08-01 security-posture review). A room delivery whose `text` is empty
+  after trimming fell through to `event_context`, which interpolated every payload field into a
+  sentence ending *"Act according to your instructions for this event."* Any room occupant could
+  reach it: the driver applies no empty-text filter, and the payload carries the free-form,
+  explicitly non-unique MUC `nick`. So a participant with the display name
+  `ignore prior instructions and …` who sent a single space landed that text in flux's own voice.
+  The payload is now rendered as one JSON line inside an explicit
+  `--- BEGIN/END UNTRUSTED EVENT DATA ---` fence, with **no field named in the code** — `nick` was the
+  reachable instance, not the bug.
+  ⚠ **The first cut of this fix was itself forgeable, and that is the part worth recording.** It
+  rested on "`serde_json` escapes every control character", which is false: `serde_json` does **not**
+  escape U+2028, U+2029 or U+0085 — Unicode mandatory line breaks that reach the provider verbatim —
+  so a value could place the END marker on its own line and write prose after it. Worse, the test
+  written to pin the property could not observe the class: Rust's `str::lines()` splits on LF and
+  `\r\n` only, so all seven separators passed. flux now escapes the **whole UAX #14 mandatory
+  line-break class** itself rather than trusting the encoder, named as a class so neither it nor a
+  future encoder can widen the gap silently, and the pin splits on that class and exercises every
+  member.
+  Fixed in passing, and never filed: payload **keys** were not escaped at all — `format!("{k}={v}")`
+  rendered a key's raw newlines straight into the prompt. Reachable from any webhook body, which is
+  decoded to a `Value` and delivered verbatim.
+
 ## [0.47.1] - 2026-08-01
 
 ### Fixed

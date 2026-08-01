@@ -2,8 +2,7 @@
 id: C-407
 title: "An attacker-chosen room nick reaches the model inside flux's own instruction framing"
 pillar: Core
-status: in-progress
-priority: 6
+status: done
 epic: meeting-rooms
 areas: [flux-app, flux-channels]
 note: "F1 of the 2026-08-01 security-posture review at 0.47.1. Reachable by any room occupant: a whitespace-only message falls through to `event_context`, which interpolates every payload field — including the free-form MUC `nick` — into a sentence ending \"Act according to your instructions for this event.\""
