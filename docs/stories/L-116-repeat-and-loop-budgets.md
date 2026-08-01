@@ -2,8 +2,7 @@
 id: L-116
 title: "`repeat` gets the loop budget discipline; budget scope is decided"
 pillar: Language
-status: in-progress
-priority: 8
+status: done
 epic: flux-lang-hardening
 design: docs/designs/flux-lang-hardening.md
 areas: [flux-lang, flux-flow]

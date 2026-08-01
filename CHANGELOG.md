@@ -6,6 +6,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **`repeat` gets the loop budget discipline, and the loop budget is now per flow execution**
+  (L-116). The `Repeat` arm carried none of the three protections `loop` had: no iteration budget, no
+  transcript cap, and — the sharper half — **no yield point**, so a pure-bodied `repeat` could never
+  be interrupted by an enclosing `timeout`. A timeout that cannot fire is worse than no timeout,
+  because callers rely on it. A wire-supplied AST that skipped `lower()` could carry `max: u32::MAX`.
+  Budget scope was documented as per-execution and was actually **per node activation**, so nested
+  loops multiplied: `repeat 400 { repeat 300 }` ran 120,000 rounds under a budget documented as
+  100,000. One `LoopBudget` is now created per execution and shared by `repeat`, `each` and `loop` at
+  every depth — enforcement rather than a corrected comment, since the alternative is documenting the
+  bug. It is a shared handle rather than a borrowed counter specifically so `parallel`/`race` branches
+  charge the *same* counter; forking it there would have reintroduced the multiplication one level up.
+  That sharing is now pinned by three tests whose branches fit individually under the ceiling and
+  exceed it only when they share, verified to fire by forking the budget and watching each fail with
+  its own diagnosis.
+  ⚠ **Stricter than before for nested loops**, and `each` now charges per element where it previously
+  had only an up-front fan-out check. Blast radius across the tree is nil — the largest `repeat` bound
+  anywhere is 50, and the built-in agent loop is unrolled into `when`-guarded statements before
+  execution, so it contains no `Repeat` node and charges nothing.
+  The analyzer's static ceiling is derived from the runtime constant rather than restating it, and a
+  compile-time assert ties the `each` fan-out ceiling to the loop budget, so the two cannot drift into
+  an order where an accepted source is rejected mid-iteration after side effects.
+  ⚠ Scope is bounded honestly: **inside flux-lang** a composite op call is the one boundary that
+  starts a fresh counter; at the engine level `task`, the `flux app` journey spawn and `flow_run` also
+  re-enter with fresh counters, bounded the same way by the outer budget. This is not a whole-process
+  ceiling and should not be read as one. The paths that execute a flow with no analyzer gate at all
+  are filed as L-123.
+
 ### Added
 
 - **An approval now discloses which vendor an operation reaches, when flux is not the one dialing**
