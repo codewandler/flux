@@ -41,6 +41,16 @@ const VENDOR_TOKEN: &str = concat!("xoxb", "-3141592653-2718281828-abcdefghijklm
 /// which is the case only the structural half of the contextual rule can reach.
 const UNMARKED_VENDOR_SECRET: &str = "wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY0";
 
+/// The **deployment's own session bearer** — the one secret flux does hold on this seam — echoed
+/// back inside a vendor response, where it has no business being (C-403).
+///
+/// Deliberately *shapeless*: no vendor prefix, and it is emitted as free prose inside a match
+/// `reason` rather than under a secret-naming property, so neither the prefix recogniser nor the
+/// contextual rule can see it. The **registered-value** pass is the only thing that can, which
+/// makes this the fixture mode that distinguishes a redactor carrying the session's registrations
+/// from a fresh one. Long enough to clear `MIN_REGISTERED_SECRET_LEN`.
+const SESSION_BEARER: &str = "connectors-session-bearer-0a1b2c3d4e5f";
+
 struct Platform;
 
 /// The mode file's current contents, or `honest` when no path was passed / the file is unreadable.
@@ -120,8 +130,31 @@ fn vendor_op() -> OperationSpec {
     }
 }
 
+/// The deployment's **endpoint-discovery** op (C-403).
+///
+/// A connector platform that also answers `endpoint.discover` is reached through the L5 endpoint
+/// broker's fan-out rather than through a projected tool — a second ingest surface for the same
+/// platform-sourced response. Declared `platform` for the same reason [`dispatch`] is: the
+/// deployment made the vendor call and holds the credential that made it possible.
+fn endpoint_discover() -> OperationSpec {
+    OperationSpec {
+        name: "endpoint.discover".into(),
+        description: "Discover product endpoints known to the deployment".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"product": {"type": "string"}},
+            "required": []
+        }),
+        effects: vec![Effect::Read],
+        risk: Some(Risk::Low),
+        idempotency: Some(Idempotency::Idempotent),
+        platform: PlatformSourcing::Operation,
+        ..OperationSpec::default()
+    }
+}
+
 fn manifest_for(mode: &str) -> PluginManifest {
-    let operations = match mode {
+    let mut operations = match mode {
         // After the operator authenticates the vendor inside the deployment, a new op appears.
         "grown" => vec![activate(), dispatch(), echo(), vendor_op()],
         // The self-contradicting manifest: platform-sourced AND asking flux to resolve a secret.
@@ -146,10 +179,25 @@ fn manifest_for(mode: &str) -> PluginManifest {
         ],
         _ => vec![activate(), dispatch(), echo()],
     };
+    // The discovery op is present in every mode, so the broker's fan-out reaches the same fixture
+    // the projected-tool tests drive. `local-discover` is the control: the same op, the same leak,
+    // and NO `platform` declaration — the boundary must leave it alone, exactly as `echo` shows on
+    // the projected-tool path.
+    operations.push(if mode == "local-discover" {
+        OperationSpec {
+            platform: PlatformSourcing::None,
+            ..endpoint_discover()
+        }
+    } else {
+        endpoint_discover()
+    });
     PluginManifest {
         name: "platform".into(),
         version: "0.1.0".into(),
         operations,
+        // The products this deployment claims to discover endpoints for — what makes the broker
+        // fan a `zendesk` query out to it.
+        discovers: vec!["zendesk".into()],
         // Deliberately empty: on this seam the deployment holds the credentials and dials the
         // vendor, so flux grants the plugin nothing beyond being a subprocess it may call.
         capabilities: PluginCapabilities::default(),
@@ -221,6 +269,63 @@ impl PluginHandler for Platform {
                 _ => json!({
                     "ticket": { "id": 4711, "subject": text, "status": "open" },
                     "url": "https://example.zendesk.com/api/v2/tickets/4711.json",
+                }),
+            }),
+            // The broker's fan-out surface (C-403). A candidate is supposed to be a *weak*
+            // reference — a URL plus the LOCATION of a credential — so every leak mode here puts
+            // the value where a weak reference has no business carrying one.
+            "endpoint.discover" => Ok(match mode.as_str() {
+                // The credential in a match reason, which is audit/explanation text the operator
+                // and the model both see.
+                "leak-discover" | "local-discover" => json!({
+                    "candidates": [{
+                        "id": "@endpoint/platform-zendesk",
+                        "url": "https://example.zendesk.com",
+                        "product": "zendesk",
+                        "source": "discovered",
+                        "score": 0.9,
+                        "reasons": [format!("reached via Authorization: Bearer {VENDOR_TOKEN}")],
+                    }]
+                }),
+                // The same leak with no vendor spelling on the value: only the label's name says
+                // what it is.
+                "leak-discover-unmarked" => json!({
+                    "candidates": [{
+                        "id": "@endpoint/platform-zendesk",
+                        "url": "https://example.zendesk.com",
+                        "product": "zendesk",
+                        "source": "discovered",
+                        "score": 0.9,
+                        "labels": { "api_token": UNMARKED_VENDOR_SECRET },
+                    }]
+                }),
+                // The deployment's own session bearer, echoed back as free prose. Invisible to
+                // every shape heuristic — only a redactor that has it registered can refuse this.
+                "leak-discover-bearer" => json!({
+                    "candidates": [{
+                        "id": "@endpoint/platform-zendesk",
+                        "url": "https://example.zendesk.com",
+                        "product": "zendesk",
+                        "source": "discovered",
+                        "score": 0.9,
+                        "reasons": [format!("matched on session {SESSION_BEARER}")],
+                    }]
+                }),
+                // The failure path is an ingest surface on this seam too.
+                "leak-discover-error" => {
+                    return Err(format!(
+                        "the deployment refused discovery: token {VENDOR_TOKEN} expired"
+                    ))
+                }
+                _ => json!({
+                    "candidates": [{
+                        "id": "@endpoint/platform-zendesk",
+                        "url": "https://example.zendesk.com",
+                        "product": "zendesk",
+                        "source": "discovered",
+                        "score": 0.9,
+                        "reasons": ["the deployment has a connector for this product"],
+                    }]
                 }),
             }),
             // Not platform-sourced: whatever it is handed comes back. The boundary must not touch

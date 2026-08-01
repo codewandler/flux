@@ -10,6 +10,12 @@
 //! Provider `endpoint.discover` ops are read-only by contract: this is a discovery/query path, so the
 //! broker only ever calls the `endpoint.discover` op — never an effectful one.
 //!
+//! **This module is a plugin-response ingest surface** (C-403). Both `call_with_host` calls below
+//! take a response authored outside flux's jail, so C-312's credential boundary applies here as much
+//! as it does on the projected-tool path — with one deliberate asymmetry, recorded at each call
+//! site: `endpoint.discover` is checked, `secret.read` is not, because returning credential material
+//! to host code is the latter's entire purpose.
+//!
 //! Layering: this is L5 (it owns the registry), driving L4 plugin hosts (`flux-plugin`) through the
 //! same guarded [`HostCapabilities`] the plugin's tools run under — the [`DatasourceHostCaps`]
 //! precedent.
@@ -23,24 +29,36 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use flux_plugin::{HostCapabilities, PluginHost, PluginManifest, ReferenceResolver};
+use flux_plugin::{
+    credential_boundary, HostCapabilities, OperationSpec, PluginHost, PluginManifest,
+    ReferenceResolver,
+};
 use flux_secret::endpoint::{EndpointCandidate, EndpointRecord, ResolvedEndpoint};
-use flux_secret::{Kind, Material, Ref, Scheme};
+use flux_secret::{Kind, Material, Redactor, Ref, Scheme};
 
 use super::{EndpointRegistry, StaticResolver};
 
-/// Resolve the actual op name a provider advertises for the bare `suffix` (`endpoint.discover` /
-/// `secret.read`). flux plugins NAMESPACE their ops (the kubernetes plugin's ops are
-/// `kubernetes.endpoint.discover`, `kubernetes.secret.read`), so a cross-plugin call must address the
-/// provider's *real* op name, not the bare one. Pick the op whose name equals `suffix` or ends with
-/// `.<suffix>`; `None` when the provider advertises no such op.
-fn resolve_op_name(manifest: &PluginManifest, suffix: &str) -> Option<String> {
+/// Resolve the actual **operation** a provider advertises for the bare `suffix`
+/// (`endpoint.discover` / `secret.read`). flux plugins NAMESPACE their ops (the kubernetes plugin's
+/// ops are `kubernetes.endpoint.discover`, `kubernetes.secret.read`), so a cross-plugin call must
+/// address the provider's *real* op name, not the bare one. Pick the op whose name equals `suffix`
+/// or ends with `.<suffix>`; `None` when the provider advertises no such op.
+///
+/// The whole spec rather than the name (C-403): the credential boundary is keyed on the op's
+/// `platform` declaration, and re-finding the spec by name after resolving it would introduce a
+/// "declaration not found" branch that cannot be reached and therefore cannot be tested — the shape
+/// a fail-open hides in.
+fn resolve_op<'a>(manifest: &'a PluginManifest, suffix: &str) -> Option<&'a OperationSpec> {
     let dotted = format!(".{suffix}");
     manifest
         .operations
         .iter()
-        .map(|o| o.name.clone())
-        .find(|n| n == suffix || n.ends_with(&dotted))
+        .find(|o| o.name == suffix || o.name.ends_with(&dotted))
+}
+
+/// [`resolve_op`]'s name, for callers that only need to address the op.
+fn resolve_op_name(manifest: &PluginManifest, suffix: &str) -> Option<String> {
+    resolve_op(manifest, suffix).map(|o| o.name.clone())
 }
 
 /// Extract `cluster=<x>` / `namespace=<y>` tokens from a free-text `query` so a caller who wrote
@@ -166,12 +184,33 @@ pub trait ProviderInvoker: Send + Sync {
 /// real plugin host's `endpoint.discover` op under the provider's own guarded capabilities.
 pub struct HostProviderInvoker {
     registry: Arc<PluginRegistry>,
+    /// The redactor the C-312 credential boundary is evaluated against (C-403).
+    ///
+    /// Defaults to a fresh one, which is the **weaker** half of the check: shape-based material is
+    /// still caught, but the registered-value pass — the only thing that can recognise a connector
+    /// deployment's own session bearer coming back — cannot fire, because a fresh redactor has
+    /// nothing registered. Surfaces that own a session redactor install it with
+    /// [`with_redactor`](Self::with_redactor); `flux-cli`'s integration assembly does. Same
+    /// trade-off, and the same reason, as `flux plugin call`'s fresh redactor.
+    redactor: Redactor,
 }
 
 impl HostProviderInvoker {
     /// Drive providers registered in `registry`.
     pub fn new(registry: Arc<PluginRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            redactor: Redactor::new(),
+        }
+    }
+
+    /// Evaluate the credential boundary against the session's redactor rather than a fresh one.
+    ///
+    /// [`Redactor`] is a handle onto a shared store, so a clone sees every value the session
+    /// registers later — including a credential materialized mid-run.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 }
 
@@ -190,10 +229,16 @@ impl ProviderInvoker for HostProviderInvoker {
             .registry
             .get(name)
             .ok_or_else(|| format!("no such provider `{name}`"))?;
-        // Resolve the provider's ACTUAL op name (plugins namespace their ops, e.g.
+        // Resolve the provider's ACTUAL op (plugins namespace their ops, e.g.
         // `kubernetes.endpoint.discover`); a bare `endpoint.discover` call would not match.
-        let op = resolve_op_name(&entry.manifest, "endpoint.discover")
+        let spec = resolve_op(&entry.manifest, "endpoint.discover")
             .ok_or_else(|| format!("provider `{name}` advertises no `endpoint.discover` op"))?;
+        let op = spec.name.clone();
+        // C-403 — the op's C-312 credential-boundary declaration. Read here so the check below is
+        // keyed on the same `platform` field the projected-tool path and `flux plugin call` read;
+        // a no-op (`PlatformSourcing::None`) for every discovery provider that ships today,
+        // including `kubernetes.endpoint.discover`.
+        let platform = spec.platform;
         let payload = json!({
             "product": product,
             "query": query,
@@ -205,8 +250,34 @@ impl ProviderInvoker for HostProviderInvoker {
             let mut host = entry.host.lock().await;
             host.call_with_host(&op, payload, entry.caps.as_ref())
                 .await
-                .map_err(|e| e.to_string())?
+                // The `err` frame is the same ingest surface as the `result` frame: a deployment
+                // answering with a raw vendor 401 body would otherwise put whatever it carries into
+                // the broker's skipped-provider diagnostic.
+                .map_err(|e| {
+                    credential_boundary::scrub_error(
+                        platform,
+                        name,
+                        &op,
+                        e.to_string(),
+                        &self.redactor,
+                    )
+                })?
         };
+        // C-403 — the credential boundary, at INGEST, on the SECOND path that reaches
+        // `call_with_host`. C-312 installed this check on the projected-tool path and on
+        // `flux plugin call`; the broker's fan-out is a third caller, and a boundary whose written
+        // scope is wider than its enforcement decays into a real hole at the next refactor.
+        //
+        // Refusal discards the whole candidate list rather than scrubbing one field: candidates are
+        // committed to the endpoint registry (which persists to `~/.flux/endpoints.toml`) and their
+        // `reasons`/`labels` are model-visible, so a sanitised-and-forwarded list would say the
+        // deployment behaved when it did not. `EndpointBroker::discover` logs and skips a provider
+        // error, so one refused provider never fails the whole query.
+        if let Some(refusal) =
+            credential_boundary::refuse_response(platform, name, &op, &result, &self.redactor)
+        {
+            return Err(refusal);
+        }
         let candidates: Vec<EndpointCandidate> =
             serde_json::from_value(result.get("candidates").cloned().unwrap_or(Value::Null))
                 .map_err(|e| {
@@ -306,6 +377,33 @@ impl CredentialReader for HostCredentialReader {
         let op = resolve_op_name(&entry.manifest, "secret.read").ok_or_else(|| {
             format!("provider `{provider}` advertises no `secret.read` op to resolve `{reference}`")
         })?;
+        // C-403 — **the credential boundary deliberately does NOT run here, and must not.**
+        //
+        // Its sibling call site (`HostProviderInvoker::discover`, above) refuses a response that
+        // carries credential material. `secret.read` is the one op whose entire *purpose* is to
+        // return credential material: it is how a discovered endpoint's `credential_ref` becomes a
+        // usable value. Refusing a credential-shaped response here would refuse every credential
+        // this path exists to resolve — the check would fire on success and pass on failure, which
+        // is a boundary with its polarity inverted, not a stricter one.
+        //
+        // What keeps this honest is not a shape check but the disposition of the value: it is
+        // returned as `Material` to `resolve_credential_for`, which is deny-by-default (an operator
+        // `CrossPluginGrants` entry plus, when installed, a first-use approval), audited by
+        // location only, and hands the value to host code and the redactor — never to a tool
+        // result, a transcript or the endpoint registry. A weak `EndpointRef` never carries it.
+        //
+        // If you arrived here to make the RESULT frame symmetrical with `discover`: don't. Tighten
+        // `resolve_credential_for`'s gate instead.
+        //
+        // **The error frame is a different question, and the argument above does not cover it.** A
+        // vendor 401 body is not "the credential material this op exists to return" — it is the
+        // same out-of-jail text `discover` runs `scrub_error` over, and it lands in the string
+        // `resolve_credential_for` propagates. It is left unscrubbed here only because doing so
+        // would be unobservable: `scrub_error` no-ops unless the op declares `platform`, and no op
+        // in the tree declares `platform` on a `secret.read` (nor is one a coherent thing to ship —
+        // a platform-sourced op by definition does not hand flux credentials). If one ever appears,
+        // wrap this `map_err` in `credential_boundary::scrub_error`, which needs a redactor on
+        // `HostCredentialReader` that it does not have today. That is the whole change.
         let result = {
             let mut host = entry.host.lock().await;
             host.call_with_host(&op, payload, entry.caps.as_ref())
