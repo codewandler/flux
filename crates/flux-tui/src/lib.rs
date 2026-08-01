@@ -1123,6 +1123,7 @@ impl ChatState {
             ctrl_c_armed_at: None,
             panes: PaneStore::default(),
             pane_queue: None,
+            panes_overflowing: false,
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
         }
@@ -1153,12 +1154,45 @@ impl ChatState {
         let Some(queue) = self.pane_queue.clone() else {
             return 0;
         };
-        let commands = queue.drain();
-        let applied = commands.len();
-        for command in commands {
+        let drained = queue.drain();
+        let applied = drained.commands.len();
+        for command in drained.commands {
             self.apply_pane_command(command);
         }
+        self.report_dropped_panes(drained.dropped);
         applied
+    }
+
+    /// Put a full pane channel in front of the operator (C-324).
+    ///
+    /// The drop itself happens in [`crate::panes::PaneQueue`] and cannot be reported back to the
+    /// caller: that seam is send-only by construction, so `emit` has no return channel to answer
+    /// through — not because the `pane.*` op has finished (it has not; the call is synchronous).
+    /// This is the one place that both knows a command was refused and has somewhere to say it, so
+    /// the operator is told here rather than nowhere. The model is told nothing, and this surface
+    /// gives it no way to check either — see the reasoning at the drop site, and C-306.
+    ///
+    /// **Edge-triggered on purpose.** An overflow is a condition, not an event: a caller flooding
+    /// the channel would otherwise earn a notice on every 62 ms frame and bury the transcript under
+    /// the very symptom it is describing. The operator is told when the channel starts refusing and
+    /// again only after it has recovered — so `dropped` here is *this drain's* count, not a running
+    /// total, and the notice says so rather than implying otherwise.
+    fn report_dropped_panes(&mut self, dropped: usize) {
+        if dropped == 0 {
+            self.panes_overflowing = false;
+            return;
+        }
+        if std::mem::replace(&mut self.panes_overflowing, true) {
+            return;
+        }
+        self.push(Entry::Notice {
+            text: format!(
+                "pane channel full — {dropped} pane command(s) dropped in this frame, and more \
+                 will be for as long as it stays full. The agent's op reported success, so a pane \
+                 it believes is open may not be on screen."
+            ),
+            sev: Sev::Warn,
+        });
     }
 
     /// Every pane currently open, each labelled with who owns it (C-224).

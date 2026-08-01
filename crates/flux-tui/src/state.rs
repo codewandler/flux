@@ -134,6 +134,10 @@ pub struct ChatState {
     /// another task, while the store may only be touched by the event loop that draws it.
     /// [`ChatState::apply_pending_panes`] is the one crossing point.
     pub(super) pane_queue: Option<Arc<crate::panes::PaneQueue>>,
+    /// Whether the last drain of [`ChatState::pane_queue`] found the channel refusing commands
+    /// (C-324) — the edge [`ChatState::report_dropped_panes`] triggers on, so a sustained overflow
+    /// costs the transcript one notice rather than one per frame.
+    pub(super) panes_overflowing: bool,
     /// The live sub-agent fleet (C-224), folded from A-79's `subagent.activity` stream by
     /// [`crate::fleet::FleetProjection`]. This is the state; [`ChatState::fleet_rows`] is its
     /// resolution against a particular `now`.
