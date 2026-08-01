@@ -57,6 +57,26 @@ All notable changes to this project are documented in this file. The format is b
   verify the number — a harness that hardcodes an RMS passes, which is why a genuine in-page
   measurement is D-232's contract.
 
+- **UDP and raw ICMP dial targets, under the one egress guard** (C-396). `flux-system`'s
+  `net::DialTarget` gains datagram and raw variants; all three IP variants route through the existing
+  `guard_target_host_pinned` rather than re-deriving a second guard, and the destination is vetted once
+  and then `connect`ed, so the kernel enforces both the send destination and the reply source.
+  An unheld `CAP_NET_RAW` refuses **at construction** — a capability check that happens on the wire has
+  already contacted the destination — and the refusal names the capability. TCP's inline empty-answer
+  check moved into the shared helper so the spellings cannot drift.
+  ⚠ **BREAKING for `codewandler-flux-system`**: `DialTarget` is a public, non-`#[non_exhaustive]` enum,
+  so downstream exhaustive matches break. Under the pre-1.0 rule this obliges a **MINOR** bump, and
+  `scripts/check-crate-versions.sh` is structurally blind to it — the `!` in the commit title and the
+  `BREAKING:` body line are the only machine-readable signal.
+  **What the review caught that the gate could not.** The first cut created the raw socket and set
+  `FD_CLOEXEC` in a following `fcntl`, leaving a window in which a `fork`+`exec` on any other thread
+  inherits a raw network socket that traversed no grant — under a comment already asserting the
+  property it did not deliver. Now close-on-exec is requested **atomically at creation** via
+  `SOCK_CLOEXEC` where the platform has it; the `fcntl` is retained because Apple has none, where it
+  narrows the window but cannot close it, and the code says so. ⚠ That regression is **not** pinnable
+  at runtime — once `open` returns the fd is close-on-exec either way, and racing a spawn would be
+  flaky — so the atomicity itself is guarded at the source level instead.
+
 ### Changed
 
 - ⚠ **A room agent now answers only when addressed** (D-207). `address_rule` was carried but never
@@ -105,29 +125,8 @@ All notable changes to this project are documented in this file. The format is b
   decision — and a parked ask has no correlation id, so a different principal can deliver the reply
   that resumes another's park. Both pre-date this change and each wants its own story.
 
-### Added
-
-- **UDP and raw ICMP dial targets, under the one egress guard** (C-396). `flux-system`'s
-  `net::DialTarget` gains datagram and raw variants; all three IP variants route through the existing
-  `guard_target_host_pinned` rather than re-deriving a second guard, and the destination is vetted once
-  and then `connect`ed, so the kernel enforces both the send destination and the reply source.
-  An unheld `CAP_NET_RAW` refuses **at construction** — a capability check that happens on the wire has
-  already contacted the destination — and the refusal names the capability. TCP's inline empty-answer
-  check moved into the shared helper so the spellings cannot drift.
-  ⚠ **BREAKING for `codewandler-flux-system`**: `DialTarget` is a public, non-`#[non_exhaustive]` enum,
-  so downstream exhaustive matches break. Under the pre-1.0 rule this obliges a **MINOR** bump, and
-  `scripts/check-crate-versions.sh` is structurally blind to it — the `!` in the commit title and the
-  `BREAKING:` body line are the only machine-readable signal.
-  **What the review caught that the gate could not.** The first cut created the raw socket and set
-  `FD_CLOEXEC` in a following `fcntl`, leaving a window in which a `fork`+`exec` on any other thread
-  inherits a raw network socket that traversed no grant — under a comment already asserting the
-  property it did not deliver. Now close-on-exec is requested **atomically at creation** via
-  `SOCK_CLOEXEC` where the platform has it; the `fcntl` is retained because Apple has none, where it
-  narrows the window but cannot close it, and the code says so. ⚠ That regression is **not** pinnable
-  at runtime — once `open` returns the fd is close-on-exec either way, and racing a spawn would be
-  flaky — so the atomicity itself is guarded at the source level instead.
-
 ## [0.48.0] - 2026-08-01
+
 
 ### Added
 
