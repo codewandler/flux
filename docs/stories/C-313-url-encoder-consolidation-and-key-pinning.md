@@ -3,8 +3,7 @@ id: C-313
 title: "The fifth encoder copy, and the query key nothing pins"
 pillar: Core
 epic: road-to-stable
-status: in-progress
-priority: 14
+status: done
 areas: [flux-web]
 note: "filed from C-303's review, not from planning — the shared RFC 3986 encoder landed and two crates were converted, but flux-plugin kept a byte-identical private copy while the design doc claims the tree has one encoder; separately, no test observes that the query KEY is encoded"
 ---

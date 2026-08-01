@@ -8,6 +8,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The query *key* is now pinned as percent-encoded, and the last private encoder in the root
+  workspace is gone** (C-313). Both loose ends from C-303's review. The key-encoding line was
+  correct but unobserved: mutating `append_query` to emit the raw key left **80 of 81**
+  `codewandler-flux-web` tests green, so nothing in the crate could see a smuggled `?q&injected=1=…`
+  parameter. That is a mutation proof rather than a merge-base proof — the code was already right,
+  and the finding was that no test observed it.
+  `flux-plugin`'s byte-identical private RFC 3986 copy now delegates to
+  `flux_core::percent_encode_component`, which moves the call site from a copy with zero tests onto
+  one with four. No manifest change was needed — the `flux-core` dependency was already in scope
+  under the `host` feature.
+  ⚠ **The design doc's "one encoder for the whole tree" was false and is now scoped honestly.** A
+  census found the root workspace consolidated but **twelve further copies in the nested `plugins/`
+  workspace**, which structurally cannot delegate: it is excluded from the root, nothing there
+  depends on `flux-core`, and `host-kit` exposes no encoder. **One has already drifted** —
+  `plugins/gitlab`'s omits `~` from the unreserved set, emitting `%7E` where the other eleven emit
+  `~`. Filed as C-405; the fix is a shared encoder in `host-kit`, which is a protocol-line change
+  owing a pack release.
+
 - **The credential boundary now covers the endpoint broker's discovery path** (C-403). C-312 put the
   boundary on the projected-tool path and `flux plugin call`; the broker reached `call_with_host`
   twice with no check on the result. Proven by a test where the credential arrives through the broker
