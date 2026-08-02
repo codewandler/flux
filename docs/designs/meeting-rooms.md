@@ -438,15 +438,38 @@ to get audio a human could hear, and it is the checklist to run **before** a cal
    publish audio at all. Say it because it is true, not to get past the check.
 6. **Probe before you trust it.** Answer `{"cmd":"level"}` with a real in-page RMS measurement of the
    *published* track. Audible measured ≈`0.12`; silence measured `0.0004`; the floor is `0.01`.
-7. **Expect a cleared environment.** flux spawns the sidecar argv-only, cwd-pinned, with the environment
-   cleared to a minimal allow-list — `DISPLAY`, `XDG_RUNTIME_DIR`, `PULSE_SERVER` and friends **do not**
-   reach it. `HOME`, `USER`, `PATH`, `TMPDIR` do. Pass anything else in argv, which flux never interprets:
+7. **Expect a cleared environment — and know that argv alone is not enough.** flux spawns the sidecar
+   argv-only, cwd-pinned, with the environment cleared to a minimal allow-list; `DISPLAY`,
+   `XDG_RUNTIME_DIR`, `PULSE_SERVER` and friends **do not** reach it, while `HOME`, `USER`, `PATH` and
+   `TMPDIR` do. So the audio server rides in argv, which flux never interprets:
    `media { sidecar ["flux-room-media", "--audio-server", "unix:/run/user/1000/pulse/native"] }`.
-8. **Mind the sandbox.** flux confines subprocesses through bubblewrap when a backend is available, and
-   Chrome's own content sandbox needs a nested user namespace inside it (the reason `spawn_debug_pipe` is
-   the browser exemption for tier-3 browsing). A room-media sidecar spawned `Sandboxed` may need
-   `FLUX_SANDBOX=off` for the flux process, or its own `--no-sandbox` posture, and **that trade-off has
-   not been exercised against a live call yet.**
+
+   ⚠ **Measured 2026-08-02 (D-232): that is necessary but not sufficient.** `bubblewrap_argv` masks
+   `/run` with `--tmpfs /run` — deliberately, since that is what keeps `docker.sock` and D-Bus
+   unreachable — and the pulse socket lives at `/run/user/<uid>/pulse/native`. Inside the sandbox
+   `pactl --server=unix:/run/user/1000/pulse/native info` fails `Connection refused` while succeeding
+   outside it, so the path is right and the file is simply not there. The operator must **also** grant
+   the socket's directory as a writable sandbox path, which re-exposes it past the mask:
+
+   ```toml
+   [sandbox]
+   writable = ["/run/user/1000/pulse"]
+   ```
+
+   Both halves or no audio, and the argv-only half is the silent-failure trap: the sidecar starts, the
+   handshake succeeds, and only the level probe tells you anything is wrong. **No env passthrough was
+   added to `flux-system`** and none is needed — the sidecar re-exports `PULSE_SERVER`/`XDG_RUNTIME_DIR`
+   into *Chrome's* environment, a child it owns, rather than asking flux for new public API.
+8. **The sandbox is fine — Chrome does not need `--no-sandbox`.** ✅ **Measured 2026-08-02 (D-232),
+   inside the exact argv `bubblewrap_argv` builds:** `--headless=new --dump-dom` rendered a page and
+   exited 0, `unshare -U -r true` succeeded inside the sandbox (so a nested user namespace is creatable
+   and Chrome's content sandbox has what it needs), and the full in-page level probe returned the same
+   number sandboxed as unsandboxed (`rms 0.3550` for a 0.5-amplitude tone). Chrome prints a wall of
+   D-Bus errors because `/run` is masked; they are noise, not failure. So `Confinement::Sandboxed`
+   stands, **no new `Confinement::Exempt` seam is needed**, and `FLUX_SANDBOX=off` is not required. The
+   sidecar keeps a `--no-sandbox` flag for hosts that refuse namespace nesting, off by default —
+   forcing it would trade Chrome's purpose-built sandbox for a weaker generic one, the same trade
+   `spawn_debug_pipe` declines.
 
 ## Multi-party is the design problem; the plumbing is the easy half
 
@@ -541,12 +564,25 @@ This is where the repo's fail-closed doctrine bites, and where the spike's own s
    sidecar that does not claim `owns_device_routing` may not publish audio, and both arms are driven over
    the real wire in `crates/flux-channels/tests/room_media.rs` —
    `a_published_track_that_carries_silence_fails_the_probe` scripts exactly the spike's shape: publish
-   returns `ok`, mute reads `false`, and the probe reads `0.0004`. What is **not** met is the other side
-   of the contract: **no test in this repository has ever measured a real browser publishing real audio**,
-   because a sidecar's probe number is whatever the sidecar says it is. The check is only worth the
-   honesty of the in-page RMS measurement behind it, and that has to be verified on a live call before
-   this invariant can be called met. Same for invariant 5 (self-announcement), which the media plane does
-   not yet do.
+   returns `ok`, mute reads `false`, and the probe reads `0.0004`.
+
+   **D-232 closed the measurement half, and the last gap is now a room rather than a number.** The
+   shipped harness (`crates/flux-channels/assets/room-media/`) measures a **real `MediaStreamTrack`**:
+   `page.js` builds the outbound track as `AudioContext → MediaStreamDestination` and probes it by
+   re-wrapping *the published track* as a fresh `MediaStreamSource` into an `AnalyserNode` on a second
+   context, so the measurement path shares nothing with the publish path but the track itself. Against
+   real Chrome 150 that reads `rms 0.3550` for a 0.5-amplitude tone (analytic `0.3536`) and `0.0000` for
+   silence — including inside flux's bubblewrap policy. Two properties make this checkable rather than
+   claimed: the probe was observed **lagging one chunk behind** the amplitude just pushed (a probe
+   echoing its input would track instantly), and the arithmetic lives in `measure.js`, loaded by *both*
+   the page and `tests/room_media_harness.rs`, whose analytic table (`a/√2` for amplitudes
+   `1.0…0.0`) no constant-returning probe can satisfy.
+
+   ⚠ **Still not met: the room.** Nothing has joined a live call, so `page.js::join` — the
+   `lib-jitsi-meet` connection, the `JitsiLocalTrack` wrap of a synthesized stream, and whether the
+   bridge accepts it — is code-reviewed and unexercised, and **no human has confirmed hearing audio**.
+   Every browser-dependent test is `#[ignore]`d (CI has no browser and no network) with its by-hand
+   command recorded. Same for invariant 5 (self-announcement), which the media plane still does not do.
 
 ## Open questions
 
