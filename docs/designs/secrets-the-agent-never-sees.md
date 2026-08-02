@@ -51,10 +51,12 @@ without needing anything from Anthropic.
 - ⚠ **A secret scoped to where it may go.** `networking.allowed_hosts` — *"controls which outbound hosts
   the secret can be substituted for… prevents your key from ever being shared with unauthorized hosts."*
   flux guards egress **per caller**, never per secret: once `resolve_in` has run, a flux secret can
-  travel anywhere the egress guard already permits.
+  travel anywhere the egress guard already permits. *(C-459 closed this on the `http.request` path; the
+  `resolve_in` sentence still stands for program-declared secrets.)*
 - ⚠ **A secret scoped to where in the request it lands.** `injection_location` — header, body, or both,
   with the reasoning: *"Request payloads are often assembled from content the agent is working with, so
-  the request body is the broader exposure surface."*
+  the request body is the broader exposure surface."* *(C-459: flux has no body-injection path at all,
+  so it scopes header vs query instead — see below.)*
 - **Rotation and revocation reaching a running session**: *"credentials are re-resolved periodically…
   rotation, archival, or deletion propagates to running sessions without a restart."*
 - **Archive versus delete**: *"Secrets are purged; records are retained for auditing."*
@@ -97,11 +99,38 @@ the natural splice point — but `flux-providers`, `flux-a2a`, `flux-channels`' 
 `flux-auth` each build their own `reqwest` client. Model-facing egress is the only part that needs this,
 which makes the scope tractable; it is still a prerequisite, not a detail.
 
-### C-459 — scope a secret
+### C-459 — scope a secret · **shipped**
 
-Two axes flux has nothing for: **which destinations** a secret may be sent to, and **which principal**
-may cause it to be used. The second is newly available — C-408 and C-415 established per-speaker
-`TurnIdentity`, so a secret bound to a principal is now expressible where it was not before.
+Two axes flux had nothing for: **which destinations** a secret may be sent to, and **which principal**
+may cause it to be used. The second was newly available — C-408 and C-415 established per-speaker
+`TurnIdentity`, so a secret bound to a principal became expressible where it was not before.
+
+`flux_system::secret_scope` is the mechanism, deliberately co-located with the egress guard rather than
+with `flux-secret`, because the security content of a destination scope is *which address was vetted*,
+not *which string was typed*. `Destination::vetted` takes the guard's own `(Url, Vec<SocketAddr>)` pair
+and refuses an empty pin set, so there is no way to match a scope against a hostname nobody resolved —
+the bypass that would otherwise make the whole feature decorative. A grant is written as
+`NAME;to=<host>;by=<principal>;in=header|query`; every declared axis is default-deny, a bare `NAME`
+stays valid and unscoped, and a malformed entry refuses rather than degrading into an absent one.
+
+⚠ **The enforcement point is `http.request`, and that is narrower than the goal.** It is flux's only
+model-facing path where a named secret meets a guarded, address-pinned send. `flux-app`'s `resolve_in`
+and `flux-channels`' adapter resolution still substitute plaintext with no destination in view, so a
+`to=` scope there would have nothing to match. Widening the reach is not a matter of applying this
+mechanism harder — it needs C-458's egress seam to exist first, which reverses the epic's original
+"C-459 has the broader reach" reading: the *mechanism* does, the *coverage* does not, yet.
+
+**Injection location, decided.** Vaults' header/body split does not transfer, because flux resolves a
+`{"$secret": …}` marker only in `headers` and in the `query` record — the body has no marker resolution,
+so their broader exposure surface does not exist here. The axis that does exist is header versus query,
+for the same underlying reason: a query-placed credential lands in a URL, which proxies, gateways and
+access logs keep. That is what `in=` scopes.
+
+**`Sensitivity` is not the carrier.** It is an ordinal level; a scope is a set of permitted destinations
+and principals, and "may go to `api.github.com`" has no rank. It is also still read by nothing, and it
+was left in place rather than removed because `codewandler-flux-secret` is a published protocol-line
+crate — retiring a public type there is a version decision C-461 should make, not a side effect of this
+story.
 
 ### C-460 — rotation, revocation, and an audit record
 

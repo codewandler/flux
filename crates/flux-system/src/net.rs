@@ -777,7 +777,13 @@ fn is_internal_hostname(lower: &str) -> bool {
         || lower.ends_with(".internal")
 }
 
-fn host_matches(patterns: &[String], host: &str) -> bool {
+/// Match `host` against a list of host patterns: an exact name, a `*.suffix` wildcard that requires
+/// a real label boundary, or `*`.
+///
+/// `pub(crate)` since C-459 so [`secret_scope`](crate::secret_scope) matches a secret's destination
+/// scope with the identical vocabulary a private-net grant uses. A second implementation of "what
+/// does `*.example.com` mean" is how two allow-lists come to disagree about one hostname.
+pub(crate) fn host_matches(patterns: &[String], host: &str) -> bool {
     let host = host
         .trim()
         .trim_matches('[')

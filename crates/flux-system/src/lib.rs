@@ -135,6 +135,7 @@ use flux_core::{Error, Result};
 pub mod net;
 pub mod port;
 pub mod sandbox;
+pub mod secret_scope;
 
 use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};
 

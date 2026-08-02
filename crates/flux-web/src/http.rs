@@ -26,6 +26,7 @@ use flux_spec::{
     IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
+use flux_system::secret_scope::{Destination, InjectionSite, Refusal, SecretAllowlist, SecretUse};
 
 use crate::{egress, WebOptions};
 
@@ -47,10 +48,12 @@ pub struct HttpRequestTool {
     private_net: PrivateNetAllow,
     audit: Option<Arc<dyn flux_plugin::EgressAudit>>,
     grant_source: String,
-    /// Env-var names this tool may resolve via `{"$secret": "NAME"}`. Fail-closed: a name not on
-    /// this list is refused before its value is read (C-76). Resolved once at construction from
+    /// Env-var names this tool may resolve via `{"$secret": "NAME"}`, each with the scope it
+    /// carries. Fail-closed on both axes: a name not on this list is refused before its value is
+    /// read (C-76), and a name whose grant declares a destination, a principal or an injection site
+    /// is refused for any use outside it (C-459). Resolved once at construction from
     /// `WebOptions.allowed_secrets`, else the `FLUX_WEB_SECRET_ALLOW` env var.
-    allowed_secrets: Vec<String>,
+    allowed_secrets: SecretAllowlist,
 }
 
 impl HttpRequestTool {
@@ -63,10 +66,11 @@ impl HttpRequestTool {
                 .grant_source
                 .clone()
                 .unwrap_or_else(|| "config:web".to_string()),
-            allowed_secrets: opts
-                .allowed_secrets
-                .clone()
-                .unwrap_or_else(secret_allowlist_from_env),
+            allowed_secrets: SecretAllowlist::parse(
+                opts.allowed_secrets
+                    .clone()
+                    .unwrap_or_else(secret_allowlist_from_env),
+            ),
         }
     }
 
@@ -79,6 +83,41 @@ impl HttpRequestTool {
             if flux_system::net::host_resolves_private(host) {
                 audit.record_private_admit("web:http.request", host, &self.grant_source);
             }
+        }
+    }
+
+    /// May this `$secret` be resolved for *this* destination, *this* principal and *this* place in
+    /// the request? Returns the operator-facing reason it may not.
+    ///
+    /// Runs **before** the value is read, so the two refusals stay in C-76's order: a name the
+    /// operator never opted in is still refused without touching the environment, and only a name
+    /// that is on the list is then measured against its own scope (C-459). `destination` is the
+    /// guard's own verdict, carried as a `Result` so an unresolvable host is only fatal to a grant
+    /// that actually declares a destination.
+    fn authorize_secret(
+        &self,
+        name: &str,
+        destination: &Result<Destination>,
+        principal: Option<&str>,
+        site: InjectionSite,
+    ) -> std::result::Result<(), String> {
+        let use_ = SecretUse {
+            destination: destination.as_ref().map_err(|why| why.to_string()),
+            principal,
+            site,
+        };
+        match self.allowed_secrets.authorize(name, &use_) {
+            Ok(()) => Ok(()),
+            Err(Refusal::NotAllowlisted) => Err(format!(
+                "secret env var `{name}` is not on the allowlist and will not be resolved. Add it \
+                 to `[web] allowed_secrets` (or the FLUX_WEB_SECRET_ALLOW env var) to permit \
+                 `{{\"$secret\": \"{name}\"}}`."
+            )),
+            Err(refusal) => Err(format!(
+                "secret env var `{name}` is allowlisted but out of scope for this request: \
+                 {refusal}. Widen the entry's scope (or drop it, leaving the name unscoped) if \
+                 this use is intended."
+            )),
         }
     }
 }
@@ -99,7 +138,8 @@ impl Tool for HttpRequestTool {
                 never build a query by formatting values into the `url`. A header or query value \
                 may be a secret reference `{\"$secret\": \"ENV_NAME\"}`, resolved from the \
                 environment and never shown — but only for env-var names the operator has \
-                allowlisted; any other name is refused."
+                allowlisted; any other name is refused, and an allowlisted name may additionally be \
+                scoped to particular destination hosts, principals, or header-vs-query placement."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -168,14 +208,40 @@ impl Tool for HttpRequestTool {
         let method = reqwest::Method::from_bytes(method_str.as_bytes())
             .map_err(|_| Error::Other(format!("http.request: invalid method {method_str:?}")))?;
 
-        // The structured query. Resolved and appended *before* the guard runs, so the guard — and
-        // the pinning, and the redirect re-guard — all see the URL that actually goes on the wire.
+        // Guard egress (SSRF) FIRST: resolve the host, block private ranges unless the `web` scope
+        // grants them, and capture the vetted addresses the connection will be pinned to. This has
+        // to precede every `$secret` resolution below, because a secret's destination scope is
+        // matched against the **vetted** destination — matching it against the hostname the caller
+        // typed would authorize a name whose address is still free to move (C-459).
+        //
+        // The query is appended afterwards instead of before: appending a query cannot move the
+        // authority, so nothing about the SSRF decision changes, and it buys the ordering above
+        // without a second DNS resolution (which would reopen the very TOCTOU the pinning closes).
+        let (base_url, pinned) = flux_system::net::guard_url_scoped_pinned(raw, &self.private_net)?;
+        // Held as a `Result` rather than propagated: only a grant that *declares* a destination
+        // scope needs a vetted address, so an unscoped secret bound for an unresolvable host still
+        // behaves exactly as it did before scoping existed (it fails at connect, not here).
+        let destination = Destination::vetted(&base_url, &pinned);
+        let principal = ctx
+            .turn_identity()
+            .map(|identity| identity.caller().principal.id.clone());
+        let authorize = |name: &str, site: InjectionSite| -> Result<()> {
+            self.authorize_secret(name, &destination, principal.as_deref(), site)
+                .map_err(|why| Error::Other(format!("http.request: {why}")))
+        };
+
+        // The structured query. Every `$secret` in it is authorized against the destination above
+        // before its value is read.
         let mut resolved_query = Vec::new();
+        // The scoped secrets this request carries, re-checked at every redirect hop below.
+        let mut carried: Vec<(String, InjectionSite)> = Vec::new();
         for (key, value) in query_fields(&params)? {
             let text = match value {
                 QueryValue::Text(text) => text,
                 QueryValue::Secret(name) => {
-                    let secret = resolve_secret_env(&name, ctx, &self.allowed_secrets)?;
+                    authorize(&name, InjectionSite::Query)?;
+                    carried.push((name.clone(), InjectionSite::Query));
+                    let secret = resolve_secret_env(&name, ctx)?;
                     // The wire carries the *encoded* spelling, and the redactor matches literally,
                     // so both forms are registered — otherwise a percent-encoded token could
                     // survive in a guard/transport error message that quotes the URL.
@@ -196,11 +262,25 @@ impl Tool for HttpRequestTool {
             resolved_query.push((key, text));
         }
         let target = append_query(raw, &resolved_query)?;
-
-        // Guard egress (SSRF): resolve the host + block private ranges unless the `web` scope grants
-        // them, and capture the vetted addresses so the connection is pinned to them (no rebinding).
-        // Runs before any bytes leave the process.
-        let (url, pinned) = flux_system::net::guard_url_scoped_pinned(&target, &self.private_net)?;
+        let url = url::Url::parse(&target)
+            .map_err(|e| Error::Other(format!("http.request: invalid url: {e}")))?;
+        // The authority is what the guard vetted and what every secret above was authorized
+        // against, so it may not have moved. It cannot — `append_query` only writes a
+        // percent-encoded query ahead of the fragment — and this refuses rather than trusting that
+        // argument: the alternative to checking is re-resolving, which is the TOCTOU itself.
+        if (url.scheme(), url.host_str(), url.port_or_known_default())
+            != (
+                base_url.scheme(),
+                base_url.host_str(),
+                base_url.port_or_known_default(),
+            )
+        {
+            return Err(Error::Other(
+                "http.request: appending the query moved the request's destination away from the \
+                 address the egress guard vetted; refusing to send"
+                    .into(),
+            ));
+        }
 
         let timeout = params
             .get("timeout")
@@ -214,7 +294,14 @@ impl Tool for HttpRequestTool {
         let mut request_headers = HeaderMap::new();
         if let Some(headers) = params.get("headers").and_then(Value::as_object) {
             for (name, val) in headers {
-                let resolved = resolve_header_value(val, ctx, &self.allowed_secrets)?;
+                let resolved = match as_secret_ref(val) {
+                    Some(secret) => {
+                        authorize(secret, InjectionSite::Header)?;
+                        carried.push((secret.to_string(), InjectionSite::Header));
+                        resolve_secret_env(secret, ctx)?
+                    }
+                    None => plain_header_value(val)?,
+                };
                 let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                     Error::Other(format!("http.request: invalid header name `{name}`: {e}"))
                 })?;
@@ -242,7 +329,34 @@ impl Tool for HttpRequestTool {
                 timeout: Duration::from_secs(timeout),
             },
             "http.request",
-            |raw| flux_system::net::guard_url_scoped_pinned(raw, &self.private_net),
+            |raw| {
+                let (url, pinned) =
+                    flux_system::net::guard_url_scoped_pinned(raw, &self.private_net)?;
+                // Every hop is re-admitted against the scope of every secret this request carries.
+                //
+                // Deliberately conservative: a cross-origin hop already clears the caller's headers,
+                // so a header-placed secret does not physically travel — but a query-placed one is
+                // in the URL, and a `Location` that echoes the query carries it to a host the
+                // operator never named. Rather than reason per-hop about which bytes survive, the
+                // whole redirect chain has to stay inside the scope. An operator who wants the hop
+                // adds its host to the `to=` list; the failure direction is a refused redirect, not
+                // a credential at an unnamed host.
+                if !carried.is_empty() {
+                    let destination = Destination::vetted(&url, &pinned);
+                    // Only the HOST is quoted, never the hop URL: a query-placed secret lives in
+                    // the URL, and a `Location` the server chose can echo it back.
+                    let hop = url.host_str().unwrap_or("the redirect target").to_string();
+                    for (name, site) in &carried {
+                        self.authorize_secret(name, &destination, principal.as_deref(), *site)
+                            .map_err(|why| {
+                                Error::Http(format!(
+                                    "http.request: refusing the redirect to {hop} — {why}"
+                                ))
+                            })?;
+                    }
+                }
+                Ok((url, pinned))
+            },
             |url| {
                 if let Some(host) = url.host_str() {
                     self.audit_admit(host);
@@ -387,11 +501,10 @@ fn collect_headers(headers: &HeaderMap, redact: impl Fn(&str) -> String) -> Resp
     ResponseHeaders { map, rendered }
 }
 
-/// A header value: a plain string, or the secret marker `{"$secret": "ENV_NAME"}`.
-fn resolve_header_value(val: &Value, ctx: &ToolContext, allowed: &[String]) -> Result<String> {
-    if let Some(name) = as_secret_ref(val) {
-        return resolve_secret_env(name, ctx, allowed);
-    }
+/// A header value that is *not* a secret marker: it must be a plain string. The marker case is
+/// handled in `execute`, which is the only place that holds the vetted destination a `$secret` has
+/// to be authorized against.
+fn plain_header_value(val: &Value) -> Result<String> {
     match val {
         Value::String(s) => Ok(s.clone()),
         _ => Err(Error::Other(
@@ -401,18 +514,13 @@ fn resolve_header_value(val: &Value, ctx: &ToolContext, allowed: &[String]) -> R
     }
 }
 
-/// Read env var `name` and seed it into the redactor — **only if `name` is on the
-/// caller-configured allowlist**. Otherwise it is refused before the value is read, so a
-/// prompt-injected model cannot name an arbitrary env var (`AWS_SECRET_ACCESS_KEY`, …) and
-/// exfiltrate it to an attacker host in one call (C-76). Shared by the header and query paths.
-fn resolve_secret_env(name: &str, ctx: &ToolContext, allowed: &[String]) -> Result<String> {
-    if !allowed.iter().any(|a| a == name) {
-        return Err(Error::Other(format!(
-            "http.request: secret env var `{name}` is not on the allowlist and will not be \
-             resolved. Add it to `[web] allowed_secrets` (or the FLUX_WEB_SECRET_ALLOW env var) \
-             to permit `{{\"$secret\": \"{name}\"}}`."
-        )));
-    }
+/// Read env var `name` and seed it into the redactor.
+///
+/// ⚠ **The caller must have authorized `name` first** ([`HttpRequestTool::authorize_secret`]): this
+/// reads the environment, and the whole point of the allowlist (C-76) and of the destination /
+/// principal scope (C-459) is that neither the value nor the request happens for a use the operator
+/// did not permit. Shared by the header and query paths.
+fn resolve_secret_env(name: &str, ctx: &ToolContext) -> Result<String> {
     let resolved = std::env::var(name).map_err(|_| {
         Error::Other(format!(
             "http.request: secret env var `{name}` is not set (referenced via {{\"$secret\": \"{name}\"}})"
@@ -608,9 +716,14 @@ fn reported_url(raw: &str, params: &Value) -> String {
     append_query(raw, &public).unwrap_or_else(|_| raw.to_string())
 }
 
-/// Parse the `FLUX_WEB_SECRET_ALLOW` env var into a list of permitted secret env-var names
+/// Parse the `FLUX_WEB_SECRET_ALLOW` env var into a list of permitted secret allowlist entries
 /// (comma- or whitespace-separated). Unset/empty ⇒ deny-all — the correct fail-closed default so a
 /// `$secret` header reference is inert until an operator opts specific names in (C-76).
+///
+/// An entry is a bare env-var name, or a name carrying its scope
+/// (`NAME;to=api.example.com;in=header`) — see [`flux_system::secret_scope`]. `;` is not a separator
+/// here, which is what lets the scope ride inside one entry without breaking the comma/whitespace
+/// spelling that existed before C-459.
 fn secret_allowlist_from_env() -> Vec<String> {
     std::env::var("FLUX_WEB_SECRET_ALLOW")
         .unwrap_or_default()
@@ -987,6 +1100,246 @@ mod tests {
             msg.contains("allowlist") && !msg.contains("exfiltrate-me"),
             "refusal must name the allowlist and never leak the value: {msg}"
         );
+    }
+
+    /// C-459 failing-first — **the destination axis**. C-76 scopes which secret may be *named*;
+    /// nothing scoped where a named secret may *go*. A secret declared `to=api.example.com` must be
+    /// refused for a host the caller is otherwise perfectly entitled to reach.
+    ///
+    /// The caller here holds `PrivateNetAllow::Any`, so `guard_url_scoped` admits the loopback
+    /// target without complaint: the only thing that can refuse this request is the secret's own
+    /// scope. And the refusal has to happen *before* any byte leaves the process — a scope that
+    /// notices after the send is a post-mortem, not a control.
+    #[tokio::test]
+    async fn a_destination_scoped_secret_is_refused_for_an_out_of_scope_host() {
+        std::env::set_var("FLUX_TEST_WEB_SCOPED_TOKEN", "scoped-secret-42");
+        let (base, seen) = capture_request().await;
+        let t = tool_allowing(
+            PrivateNetAllow::Any,
+            &["FLUX_TEST_WEB_SCOPED_TOKEN;to=api.example.com"],
+        );
+        let err = t
+            .execute(
+                &ctx(),
+                json!({
+                    "url": base,
+                    "headers": { "authorization": { "$secret": "FLUX_TEST_WEB_SCOPED_TOKEN" } }
+                }),
+            )
+            .await
+            .expect_err("a secret scoped to api.example.com must not travel to 127.0.0.1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("127.0.0.1") && msg.contains("api.example.com"),
+            "the refusal names the destination refused and the scope it violated: {msg}"
+        );
+        assert!(
+            !msg.contains("scoped-secret-42"),
+            "a refusal never quotes the value: {msg}"
+        );
+        let reached = tokio::time::timeout(Duration::from_millis(250), seen).await;
+        assert!(
+            reached.is_err(),
+            "the refused request must never reach the wire: {reached:?}"
+        );
+    }
+
+    /// The other half of C-459's destination axis: the same secret reaches the host its scope
+    /// names, and actually arrives on the header it was asked for. A refusal-only test would pass
+    /// against a scope that refused everything.
+    #[tokio::test]
+    async fn a_destination_scoped_secret_still_reaches_the_host_its_scope_names() {
+        std::env::set_var("FLUX_TEST_WEB_INSCOPE_TOKEN", "in-scope-secret-42");
+        let (base, seen) = capture_request().await;
+        let t = tool_allowing(
+            PrivateNetAllow::Any,
+            &["FLUX_TEST_WEB_INSCOPE_TOKEN;to=127.0.0.1"],
+        );
+        t.execute(
+            &ctx(),
+            json!({
+                "url": base,
+                "headers": { "authorization": { "$secret": "FLUX_TEST_WEB_INSCOPE_TOKEN" } }
+            }),
+        )
+        .await
+        .expect("the scope names this host, so the request goes through");
+        let request = seen.await.expect("the in-scope host received the request");
+        assert!(
+            request.to_ascii_lowercase().contains("in-scope-secret-42"),
+            "the authorized secret is on the wire: {request}"
+        );
+    }
+
+    /// ⚠ C-459 — **an unscoped secret keeps working.** A bare `NAME` entry is still valid and still
+    /// travels anywhere the caller's own egress scope permits. Breaking every existing
+    /// `secret "NAME"` to introduce scoping would guarantee nobody adopted it, so this is the
+    /// compatibility floor the whole feature stands on.
+    #[tokio::test]
+    async fn an_unscoped_secret_keeps_travelling_wherever_the_caller_may_reach() {
+        std::env::set_var("FLUX_TEST_WEB_UNSCOPED_TOKEN", "unscoped-secret-42");
+        let (base, seen) = capture_request().await;
+        let t = tool_allowing(PrivateNetAllow::Any, &["FLUX_TEST_WEB_UNSCOPED_TOKEN"]);
+        t.execute(
+            &ctx(),
+            json!({
+                "url": base,
+                "headers": { "authorization": { "$secret": "FLUX_TEST_WEB_UNSCOPED_TOKEN" } }
+            }),
+        )
+        .await
+        .expect("an unscoped secret behaves exactly as it did before scoping existed");
+        let request = seen.await.expect("the request was sent");
+        assert!(
+            request.to_ascii_lowercase().contains("unscoped-secret-42"),
+            "the unscoped secret still reaches the wire: {request}"
+        );
+        // …and the allowlist says out loud that it is unscoped rather than leaving it to inference.
+        let list = flux_system::secret_scope::SecretAllowlist::parse([
+            "FLUX_TEST_WEB_UNSCOPED_TOKEN",
+            "OTHER;to=api.example.com",
+        ]);
+        assert_eq!(list.unscoped_names(), vec!["FLUX_TEST_WEB_UNSCOPED_TOKEN"]);
+    }
+
+    /// ⚠ C-459 — the scope survives a redirect. Admitting only the *first* hop would leave the
+    /// obvious bypass: a host the operator did name answers `302` to one they did not.
+    ///
+    /// The rule enforced here is deliberately conservative — the whole chain stays inside the scope,
+    /// rather than reasoning per-hop about which bytes survive `send_guarded`'s cross-origin header
+    /// clearing. A query-placed secret lives in the URL, and a `Location` that echoes the query
+    /// carries it onward.
+    #[tokio::test]
+    async fn a_scoped_secret_does_not_follow_a_redirect_out_of_its_scope() {
+        std::env::set_var("FLUX_TEST_WEB_HOP_TOKEN", "hop-secret-42");
+        let (url, seen) = redirect_to_loopback("localhost", "must not arrive").await;
+        // The caller may reach BOTH spellings, so nothing about the egress grant refuses the hop.
+        let t = tool_allowing(
+            PrivateNetAllow::from_hosts(["localhost".to_string(), "127.0.0.1".to_string()]),
+            &["FLUX_TEST_WEB_HOP_TOKEN;to=localhost"],
+        );
+        let err = t
+            .execute(
+                &ctx(),
+                json!({
+                    "url": url,
+                    "headers": { "authorization": { "$secret": "FLUX_TEST_WEB_HOP_TOKEN" } }
+                }),
+            )
+            .await
+            .expect_err("the redirect leaves the secret's scope and must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("redirect") && msg.contains("localhost"),
+            "the refusal names the hop and the scope it left: {msg}"
+        );
+        assert!(
+            !msg.contains("hop-secret-42"),
+            "never leaks the value: {msg}"
+        );
+        let reached = tokio::time::timeout(Duration::from_millis(250), seen).await;
+        assert!(
+            reached.is_err(),
+            "the redirect target must never be contacted: {reached:?}"
+        );
+    }
+
+    /// ⚠ C-459 — the **principal** axis, built on the `TurnIdentity` C-408/C-415 established. Not a
+    /// second identity concept: the id matched here is the one the surface froze for the turn.
+    ///
+    /// On a shared surface this is the difference between a credential the operator holds and one
+    /// anyone in the room can spend, so the default-deny direction matters most: a turn for which
+    /// no principal was resolved cannot satisfy `by=`.
+    #[tokio::test]
+    async fn a_principal_scoped_secret_admits_its_principal_and_refuses_every_other_turn() {
+        std::env::set_var("FLUX_TEST_WEB_PRINCIPAL_TOKEN", "principal-secret-42");
+        let t = tool_allowing(
+            PrivateNetAllow::Any,
+            &["FLUX_TEST_WEB_PRINCIPAL_TOKEN;by=alice"],
+        );
+        let params = |base: &str| {
+            json!({
+                "url": base,
+                "headers": { "authorization": { "$secret": "FLUX_TEST_WEB_PRINCIPAL_TOKEN" } }
+            })
+        };
+
+        // alice is the frozen turn identity: authorized.
+        let (base, seen) = capture_request().await;
+        let alice =
+            flux_runtime::TurnIdentity::unauthenticated_participant("alice", "test-surface");
+        flux_runtime::scope_runtime_turn(
+            flux_runtime::RuntimeTurnContext::new().with_identity(alice),
+            t.execute(&ctx(), params(&base)),
+        )
+        .await
+        .expect("the turn runs as alice, whom the grant names");
+        assert!(seen.await.unwrap().contains("principal-secret-42"));
+
+        // bob is not alice.
+        let (base, _seen) = capture_request().await;
+        let bob = flux_runtime::TurnIdentity::unauthenticated_participant("bob", "test-surface");
+        let err = flux_runtime::scope_runtime_turn(
+            flux_runtime::RuntimeTurnContext::new().with_identity(bob),
+            t.execute(&ctx(), params(&base)),
+        )
+        .await
+        .expect_err("bob may not spend alice's credential");
+        assert!(err.to_string().contains("bob"), "{err}");
+
+        // And a turn with no resolved principal is a refusal, not a wildcard.
+        let (base, _seen) = capture_request().await;
+        let err = t
+            .execute(&ctx(), params(&base))
+            .await
+            .expect_err("`by=` cannot be satisfied by an unidentified turn");
+        assert!(
+            err.to_string().contains("resolved no principal"),
+            "the refusal says the identity is missing, not that the name is: {err}"
+        );
+    }
+
+    /// C-459 — the injection-site axis. flux resolves a `$secret` marker only in `headers` and in
+    /// the `query` record; there is no body path at all, so Vaults' header/body split does not
+    /// transfer. The split that *does* matter here is header versus query, because a query-placed
+    /// credential lands in a URL that proxies and access logs keep.
+    #[tokio::test]
+    async fn a_header_only_secret_is_refused_in_a_query_parameter() {
+        std::env::set_var("FLUX_TEST_WEB_SITE_TOKEN", "site-secret-42");
+        let (base, seen) = capture_request().await;
+        let t = tool_allowing(
+            PrivateNetAllow::Any,
+            &["FLUX_TEST_WEB_SITE_TOKEN;to=127.0.0.1;in=header"],
+        );
+        let err = t
+            .execute(
+                &ctx(),
+                json!({
+                    "url": base,
+                    "query": { "api_key": { "$secret": "FLUX_TEST_WEB_SITE_TOKEN" } }
+                }),
+            )
+            .await
+            .expect_err("a header-only secret must not be placed in the query string");
+        assert!(
+            err.to_string().contains("query"),
+            "the refusal names the site: {err}"
+        );
+        let reached = tokio::time::timeout(Duration::from_millis(250), seen).await;
+        assert!(reached.is_err(), "nothing was sent: {reached:?}");
+
+        // The same secret on the header it was scoped to goes through.
+        let (base, seen) = capture_request().await;
+        t.execute(
+            &ctx(),
+            json!({
+                "url": base,
+                "headers": { "authorization": { "$secret": "FLUX_TEST_WEB_SITE_TOKEN" } }
+            }),
+        )
+        .await
+        .expect("the header placement is the one the grant permits");
+        assert!(seen.await.unwrap().contains("site-secret-42"));
     }
 
     /// C-303 — the injection this story closes. A query value carrying `&injected=1` (plus `#`,
