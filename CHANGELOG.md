@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.52.1] - 2026-08-02
+
 ### Added
 
 - **Hosts can project authored Flux into a versioned visual-editor graph and correlate execution

@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.52.1] - 2026-08-02
+
 ### Improved
 
 - **It is now clear what Docker, Kubernetes, and microVM support means.** A new execution-placement
