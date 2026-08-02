@@ -2,7 +2,7 @@
 id: C-459
 title: "A secret has no scope — once resolved it can go anywhere the egress guard already allows"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 design: docs/designs/secrets-the-agent-never-sees.md
 epic: secrets-the-agent-never-sees
@@ -63,8 +63,9 @@ operator holds and a credential anyone in the room can spend.
 - [x] Destination scope is **default-deny** where declared, and the check happens on the **resolved,
       vetted** address, matching the discipline `guard_target_host_pinned` already enforces. ⚠ A scope
       matched against the pre-resolution hostname is a bypass.
-      → `flux_system::secret_scope::Destination::vetted` is the *only* constructor and takes the guard's
-      own `(Url, Vec<SocketAddr>)` pair, refusing an empty pin set. `http.request::execute` now guards
+      → `flux_system::net::guard_url_scoped_for_secret` is the only public minting path and returns
+      one private-field value carrying the guard's URL, exact pins, and destination token; an empty
+      pin set produces no token. `http.request::execute` now guards
       **before** resolving any `$secret`, and the same vetted set becomes the connection's pin, so the
       address authorized is the address dialled. Every redirect hop is re-authorized.
 - [x] ⚠ **A secret with no declared scope keeps working.** Breaking every existing `secret "NAME"` to add
@@ -108,8 +109,8 @@ much is one rule and D-227 should not restate it differently.
 
 They cannot share one *matcher*, and the reason is the part each story calls its own bypass. Here the
 canonicalization step is **resolve the hostname and pin the answer** — a name is not a destination until
-DNS has been consulted and the result frozen, which is why `Destination::vetted` refuses an empty pin
-set. In D-227 it is **dial-plan normalization** — `+49…`, `0049…`, `00 49…` and a prefixed extension are
+DNS has been consulted and the result frozen, which is why the guard cannot mint a `Destination` for
+an empty pin set. In D-227 it is **dial-plan normalization** — `+49…`, `0049…`, `00 49…` and a prefixed extension are
 one destination, and an allowlist matching unnormalized text is "a bypass wearing a whitelist" in that
 story's own words. A shared `Vec<String>` host matcher would force the phone side to normalize *outside*
 the check, which is precisely the hole D-227 exists to close; a shared abstraction over both would have
@@ -164,3 +165,12 @@ settled, either by giving it a reader or by retiring it behind a proper bump.
   - **Redirects are refused conservatively.** The whole chain must stay in scope, even though
     `send_guarded` already clears headers cross-origin — reasoning per-hop about which bytes survive is
     how this class of check goes wrong. The failure direction is a refused redirect.
+
+- **2026-08-02 — independent review accepted after one structural fix.** The first cut exposed
+  `Destination::vetted(url, pins)` publicly. Its fields were private, but any consumer could still
+  pass an arbitrary pair and claim it was guard-vetted, so the provenance promised by the docs was
+  conventional rather than enforced. `Destination` now has no public constructor;
+  `guard_url_scoped_for_secret` alone mints one correlated private-field result containing the
+  admitted URL, exact connection pins, and scope token. `flux-web` consumes all three from that one
+  value on the first request and every redirect hop. Focused `flux-system` and `flux-web` tests plus
+  clippy pass after the change; the release-wide gate is rerun on the integrated tree.

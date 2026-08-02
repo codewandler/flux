@@ -15,11 +15,12 @@
 //! Matching a scope against the hostname the caller typed is a bypass, and the reason is the same
 //! one [`net::guard_url_scoped_pinned`](crate::net::guard_url_scoped_pinned) exists: a DNS answer
 //! that changes between the check and the connection sends the value somewhere the check never saw.
-//! So the only thing this module will match against is a [`Destination`], and the only way to build
-//! one is from a URL the egress guard has already resolved **together with the socket addresses it
-//! vetted** — an empty set means the guard vetted nothing, and [`Destination::vetted`] refuses it
-//! rather than matching a name whose address is still open. Callers pass the same vetted set to the
-//! connection as its pin, so the address the scope authorized is the address dialled.
+//! So the only thing this module will match against is a [`Destination`], and only
+//! [`net::guard_url_scoped_for_secret`](crate::net::guard_url_scoped_for_secret) can mint one. It
+//! carries the URL the egress guard resolved **together with the socket addresses it vetted** — an
+//! empty set means the guard vetted nothing and produces no destination token rather than matching a
+//! name whose address is still open. The same guard result carries the connection pins, so the
+//! address the scope authorized is the address dialled.
 //!
 //! # Grant grammar
 //!
@@ -63,8 +64,8 @@ use crate::net::host_matches;
 /// A destination a secret is about to be sent to: the host of a URL the egress guard has already
 /// admitted, plus the socket addresses that guard vetted and the connection will be pinned to.
 ///
-/// Constructed only by [`Destination::vetted`], so a scope can never be matched against a name
-/// nobody resolved.
+/// Minted only inside [`net::guard_url_scoped_for_secret`](crate::net::guard_url_scoped_for_secret),
+/// so a scope can never be matched against a caller-asserted name/address pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     host: String,
@@ -72,14 +73,13 @@ pub struct Destination {
 }
 
 impl Destination {
-    /// Build the destination from the egress guard's own output — the admitted URL and the socket
-    /// addresses it vetted (`guard_url_scoped_pinned` returns exactly this pair).
+    /// Build a destination from the egress guard's own output.
     ///
     /// An **empty** `pinned` set is refused. Empty means the guard resolved nothing, so nothing was
     /// vetted: the host still has an open address, and authorizing a secret for it would be
     /// authorizing a name rather than a destination. `flux-web`'s `pinned_client` already refuses to
     /// connect unpinned for the same reason; this refuses to *authorize* unpinned, one step earlier.
-    pub fn vetted(url: &url::Url, pinned: &[SocketAddr]) -> Result<Self> {
+    pub(crate) fn from_guard(url: &url::Url, pinned: &[SocketAddr]) -> Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| Error::Other("the guarded url has no host".into()))?;
@@ -104,6 +104,40 @@ impl Destination {
     /// The addresses the guard vetted, which the connection is pinned to.
     pub fn pinned(&self) -> &[SocketAddr] {
         &self.pinned
+    }
+}
+
+/// One correlated egress-guard result for a request that may carry a scoped secret.
+///
+/// The fields are private and construction is crate-private: external callers can obtain this only
+/// from [`net::guard_url_scoped_for_secret`](crate::net::guard_url_scoped_for_secret). Keeping the
+/// parsed URL, its exact connection pins and the destination token in one value prevents a caller
+/// from claiming an arbitrary pair was guard-vetted.
+#[derive(Debug)]
+pub struct GuardedSecretTarget {
+    url: url::Url,
+    pinned: Vec<SocketAddr>,
+    destination: Result<Destination>,
+}
+
+impl GuardedSecretTarget {
+    pub(crate) fn from_guard(url: url::Url, pinned: Vec<SocketAddr>) -> Self {
+        let destination = Destination::from_guard(&url, &pinned);
+        Self {
+            url,
+            pinned,
+            destination,
+        }
+    }
+
+    /// Split the correlated result into the URL to send, the addresses to pin the connection to,
+    /// and the destination token used for secret authorization.
+    ///
+    /// The token is an error only when the guard resolved no address. An unscoped grant does not
+    /// inspect it, preserving the pre-C-459 behavior; the pinned HTTP client will then refuse the
+    /// empty set before connecting.
+    pub fn into_parts(self) -> (url::Url, Vec<SocketAddr>, Result<Destination>) {
+        (self.url, self.pinned, self.destination)
     }
 }
 
@@ -467,7 +501,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             443,
         )];
-        Destination::vetted(&url, &pinned).unwrap()
+        Destination::from_guard(&url, &pinned).unwrap()
     }
 
     fn use_at<'a>(destination: &'a Destination) -> SecretUse<'a> {
@@ -533,7 +567,7 @@ mod tests {
     #[test]
     fn a_destination_with_no_vetted_address_cannot_be_built_and_refuses_a_scoped_secret() {
         let url = url::Url::parse("https://unresolvable.example/p").unwrap();
-        let err = Destination::vetted(&url, &[])
+        let err = Destination::from_guard(&url, &[])
             .expect_err("an empty pin set means nothing was vetted")
             .to_string();
         assert!(
@@ -715,11 +749,11 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(140, 82, 121, 6)), 443),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(140, 82, 121, 5)), 443),
         ];
-        let destination = Destination::vetted(&url, &pinned).unwrap();
+        let destination = Destination::from_guard(&url, &pinned).unwrap();
         assert_eq!(destination.host(), "api.github.com");
         assert_eq!(destination.pinned(), pinned);
         // A URL with no host cannot be a destination.
         let opaque = url::Url::parse("data:text/plain,hi").unwrap();
-        assert!(Destination::vetted(&opaque, &pinned).is_err());
+        assert!(Destination::from_guard(&opaque, &pinned).is_err());
     }
 }

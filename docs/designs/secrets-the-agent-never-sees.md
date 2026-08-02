@@ -107,9 +107,10 @@ may cause it to be used. The second was newly available — C-408 and C-415 esta
 
 `flux_system::secret_scope` is the mechanism, deliberately co-located with the egress guard rather than
 with `flux-secret`, because the security content of a destination scope is *which address was vetted*,
-not *which string was typed*. `Destination::vetted` takes the guard's own `(Url, Vec<SocketAddr>)` pair
-and refuses an empty pin set, so there is no way to match a scope against a hostname nobody resolved —
-the bypass that would otherwise make the whole feature decorative. A grant is written as
+not *which string was typed*. `guard_url_scoped_for_secret` alone mints one private-field result
+carrying the guard's URL, exact pins, and `Destination` token; an empty pin set produces no token, so
+there is no public constructor that can assert an arbitrary pair was vetted — the bypass that would
+otherwise make the whole feature decorative. A grant is written as
 `NAME;to=<host>;by=<principal>;in=header|query`; every declared axis is default-deny, a bare `NAME`
 stays valid and unscoped, and a malformed entry refuses rather than degrading into an absent one.
 

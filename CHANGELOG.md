@@ -27,6 +27,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Named HTTP secrets can now carry destination, principal, and placement scopes** (C-459).
+  `http.request` allowlist entries accept `NAME;to=<host>;by=<principal>;in=header|query`; every
+  declared axis denies non-matching uses before the environment value is read, and redirects are
+  re-authorized at every hop. Destination authorization uses a private-field token minted only by
+  the egress guard alongside the exact connection pins, so callers cannot assert that an arbitrary
+  hostname/address pair was vetted. Bare names retain their previous unscoped behavior and are
+  explicitly reportable as unscoped.
+
 - **The guarded-IO port now has a local-first delegating backend** (C-399). `RemoteSystem` hands
   process, environment, host-file and workspace-file operations to a `Delegate`, while `Loopback`
   exercises the same path over an in-process substrate with no service running. Refused,

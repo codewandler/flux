@@ -107,6 +107,22 @@ pub fn guard_url_scoped_pinned(
     guard_and_pin(raw, allow, &SystemHostResolver)
 }
 
+/// Guard a URL for a request that may carry a destination-scoped secret.
+///
+/// Unlike the raw `(Url, pins)` API, this also mints an unforgeable
+/// [`GuardedSecretTarget`](crate::secret_scope::GuardedSecretTarget): its private destination token
+/// can only originate here, after this guard resolved and vetted the addresses. The caller receives
+/// the URL, pins and token as one correlated value and must use the same pins for the connection.
+pub fn guard_url_scoped_for_secret(
+    raw: &str,
+    allow: &PrivateNetAllow,
+) -> Result<crate::secret_scope::GuardedSecretTarget> {
+    let (url, pinned) = guard_and_pin(raw, allow, &SystemHostResolver)?;
+    Ok(crate::secret_scope::GuardedSecretTarget::from_guard(
+        url, pinned,
+    ))
+}
+
 /// [`guard_url_scoped_pinned`] with an injectable resolver — tests inject a rebinding resolver to
 /// prove the connection pins to the vetted answer rather than a later, internal one.
 pub fn guard_url_scoped_pinned_with_resolver(

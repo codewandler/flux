@@ -217,11 +217,11 @@ impl Tool for HttpRequestTool {
         // The query is appended afterwards instead of before: appending a query cannot move the
         // authority, so nothing about the SSRF decision changes, and it buys the ordering above
         // without a second DNS resolution (which would reopen the very TOCTOU the pinning closes).
-        let (base_url, pinned) = flux_system::net::guard_url_scoped_pinned(raw, &self.private_net)?;
+        let guarded = flux_system::net::guard_url_scoped_for_secret(raw, &self.private_net)?;
+        let (base_url, pinned, destination) = guarded.into_parts();
         // Held as a `Result` rather than propagated: only a grant that *declares* a destination
         // scope needs a vetted address, so an unscoped secret bound for an unresolvable host still
         // behaves exactly as it did before scoping existed (it fails at connect, not here).
-        let destination = Destination::vetted(&base_url, &pinned);
         let principal = ctx
             .turn_identity()
             .map(|identity| identity.caller().principal.id.clone());
@@ -330,8 +330,9 @@ impl Tool for HttpRequestTool {
             },
             "http.request",
             |raw| {
-                let (url, pinned) =
-                    flux_system::net::guard_url_scoped_pinned(raw, &self.private_net)?;
+                let guarded =
+                    flux_system::net::guard_url_scoped_for_secret(raw, &self.private_net)?;
+                let (url, pinned, destination) = guarded.into_parts();
                 // Every hop is re-admitted against the scope of every secret this request carries.
                 //
                 // Deliberately conservative: a cross-origin hop already clears the caller's headers,
@@ -342,7 +343,6 @@ impl Tool for HttpRequestTool {
                 // adds its host to the `to=` list; the failure direction is a refused redirect, not
                 // a credential at an unnamed host.
                 if !carried.is_empty() {
-                    let destination = Destination::vetted(&url, &pinned);
                     // Only the HOST is quoted, never the hop URL: a query-placed secret lives in
                     // the URL, and a `Location` the server chose can echo it back.
                     let hop = url.host_str().unwrap_or("the redirect target").to_string();
