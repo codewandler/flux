@@ -100,6 +100,8 @@ therefore ignored — including one pointing somewhere harmless inside the repo.
 
 ## Related docs
 
+- [Context management](./context-management.md) — the other half: what happens to the *conversation*
+  as it grows, and how compaction bounds it.
 - [Skills and roles](./skills-and-roles.md) — the on-demand alternative to always-loaded context.
 - [The agent loop](./agent-loop.md) — where the assembled block sits in a turn, and what runs after it.
 - [Safety & approvals](./safety.md) — the authorization and guarded-IO envelope that reads these files.

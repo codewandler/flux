@@ -24,7 +24,10 @@ mod agent_runtime;
 pub use agent_runtime::{AgentRuntime, Worker, WorkerSpec, WorkerState, WorkerStatus};
 
 mod limits;
-pub use limits::{ConcurrencyRefusal, ResourceLimits, DEFAULT_TOOL_CALL_QUEUE_TIMEOUT};
+pub use limits::{
+    AgentCensusRefusal, AgentSlot, ConcurrencyRefusal, ResourceLimits,
+    DEFAULT_TOOL_CALL_QUEUE_TIMEOUT,
+};
 
 pub mod context;
 pub mod metadata;

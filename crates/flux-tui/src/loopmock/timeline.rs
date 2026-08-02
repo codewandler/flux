@@ -95,10 +95,10 @@ pub(super) fn draw(
         ));
     }
 
-    let mut drawn = 0usize;
+    let mut drawn: Vec<usize> = Vec::new();
     for flat in rows.iter().skip(usize::from(start > 0)) {
         let step = flat.step;
-        drawn += 1;
+        drawn.push(step.id);
         let label = format!(
             "{}{} {}",
             " ".repeat(flat.depth),

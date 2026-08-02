@@ -1756,7 +1756,7 @@ pub(super) async fn build_agent_with(
                     backend: backend.clone(),
                 })),
                 browser_bin: cfg.browser_bin.clone(),
-                allowed_secrets: None,
+                allowed_secrets: cfg.web.allowed_secrets.clone(),
             },
         )?;
     }

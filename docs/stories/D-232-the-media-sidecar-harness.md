@@ -2,7 +2,7 @@
 id: D-232
 title: "The browser harness itself — a lib-jitsi-meet peer that joins, publishes audible audio, and proves it"
 pillar: Agent
-status: ready
+status: in-progress
 priority: 1
 design: docs/designs/meeting-rooms.md
 epic: meeting-rooms

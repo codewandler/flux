@@ -148,13 +148,17 @@ impl FlowClientBuilder {
         self.envelope.deny.push(rule.into());
         self
     }
-    /// Approve every tool call automatically (no human in the loop). Use with care — model-backed
-    /// cognition ops egress over the network, so they gate by default.
+    /// Approve every tool call automatically — an **autonomous posture**. Note that model-backed
+    /// cognition ops egress over the network, so they gate by default and this ungates them.
     ///
-    /// It does not raise the OS-sandbox posture. The CLI pins its own auto-approved and headless
-    /// surfaces to fail-closed `require` (C-262 / C-410); a library has no argv to classify, so an
-    /// unattended embedder states the posture itself — [`with_sandbox`](Self::with_sandbox) or
-    /// `FLUX_SANDBOX=require`. See [`Sandbox`](crate::Sandbox).
+    /// Choosing it brings its confinement and its ceiling with it (C-444): unless you state otherwise,
+    /// the built client resolves to sandbox `require` with the sandbox network closed and to
+    /// [`ResourceLimits::autonomous`](crate::ResourceLimits::autonomous) ceilings — the same pairing the
+    /// CLI applies to its own auto-approved and headless surfaces (C-262 / C-410). Both are floors over
+    /// silence: [`with_sandbox`](Self::with_sandbox) and [`resource_limits`](Self::resource_limits) win
+    /// outright. An injected [`Approver`] receives the same conservative floor because the SDK cannot
+    /// distinguish an interactive policy from a blanket allow. See
+    /// [`ClientBuilder::auto_approve`](crate::ClientBuilder::auto_approve) for the full contract.
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
         self
@@ -188,11 +192,17 @@ impl FlowClientBuilder {
     /// client's own executors run — including the branches of a `parallel` block, which is where an
     /// authored flow actually produces concurrency. It does **not** descend into sub-agents
     /// attached via [`with_sub_agents`](FlowClient::with_sub_agents): a `task`-delegated child gets
-    /// a fresh, unbounded executor. Unbounded by default; see
+    /// a fresh, unbounded executor.
+    ///
+    /// The default follows the posture (C-444): unbounded under supervision, and
+    /// [`ResourceLimits::autonomous`](crate::ResourceLimits::autonomous) under
+    /// [`auto_approve`](Self::auto_approve). Calling this wins outright either way. See
     /// [`ClientBuilder::resource_limits`](crate::ClientBuilder::resource_limits) for the full
-    /// contract, including why the queue timeout is not clamped.
+    /// contract — why the queue timeout is not clamped, and why bounding a delegated tree needs
+    /// [`with_max_live_agents`](crate::ResourceLimits::with_max_live_agents) rather than a shared
+    /// semaphore.
     pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
-        self.envelope.resource_limits = limits;
+        self.envelope.resource_limits = Some(limits);
         self
     }
     /// Skip seeding the operation catalog `$defs` with the prelude artifact ontology (default: seed).
@@ -203,13 +213,13 @@ impl FlowClientBuilder {
     /// Inject an explicit OS-sandbox [`Sandbox`] that the built client's guarded `System` enforces on
     /// every spawn. When left unset (the default), the posture is resolved from the environment at
     /// [`build`](Self::build) via `Sandbox::resolve(SandboxSettings::from_env())` — so a consumer that
-    /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
-    /// Pass one only to pin a posture independent of ambient env.
+    /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe) —
+    /// except under an autonomous posture, where [`auto_approve`](Self::auto_approve) raises the floor
+    /// to fail-closed `require` with the network closed (C-444).
     ///
-    /// **These two are the whole story for an embedder** — nothing in this crate infers a posture
-    /// from the client's configuration the way the CLI infers one from its argv (C-262 / C-410), so
-    /// an unattended deployment that does neither runs its spawns unconfined. See
-    /// [`Sandbox`](crate::Sandbox).
+    /// **This call wins outright**, in either direction: it pins a posture independent of ambient env,
+    /// and it is also how an autonomous embedder whose isolation comes from elsewhere declines the
+    /// raise in one visible line. See [`Sandbox`](crate::Sandbox).
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.envelope.sandbox = Some(sandbox);
         self
@@ -235,6 +245,9 @@ impl FlowClientBuilder {
         // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
         // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
         let sandbox = self.envelope.resolve_sandbox();
+        // C-444: resolved before the envelope is destructured below — silence means the approval
+        // posture decides (autonomous ⇒ bounded), an explicit call is honored verbatim.
+        let resource_limits = self.envelope.resolve_resource_limits();
         let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
         let registry = try_assemble_registry(provider.clone(), self.model.clone())?;
         let store = Arc::new(self.storage.unwrap_or_default().into_flow_store()?);
@@ -254,7 +267,7 @@ impl FlowClientBuilder {
             approver: self.envelope.approver,
             authorization: self.envelope.authorization,
             redactor: self.envelope.redactor,
-            resource_limits: self.envelope.resource_limits,
+            resource_limits,
             prelude_defs,
             session_id: "flux-sdk".to_string(),
             spawner: None,
@@ -1188,6 +1201,56 @@ mod tests {
         assert!(names.iter().any(|n| n == "ai.extract"));
     }
 
+    /// C-470: the two public SDK doors resolve the same autonomous envelope. This lives inside the
+    /// crate so the proof observes the binding `System` and `ResourceLimits` without publishing a
+    /// new inspection API solely for a test.
+    #[test]
+    fn both_sdk_doors_resolve_the_same_autonomous_posture() {
+        let client = crate::Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .build(
+                Box::new(MockProvider::new(["noop".to_string()])),
+                temp_root("client-posture"),
+            )
+            .unwrap();
+        let flow = FlowClient::builder()
+            .model("mock")
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("flow-posture"))
+            .unwrap();
+
+        let client_system = client.engine().executor.context().system();
+        let client_sandbox = client_system.sandbox().settings();
+        let flow_sandbox = flow.system.sandbox().settings();
+        assert_eq!(flow_sandbox.mode, client_sandbox.mode);
+        assert_eq!(flow_sandbox.network, client_sandbox.network);
+        assert_eq!(flow_sandbox.extra_writable, client_sandbox.extra_writable);
+
+        let client_limits = client.resource_limits();
+        let flow_limits = &flow.resource_limits;
+        assert_eq!(
+            flow_limits.max_concurrent_tool_calls(),
+            client_limits.max_concurrent_tool_calls()
+        );
+        assert_eq!(
+            flow_limits.max_retained_result_bytes(),
+            client_limits.max_retained_result_bytes()
+        );
+        assert_eq!(
+            flow_limits.max_evidence_payload_bytes(),
+            client_limits.max_evidence_payload_bytes()
+        );
+        assert_eq!(
+            flow_limits.max_live_agents(),
+            client_limits.max_live_agents()
+        );
+        assert_eq!(
+            flow_limits.tool_call_queue_timeout(),
+            client_limits.tool_call_queue_timeout()
+        );
+    }
+
     #[tokio::test]
     async fn round_trip_analyze_then_execute_on_a_json_flow() {
         // A hand-authored DraftAst: read a file we control, then return it. Exercises
@@ -1523,6 +1586,15 @@ mod tests {
             .approver(Arc::new(DenyBoom))
             .build(MockProvider::one("noop"), temp_root("approver-policy"))
             .unwrap();
+        assert_eq!(
+            client.system.sandbox().settings().mode,
+            flux_system::sandbox::SandboxMode::Require,
+            "an opaque flow approver must receive the conservative confinement floor"
+        );
+        assert!(
+            !client.resource_limits.is_unbounded(),
+            "an opaque flow approver must receive the delegated-tree ceiling"
+        );
         client.register_op(Arc::new(EchoArgsTool));
         client.register_op(Arc::new(BoomTool));
 

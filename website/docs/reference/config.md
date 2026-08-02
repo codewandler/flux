@@ -45,6 +45,9 @@ prometheus = ["prometheus.internal.example"]
 [private_net.endpoints]
 "gitlab:gitlab.endpoint" = ["gitlab.internal.example"]
 
+[web]
+allowed_secrets = ["GITHUB_TOKEN;to=api.github.com;in=header"]
+
 [limits]
 turn_token_budget = 120000
 
@@ -202,6 +205,36 @@ flux --allow-private-net plugin call gitlab gitlab.test
 The plugin still cannot use a host absent from its manifest. Native web has no manifest intersection,
 so the flag also admits cloud-metadata addresses for that run; prefer scoped config for recurring
 access. Every admitted private request is audited.
+
+## HTTP secret allowlist
+
+`http.request` resolves `{"$secret": "NAME"}` markers in header and structured-query values only
+for names an operator allowlisted. The default is deny-all. Configure the list under `[web]`:
+
+```toml
+[web]
+allowed_secrets = [
+  "GITHUB_TOKEN;to=api.github.com;in=header",
+  "REPORT_TOKEN;to=reports.example;by=alice;in=query",
+]
+```
+
+A bare name such as `"GITHUB_TOKEN"` keeps the pre-scoping behavior: it may go to any destination
+the web egress guard otherwise permits, on behalf of any principal, in a header or query parameter.
+That compatibility form is intentionally unscoped. Scope parameters narrow it:
+
+- `to=` accepts an exact host, `*.suffix` (requiring a real label boundary), or `*`. It is checked
+  only after the egress guard resolves and vets the address, and every redirect hop is checked again.
+- `by=` matches the principal frozen into the turn identity. A turn with no resolved principal does
+  not satisfy a principal-scoped entry.
+- `in=header` or `in=query` limits placement. Query credentials are the broader exposure because
+  URLs are commonly retained by proxies and access logs. `$secret` substitution is not supported in
+  request bodies.
+
+Repeat an entry to allow multiple combinations. User and project lists merge. An explicit empty list
+is deny-all and suppresses the environment fallback; if `[web] allowed_secrets` is absent,
+`FLUX_WEB_SECRET_ALLOW` remains the equivalent comma- or whitespace-separated environment form.
+Malformed scoped entries refuse every use under that name rather than falling back to unscoped.
 
 ## Resource limits
 
@@ -475,6 +508,7 @@ Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values su
 | `FLUX_ALLOW_ALL` | Lifts filesystem read and write confinement, like `--allow-all-paths` or `[workspace] allow_all = true`. It does **not** approve actions, change network policy, or act as an environment form of `--yes`. |
 | `FLUX_ENABLE_BASH` | Surfaces the high-risk shell group, like `enable_shell`. |
 | `FLUX_ALLOW_PRIVATE_NET` | Blanket private-network override for native web ops and outbound fleet worker calls; also supplies the operator side of plugin grants (the plugin's manifest declaration still bounds it). Prefer scoped `[private_net]` grants for recurring access. |
+| `FLUX_WEB_SECRET_ALLOW` | Comma- or whitespace-separated `http.request` secret entries, using the same `NAME;to=host;by=principal;in=header|query` grammar as `[web] allowed_secrets`. Used only when the config key is absent; unset/empty means deny-all. |
 | `FLUX_ALLOW_SOURCE_BUILD` | Permits installing a plugin by building it from source, bypassing the signed-pack channel. See [Plugin trust](../security/plugin-trust.md). |
 | `FLUX_SANDBOX` | `off` / `on` / `require`. With `FLUX_SANDBOX_NET`, `FLUX_SANDBOX_WRITABLE`, `FLUX_BWRAP_BIN`, `FLUX_SANDBOX_EXEC_BIN` — see [OS process sandboxing](../security/os-sandbox.md). |
 | `FLUX_MANAGED_CONFIG` | Path to the managed config file, overriding the `/etc/flux/config.toml` convention. |
@@ -502,11 +536,14 @@ See the [HTTP API](../agent/http-api.md) and
 
 ### Model, context and cost
 
+What these three actually bound, and what flux deliberately does not manage, is explained in
+[Context management](../agent/context-management.md).
+
 | Variable | Effect |
 |---|---|
 | `FLUX_TURN_TOKEN_BUDGET` | Per-turn token budget. |
-| `FLUX_COMPACT_CHARS` | Character threshold that triggers history compaction. |
-| `FLUX_TOOL_OUTPUT_CAP` | Maximum characters of a single tool result kept in context. |
+| `FLUX_COMPACT_CHARS` | Character threshold (of serialized history) that triggers history compaction; `0` disables it. Default `48000`. Not a fraction of the model's context window — the same count applies to every model. |
+| `FLUX_TOOL_OUTPUT_CAP` | Maximum characters of a single tool result kept in context (default `20000`; `0` disables trimming). |
 | `FLUX_CACHE_TAIL` | Tunes the prompt-cache tail boundary. |
 | `FLUX_BEDROCK_HAIKU_PROFILE` | Bedrock inference profile used for the small/fast model. |
 | `FLUX_CODEX_WS` | Toggles the Codex provider's WebSocket transport. |
