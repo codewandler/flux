@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Security
+
+- **Default web.fetch no longer links the PDF parser affected by RUSTSEC-2026-0187** (C-494).
+  Detected PDF bodies stay opaque unless the new pdf feature is enabled; that feature uses the
+  fixed parser line and has a Rust 1.88 feature-specific floor, while the default workspace keeps
+  its declared Rust 1.87 MSRV.
+
 ## [0.52.2] - 2026-08-03
 
 ### Fixed

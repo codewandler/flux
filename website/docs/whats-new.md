@@ -12,6 +12,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Fixed
+
+- **Default web fetches no longer parse PDFs with an unsafe dependency.** PDF bodies are detected
+  and kept opaque unless the optional safe PDF extractor is enabled. Ordinary HTML and HTTP fetches
+  are unchanged.
+
 ## [0.52.2] - 2026-08-03
 
 ### Fixed
