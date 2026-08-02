@@ -32,10 +32,12 @@ serde_json.workspace = true
 tokio.workspace = true
 # HTML parsing for the tier-2 condenser (the html5ever family). The dep lands in flux-web — not
 # flux-markdown — so the markdown engine stays parser-free. Pure Rust; build-weight measured in D-120.
-scraper = "0.27"
+# 0.26+ uses let-chains, which are newer than the workspace's Rust 1.87 MSRV.
+scraper = "0.25"
 # Pure-Rust PDF text extraction (D-161): `web.fetch` returns extracted text for PDF responses instead
 # of a raw lossy byte dump. No native pdfium / C deps — it walks the PDF with `lopdf` + font parsers.
-pdf-extract = "0.12.0"
+# 0.12 requires a lopdf line that uses let-chains newer than Rust 1.87.
+pdf-extract = "0.10"
 
 [dev-dependencies]
 tokio.workspace = true

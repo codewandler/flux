@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The default workspace builds on the declared Rust 1.87 MSRV again** (C-493). Registry-only
+  dependency lines for bundled SQLite, PostgreSQL, plugin archives, HTML/PDF extraction, terminal
+  stability macros, and Slack serialization stay on their last compatible releases. This repairs
+  the published compatibility promise without raising it or introducing a path/git override.
+
 ## [0.52.1] - 2026-08-02
 
 ### Added

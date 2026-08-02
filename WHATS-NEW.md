@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Flux builds on Rust 1.87 again.** Several dependency updates had started requiring newer
+  compilers even though Flux still promised 1.87. The affected database, archive, document,
+  terminal, and channel dependencies are back on compatible lines; no toolchain upgrade is needed.
+
 ## [0.52.1] - 2026-08-02
 
 ### Improved
