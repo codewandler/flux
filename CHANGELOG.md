@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-08-02
+
 ### Added
 
 - **Local agents can now place guarded effects on an explicit remote execution system** (C-436,

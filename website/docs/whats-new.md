@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.51.0] - 2026-08-02
+
 ### Action needed
 
 - **Embedders implementing the guarded system port need to update two exhaustive contracts.**
