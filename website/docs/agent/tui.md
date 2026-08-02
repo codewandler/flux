@@ -133,6 +133,7 @@ These are the TUI's built-ins. A command file discovered from `.flux/commands`, 
 |---|---|
 | `/help` | Open the keybinding and command overlay (same as `F1`) |
 | `/usage` | Overlay: tokens, cache hit rate, and cost for the turn and the session |
+| `/insights [direction]` | Show durable facts for this session, then narrate them once; optional text focuses the summary without changing the facts |
 | `/model [spec]` | Show the active model, or switch mid-session (`/model opus`) |
 | `/effort [low\|medium\|high\|xhigh\|max\|off]` | Show or set reasoning effort; takes effect from the next turn |
 | `/theme [name]` | List the palettes and the current one, or switch (see [Themes](#themes)) |
@@ -150,6 +151,10 @@ These are the TUI's built-ins. A command file discovered from `.flux/commands`, 
 While a turn is running, only the read-only commands (`/help`, `/tools`, `/evidence`, `/session`,
 `/sessions`, `/queue`, `/theme`, bare `/effort`) and `/quit` run — anything that mutates the session
 asks you to interrupt the current action first.
+
+`/insights` is an idle-only, cancellable report action because it makes one provider call. Its fact
+block comes from the session log, the optional direction only focuses the prose, and the generated
+summary is displayed without becoming conversation history.
 
 `/sessions` opens a picker rather than printing a list: type to filter, `↑`/`↓` to
 select, `Enter` to switch, `Esc` to close. Switching is refused while a turn is

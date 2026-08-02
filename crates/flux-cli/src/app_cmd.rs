@@ -887,7 +887,7 @@ impl flux_tui::ModelResolver for CliTuiModelResolver {
 /// load (with a warning) rather than shadowing it — mirrors `flux-tui`'s `BUILTIN_COMMANDS` names.
 const TUI_BUILTIN_COMMANDS: &[&str] = &[
     "help", "usage", "clear", "new", "model", "effort", "quit", "exit", "compact", "shell",
-    "tools", "evidence", "session", "sessions", "resume", "queue",
+    "tools", "evidence", "session", "sessions", "resume", "queue", "insights",
 ];
 
 pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {

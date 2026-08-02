@@ -551,22 +551,24 @@ pub(crate) fn finalize_row(model: String, acc: RowAcc) -> ModelCost {
 }
 
 /// Roll up token spend + cost by model, folding a stream's events. Prefers the per-call
-/// [`EventKind::CallUsage`] attribution (C-06); a stream with none recorded (an older log, written
-/// before per-call attribution existed) falls back to summing each turn's [`EventKind::TurnEnded`]
-/// total, attributed to that turn's [`EventKind::TurnStarted`] model — coarser (turn-level, not
-/// call-level), but every old log still rolls up rather than reporting nothing. The two sources are
-/// never mixed within one stream: a stream that recorded even one `CallUsage` uses ONLY those (the
-/// turn totals they came from would double-count the same spend). Rows are sorted by model id for a
-/// stable, diffable report. Each call (or, in the fallback, each turn total) is priced
+/// [`EventKind::CallUsage`] attribution (C-06); a turn with none recorded (an older log, written
+/// before per-call attribution existed) falls back to its [`EventKind::TurnEnded`] total, attributed
+/// to that turn's [`EventKind::TurnStarted`] model — coarser (turn-level, not call-level), but every
+/// old turn still rolls up rather than reporting nothing. Selection is per turn, not per stream: an
+/// unscoped maintenance call (C-490 insights) or a modern turn appended to a legacy session must not
+/// make one `CallUsage` suppress every older turn total. Rows are sorted by model id for a stable,
+/// diffable report. Each call (or, in the fallback, each turn total) is priced
 /// INDIVIDUALLY — see [`RowAcc`] — so a mix of provider-reported and table-estimated calls for the
 /// same model sums correctly instead of one source silently eclipsing the other (C-34).
 pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<ModelCost> {
     let mut per_model: BTreeMap<String, RowAcc> = BTreeMap::new();
-    let mut any_call_usage = false;
+    let mut covered_turns = std::collections::HashSet::new();
 
     for e in events {
         if let EventKind::CallUsage { model, usage } = &e.kind {
-            any_call_usage = true;
+            if let Some(turn_id) = e.turn_id {
+                covered_turns.insert(turn_id);
+            }
             per_model
                 .entry(model.clone())
                 .or_default()
@@ -574,18 +576,18 @@ pub fn cost_summary(events: &[StoredEvent], pricing: &PricingTable) -> Vec<Model
         }
     }
 
-    if !any_call_usage {
-        // Fallback: attribute each turn's total to the model active when that turn STARTED (the
-        // `turns()` join point) — the best attribution an old log (no `CallUsage`) can give. Each
-        // turn's total is still priced as ONE call (single-total pricing, same as before C-34) —
-        // there is no per-call granularity to recover from an old log.
-        for t in turns(events) {
-            if let Some(usage) = &t.usage {
-                per_model
-                    .entry(t.model.clone())
-                    .or_default()
-                    .record_call(usage, &t.model, pricing);
-            }
+    // Fallback: attribute each uncovered turn's total to the model active when that turn STARTED
+    // (the `turns()` join point) — the best attribution an old log can give. Each turn's total is
+    // still priced as ONE call; there is no per-call granularity to recover from that turn.
+    for t in turns(events) {
+        if covered_turns.contains(&t.turn_id) {
+            continue;
+        }
+        if let Some(usage) = &t.usage {
+            per_model
+                .entry(t.model.clone())
+                .or_default()
+                .record_call(usage, &t.model, pricing);
         }
     }
 

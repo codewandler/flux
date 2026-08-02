@@ -990,6 +990,28 @@ impl EventStore {
         Ok(())
     }
 
+    /// Record one provider call that belongs to a session but not to a conversational turn.
+    ///
+    /// Maintenance/reporting calls such as C-490 insights must remain visible to cost accounting
+    /// without inventing a `TurnStarted` or appending generated prose to the conversation. The
+    /// event therefore has no `turn_id`; [`projection::cost_summary`] folds it directly while
+    /// retaining `TurnEnded.usage` fallback for uncovered legacy turns in the same stream.
+    pub fn record_unscoped_call_usage(
+        &self,
+        stream: &str,
+        model: &str,
+        usage: Usage,
+    ) -> Result<()> {
+        self.append(
+            stream,
+            NewEvent::new(EventKind::CallUsage {
+                model: model.to_string(),
+                usage,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Register a future wake-up on `stream` (A-98): resume this session with `prompt` (+
     /// optional `context`, replayed back unchanged) once `fire_at_ms` elapses. Returns the
     /// wake-up's id — the store-minted id of the `WakeupScheduled` event itself, so callers never

@@ -273,6 +273,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("effort", "show or set reasoning effort"),
     ("quit", "exit flux"),
     ("usage", "tokens, cache hit rate, and cost"),
+    ("insights", "summarize current-session facts"),
     ("compact", "compact session context"),
     ("shell", "toggle the generic bash op"),
     ("tools", "list registered tools"),
@@ -1373,6 +1374,21 @@ impl ChatState {
                 operations,
                 usage: u.clone(),
             });
+        }
+    }
+
+    /// Fold a non-turn provider call into session totals only. `/insights` is not a new user turn
+    /// and must not rewrite the per-turn `/usage` overlay the operator just inspected.
+    fn record_background_usage(&mut self, model: &str, usage: &Usage) {
+        self.cache.add(usage);
+        self.tokens_out += usage.output_tokens;
+        self.tokens_reasoning += usage.reasoning_tokens;
+        if let Some((_, pricing)) = &self.cost_model {
+            match pricing.cost(usage, model) {
+                Some(money) => *self.cost_usd.get_or_insert(0.0) += money.usd,
+                None if flux_core::is_metered_cloud_spec(model) => self.cost_unpriced = true,
+                None => {}
+            }
         }
     }
 
@@ -2850,8 +2866,8 @@ impl ChatState {
         let mut turn_starts: HashMap<i64, i64> = HashMap::new();
         let mut prior_turn_elapsed = None;
         let mut prior_user_completed = false;
-        let mut turn_usage = Vec::new();
-        let mut call_usage: Vec<(String, Usage)> = Vec::new();
+        let mut turn_usage: Vec<(Option<i64>, Usage)> = Vec::new();
+        let mut call_usage: Vec<(Option<i64>, String, Usage)> = Vec::new();
         let mut proposed_plan_recorded = false;
 
         for event in stored {
@@ -3001,7 +3017,7 @@ impl ChatState {
                 }),
                 EventKind::TurnEnded { usage, .. } => {
                     if let Some(usage) = usage {
-                        turn_usage.push(usage);
+                        turn_usage.push((event.turn_id, usage));
                     }
                     prior_turn_elapsed = event
                         .turn_id
@@ -3010,7 +3026,9 @@ impl ChatState {
                             Duration::from_millis(event.ts_ms.saturating_sub(started).max(0) as u64)
                         });
                 }
-                EventKind::CallUsage { model, usage } => call_usage.push((model, usage)),
+                EventKind::CallUsage { model, usage } => {
+                    call_usage.push((event.turn_id, model, usage))
+                }
                 _ => {}
             }
         }
@@ -3054,27 +3072,44 @@ impl ChatState {
         // carrying the previous session's workers.
         self.fleet = crate::fleet::FleetProjection::new();
         self.fleet_rows.clear();
-        for usage in &turn_usage {
+        for (_, usage) in &turn_usage {
             self.tokens_out += usage.output_tokens;
             self.tokens_reasoning += usage.reasoning_tokens;
         }
-        // C-139: prompt tiers come from the per-call rows, matching the live path and `flux usage`.
-        // Only when a session predates `CallUsage` (or recorded none) do we fall back to the turn
-        // snapshots — under-counted, but the best the log holds. Same precedence the cost fold below
-        // already uses.
-        if call_usage.is_empty() {
-            for usage in &turn_usage {
-                self.cache.add(usage);
+        // Unscoped maintenance calls have no TurnEnded total, so add their generated tokens here;
+        // scoped calls are already represented by their owning turn total above.
+        for (turn_id, _, usage) in &call_usage {
+            if turn_id.is_none() {
+                self.tokens_out += usage.output_tokens;
+                self.tokens_reasoning += usage.reasoning_tokens;
             }
-        } else {
-            for (_, usage) in &call_usage {
+        }
+        // C-139/C-490: use per-call rows for the turns they cover, then retain the old turn-total
+        // fallback for every uncovered legacy turn. One unscoped insights call must not suppress a
+        // whole old session's prompt accounting.
+        let covered_turns: std::collections::HashSet<i64> = call_usage
+            .iter()
+            .filter_map(|(turn_id, _, _)| *turn_id)
+            .collect();
+        for (_, _, usage) in &call_usage {
+            self.cache.add(usage);
+        }
+        for (turn_id, usage) in &turn_usage {
+            if !turn_id.is_some_and(|id| covered_turns.contains(&id)) {
                 self.cache.add(usage);
             }
         }
         if let Some((_, pricing)) = &self.cost_model {
-            if call_usage.is_empty() {
-                if let Some(spec) = self.model_spec.as_deref() {
-                    for usage in &turn_usage {
+            for (_, model, usage) in &call_usage {
+                match pricing.cost(usage, model) {
+                    Some(money) => *self.cost_usd.get_or_insert(0.0) += money.usd,
+                    None if flux_core::is_metered_cloud_spec(model) => self.cost_unpriced = true,
+                    None => {}
+                }
+            }
+            if let Some(spec) = self.model_spec.as_deref() {
+                for (turn_id, usage) in &turn_usage {
+                    if !turn_id.is_some_and(|id| covered_turns.contains(&id)) {
                         match pricing.cost(usage, spec) {
                             Some(money) => *self.cost_usd.get_or_insert(0.0) += money.usd,
                             None if flux_core::is_metered_cloud_spec(spec) => {
@@ -3082,16 +3117,6 @@ impl ChatState {
                             }
                             None => {}
                         }
-                    }
-                }
-            } else {
-                for (model, usage) in &call_usage {
-                    match pricing.cost(usage, model) {
-                        Some(money) => *self.cost_usd.get_or_insert(0.0) += money.usd,
-                        None if flux_core::is_metered_cloud_spec(model) => {
-                            self.cost_unpriced = true
-                        }
-                        None => {}
                     }
                 }
             }
@@ -3620,6 +3645,9 @@ where
                         round,
                         timing,
                     });
+                }
+                UiEvent::BackgroundUsage { model, usage } => {
+                    state.record_background_usage(&model, &usage);
                 }
                 UiEvent::Retry {
                     attempt,
@@ -4787,6 +4815,9 @@ async fn handle_command(
         "compact" => {
             *cancel = start_compaction(agent, tx, state);
         }
+        "insights" => {
+            *cancel = start_insights(agent, tx, state, args.to_string());
+        }
         "theme" if args.is_empty() => state.push(Entry::Notice {
             text: format!(
                 "themes: {} · current: {}",
@@ -4974,6 +5005,96 @@ fn start_compaction(
                 sev: notice.1,
             },
         );
+        send_action_event(&task_tx, action_id, UiEvent::Finished);
+    });
+    cancel
+}
+
+fn start_insights(
+    agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    state: &mut ChatState,
+    direction: String,
+) -> CancellationToken {
+    let action_id = state.begin_action();
+    state.phase = Phase::Thinking;
+    state.turn_start = Some(Instant::now());
+    state.follow = true;
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task_agent = agent.clone();
+    let task_tx = tx.clone();
+    let session = state.session_id.clone();
+    let pricing = state
+        .cost_model
+        .as_ref()
+        .map(|(_, pricing)| pricing.clone())
+        .unwrap_or_else(flux_core::PricingTable::builtin);
+    tokio::spawn(async move {
+        let engine = task_agent.read().await;
+        let redactor = engine.executor.context().redactor.clone();
+        let facts = flux_flow::insights::collect_facts(
+            &engine.events,
+            &flux_flow::insights::InsightScope::Session {
+                root: session.clone(),
+                label: format!("current session · {session}"),
+            },
+            &pricing,
+            &redactor,
+        );
+        let facts = match facts {
+            Ok(facts) => facts,
+            Err(error) => {
+                send_action_event(
+                    &task_tx,
+                    action_id,
+                    UiEvent::Notice {
+                        text: format!("insights: {error}"),
+                        sev: Sev::Err,
+                    },
+                );
+                send_action_event(&task_tx, action_id, UiEvent::Finished);
+                return;
+            }
+        };
+        send_action_event(
+            &task_tx,
+            action_id,
+            UiEvent::Notice {
+                text: facts.render(),
+                sev: Sev::Info,
+            },
+        );
+        if facts.is_empty() {
+            send_action_event(&task_tx, action_id, UiEvent::Finished);
+            return;
+        }
+        let (summary, usage) = flux_flow::insights::narrate(
+            engine.provider.as_ref(),
+            &engine.model,
+            &facts,
+            (!direction.is_empty()).then_some(direction.as_str()),
+            &redactor,
+            &task_cancel,
+        )
+        .await;
+        let model = flux_core::canonical_model_spec(Some(engine.provider.name()), &engine.model);
+        let accounting = engine
+            .events
+            .record_unscoped_call_usage(&session, &model, usage.clone());
+        if accounting.is_ok() {
+            send_action_event(
+                &task_tx,
+                action_id,
+                UiEvent::BackgroundUsage { model, usage },
+            );
+        }
+        let (text, sev) = match (summary, accounting) {
+            (Ok(summary), Ok(())) => (format!("Summary\n{summary}"), Sev::Info),
+            (_, Err(error)) => (format!("insights accounting: {error}"), Sev::Err),
+            (Err(error), Ok(())) => (format!("insights: {error}"), Sev::Err),
+        };
+        send_action_event(&task_tx, action_id, UiEvent::Notice { text, sev });
         send_action_event(&task_tx, action_id, UiEvent::Finished);
     });
     cancel
@@ -6002,7 +6123,7 @@ mod tests {
     #[test]
     fn help_overlay_lists_keys_and_all_commands() {
         let mut state = ChatState::new("mock".into());
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 26)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(!screen(&terminal).contains("help · Esc close"));
 
@@ -7970,6 +8091,46 @@ mod tests {
     }
 
     #[test]
+    fn resumed_session_keeps_legacy_usage_beside_unscoped_insight_call() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let sid = events.create_session("legacy-model").unwrap();
+        let turn = events
+            .begin_turn(&sid, "legacy turn", "legacy-model")
+            .unwrap();
+        events
+            .end_turn(
+                &sid,
+                turn,
+                "ok",
+                1,
+                "done",
+                Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    ..Usage::default()
+                }),
+            )
+            .unwrap();
+        events
+            .record_unscoped_call_usage(
+                &sid,
+                "summary-model",
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..Usage::default()
+                },
+            )
+            .unwrap();
+
+        let mut state = ChatState::new("legacy-model".into());
+        state.project_session(&events, &sid).unwrap();
+
+        assert_eq!(state.cache.fresh, 110);
+        assert_eq!(state.tokens_out, 22);
+    }
+
+    #[test]
     fn resumed_plan_uses_the_attempt_without_duplicate_context_message() {
         let events = flux_events::EventStore::in_memory().unwrap();
         let sid = events.create_session("mock").unwrap();
@@ -8279,6 +8440,18 @@ mod tests {
         );
         assert_eq!(state.turn_cache.read, 90_000);
 
+        state.record_background_usage(
+            "claude/claude-fable-5",
+            &Usage {
+                input_tokens: 500,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.cache.fresh, 10_500);
+        assert_eq!(state.turn_cache.fresh, 10_000);
+        assert_eq!(state.turn_rounds.len(), 1);
+
         // The next real turn does clear it.
         state.begin_turn_usage();
         assert!(state.turn_rounds.is_empty());
@@ -8309,6 +8482,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(screen(&terminal).contains("this turn"), "overlay rendered");
+    }
+
+    #[test]
+    fn slash_insights_is_listed_as_a_builtin_report() {
+        assert!(
+            all_slash_commands(&[])
+                .iter()
+                .any(|command| command.name == "insights"),
+            "/insights must be listed in the slash menu"
+        );
     }
 
     /// C-140: a session with no model calls yet renders an empty state, not a bare frame or a
@@ -8907,7 +9090,7 @@ mod tests {
 
     #[test]
     fn slash_menu_shows_overflow_counter_past_the_window() {
-        // C-153: the slash menu only ever renders 6 rows; with the 16 built-ins visible on a bare
+        // C-153: the slash menu only ever renders 6 rows; with all built-ins visible on a bare
         // `/`, it must signal that more rows exist below rather than silently hiding them.
         let mut state = ChatState::new("mock".into());
         state.set_input("/");
@@ -8915,7 +9098,10 @@ mod tests {
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let content = screen(&terminal);
         assert!(content.contains("/help"));
-        assert!(content.contains("1/16"), "{content}");
+        assert!(
+            content.contains(&format!("1/{}", BUILTIN_COMMANDS.len())),
+            "{content}"
+        );
     }
 
     #[test]

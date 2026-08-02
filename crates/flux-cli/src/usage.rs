@@ -764,30 +764,31 @@ fn flux_records_from_events(
     pricing: &PricingTable,
 ) -> Vec<UsageRecord> {
     let mut records = Vec::new();
-    let any_call_usage = events
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CallUsage { .. }));
-    if any_call_usage {
-        for event in events {
-            if let EventKind::CallUsage { model, usage } = &event.kind {
-                if usage_is_empty(usage) {
-                    continue;
-                }
-                records.push(usage_record(
-                    HarnessKind::Flux,
-                    stream.to_string(),
-                    model.clone(),
-                    Some(event.ts_ms),
-                    Some(event.ts_ms),
-                    usage.clone(),
-                    pricing,
-                ));
+    let mut covered_turns = HashSet::new();
+    for event in events {
+        if let EventKind::CallUsage { model, usage } = &event.kind {
+            if let Some(turn_id) = event.turn_id {
+                covered_turns.insert(turn_id);
             }
+            if usage_is_empty(usage) {
+                continue;
+            }
+            records.push(usage_record(
+                HarnessKind::Flux,
+                stream.to_string(),
+                model.clone(),
+                Some(event.ts_ms),
+                Some(event.ts_ms),
+                usage.clone(),
+                pricing,
+            ));
         }
-        return records;
     }
 
     for turn in flux_events::turns(events) {
+        if covered_turns.contains(&turn.turn_id) {
+            continue;
+        }
         if let Some(usage) = turn.usage {
             if usage_is_empty(&usage) {
                 continue;
@@ -2324,6 +2325,52 @@ mod tests {
             active: false,
             last_len: 0,
         }
+    }
+
+    #[test]
+    fn flux_usage_keeps_legacy_turn_total_beside_unscoped_insight_call() {
+        let events = EventStore::ephemeral();
+        let session = events.create_session("legacy-model").unwrap();
+        let turn = events
+            .begin_turn(&session, "legacy turn", "legacy-model")
+            .unwrap();
+        events
+            .end_turn(
+                &session,
+                turn,
+                "ok",
+                1,
+                "done",
+                Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    ..Usage::default()
+                }),
+            )
+            .unwrap();
+        events
+            .record_unscoped_call_usage(
+                &session,
+                "summary-model",
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..Usage::default()
+                },
+            )
+            .unwrap();
+
+        let stored = events.load_stream(&session, None).unwrap();
+        let records = flux_records_from_events(&session, &stored, &PricingTable::builtin());
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.usage.input_tokens)
+                .sum::<u64>(),
+            110
+        );
     }
 
     #[test]

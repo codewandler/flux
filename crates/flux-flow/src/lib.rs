@@ -24,6 +24,7 @@ pub mod cassette;
 pub mod composites;
 pub mod engine;
 pub mod fork;
+pub mod insights;
 pub mod loop_host;
 mod model;
 pub mod registry;

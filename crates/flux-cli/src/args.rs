@@ -476,6 +476,13 @@ pub(super) enum Commands {
     },
     /// Per-model token usage + cost across flux and detected local agent harnesses.
     Usage(usage::UsageArgs),
+    /// Derive today's work facts from the durable Flux session log and narrate them with one
+    /// tool-free model call. Empty days make no provider call.
+    Insights {
+        /// Model used for the one summary call; defaults through normal Flux configuration.
+        #[arg(short = 'm', long, value_name = "PROVIDER/MODEL")]
+        model: Option<String>,
+    },
     /// Hermetically replay a recorded session (A-45): host-recorded execution flows re-parse from
     /// durable history, and op outputs come from the C-43 cassette — no model call, no live IO,
     /// side effects never re-fired. Divergence from the recording fails loudly.

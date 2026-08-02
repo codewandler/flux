@@ -47,6 +47,7 @@ and [Safety & approvals](./safety.md).
 | `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) — the public, in-repo scoring engine; an optional standalone harness benchmark is maintained separately and is not currently published |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
+| `flux insights [-m <provider/model>]` | derive today's sessions, outcomes, time, usage, operations, errors, approvals and subjects from the durable log, then narrate those redacted facts with one tool-free model call |
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
@@ -269,13 +270,14 @@ Bare `flux` opens a line-oriented REPL. Its built-in commands:
 | `/shell` | explicitly toggle the optional shell group |
 | `/session` · `/sessions` · `/resume <id>` · `/clear` | session management (`/sessions --prune` deletes empty sessions) |
 | `/compact` | compact older conversation history now |
+| `/insights [direction]` | show deterministic facts for the active session, then focus one grounded summary (for example, `focus on blockers`) |
 | `/pd <goal>` | plan-and-dispatch: run subtasks as parallel dependency waves |
 | `/goal <condition>` | drive turns toward a goal, stopping once it is satisfied |
 | `/loop <n> <task>` | repeat a task up to `n` times |
 | `/exit` · `/quit` | leave the REPL (`Ctrl-D` also exits; `Ctrl-C` interrupts a running turn) |
 
 The [TUI](./tui.md#slash-commands) has its own, partly different set — it adds `/new`, `/usage`,
-`/queue` and `/theme`, and does not carry `/pd`, `/goal`, or `/loop`.
+`/queue` and `/theme`, shares `/insights`, and does not carry `/pd`, `/goal`, or `/loop`.
 
 ## Command files
 

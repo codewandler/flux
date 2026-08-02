@@ -656,7 +656,7 @@ impl TurnCost {
 /// load (with a warning) rather than shadowing it — see [`load_command_files`].
 const REPL_BUILTIN_COMMANDS: &[&str] = &[
     "exit", "quit", "help", "shell", "model", "effort", "pd", "goal", "loop", "tools", "evidence",
-    "session", "sessions", "resume", "compact", "clear",
+    "session", "sessions", "resume", "compact", "insights", "clear",
 ];
 
 pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
@@ -739,6 +739,10 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                         ("/resume <id>", "switch to a previous session"),
                         ("/clear", "start a new session"),
                         ("/compact", "summarise and compact the context window"),
+                        (
+                            "/insights [direction]",
+                            "derive current-session facts and narrate them once",
+                        ),
                         ("/pd <goal>", "plan-and-dispatch: parallel dependency waves"),
                         (
                             "/goal <cond>",
@@ -988,6 +992,22 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                         Err(e) => eprintln!("{} {e}", style::red("compact error:")),
                     }
                 }
+                "insights" => {
+                    let direction = rest
+                        .strip_prefix("insights")
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    run_interruptible(|cancel| {
+                        run_repl_insights(
+                            &agent,
+                            &session_id,
+                            (!direction.is_empty()).then_some(direction.as_str()),
+                            cancel,
+                        )
+                    })
+                    .await;
+                }
                 "clear" => {
                     // Don't `?`-abort the REPL on a store error: that would also skip the
                     // loop-exit `persist_new_rules`, silently dropping every "always allow"
@@ -1043,6 +1063,56 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
     }
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
     Ok(())
+}
+
+async fn run_repl_insights(
+    agent: &FlowEngine,
+    session_id: &str,
+    direction: Option<&str>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let redactor = agent.executor.context().redactor.clone();
+    let pricing = flux_credentials::load_pricing_table();
+    let facts = match flux_flow::insights::collect_facts(
+        &agent.events,
+        &flux_flow::insights::InsightScope::Session {
+            root: session_id.to_string(),
+            label: format!("current session · {session_id}"),
+        },
+        &pricing,
+        &redactor,
+    ) {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("{} {error}", style::red("insights error:"));
+            return;
+        }
+    };
+    println!("{}", facts.render());
+    if facts.is_empty() {
+        return;
+    }
+    let (summary, usage) = flux_flow::insights::narrate(
+        agent.provider.as_ref(),
+        &agent.model,
+        &facts,
+        direction,
+        &redactor,
+        &cancel,
+    )
+    .await;
+    let model = flux_core::canonical_model_spec(Some(agent.provider.name()), &agent.model);
+    if let Err(error) = agent
+        .events
+        .record_unscoped_call_usage(session_id, &model, usage)
+    {
+        eprintln!("{} {error}", style::red("insights accounting error:"));
+        return;
+    }
+    match summary {
+        Ok(summary) => println!("\nSummary\n{summary}"),
+        Err(error) => eprintln!("{} {error}", style::red("insights error:")),
+    }
 }
 
 /// Run `make(cancel)` to completion, but cancel it on Ctrl-C (the token's clones are linked, so

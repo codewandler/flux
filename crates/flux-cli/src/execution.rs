@@ -2194,6 +2194,31 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 
+        // `flux insights -m mock` is a direct, tool-free narration request rather than the first
+        // stage of the adaptive loop. Keep the offline provider useful on that public surface and
+        // give its usage/accounting path a real deterministic payload.
+        if req
+            .system_text()
+            .is_some_and(|system| system.contains("Narrate only the supplied deterministic facts"))
+            && req.tools.is_empty()
+        {
+            let chunks = vec![
+                Chunk::TextDelta(
+                    "Highlights\n- Durable facts collected.\n\nPatterns\n- See the fact block.\n\nBlockers / open threads\n- The mock provider does not infer causes.\n\nSuggested focus\n- Use the recorded outcomes and denials."
+                        .into(),
+                ),
+                Chunk::Usage(Usage {
+                    input_tokens: 128,
+                    output_tokens: 32,
+                    ..Default::default()
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+
         let target = std::env::var("FLUX_MOCK_TOOL")
             .ok()
             .or_else(|| std::env::var("FLUX_MOCK_BASH").ok().map(|_| "bash".into()))
@@ -2375,6 +2400,35 @@ impl Provider for MockCliProvider {
         }
 
         unreachable!("the first mock provider call is always intent detection")
+    }
+}
+
+#[cfg(test)]
+mod mock_insights_tests {
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn offline_provider_accepts_the_tool_free_insight_request() {
+        let provider = MockCliProvider::default();
+        let request = Request::new("mock", "deterministic fact packet")
+            .with_system("Narrate only the supplied deterministic facts")
+            .with_thinking(false);
+        let mut stream = provider.stream(request).await.unwrap();
+        let mut text = String::new();
+        let mut usage = Usage::default();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                Chunk::TextDelta(delta) => text.push_str(&delta),
+                Chunk::Usage(call_usage) => usage = call_usage,
+                _ => {}
+            }
+        }
+
+        assert!(text.contains("Highlights"));
+        assert_eq!(usage.input_tokens, 128);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
     }
 }
 

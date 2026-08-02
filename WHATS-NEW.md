@@ -17,6 +17,12 @@
 
 ### New
 
+- **See what today's agent work actually accomplished.** Run `flux insights` for a factual daily
+  rollup of sessions, outcomes, time, model usage, operations, errors, approvals and touched
+  subjects, followed by one grounded summary. Inside the REPL or TUI, `/insights [direction]`
+  reports on the current session and can focus the summary on something like blockers. Flux
+  computes every fact from the durable log; the model only narrates the bounded, redacted result.
+
 - **Run a review shaped by the project instead of a fixed checklist.** The new
   `examples/review.flux` classifies the current project from its file structure and Git history,
   derives four project-specific review dimensions from that classification alone, runs four

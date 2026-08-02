@@ -53,6 +53,12 @@ pub(super) enum UiEvent {
         usage: Usage,
         timing: ModelCallTiming,
     },
+    /// A tool-free maintenance/report call (currently `/insights`): durable session usage that
+    /// updates session totals without pretending to be a round of the previous conversational turn.
+    BackgroundUsage {
+        model: String,
+        usage: Usage,
+    },
     /// A provider connect retry reported *while the wait is still ahead of us* (C-181) — a backed-off
     /// 429/5xx, a forced OAuth refresh, or a transport→HTTP fallback.
     Retry {

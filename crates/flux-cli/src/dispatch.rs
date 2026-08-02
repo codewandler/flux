@@ -179,6 +179,9 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Docs { .. }
         | Commands::Completion { .. }
         | Commands::Doctor { .. } => None,
+        // One foreground, tool-free provider request over already-redacted local facts. No agent
+        // turn, plugin, operation dispatch, or process launch exists for the OS sandbox to bound.
+        Commands::Insights { .. } => None,
     }
 }
 
@@ -770,6 +773,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             }) => run_sessions(prune, query, file, since, until),
             Some(Commands::Wakeups { action }) => run_wakeups(action),
             Some(Commands::Usage(args)) => run_usage(args),
+            Some(Commands::Insights { model }) => run_insights(model).await,
             Some(Commands::Replay {
                 session,
                 turn,

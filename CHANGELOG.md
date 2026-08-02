@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Grounded session insights (C-490).** `flux insights` deterministically folds today's durable
+  Flux events into sessions, turns, outcomes, time, usage/cost, operations, errors, approvals and
+  subjects; `/insights [direction]` does the same for the active REPL/TUI session. One bounded,
+  tool-free model call narrates the redacted facts, while its usage is recorded without persisting
+  generated prose as conversation history.
+
 - **Documentation examples are now real local workbenches** (L-128). Flux code blocks and
   `/console/` share a lazy Monaco editor backed by the shipped Flux LSP for diagnostics,
   completion, hover, formatting, and semantic syntax. Declared examples on the language cookbook

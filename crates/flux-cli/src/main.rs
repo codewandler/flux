@@ -26,6 +26,7 @@ mod doctor;
 mod execution;
 mod export_cmd;
 mod flow_cmd;
+mod insights_cmd;
 mod lab_cmd;
 mod plugin_cmd;
 mod policy_cmd;
@@ -49,6 +50,7 @@ use doctor::*;
 use execution::*;
 use export_cmd::*;
 use flow_cmd::*;
+use insights_cmd::*;
 use lab_cmd::*;
 use plugin_cmd::*;
 use policy_cmd::*;
@@ -4139,6 +4141,7 @@ mod tests {
             "plugin",
             "skill",
             "docs",
+            "insights",
             "completion",
             "preset",
         ] {
@@ -4432,6 +4435,8 @@ mod tests {
         ok(&["flux", "skill", "--install", "--global"]);
         ok(&["flux", "docs", "--bind", "0.0.0.0:8788"]);
         ok(&["flux", "docs", "--model", "mock"]);
+        ok(&["flux", "insights"]);
+        ok(&["flux", "insights", "--model", "mock"]);
         ok(&["flux", "replay", "--turn", "1"]);
         ok(&["flux", "eval", "terminal-bench"]);
         ok(&["flux", "eval", "multi", "--members", "synthetic,mock"]);

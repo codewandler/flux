@@ -70,6 +70,7 @@ Inside the REPL:
 | `/tools` | list available operations |
 | `/evidence` | inspect intent, tool, approval, and execution observations |
 | `/sessions`, `/resume <id>`, `/clear` | session management |
+| `/insights [direction]` | derive current-session facts and focus one grounded summary |
 | `/help` | full command list |
 
 ## Terminal UI
@@ -85,7 +86,7 @@ background. Enter sends; `Ctrl-J`, `Alt-Enter`, or `Shift-Enter` inserts a newli
 inserted atomically. While a turn runs, Enter adds a visible FIFO follow-up instead of replacing the
 previous one; `/queue` opens the editor (`Delete`, `Alt-Up`/`Alt-Down`, Enter to edit).
 
-`/model`, `/shell`, `/tools`, `/evidence`, `/compact`, `/new`, and `/clear` mirror
+`/model`, `/shell`, `/tools`, `/evidence`, `/compact`, `/insights`, `/new`, and `/clear` mirror
 the REPL controls. `/sessions` opens a picker, and `/resume <id>` switches directly; either path
 reconstructs messages, plans, tool results, notices, and usage from the durable session log without
 re-running operations. Use PgUp/PgDn or the mouse wheel for scrollback and `Ctrl-End` to follow the
@@ -211,6 +212,9 @@ flux usage                       # aligned token/cost dashboard for flux + detec
                                  #   histories. Use --last 7d,
                                  #   --since/--until, --no-external, --harness ..., --progress ...,
                                  #   or --json for normalized machine-readable metrics + rows
+flux insights                    # derive today's facts from Flux's durable session log, print the
+                                 #   auditable fact block, then spend one tool-free model call on a
+                                 #   grounded summary; -m/--model overrides the configured model
 flux replay <session|last>       # TIME MACHINE (C-43/A-45): hermetically re-execute a recorded run —
                                  #   authored or host-derived flows re-parse from durable source, op outputs are served
                                  #   from the recorded cassette: NO model call, NO live IO, side effects
