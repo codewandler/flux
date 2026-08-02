@@ -5,7 +5,9 @@
 //! headline test here is the load matrix: every mock, under every hard case, at every viewport —
 //! inside its bounds, and naming whatever it hides.
 
-use flux_tui::loopmock::{self, LoadCase, Mock, Viewport, LOAD_CASES, MOCKS};
+use flux_tui::loopmock::{
+    self, Axes, Depth, LoadCase, Mock, Shape, Viewport, AXIS_SPACE, LOAD_CASES, MOCKS,
+};
 use flux_tui::theme::Theme;
 
 /// Widths the sweep visits: every mock's `min_cols` and one column under it — the boundaries where
@@ -36,6 +38,584 @@ fn matrix() -> Vec<(Mock, LoadCase, Viewport)> {
         }
     }
     out
+}
+
+// ===========================================================================
+// A-146 — the three axes
+//
+// The claim under test: the five mocks are not five candidates but points in a space with three
+// orthogonal controls, so that "the flat thread with condensing and a depth limit and an optional
+// pane *is* the split". These tests measure that rather than argue it, and they are the evidence
+// behind the DEFAULTS section of `loopmock::RECOMMENDATION`.
+// ===========================================================================
+
+/// Every configuration × every hard case × the same viewport envelope the five are held to.
+fn axis_matrix() -> Vec<(Axes, LoadCase, Viewport)> {
+    let mut out = Vec::new();
+    for axes in AXIS_SPACE {
+        for case in LOAD_CASES {
+            for cols in COLS {
+                for rows in ROWS {
+                    out.push((*axes, case, Viewport { cols, rows }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the split has room to express its own rule at `vp`: **every** top-level step on the
+/// rail. That is what mock 3's `rail_rows` is for — one row per top-level step, plus the focused
+/// one's subtree — and below the rows it needs, its window collapses the rail onto the tail around
+/// the focus, which is what *any* uncondensed view shows. Comparisons taken there measure the
+/// terminal rather than the layout, which is the confound A-144 was already caught by once.
+fn split_can_express_its_rule(case: LoadCase, vp: Viewport, theme: &Theme) -> bool {
+    let split = loopmock::render(Mock::Split, case, vp, theme);
+    !split.below_floor
+        && loopmock::fixture(case)
+            .steps
+            .iter()
+            .all(|s| split.represented.contains(&s.id))
+}
+
+/// Every configuration whose drawing of `case` at `vp` has the same [`Shape`] as mock 3's — the
+/// same steps shown and the same number withheld, with *how* each draws them thrown away. That is
+/// the only comparison this story can be settled on: mocks 1 and 2 prove a shape does not determine
+/// a picture, and A-145 proved a withheld *count* does not determine a shape.
+fn axes_matching_the_split(case: LoadCase, vp: Viewport, theme: &Theme) -> Vec<String> {
+    let split = Shape::of(&loopmock::render(Mock::Split, case, vp, theme), case);
+    AXIS_SPACE
+        .iter()
+        .filter(|a| {
+            let r = loopmock::render_axes(**a, case, vp, theme);
+            // A refusal notice represents no steps, so two layouts under their floors are trivially
+            // "equal" at nothing — an artefact that would report agreement exactly where neither
+            // draws.
+            !r.below_floor && Shape::of(&r, case) == split
+        })
+        .map(|a| a.label())
+        .collect()
+}
+
+/// ⚠⚠ **THE HEADLINE, AND IT IS A REFUTATION.**
+///
+/// The story's claim is that composing the three axes reproduces the five layouts, and the case it
+/// names is the split: *"the flat thread with condensing on, a depth limit and the pane enabled
+/// renders equivalently to the split"*. Swept over the **whole** axis space rather than the single
+/// setting the claim names, it is false, and the boundary is exactly this:
+///
+/// > **The axes reach the split only when the run has ONE top-level step, or the terminal is too
+/// > short for the split to draw its own rule. Give it nine turns and the rows to show them and
+/// > nothing in the space reaches it.**
+///
+/// Measured over the full envelope: on the real nine-turn session there are 24 viewports where the
+/// split both draws its rule and withholds something, and **zero** matches in them; on the fan-out
+/// case, 42 viewports and zero matches. On one recorded *turn* every viewport matches — because
+/// with a single root the split's rule and an uncondensed view are literally the same rule.
+///
+/// The reason is structural rather than a tuning miss. The split's rail is not "condense completed":
+/// it is *one row per top-level step, plus the focused top-level step's entire subtree* — including
+/// that subtree's **completed** work, which condensing by definition folds away. So its rule
+/// discriminates on **focus** and condensing discriminates on **status**. With one root the two
+/// coincide; with nine turns they cannot. Section 2 of the recommendation says what A-137 owes.
+///
+/// ⚠ An earlier reading of this measurement, taken only at 100×28, concluded that the axes agree
+/// with the split "exactly when the split is hiding nothing". The full sweep falsifies it: at 64×10
+/// the split withholds 10 of the tidy case's 18 steps and two configurations still match it. The
+/// agreement is about **one root and too few rows**, not about hiding nothing — and the difference
+/// matters, because the first phrasing would have sent A-137 looking for the divergence in the
+/// elision policy instead of in the rail's rule.
+#[test]
+fn the_axes_reach_the_split_only_with_one_root_or_too_few_rows() {
+    let theme = Theme::MONO;
+    for case in LOAD_CASES {
+        let fx = loopmock::fixture(case);
+        // With a single top-level step there is nothing for a focus-relative rule to be relative
+        // *to*, so this test has no claim to make about that case. `…coincide_on_a_single_root`
+        // pins what happens there instead.
+        if fx.steps.len() < 2 {
+            continue;
+        }
+        for cols in COLS {
+            for rows in ROWS {
+                let vp = Viewport { cols, rows };
+                if !split_can_express_its_rule(case, vp, &theme) {
+                    continue;
+                }
+                let split = loopmock::render(Mock::Split, case, vp, &theme);
+                if split.steps_drawn() == fx.step_count() {
+                    continue;
+                }
+                let matched = axes_matching_the_split(case, vp, &theme);
+                assert!(
+                    matched.is_empty(),
+                    "{} / {cols}x{rows}: the split draws its whole rail, withholds {} of {} \
+                     steps, and yet {matched:?} reproduces it — if this ever passes, section 2 of \
+                     the recommendation is stale and needs rewriting, not deleting",
+                    case.name(),
+                    fx.step_count() - split.steps_drawn(),
+                    fx.step_count(),
+                );
+            }
+        }
+    }
+}
+
+/// The other side of the boundary, pinned so the refutation above is bounded rather than absolute:
+/// on a run with **one** top-level step the split's focus-relative rail and an uncondensed composed
+/// view are the same rule, and they agree at every viewport where both draw.
+///
+/// ⚠ This is the trap A-145 built the nine-turn case to expose, caught a second time. A-144's whole
+/// fixture had one root. Anyone testing "is the split a point in the axis space?" against a
+/// single-turn run would have measured 60 viewports out of 60 agreeing and called the composition
+/// proved.
+#[test]
+fn the_split_and_the_axes_coincide_on_a_single_root_run() {
+    let theme = Theme::MONO;
+    let case = LoadCase::Tidy;
+    assert_eq!(
+        loopmock::fixture(case).steps.len(),
+        1,
+        "the tidy case is supposed to be one recorded turn",
+    );
+    let mut agreed = 0usize;
+    for cols in COLS {
+        for rows in ROWS {
+            let vp = Viewport { cols, rows };
+            if !split_can_express_its_rule(case, vp, &theme) {
+                continue;
+            }
+            if !axes_matching_the_split(case, vp, &theme).is_empty() {
+                agreed += 1;
+            }
+        }
+    }
+    assert!(
+        agreed > 20,
+        "only {agreed} viewports agreed on a single-root run — the coincidence this test documents \
+         has gone, and the refutation's scoping needs re-deriving",
+    );
+}
+
+/// **What the composition does reproduce, exactly.** The nested tree is
+/// `depth 6 · condense off · pane off` — 6 being `plan::MAX_TREE_DEPTH`, the bound mock 2 borrows
+/// from the live plan renderer. Not "approximately": the same steps, on every load case.
+#[test]
+fn composing_the_axes_reproduces_the_nested_tree_exactly() {
+    let theme = Theme::MONO;
+    let axes = Axes {
+        depth: Depth::Levels(6),
+        condense: false,
+        pane: false,
+    };
+    for case in LOAD_CASES {
+        for vp in [loopmock::WIDE, loopmock::NARROW] {
+            let tree = loopmock::render(Mock::Tree, case, vp, &theme);
+            let composed = loopmock::render_axes(axes, case, vp, &theme);
+            assert_eq!(
+                composed.represented,
+                tree.represented,
+                "{} / {}x{}: the tree is supposed to be a point in this space",
+                case.name(),
+                vp.cols,
+                vp.rows,
+            );
+        }
+    }
+}
+
+/// ⚠ **The claim's second failure, and the more interesting one: mocks 1 and 2 are the SAME point.**
+///
+/// The story assigns the depth limit the job of turning the flat thread into the tree. It cannot,
+/// because that is not what separates them. The thread draws every step at every depth and spends no
+/// column on indentation; the tree draws every step at every depth and spends three columns per
+/// level. **Neither hides anything the other shows** — on all four cases the composed view at
+/// `depth ∞ · condense off · pane off` has the identical step set to the flat thread, and on the
+/// three cases where the tree's own depth bound never bites, the tree's is identical too.
+///
+/// So the thread↔tree axis is *indentation*: a drawing decision the three show/hide controls cannot
+/// express, and a **fourth** control if A-137 wants both pictures. A depth limit is a real and
+/// useful control — it is just not this one.
+#[test]
+fn the_flat_thread_and_the_nested_tree_are_one_point_in_the_axis_space() {
+    let theme = Theme::MONO;
+    let vp = loopmock::WIDE;
+    let unlimited = Axes {
+        depth: Depth::All,
+        condense: false,
+        pane: false,
+    };
+    for case in LOAD_CASES {
+        let thread = loopmock::render(Mock::Thread, case, vp, &theme);
+        let composed = loopmock::render_axes(unlimited, case, vp, &theme);
+        assert_eq!(
+            composed.represented,
+            thread.represented,
+            "{}: the flat thread's view is not reachable",
+            case.name(),
+        );
+        // The same view, and demonstrably not the same picture.
+        assert_ne!(
+            composed.to_plain(),
+            thread.to_plain(),
+            "{}: the composed view drew the flat thread's picture, so this test proves nothing",
+            case.name(),
+        );
+    }
+
+    // And on every case the log can actually produce — A-145 measured real nesting at three levels,
+    // so the tree's six-level bound never bites — the two mocks withhold the identical set.
+    for case in LOAD_CASES.iter().filter(|c| c.is_recorded()) {
+        assert_eq!(
+            loopmock::render(Mock::Thread, *case, vp, &theme).represented,
+            loopmock::render(Mock::Tree, *case, vp, &theme).represented,
+            "{}: mocks 1 and 2 stopped being the same view",
+            case.name(),
+        );
+    }
+}
+
+/// "Real and independent": each control changes the drawing with the other two held fixed. Two
+/// knobs that only did something together would be one knob with a confusing interface.
+#[test]
+fn each_axis_moves_the_drawing_on_its_own() {
+    let theme = Theme::MONO;
+    let vp = loopmock::WIDE;
+    let base = Axes {
+        depth: Depth::All,
+        condense: false,
+        pane: false,
+    };
+    for case in LOAD_CASES {
+        let flat = loopmock::render_axes(base, case, vp, &theme).to_plain();
+        for (name, moved) in [
+            (
+                "depth",
+                Axes {
+                    depth: Depth::Levels(2),
+                    ..base
+                },
+            ),
+            (
+                "condense",
+                Axes {
+                    condense: true,
+                    ..base
+                },
+            ),
+            ("pane", Axes { pane: true, ..base }),
+        ] {
+            assert_ne!(
+                loopmock::render_axes(moved, case, vp, &theme).to_plain(),
+                flat,
+                "{} / {name}: the axis is settable and changes nothing",
+                case.name(),
+            );
+        }
+    }
+}
+
+/// ⚠ **A-144's honesty property, held over three new ways to hide things.** `Tally::finish` made it
+/// unconditional for the five; the point of sweeping the same envelope here is that a depth limit,
+/// condensing and a pane are each a fresh opportunity to withhold something quietly.
+#[test]
+fn the_whole_axis_space_stays_inside_its_viewport_and_names_what_it_elides() {
+    let theme = Theme::MONO;
+    for (axes, case, vp) in axis_matrix() {
+        let render = loopmock::render_axes(axes, case, vp, &theme);
+        let where_ = format!(
+            "{} / {} / {}x{}",
+            axes.label(),
+            case.name(),
+            vp.cols,
+            vp.rows
+        );
+
+        let over = render.overflowing(vp.cols);
+        assert!(
+            over.is_empty(),
+            "{where_}: {} line(s) wider than {} cols, first {:?}",
+            over.len(),
+            vp.cols,
+            over.first(),
+        );
+        assert!(
+            render.lines.len() <= vp.rows,
+            "{where_}: {} lines in a {}-row viewport",
+            render.lines.len(),
+            vp.rows,
+        );
+        assert!(!render.lines.is_empty(), "{where_}: drew nothing");
+
+        let plain = render.to_plain();
+        for elision in &render.elisions {
+            assert!(elision.hidden > 0, "{where_}: an elision of nothing");
+            assert!(
+                plain.contains(&elision.marker),
+                "{where_}: withheld {} {} without showing {:?}\n{plain}",
+                elision.hidden,
+                elision.what,
+                elision.marker,
+            );
+        }
+
+        // And the step accounting still derives from `total - drawn`, unbribed by a new axis.
+        if !render.below_floor {
+            let total = loopmock::fixture(case).step_count();
+            let hidden: usize = render
+                .elisions
+                .iter()
+                .filter(|e| e.what == loopmock::STEPS)
+                .map(|e| e.hidden)
+                .sum();
+            assert_eq!(
+                render.steps_drawn() + hidden,
+                total,
+                "{where_}: {} steps unaccounted for",
+                total - render.steps_drawn() - hidden,
+            );
+        }
+    }
+}
+
+/// ⚠ **Condensing must never swallow a failure**, pinned against the failure the log actually
+/// recorded rather than one invented to be caught.
+///
+/// Session `s_1477` turn 7 ran `git_stage` on a path that no longer existed; it failed with
+/// `exit 128`, and the `execute_batch` phase around it then closed **ok**. So the fixture contains
+/// a `Done` parent holding a `Failed` child — which is the shape that makes "finished work collapses
+/// to one row" dangerous, and it is not a shape anybody would have thought to author.
+#[test]
+fn condensing_never_swallows_the_recorded_failure() {
+    let theme = Theme::MONO;
+    let case = LoadCase::Tidy;
+    let failed: Vec<usize> = loopmock::fixture(case)
+        .flatten()
+        .iter()
+        .filter(|f| f.step.status == loopmock::Status::Failed)
+        .map(|f| f.step.id)
+        .collect();
+    assert_eq!(
+        failed.len(),
+        1,
+        "the recorded turn is supposed to contain exactly one real failure",
+    );
+
+    for axes in AXIS_SPACE.iter().filter(|a| a.condense) {
+        // Held against the same configuration with condensing off: condensing is not allowed to be
+        // the reason a failure left the screen.
+        let off = Axes {
+            condense: false,
+            ..*axes
+        };
+        let with = loopmock::render_axes(*axes, case, loopmock::WIDE, &theme);
+        let without = loopmock::render_axes(off, case, loopmock::WIDE, &theme);
+        for id in &failed {
+            assert!(
+                with.represented.contains(id) || !without.represented.contains(id),
+                "{}: condensing hid the failed step this fixture exists to protect",
+                axes.label(),
+            );
+        }
+    }
+}
+
+/// ⚠ **And the result that inverts the worry.** The story's fear was that condensing would flatten
+/// the run by hiding a failure. Measured on the real nine-turn session the opposite happens:
+/// condensing is what **buys the room** to show it.
+///
+/// With condensing off, the failed `git_stage` sits 166 steps back in turn 7 and the terminal's
+/// window has long since scrolled past it. With condensing on, the six clean turns fold to a row
+/// each, turn 7 refuses to fold *because* it holds a failure, and the failure is on screen. The
+/// axis whose risk was hiding a failure is the one that reveals this one.
+#[test]
+fn on_a_long_run_condensing_is_what_makes_the_failure_visible() {
+    let theme = Theme::MONO;
+    let case = LoadCase::LongRun;
+    let vp = loopmock::WIDE;
+    let base = Axes {
+        depth: Depth::All,
+        condense: false,
+        pane: false,
+    };
+    let failure = "✗ → git_stage";
+    assert!(
+        !loopmock::render_axes(base, case, vp, &theme)
+            .to_plain()
+            .contains(failure),
+        "the uncondensed nine-turn view already shows the failure — the finding is stale",
+    );
+    assert!(
+        loopmock::render_axes(
+            Axes {
+                condense: true,
+                ..base
+            },
+            case,
+            vp,
+            &theme
+        )
+        .to_plain()
+        .contains(failure),
+        "condensing stopped surfacing the recorded failure on the long run",
+    );
+}
+
+/// ⚠ **A depth limit must say how many LEVELS it withheld**, not merely that there is more below.
+/// A sub-agent's entire run can live in one withheld level, so "some of it is deeper" is not an
+/// answer a reader can act on — and where the withheld levels contain a failure, the marker says
+/// that too.
+#[test]
+fn a_depth_limit_reports_the_number_of_levels_it_withheld() {
+    let theme = Theme::MONO;
+    for case in LOAD_CASES {
+        for axes in AXIS_SPACE.iter().filter(|a| a.depth != Depth::All) {
+            let render = loopmock::render_axes(*axes, case, loopmock::WIDE, &theme);
+            let levels: Vec<_> = render
+                .elisions
+                .iter()
+                .filter(|e| e.what == loopmock::LEVELS)
+                .collect();
+            let total = loopmock::fixture(case).step_count();
+            if render.steps_drawn() == total {
+                continue;
+            }
+            // Depth is not the only thing that can withhold here, so this only fires where the
+            // depth limit is genuinely below the fixture's own nesting.
+            let deepest = loopmock::fixture(case)
+                .flatten()
+                .iter()
+                .map(|f| f.depth)
+                .max()
+                .unwrap_or(0);
+            let limit = match axes.depth {
+                Depth::Levels(n) => n,
+                Depth::All => continue,
+            };
+            if deepest < limit {
+                continue;
+            }
+            assert!(
+                !levels.is_empty(),
+                "{} / {}: {limit} levels drawn of {} and nothing said how many were withheld",
+                axes.label(),
+                case.name(),
+                deepest + 1,
+            );
+            for elision in levels {
+                assert!(
+                    elision.hidden > 0 && render.to_plain().contains(&elision.marker),
+                    "{} / {}: {:?} is not on screen",
+                    axes.label(),
+                    case.name(),
+                    elision.marker,
+                );
+            }
+        }
+    }
+}
+
+/// ⚠ **The floor re-measured per configuration, which is what the story asked for.**
+///
+/// A-144 charged the split a 64×10 floor and called it the layout's main cost. It is the *pane's*:
+/// with the pane off the composed view draws every case at 40×6 — the flat thread's floor, the
+/// lowest of the five — and with it on it refuses one column under 64 exactly as mock 3 does. So
+/// the sub-64-column fallback A-144 recommended stops being a second layout and becomes this layout
+/// with a toggle off, which is the concrete thing making the pane optional buys.
+#[test]
+fn the_panes_floor_travels_with_the_pane_and_not_with_the_layout() {
+    let theme = Theme::MONO;
+    let with = Axes {
+        pane: true,
+        ..Axes::DEFAULT
+    };
+    let without = Axes::DEFAULT;
+    assert_eq!(without.floor(), (40, 6));
+    assert_eq!(with.floor(), (64, 10));
+
+    for case in LOAD_CASES {
+        // The pane's floor is the split's, at both ends of it.
+        for (vp, refuses) in [
+            (Viewport { cols: 64, rows: 10 }, false),
+            (Viewport { cols: 63, rows: 10 }, true),
+            (Viewport { cols: 64, rows: 9 }, true),
+        ] {
+            assert_eq!(
+                loopmock::render_axes(with, case, vp, &theme).below_floor,
+                refuses,
+                "{}: pane on at {}x{}",
+                case.name(),
+                vp.cols,
+                vp.rows,
+            );
+        }
+        // And with it off, the same view draws in the terminals the pane cannot.
+        for vp in [
+            Viewport { cols: 40, rows: 6 },
+            Viewport { cols: 52, rows: 20 },
+            Viewport { cols: 63, rows: 10 },
+        ] {
+            assert!(
+                !loopmock::render_axes(without, case, vp, &theme).below_floor,
+                "{}: the pane's floor followed the layout to {}x{}",
+                case.name(),
+                vp.cols,
+                vp.rows,
+            );
+        }
+    }
+}
+
+/// ⚠ **Defaults are the honesty question**, so each one is pinned to what it withholds rather than
+/// to a preference. Every axis defaults to the setting that hides least, and "least" means something
+/// different on each of the three — which is why this checks three properties and not one ratio.
+#[test]
+fn every_axis_default_is_the_setting_that_withholds_least() {
+    let theme = Theme::MONO;
+    // The defaults themselves, so a change to them has to come through this test's reasoning.
+    const { assert!(matches!(Axes::DEFAULT.depth, Depth::All)) };
+    const { assert!(Axes::DEFAULT.condense) };
+    const { assert!(!Axes::DEFAULT.pane) };
+
+    for case in LOAD_CASES {
+        for cols in COLS {
+            for rows in ROWS {
+                let vp = Viewport { cols, rows };
+                let render = loopmock::render_axes(Axes::DEFAULT, case, vp, &theme);
+                // Depth: `All` withholds no level, anywhere in the envelope.
+                assert!(
+                    !render.elisions.iter().any(|e| e.what == loopmock::LEVELS),
+                    "{} / {cols}x{rows}: the default depth withheld a level",
+                    case.name(),
+                );
+                // Pane: off, so the layout draws where the pane would have refused.
+                assert!(
+                    !render.below_floor || cols < 40 || rows < 6,
+                    "{} / {cols}x{rows}: the default refused above the no-pane floor",
+                    case.name(),
+                );
+            }
+        }
+    }
+
+    // Condensing: on, and every step it folds away is attributed to a row that says how many —
+    // which is the sense in which it shows more than it hides. It relocates steps into a visible
+    // summary; it does not remove them from the accounting.
+    for case in LOAD_CASES {
+        let render = loopmock::render_axes(Axes::DEFAULT, case, loopmock::WIDE, &theme);
+        let folded: usize = render
+            .elisions
+            .iter()
+            .filter(|e| e.what == loopmock::CONDENSED)
+            .map(|e| e.hidden)
+            .sum();
+        let total = loopmock::fixture(case).step_count();
+        assert!(
+            render.steps_drawn() + folded <= total,
+            "{}: condensing folded more steps than the run has",
+            case.name(),
+        );
+    }
 }
 
 /// A-145's headline: the cases that carry the comparison are **reconstructed from a recorded run**,
@@ -149,27 +729,27 @@ fn a_mock_that_drops_steps_accounts_for_every_one_of_them() {
             .map(|e| e.hidden)
             .sum();
         assert!(
-            render.steps_drawn + hidden <= total,
+            render.steps_drawn() + hidden <= total,
             "{} / {} / {}x{}: drew {} + hid {} of {} steps",
             mock.spec().name,
             case.name(),
             vp.cols,
             vp.rows,
-            render.steps_drawn,
+            render.steps_drawn(),
             hidden,
             total,
         );
         // Anything a mock does not draw it must have counted.
-        if render.steps_drawn < total && !render.below_floor {
+        if render.steps_drawn() < total && !render.below_floor {
             assert_eq!(
-                render.steps_drawn + hidden,
+                render.steps_drawn() + hidden,
                 total,
                 "{} / {} / {}x{}: {} steps unaccounted for",
                 mock.spec().name,
                 case.name(),
                 vp.cols,
                 vp.rows,
-                total - render.steps_drawn - hidden,
+                total - render.steps_drawn() - hidden,
             );
         }
     }

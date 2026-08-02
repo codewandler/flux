@@ -32,11 +32,17 @@ pub(super) const SPEC: MockSpec = MockSpec {
                it renders at all, which none of the other four do",
     pause_affordance: "the focused rail row, where the ⏸ sits beside the step it would pause",
     inspection_pane: "already built: the right-hand pane *is* A-142's inspection surface",
-    min_cols: 64,
-    // The pane spends PANE_CHROME rows before it says anything, and must still hold a body row, an
-    // elision marker and the hint; plus the run header and the step footer. See PANE_CHROME.
-    min_rows: 10,
+    min_cols: MIN_COLS,
+    min_rows: MIN_ROWS,
 };
+
+/// This layout's width floor — the highest of the five, and A-144's single biggest charge against
+/// it. Named since A-146 because [`super::axes`] needed to ask whether the floor belongs to the
+/// *layout* or to the *pane*; it borrows the pane, so it borrows the floor with it.
+pub(super) const MIN_COLS: usize = 64;
+/// The pane spends [`PANE_CHROME`] rows before it says anything, and must still hold a body row, an
+/// elision marker and the hint; plus the run header and the step footer.
+pub(super) const MIN_ROWS: usize = 10;
 
 /// Rows the pane spends on chrome before any content: breadcrumb, header, timing/usage, rule.
 /// The one number behind this mock's row floor — and the reason it has the highest one.
@@ -44,7 +50,7 @@ const PANE_CHROME: usize = 4;
 
 /// The rail is a share of the terminal, clamped so it neither starves the pane nor becomes a
 /// column of ellipses.
-fn rail_cols(cols: usize) -> usize {
+pub(super) fn rail_cols(cols: usize) -> usize {
     (cols * 2 / 5).clamp(26, 42)
 }
 
@@ -81,7 +87,7 @@ pub(super) fn draw(
         out.push(clip(Line::from(spans), vp.cols));
     }
 
-    tally.drew(seen.len());
+    tally.drew(seen.iter().copied());
     if hidden_detail > 0 {
         tally.hid(DETAIL, hidden_detail, format!("+{hidden_detail} more"));
     }
@@ -172,7 +178,7 @@ fn rail_rows(
 ///
 /// The breadcrumb is the pane's answer to the tree's indentation: the ancestors are named once, at
 /// the top, instead of costing three columns on every row beneath them.
-fn pane_rows(
+pub(super) fn pane_rows(
     fx: &Fixture,
     focused: &Step,
     cols: usize,

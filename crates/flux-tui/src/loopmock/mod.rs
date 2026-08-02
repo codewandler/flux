@@ -47,6 +47,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
+pub mod axes;
 pub mod capture;
 pub mod fixture;
 mod graph;
@@ -55,6 +56,7 @@ mod thread;
 mod timeline;
 mod tree;
 
+pub use axes::{render_axes, Axes, Depth, Shape, AXIS_SPACE};
 pub use capture::{Fidelity, FidelityRow, FIDELITY};
 pub use fixture::{
     fixture, Fixture, Flat, LoadCase, Provenance, Status, Step, StepKind, Usage, LOAD_CASES,
@@ -65,6 +67,11 @@ pub use graph::{graph_gutter_len, graph_plan_line_count};
 pub const STEPS: &str = "steps";
 /// The `what` of an [`Elision`] that withheld lines *within* a step's detail.
 pub const DETAIL: &str = "detail lines";
+/// The `what` of an [`Elision`] that collapsed a finished subtree into its own row ([`axes`]).
+pub const CONDENSED: &str = "condensed steps";
+/// The `what` of an [`Elision`] that stopped descending at a depth limit ([`axes`]). Counted in
+/// **levels**, not steps: "some of it is deeper" is not an answer a reader can act on.
+pub const LEVELS: &str = "nesting levels";
 
 /// The marker every mock puts on the step a pause would attach to (A-140). Mocked as a glyph
 /// only — no key is bound and nothing pauses.
@@ -178,14 +185,24 @@ pub struct Render {
     pub lines: Vec<Line<'static>>,
     /// Everything withheld, each naming the text on screen that says so.
     pub elisions: Vec<Elision>,
-    /// How many of the fixture's steps this drawing actually represents.
-    pub steps_drawn: usize,
+    /// **Which** of the fixture's steps this drawing represents, by [`Step::id`].
+    ///
+    /// ⚠ Identities rather than a count, and A-145 is why: on the long-run case the split and the
+    /// flat thread both report `166 of 191 steps not shown`, and they are not hiding the same 166.
+    /// A comparison done on counts would have called those two layouts equivalent. Everything in
+    /// [`axes`] that compares one view with another compares this set.
+    pub represented: std::collections::BTreeSet<usize>,
     /// The viewport is under [`MockSpec::min_cols`] or [`MockSpec::min_rows`]; what was drawn is a
     /// refusal notice naming the dimension, not the layout.
     pub below_floor: bool,
 }
 
 impl Render {
+    /// How many of the fixture's steps this drawing represents.
+    pub fn steps_drawn(&self) -> usize {
+        self.represented.len()
+    }
+
     /// The drawing as plain text — what the snapshot set commits and what the tests read.
     pub fn to_plain(&self) -> String {
         let mut out = String::new();
@@ -216,7 +233,7 @@ pub fn render(mock: Mock, case: LoadCase, vp: Viewport, theme: &Theme) -> Render
     let spec = mock.spec();
     let fx = fixture(case);
     if vp.cols < spec.min_cols || vp.rows < spec.min_rows {
-        return below_floor(&spec, vp, theme);
+        return below_floor(spec.name, spec.min_cols, spec.min_rows, vp, theme);
     }
     let mut tally = Tally::new(fx.step_count());
     let body = match mock {
@@ -233,25 +250,35 @@ pub fn render(mock: Mock, case: LoadCase, vp: Viewport, theme: &Theme) -> Render
 /// lower. It is a sanity bound on the specs, not the envelope itself — the envelope is per mock.
 pub const MIN_ROWS: usize = 6;
 
-/// What a mock draws under its own floor: a refusal naming the dimension it is short of. Silently
+/// What a layout draws under its own floor: a refusal naming the dimension it is short of. Silently
 /// degrading here would teach exactly the wrong lesson — every layout has a floor, and the
 /// question A-137 has to answer is what happens at it, not whether one exists.
-fn below_floor(spec: &MockSpec, vp: Viewport, theme: &Theme) -> Render {
-    let (need, have) = if vp.cols < spec.min_cols {
+///
+/// Takes the floor as two numbers rather than a [`MockSpec`] because since A-146 the floor is not
+/// always a constant of a layout: the composed view's is a function of its [`Axes`], and the whole
+/// point of making the detail pane optional was to find out whether its 64×10 floor travels with it.
+pub(crate) fn below_floor(
+    name: &str,
+    min_cols: usize,
+    min_rows: usize,
+    vp: Viewport,
+    theme: &Theme,
+) -> Render {
+    let (need, have) = if vp.cols < min_cols {
         (
-            format!("needs {} cols", spec.min_cols),
+            format!("needs {min_cols} cols"),
             format!("have {}", vp.cols),
         )
     } else {
         (
-            format!("needs {} rows", spec.min_rows),
+            format!("needs {min_rows} rows"),
             format!("have {}", vp.rows),
         )
     };
     let mut lines = vec![
         clip(
             Line::from(Span::styled(
-                spec.name.to_string(),
+                name.to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             vp.cols,
@@ -263,7 +290,7 @@ fn below_floor(spec: &MockSpec, vp: Viewport, theme: &Theme) -> Render {
     Render {
         lines,
         elisions: Vec::new(),
-        steps_drawn: 0,
+        represented: std::collections::BTreeSet::new(),
         below_floor: true,
     }
 }
@@ -273,22 +300,26 @@ fn below_floor(spec: &MockSpec, vp: Viewport, theme: &Theme) -> Render {
 /// last, into a row reserved for exactly that purpose.
 pub(crate) struct Tally {
     total: usize,
-    drawn: usize,
+    drawn: std::collections::BTreeSet<usize>,
     extra: Vec<Elision>,
 }
 
 impl Tally {
-    fn new(total: usize) -> Self {
+    pub(crate) fn new(total: usize) -> Self {
         Self {
             total,
-            drawn: 0,
+            drawn: std::collections::BTreeSet::new(),
             extra: Vec::new(),
         }
     }
 
-    /// Record that `n` of the fixture's steps are represented in the drawing.
-    pub(crate) fn drew(&mut self, n: usize) {
-        self.drawn += n;
+    /// Record **which** of the fixture's steps are represented in the drawing.
+    ///
+    /// Identities rather than a count since A-146: two layouts that hide the same *number* of steps
+    /// can be hiding entirely different ones, which is precisely what A-145 measured, so a count is
+    /// not a thing two views can be compared on. It also makes double-counting unrepresentable.
+    pub(crate) fn drew(&mut self, ids: impl IntoIterator<Item = usize>) {
+        self.drawn.extend(ids);
     }
 
     /// Record a non-step elision (a truncated detail body). `marker` must be on screen.
@@ -316,9 +347,14 @@ impl Tally {
     /// comes to that. Every renderer is written so this never has to fire; it fires anyway if one
     /// of them is ever wrong, which is the point of putting it in the one place that owns the
     /// property. Dropping the record instead would be the tempting fix and the dishonest one.
-    fn finish(self, mut lines: Vec<Line<'static>>, vp: Viewport, theme: &Theme) -> Render {
+    pub(crate) fn finish(
+        self,
+        mut lines: Vec<Line<'static>>,
+        vp: Viewport,
+        theme: &Theme,
+    ) -> Render {
         let mut elisions = self.extra;
-        let hidden = self.total.saturating_sub(self.drawn);
+        let hidden = self.total.saturating_sub(self.drawn.len());
         // Rows the step footer will need. Reserved before anything else competes for them: a
         // render that ran out of room for its own admission of elision is the exact failure this
         // module is about.
@@ -368,7 +404,7 @@ impl Tally {
         Render {
             lines,
             elisions,
-            steps_drawn: self.drawn,
+            represented: self.drawn,
             below_floor: false,
         }
     }
@@ -534,6 +570,127 @@ pub(crate) fn status_style(status: Status, theme: &Theme) -> Style {
 /// The recommendation this story exists to produce. Five pictures and no decision is the failure
 /// mode, so the decision ships in the artifact rather than only in a review comment.
 pub const RECOMMENDATION: &str = "\
+BUILD THE AXES, AND SHIP THESE DEFAULTS: depth ALL · condense ON · pane OFF.
+Do not adopt a picture. And do not expect the axes to give you mock 3 — they do not, and section 2
+is the measurement that says so.
+
+═══ A-146: THE COMPOSITION WAS TESTED AND IT DOES NOT HOLD ═══
+
+A-146 built the three controls the owner named — a depth limit, condense-completed, an optional
+detail pane — and swept all twelve combinations across four load cases and the same 18x28 viewport
+envelope the five mocks are held to. The claim under test was: 'the flat thread with condensing and
+a depth limit and an optional pane IS the split'.
+
+1. WHAT THE COMPOSITION DOES REPRODUCE, EXACTLY. A partial result is still a result.
+   - THE NESTED TREE is `depth 6 · condense off · pane off` — 6 being plan.rs's MAX_TREE_DEPTH,
+     which mock 2 borrows from the live plan renderer. The same steps, on every load case, at
+     every viewport tested. Mock 2 is a point in this space.
+   - THE FLAT THREAD'S VIEW is `depth ∞ · condense off · pane off`, on every case.
+   - Mocks 4 and 5 are not in the space and were never claimed to be. A-145 already dropped mock 5
+     from candidacy; mock 4's axis is time, which no show/hide control produces.
+
+2. ⚠ THE SPLIT IS NOT A POINT IN THIS SPACE, AND THE BOUNDARY IS EXACT.
+   THE AXES REACH THE SPLIT ONLY WHEN THE RUN HAS ONE TOP-LEVEL STEP, OR THE TERMINAL IS TOO SHORT
+   FOR THE SPLIT TO DRAW ITS OWN RULE. Give it nine turns and the rows to show them, and nothing in
+   the space reaches it. Measured over the full envelope: on the real nine-turn session there are 24
+   viewports where the split both draws its whole rail and withholds something, and ZERO matches in
+   them; on the fan-out case, 42 viewports and zero matches. On ONE recorded turn, 60 of 60 match.
+
+   THE STRUCTURAL REASON. Mock 3's rail is not 'condense completed'. It is one row per top-level
+   step PLUS THE FOCUSED TOP-LEVEL STEP'S ENTIRE SUBTREE — including that subtree's COMPLETED work,
+   which condensing by definition folds away. So the rail discriminates on FOCUS and condensing
+   discriminates on STATUS. With one root the two rules coincide; with nine turns they cannot.
+
+   ⚠ WHAT A-137 ACTUALLY OWES, THEN: not a fourth picture but a fourth DECISION — condensing's
+   GRANULARITY. 'Finished work collapses to one row' does not say at what level, and the answer
+   changes what you get. Fold uniformly (what this module implements) and you get every turn's shape
+   at one row per phase. Fold only at the top level and you get mock 3's rail. Both are defensible;
+   they are not the same view, and a one-bit `condense` flag cannot express the difference. Decide
+   it explicitly rather than inheriting whichever one gets written first.
+
+   ⚠ AN EARLIER READING OF THIS SAME MEASUREMENT, taken only at 100x28, said the axes agree with the
+   split 'exactly when the split is hiding nothing'. The full sweep falsifies it: at 64x10 the split
+   withholds 10 of the tidy case's 18 steps and two configurations still match. The agreement is
+   about ONE ROOT AND TOO FEW ROWS. The distinction matters — the first phrasing would have sent
+   A-137 hunting for the divergence in the elision policy instead of in the rail's rule.
+
+3. ⚠ THE DEPTH LIMIT DOES NOT TURN THE THREAD INTO THE TREE. MOCKS 1 AND 2 ARE THE SAME POINT.
+   The owner's table assigned the depth axis the job of moving between the flat thread and the tree.
+   It cannot, because depth is not what separates them. The thread draws every step at every depth
+   and spends no column on indentation; the tree draws every step at every depth and spends three
+   columns per level. NEITHER HIDES ANYTHING THE OTHER SHOWS — on both recorded cases their step
+   sets are identical, and the composed view at `depth ∞ · condense off · pane off` matches both.
+
+   So the thread↔tree axis is INDENTATION: a drawing decision, invisible to any show/hide control,
+   and a FOURTH axis if A-137 wants both pictures. The depth limit is a real and useful control —
+   it is simply not this one. (It is what makes the deep-nesting case readable, and A-145 measured
+   real nesting at three levels, so on a real run it never has to fire at all.)
+
+4. ⚠ THE INVERSION: ON A REAL RUN, CONDENSING IS WHAT BUYS THE ROOM TO SHOW A FAILURE.
+   The story's stated risk was that condensing would swallow a failed step and flatter the run. The
+   opposite is what happens. Session s_1477 turn 7 ran `git_stage` against a path that no longer
+   existed; it failed with exit 128, and the `execute_batch` phase around it then closed OK — a DONE
+   parent holding a FAILED child, a shape nobody would have authored and which only exists here
+   because the fixture is a real capture. On the nine-turn case at 100x28:
+     - condense OFF: the failure is 166 steps back and the terminal has long since scrolled past it.
+     - condense ON:  six clean turns fold to a row each, TURN 7 REFUSES TO FOLD BECAUSE IT HOLDS A
+                     FAILURE, and the failed git_stage is on screen with its siblings folded to +2.
+   The rule that makes this work is that a subtree is condensable only if it is entirely finished
+   AND entirely successful. The two halves are stated separately in `axes::condensable` so that a
+   later change to what 'finished' means cannot take the failure rule with it.
+
+5. THE FLOORS, RE-MEASURED PER CONFIGURATION — AND THIS RETIRES A CLAIM FROM THE LAST ROUND.
+   A-144 charged the split a 64x10 floor and called it the layout's main cost, recommending mock 1
+   as a separate sub-64-column fallback. The floor is the PANE'S, not the layout's: with the pane
+   off the composed view draws every load case at 40x6 — the flat thread's floor, the lowest of the
+   five — and with it on it refuses one column under 64 exactly as mock 3 does.
+   ⚠ SO THE SUB-64-COLUMN FALLBACK IS NOT A SECOND LAYOUT. IT IS THIS LAYOUT WITH A TOGGLE OFF.
+   That is the concrete thing making the pane optional buys, and it is why `pane` defaults to off.
+
+6. THE DEFAULTS, AND WHAT EACH ONE SHOWS AND HIDES. Every axis defaults to the setting that
+   withholds least, and 'least' means something different on each — which is why this is three
+   arguments and not one ratio.
+
+   DEPTH = ALL.
+     shows  every level of nesting.
+     hides  nothing. Zero depth elisions anywhere in the envelope, on any case.
+     why    A-145 measured real nesting at THREE levels (turn > loop phase > op). The eight-level
+            case that cost the tree A-144's comparison is a shape this log has never recorded, so a
+            limit set against it would pay a real cost to solve an imagined problem. Keep the
+            control for the fan-out a sub-agent produces; do not arm it by default. A default depth
+            that hid a sub-agent's work would be the flattering-view failure this epic exists to
+            avoid, and where it does fire it names the number of LEVELS withheld and how many of the
+            withheld steps failed — 'there is more below' is not an answer a reader can act on.
+
+   CONDENSE = ON.
+     shows  every top-level step; full structure wherever a failure lives; the running path always.
+     hides  finished, wholly successful subtrees — each folded into a row that carries `+N`, plus
+            one summary line saying how many steps went into how many rows.
+     why    it is the single biggest effect available (191 steps to a ~29-row rail) and, per point
+            4, it is what surfaces the failure rather than what buries it. ⚠ Temper the expectation
+            with A-145's second correction: the win is CONCENTRATED, not uniform. 36 of 55 real
+            phases are exactly one step, where folding saves nothing; one is 57, where the whole
+            win lives. Do it — one phase of 57 is reason enough — but do not expect the row count
+            to stop tracking the run.
+
+   PANE = OFF.
+     shows  the rail at full terminal width, which is where a row can still carry an OP'S ARGUMENT.
+            A-145 measured mock 3's 40-column rail down to op-and-timing with the argument gone.
+     hides  the focused step's token cost and output tail — one keystroke away, not a relayout.
+     why    per point 5 it is the axis that owns the 64x10 floor, and at 52 columns — the width A-145
+            notes most of this is actually read at — pane-on refuses entirely while pane-off draws.
+            A default that refuses to draw in the operator's usual terminal is not a default.
+
+⚠ WHAT REMAINS TRUE FROM A-144 AND A-145. Condensing first is still right and is still most of the
+win; the split's second column still buys the only place to put token cost and a streaming tail
+beside the chain that produced it, which is why the pane is an axis rather than a deletion; and the
+condensed tree is still the honest runner-up A-145 promoted it to — it is now literally the default
+this section recommends. What changed is that 'build mock 3' has become 'build the controls, and
+here are the settings', and that mock 3's rail turns out to encode a rule the three controls cannot
+say. Everything below this line is the A-144/A-145 reasoning, left intact.
+
+═══ A-144/A-145's ORIGINAL RECOMMENDATION, SUPERSEDED ABOVE BUT NOT EDITED ═══
+
 FIRST, CONDENSE FINISHED PHASES. THEN BUILD MOCK 3 — the split (condensed rail + detail pane) —
 with mock 1 as its sub-64-column fallback. The two are separable, and the first is most of the win.
 
@@ -681,6 +838,194 @@ fn fidelity_table() -> String {
     out
 }
 
+/// **A-146's section of the snapshot set** — the three axes, drawn rather than described.
+///
+/// The pictures are chosen to carry the findings that a reader would otherwise have to take on
+/// trust, above all the recorded failure: the same nine-turn run drawn with condensing off and on,
+/// so that "condensing is what buys the room to show the failure" is something you can see instead
+/// of a claim in a paragraph.
+fn axes_section() -> String {
+    let theme = Theme::MONO;
+    let mut out = String::new();
+    out.push_str("# A-146 — the same five, as three knobs\n\n");
+    out.push_str(
+        "A-144 drew five layouts and A-145 re-checked them against a real recorded run. A-146 asks \
+         a different question: are the five **points in a space with three orthogonal axes** — a \
+         depth limit, condense-completed, and an optional detail pane — so that A-137 can build \
+         *controls* and choose *defaults* rather than adopt a picture?\n\n\
+         **The answer is no, and the refutation is the deliverable.** Two of the five are \
+         reproduced exactly; the split is not reachable at all; and two of the five turn out to be \
+         the *same point*. The measurement is in the recommendation above, section by section. What \
+         follows is the evidence.\n\n",
+    );
+
+    out.push_str("## What each configuration reproduces\n\n");
+    out.push_str("| configuration | floor | reproduces |\n|---|---|---|\n");
+    for axes in AXIS_SPACE {
+        let (c, r) = axes.floor();
+        let what = match (axes.depth, axes.condense, axes.pane) {
+            (axes::Depth::All, false, false) => {
+                "**the flat thread's view** (and the tree's, on a real run) — exactly"
+            }
+            (axes::Depth::All, false, true) => "the split *only* where the split hides nothing",
+            (axes::Depth::All, true, false) => "**the recommended default**",
+            _ => "—",
+        };
+        out.push_str(&format!("| `{}` | {c}×{r} | {what} |\n", axes.label()));
+    }
+    out.push_str(
+        "\nAnd separately, `depth 6 · condense off · pane off` reproduces **the nested tree** \
+         exactly, on every load case — 6 being `plan.rs`'s `MAX_TREE_DEPTH`, the bound mock 2 \
+         borrows from the live plan renderer.\n\n",
+    );
+
+    // ⚠ The centrepiece. A `Done` phase holding a `Failed` op is a shape nobody would author, and
+    // it only exists here because the fixture is a real capture — so it is drawn, twice, rather
+    // than asserted once.
+    out.push_str("## ⚠ The recorded failure, with condensing off and on\n\n");
+    out.push_str(
+        "Session `s_1477` turn 7 ran `git_stage` against a path that no longer existed. It failed \
+         with `exit 128` — and the `execute_batch` phase around it then closed **ok**. That is a \
+         `Done` parent holding a `Failed` child, which is exactly the shape that makes \"finished \
+         work collapses to one row\" dangerous, and it is not a shape anybody would have thought \
+         to author.\n\n\
+         The story's stated risk was that condensing would swallow it. On the real nine-turn run \
+         the opposite happens — **condensing is what buys the room to show it.** Both drawings \
+         below are the same run at the same viewport.\n\n",
+    );
+    for (axes, caption) in [
+        (
+            Axes {
+                depth: Depth::All,
+                condense: false,
+                pane: false,
+            },
+            "**condense off** — the failure is 166 steps back, and the window has scrolled past it. \
+             There is no `✗` on this screen.",
+        ),
+        (
+            Axes::DEFAULT,
+            "**condense on (the default)** — six clean turns fold to a row each, **turn 7 refuses \
+             to fold because it holds a failure**, and `✗ → git_stage` is on screen with its clean \
+             sibling folded to `+2`.",
+        ),
+    ] {
+        out.push_str(&format!(
+            "### long run · `{}` · {}×{}\n\n{caption}\n\n```text\n{}```\n\n",
+            axes.label(),
+            WIDE.cols,
+            WIDE.rows,
+            render_axes(axes, LoadCase::LongRun, WIDE, &theme).to_plain(),
+        ));
+    }
+
+    out.push_str("## ⚠ Mocks 1 and 2 are the same point\n\n");
+    out.push_str(
+        "The depth limit was supposed to move between the flat thread and the tree. It cannot: \
+         neither hides anything the other shows. Below, the composed view at `depth ∞ · condense \
+         off · pane off` beside both mocks on the same recorded turn — three different pictures, \
+         one view.\n\n",
+    );
+    for (name, plain) in [
+        (
+            "composed · depth ∞ · condense off · pane off".to_string(),
+            render_axes(
+                Axes {
+                    depth: Depth::All,
+                    condense: false,
+                    pane: false,
+                },
+                LoadCase::Tidy,
+                WIDE,
+                &theme,
+            )
+            .to_plain(),
+        ),
+        (
+            Mock::Thread.spec().name.to_string(),
+            render(Mock::Thread, LoadCase::Tidy, WIDE, &theme).to_plain(),
+        ),
+        (
+            Mock::Tree.spec().name.to_string(),
+            render(Mock::Tree, LoadCase::Tidy, WIDE, &theme).to_plain(),
+        ),
+    ] {
+        out.push_str(&format!("### {name} · tidy\n\n```text\n{plain}```\n\n"));
+    }
+
+    out.push_str("## Each axis on its own\n\n");
+    out.push_str(
+        "The three are independent: each is settable without the others and each changes the \
+         drawing with the other two held fixed.\n\n",
+    );
+    for (axes, case, caption) in [
+        (
+            Axes {
+                depth: Depth::Levels(2),
+                condense: false,
+                pane: false,
+            },
+            LoadCase::FanOut,
+            "**the depth axis alone.** Where it bites it says how many *levels* went with it, not \
+             merely that something did — a sub-agent's whole run can live in one withheld level.",
+        ),
+        (
+            Axes {
+                depth: Depth::All,
+                condense: true,
+                pane: true,
+            },
+            LoadCase::LongRun,
+            "**all three on.** The nearest point in the space to mock 3 — and, per section 2 of the \
+             recommendation, still not mock 3.",
+        ),
+    ] {
+        out.push_str(&format!(
+            "### {} · {} · {}×{}\n\n{caption}\n\n```text\n{}```\n\n",
+            case.name(),
+            axes.label(),
+            WIDE.cols,
+            WIDE.rows,
+            render_axes(axes, case, WIDE, &theme).to_plain(),
+        ));
+    }
+
+    out.push_str("## The floor travels with the pane\n\n");
+    out.push_str(
+        "A-144 charged the split a 64×10 floor and recommended the flat thread as a separate \
+         sub-64-column fallback. The floor belongs to the **pane**: with it off, the same view \
+         draws at 40×6 — the lowest floor of the five. So the fallback is not a second layout, it \
+         is this layout with a toggle off.\n\n",
+    );
+    for (axes, vp) in [
+        (Axes::DEFAULT, Viewport { cols: 40, rows: 6 }),
+        (Axes::DEFAULT, NARROW),
+        (
+            Axes {
+                pane: true,
+                ..Axes::DEFAULT
+            },
+            NARROW,
+        ),
+        (
+            Axes {
+                pane: true,
+                ..Axes::DEFAULT
+            },
+            Viewport { cols: 64, rows: 10 },
+        ),
+    ] {
+        out.push_str(&format!(
+            "### `{}` · tidy · {}×{}\n\n```text\n{}```\n\n",
+            axes.label(),
+            vp.cols,
+            vp.rows,
+            render_axes(axes, LoadCase::Tidy, vp, &theme).to_plain(),
+        ));
+    }
+    out
+}
+
 /// The committed side-by-side comparison, as markdown. This is the artifact a reviewer reads
 /// instead of running anything; `the_snapshot_set_matches_the_renderers` keeps it honest.
 pub fn snapshot_document() -> String {
@@ -811,6 +1156,7 @@ pub fn snapshot_document() -> String {
             ));
         }
     }
+    out.push_str(&axes_section());
     out
 }
 
@@ -843,7 +1189,7 @@ mod tests {
     #[test]
     fn the_tally_derives_the_hidden_count_rather_than_trusting_a_renderer() {
         let mut tally = Tally::new(20);
-        tally.drew(7);
+        tally.drew(0..7);
         let render = tally.finish(Vec::new(), WIDE, &Theme::MONO);
         assert_eq!(render.elisions.len(), 1);
         assert_eq!(render.elisions[0].hidden, 13);
@@ -857,7 +1203,7 @@ mod tests {
         // written so this cannot happen; `finish` is what makes the property unconditional rather
         // than true-for-the-viewports-we-happened-to-test.
         let mut tally = Tally::new(3);
-        tally.drew(3);
+        tally.drew(0..3);
         tally.hid(DETAIL, 4, "+4 more".to_string());
         let lines = vec![
             Line::from(Span::raw("chrome")),
@@ -875,7 +1221,7 @@ mod tests {
     #[test]
     fn the_step_footer_outlives_a_displaced_detail_marker() {
         let mut tally = Tally::new(9);
-        tally.drew(2);
+        tally.drew(0..2);
         tally.hid(DETAIL, 3, "+3 more".to_string());
         let lines = vec![Line::from(Span::raw("x")), Line::from(Span::raw("y"))];
         let render = tally.finish(lines, Viewport { cols: 40, rows: 3 }, &Theme::MONO);
@@ -889,7 +1235,7 @@ mod tests {
     #[test]
     fn a_complete_drawing_admits_nothing() {
         let mut tally = Tally::new(4);
-        tally.drew(4);
+        tally.drew(0..4);
         assert!(tally
             .finish(Vec::new(), WIDE, &Theme::MONO)
             .elisions

@@ -138,9 +138,7 @@ pub(super) fn draw(
         out.push(clip(Line::from(spans), vp.cols));
     }
 
-    drawn.sort_unstable();
-    drawn.dedup();
-    tally.drew(drawn.len());
+    tally.drew(drawn);
 
     if out.len() < vp.rows.saturating_sub(tally.footer_rows()) {
         out.push(clip(
