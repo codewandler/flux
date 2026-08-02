@@ -989,6 +989,7 @@ pub fn router_with_approvals_in(
     approvals: ApprovalGate,
 ) -> anyhow::Result<Router> {
     guard_open_bind(&auth, bind)?;
+    guard_approval_auth(&auth, &approvals)?;
     Ok(router_with_ttl_in(
         engine,
         auth,
@@ -997,6 +998,22 @@ pub fn router_with_approvals_in(
         env,
         approvals,
     ))
+}
+
+/// A principal-authenticated server has many mutually isolated callers, while C-453's approval
+/// queue is deliberately one operator queue for one served agent. Combining them would let any
+/// authenticated principal list and answer every other principal's effects. Refuse that topology
+/// until the protocol carries a separately authorized supervisor identity.
+fn guard_approval_auth(auth: &ServerAuth, approvals: &ApprovalGate) -> anyhow::Result<()> {
+    if approvals.0.is_some() && matches!(auth, ServerAuth::Principal(_)) {
+        anyhow::bail!(
+            "remote approval cannot be combined with principal authentication: the approval queue \
+             is deployment-wide, so one authenticated principal could list and answer another's \
+             effects. Use a shared operator token for this single-agent posture; principal mode \
+             needs a separately authorized supervisor identity before it can serve approvals"
+        );
+    }
+    Ok(())
 }
 
 /// [`router`] against an explicit [`DiscoveryEnv`] rather than the process's own (C-392).
@@ -1133,9 +1150,11 @@ fn router_with_ttl_limits_and_approvals(
     // `/a2a` belongs here because blocking `message/send` runs a full turn in-handler. Its
     // `message/stream` path returns the response promptly, so body streaming is not severed.
     // The approval routes belong here — inside `protected`, so they inherit `require_auth` by
-    // construction. ⚠ Who may answer an approval is exactly who may authenticate: a decision
-    // endpoint outside the auth layer would let anyone who can reach the port approve the agent's
-    // effects, which is strictly worse than having no approval stage at all. They are mounted
+    // construction. ⚠ In the supported shared-token/open-loopback modes, who may answer an
+    // approval is exactly who the server admits; principal mode plus a global queue is refused at
+    // construction. A decision endpoint outside the auth layer would let anyone who can reach the
+    // port approve the agent's effects, which is strictly worse than having no approval stage.
+    // They are mounted
     // unconditionally (rather than only when a queue exists) so a client can tell "this server does
     // not offer remote approval" from "that request is gone" — see [`list_approvals`].
     let timed = Router::new()
@@ -1186,9 +1205,11 @@ fn router_with_ttl_limits_and_approvals(
 
 /// `GET /approvals` — the effects currently parked awaiting a human decision, oldest first.
 ///
-/// Returns `501` when this server is not running the remote-approval posture. That is a *statement
-/// of posture*, not an error: an operator can be running the agent under `AllowApprover` with policy
-/// + sandbox + budget doing the constraining, which is a legitimate and often correct choice. What
+/// Returns `501` when this server is not running the remote-approval posture.
+///
+/// That is a *statement of posture*, not an error: an operator can be running the agent under
+/// `AllowApprover` with policy, sandbox and budget doing the constraining, which is a legitimate
+/// and often correct choice. What
 /// this route must never do is return an empty list in that case — "nothing is waiting" and "nobody
 /// is ever asked" look identical to a client, and only one of them means a human is in the loop.
 async fn list_approvals(State(gate): State<ApprovalGate>) -> Response {
@@ -2056,6 +2077,35 @@ mod tests {
         }
     }
 
+    /// A single global queue cannot safely serve principal mode: Alice would otherwise list and
+    /// answer Bob's effects despite the rest of the server keeping their sessions in separate
+    /// realms. Until approvals carry a separately authorized supervisor identity, construction
+    /// must refuse that incoherent combination.
+    #[test]
+    fn principal_auth_cannot_share_a_global_remote_approval_queue() {
+        let (engine, _) = usage_test_engine();
+        let auth = ServerAuth::Principal(PrincipalAuth::new(
+            Arc::new(PrincipalTestAuthenticator),
+            "https://agents.example.test",
+        ));
+        let result = router_with_approvals_in(
+            engine,
+            auth,
+            CardInfo::flux_coding(),
+            "127.0.0.1:0".parse().unwrap(),
+            &DiscoveryEnv::empty(),
+            ApprovalGate::serving(Arc::new(flux_runtime::ApprovalQueue::new(
+                Duration::from_secs(30),
+            ))),
+        );
+        let error = match result {
+            Ok(_) => panic!("principal mode accepted a cross-realm global approval queue"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("principal"), "{error}");
+        assert!(error.contains("approval"), "{error}");
+    }
+
     #[test]
     fn constant_time_eq_matches() {
         assert!(constant_time_eq(b"secret", b"secret"));
@@ -2423,6 +2473,7 @@ mod tests {
             CardInfo::flux_coding(),
             A2aTtl(60),
             &DiscoveryEnv::empty(),
+            ApprovalGate::none(),
         );
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "message/send",

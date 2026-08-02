@@ -142,18 +142,22 @@ is not all of them on the program form.
    `AllowApprover`, because it would look like a control. Pinned by
    `an_effect_nobody_answers_is_refused`.
 2. **An approval is bound to the effect it was granted for.** A decision must echo the request's
-   `fingerprint`, which is the canonical form of the effect **itself, not a digest of it** — so
-   there is no collision to hunt for, and a `yes` shown for `write → notes.txt` cannot be delivered
-   against `write → credentials.txt`. Pinned by
+   `fingerprint`, which is the canonical form of the effect **itself, not a digest of it** —
+   including the full structured intent targets and exact plan requirements, not merely the two
+   risk booleans. There is no collision to hunt for, and a `yes` shown for `write → notes.txt`
+   cannot be delivered against `write → credentials.txt`. Pinned by
    `an_approval_cannot_be_delivered_against_a_different_effect`. This is also why `request_plan` is
    overridden rather than inherited: the trait default renders a whole plan as `N op(s) · summary`,
    so two unrelated plans sharing a count and a summary would share a fingerprint.
 3. **Single use.** Answering removes the request; a replay finds nothing. Pinned by
    `a_replayed_decision_is_refused`.
-4. **Who may answer is who may authenticate.** The routes sit inside the server's auth layer, and an
-   unauthenticated non-loopback bind is still refused at router construction. A decision endpoint
-   outside auth would be strictly worse than having no approval stage. Pinned by
-   `answering_an_approval_requires_authentication`.
+4. **The operator boundary is structural.** The routes sit inside the server's auth layer, and an
+   unauthenticated non-loopback bind is still refused at router construction. The shipped posture
+   supports one shared operator token (or open loopback). It deliberately refuses principal auth:
+   one deployment-wide queue would otherwise let Alice list and answer Bob's effects despite their
+   session realms being isolated. A distinct supervisor authorization model is required before that
+   topology can be enabled. Pinned by `answering_an_approval_requires_authentication` and
+   `principal_auth_cannot_share_a_global_remote_approval_queue`.
 
 **Deliberately not built:** a remote `AllowAlways`. Standing grants are not wrong — that is what the
 unattended posture *is* — but accumulating one click by click is a posture nobody chose. And there

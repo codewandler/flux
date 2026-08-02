@@ -203,9 +203,10 @@ Three properties worth knowing before you build a client against it:
 - **You must echo the `fingerprint`.** It is the effect in canonical form, and it is what binds your
   `yes` to the effect you were shown; a decision that names a different one is refused with `409`.
   A decision is also single-use, so it cannot be replayed onto the next effect.
-- **Only authenticated callers may answer.** The routes sit behind the server's auth, and an
-  unauthenticated non-loopback bind is refused outright — anyone who can approve the agent's effects
-  can make it do anything it is authorized to do.
+- **The operator boundary is one shared token (or open loopback).** The routes sit behind the
+  server's auth, and an unauthenticated non-loopback bind is refused outright. Principal auth is
+  refused for this posture: one global queue would otherwise let one principal answer another's
+  effects. Anyone holding the shared token can make the agent do anything it is authorized to do.
 
 **`--yes`** never asks. That is not safety switched off: authorization policy, the mandatory
 fail-closed sandbox floor on this surface, and the resource budgets are still doing the

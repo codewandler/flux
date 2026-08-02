@@ -271,12 +271,23 @@ routes answer `501` with a body saying so, rather than an empty list — "nothin
   "approvals": [
     {
       "id": "ap_3f1c9a02b7d4e615_0",
-      "fingerprint": "[\"write\",[\"report.txt\"],null,false,true]",
+      "fingerprint": "…",
       "tool": "write",
       "subjects": ["report.txt"],
       "summary": null,
       "destructive": false,
       "mutating": true,
+      "intents": {
+        "intents": [
+          {
+            "behavior": "filesystem_write",
+            "target": { "type": "path", "path": "report.txt" },
+            "role": "write_target",
+            "certainty": "certain"
+          }
+        ]
+      },
+      "plan": null,
       "waiting_secs": 4
     }
   ],
@@ -287,12 +298,13 @@ routes answer `501` with a body saying so, rather than an empty list — "nothin
 `POST /approvals/{id}` delivers one decision:
 
 ```json
-{ "fingerprint": "[\"write\",[\"report.txt\"],null,false,true]", "decision": "deny", "reason": "not that path" }
+{ "fingerprint": "…", "decision": "deny", "reason": "not that path" }
 ```
 
 `decision` is `allow` or `deny`; `reason` is optional and, on a denial, is passed to the model.
-`fingerprint` is **required and must match** — it is the effect in canonical form, and echoing it is
-what binds your decision to the effect you were shown.
+`fingerprint` is **required and must match** — echo the opaque value returned by `GET`; do not
+reconstruct it. It canonically binds the complete effect, including structured intent targets and
+exact plan requirements, to the decision you were shown.
 
 | Status | Meaning |
 |---|---|
@@ -315,9 +327,13 @@ Three properties are load-bearing, and a client should be written expecting them
   against another, even an identical-looking one — that is what the `id` plus `fingerprint` pair is
   for.
 
-⚠ Whoever can authenticate to this server can approve its agent's effects. These routes are inside
-the auth layer, and an unauthenticated non-loopback bind is refused at startup, but that is the
-whole of the protection: treat the ability to POST here as equivalent to the agent's own authority.
+⚠ Remote approval supports the single-operator server modes: a shared bearer token, or an open
+loopback listener. Router construction refuses it with per-request principal authentication. One
+deployment-wide queue in principal mode would otherwise let any authenticated principal list and
+answer every other principal's effects despite their session realms being isolated; that topology
+needs a separately authorized supervisor identity first. An unauthenticated non-loopback bind is
+still refused. Treat the shared token—and the ability to POST here—as equivalent to the agent's own
+authority.
 
 ## Tenancy
 

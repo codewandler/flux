@@ -13,8 +13,8 @@ pub use approval::{RiskApprover, DEFAULT_CONSENT_MARKER};
 
 mod remote_approval;
 pub use remote_approval::{
-    ApprovalQueue, DecideError, PendingApproval, RemoteApprover, APPROVAL_TIMEOUT_ENV,
-    DEFAULT_APPROVAL_TIMEOUT_SECS,
+    ApprovalQueue, DecideError, PendingApproval, PendingPlanApproval, RemoteApprover,
+    APPROVAL_TIMEOUT_ENV, DEFAULT_APPROVAL_TIMEOUT_SECS, MAX_APPROVAL_TIMEOUT_SECS,
 };
 
 mod fn_tool;

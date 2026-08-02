@@ -302,9 +302,15 @@ async fn an_approval_cannot_be_delivered_against_a_different_effect() {
         StatusCode::OK
     );
     assert_eq!(
-        decide(&agent.router, None, &benign_id, &benign_fingerprint, "allow")
-            .await
-            .0,
+        decide(
+            &agent.router,
+            None,
+            &benign_id,
+            &benign_fingerprint,
+            "allow"
+        )
+        .await
+        .0,
         StatusCode::OK
     );
     assert!(!benign.await.unwrap().is_error);
@@ -432,7 +438,9 @@ async fn answering_an_approval_requires_authentication() {
 
     // The authenticated operator still can.
     assert_eq!(
-        decide(&agent.router, auth, &id, &fingerprint, "allow").await.0,
+        decide(&agent.router, auth, &id, &fingerprint, "allow")
+            .await
+            .0,
         StatusCode::OK
     );
     assert!(!running.await.unwrap().is_error);
@@ -514,6 +522,14 @@ async fn the_listing_describes_the_effect_it_binds() {
     assert_eq!(
         request["mutating"], true,
         "the runtime's own risk signal must reach the human, not be dropped in transit"
+    );
+    assert!(
+        request["intents"]["intents"].is_array(),
+        "the exact intent targets must be shown and bound, not collapsed to risk booleans"
+    );
+    assert!(
+        request["plan"].is_null(),
+        "one effect is not a plan approval"
     );
     assert!(request["waiting_secs"].is_number());
 

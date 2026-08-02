@@ -2,7 +2,7 @@
 id: C-453
 title: "No approver in the tree speaks over a network — a served agent can only allow everything or deny everything"
 pillar: Core
-status: in-progress
+status: done
 priority: 2
 design: docs/designs/remote-agents.md
 epic: remote-agents
@@ -48,21 +48,21 @@ consumers with no human at a terminal to prompt."* This story builds the termina
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test asserting a served agent can have one specific effect approved by a
+- [x] **Failing-first**: a test asserting a served agent can have one specific effect approved by a
       remote decision, and that an unapproved effect is refused — failing at the merge base.
-- [ ] Implemented as an `Approver`, reusing the shape of `ChannelApprover` — it already decouples the
+- [x] Implemented as an `Approver`, reusing the shape of `ChannelApprover` — it already decouples the
       decision from the terminal, so a network approver is that with a different transport. ⚠ **Do not
       add a second approval concept**; the envelope has one stage and it should keep one.
-- [ ] ⚠ **Fails closed when nobody answers.** A timeout must deny, never allow. An approval channel that
+- [x] ⚠ **Fails closed when nobody answers.** A timeout must deny, never allow. An approval channel that
       allows on silence is worse than `AllowApprover`, because it looks like a control.
-- [ ] ⚠ **An approval is bound to the effect it was granted for** and cannot be replayed onto another.
+- [x] ⚠ **An approval is bound to the effect it was granted for** and cannot be replayed onto another.
       The obvious implementation — "the client said yes" — is a confused-deputy waiting to happen.
-- [ ] `auto_approve` remains an explicit, visible choice. Closing this hole must not remove the
+- [x] `auto_approve` remains an explicit, visible choice. Closing this hole must not remove the
       deliberate escape hatch.
-- [ ] ⚠ The docs state what shipped **before** this — allow-all or deny-all — so it reads as closing a
+- [x] ⚠ The docs state what shipped **before** this — allow-all or deny-all — so it reads as closing a
       hole rather than adding a feature. An operator running a served agent today should learn that they
       have been in one of those two modes.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -76,3 +76,12 @@ consumers with no human at a terminal to prompt."* This story builds the termina
 
 ## Progress
 - Filed 2026-08-02 while comparing flux's remote-agents model to Anthropic's Managed Agents.
+- Closed 2026-08-02 after rehabilitating the stopped session's WIP. The merge base has neither
+  `RemoteApprover` nor the server integration test; the new test drives a real served engine, real
+  guarded write and HTTP-only decision path, and verifies both an approved effect and an unanswered
+  refusal. Independent review found three gaps beyond that headline test: distinct structured intent
+  targets collapsed to one fingerprint, every principal could share one global approval queue, and
+  program mode accepted `--remote-approval` while ignoring it. Failing-first tests captured all
+  three. The binding now includes full intents and exact plan requirements, principal mode is refused
+  until a supervisor authorization model exists, and the inert flag combination is a parse error.
+  Approval waits are capped at one hour. Standard and no-`bwrap` full workspace gates are green.

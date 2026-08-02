@@ -389,6 +389,25 @@ mod tests {
         }
     }
 
+    /// C-453's remote approver belongs to the built-in served agent. Program mode has its own
+    /// channel lifecycle and must not accept a flag it silently ignores.
+    #[test]
+    fn remote_approval_is_refused_with_a_program_path() {
+        use super::Cli;
+        use clap::Parser;
+
+        let error = Cli::try_parse_from([
+            "flux",
+            "app",
+            "run",
+            "program.flux",
+            "--serve",
+            "--remote-approval",
+        ])
+        .expect_err("program mode must not accept an inert remote-approval flag");
+        assert!(error.to_string().contains("--remote-approval"));
+    }
+
     #[test]
     fn saved_flow_subcommands_and_input_flags_parse() {
         use super::{Cli, Commands, FlowAction};

@@ -78,21 +78,25 @@ use flux_spec::IntentSet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::{ApprovalChoice, Approver, PlanApprovalRequest};
+use crate::{ApprovalChoice, Approver, AuthorityRequirement, PlanApprovalRequest};
 
 /// How long a parked approval waits for a decision before denying. Two minutes: long enough for a
 /// human to read a request that arrived on a phone, short enough that a wedged turn is not a
 /// resource leak.
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
+/// Longest a request may hold a served turn while waiting for a human.
+pub const MAX_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
+
 /// Environment override for [`DEFAULT_APPROVAL_TIMEOUT_SECS`].
 pub const APPROVAL_TIMEOUT_ENV: &str = "FLUX_APPROVAL_TIMEOUT_SECS";
 
 /// One approval request parked on an [`ApprovalQueue`], as a remote approver sees it.
 ///
-/// Everything a human needs to decide is here, and everything here is part of the
-/// [`fingerprint`](Self::fingerprint) — so what was displayed and what gets bound are the same
-/// facts by construction rather than by two code paths agreeing.
+/// Everything a human needs to decide is here. Every effect fact is part of the
+/// [`fingerprint`](Self::fingerprint); only the queue id and advisory wait age are excluded. What
+/// was displayed and what gets bound are therefore the same facts by construction rather than by
+/// two code paths agreeing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingApproval {
     /// Queue-unique id for this request. Not a secret and not a capability — see the module docs.
@@ -111,9 +115,38 @@ pub struct PendingApproval {
     pub destructive: bool,
     /// True when the effect writes, executes, or connects out.
     pub mutating: bool,
+    /// The complete structured intent set the runtime used for its pre-execution risk decision.
+    /// This is part of the fingerprint: two calls with the same permission subject but different
+    /// concrete targets are different effects.
+    pub intents: IntentSet,
+    /// Exact whole-plan facts when this is a batch approval. `None` for one tool dispatch.
+    pub plan: Option<PendingPlanApproval>,
     /// Whole seconds this request has already been parked. Advisory display only; expiry is decided
     /// by the waiting side, which denies.
     pub waiting_secs: u64,
+}
+
+/// Exact plan-only facts carried by a [`PendingApproval`].
+///
+/// The friendly `subjects` lines are for display; these typed values are also exposed and bound so
+/// two plans cannot collide merely because their summaries render alike.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingPlanApproval {
+    /// Distinct operation names in first-seen order.
+    pub ops: Vec<String>,
+    /// Exact authority requirements derived by plan preview.
+    pub requirements: Vec<AuthorityRequirement>,
+}
+
+/// The effect facts that become both the public pending request and its exact binding.
+struct ApprovalEffect {
+    tool: String,
+    subjects: Vec<String>,
+    summary: Option<String>,
+    destructive: bool,
+    mutating: bool,
+    intents: IntentSet,
+    plan: Option<PendingPlanApproval>,
 }
 
 /// Why a delivered decision was refused. Each is a **refusal of the decision**, never an approval:
@@ -168,13 +201,15 @@ pub struct ApprovalQueue {
 }
 
 impl ApprovalQueue {
-    /// A queue that denies any request left unanswered for `timeout`.
+    /// A queue that denies any request left unanswered for `timeout`, capped at
+    /// [`MAX_APPROVAL_TIMEOUT_SECS`] so a nominally finite value cannot become an effectively
+    /// permanent resource hold.
     ///
     /// A zero `timeout` denies immediately — which is fail-closed, and is the only thing a
     /// "disabled" setting is allowed to mean here.
     pub fn new(timeout: Duration) -> Self {
         Self {
-            timeout,
+            timeout: timeout.min(Duration::from_secs(MAX_APPROVAL_TIMEOUT_SECS)),
             seq: AtomicU64::new(0),
             nonce: queue_nonce(),
             parked: Mutex::new(HashMap::new()),
@@ -187,7 +222,8 @@ impl ApprovalQueue {
     /// ⚠ There is no value meaning *wait forever*. An unbounded wait is not a denial — it is a
     /// wedged turn holding whatever the effect was about to touch — and an operator reaching for
     /// "no timeout" is reaching for the wrong control. An unparsable value falls back to the
-    /// default rather than failing the surface; a *shorter* wait is never the unsafe direction.
+    /// default rather than failing the surface; values above [`MAX_APPROVAL_TIMEOUT_SECS`] are
+    /// capped. A *shorter* wait is never the unsafe direction.
     pub fn from_env() -> Self {
         let secs = std::env::var(APPROVAL_TIMEOUT_ENV)
             .ok()
@@ -249,7 +285,9 @@ impl ApprovalQueue {
                 Some(entry) if entry.request.fingerprint != fingerprint => {
                     return Err(DecideError::EffectMismatch);
                 }
-                Some(_) => parked.remove(id).expect("checked present under the same lock"),
+                Some(_) => parked
+                    .remove(id)
+                    .expect("checked present under the same lock"),
                 None => return Err(DecideError::UnknownRequest),
             }
         };
@@ -334,24 +372,24 @@ impl RemoteApprover {
     }
 
     /// Park one request and await the answer. This is the whole fail-closed rule, in one place.
-    async fn ask(
-        &self,
-        tool: &str,
-        subjects: Vec<String>,
-        summary: Option<String>,
-        destructive: bool,
-        mutating: bool,
-    ) -> ApprovalChoice {
+    async fn ask(&self, effect: ApprovalEffect) -> ApprovalChoice {
+        let Ok(fingerprint) = fingerprint(&effect) else {
+            // The binding could not be represented, so there is no effect-safe approval request
+            // to show. A serialization failure must never degrade to a transferable constant.
+            return ApprovalChoice::Deny;
+        };
         let request = PendingApproval {
             // Replaced by `park`; the fingerprint below is over the *content*, so the id — which is
             // assigned after — is deliberately not part of it.
             id: String::new(),
-            fingerprint: fingerprint(tool, &subjects, summary.as_deref(), destructive, mutating),
-            tool: tool.to_string(),
-            subjects,
-            summary,
-            destructive,
-            mutating,
+            fingerprint,
+            tool: effect.tool,
+            subjects: effect.subjects,
+            summary: effect.summary,
+            destructive: effect.destructive,
+            mutating: effect.mutating,
+            intents: effect.intents,
+            plan: effect.plan,
             waiting_secs: 0,
         };
         let (id, rx) = self.queue.park(request);
@@ -377,13 +415,15 @@ impl Approver for RemoteApprover {
         subjects: &[String],
         intents: &IntentSet,
     ) -> ApprovalChoice {
-        self.ask(
-            tool,
-            subjects.to_vec(),
-            None,
-            intents.is_destructive(),
-            intents.is_mutating(),
-        )
+        self.ask(ApprovalEffect {
+            tool: tool.into(),
+            subjects: subjects.to_vec(),
+            summary: None,
+            destructive: intents.is_destructive(),
+            mutating: intents.is_mutating(),
+            intents: intents.clone(),
+            plan: None,
+        })
         .await
     }
 
@@ -393,13 +433,18 @@ impl Approver for RemoteApprover {
     /// fingerprint, and one plan's approval would be deliverable against the other. Spending the
     /// plan's own content here is what keeps distinct plans distinct.
     async fn request_plan(&self, plan: &PlanApprovalRequest) -> ApprovalChoice {
-        self.ask(
-            "run plan",
-            plan_detail_lines(plan),
-            Some(plan.summary.clone()),
-            plan.destructive,
-            plan.mutating,
-        )
+        self.ask(ApprovalEffect {
+            tool: "run plan".into(),
+            subjects: plan_detail_lines(plan),
+            summary: Some(plan.summary.clone()),
+            destructive: plan.destructive,
+            mutating: plan.mutating,
+            intents: plan.intents.clone(),
+            plan: Some(PendingPlanApproval {
+                ops: plan.ops.clone(),
+                requirements: plan.requirements.clone(),
+            }),
+        })
         .await
     }
 }
@@ -448,18 +493,16 @@ fn plan_detail_lines(plan: &PlanApprovalRequest) -> Vec<String> {
 /// supplies the unambiguity (`["a", "b"]` and `["a\nb"]` do not encode alike), and a positional
 /// tuple rather than a map means the field order is fixed by the type, not by a serializer setting
 /// a future feature flag could reorder.
-fn fingerprint(
-    tool: &str,
-    subjects: &[String],
-    summary: Option<&str>,
-    destructive: bool,
-    mutating: bool,
-) -> String {
-    serde_json::to_string(&(tool, subjects, summary, destructive, mutating))
-        // Serializing these types cannot fail. If it somehow did, fall back to an encoding that is
-        // still injective (`Debug` escapes identically) rather than to a constant — two effects
-        // sharing one fingerprint is the one outcome this function must never produce.
-        .unwrap_or_else(|_| format!("{tool:?}{subjects:?}{summary:?}{destructive}{mutating}"))
+fn fingerprint(effect: &ApprovalEffect) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&(
+        &effect.tool,
+        &effect.subjects,
+        effect.summary.as_deref(),
+        effect.destructive,
+        effect.mutating,
+        &effect.intents,
+        effect.plan.as_ref(),
+    ))
 }
 
 /// A per-queue, per-process value that makes request ids non-enumerable across queues.
@@ -538,7 +581,11 @@ mod tests {
         let queue = queue(0);
         let approver = RemoteApprover::new(Arc::clone(&queue));
         let choice = approver
-            .request("process.exec", &["rm -rf /".to_string()], &IntentSet::default())
+            .request(
+                "process.exec",
+                &["rm -rf /".to_string()],
+                &IntentSet::default(),
+            )
             .await;
         assert!(
             matches!(choice, ApprovalChoice::Deny),
@@ -606,10 +653,55 @@ mod tests {
             )
             .expect("its own fingerprint is accepted");
         queue
-            .decide(&benign_req.id, &benign_req.fingerprint, ApprovalChoice::Allow)
+            .decide(
+                &benign_req.id,
+                &benign_req.fingerprint,
+                ApprovalChoice::Allow,
+            )
             .expect("its own fingerprint is accepted");
         assert!(matches!(benign.await.unwrap(), ApprovalChoice::Allow));
         assert!(matches!(destructive.await.unwrap(), ApprovalChoice::Deny));
+    }
+
+    /// Two calls can name the same tool and permission subject while carrying different concrete
+    /// intent targets. The binding must retain that distinction rather than collapsing the risk
+    /// signal to the two display booleans.
+    #[tokio::test]
+    async fn different_intent_targets_are_different_effects() {
+        use flux_spec::{Intent, IntentBehavior, IntentCertainty, IntentRole, IntentTarget};
+
+        let queue = queue(30);
+        let approver = Arc::new(RemoteApprover::new(Arc::clone(&queue)));
+        let ask = |approver: Arc<RemoteApprover>, url: &'static str| {
+            tokio::spawn(async move {
+                let intents = IntentSet {
+                    intents: vec![Intent {
+                        behavior: IntentBehavior::NetworkFetch,
+                        target: IntentTarget::Url { url: url.into() },
+                        role: IntentRole::ReadTarget,
+                        certainty: IntentCertainty::Certain,
+                    }],
+                };
+                approver
+                    .request("http.request", &["api.example".into()], &intents)
+                    .await
+            })
+        };
+        let benign = ask(Arc::clone(&approver), "https://api.example/status");
+        let privileged = ask(approver, "https://api.example/admin");
+
+        let pending = wait_for_pending(&queue, 2).await;
+        assert_ne!(
+            pending[0].fingerprint, pending[1].fingerprint,
+            "different intent targets collapsed to one remotely transferable approval"
+        );
+        for request in pending {
+            queue
+                .decide(&request.id, &request.fingerprint, ApprovalChoice::Deny)
+                .unwrap();
+        }
+        benign.await.unwrap();
+        privileged.await.unwrap();
     }
 
     /// ⚠ Single use: a captured decision cannot be replayed onto the next request.
@@ -749,17 +841,30 @@ mod tests {
     /// The fingerprint is injective across the shapes a naive join would confuse.
     #[test]
     fn the_fingerprint_separates_effects_a_naive_join_would_merge() {
-        let two = fingerprint("exec", &["a".into(), "b".into()], None, false, true);
-        let one = fingerprint("exec", &["a\nb".into()], None, false, true);
+        let intents = IntentSet::default();
+        let fingerprint_of = |subjects: Vec<String>, destructive| {
+            fingerprint(&ApprovalEffect {
+                tool: "exec".into(),
+                subjects,
+                summary: None,
+                destructive,
+                mutating: true,
+                intents: intents.clone(),
+                plan: None,
+            })
+            .unwrap()
+        };
+        let two = fingerprint_of(vec!["a".into(), "b".into()], false);
+        let one = fingerprint_of(vec!["a\nb".into()], false);
         assert_ne!(two, one);
         assert_ne!(
-            fingerprint("exec", &["x".into()], None, false, true),
-            fingerprint("exec", &["x".into()], None, true, true),
+            fingerprint_of(vec!["x".into()], false),
+            fingerprint_of(vec!["x".into()], true),
             "the risk signal the human was shown is part of what they approved"
         );
         assert_eq!(
-            fingerprint("exec", &["x".into()], None, false, true),
-            fingerprint("exec", &["x".into()], None, false, true),
+            fingerprint_of(vec!["x".into()], false),
+            fingerprint_of(vec!["x".into()], false),
             "the same effect fingerprints the same, or no decision could ever be delivered"
         );
     }
@@ -771,6 +876,11 @@ mod tests {
         assert_eq!(
             DEFAULT_APPROVAL_TIMEOUT_SECS, 120,
             "the documented default and the constant must agree"
+        );
+        assert_eq!(
+            ApprovalQueue::new(Duration::from_secs(u64::MAX)).timeout(),
+            Duration::from_secs(MAX_APPROVAL_TIMEOUT_SECS),
+            "a nominally finite timeout must not become a centuries-long resource hold"
         );
     }
 }

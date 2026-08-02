@@ -674,8 +674,10 @@ pub(super) enum AppAction {
         ///
         /// This is the posture with a human in it. The alternative is `--yes` — do not ask, and let
         /// authorization policy, the sandbox floor and resource budgets do the constraining, which
-        /// is the right design for high-autonomy work. Pick one; they contradict each other.
-        #[arg(long, requires = "serve")]
+        /// is the right design for high-autonomy work. Pick one; they contradict each other. Remote
+        /// approval supports the shared operator token (or open loopback) server modes; principal
+        /// auth is refused until approvals have a distinct supervisor authorization model.
+        #[arg(long, requires = "serve", conflicts_with = "program")]
         remote_approval: bool,
     },
 }

@@ -1045,9 +1045,9 @@ mod served_approval_posture {
     /// environment from one test in a parallel suite is how a neighbouring test starts flaking.
     #[tokio::test]
     async fn the_remote_posture_denies_when_nobody_answers() {
-        let posture = ServedApprovalPosture::Remote(Arc::new(
-            flux_runtime::ApprovalQueue::new(std::time::Duration::ZERO),
-        ));
+        let posture = ServedApprovalPosture::Remote(Arc::new(flux_runtime::ApprovalQueue::new(
+            std::time::Duration::ZERO,
+        )));
         let choice = posture
             .approver()
             .request("write", &["/etc/passwd".to_string()], &IntentSet::default())

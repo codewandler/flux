@@ -25,6 +25,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **A served agent can ask you before each effect.** Start the built-in HTTP/A2A agent with
+  `--remote-approval` to receive pending operations at `/approvals` and allow or deny each one from
+  your client. An unanswered request is denied, every decision is tied to exactly what you reviewed,
+  and captured decisions cannot be replayed. The existing `--yes` mode remains the explicit choice
+  for unattended work. Remote approval currently uses one shared operator token (or an open loopback
+  listener); per-user principal mode is refused until it has a separate supervisor authorization
+  model.
+
 - **HTTP credentials can be limited to where—and for whom—they work.** An `http.request` secret
   allowlist entry can now name destination hosts, the person allowed to cause its use, and whether
   it may appear in a header or query parameter. The check happens before flux reads the value and is
