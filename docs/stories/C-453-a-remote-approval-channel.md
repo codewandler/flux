@@ -2,7 +2,7 @@
 id: C-453
 title: "No approver in the tree speaks over a network — a served agent can only allow everything or deny everything"
 pillar: Core
-status: ready
+status: in-progress
 priority: 2
 design: docs/designs/remote-agents.md
 epic: remote-agents

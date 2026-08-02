@@ -78,6 +78,9 @@ triage:
 - [`2026-08-01-concept-docs-review.md`](single/2026-08-01-concept-docs-review.md) — diff review of
   the uncommitted concept-docs work (Concepts rewrite, Ecosystem page, sync script, CI gate);
   10 confirmed findings, gate red at time of review.
+- [`2026-08-02-c444-sdk-autonomous-posture.md`](single/2026-08-02-c444-sdk-autonomous-posture.md) —
+  envelope-integrity review of the SDK autonomous posture; two material gaps corrected and pinned
+  before integration, with no release-blocking finding left in scope.
 
 Tracked by C-186 (in progress) and C-267.
 

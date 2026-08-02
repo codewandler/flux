@@ -41,6 +41,7 @@ const sidebars = {
             'agent/providers',
             'agent/claude-code',
             'agent/project-context',
+            'agent/context-management',
             'agent/skills-and-roles',
             'agent/claude-compat',
           ],
