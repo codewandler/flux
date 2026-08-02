@@ -30,10 +30,17 @@ fn assets() -> PathBuf {
 
 /// Run a snippet of Node with `measure.js` required, printing one JSON line, and parse it.
 ///
-/// `node` is a **runtime** dependency of the sidecar, not of flux: it is what the harness is written
-/// in, the same way a browser is what it drives. A machine without it skips rather than fails, which
-/// is the same posture `check-feature-gated-tests.sh` takes for the browser itself.
-fn node_eval(script: &str) -> Option<serde_json::Value> {
+/// **A missing `node` fails these tests rather than skipping them**, and that is deliberate. The
+/// first version of this file returned early with an `eprintln!` — but libtest captures stderr for
+/// *passing* tests, so with `node` off `PATH` the suite reported `ok. 4 passed` and the word
+/// "skipped" appeared nowhere without `--nocapture`. Three of the four legs no-op'd while the gate
+/// read green, which is precisely the defect class this suite exists to catch, turned on itself.
+///
+/// `node` is not a flux dependency: it is the language the sidecar is written in, so without it
+/// there is no harness to check and a green result would be a lie. `check-feature-gated-tests.sh`
+/// marks this suite `run`, and a `run` leg that silently declines to run is worse than one that is
+/// honestly absent — so the absence is loud.
+fn node_eval(script: &str) -> serde_json::Value {
     let measure = assets().join("measure.js");
     assert!(
         measure.is_file(),
@@ -44,21 +51,25 @@ fn node_eval(script: &str) -> Option<serde_json::Value> {
         "const M = require({});\n{script}",
         serde_json::to_string(&measure.to_string_lossy()).unwrap()
     );
-    let output = match Command::new("node").arg("-e").arg(&program).output() {
-        Ok(output) => output,
-        // No node on this machine: the sidecar could not run here anyway.
-        Err(_) => return None,
-    };
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(&program)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "`node` must be on PATH to check the sidecar's measurement code, and this suite is \
+                 marked `run` in scripts/check-feature-gated-tests.sh: {e}. Install Node, or move \
+                 that ledger row off `run` and say why — do not let it pass by not testing."
+            )
+        });
     assert!(
         output.status.success(),
         "node failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Some(
-        serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("expected one JSON line, got {stdout:?}: {e}")),
-    )
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("expected one JSON line, got {stdout:?}: {e}"))
 }
 
 /// The probe's arithmetic is right, checked against an answer derived rather than recorded.
@@ -84,10 +95,7 @@ fn the_level_probe_computes_a_real_rms_rather_than_reporting_a_constant() {
       }
       console.log(JSON.stringify(rows));
     "#;
-    let Some(rows) = node_eval(script) else {
-        eprintln!("skipped: no `node` on PATH — the sidecar's own runtime is absent");
-        return;
-    };
+    let rows = node_eval(script);
 
     for row in rows.as_array().expect("rows") {
         let amplitude = row["amplitude"].as_f64().unwrap();
@@ -118,7 +126,7 @@ fn the_level_probe_computes_a_real_rms_rather_than_reporting_a_constant() {
         speech: M.frameLevel(speech),
       }));
     "#;
-    let measured = node_eval(script).expect("node was present a moment ago");
+    let measured = node_eval(script);
     assert!(
         measured["silence"]["rms"].as_f64().unwrap() < 0.01,
         "digital silence must read below flux's floor: {measured}"
@@ -145,10 +153,7 @@ fn an_unmeasurable_frame_is_reported_as_unmeasurable_not_as_silence() {
         window: M.windowLevel([loud, broken, loud]),
       }));
     "#;
-    let Some(measured) = node_eval(script) else {
-        eprintln!("skipped: no `node` on PATH");
-        return;
-    };
+    let measured = node_eval(script);
     assert!(
         measured["frame"]["rms"].is_null() || !measured["frame"]["rms"].is_number(),
         "NaN must survive as NaN (JSON null), not become 0.0: {measured}"
@@ -173,10 +178,7 @@ fn pcm16_decodes_little_endian_at_full_scale_without_clipping() {
       const samples = Array.from(M.pcm16ToFloat(bytes.toString("base64"), decode));
       console.log(JSON.stringify(samples));
     "#;
-    let Some(samples) = node_eval(script) else {
-        eprintln!("skipped: no `node` on PATH");
-        return;
-    };
+    let samples = node_eval(script);
     let samples: Vec<f64> = samples
         .as_array()
         .expect("samples")
