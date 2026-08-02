@@ -120,7 +120,6 @@ _flux's central claim is that **the LLM is not the runtime** — authored contro
 ### The docs are missing things a user expects to find — starting with context management
 _Someone evaluating an agent harness arrives with a checklist they did not write down. *How does it_
 - [C-442 — What do Codex, Claude Code, OpenCode and Pi document that we do not?](C-442-peer-docs-gap-audit.md) · Core · ⚠ verify against the LIVE docs; do not write this from recollection. A gap list assembled from memory of what a competitor's docs probably contain is exactly the confident-and-wrong artifact this repo keeps catching — leave a row empty rather than guess it
-- [C-455 — `docs/ecosystem.md` says flux-exchange \"binds no port, holds no credential, and answers no request\" — three of those shipped](C-455-ecosystem-doc-is-stale.md) · Core · found while comparing localities. The paragraph was true at flux-exchange v0.4.0 and is false at v0.11.0 — sign-in, the credential store and `invoke` all exist. Only channels, `subscribe`, stored workflows and execution records remain accurate
 
 ### the execution substrate — `flux-system` for a second consumer
 _`flux-system` has had exactly one consumer since it was written: flux. That is about to stop being_

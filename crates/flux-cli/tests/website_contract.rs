@@ -1038,6 +1038,67 @@ fn homepage_flux_example_is_canonical_and_analyzes_against_the_live_catalog() {
     );
 }
 
+/// C-491: the team presentation is part of the release-matched docs artifact, not an external deck
+/// that can drift from its sources. Its one executable seam must remain L-128's already-declared
+/// scratch fixture, and the mutable ecosystem status must stay visibly dated.
+#[test]
+fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixture() {
+    let route = read("website/src/pages/presentation.js");
+    let deck = read("website/src/components/FluxPresentation/index.js");
+    let console = read("website/src/pages/console.js");
+    let ecosystem = read("docs/ecosystem.md");
+    let ecosystem_prose = normalized_prose(&ecosystem);
+
+    assert!(
+        route.contains("<FluxPresentation"),
+        "the Docusaurus route must mount the interactive deck"
+    );
+    assert!(
+        console.contains("to=\"/presentation/\"")
+            && console.contains("Present flux to your engineering team"),
+        "the Flux-Lang console must expose the presentation entry point"
+    );
+    for claim in [
+        "The LLM is not the runtime.",
+        "authorization → approval → guarded IO",
+        "flux-connectors main · v0.16.0",
+        "flux-exchange main · v0.13.0",
+        "Flux does not yet carry a client binding",
+    ] {
+        assert!(deck.contains(claim), "presentation omits `{claim}`");
+    }
+    assert!(
+        deck.contains("fixture=\"rust-files\"") && deck.contains("<FluxWorkbench"),
+        "the demo must reuse the declared L-128 scratch fixture"
+    );
+    assert!(
+        deck.contains("Source snapshot · 2026-08-03"),
+        "mutable sibling-project claims must carry a visible date"
+    );
+
+    for stale in [
+        "binds no port, holds no credential, and answers no request",
+        "Neither verb is built",
+        "flux loads connectors directly",
+    ] {
+        assert!(
+            !ecosystem.contains(stale),
+            "docs/ecosystem.md retained C-455's stale claim `{stale}`"
+        );
+    }
+    for absent in [
+        "flux itself has no exchange client binding",
+        "subscribe does not exist",
+        "hosted channels",
+        "execution records",
+    ] {
+        assert!(
+            ecosystem_prose.contains(absent),
+            "ecosystem correction must keep the unbuilt boundary explicit: `{absent}`"
+        );
+    }
+}
+
 /// The endpoint walkthrough is duplicated deliberately between the operator overview and the SQL
 /// plugin guide. Parse and analyze both copies with the published operation shapes: a formatter
 /// fixed point alone does not reject a positional value mixed with named arguments.

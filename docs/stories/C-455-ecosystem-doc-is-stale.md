@@ -2,8 +2,7 @@
 id: C-455
 title: "`docs/ecosystem.md` says flux-exchange \"binds no port, holds no credential, and answers no request\" — three of those shipped"
 pillar: Core
-status: ready
-priority: 6
+status: done
 design: docs/designs/docs-completeness.md
 epic: docs-completeness
 areas: [docs]
@@ -31,15 +30,15 @@ listed, rotated and deleted, and **`invoke` runs** — gated by a grant since X-
 
 ## Acceptance
 
-- [ ] The paragraph reflects v0.11.0, and names the version it was checked against **with a date**, since
+- [x] The paragraph reflects the newer v0.13.0, and names the version it was checked against **with a date**, since
       it will go stale again.
-- [ ] ⚠ **Check the neighbours in the same pass.** `docs/ecosystem.md` is the derived summary of
+- [x] ⚠ **Check the neighbours in the same pass.** `docs/ecosystem.md` is the derived summary of
       `docs/designs/ecosystem.md`; that design says *"Where they disagree, this one is the argument and
       that one is the summary — **fix both**."* A one-sided fix reproduces the drift.
-- [ ] The still-accurate half stays explicit. ⚠ A correction that quietly drops *"none of them are built"*
+- [x] The still-accurate half stays explicit. ⚠ A correction that quietly drops *"none of them are built"*
       without stating which four remain unbuilt trades an understatement for an overstatement, which is
       the worse error for a page about who owns what.
-- [ ] ⚠ flux-exchange's own docs carry the same drift in the other direction — its `README.md:11` says
+- [x] ⚠ flux-exchange's own docs carry the same drift in the other direction — its `README.md:11` says
       "v0.9.0" while `Cargo.toml` and `CHANGELOG.md` say 0.11.0, and its `docs/roadmap.md` still says
       v0.4.0 and *"it still executes nothing"*. Out of scope for this repo; record it so someone raises
       it there.
@@ -51,3 +50,7 @@ listed, rotated and deleted, and **`invoke` runs** — gated by a grant since X-
 
 ## Progress
 - Filed 2026-08-02.
+- 2026-08-03: Taken with C-491 so the presentation and its source documentation cannot disagree.
+- 2026-08-03: Corrected the summary, website mirror, and design against flux-exchange main v0.13.0
+  and flux-connectors main v0.16.0. The Exchange README is now current, but its out-of-scope
+  `docs/roadmap.md` still says v0.4.0 and "executes nothing"; that repository still owes the fix.

@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Release-matched interactive engineering presentation (C-491).** `/flux/presentation/` is a
+  ten-part, keyboard-accessible tour of Flux's deterministic runtime boundary, product surfaces,
+  connectors, Exchange, local/shared topology, and operational posture. `/console/` links to the
+  deck, and its one runnable chapter reuses the existing `rust-files` guarded scratch fixture, so
+  hosted docs stay editor-only and `flux docs` gains no new authority.
+
 - **Grounded session insights (C-490).** `flux insights` deterministically folds today's durable
   Flux events into sessions, turns, outcomes, time, usage/cost, operations, errors, approvals and
   subjects; `/insights [direction]` does the same for the active REPL/TUI session. One bounded,
@@ -53,6 +59,12 @@ All notable changes to this project are documented in this file. The format is b
   derives fresh runtime paths instead of trusting stale projection metadata.
 
 ### Changed
+
+- **The ecosystem overview now reflects the shipped connector and Exchange boundaries** (C-455).
+  It records dated v0.16.0/v0.13.0 source snapshots, replaces the obsolete claim that Exchange
+  serves nothing with its OIDC/connection/grant/`invoke` inventory, and keeps the missing Flux
+  client binding, agent authentication, `subscribe`, hosted channels, workflows, and execution
+  records explicit.
 
 - **Remote dispatch evidence now records the selected execution substrate as host-stamped
   provenance** (C-439). `tool_call` and dispatch lifecycle observations carry the immutable

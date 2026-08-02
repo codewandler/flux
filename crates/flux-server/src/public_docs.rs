@@ -1182,7 +1182,7 @@ fn resolve_asset_path<'a>(
     if assets.contains_key(relative) {
         return assets.get_key_value(relative).map(|(key, _)| key.as_str());
     }
-    let html = format!("{relative}.html");
+    let html = format!("{}.html", relative.trim_end_matches('/'));
     if assets.contains_key(&html) {
         return assets.get_key_value(&html).map(|(key, _)| key.as_str());
     }
@@ -1285,7 +1285,7 @@ mod tests {
             "9.8.7"
         );
 
-        for path in ["/flux/", "/console/"] {
+        for path in ["/flux/", "/console/", "/flux/presentation/"] {
             let (status, body) = response("GET", path, "").await;
             assert_eq!(status, StatusCode::OK, "{path}");
             assert!(

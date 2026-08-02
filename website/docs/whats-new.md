@@ -14,6 +14,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Present Flux to your engineering team from the docs.** The new 15-minute presentation explains
+  why the model is not the runtime, walks through authorization, approval, and guarded IO, and puts
+  connectors and Exchange into honest local and shared deployment topologies. It is linked from the
+  Flux-Lang console, works as a keyboard-driven hosted deck, and reuses the existing guarded scratch
+  example when opened through local `flux docs`.
+
 - **See what today's agent work actually accomplished.** Run `flux insights` for a factual daily
   rollup of sessions, outcomes, time, model usage, operations, errors, approvals and touched
   subjects, followed by one grounded summary. Inside the REPL or TUI, `/insights [direction]`

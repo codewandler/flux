@@ -160,8 +160,9 @@ A connector declares two directions, so a host can serve either one remotely. Th
 not "channels" — it is a **remote connector binding with two verbs**, and the symmetry is the design.
 
 - **`invoke`** — the caller names an operation id and arguments. The host resolves the credential,
-  evaluates the operation's own compiled Flux to build the request, and dispatches. This exists
-  today in `flux-connectors/crates/connectors-api`.
+  evaluates the operation's own compiled Flux to build the request, and dispatches. This exists in
+  the non-published `flux-connectors/crates/connectors-api` proof host and, for tenant/grant-scoped
+  HTTP operations, in flux-exchange v0.13.0.
 - **`subscribe`** — the host terminates the vendor webhook, holds the socket, or runs the poll; it
   verifies the signature **with the credential it owns**; it maps the payload through the binding the
   manifest declares; and it emits a normalized, typed event to a subscriber. This does not exist.
@@ -199,10 +200,10 @@ are all the same shape — a long-lived authenticated bidirectional frame stream
 2. streamed operation output (`logs -f`, process stdout, a socket read loop),
 3. lease liveness — the host must learn the holder died so it can release what it is holding.
 
-flux needs no new concept to consume this. `flux-channels` already has a generic `connector` channel
-kind that reads a manifest and drives a binding locally; a `mode = "remote"` setting opens a stream
-instead of binding a listener, and `trigger { on = … }` is unchanged because the event names come
-from the same manifest either way.
+flux needs no new trigger concept to consume this. `flux-channels` already has a generic `connector`
+channel kind that reads a manifest and drives a deliberately narrow webhook binding locally. A
+future `mode = "remote"` setting could open a stream instead of binding a listener while keeping
+event labels unchanged; neither that mode nor Exchange `subscribe` exists today.
 
 ## Principals and grants
 
@@ -255,16 +256,10 @@ was `http.request` returning a flat string, which refused any composite operatio
 of a previous step's response. It now returns the record `{status, headers, body}` as canonical
 `content`, keeping the flat rendering as the model-facing `view` (`flux-web/src/http.rs`).
 
-That landed in flux at **v0.43.0**. **flux-connectors pins `codewandler-flux-web` 0.41.0**, where it
-is still the flat string — so `$resp.body.data.id` is selectable in flux today and *not* in
-flux-connectors, whose `Graph` → composite-operation lowering therefore still refuses correctly for
-its pinned dependency. The unblock is real, it is upstream, and it reaches the connector compiler on a
-flux-web bump and not before.
-
-Recording it this way rather than as "unblocked" is deliberate: the first draft of this document said
-the latter, and a reader acting on it would have rewritten a live refusal that is correct for the
-version actually in the lockfile. Downstream migration plans naming this as a blocker should be
-re-checked against the *pin*, not against flux's HEAD.
+That landed in flux at **v0.43.0**. The downstream migration has now happened: flux-connectors
+v0.16.0 pins the Flux engine crates, including `flux-web`, on the **0.52** line. The earlier statement
+that its 0.41 pin still blocked composite response selection became false; retaining the dated
+history here explains the seam without presenting a closed dependency migration as current work.
 
 ## How a downstream product reuses this without forking it
 
@@ -290,9 +285,10 @@ working, not an omission.
 One fact belongs here rather than downstream, because it is a property of this family and more than
 one consumer has recorded it wrongly:
 
-> **The connector crates are published.** `codewandler-connector-{catalog,spec,secrets,pack}` are all
-> on crates.io at **0.8.0** as of 2026-07-31. Documents in at least two repositories still record a
-> verified 404 and plan around a `path`/`git` dependency. Re-check before designing around it.
+> **The connector crates are published.** The source workspace reports
+> `codewandler-connector-{catalog,spec,secrets,pack}` on **0.16.0** as of 2026-08-03. Re-check the
+> registry and the consuming engine line before designing around a version; this family moves faster
+> than a copied dependency example.
 
 Two patterns generalize from the first adoption and are worth stating for the next one:
 
@@ -309,9 +305,9 @@ Two patterns generalize from the first adoption and are worth stating for the ne
 - **Whether flux-exchange's console reuses flux-connectors' explorer components.** They import no
   framework by tested invariant, so they are mountable — but the two data models are cousins, not the
   same type. Deferred to the flux-exchange charter.
-- **Whether `subscribe` ships before or after multi-tenant sign-in.** The inbound confused-deputy
-  argument above is sound only once a principal exists; until then a loopback bind is what stands in
-  for one, exactly as it does for `invoke`.
+- **How `subscribe` follows shipped multi-tenant sign-in.** OIDC identity and tenant derivation now
+  exist in Exchange; inbound grant shape, transport, replay, and delivery evidence remain undecided
+  implementation work rather than a sign-in ordering question.
 - **Contract conformance.** `flux-connectors/docs/designs/connector-contracts.md` is hard-blocked on
   a global operation-naming story (C-23, `backlog`, never started) because `fills_slot` *infers*
   conformance from trailing name segments. That inference is measurably broken in both directions —
