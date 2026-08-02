@@ -149,9 +149,10 @@ operation fails:
 | `Unserved` | The delegate does not implement the operation at all. | Implement it, or stop asking. Retrying never helps. |
 
 The classification is **structural**: a delegate returns `Answer::Refused` or `Err(Unreachable)`,
-which are different positions in the type, and only a transport can construct the latter. The marker
-prefixes `failure_mode` matches on are written by `remote.rs` rather than by the delegate, so a
-refusal whose reason reads *"the substrate is unreachable"* still classifies as a refusal. That
+which are different positions in the type, and only a transport can construct the latter. `settle`
+stores the distinction in `flux_core::Error::GuardedIo` with a typed `GuardedIoFailure`, and
+`failure_mode` matches that variant rather than formatted text. A refusal whose reason begins with
+the exact unreachable diagnostic therefore still classifies as a refusal. That
 matters more than it looks: delegate-authored text that could reclassify a refusal would send an
 operator to investigate a perfectly healthy network.
 

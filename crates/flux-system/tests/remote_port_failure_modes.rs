@@ -16,12 +16,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use flux_system::port::{
-    GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles, UNSERVED,
-};
+use flux_system::port::{GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles};
 use flux_system::remote::{
     failure_mode, Answer, Answered, Delegate, Delivered, FailureMode, Loopback, RemoteSystem,
-    Unreachable, REFUSED, UNREACHABLE,
+    Unreachable,
 };
 use flux_system::{ProcessOutput, System, Workspace};
 
@@ -216,7 +214,11 @@ async fn a_refusal_and_an_unreachable_delegate_are_distinguishable() {
 /// and a marker reword would silently un-arm the test that is supposed to catch exactly this.
 #[tokio::test]
 async fn a_delegates_wording_cannot_forge_the_other_failure_mode() {
-    for marker in [UNREACHABLE, UNSERVED, REFUSED] {
+    for marker in [
+        FailureMode::Unreachable.prefix(),
+        FailureMode::Unserved.prefix(),
+        FailureMode::Refused.prefix(),
+    ] {
         for detail in [
             marker.to_string(),
             format!("{marker}no really, go check the network"),
@@ -251,7 +253,10 @@ async fn a_path_cannot_forge_a_failure_mode_on_the_loopback_path() {
     std::fs::create_dir_all(&root).unwrap();
     let remote = RemoteSystem::loopback(Arc::new(System::new(Workspace::new(&root).unwrap())));
 
-    for marker in [UNREACHABLE, UNSERVED] {
+    for marker in [
+        FailureMode::Unreachable.prefix(),
+        FailureMode::Unserved.prefix(),
+    ] {
         // A filename that opens with a marker, holding bytes that are not valid UTF-8.
         let name = format!("{marker}forged.bin").replace('/', "_");
         std::fs::write(root.join(&name), [0x66, 0xff, 0xfe]).unwrap();
@@ -301,11 +306,7 @@ async fn a_nested_hop_preserves_the_innermost_failure_mode() {
 
         // The mode travels structurally, so relaying it never stacks a second marker.
         let message = error.to_string();
-        let marker = match expected {
-            FailureMode::Refused => REFUSED,
-            FailureMode::Unreachable => UNREACHABLE,
-            FailureMode::Unserved => UNSERVED,
-        };
+        let marker = expected.prefix();
         assert!(
             !message[marker.len()..].contains(marker),
             "a hop stacked a duplicate {label} marker: {message}"

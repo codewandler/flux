@@ -91,7 +91,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-pub use flux_core::{Error, Result};
+pub use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
 
 use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead, System};
 
@@ -344,16 +344,14 @@ pub trait GuardedWorkspaceFiles: Send + Sync {
 
 /// The one spelling of "the substrate does not serve this", as a prefix.
 ///
-/// Public because it is the *only* way a consumer can tell a capability the substrate does not offer
-/// from a guard that rejected its path — the two are both `Error::Other`, so the distinction lives in
-/// this prefix and nowhere else. [`remote`](crate::remote) matches on it to classify a delegated
-/// failure, which is why it is a named constant rather than a literal inside [`deny`].
-pub const UNSERVED: &str = "this guarded substrate cannot ";
+/// Public so diagnostics can quote the canonical spelling without copying it. Classification is
+/// structural through [`GuardedIoFailure::Unserved`], never inferred from this text.
+pub const UNSERVED: &str = GuardedIoFailure::Unserved.prefix();
 
 /// The refusal an unserved optional port operation returns. One spelling, so a consumer can tell a
 /// capability the substrate does not offer from a guard that rejected its path.
 fn deny(operation: &str) -> Error {
-    Error::Other(format!("{UNSERVED}{operation}"))
+    Error::GuardedIo(GuardedIoError::new(GuardedIoFailure::Unserved, operation))
 }
 
 // ---------------------------------------------------------------------------

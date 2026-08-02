@@ -41,18 +41,18 @@
 //! | [`FailureMode::Unreachable`] | No answer arrived. Whether the operation happened is **unknown**. | Investigate the link. Retrying is meaningful. |
 //! | [`FailureMode::Unserved`] | The delegate does not implement this operation at all. | Implement it, or stop asking. Retrying never helps. |
 //!
-//! [`failure_mode`] recovers the mode from a `flux_core::Error`, so a consumer holding nothing but
-//! the port's `Result` can still branch on it.
+//! [`failure_mode`] recovers the mode from `flux_core::Error`'s typed guarded-IO variant, so a
+//! consumer holding nothing but the port's `Result` can still branch on it.
 //!
 //! ### The classification is structural, not textual
 //!
 //! A delegate reports a refusal by *returning* [`Answer::Refused`] and a broken link by returning
 //! [`Unreachable`] — two different positions in the type, not two different strings. Only the
-//! transport can produce `Unreachable`, and the marker prefix that [`failure_mode`] matches on is
-//! written by **this** module, at the front of the message, with the delegate's text appended after
-//! it. So a delegate whose refusal reason reads *"the substrate is unreachable"* still classifies as
-//! a refusal. This matters: an operator who saw "unreachable" for a guard refusal would go and
-//! investigate a perfectly healthy network.
+//! transport can produce `Unreachable`, and [`settle`] stores that distinction in
+//! `flux_core::Error::GuardedIo`. The diagnostic prefix is presentation only. So a delegate whose
+//! refusal reason begins with the exact unreachable diagnostic still classifies as a refusal. This
+//! matters: an operator who saw "unreachable" for a guard refusal would go and investigate a
+//! perfectly healthy network.
 //!
 //! ### An answered failure defaults to a refusal
 //!
@@ -96,51 +96,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use flux_core::{Error, Result};
+pub use flux_core::{Error, GuardedIoError, GuardedIoFailure as FailureMode, Result};
 
-use crate::port::{
-    Guarded, GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles, UNSERVED,
-};
+use crate::port::{Guarded, GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles};
 use crate::{OutputObserver, ProcessOutput, ScopedFileRead};
-
-/// The marker [`failure_mode`] reads to recognize a refusal. Written by this module at the front of
-/// the message, never by a delegate, so delegate-authored text cannot forge a mode.
-const REFUSED: &str = "the remote guarded substrate refused: ";
-
-/// The marker [`failure_mode`] reads to recognize a broken link. Reachable only from
-/// [`Unreachable`], which only a transport can construct.
-const UNREACHABLE: &str = "the remote guarded delegate is unreachable: ";
-
-/// Which of the three ways a delegated operation failed, recovered from the error it produced.
-///
-/// The distinction is the reason this module exists: see the module docs' table for what an operator
-/// does with each.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureMode {
-    /// The far side answered, and the answer was no. A guard did its job.
-    Refused,
-    /// No answer arrived; whether the operation happened is unknown.
-    Unreachable,
-    /// The delegate does not serve this operation at all.
-    Unserved,
-}
 
 /// The failure mode behind a guarded error, or `None` if it did not come from a delegated operation.
 ///
-/// Matching is on the message's **prefix**, and every prefix is written by this crate — so a
-/// refusal whose reason mentions an unreachable host is still a refusal. `None` means the error is
-/// not one this module produced (an unrelated `Error::Io`, say), which a consumer should treat as it
-/// would any other error rather than as a fourth mode.
+/// Matching is on the shared error variant, never on formatted text, so a refusal whose reason
+/// begins with another mode's canonical prefix is still a refusal. `None` means the error is not one
+/// this module produced (an unrelated `Error::Io`, say), which a consumer should treat as it would
+/// any other error rather than as a fourth mode.
 pub fn failure_mode(error: &Error) -> Option<FailureMode> {
-    let message = error.to_string();
-    if message.starts_with(REFUSED) {
-        Some(FailureMode::Refused)
-    } else if message.starts_with(UNREACHABLE) {
-        Some(FailureMode::Unreachable)
-    } else if message.starts_with(UNSERVED) {
-        Some(FailureMode::Unserved)
-    } else {
-        None
+    match error {
+        Error::GuardedIo(failure) => Some(failure.kind()),
+        _ => None,
     }
 }
 
@@ -178,7 +148,7 @@ impl Unreachable {
 
 impl std::fmt::Display for Unreachable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{}", UNREACHABLE, self.0)
+        f.write_str(&self.0)
     }
 }
 
@@ -411,30 +381,23 @@ fn unserved_now<T>(operation: &'static str) -> Answer<T> {
     Answer::Unserved(operation.to_string())
 }
 
-/// Turn what a delegate delivered into the port's `Result`, encoding the failure mode into the
-/// message so [`failure_mode`] can recover it.
-///
-/// Prefixing is idempotent: a message that already carries a marker (because it came back through a
-/// nested delegation) is passed through rather than wrapped again, so a chain of hops does not
-/// accumulate prefixes and the innermost mode is the one that survives.
+/// Turn what a delegate delivered into the port's `Result`, preserving the failure mode in the
+/// shared error variant so [`failure_mode`] never has to interpret operator-facing text.
 fn settle<T>(delivered: Delivered<T>) -> Result<T> {
     match delivered {
         Ok(Answer::Served(value)) => Ok(value),
-        Ok(Answer::Refused(detail)) => Err(Error::Other(marked(REFUSED, detail))),
-        Ok(Answer::Unserved(what)) => Err(Error::Other(marked(UNSERVED, what))),
-        Err(unreachable) => Err(Error::Other(unreachable.to_string())),
-    }
-}
-
-/// `prefix` + `detail`, unless `detail` already begins with a failure marker of its own.
-fn marked(prefix: &str, detail: String) -> String {
-    if detail.starts_with(REFUSED)
-        || detail.starts_with(UNREACHABLE)
-        || detail.starts_with(UNSERVED)
-    {
-        detail
-    } else {
-        format!("{prefix}{detail}")
+        Ok(Answer::Refused(detail)) => Err(Error::GuardedIo(GuardedIoError::new(
+            FailureMode::Refused,
+            detail,
+        ))),
+        Ok(Answer::Unserved(what)) => Err(Error::GuardedIo(GuardedIoError::new(
+            FailureMode::Unserved,
+            what,
+        ))),
+        Err(unreachable) => Err(Error::GuardedIo(GuardedIoError::new(
+            FailureMode::Unreachable,
+            unreachable.0,
+        ))),
     }
 }
 
@@ -634,17 +597,14 @@ impl<T: GuardedSubstrate + ?Sized> Loopback<T> {
 fn relay<T>(result: Result<T>) -> Delivered<T> {
     match result {
         Ok(value) => Ok(Answer::Served(value)),
-        Err(error) => {
-            let message = error.to_string();
-            match failure_mode(&error) {
-                Some(FailureMode::Unreachable) => Err(Unreachable::new(
-                    message.trim_start_matches(UNREACHABLE).to_string(),
-                )),
-                Some(FailureMode::Unserved) => Ok(Answer::Unserved(message)),
-                // Refused, or an ordinary failure the far side reported — both are answers.
-                _ => Ok(Answer::Refused(message)),
-            }
-        }
+        Err(Error::GuardedIo(failure)) => match failure.kind() {
+            FailureMode::Unreachable => Err(Unreachable::new(failure.detail())),
+            FailureMode::Unserved => Ok(Answer::Unserved(failure.detail().to_string())),
+            FailureMode::Refused => Ok(Answer::Refused(failure.detail().to_string())),
+        },
+        // An ordinary failure came back from the far side, so it is an answered refusal rather than
+        // evidence that the transport broke.
+        Err(error) => Ok(Answer::Refused(error.to_string())),
     }
 }
 
@@ -767,24 +727,32 @@ impl<T: GuardedSubstrate + ?Sized> Delegate for Loopback<T> {
 mod tests {
     use super::*;
 
-    /// The marker prefixes are the whole classification mechanism, so they must stay distinct from
-    /// each other and from `port.rs`'s unserved spelling — a shared prefix would make one mode
-    /// unreachable in the literal sense.
+    /// Prefixes remain distinct for readable diagnostics even though classification no longer reads
+    /// them.
     #[test]
     fn the_three_markers_are_mutually_non_prefixing() {
         for (a, b) in [
-            (REFUSED, UNREACHABLE),
-            (REFUSED, UNSERVED),
-            (UNREACHABLE, UNSERVED),
+            (
+                FailureMode::Refused.prefix(),
+                FailureMode::Unreachable.prefix(),
+            ),
+            (
+                FailureMode::Refused.prefix(),
+                FailureMode::Unserved.prefix(),
+            ),
+            (
+                FailureMode::Unreachable.prefix(),
+                FailureMode::Unserved.prefix(),
+            ),
         ] {
             assert!(!a.starts_with(b) && !b.starts_with(a), "{a:?} vs {b:?}");
         }
     }
 
-    /// Prefixing is idempotent, so a message that crossed two delegations still reports the mode the
-    /// innermost one chose rather than a stack of markers.
+    /// Delegate-authored text is always detail, even when it quotes a canonical prefix. The typed
+    /// kind remains the answer variant the delegate actually returned.
     #[test]
-    fn a_marked_message_is_not_marked_twice() {
+    fn a_marker_in_delegate_text_does_not_choose_the_kind() {
         let once = settle::<()>(Ok(Answer::Refused("denied".into())))
             .expect_err("a refusal is an error")
             .to_string();
@@ -792,8 +760,15 @@ mod tests {
             .expect_err("a refusal is an error")
             .to_string();
 
-        assert_eq!(once, twice);
-        assert_eq!(once.matches(REFUSED).count(), 1);
+        assert_ne!(
+            once, twice,
+            "a delegate-authored string is always quoted as detail"
+        );
+        assert_eq!(
+            failure_mode(&settle::<()>(Ok(Answer::Refused(once))).unwrap_err()),
+            Some(FailureMode::Refused),
+            "a nested diagnostic cannot change the structural kind"
+        );
     }
 
     /// `Unreachable` renders through its own marker, so a transport error that reaches an operator

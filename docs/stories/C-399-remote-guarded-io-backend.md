@@ -27,7 +27,7 @@ operations somewhere other than its own process while the guarantees stay stated
 
 **Landed** as `crates/flux-system/src/remote.rs` — `RemoteSystem` serves all four port families by
 handing each operation to a `Delegate`, plus `Loopback` for the in-process far side. Test:
-`crates/flux-system/tests/remote_port_failure_modes.rs` (8 tests, an out-of-crate consumer on
+`crates/flux-system/tests/remote_port_failure_modes.rs` (10 tests, an out-of-crate consumer on
 purpose — a unit test inside the crate could pass while the seam stayed private).
 
 **Three** failure modes, not two. The Acceptance names a refusal and an unreachable delegate;
@@ -39,8 +39,9 @@ and `failure_mode(&Error)` recovers which.
 
 **The classification is structural, not textual.** A delegate returns `Answer::Refused` or
 `Err(Unreachable)` — different positions in the type. Only a transport can construct `Unreachable`,
-and the marker prefixes are written by `remote.rs`, so a delegate whose refusal reason *reads*
-"the substrate is unreachable" still classifies as a refusal
+and `settle` stores the result in `flux_core::Error::GuardedIo` with a typed
+`GuardedIoFailure`. The diagnostic prefix is presentation only, so a delegate whose refusal reason
+begins with the exact unreachable or unserved prefix still classifies as a refusal
 (`a_delegates_wording_cannot_forge_the_other_failure_mode`). Without this, delegate-authored text
 would be able to send an operator to investigate a healthy network.
 
@@ -52,11 +53,10 @@ and keeps this story to the failure semantics its Acceptance is about.
 **Local-first, verified.** `RemoteSystem::loopback` exercises the whole delegation path with nothing
 running, and a `Loopback` never reports an unreachable link because there is no link to break.
 
-**Two knock-on fixes in `port.rs`:** the unserved denial is now the public `port::UNSERVED` constant
-(the distinction between "not offered" and "guard refused" lived only in that prefix, and
-`remote.rs` needs to match on it), and `run_with_stdin`/`spawn_background` now build their denials
-through `deny()` instead of hand-writing the same prefix — two literals that had already drifted out
-of the one-spelling rule the constant exists to enforce.
+**Two knock-on fixes in `port.rs`:** unserved denials now use the same typed guarded-IO error as the
+remote backend (`port::UNSERVED` remains only the canonical display spelling), and
+`run_with_stdin`/`spawn_background` build their denials through `deny()` instead of hand-writing the
+same prefix — two literals that had already drifted out of the one-spelling rule.
 
 **The reviewed cost was paid**, as the ownership decision said it would be: three entries in
 `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` allow-list, with the review
