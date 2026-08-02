@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-08-02
+
 ### Added
 
 - **The three-axis loop-view claim, tested and half refuted** (A-146). Internal design artifact. The

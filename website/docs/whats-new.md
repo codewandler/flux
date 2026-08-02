@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.49.0] - 2026-08-02
+
 ### Action needed
 
 - **An agent in a shared room now answers only when it is addressed.** Until now an agent sitting in
