@@ -80,3 +80,21 @@ operator holds and a credential anyone in the room can spend.
 
 ## Progress
 - Filed 2026-08-02 from the Vaults comparison.
+- 2026-08-02 — implementor reported COMPLETE on `impl/C-459`; gate green in its worktree including the
+  `FLUX_BWRAP_BIN=/nonexistent/bwrap` posture. ⚠ **HELD UNMERGED, awaiting an independent review.** The
+  adversarial reviewer commissioned for it died on the org's monthly spend limit, and so did the C-453
+  implementor — no agent can be spawned.
+  The coordinator read it single-handed and confirmed four of the flagged surfaces: the `NAME;to=host`
+  parser **fails closed** on an empty name, a non-`key=value` part, an empty value, an unknown key and a
+  bad `in=` (`is_unscoped()` explicitly requires `unusable.is_none()`, so a malformed entry constrains
+  everything rather than nothing); an unusable grant refuses at the use site and an unmatched name is
+  `NotAllowlisted`; `Destination` has private fields and exactly one constructor, `vetted`, which
+  refuses an empty pin set; and the guarded-path reorder keeps **one** DNS resolution with an explicit
+  authority-equality assertion, the comment naming re-resolution as the TOCTOU itself.
+  ⚠ **That is one context, not two, and it is the context that wrote the dispatch** — the weakest form
+  of independence. The change adds a security check *and modifies the guarded egress path* C-77
+  hardened, so it waits. Minor note for whoever reviews: the authority check compares
+  `(scheme, host, port)` and not userinfo — unreachable via `append_query`, so harmless as written, but
+  it is the kind of omission that matters if that code is ever reused.
+  **Nothing about this is a finding against the diff.** It is preserved, gated and ready; it has not
+  been accepted.
