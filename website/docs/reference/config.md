@@ -524,6 +524,7 @@ Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values su
 | `FLUX_SERVER_MAX_INFLIGHT_PER_PRINCIPAL` | Overrides the cross-surface live-work cap. |
 | `FLUX_SERVER_PROVIDER_CALLS_PER_DAY` | Overrides the completed provider-call circuit-breaker threshold. |
 | `FLUX_SERVER_PROVIDER_SPEND_USD_PER_DAY` | Overrides the completed priced-spend circuit-breaker threshold. |
+| `FLUX_APPROVAL_TIMEOUT_SECS` | How long a served agent under `--remote-approval` waits for a human decision at `/approvals` before **denying** the effect (default `120`, maximum `3600`). There is deliberately no "wait forever" value — an unbounded wait is a wedged turn, not a decision. Larger values are capped; an unparseable value falls back to the default. |
 | `FLUX_A2A_TOKEN` | Bearer token used when flux calls *out* to another agent. |
 | `FLUX_A2A_MAX_INFLIGHT_PER_REALM` | Concurrent in-flight A2A turns permitted per realm. |
 | `FLUX_A2A_PUSH_ALLOW_LOCAL` | Permits A2A push notifications to loopback targets. |

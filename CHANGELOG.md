@@ -33,6 +33,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Served agents can now ask a human before each guarded effect** (C-453). The existing
+  `Approver` stage now has a remote implementation selected with `flux app run --serve
+  --remote-approval`; authenticated `GET /approvals` and `POST /approvals/{id}` routes list and
+  answer parked effects. Silence, cancellation and timeout deny; decisions are single-use and bind
+  the complete structured intents and plan requirements, not only display booleans. The existing
+  explicit `--yes` unattended posture remains available and visible. The operator queue supports a
+  shared bearer token or open loopback; router construction refuses principal auth until a distinct
+  supervisor identity can prevent cross-realm approvals.
+
 - **Named HTTP secrets can now carry destination, principal, and placement scopes** (C-459).
   `http.request` allowlist entries accept `NAME;to=<host>;by=<principal>;in=header|query`; every
   declared axis denies non-matching uses before the environment value is read, and redirects are

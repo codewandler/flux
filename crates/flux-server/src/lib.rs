@@ -10,9 +10,15 @@
 //! - `POST /sessions`                     → `{ id, model }`
 //! - `GET  /sessions/{id}`                 → session info
 //! - `POST /sessions/{id}/messages`        → `{ text, tool_calls, usage }`
+//! - `GET  /approvals`                     → effects parked awaiting a human decision (C-453)
+//! - `POST /approvals/{id}`                → deliver one decision
 //!
-//! The agent runs tools through the same safety envelope as the CLI; build it with auto-approve
-//! since HTTP requests have no interactive approver.
+//! The agent runs tools through the same safety envelope as the CLI. **Which approval posture it
+//! runs under is the caller's choice**, and this crate serves whichever one was picked: build the
+//! engine with `AllowApprover` for an unattended agent constrained by policy + sandbox + budget, or
+//! with `flux_runtime::RemoteApprover` and pass its queue to [`serve_with_approvals`] /
+//! [`router_with_approvals_in`] so a human answers each effect over the `/approvals` routes.
+//! Before C-453 only the first was reachable here — see [`ApprovalGate`].
 
 mod a2a;
 mod resource;
@@ -459,6 +465,46 @@ pub struct ServerState {
     /// sweep keep-list. One per router, like the turn gate.
     tasks: Arc<a2a::TaskRegistry>,
     resources: Arc<ResourceGovernor>,
+    /// The approval queue the served engine parks on, when the operator chose the remote-approval
+    /// posture (C-453). `None` for every other posture.
+    approvals: ApprovalGate,
+}
+
+/// The served agent's approval queue, or its absence — the router-side half of the remote-approval
+/// posture (C-453).
+///
+/// ⚠ **Read this if you operate a served agent.** The envelope is *authorization → approval →
+/// guarded IO*, and approval is the only stage with a human in it. Which posture that stage runs
+/// under is a legitimate choice — prompt per effect, or do not prompt and constrain through policy,
+/// sandbox and budget instead (the right design for high-autonomy work, and why flux raises
+/// unattended surfaces to the fail-closed `require` sandbox profile). What was missing before C-453
+/// is that a served agent could not *make* that choice: every approver in the tree was local, so
+/// the served surface had `AllowApprover` or `DenyApprover` and nothing with a human in it. This
+/// type is what makes the first posture reachable here.
+///
+/// A `None` gate is not a failure mode: it is every other posture, and the `/approvals` routes say
+/// so rather than pretending to be a control that nobody is behind.
+#[derive(Clone, Default)]
+pub struct ApprovalGate(Option<Arc<flux_runtime::ApprovalQueue>>);
+
+impl ApprovalGate {
+    /// No remote-approval posture on this router — the engine's own approver decides alone.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Serve `queue`. It must be the very queue the engine's `RemoteApprover` parks on: a router
+    /// holding a *different* queue lists nothing and denies nothing — every effect would sit
+    /// unanswered until it timed out, which is safe but useless.
+    pub fn serving(queue: Arc<flux_runtime::ApprovalQueue>) -> Self {
+        Self(Some(queue))
+    }
+}
+
+impl From<Option<Arc<flux_runtime::ApprovalQueue>>> for ApprovalGate {
+    fn from(queue: Option<Arc<flux_runtime::ApprovalQueue>>) -> Self {
+        Self(queue)
+    }
 }
 
 impl FromRef<ServerState> for Arc<FlowEngine> {
@@ -503,6 +549,12 @@ impl FromRef<ServerState> for Arc<ResourceGovernor> {
     }
 }
 
+impl FromRef<ServerState> for ApprovalGate {
+    fn from_ref(s: &ServerState) -> Self {
+        s.approvals.clone()
+    }
+}
+
 /// Bind `addr` and serve until shutdown, authenticating per `auth` (see [`ServerAuth`] for the
 /// three modes). [`ServerAuth::Open`] requires a loopback bind.
 ///
@@ -521,16 +573,57 @@ pub async fn serve(addr: &str, agent: FlowEngine, auth: ServerAuth) -> anyhow::R
     serve_on(listener, agent, auth).await
 }
 
+/// [`serve`] for an agent running the **remote-approval** posture (C-453): `approvals` is the queue
+/// the engine's `flux_runtime::RemoteApprover` parks on, and the `/approvals` routes serve it.
+///
+/// Passing [`ApprovalGate::none()`] is exactly [`serve`] — every other posture.
+pub async fn serve_with_approvals(
+    addr: &str,
+    agent: FlowEngine,
+    auth: ServerAuth,
+    approvals: ApprovalGate,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    eprintln!(
+        "{}",
+        flux_core::readiness::serving_announcement(&addr.to_string())
+    );
+    eprintln!("  A2A agent card:  http://{addr}/.well-known/agent-card.json");
+    eprintln!("  A2A endpoint:    http://{addr}/a2a  (message/send, message/stream)");
+    if approvals.0.is_some() {
+        eprintln!("  Approvals:       http://{addr}/approvals  (GET to list, POST /approvals/{{id}} to decide)");
+    }
+    serve_on_with_approvals(listener, agent, auth, approvals).await
+}
+
 /// Serve on an already-bound listener (lets callers pick an ephemeral port).
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     agent: FlowEngine,
     auth: ServerAuth,
 ) -> anyhow::Result<()> {
+    serve_on_with_approvals(listener, agent, auth, ApprovalGate::none()).await
+}
+
+/// [`serve_on`] carrying an [`ApprovalGate`] — the one place both forms converge, so the
+/// non-loopback refusal and the route set cannot differ between postures.
+pub async fn serve_on_with_approvals(
+    listener: tokio::net::TcpListener,
+    agent: FlowEngine,
+    auth: ServerAuth,
+    approvals: ApprovalGate,
+) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
     // The non-loopback refusal now lives in `router` (construction-time, C-190); `serve_on` simply
     // propagates it, so there is one enforcement point every caller shares.
-    let router = router(Arc::new(agent), auth, CardInfo::flux_coding(), addr)?;
+    let router = router_with_approvals(
+        Arc::new(agent),
+        auth,
+        CardInfo::flux_coding(),
+        addr,
+        approvals,
+    )?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -867,6 +960,62 @@ pub fn router(
     router_in(engine, auth, card, bind, &DiscoveryEnv::from_process())
 }
 
+/// [`router`] serving an [`ApprovalGate`] — the remote-approval posture (C-453).
+pub fn router_with_approvals(
+    engine: Arc<FlowEngine>,
+    auth: ServerAuth,
+    card: CardInfo,
+    bind: SocketAddr,
+    approvals: ApprovalGate,
+) -> anyhow::Result<Router> {
+    router_with_approvals_in(
+        engine,
+        auth,
+        card,
+        bind,
+        &DiscoveryEnv::from_process(),
+        approvals,
+    )
+}
+
+/// [`router_in`] serving an [`ApprovalGate`] — the remote-approval posture (C-453). This is the
+/// form tests use, since it pins the config read to an explicit [`DiscoveryEnv`] (C-392).
+pub fn router_with_approvals_in(
+    engine: Arc<FlowEngine>,
+    auth: ServerAuth,
+    card: CardInfo,
+    bind: SocketAddr,
+    env: &DiscoveryEnv,
+    approvals: ApprovalGate,
+) -> anyhow::Result<Router> {
+    guard_open_bind(&auth, bind)?;
+    guard_approval_auth(&auth, &approvals)?;
+    Ok(router_with_ttl_in(
+        engine,
+        auth,
+        card,
+        a2a_ttl_from_config_in(env),
+        env,
+        approvals,
+    ))
+}
+
+/// A principal-authenticated server has many mutually isolated callers, while C-453's approval
+/// queue is deliberately one operator queue for one served agent. Combining them would let any
+/// authenticated principal list and answer every other principal's effects. Refuse that topology
+/// until the protocol carries a separately authorized supervisor identity.
+fn guard_approval_auth(auth: &ServerAuth, approvals: &ApprovalGate) -> anyhow::Result<()> {
+    if approvals.0.is_some() && matches!(auth, ServerAuth::Principal(_)) {
+        anyhow::bail!(
+            "remote approval cannot be combined with principal authentication: the approval queue \
+             is deployment-wide, so one authenticated principal could list and answer another's \
+             effects. Use a shared operator token for this single-agent posture; principal mode \
+             needs a separately authorized supervisor identity before it can serve approvals"
+        );
+    }
+    Ok(())
+}
+
 /// [`router`] against an explicit [`DiscoveryEnv`] rather than the process's own (C-392).
 ///
 /// Router construction resolves two things from the layered flux config — the A2A session TTL
@@ -898,6 +1047,7 @@ pub fn router_in(
         card,
         a2a_ttl_from_config_in(env),
         env,
+        ApprovalGate::none(),
     ))
 }
 
@@ -934,18 +1084,29 @@ fn router_with_ttl_in(
     card: CardInfo,
     a2a_ttl: A2aTtl,
     env: &DiscoveryEnv,
+    approvals: ApprovalGate,
 ) -> Router {
-    router_with_ttl_and_limits(engine, auth, card, a2a_ttl, ServerLimits::from_env_in(env))
+    router_with_ttl_limits_and_approvals(
+        engine,
+        auth,
+        card,
+        a2a_ttl,
+        ServerLimits::from_env_in(env),
+        approvals,
+    )
 }
 
-/// [`router_with_ttl_in`] with explicit resource limits (C-189). Tests inject tiny limits to exercise
-/// the `413`/`408` paths; production reads them from the environment once at build time.
-fn router_with_ttl_and_limits(
+/// [`router_with_ttl_in`] with explicit resource limits (C-189) and the approval posture (C-453).
+/// Tests inject tiny limits to exercise the `413`/`408` paths; production reads them from the
+/// environment once at build time. The single construction point for [`ServerState`], so every
+/// entry point above agrees on the route set.
+fn router_with_ttl_limits_and_approvals(
     engine: Arc<FlowEngine>,
     auth: ServerAuth,
     card: CardInfo,
     a2a_ttl: A2aTtl,
     limits: ServerLimits,
+    approvals: ApprovalGate,
 ) -> Router {
     let auth = Arc::new(auth);
     let resources = Arc::new(ResourceGovernor::new(limits));
@@ -957,6 +1118,7 @@ fn router_with_ttl_and_limits(
         auth: auth.clone(),
         tasks: Arc::new(a2a::TaskRegistry::default()),
         resources,
+        approvals,
     };
     let timeout = request_timeout_layer(limits);
 
@@ -987,11 +1149,21 @@ fn router_with_ttl_and_limits(
     // deadline: a wedged handler yields `408`, but only after its owning turn and children finalize.
     // `/a2a` belongs here because blocking `message/send` runs a full turn in-handler. Its
     // `message/stream` path returns the response promptly, so body streaming is not severed.
+    // The approval routes belong here — inside `protected`, so they inherit `require_auth` by
+    // construction. ⚠ In the supported shared-token/open-loopback modes, who may answer an
+    // approval is exactly who the server admits; principal mode plus a global queue is refused at
+    // construction. A decision endpoint outside the auth layer would let anyone who can reach the
+    // port approve the agent's effects, which is strictly worse than having no approval stage.
+    // They are mounted
+    // unconditionally (rather than only when a queue exists) so a client can tell "this server does
+    // not offer remote approval" from "that request is gone" — see [`list_approvals`].
     let timed = Router::new()
         .route("/a2a", post(a2a::a2a_handler))
         .route("/sessions", post(create_session))
         .route("/usage", get(get_usage_all))
         .route("/webhook", post(webhook))
+        .route("/approvals", get(list_approvals))
+        .route("/approvals/{id}", post(decide_approval))
         .merge(sessions_rest)
         .layer(middleware::from_fn_with_state(
             limits.request_timeout,
@@ -1027,6 +1199,110 @@ fn router_with_ttl_and_limits(
         .merge(protected)
         .layer(DefaultBodyLimit::max(limits.max_body_bytes))
         .with_state(state)
+}
+
+// ── Remote approval (C-453) ─────────────────────────────────────────────────────
+
+/// `GET /approvals` — the effects currently parked awaiting a human decision, oldest first.
+///
+/// Returns `501` when this server is not running the remote-approval posture.
+///
+/// That is a *statement of posture*, not an error: an operator can be running the agent under
+/// `AllowApprover` with policy, sandbox and budget doing the constraining, which is a legitimate
+/// and often correct choice. What
+/// this route must never do is return an empty list in that case — "nothing is waiting" and "nobody
+/// is ever asked" look identical to a client, and only one of them means a human is in the loop.
+async fn list_approvals(State(gate): State<ApprovalGate>) -> Response {
+    let Some(queue) = gate.0 else {
+        return no_remote_approval_posture();
+    };
+    Json(json!({
+        "approvals": queue.pending(),
+        "timeout_secs": queue.timeout().as_secs(),
+    }))
+    .into_response()
+}
+
+/// The body of `POST /approvals/{id}`.
+#[derive(serde::Deserialize)]
+struct ApprovalDecisionBody {
+    /// The parked request's `fingerprint`, echoed back verbatim. ⚠ Required, and required to
+    /// match: it is what binds this decision to the effect the human was actually shown. Without
+    /// it the endpoint would mean "the client said yes", and a `yes` for a benign effect would be
+    /// deliverable against a destructive one.
+    fingerprint: String,
+    /// `"allow"` or `"deny"`. Anything else is a `400` — an unrecognised decision must never fall
+    /// through to allow, and must not be silently read as a denial either, because that would hide
+    /// a client bug behind a plausible-looking outcome.
+    decision: String,
+    /// Optional rationale, carried to the model on a denial (C-113's `DenyWithReason`).
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /approvals/{id}` — deliver one human decision for one specific parked effect.
+///
+/// Refusals are distinguished, because an operator responds to them differently:
+/// `404` the request is gone (answered already, timed out, or its turn ended) · `409` the decision
+/// named a different effect than the request · `410` the run waiting on it disappeared · `400` the
+/// decision word was not `allow`/`deny`. In every one of those, **nothing was approved**, and the
+/// parked request — if it is still parked — will time out into a denial on its own.
+async fn decide_approval(
+    State(gate): State<ApprovalGate>,
+    Path(id): Path<String>,
+    Json(body): Json<ApprovalDecisionBody>,
+) -> Response {
+    let Some(queue) = gate.0 else {
+        return no_remote_approval_posture();
+    };
+    // Exhaustive by intent: the fallthrough is a refusal, never a decision.
+    let choice = match body.decision.as_str() {
+        "allow" => flux_runtime::ApprovalChoice::Allow,
+        "deny" => match body.reason {
+            Some(why) => flux_runtime::ApprovalChoice::DenyWithReason(why),
+            None => flux_runtime::ApprovalChoice::Deny,
+        },
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "unknown decision {other:?} — use \"allow\" or \"deny\". Nothing was \
+                         approved; this request is still awaiting a decision and will be denied if \
+                         none arrives."
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    };
+    match queue.decide(&id, &body.fingerprint, choice) {
+        Ok(()) => Json(json!({ "status": "recorded", "id": id, "decision": body.decision }))
+            .into_response(),
+        Err(e) => {
+            let status = match e {
+                flux_runtime::DecideError::UnknownRequest => StatusCode::NOT_FOUND,
+                flux_runtime::DecideError::EffectMismatch => StatusCode::CONFLICT,
+                flux_runtime::DecideError::Abandoned => StatusCode::GONE,
+            };
+            (status, Json(json!({ "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+/// The honest answer when this server runs some other approval posture.
+fn no_remote_approval_posture() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "this server is not running the remote-approval posture — no effect on it is \
+                      ever parked for a human decision. Its agent was built with a headless \
+                      approver (constrained instead by authorization policy, the sandbox floor and \
+                      resource budgets). To be asked per effect, start it with the remote-approval \
+                      posture.",
+        })),
+    )
+        .into_response()
 }
 
 // ── Multi-agent A2A mount (D-63) ────────────────────────────────────────────────
@@ -1716,6 +1992,31 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt; // for `oneshot`
 
+    /// [`router_with_ttl_limits_and_approvals`] with no remote-approval posture — the shape every
+    /// pre-C-453 test in this module was written against.
+    ///
+    /// It lives *inside* the test module rather than beside its production sibling on purpose:
+    /// `website_contract`'s `http_api_reference_covers_every_served_route` recovers the mounted
+    /// route set by reading this file up to its first `#[cfg(test)]`, so a test-only `fn` placed
+    /// above the `.route(` calls truncates the scan to nothing and the guard silently stops
+    /// checking anything.
+    fn router_with_ttl_and_limits(
+        engine: Arc<FlowEngine>,
+        auth: ServerAuth,
+        card: CardInfo,
+        a2a_ttl: A2aTtl,
+        limits: ServerLimits,
+    ) -> Router {
+        router_with_ttl_limits_and_approvals(
+            engine,
+            auth,
+            card,
+            a2a_ttl,
+            limits,
+            ApprovalGate::none(),
+        )
+    }
+
     /// C-277: `serve`'s readiness line is a cross-crate contract, not an `eprintln!`.
     ///
     /// `flux-orchestrate` (L3) decides a fleet worker is live by matching this crate's (L6) stderr.
@@ -1774,6 +2075,35 @@ mod tests {
                 },
             })
         }
+    }
+
+    /// A single global queue cannot safely serve principal mode: Alice would otherwise list and
+    /// answer Bob's effects despite the rest of the server keeping their sessions in separate
+    /// realms. Until approvals carry a separately authorized supervisor identity, construction
+    /// must refuse that incoherent combination.
+    #[test]
+    fn principal_auth_cannot_share_a_global_remote_approval_queue() {
+        let (engine, _) = usage_test_engine();
+        let auth = ServerAuth::Principal(PrincipalAuth::new(
+            Arc::new(PrincipalTestAuthenticator),
+            "https://agents.example.test",
+        ));
+        let result = router_with_approvals_in(
+            engine,
+            auth,
+            CardInfo::flux_coding(),
+            "127.0.0.1:0".parse().unwrap(),
+            &DiscoveryEnv::empty(),
+            ApprovalGate::serving(Arc::new(flux_runtime::ApprovalQueue::new(
+                Duration::from_secs(30),
+            ))),
+        );
+        let error = match result {
+            Ok(_) => panic!("principal mode accepted a cross-realm global approval queue"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("principal"), "{error}");
+        assert!(error.contains("approval"), "{error}");
     }
 
     #[test]
@@ -2143,6 +2473,7 @@ mod tests {
             CardInfo::flux_coding(),
             A2aTtl(60),
             &DiscoveryEnv::empty(),
+            ApprovalGate::none(),
         );
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "message/send",

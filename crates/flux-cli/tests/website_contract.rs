@@ -2126,18 +2126,54 @@ fn topologies_page_does_not_present_unbuilt_surface_as_runnable() {
     let page = read(TOPOLOGIES);
 
     assert!(
-        !flux_help(&["tui"]).contains("--remote"),
+        !mentions_flag(&flux_help(&["tui"]), "--remote"),
         "`flux tui --remote` now ships (C-436) — {TOPOLOGIES} still files the local-runtime / \
          remote-system row as proposed. Update the row's status, move its command into an `sh` \
          fence, and relax this pin."
     );
+    // Ground the distinction in the shipped binary rather than in this test's own reading of it:
+    // `--remote-approval` must really exist, or `mentions_flag` is drawing a line between a real
+    // flag and an imaginary one.
+    let app_run_help = flux_help(&["app", "run"]);
+    assert!(
+        mentions_flag(&app_run_help, "--remote-approval"),
+        "`flux app run --remote-approval` (C-453) is gone from the CLI, so the exception carved \
+         out below is no longer about anything real"
+    );
+    assert!(
+        !mentions_flag(&app_run_help, "--remote"),
+        "`flux app run --remote` now exists — the `sh`-fence guard below would start reading it as \
+         C-436's unbuilt flag"
+    );
+
     for block in fenced_blocks(&page, "sh") {
         assert!(
-            !block.contains("--remote"),
+            !mentions_flag(&block, "--remote"),
             "{TOPOLOGIES} prints `--remote` in a runnable `sh` fence, but no such flag exists. \
              Proposed spellings belong in a `text` fence."
         );
     }
+}
+
+/// Whether `text` names `flag` as a *whole* flag, rather than as the prefix of a longer one.
+///
+/// A plain `contains` would be wrong here and quietly so: `--remote-approval` (C-453, which ships)
+/// contains `--remote` (C-436, which does not), so the substring form fails a page that is telling
+/// the truth. The guard has to key on the flag, not on its first eight characters.
+fn mentions_flag(text: &str, flag: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(offset) = text[from..].find(flag) {
+        let at = from + offset;
+        let ends_here = text[at + flag.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
+        if ends_here {
+            return true;
+        }
+        from = at + flag.len();
+    }
+    false
 }
 
 /// The commitments that make this page a decision aid rather than a brochure, pinned so that

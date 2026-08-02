@@ -1119,7 +1119,20 @@ pub(super) fn assemble_cli_execution_environment(
 pub(super) async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None, None).await
+    build_agent_with(flags, true, None, None, None).await
+}
+
+/// [`build_agent`] for a surface whose approver is neither the terminal prompt nor `--yes` (C-453).
+///
+/// The served agent is the case: `flux app run --serve` has no terminal, so the posture it runs
+/// under is chosen at the surface (`ServedApprovalPosture`) and handed down here. Everything else
+/// about the agent — catalog, permission floor, hooks, sandbox — is assembled identically, which is
+/// the point: a posture changes *who answers*, never what is asked or what is guarded.
+pub(super) async fn build_agent_with_approver(
+    flags: &AgentFlags,
+    approver: Arc<dyn Approver>,
+) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+    build_agent_with(flags, true, None, None, Some(approver)).await
 }
 
 /// [`build_agent`] for a surface that has a human terminal to draw on (C-305).
@@ -1133,7 +1146,7 @@ pub(super) async fn build_agent_with_surface(
     flags: &AgentFlags,
     surface_sink: Arc<dyn flux_runtime::SurfaceSink>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None, Some(surface_sink)).await
+    build_agent_with(flags, true, None, Some(surface_sink), None).await
 }
 
 /// [`build_agent`] with a LAZY provider (C-11): `flux flow run` / `flux preset --run` replay
@@ -1146,7 +1159,7 @@ pub(super) async fn build_agent_lazy(
     flags: &AgentFlags,
     session_override: Option<String>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, false, session_override, None).await
+    build_agent_with(flags, false, session_override, None, None).await
 }
 
 /// Build the workspace view used by every saved-flow consumer. Agent construction creates the two
@@ -1398,16 +1411,20 @@ fn resolve_permissions(
     cwd: &std::path::Path,
     cfg: &flux_config::Config,
     flags: &AgentFlags,
+    approver_override: Option<Arc<dyn Approver>>,
 ) -> ResolvedPermissions {
     let mut allow = cfg.permissions.allow.clone();
     if allow.is_empty() {
         allow.extend(DEFAULT_ALLOW.iter().map(|s| s.to_string()));
     }
     let perms = PermissionManager::from_rules(&allow, &cfg.permissions.deny);
-    let approver: Arc<dyn Approver> = if flags.yes {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(StdinApprover)
+    // C-453: a surface with no terminal chooses its own approver (the served agent's posture). Only
+    // the PROMPT differs — the permission floor, hooks and everything downstream are identical, so
+    // this cannot be used to widen what a run may do, only to change who is asked.
+    let approver: Arc<dyn Approver> = match approver_override {
+        Some(approver) => approver,
+        None if flags.yes => Arc::new(AllowApprover),
+        None => Arc::new(StdinApprover),
     };
     let mut hook_dirs = vec![cwd.join(".flux").join("hooks")];
     if let Some(home) = std::env::var_os("HOME") {
@@ -1533,6 +1550,7 @@ pub(super) async fn build_agent_with(
     eager_provider: bool,
     session_override: Option<String>,
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
+    approver_override: Option<Arc<dyn Approver>>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
@@ -1824,7 +1842,7 @@ pub(super) async fn build_agent_with(
         perms,
         approver,
         hooks,
-    } = resolve_permissions(&cwd, &cfg, flags);
+    } = resolve_permissions(&cwd, &cfg, flags, approver_override);
 
     let executor = assemble_cli_execution_environment(
         system.clone(),

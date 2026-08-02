@@ -39,6 +39,8 @@ explicit permission policy in [`.flux/config.toml`](../reference/config.md).
 | `GET` | `/usage` | per mode | Token tiers and cost across sessions. |
 | `POST` | `/webhook` | per mode | Mint a session and run one turn. |
 | `POST` | `/a2a` | per mode | A2A JSON-RPC dispatcher. |
+| `GET` | `/approvals` | per mode | Effects parked awaiting a human decision. |
+| `POST` | `/approvals/{id}` | per mode | Deliver one decision for one parked effect. |
 
 The **multi-agent mount** serves N agents from one server, keyed by path:
 
@@ -254,6 +256,84 @@ In principal mode bearer introspection necessarily runs **before** the in-proces
 the verified principal selects the bucket. Protect the listener and introspection dependency with
 reverse-proxy/identity-provider arrival limits as well; Flux's per-principal limiter cannot shield
 that pre-admission authentication call from raw request floods.
+
+## Approvals
+
+Only when the server was started with `--remote-approval` (see
+[Topologies](../topologies.md#served-agent-thin-client)). Under any other approval posture both
+routes answer `501` with a body saying so, rather than an empty list — "nothing is waiting" and
+"nobody is ever asked" must not look alike.
+
+`GET /approvals` returns everything the agent is currently blocked on, oldest first:
+
+```json
+{
+  "approvals": [
+    {
+      "id": "ap_3f1c9a02b7d4e615_0",
+      "fingerprint": "…",
+      "tool": "write",
+      "subjects": ["report.txt"],
+      "summary": null,
+      "destructive": false,
+      "mutating": true,
+      "intents": {
+        "intents": [
+          {
+            "behavior": "filesystem_write",
+            "target": { "type": "path", "path": "report.txt" },
+            "role": "write_target",
+            "certainty": "certain"
+          }
+        ]
+      },
+      "plan": null,
+      "waiting_secs": 4
+    }
+  ],
+  "timeout_secs": 120
+}
+```
+
+`POST /approvals/{id}` delivers one decision:
+
+```json
+{ "fingerprint": "…", "decision": "deny", "reason": "not that path" }
+```
+
+`decision` is `allow` or `deny`; `reason` is optional and, on a denial, is passed to the model.
+`fingerprint` is **required and must match** — echo the opaque value returned by `GET`; do not
+reconstruct it. It canonically binds the complete effect, including structured intent targets and
+exact plan requirements, to the decision you were shown.
+
+| Status | Meaning |
+|---|---|
+| `200` | Recorded. The waiting effect proceeds or is refused accordingly. |
+| `400` | `decision` was neither `allow` nor `deny`. Nothing was approved; the effect is still parked. |
+| `404` | No such parked request — already answered (including a replay), timed out, or its turn ended. |
+| `409` | The `fingerprint` names a different effect than this request. Nothing was approved, and the request stays parked. |
+| `410` | The run waiting on it is gone. |
+| `422` | The body is missing `fingerprint` or `decision`. |
+| `501` | This server is not running the remote-approval posture. |
+
+Three properties are load-bearing, and a client should be written expecting them:
+
+- **An effect nobody answers is denied** after `timeout_secs`
+  ([`FLUX_APPROVAL_TIMEOUT_SECS`](../reference/config.md), default 120). Silence is never an
+  approval.
+- **A decision is single-use.** Answering removes the request, so a captured decision cannot be
+  replayed onto a later effect.
+- **A decision is bound to its effect.** An `allow` you obtained for one request cannot be delivered
+  against another, even an identical-looking one — that is what the `id` plus `fingerprint` pair is
+  for.
+
+⚠ Remote approval supports the single-operator server modes: a shared bearer token, or an open
+loopback listener. Router construction refuses it with per-request principal authentication. One
+deployment-wide queue in principal mode would otherwise let any authenticated principal list and
+answer every other principal's effects despite their session realms being isolated; that topology
+needs a separately authorized supervisor identity first. An unauthenticated non-loopback bind is
+still refused. Treat the shared token—and the ability to POST here—as equivalent to the agent's own
+authority.
 
 ## Tenancy
 
