@@ -6,6 +6,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **The SDK autonomous posture now carries fail-closed confinement and a finite delegated-tree
+  budget** (C-444, C-470). `ClientBuilder` and `FlowClientBuilder` resolve blanket
+  `auto_approve(true)` and every injected opaque `Approver` to sandbox `Require` with the sandbox
+  network closed, plus `ResourceLimits::autonomous()`, unless the embedder explicitly pins a
+  sandbox or resource-limit decision. The preset bounds tool concurrency per agent, live agents per
+  tree, retained results, and evidence payloads. This is a **breaking pre-1.0 change**: an embedder
+  that previously relied on ambient `Off` or unbounded defaults must now state that choice.
+  Failing-first tests cover blanket and custom approval, both SDK doors resolve the same binding
+  posture, and a mutation-pinned `LocalSpawner` test proves the tree census is enforced before child
+  provider construction.
+
 ### Added
 
 - **A context-management page that matches the compaction the code implements** (C-441). The mechanism

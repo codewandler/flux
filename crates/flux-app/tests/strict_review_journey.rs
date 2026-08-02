@@ -183,6 +183,13 @@ async fn run_via_direct_flow() -> Value {
     let mut client = flux_sdk::FlowClient::builder()
         .model("mock")
         .auto_approve(true)
+        // C-444: an auto-approving SDK client now resolves to a fail-closed `require` sandbox, which
+        // is right for a deployment and wrong for *this* comparison — the journey path above does not
+        // go through the SDK envelope, so leaving the raise in place would compare two different
+        // postures and would fail outright on any host without a sandbox backend (every CI runner).
+        // Stating the posture explicitly is the documented escape hatch, and it puts both paths on the
+        // equal footing this test exists to check.
+        .with_sandbox(flux_sdk::Sandbox::resolve(flux_sdk::SandboxSettings::off()))
         .build(Arc::new(UnusedTopLevelProvider), repo_root())
         .expect("build FlowClient");
     client.with_sub_agents(sub_agents());

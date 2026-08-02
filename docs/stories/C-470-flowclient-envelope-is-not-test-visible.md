@@ -2,7 +2,7 @@
 id: C-470
 title: "`FlowClient`'s resolved envelope is not test-visible, so the flow door's posture is unproven"
 pillar: Core
-status: ready
+status: done
 priority: 4
 areas: [flux-sdk]
 note: "spun out of C-444: the confinement raise is asserted on the Client door only. Both doors share one Envelope, which is why they agree — but nothing test-visible proves the flow door resolves the same posture, and that is the door an SDK embedder is most likely to use"
@@ -34,17 +34,16 @@ headline surface. Leaving the unproven door as the more-used one is the wrong wa
 
 ## Acceptance
 
-- [ ] A failing-first test that observes `FlowClient`'s **resolved** posture — not its inputs — and pins
+- [x] A failing-first test that observes `FlowClient`'s **resolved** posture — not its inputs — and pins
       that an auto-approving `FlowClient` is confined and bounded exactly as the `Client` door is. It
       must fail if `FlowClient` is given an independent resolution path.
-- [ ] Whatever accessor makes that possible is a deliberate public-API addition on
-      `codewandler-flux-sdk`, documented, and carries its version decision. ⚠ Prefer the narrowest
-      surface that makes the property observable — an accessor exposing the whole `System` to read one
-      posture is a larger commitment than the test needs, and a published crate cannot un-expose it.
-- [ ] ⚠ A test that pins the two doors resolve the **same** posture from the same inputs, so the
+- [x] The observation surface is deliberate: a crate-internal unit test reads both clients' binding
+      fields directly, so no accessor is added to the published `codewandler-flux-sdk` API merely for
+      testing. This is the narrow alternative the Notes require trying first.
+- [x] ⚠ A test that pins the two doors resolve the **same** posture from the same inputs, so the
       agreement is asserted rather than structural. That is the actual deliverable; a second copy of the
       client-door test is not.
-- [ ] No behaviour change: this story makes an existing guarantee observable and must not alter what
+- [x] No behaviour change: this story makes an existing guarantee observable and must not alter what
       either door resolves.
 
 ## Notes
@@ -57,3 +56,8 @@ headline surface. Leaving the unproven door as the more-used one is the wrong wa
   commitment at all. Try that first.
 - Related: [C-444](C-444-sdk-secure-defaults.md), [C-463](C-463-autonomy-postures.md).
 - Filed 2026-08-02 out of C-444's handoff.
+- Closed 2026-08-02 on `impl/C-444`: `both_sdk_doors_resolve_the_same_autonomous_posture` lives in
+  `flow.rs`'s crate-internal test module, compares the resolved sandbox and every resource-limit field
+  on both public doors, and needs no new published accessor. The original client-door failing-first
+  proof establishes the merge-base failure; deleting the flow door's resolution now breaks this
+  direct equality pin.
