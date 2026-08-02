@@ -165,12 +165,15 @@ hex = "0.4"
 regex = "1"
 similar = "3"
 rand = "0.10"
-rusqlite = { version = "0.40", features = ["bundled"] }
+# 0.40's libsqlite3-sys build script uses cfg_select!, which is newer than this workspace's 1.87
+# MSRV. Keep the bundled database on the last compatible line until upstream declares that floor.
+rusqlite = { version = "0.39", features = ["bundled"] }
 ulid = "3"
 # Postgres backend (`flux-pg`, opt-in behind `postgres` features): the default build stays
 # rusqlite-only and DB-free. `default-features = false` + no sqlx macros so a build never needs a
 # live database; `tls-rustls` avoids an OpenSSL system dep. `percent-encoding` decodes DSN userinfo.
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+# sqlx 0.9 requires Rust 1.94. The 0.8 line supports this workspace's declared 1.87 MSRV.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 percent-encoding = "2"
 rquickjs = "0.12"
 axum = "0.8"
@@ -192,7 +195,8 @@ tower-lsp = "0.20"
 minisign-verify = "0.2"
 tar = "0.4"
 lzma-rs = "0.3"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+# zip 8 requires Rust 1.88; 7 keeps plugin archives available at the workspace's 1.87 MSRV.
+zip = { version = "7", default-features = false, features = ["deflate"] }
 # Dev-only: signs fixtures in flux-plugin's hermetic pack tests (production signing happens in CI
 # via the real `minisign` CLI against a keypair generated once with this crate's own generator —
 # see `crates/flux-plugin/src/pack.rs`'s `generate_pack_keypair`).

@@ -62,7 +62,11 @@
   non-coding persona; `Role.prompt` is now `Role.instructions`. Program-agent settings use
   `instructions` and `instruction_files`; the old `system_prompt` names fail with a migration
   message instead of silently removing Flux's harness protocol.
+### Fixed
 
+- **Flux builds on Rust 1.87 again.** Several dependency updates had started requiring newer
+  compilers even though Flux still promised 1.87. The affected database, archive, document,
+  terminal, and channel dependencies are back on compatible lines; no toolchain upgrade is needed.
 ## [0.52.1] - 2026-08-02
 
 ### Improved
