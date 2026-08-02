@@ -1,6 +1,6 @@
 # Design: Remote agents — run the agent here, land the effects there
 
-**Status:** shipped (v1, port-aware catalog) · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md) · [C-473](../stories/C-473-remotely-representable-guarded-resources.md) · [C-474](../stories/C-474-selectable-execution-system.md) · [C-475](../stories/C-475-remote-system-https-protocol.md) · [C-476](../stories/C-476-remote-operation-delivery.md) · [C-453](../stories/C-453-a-remote-approval-channel.md)
+**Status:** shipped (v1, port-aware catalog) · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md) · [C-473](../stories/C-473-remotely-representable-guarded-resources.md) · [C-474](../stories/C-474-selectable-execution-system.md) · [C-475](../stories/C-475-remote-system-https-protocol.md) · [C-476](../stories/C-476-remote-operation-delivery.md) · [C-477](../stories/C-477-execution-placement-and-deployment-guide.md) · [C-478](../stories/C-478-explicit-operation-execution-placement.md) · [C-479](../stories/C-479-plugins-on-the-selected-execution-system.md) · [C-480](../stories/C-480-first-class-remote-system-deployment-profiles.md) · [C-453](../stories/C-453-a-remote-approval-channel.md)
 
 ## Why
 
@@ -29,7 +29,7 @@ This is the first thing to settle, because the two have opposite consequences an
 | | **remote agent** (serve a whole agent) | **remote system** (this epic) |
 |---|---|---|
 | what moves | the entire agent — planning, model calls, approval | only *where effects land* |
-| what stays local | a thin client | the runtime, the approver, the model choice, credentials |
+| what stays local | a thin client | the runtime, approver, model choice and provider credentials; an approved operation-bound secret may cross |
 | the analogy | the Docker **CLI**: a thin client, daemon does everything | a local process with a **remote executor** |
 | status | **largely shipped** | **ships (v1 port-aware catalog)** |
 
@@ -192,6 +192,12 @@ A remote system executes your effects and reports what happened. That is a large
 two failures matter: an unauthenticated or hijacked endpoint, and ⚠ **a remote that lies** — reports
 success it did not achieve, or omits what it did. The evidence chain is flux's core guarantee, and a
 remote link is a place it can quietly stop meaning anything.
+
+**Shipped:** bearer-authenticated TLS and guarded HTTPS/WSS refuse an unauthenticated endpoint;
+delivery outcomes distinguish refused, unserved, unreachable and accepted-with-unknown-outcome.
+Dispatch evidence host-stamps the immutable selected substrate's `kind` and `remotely_reported`
+classification on both the call and lifecycle records, without storing its workspace path or
+endpoint. This records provenance honestly; it does not prove that a remote report is true.
 
 ## Alternatives considered
 

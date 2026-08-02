@@ -15,6 +15,19 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **It is now clear what Docker, Kubernetes, and microVM support means.** A new execution-placement
+  matrix separates managing existing infrastructure, choosing where one effect lands, placing a
+  whole worker agent, and provisioning the isolation itself. The Docker plugin has a complete setup
+  and safety guide, the Kubernetes guide calls out its runtime boundary, and one deployment guide
+  gives the TLS, token, persistent-workspace, readiness, container, pod, and microVM contract for a
+  remote execution system. It also says plainly which pieces are bring-your-own today.
+
+- **Remote-effect evidence identifies its source.** Tool-call and result lifecycle records now say
+  whether Flux observed the work locally or received a report from a remote execution system,
+  without adding workspace paths or endpoint addresses to the audit trail.
+
 ## [0.52.0] - 2026-08-02
 
 ### Action needed

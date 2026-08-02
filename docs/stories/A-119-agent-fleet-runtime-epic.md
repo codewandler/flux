@@ -2,10 +2,10 @@
 id: A-119
 title: "Agent fleet runtime — addressing, lifecycle and discovery for a fleet of agents (epic)"
 pillar: Agent
-status: backlog
+status: in-progress
 epic: agent-fleet-runtime
 design: docs/designs/agent-fleet-runtime.md
-note: "EPIC — today nobody starts an agent (a human, in a shell) and nothing discovers one; this adds a runtime port with external/proc/docker/k8s backends, a URI address whose scheme picks the runtime, and agents as a product of the endpoint broker that already exists"
+note: "EPIC — C-243 shipped the AgentRuntime port plus process/external workers; Docker/Kubernetes placement, address vocabulary and discovery remain"
 ---
 
 # Agent fleet runtime — addressing, lifecycle and discovery for a fleet of agents (epic)
@@ -26,7 +26,7 @@ both — the scheme picks the runtime, the transport is defaulted per scheme and
       `AgentRuntime` port and its four backends, the transport axis, discovery via the existing
       endpoint broker, the roles/fleet unification, and the safety envelope — each claim about the
       current tree pinned at `file:line`.
-- [ ] The epic is broken into implementation stories (A-120…A-128); each behavioral change ships
+- [x] The epic is broken into implementation stories (A-120…A-128); each behavioral change ships
       with a failing-first test.
 - [ ] Headline proof: a coordinator starts a worker from an address it discovered, dispatches a
       board item to it, watches it reach `Ready` → `Busy` → `Exited`, and stops it — **offline**, on
@@ -46,11 +46,17 @@ both — the scheme picks the runtime, the transport is defaulted per scheme and
     fan-out we want — ask the host "which endpoints exist for product X", get back weak refs with
     `labels` and `credential_ref` and never a secret. Reusing it means the k8s plugin can enumerate
     live pods as agents with no new mechanism.
+- 2026-08-02 — C-243 superseded A-120/A-121/A-122's proposed crate/address-first cut and shipped
+  `AgentRuntime` in `flux-runtime`, `ProcessRuntime` + `ExternalRuntime` in `flux-orchestrate`, and
+  the `fleet.start`/`fleet.worker_status`/`fleet.stop` operations. The epic is now in progress rather
+  than backlog. A-124/A-125 are unblocked and promoted to ready; address/discovery work remains.
 
 ## Notes
-- Decisions taken with the user, 2026-07-29: scheme = runtime with transport inferred; discovery
-  reuses the endpoint broker; foreign CLI agents (`proc://claude`, `proc://codex`) ship in the first
-  cut via NDJSON/stdio; roles gain an optional `address` so `task(role)` routes local vs remote.
-- **This work lands in a new L5 crate, `flux-fleet`.** The in-flight [fleet
-  coordinator](fleet-coordinator.md) stories (A-112/A-113/A-116) stay where they are — no rework.
-- Order: A-120 → A-121 → {A-122, A-126} → {A-123, A-124, A-125} → A-127 → A-128.
+- The 2026-07-29 design chose endpoint-broker discovery, an NDJSON/stdio path for foreign CLI
+  agents, and an optional remote target on roles. C-243 later rejected the runtime-selecting URI and
+  new-crate part of that design; the remaining stories build on its opaque worker id and
+  `AgentRuntime` instead.
+- Lifecycle stays split across L2 `flux-runtime` and L5 `flux-orchestrate`; there is no
+  `flux-fleet` crate to add. The in-flight [fleet coordinator](fleet-coordinator.md) stories
+  (A-112/A-113/A-116) stay where they are.
+- Current order: {A-123, A-124, A-125, A-126} → A-127 → A-128.

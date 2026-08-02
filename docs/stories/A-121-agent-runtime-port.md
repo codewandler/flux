@@ -2,11 +2,11 @@
 id: A-121
 title: The AgentRuntime port — start/stop/status/endpoint, with ExternalRuntime and a contract suite
 pillar: Agent
-status: backlog
+status: done
 epic: agent-fleet-runtime
 design: docs/designs/agent-fleet-runtime.md
 areas: [flux-fleet]
-note: "readiness is status(), not start() returning — a scheduled pod is not an agent that can take a turn"
+note: "SUPERSEDED by C-243: AgentRuntime ships in flux-runtime with WorkerSpec/WorkerStatus; the original flux-fleet shape and state vocabulary were deliberately replaced"
 ---
 
 # The AgentRuntime port — start/stop/status/endpoint, with ExternalRuntime and a contract suite
@@ -36,7 +36,11 @@ unmodified, so it is the story that decides whether the port is right.
       before it is used.
 
 ## Progress
-- (not started)
+
+- Closed as superseded by C-243. The port exists, but not in the proposed crate or exact signature:
+  `flux-runtime::AgentRuntime` uses an opaque worker id and `WorkerSpec`; `ProcessRuntime` waits for
+  readiness before returning, and `ExternalRuntime` reports the liveness it can honestly know. New
+  backends must reuse that shipped contract and extract shared contract tests where useful.
 
 ## Notes
 - Design: [agent-fleet-runtime.md](../designs/agent-fleet-runtime.md) — "The `AgentRuntime` port".

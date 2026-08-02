@@ -61,6 +61,33 @@ flag breaks the build rather than quietly turning a documented topology into a l
 
 The rest of this page is one section per row.
 
+## Execution placement matrix
+
+“Supports Docker” or “supports Kubernetes” is ambiguous unless the job is named. Flux keeps four
+different jobs separate:
+
+- **Manage infrastructure:** inspect or mutate an existing Docker daemon or Kubernetes cluster.
+- **Place guarded effects:** choose where one approved file, process, or network operation happens.
+- **Place agent workers:** choose where a whole fleet worker process runs.
+- **Provision isolation:** create, pool, snapshot, or destroy the container, pod, VM, or microVM
+  that supplies the boundary.
+
+| Target | Manage infrastructure | Place guarded effects | Place agent workers | Provision isolation |
+|---|---|---|---|---|
+| Native host | not a separate integration | **ships** — local is the default | **ships** — guarded process workers; externally managed workers exist as a library runtime | **ships** — Bubblewrap on Linux, Seatbelt on macOS |
+| Docker | **ships** — [Docker plugin](./plugins/docker.md), in local mode | **proposed** — [C-397](https://github.com/codewandler/flux/blob/main/docs/stories/C-397-container-process-backend.md) | **proposed** — [A-124](https://github.com/codewandler/flux/blob/main/docs/stories/A-124-docker-runtime.md) | **BYO remote system** — run the daemon in an operator-supplied container |
+| Kubernetes | **ships** — [Kubernetes plugin](./plugins/kubernetes.md), in local mode | **BYO remote system** — deploy the daemon in a pod; there is no native pod-per-effect backend | **proposed** — [A-125](https://github.com/codewandler/flux/blob/main/docs/stories/A-125-kubernetes-runtime.md) | **BYO** — the cluster/runtime owns pod isolation |
+| microVM | no management integration | **BYO remote system** — run the daemon inside the guest | externally managed workers are possible through the runtime port, but not CLI-configurable | **BYO** — Flux does not provision, pool, snapshot, attest, or destroy microVMs |
+
+The Docker and Kubernetes plugins are **management integrations**, not placement backends. Installing
+one does not make `--remote` send plugin calls to that target, and it does not turn `fleet.start` into
+a container or pod scheduler. Conversely, the generic remote-system daemon can run inside a
+container, Kubernetes pod, VM, or microVM without teaching the local runtime how that boundary was
+provisioned.
+
+See [Deploy a remote execution system](./remote-system-deployment.md) for the shipped BYO profiles
+and their TLS, token, workspace, persistence, and readiness contract.
+
 ## Fully local {#fully-local}
 
 **Status: ships.**
@@ -134,8 +161,10 @@ shipped worker runtimes are an OS process and an externally-managed one — neit
 substrate half is [C-399](https://github.com/codewandler/flux/blob/main/docs/stories/C-399-remote-guarded-io-backend.md).
 
 The one where the agent you drive is here and the system it acts on is there — you approve on your
-machine and the effect lands in a container or a microVM somewhere else. The local mode remains the
-default; this is an explicit operator-selected execution target, never a mode the model may select.
+machine and the effect lands on another host, which may itself be a container, pod, VM, or microVM.
+The local mode remains the default; this is an explicit operator-selected execution target, never a
+mode the model may select. Flux ships the daemon and protocol, not the surrounding container image,
+Kubernetes manifest, or microVM provisioner; those are [BYO deployment profiles](./remote-system-deployment.md).
 
 ```sh
 # On the execution host. Use a CA-issued certificate in production.

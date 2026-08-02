@@ -26,7 +26,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'Fundamentals',
-      items: ['concepts', 'ecosystem', 'infrastructure', 'topologies'],
+      items: ['concepts', 'ecosystem', 'infrastructure', 'topologies', 'remote-system-deployment'],
     },
     {
       type: 'category',
@@ -100,6 +100,7 @@ const sidebars = {
             'plugins/using-plugins',
             'plugins/gitlab',
             'plugins/slack',
+            'plugins/docker',
             'plugins/kubernetes',
             'plugins/sql',
             'plugins/authoring',

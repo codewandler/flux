@@ -1995,6 +1995,8 @@ fn context_management_page_matches_the_compaction_the_code_implements() {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 const TOPOLOGIES: &str = "website/docs/topologies.md";
+const DOCKER_PLUGIN: &str = "website/docs/plugins/docker.md";
+const REMOTE_SYSTEM_DEPLOYMENT: &str = "website/docs/remote-system-deployment.md";
 
 /// `flux <path…> --help`, as the shipped binary renders it.
 ///
@@ -2164,6 +2166,77 @@ fn remote_system_topology_states_workspace_and_guarantee_boundaries() {
         assert!(
             page.contains(required),
             "{TOPOLOGIES} is missing the remote-system contract `{required}`"
+        );
+    }
+}
+
+/// C-477: "Docker/Kubernetes support" has four independent meanings. The public docs must keep
+/// infrastructure management, guarded-effect placement, whole-agent placement, and isolation
+/// provisioning separate, then give an operator a real deployment contract for the one portable
+/// primitive that ships today: `flux system serve` inside infrastructure they supply.
+#[test]
+fn execution_targets_have_one_complete_placement_and_deployment_contract() {
+    let topologies = normalized_prose(&read(TOPOLOGIES));
+    for required in [
+        "execution placement matrix",
+        "manage infrastructure",
+        "place guarded effects",
+        "place agent workers",
+        "provision isolation",
+        "docker plugin",
+        "kubernetes plugin",
+        "byo remote system",
+        "microvm",
+    ] {
+        assert!(
+            topologies.contains(required),
+            "{TOPOLOGIES} is missing the execution-placement contract `{required}`"
+        );
+    }
+
+    let docker = normalized_prose(&read(DOCKER_PLUGIN));
+    for required in [
+        "unix socket",
+        "root-equivalent",
+        "manage docker",
+        "does not place",
+        "remote mode",
+    ] {
+        assert!(
+            docker.contains(required),
+            "{DOCKER_PLUGIN} is missing the Docker boundary `{required}`"
+        );
+    }
+
+    let kubernetes = normalized_prose(&read("website/docs/plugins/kubernetes.md"));
+    for required in [
+        "managing kubernetes is not worker placement",
+        "does not place guarded effects",
+        "remote mode",
+    ] {
+        assert!(
+            kubernetes.contains(required),
+            "website/docs/plugins/kubernetes.md is missing the Kubernetes boundary `{required}`"
+        );
+    }
+
+    let deployment = normalized_prose(&read(REMOTE_SYSTEM_DEPLOYMENT));
+    for required in [
+        "byo deployment profiles",
+        "canonical workspace",
+        "tls certificate",
+        "bearer token",
+        "persistent delivery ledger",
+        "container",
+        "kubernetes pod",
+        "microvm",
+        "flux system serve",
+        "flux tui --remote",
+        "no local fallback",
+    ] {
+        assert!(
+            deployment.contains(required),
+            "{REMOTE_SYSTEM_DEPLOYMENT} is missing the deployment contract `{required}`"
         );
     }
 }

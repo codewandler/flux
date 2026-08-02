@@ -16,6 +16,21 @@ All notable changes to this project are documented in this file. The format is b
   host. Identity reconciliation preserves nodes across in-place source edits and graph reordering
   derives fresh runtime paths instead of trusting stale projection metadata.
 
+### Changed
+
+- **Remote dispatch evidence now records the selected execution substrate as host-stamped
+  provenance** (C-439). `tool_call` and dispatch lifecycle observations carry the immutable
+  substrate kind plus whether results are remotely reported, so evidence no longer presents a
+  remote daemon's report as a local observation. The stamp deliberately omits workspace paths and
+  endpoint addresses.
+
+- **Execution-model documentation now separates infrastructure management, guarded-effect
+  placement, whole-agent placement and isolation provisioning** (C-477). The public site adds a
+  release-accurate placement matrix, a Docker plugin guide, explicit Kubernetes boundaries, and one
+  production contract with BYO container, pod and VM/microVM deployment profiles for
+  `flux system serve`. Internal execution-substrate/fleet status now reflects the shipped remote and
+  process runtimes while keeping C-397, A-124 and A-125 open.
+
 ## [0.52.0] - 2026-08-02
 
 ### Removed

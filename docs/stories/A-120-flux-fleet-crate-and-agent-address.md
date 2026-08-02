@@ -2,11 +2,11 @@
 id: A-120
 title: The flux-fleet crate and AgentAddress — one URI whose scheme picks the runtime
 pillar: Agent
-status: backlog
+status: done
 epic: agent-fleet-runtime
 design: docs/designs/agent-fleet-runtime.md
 areas: [flux-fleet]
-note: "new crate ⇒ must be classified in flux-codegate's layer() map at L5 or the architecture lint fails"
+note: "SUPERSEDED by C-243: no flux-fleet crate or runtime-selecting URI was added; WorkerSpec + an opaque worker id became the narrower lifecycle contract"
 ---
 
 # The flux-fleet crate and AgentAddress — one URI whose scheme picks the runtime
@@ -36,7 +36,11 @@ the string written onto a board item's `runner` field.
       caller can guard egress the same way every other network op does.
 
 ## Progress
-- (not started)
+
+- Closed as superseded by C-243, not implemented as originally written. The shipped lifecycle seam
+  does not need a new `flux-fleet` crate or a URI whose scheme selects a runtime. Address/discovery
+  vocabulary remains separate open epic work; Docker/Kubernetes backends implement the existing
+  `AgentRuntime` trait directly.
 
 ## Notes
 - Design: [agent-fleet-runtime.md](../designs/agent-fleet-runtime.md) — "Two axes" and "The address".

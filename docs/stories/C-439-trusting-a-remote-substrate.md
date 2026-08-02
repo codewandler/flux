@@ -2,8 +2,7 @@
 id: C-439
 title: "Trusting a remote substrate — an unauthenticated endpoint, and a remote that lies about what it did"
 pillar: Core
-status: ready
-priority: 5
+status: done
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-system, flux-auth, flux-evidence]
@@ -32,20 +31,20 @@ the executor and the recorder are the same process, so the question never arises
 
 ## Acceptance
 
-- [ ] The remote endpoint is authenticated, and an unauthenticated one is **refused rather than
+- [x] The remote endpoint is authenticated, and an unauthenticated one is **refused rather than
       warned about**. ⚠ Follow `flux-server`'s existing posture rather than inventing a second one — it
       already refuses a non-loopback bind without auth, and the client side should mirror that shape.
-- [ ] The transport is guarded: the endpoint routes through `guard_url_scoped` in its `http`/`https`
+- [x] The transport is guarded: the endpoint routes through `guard_url_scoped` in its `http`/`https`
       form, as D-205 does for `wss://`. A remote address is still an egress destination.
-- [ ] ⚠ **The evidence chain states its provenance.** Where a record comes from a remote's report rather
+- [x] ⚠ **The evidence chain states its provenance.** Where a record comes from a remote's report rather
       than from flux's own execution, the record says so. A log that cannot distinguish "flux did this"
       from "a remote told flux it did this" has lost the property that makes it evidence.
-- [ ] Unreachable · refused · reported-failure are three distinguishable outcomes — C-399's acceptance,
+- [x] Unreachable · refused · reported-failure are three distinguishable outcomes — C-399's acceptance,
       and the operator response differs for each.
-- [ ] What flux does **not** verify is stated plainly. ⚠ flux cannot independently confirm a remote
+- [x] What flux does **not** verify is stated plainly. ⚠ flux cannot independently confirm a remote
       executed what it claims; pretending otherwise would be worse than the gap. Say it, in the docs
       that [C-440](C-440-the-topologies-page.md) produces.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -60,3 +59,11 @@ the executor and the recorder are the same process, so the question never arises
 ## Progress
 
 - Filed 2026-08-01 with the remote-agents epic.
+- 2026-08-02: C-475/C-476 shipped bearer-authenticated TLS, guarded HTTPS/WSS transport, and typed
+  `Refused`/`Unserved`/`Unreachable`/`Unknown` delivery outcomes. C-437 and the public topologies page
+  state exactly which guarantees become the remote's responsibility.
+- 2026-08-02: dispatch evidence now host-stamps `{kind, remotely_reported}` from the immutable
+  selected `ExecutionSystem` on `tool_call` and every lifecycle record. The stamp excludes workspace
+  paths and endpoint addresses so provenance does not become a new disclosure surface. The
+  local/loopback-remote regression test proves a tool cannot forge the classification with result
+  text. The workspace build/tests, clippy, architecture gate and both CI sandbox postures are green.
