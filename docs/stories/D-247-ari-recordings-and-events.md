@@ -2,7 +2,7 @@
 id: D-247
 title: "Ship ARI recordings and the event WebSocket"
 pillar: Agent
-status: in-progress
+status: done
 priority: 7
 epic: asterisk-ari
 design: docs/designs/asterisk-ari.md
@@ -52,3 +52,7 @@ Close the two ARI surfaces that ordinary JSON request/response generation cannot
   the three D-241 host tests for authenticated/pinned frame typing, lifecycle cleanup and
   frame/queue overflow each passed; and `rustfmt --edition 2021 --check` plus `git diff --check`
   passed for the D-247 source and test files.
+- 2026-08-02 release verification: core `v0.51.1` targets
+  `7270b2f75fda9bd3f1e9b21bbad7531886e6c5f3`; plugin dry run `30746468440` and publish run
+  `30746595522` both succeeded at that SHA. The workflow-created `plugins-v0.1.6` tag targets the
+  same commit and publishes all five Asterisk archives in its minisign-signed 97-asset release.
