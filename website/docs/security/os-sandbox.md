@@ -69,10 +69,14 @@ its declared channels until Ctrl-C and its cron/webhook/Slack triggers fire turn
 attached. Those forms refuse startup when no backend is usable. Every other subcommand is classified
 explicitly as *not* one of them, so a new subcommand cannot join the list by accident — the rest of
 `flux plugin …` is management rather than operation invocation and stays on the interactive
-contract. Direct SDK/server embedders receive no automatic posture
-from `flux-server` and must inject a sandbox or export its environment settings. Both default to off
-with networking open when no posture is selected. Enable confinement with a flag, a config table,
-the environment, or an SDK-injected sandbox. When more than one CLI/config source has an opinion,
+contract. The SDK applies the same rule to the one posture it can classify without an argv: a
+`Client`/`FlowClient` built with `auto_approve(true)` and no injected approver resolves to `require`
+with the sandbox network closed, and to autonomous resource ceilings, unless the embedder states a
+sandbox or ceiling of its own — which wins outright. Otherwise direct SDK/server embedders receive no
+automatic posture from `flux-server` and must inject a sandbox or export its environment settings.
+Both default to off with networking open when no posture is selected. Enable confinement with a flag,
+a config table, the environment, or an SDK-injected sandbox. When more than one CLI/config source has
+an opinion,
 the **strictest posture wins** (`require` beats `on` beats off), so
 `--sandbox` on top of `[sandbox] require = true` stays `require`. Only `--no-sandbox` or exact
 `FLUX_SANDBOX=off` can force sandboxing off outright. On one of those CLI unattended forms, that
