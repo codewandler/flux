@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Hosts can project authored Flux into a versioned visual-editor graph and correlate execution
+  back to exact graph nodes** (L-126). The pure language contract round-trips calls, conditions,
+  bounded loops, parallel branches and returns; valid unsupported source remains explicitly
+  source-only with byte ranges. An opt-in interpreter entry point emits value-free node lifecycle,
+  branch and occurrence records without changing ordinary execution or bypassing the operation
+  host. Identity reconciliation preserves nodes across in-place source edits and graph reordering
+  derives fresh runtime paths instead of trusting stale projection metadata.
+
 ## [0.51.1] - 2026-08-02
 
 ### Added

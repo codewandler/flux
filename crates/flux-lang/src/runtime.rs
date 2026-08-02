@@ -24,6 +24,7 @@ use crate::ast::{
     DraftAst, FailureKind, Node, NodeId, PhysicalPlan, RunEvent, Stage, StepId, SymbolName,
     TypeRef, Value, ValueId, Visibility,
 };
+use crate::editor::EditorExecutionTrace;
 use crate::host::{ApprovalChoice, OpHost, OpOutcome};
 use crate::opspec::OpCatalog;
 use crate::program::CompositeOpDecl;
@@ -1097,7 +1098,38 @@ pub async fn execute_flow(
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
     let fk = flow_key(ast.name.as_deref(), &ast.body);
-    run_top_level(store, executor, session_id, &ast.body, 0, None, &fk, sink).await
+    run_top_level(
+        store, executor, session_id, &ast.body, 0, None, &fk, sink, None,
+    )
+    .await
+}
+
+/// Execute a flow while reporting value-free lifecycle events for nodes in an editor projection.
+///
+/// This is an opt-in sibling of [`execute_flow`], not a second runtime: it uses the same interpreter,
+/// operation host, value store, and dispatch envelope. `trace` only maps semantic AST paths to host
+/// editor ids and observes their lifecycle.
+pub async fn execute_flow_traced(
+    store: &dyn ValueStore,
+    executor: &dyn OpHost,
+    session_id: &str,
+    ast: &DraftAst,
+    sink: &mut dyn FlowSink,
+    trace: &EditorExecutionTrace,
+) -> Result<FlowOutcome> {
+    let fk = flow_key(ast.name.as_deref(), &ast.body);
+    run_top_level(
+        store,
+        executor,
+        session_id,
+        &ast.body,
+        0,
+        None,
+        &fk,
+        sink,
+        Some(trace),
+    )
+    .await
 }
 
 /// The **resumable** analog of [`execute_flow`]: a failing TOP-LEVEL statement is reified as
@@ -1220,6 +1252,7 @@ pub async fn resume_flow_named(
         Some(input),
         &fk,
         sink,
+        None,
     )
     .await
 }
@@ -1240,6 +1273,7 @@ async fn run_top_level(
     resume: Option<Value>,
     flow_key: &str,
     sink: &mut dyn FlowSink,
+    editor_trace: Option<&EditorExecutionTrace>,
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
     // L-116: ONE loop-iteration budget for this whole flow execution — cloned into every
@@ -1329,7 +1363,7 @@ async fn run_top_level(
                 failure: None,
             });
         }
-        let (blast, _bvid, step) = exec_body(
+        let (blast, _bvid, step) = exec_body_at(
             store,
             executor,
             session_id,
@@ -1338,6 +1372,8 @@ async fn run_top_level(
             &mut steps,
             &mut transcript,
             budget.clone(),
+            editor_trace,
+            Some(TraceBody::single("body", i)),
         )
         .await?;
         // A `return` exits the flow immediately. An explicit `return <expr>` yields that
@@ -1861,12 +1897,57 @@ fn exec_body<'a>(
     transcript: &'a mut Vec<String>,
     budget: LoopBudget,
 ) -> BodyFuture<'a> {
+    exec_body_at(
+        store, executor, session_id, body, sink, steps, transcript, budget, None, None,
+    )
+}
+
+#[derive(Clone)]
+struct TraceBody {
+    prefix: String,
+    offset: usize,
+}
+
+impl TraceBody {
+    fn nested(prefix: String) -> Self {
+        Self { prefix, offset: 0 }
+    }
+
+    fn single(prefix: &str, index: usize) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            offset: index,
+        }
+    }
+
+    fn node_path(&self, index: usize) -> String {
+        format!("{}[{}]", self.prefix, self.offset + index)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_body_at<'a>(
+    store: &'a dyn ValueStore,
+    executor: &'a dyn OpHost,
+    session_id: &'a str,
+    body: &'a [Node],
+    sink: &'a mut dyn FlowSink,
+    steps: &'a mut usize,
+    transcript: &'a mut Vec<String>,
+    budget: LoopBudget,
+    editor_trace: Option<&'a EditorExecutionTrace>,
+    trace_body: Option<TraceBody>,
+) -> BodyFuture<'a> {
     Box::pin(async move {
         let mut last = String::new();
         // The value id the body's most recent op produced — so `seq`/`each`/`parallel`/`pipe` can
         // bind a block's result without the caller threading a separate accumulator.
         let mut last_value: Option<ValueId> = None;
-        for node in body {
+        for (node_index, node) in body.iter().enumerate() {
+            let node_path = trace_body.as_ref().map(|body| body.node_path(node_index));
+            let mut editor_activation = node_path
+                .as_deref()
+                .and_then(|path| editor_trace.and_then(|trace| trace.enter(path)));
             match node {
                 Node::Bind {
                     name, value, ty, ..
@@ -2009,6 +2090,9 @@ fn exec_body<'a>(
                     trace_structural(sink, "loop.node", data);
                     let (content, vid) =
                         eval_return(store, executor, session_id, value, sink, steps).await?;
+                    if let Some(activation) = &mut editor_activation {
+                        activation.succeed();
+                    }
                     return Ok((content, vid.clone(), Step::Return(vid)));
                 }
                 Node::When {
@@ -2025,8 +2109,17 @@ fn exec_body<'a>(
                         data["cond"] = serde_json::Value::String(l);
                     }
                     trace_structural(sink, "loop.node", data);
+                    if let Some(activation) = &editor_activation {
+                        activation.branch_selected(if take { "then" } else { "otherwise" });
+                    }
                     let branch = if take { then } else { otherwise };
-                    let (blast, bvid, step) = exec_body(
+                    let branch_path = node_path.as_ref().map(|path| {
+                        TraceBody::nested(format!(
+                            "{path}.{}",
+                            if take { "then" } else { "otherwise" }
+                        ))
+                    });
+                    let (blast, bvid, step) = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -2035,6 +2128,8 @@ fn exec_body<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        editor_trace,
+                        branch_path,
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2043,6 +2138,9 @@ fn exec_body<'a>(
                     // The branch's value is the node's value even when its text renders empty (F20b).
                     last_value = bvid;
                     if let Step::Return(v) = step {
+                        if let Some(activation) = &mut editor_activation {
+                            activation.succeed();
+                        }
                         return Ok((last, v.clone(), Step::Return(v)));
                     }
                 }
@@ -2065,7 +2163,10 @@ fn exec_body<'a>(
                             "loop.round",
                             serde_json::json!({"round": round + 1, "max": max}),
                         );
-                        let (blast, bvid, step) = exec_body(
+                        let repeat_path = node_path
+                            .as_ref()
+                            .map(|path| TraceBody::nested(format!("{path}.body")));
+                        let (blast, bvid, step) = exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -2074,6 +2175,8 @@ fn exec_body<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            editor_trace,
+                            repeat_path,
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -2086,6 +2189,9 @@ fn exec_body<'a>(
                             last_value = Some(v);
                         }
                         if let Step::Return(v) = step {
+                            if let Some(activation) = &mut editor_activation {
+                                activation.succeed();
+                            }
                             return Ok((last, v.clone(), Step::Return(v)));
                         }
                         // L-116: bound the model-facing transcript so a long `repeat` can't grow it
@@ -2164,7 +2270,10 @@ fn exec_body<'a>(
                         budget.charge("each")?;
                         let vid = store.put_value(session_id, &Value::from_json(elem))?;
                         bind_existing(store, session_id, item, &vid)?;
-                        let (blast, bvid, step) = exec_body(
+                        let each_path = node_path
+                            .as_ref()
+                            .map(|path| TraceBody::nested(format!("{path}.body")));
+                        let (blast, bvid, step) = exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -2173,6 +2282,8 @@ fn exec_body<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            editor_trace,
+                            each_path,
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -2183,6 +2294,9 @@ fn exec_body<'a>(
                             last_value = Some(v);
                         }
                         if let Step::Return(v) = step {
+                            if let Some(activation) = &mut editor_activation {
+                                activation.succeed();
+                            }
                             return Ok((last, v.clone(), Step::Return(v)));
                         }
                         // L-82: bound transcript growth and yield cooperatively per element.
@@ -2392,11 +2506,22 @@ fn exec_body<'a>(
                     // borrow `sink`, so each branch's own `BufferSink` carries the parent's opt-in
                     // forward instead of defaulting to untraced.
                     let trace = sink.trace_structural();
-                    let futs = branches.iter().map(|b| {
+                    if let Some(activation) = &editor_activation {
+                        for branch in branches {
+                            activation.branch_selected(branch.name.0.clone());
+                        }
+                    }
+                    let parallel_path = node_path.clone();
+                    let futs = branches.iter().enumerate().map(|(branch_index, b)| {
                         // L-116: a HANDLE to the one execution budget per branch (`steps`/transcript
                         // are forked and merged, the budget is shared), so N concurrent branches
                         // cannot each spend a private `DEFAULT_MAX_LOOP_ITERATIONS`.
                         let budget = budget.clone();
+                        let branch_path = parallel_path.as_ref().map(|path| {
+                            TraceBody::nested(format!(
+                                "{path}.branches[{branch_index}].body"
+                            ))
+                        });
                         async move {
                             let mut buf = BufferSink {
                                 trace,
@@ -2409,9 +2534,9 @@ fn exec_body<'a>(
                             );
                             let mut s = 0usize;
                             let mut tr: Vec<String> = Vec::new();
-                            let res = exec_body(
+                            let res = exec_body_at(
                                 store, executor, session_id, &b.body, &mut buf, &mut s, &mut tr,
-                                budget,
+                                budget, editor_trace, branch_path,
                             )
                             .await;
                             (b, buf, s, tr, res)
@@ -3482,6 +3607,9 @@ fn exec_body<'a>(
                         "a bare value is not an executable statement".to_string(),
                     ));
                 }
+            }
+            if let Some(activation) = &mut editor_activation {
+                activation.succeed();
             }
         }
         Ok((last, last_value, Step::Next))
@@ -4908,8 +5036,12 @@ fn node_kind(node: &Node) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     use crate::ast::{Branch, Node, RunEvent, SymbolName, Value, Visibility};
+    use crate::editor::{
+        project, EditorExecutionTrace, EditorTraceEvent, EditorTraceObserver, EditorTracePhase,
+    };
     use crate::opspec::{OpCatalog, OpSignature};
     use crate::store::MemStore;
 
@@ -10025,6 +10157,121 @@ mod tests {
             branch_names,
             vec!["left", "right"],
             "each branch's parallel.branch event fires exactly once, in declaration order: {obs:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct EditorTraceRecorder(Mutex<Vec<EditorTraceEvent>>);
+
+    impl EditorTraceObserver for EditorTraceRecorder {
+        fn event(&self, event: &EditorTraceEvent) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.clone());
+        }
+    }
+
+    impl EditorTraceRecorder {
+        fn events(&self) -> Vec<EditorTraceEvent> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_trace_distinguishes_duplicate_loop_and_parallel_activations() {
+        let host = TraceHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                Node::Repeat {
+                    max: 2,
+                    until: None,
+                    body: vec![call("plan", vec![]), call("plan", vec![])],
+                    collect: None,
+                },
+                Node::Parallel {
+                    branches: vec![
+                        Branch {
+                            name: SymbolName("left".into()),
+                            body: vec![call("plan", vec![])],
+                        },
+                        Branch {
+                            name: SymbolName("right".into()),
+                            body: vec![call("plan", vec![])],
+                        },
+                    ],
+                },
+            ],
+            ..Default::default()
+        };
+        let graph = project(&ast, None).graph.expect("visual graph");
+        let node_map = graph.node_map();
+        let recorder = Arc::new(EditorTraceRecorder::default());
+        let trace = EditorExecutionTrace::for_flow(&graph, recorder.clone());
+
+        execute_flow_traced(
+            &store,
+            &host,
+            "editor-trace",
+            &ast,
+            &mut BufferSink::default(),
+            &trace,
+        )
+        .await
+        .unwrap();
+
+        let events = recorder.events();
+        let entered = |path: &str| {
+            let id = &node_map[path];
+            events
+                .iter()
+                .filter(|event| event.node_id == *id && event.phase == EditorTracePhase::Entered)
+                .map(|event| event.occurrence)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(entered("body[0].body[0]"), vec![1, 2]);
+        assert_eq!(entered("body[0].body[1]"), vec![1, 2]);
+        assert_ne!(
+            node_map["body[0].body[0]"], node_map["body[0].body[1]"],
+            "identical calls at distinct authored paths keep distinct ids"
+        );
+        assert_eq!(entered("body[1].branches[0].body[0]"), vec![1]);
+        assert_eq!(entered("body[1].branches[1].body[0]"), vec![1]);
+        assert!(events
+            .iter()
+            .all(|event| event.branch.as_deref() != Some("planned")));
+    }
+
+    #[tokio::test]
+    async fn editor_trace_closes_a_failed_activation_without_recording_values() {
+        let host = TraceHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![call("unknown", vec![])],
+            ..Default::default()
+        };
+        let graph = project(&ast, None).graph.expect("visual graph");
+        let recorder = Arc::new(EditorTraceRecorder::default());
+        let trace = EditorExecutionTrace::for_flow(&graph, recorder.clone());
+
+        assert!(execute_flow_traced(
+            &store,
+            &host,
+            "editor-trace-failure",
+            &ast,
+            &mut BufferSink::default(),
+            &trace,
+        )
+        .await
+        .is_err());
+        let phases: Vec<_> = recorder.events().iter().map(|event| event.phase).collect();
+        assert_eq!(
+            phases,
+            vec![EditorTracePhase::Entered, EditorTracePhase::Failed]
         );
     }
 
