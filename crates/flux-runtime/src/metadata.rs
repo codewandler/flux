@@ -1555,6 +1555,7 @@ mod tests {
     /// and neither answer depends on the machine the gate runs on.
     #[test]
     fn load_config_in_reads_the_pinned_home_and_never_the_process_home() {
+        let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
         let home = temp_dir("pinned-home");
         std::fs::create_dir_all(home.join(".flux")).unwrap();
         std::fs::write(

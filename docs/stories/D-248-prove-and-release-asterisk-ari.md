@@ -54,3 +54,8 @@ operators can install.
   assertions and four shared executor tests.
 - Coordinator-owned work remains unchecked: root/protocol/pack gates, clean-tree integration,
   versioning, changelogs, signing, publication and release verification.
+- The first release-cut gate exposed a pre-existing process-global environment race in
+  `metadata::tests::load_config_in_reads_the_pinned_home_and_never_the_process_home`: a sibling test
+  could temporarily supply `FLUX_MANAGED_CONFIG = org-default` while this reader asserted an empty
+  managed layer. The failing full-workspace run is the regression evidence; taking the existing
+  `MANAGED_CONFIG_LOCK` made all 182 `codewandler-flux-runtime` library tests pass together.
