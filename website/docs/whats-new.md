@@ -12,6 +12,50 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Action needed
+
+- **An agent in a shared room now answers only when it is addressed.** Until now an agent sitting in
+  a room replied to every line said in it, including conversation between other people. It now
+  answers when it is mentioned, whispered to, or greeted by a wake phrase.
+  ⚠ **A room that relied on the agent answering everything will go quiet** until you set
+  `address_rule "always"` on that channel. The agent stays silent in the room when it declines, by
+  design — but flux prints one line to your terminal per distinct reason, naming the rule and the
+  name it is listening for, so silence is never a mystery.
+  Two things come with it: the agent keeps an attributed record of what it overheard, so an answer
+  can refer to something said before it was addressed, and two agents in one room now converge
+  instead of replying to each other until they hit a limit.
+
+### New
+
+- **Every way to run flux, on one page, with what each one costs.** A new
+  [topologies](https://flux.codewandler.dev/docs/topologies) page lays out nine ways to run flux —
+  entirely on your machine, OS-sandboxed, with containerized operations, with the work happening on
+  another machine, as a served agent with a thin client, embedded in your own program, as portable
+  wasm, on a hosted exchange, and over plain `ssh` — and answers the two questions people actually
+  have about each: **where are my files**, and **where does the approval prompt appear**.
+  Every row says honestly whether it ships today, ships partly, or is still proposed, so you can
+  tell what you can run this afternoon from what is on the way.
+
+- **An agent can join a meeting and hear it.** A room channel can now carry audio and video: a
+  separate process owns the media while flux drives it, so text and presence keep working exactly as
+  before if you do not enable it.
+  ⚠ **The browser side is not shipped yet, so there is no audio in a real call in this release.** The
+  seam and the protocol are in place; what is missing is the piece that actually joins the call.
+
+- **Reaching a host by UDP or ping, under the same permission you already grant.** Network
+  operations that need datagrams or a raw socket — a DNS probe, an ICMP ping — now work, and pass
+  through exactly the same host permission check as everything else, so nothing reaches the network
+  on a route you did not allow. If the machine lacks the privilege for a raw socket, flux says so
+  before touching the network rather than failing halfway.
+
+### Fixed
+
+- **A room message no longer runs work as if you had typed it.** When a message in a shared room
+  started a piece of work, that work ran with your own permissions — so a stranger's message could
+  drive operations recorded under your name. It now runs as the person who spoke, with a stranger
+  treated as untrusted, and each run records who it ran as. Questions the work pauses to ask carry
+  the same identity when they resume.
+
 ## [0.48.0] - 2026-08-01
 
 ### Action needed

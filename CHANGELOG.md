@@ -22,24 +22,6 @@ All notable changes to this project are documented in this file. The format is b
   Recommended defaults instead: **depth All · condense on · pane off** — and ⚠ on a real run **condensing
   is what *buys the room* to show a failure**, the inverse of the worry the story was written around.
 
-### Fixed
-
-- **Pinned that compaction records a durable `Compacted` event** (C-443). An audit of the local event
-  store found **zero `Compacted` rows in 112,114 events**, which raised the question of whether history
-  was being replaced with no record — that would have silently corrupted every `flux replay`,
-  `flux export` and log reconstruction.
-  ⚠ **It is not.** Compaction replaces history *by calling* the `Compacted` writer, so the record **is**
-  the replacement mechanism and no code path can do one without the other. Now pinned by the first test
-  on the automatic adaptive path, and the first to assert the durable event rather than only the
-  resulting projection.
-  **The real answer is that the threshold is never reached**: 85% of the store is two-message one-shot
-  runs, the mean conversation among sessions long enough to qualify is **9% of the 48,000-char
-  threshold**, and the single session that ever crossed it did so at its *final* message — so the
-  next-turn check never ran. The default is unchanged and its reasoning is now recorded where a reader
-  meets the number. ⚠ Honest limit stated: zero rows measures *this workload*, not the threshold.
-
-### Added
-
 - **A topologies page — every way to run flux, and what each one costs** (C-440).
   `website/docs/topologies.md` covers nine ways to run flux (fully local · OS-sandboxed ·
   containerized ops · remote system · served agent + thin client · embedded SDK · portable wasm ·
@@ -151,6 +133,20 @@ All notable changes to this project are documented in this file. The format is b
   it affects every channel that puts structure beside `text`.
 
 ### Fixed
+
+- **Pinned that compaction records a durable `Compacted` event** (C-443). An audit of the local event
+  store found **zero `Compacted` rows in 112,114 events**, which raised the question of whether history
+  was being replaced with no record — that would have silently corrupted every `flux replay`,
+  `flux export` and log reconstruction.
+  ⚠ **It is not.** Compaction replaces history *by calling* the `Compacted` writer, so the record **is**
+  the replacement mechanism and no code path can do one without the other. Now pinned by the first test
+  on the automatic adaptive path, and the first to assert the durable event rather than only the
+  resulting projection.
+  **The real answer is that the threshold is never reached**: 85% of the store is two-message one-shot
+  runs, the mean conversation among sessions long enough to qualify is **9% of the 48,000-char
+  threshold**, and the single session that ever crossed it did so at its *final* message — so the
+  next-turn check never ran. The default is unchanged and its reasoning is now recorded where a reader
+  meets the number. ⚠ Honest limit stated: zero rows measures *this workload*, not the threshold.
 
 - **A room-triggered journey authorizes and audits as the speaker, not as the local operator**
   (C-415). A journey woken by a room message ran at the assembly-time identity — under `flux app run`
