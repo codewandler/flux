@@ -37,8 +37,9 @@ saved filename stem or declared flow name.
 - Providers are constructed lazily. A flow that never reaches a model-backed operation runs without
   provider credentials.
 - Every operation uses the same safety envelope; `--yes` auto-approves calls for trusted headless use.
-- Agents discover the same catalog through `flow_list` and execute a selected flow through
-  `flow_run` in the current guarded session.
+- Agents discover the same stored catalog through `flow_list`. `flow_run` accepts exactly one stored
+  `name` or workspace-relative `.flux` `path`; a path such as `examples/review.flux` is reread on
+  every call and checked against the current operation catalog before guarded execution.
 
 ## `flux run` — the adaptive agent
 

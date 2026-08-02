@@ -43,8 +43,10 @@ without involving a model unless natural-language mapping is explicitly requeste
 
 ## Notes
 
-- Existing agent-side `flow_run(inputs)` remains compatibility-lenient; only its discovery/resolution
-  path is shared. The strict declared-parameter policy belongs to direct CLI execution.
+- C-376 deliberately revises the agent-side address policy: `flow_run` now accepts exactly one
+  stored-flow `name` or workspace-confined `path`, so checked-in examples have a model-facing route.
+  "Compatibility-lenient" continues to describe only input-key/type validation; the strict declared-
+  parameter policy still belongs to direct CLI execution.
 - Saved homes remain `.flux/flows` and `~/.flux/flows`; legacy `.flux/ops` homes remain readable.
 - Standalone composite-op execution from the CLI, arbitrary extra flow directories, and JSON output
   for `flow list` are deliberately out of scope.

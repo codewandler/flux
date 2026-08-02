@@ -93,10 +93,13 @@ all consume that same snapshot:
 
 - **`flow_list`** enumerates `.flux/flows` → `@global_flows` → `.flux/ops` → `@global_ops` and lists every
   flow and composite op with its description and params.
-- **`flow_run(name, inputs?)`** resolves a flow by name, seeds `inputs` as prepended literal binds, and
-  runs it in the current session by re-entering the depth-guarded `run_plan` path (`ctx.loop_host`), so it
-  inherits the provider, session, and approval/IO envelope. Its compatibility-lenient input semantics
-  are unchanged. (It needs a `LoopHost`, like `run_plan`.)
+- **`flow_run(name | path, inputs?)`** accepts exactly one stored-flow name or confined,
+  workspace-relative `.flux` path, rereading path source on each call. It seeds `inputs` as prepended
+  literal binds and runs in the current session by re-entering the depth-guarded `run_plan` path
+  (`ctx.loop_host`), so lowering sees the live operation catalog and execution inherits the provider,
+  session, and approval/IO envelope. Its compatibility-lenient input semantics are unchanged. The
+  result includes a route receipt with resolved path, flow name, and seeded input keys. (It needs a
+  `LoopHost`, like `run_plan`.)
 - **`flux flow list`** (alias `ls`) prints the identical catalog without constructing an agent,
   provider, event store, or session.
 - **`flux flow run <target>`** resolves an existing file first, then a saved filename stem or declared

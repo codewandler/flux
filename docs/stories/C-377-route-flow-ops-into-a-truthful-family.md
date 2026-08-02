@@ -5,7 +5,7 @@ pillar: Agent
 status: backlog
 epic: harness-route-integrity
 design: docs/designs/harness-route-integrity.md
-note: "flow_list/flow_render route to workspace.read; flow_run has empty effect+access sets so virtual_family drops it into `core` — 'Pure and generally useful deterministic operations' — for a Risk::Medium NonIdempotent flow runner"
+note: "C-376 makes flow_run's source read metadata truthful, but the three flow operations still have no explicit shared family; virtual_family also still permits a Risk::Medium NonIdempotent op with empty effects to fall into core"
 ---
 
 # Route the flow ops into a capability family whose description is true of them
@@ -29,6 +29,10 @@ act, and stop discovery and execution from living in different families.
 
 - 2026-08-01 — filed from validation of HAR-01. This is the structural hazard behind the reported
   symptom, independent of what the reviewed session actually surfaced.
+- 2026-08-02 — C-376 gives `flow_run` truthful filesystem-read metadata, so the production runner no
+  longer reaches `core` by the originally observed empty-effects path. The residual remains: all
+  three flow operations need an explicit shared family, and the unsafe virtual fallback still needs
+  a general invariant for any future medium-or-higher operation with empty effect metadata.
 
 ## Notes
 

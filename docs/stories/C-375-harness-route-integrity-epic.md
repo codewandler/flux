@@ -17,7 +17,7 @@ inside the staged narrowing design, not by widening the surfaced catalog.
 
 ## Acceptance
 
-- [ ] C-376 lets `flow_run` address a workspace flow path and return a route receipt.
+- [x] C-376 lets `flow_run` address a workspace flow path and return a route receipt.
 - [ ] C-377 routes the flow ops into a family whose description is true of them.
 - [ ] C-378 adds an exact-flow preflight that separates inspectable from executable.
 - [ ] C-379 binds completion to the route the user required.
@@ -29,6 +29,8 @@ inside the staged narrowing design, not by widening the surfaced catalog.
 ## Progress
 
 - 2026-08-01 — opened from validation of HAR-01/02/03/05 and ROUTE-01.
+- 2026-08-02 — C-376 done: the model-facing runner can now execute a freshly read, confined
+  workspace `.flux` path and returns the route identity needed by C-379.
 
 ## Notes
 

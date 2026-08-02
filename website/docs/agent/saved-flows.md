@@ -56,10 +56,14 @@ fully supplied deterministic flows require no provider credential.
 The agent sees the same catalog through:
 
 - `flow_list()` — names, descriptions, parameters, composite ops, and parse errors;
-- `flow_run({name, inputs?})` — execute a saved flow inside the current session.
+- `flow_run({name, inputs?})` — execute a saved flow inside the current session; or
+- `flow_run({path, inputs?})` — execute a workspace-relative `.flux` file such as
+  `examples/review.flux`.
 
-The catalog is loaded once for a run. A malformed file is reported without making every other saved
-flow unavailable.
+Provide exactly one of `name` or `path`. Path-addressed source is reread for every call, then checked
+against the current operation catalog before it runs through the session's normal approval and IO
+envelope. The result includes a route receipt naming the resolved path, flow, and seeded input keys.
+A malformed file is reported without making every other saved flow unavailable.
 
 ## Register an operation during a turn
 

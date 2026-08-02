@@ -61,3 +61,11 @@ structurally. What *is* reproduced is sharper and worse:
 - **Static parse/lower is never evidence of execution.** Where a preflight reports on a flow, its
   output separates `inspectable` from `executable` as distinct fields so the distinction cannot be
   flattened in prose.
+
+## Implementation status
+
+- **2026-08-02 — C-376:** `flow_run` now accepts exactly one stored `name` or confined workspace
+  `path`, rereads path source per call, revalidates through the live authored-flow host, and returns
+  a route receipt. Its source read is now declared as a filesystem effect. This removes the specific
+  production `flow_run` → `core` fallback observed above; C-377 remains necessary for an explicit
+  shared flow family and a general fallback invariant.

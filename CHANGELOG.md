@@ -8,6 +8,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Project-adaptive multi-agent review example (L-129).** `examples/review.flux` classifies the
+  guarded workspace inventory and recent Git history, derives exactly four structured review
+  dimensions from only that classification, fans out to four read-only reviewer roles, joins their
+  reports, and delegates one final evidence-preserving verdict.
+
+- **Workspace-addressable authored flows from the harness (C-376).** `flow_run` now accepts exactly
+  one stored-flow `name` or guarded workspace-relative `.flux` `path`, so checked-in flows such as
+  `examples/review.flux` are reachable without moving them into `.flux/flows`. Path source is reread
+  per invocation and lowered against the live operation catalog; results include a route receipt
+  with the resolved path, flow name, and seeded input keys.
+
 - **Hosts can project authored Flux into a versioned visual-editor graph and correlate execution
   back to exact graph nodes** (L-126). The pure language contract round-trips calls, conditions,
   bounded loops, parallel branches and returns; valid unsupported source remains explicitly

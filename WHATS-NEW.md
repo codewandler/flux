@@ -15,6 +15,18 @@
 
 ## [Unreleased]
 
+### New
+
+- **Run a review shaped by the project instead of a fixed checklist.** The new
+  `examples/review.flux` classifies the current project from its file structure and Git history,
+  derives four project-specific review dimensions from that classification alone, runs four
+  read-only reviewers in parallel, and combines their evidence into one prioritized verdict.
+
+- **Agents can run checked-in Flux workflows by path.** The `flow_run` operation now accepts a
+  workspace-relative file such as `examples/review.flux`, rereads it whenever it runs, and checks
+  it against the operations currently available in the session. Its result identifies the exact
+  file and flow that ran, plus the input names supplied.
+
 ### Improved
 
 - **It is now clear what Docker, Kubernetes, and microVM support means.** A new execution-placement

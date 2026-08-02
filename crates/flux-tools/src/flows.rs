@@ -4,9 +4,10 @@
 //! (global — the `@global_flows` named root the CLI registers), plus the legacy
 //! `.flux/ops` / `@global_ops` dirs, kept readable during the ops→flows unification.
 //! `flow_list` enumerates them (flows *and* composite ops, with descriptions + params);
-//! `flow_run` runs a named flow in the CURRENT session through the engine's depth-guarded authored
-//! flow host, so it inherits the approval + IO envelope, provider, and session while holding no
-//! engine state of its own.
+//! `flow_run` runs either a named stored flow or a workspace-relative `.flux` path in the CURRENT
+//! session through the engine's depth-guarded authored flow host. Path-addressed source is reread
+//! for every call; both forms inherit the approval + IO envelope, provider, session, and current
+//! operation catalog while holding no engine state of their own.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use flux_lang::ast::{DraftAst, Node, Param};
 use flux_lang::program::Module;
 use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
-use flux_system::System;
+use flux_system::{PathAccess, System};
 
 /// Directories searched, in precedence order (project flows shadow global flows; flows shadow the
 /// legacy ops homes). `@`-prefixed entries are workspace named roots, read only when registered.
@@ -343,15 +344,20 @@ impl Tool for FlowListTool {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FlowRunInput {
-    /// The flow to run: a filename stem under .flux/flows (e.g. "mr_update") or a declared flow name.
-    name: String,
+    /// A filename stem under .flux/flows (e.g. "mr_update") or a declared stored-flow name.
+    #[serde(default)]
+    name: Option<String>,
+    /// A workspace-relative `.flux` file path, read afresh for this call (e.g.
+    /// "examples/review.flux"). Exactly one of `name` or `path` is required.
+    #[serde(default)]
+    path: Option<String>,
     /// Optional JSON object of inputs bound as `$key` before the run (seeded as literal binds; a
     /// flow-local bind shadows them).
     #[serde(default)]
     inputs: Option<Value>,
 }
 
-/// `flow_run(name, inputs?) -> Outcome` — run a stored flow in the current session.
+/// `flow_run(name | path, inputs?) -> Outcome + route receipt` — run a flow in this session.
 struct FlowRunTool;
 
 #[async_trait]
@@ -359,34 +365,47 @@ impl Tool for FlowRunTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "flow_run".into(),
-            description: "Run a stored Flux-Lang flow by name (a file under .flux/flows or \
-                          ~/.flux/flows). `inputs` are bound as `$key` before the run. The flow \
-                          executes in the current session through the same approval + IO envelope \
-                          as any op and returns its Outcome; bounded by a reentry-depth cap. \
-                          Discover names with flow_list."
-                .into(),
+            description:
+                "Run a Flux-Lang flow by exactly one address: `name` selects a stored flow \
+                          under .flux/flows or ~/.flux/flows; `path` selects a workspace-relative \
+                          .flux file such as examples/review.flux and rereads it on every call. \
+                          `inputs` are bound as `$key` before the run. The flow executes in the \
+                          current session through the same approval + IO envelope, is revalidated \
+                          against the current live operation catalog, and returns an Outcome with \
+                          a route receipt; bounded by a reentry-depth cap. Discover stored names \
+                          with flow_list."
+                    .into(),
             input_schema: flux_spec::tool_input_schema::<FlowRunInput>(),
             output_schema: None,
-            // No host effects of its own: the flow's inner ops declare and gate their own.
-            effects: Vec::new(),
+            // Resolving either address reads Flux source; every inner operation still declares and
+            // gates its own effects independently when the authored flow re-enters the loop host.
+            effects: vec![Effect::Read, Effect::Filesystem],
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
-            access: Vec::new(),
+            access: vec![AccessKind::Filesystem],
             group: None,
         }
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(|name| vec![format!("flow:{name}")])
-            .unwrap_or_default()
+        if let Some(path) = params.get("path").and_then(Value::as_str) {
+            vec![path.to_string()]
+        } else {
+            params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| vec![format!("flow:{name}")])
+                .unwrap_or_default()
+        }
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: FlowRunInput = crate::parse_params(params, "flow_run")?;
-        let mut ast = resolve_flow(ctx, &args.name)?;
+        let resolved = resolve_flow(ctx, &args).await?;
+        let resolved_path = resolved.path;
+        let mut ast = resolved.ast;
+        let flow_name = ast.name.clone().unwrap_or_else(|| basename(&resolved_path));
+        let mut seeded_input_keys = Vec::new();
 
         // Preserve the agent tool's existing compatibility semantics: arbitrary input keys are
         // literal binds and a flow-local bind can shadow them. The strict declared-param contract is
@@ -395,6 +414,8 @@ impl Tool for FlowRunTool {
             let obj = inputs
                 .as_object()
                 .ok_or_else(|| Error::Other("flow_run: `inputs` must be a JSON object".into()))?;
+            seeded_input_keys.extend(obj.keys().cloned());
+            seeded_input_keys.sort();
             let mut seeded: Vec<Node> = obj
                 .iter()
                 .map(|(key, value)| Node::Bind {
@@ -413,17 +434,80 @@ impl Tool for FlowRunTool {
         let ast_json = serde_json::to_value(&ast)
             .map_err(|e| Error::Other(format!("flow_run: serialize flow: {e}")))?;
         let outcome = loop_host(ctx)?.run_authored_flow(ast_json).await?;
-        Ok(ToolResult::ok(
-            serde_json::to_string(&outcome).unwrap_or_default(),
-        ))
+        let route = serde_json::json!({
+            "operation": "flow_run",
+            "resolved_path": resolved_path,
+            "flow_name": flow_name,
+            "seeded_input_keys": seeded_input_keys,
+        });
+        let with_receipt = match outcome {
+            Value::Object(mut object) => {
+                object.insert("route".into(), route);
+                Value::Object(object)
+            }
+            other => serde_json::json!({"outcome": other, "route": route}),
+        };
+        let content = serde_json::to_string(&with_receipt)
+            .map_err(|e| Error::Other(format!("flow_run: serialize outcome: {e}")))?;
+        Ok(ToolResult::ok(content))
     }
 }
 
-fn resolve_flow(ctx: &ToolContext, name: &str) -> Result<DraftAst> {
-    StoredFlowCatalog::load(ctx.system().as_ref())
-        .resolve(name)
-        .map(|resolved| resolved.ast)
-        .map_err(|e| Error::Other(format!("flow_run: {e}")))
+async fn resolve_flow(ctx: &ToolContext, args: &FlowRunInput) -> Result<ResolvedStoredFlow> {
+    match (args.name.as_deref(), args.path.as_deref()) {
+        (Some(name), None) => StoredFlowCatalog::load(ctx.system().as_ref())
+            .resolve(name)
+            .map_err(|e| Error::Other(format!("flow_run: {e}"))),
+        (None, Some(path)) => resolve_workspace_flow_path(ctx.system().as_ref(), path).await,
+        _ => Err(Error::Other(
+            "flow_run: provide exactly one of `name` or `path`".into(),
+        )),
+    }
+}
+
+async fn resolve_workspace_flow_path(system: &System, path: &str) -> Result<ResolvedStoredFlow> {
+    if path.is_empty()
+        || std::path::Path::new(path).is_absolute()
+        || path.starts_with('@')
+        || !path.ends_with(".flux")
+    {
+        return Err(Error::Other(format!(
+            "flow_run: `path` must be a workspace-relative .flux file, got {path:?}"
+        )));
+    }
+    let resolved_path = system
+        .workspace()
+        .path_identity(path, PathAccess::Read)
+        .map_err(|e| Error::Other(format!("flow_run: {e}")))?;
+    if std::path::Path::new(&resolved_path).is_absolute() {
+        return Err(Error::Other(format!(
+            "flow_run: path {path:?} resolves outside the primary workspace"
+        )));
+    }
+    let source = system
+        .read_file(&resolved_path)
+        .await
+        .map_err(|e| Error::Other(format!("flow_run: read {resolved_path}: {e}")))?;
+    let module = Module::parse_str(&source)
+        .map_err(|e| Error::Other(format!("flow_run: parse {resolved_path}: {e}")))?;
+    let ast = match module {
+        Module::Flow(ast) => ast,
+        Module::Program(program) => match (program.flows.as_slice(), program.journeys.as_slice()) {
+            ([flow], []) => flow.clone(),
+            ([], [journey]) => journey.flow.clone(),
+            _ => {
+                return Err(Error::Other(format!(
+                    "flow_run: `{resolved_path}` needs a bare flow or a module with exactly one \
+                     flow/journey"
+                )))
+            }
+        },
+    };
+    Ok(ResolvedStoredFlow {
+        path: resolved_path,
+        source,
+        ast,
+    })
 }
 
 #[cfg(test)]
@@ -432,6 +516,7 @@ mod tests {
     use flux_system::Workspace;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -557,5 +642,118 @@ mod tests {
             assert!(error.contains("composite op `greet`"), "{target}: {error}");
             assert!(error.contains("call it from a flow"), "{target}: {error}");
         }
+    }
+
+    #[derive(Default)]
+    struct CapturingLoopHost {
+        asts: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl LoopHost for CapturingLoopHost {
+        async fn run_authored_flow(&self, ast: Value) -> Result<Value> {
+            self.asts.lock().unwrap().push(ast);
+            Ok(serde_json::json!({
+                "result": "ran",
+                "transcript": [],
+                "steps": 1,
+                "suspension": null,
+            }))
+        }
+    }
+
+    fn flow_run_context(system: System, host: Arc<CapturingLoopHost>) -> ToolContext {
+        let mut ctx = ToolContext::new(Arc::new(system));
+        ctx.loop_host = Some(host);
+        ctx
+    }
+
+    /// C-376 failing-first: the model-facing operation must address a literal workspace flow path,
+    /// reread it on every call, and say exactly which route ran. Before C-376, `path` is rejected by
+    /// `FlowRunInput`'s `deny_unknown_fields`, so `examples/review.flux` is CLI-only.
+    #[tokio::test]
+    async fn flow_run_workspace_path_is_fresh_and_returns_a_route_receipt() {
+        let (temp, system) = fixture();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join("examples")).unwrap();
+        let path = project.join("examples/fresh.flux");
+        std::fs::write(&path, "flow first\n  return \"one\"\n").unwrap();
+
+        let host = Arc::new(CapturingLoopHost::default());
+        let ctx = flow_run_context(system, host.clone());
+        let first = FlowRunTool
+            .execute(
+                &ctx,
+                serde_json::json!({
+                    "path": "examples/fresh.flux",
+                    "inputs": {"z": 1, "a": 2},
+                }),
+            )
+            .await
+            .expect("workspace path should run");
+        let first: Value = serde_json::from_str(&first.content).unwrap();
+        assert_eq!(
+            first["route"],
+            serde_json::json!({
+                "operation": "flow_run",
+                "resolved_path": "examples/fresh.flux",
+                "flow_name": "first",
+                "seeded_input_keys": ["a", "z"],
+            })
+        );
+
+        std::fs::write(&path, "flow updated\n  return \"two\"\n").unwrap();
+        let second = FlowRunTool
+            .execute(&ctx, serde_json::json!({"path": "examples/fresh.flux"}))
+            .await
+            .expect("updated workspace path should run");
+        let second: Value = serde_json::from_str(&second.content).unwrap();
+        assert_eq!(second["route"]["flow_name"], "updated");
+
+        let asts = host.asts.lock().unwrap();
+        assert_eq!(asts.len(), 2);
+        assert_eq!(asts[0]["name"], "first");
+        assert_eq!(asts[1]["name"], "updated");
+    }
+
+    /// A path is an alternative address, never a second ambiguous selector. The exact-one rule is
+    /// checked before filesystem IO so malformed model output cannot accidentally run a name.
+    #[tokio::test]
+    async fn flow_run_requires_exactly_one_of_name_or_path() {
+        let (_temp, system) = fixture();
+        let host = Arc::new(CapturingLoopHost::default());
+        let ctx = flow_run_context(system, host);
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"name": "saved", "path": "examples/saved.flux"}),
+        ] {
+            let error = FlowRunTool
+                .execute(&ctx, input)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("exactly one of `name` or `path`"), "{error}");
+        }
+    }
+
+    /// The path resolver is the guarded `System`, not ambient `std::fs`; a lexical escape never
+    /// reaches the loop host even when the target exists.
+    #[tokio::test]
+    async fn flow_run_path_cannot_escape_the_workspace() {
+        let (temp, system) = fixture();
+        std::fs::write(
+            temp.path().join("outside.flux"),
+            "flow outside\n  return null\n",
+        )
+        .unwrap();
+        let host = Arc::new(CapturingLoopHost::default());
+        let ctx = flow_run_context(system, host.clone());
+        let error = FlowRunTool
+            .execute(&ctx, serde_json::json!({"path": "../outside.flux"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escapes the workspace root"), "{error}");
+        assert!(host.asts.lock().unwrap().is_empty());
     }
 }
