@@ -21,6 +21,7 @@
 //! Before C-453 only the first was reachable here — see [`ApprovalGate`].
 
 mod a2a;
+pub mod public_docs;
 mod resource;
 pub mod system;
 

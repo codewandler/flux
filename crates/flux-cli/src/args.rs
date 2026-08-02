@@ -606,6 +606,17 @@ pub(super) enum Commands {
         #[arg(long)]
         unreleased: bool,
     },
+    /// Serve this binary's embedded documentation and Flux-Lang workbench. Loopback listeners add
+    /// guarded scratch execution and editor support; public listeners remain effect-free.
+    Docs {
+        /// Listener address. Non-loopback binds do not construct or mount execution/LSP services.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8788")]
+        bind: std::net::SocketAddr,
+        /// Model used lazily by model-backed runnable examples. Uses normal Flux configuration
+        /// and defaults when omitted.
+        #[arg(short = 'm', long, value_name = "PROVIDER/MODEL")]
+        model: Option<String>,
+    },
     /// Print a shell completion script to stdout (defaults to fish).
     Completion {
         /// Shell to generate for (defaults to fish). An unknown shell is a usage error (exit 2),

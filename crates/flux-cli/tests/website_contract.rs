@@ -91,7 +91,8 @@ fn fenced_blocks(markdown: &str, language: &str) -> Vec<String> {
             continue;
         }
         let ticks = rest.bytes().take_while(|byte| *byte == b'`').count();
-        if ticks >= 3 && rest[ticks..].trim() == language {
+        let info = rest[ticks..].trim();
+        if ticks >= 3 && info.split_whitespace().next() == Some(language) {
             open = Some((indent, ticks, Vec::new()));
         }
     }

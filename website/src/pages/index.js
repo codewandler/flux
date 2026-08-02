@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {useEffect, useState} from 'react';
 import Layout from '@theme/Layout';
 import Link from '@docusaurus/Link';
 import CodeBlock from '@theme/CodeBlock';
@@ -17,6 +17,83 @@ const HERO_FLOW = `flow triage-failures -> String
   diagnosis = ai.reason(ask: "Likely cause?", ctx: pack)
   return diagnosis
 `;
+
+const HERO_STEPS = [
+  {kind: 'inspect', label: 'git_status()', detail: 'read workspace state'},
+  {kind: 'verify', label: 'cargo_test()', detail: 'run through guarded IO'},
+  {kind: 'scope', label: 'ctx pack', detail: 'freeze the evidence slice'},
+  {kind: 'reason', label: 'ai.reason()', detail: 'typed model stage'},
+  {kind: 'return', label: 'return diagnosis', detail: 'publish the result'},
+];
+
+function VersionBadge() {
+  const [version, setVersion] = useState(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch('/version', {signal: controller.signal})
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((body) => setVersion(body.version))
+      .catch(() => {});
+    return () => controller.abort();
+  }, []);
+  return version ? <span className="served-version">flux v{version} · served locally</span> : null;
+}
+
+function HeroDebugger() {
+  const [cursor, setCursor] = useState(-1);
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    if (!playing) return undefined;
+    const timer = window.setInterval(() => {
+      setCursor((current) => {
+        if (current >= HERO_STEPS.length - 1) {
+          setPlaying(false);
+          return current;
+        }
+        return current + 1;
+      });
+    }, 900);
+    return () => window.clearInterval(timer);
+  }, [playing]);
+
+  const move = (next) => {
+    setPlaying(false);
+    setCursor(Math.max(-1, Math.min(next, HERO_STEPS.length - 1)));
+  };
+  const toggle = () => {
+    if (!playing && cursor >= HERO_STEPS.length - 1) setCursor(-1);
+    setPlaying((value) => !value);
+  };
+
+  return (
+    <div className="hero-debugger">
+      <div className="hero-code-toolbar">
+        <span>structural trace</span>
+        <div className="hero-debug-controls" role="group" aria-label="Flux debugger preview controls">
+          <button type="button" onClick={() => move(-1)} aria-label="Rewind" title="Rewind">&lt;&lt;</button>
+          <button type="button" onClick={toggle} aria-label={playing ? 'Pause' : 'Play'} title={playing ? 'Pause' : 'Play'}>
+            {playing ? 'Ⅱ' : '▶'}
+          </button>
+          <button type="button" onClick={() => move(HERO_STEPS.length - 1)} aria-label="Jump to end" title="Jump to end">&gt;&gt;</button>
+        </div>
+      </div>
+      <CodeBlock language="flux" title="triage.flux">
+        {HERO_FLOW}
+      </CodeBlock>
+      <div className="hero-trace" aria-live="polite">
+        {HERO_STEPS.map((step, index) => (
+          <div
+            className={`hero-trace-node${index === cursor ? ' is-active' : ''}${index < cursor ? ' is-done' : ''}`}
+            key={step.label}>
+            <span>{String(index + 1).padStart(2, '0')}</span>
+            <div><strong>{step.label}</strong><small>{step.detail}</small></div>
+          </div>
+        ))}
+      </div>
+      <p className="hero-trace-note">Preview only — no operation runs from this page.</p>
+    </div>
+  );
+}
 
 function Card({title, children, to}) {
   return (
@@ -37,6 +114,7 @@ export default function Home() {
           <div className="container home-hero-inner">
             <div>
               <p className="eyebrow">deterministic agent platform</p>
+              <VersionBadge />
               {/*
                 The wordmark is the brand lockup from assets/flux-logo.svg, shipped as two
                 explicit files rather than one prefers-color-scheme SVG: the source asset keys
@@ -65,12 +143,13 @@ export default function Home() {
                 <Link className="button button--secondary button--lg" to="/docs/language/overview">
                   Explore Flux-Lang
                 </Link>
+                <Link className="button button--secondary button--lg" to="/console/">
+                  Open the playground
+                </Link>
               </div>
             </div>
             <div className="hero-code">
-              <CodeBlock language="flux" title="triage.flux">
-                {HERO_FLOW}
-              </CodeBlock>
+              <HeroDebugger />
             </div>
           </div>
         </section>

@@ -1,0 +1,32 @@
+.openButton { margin: .35rem 0 1.25rem; border: 1px solid var(--ifm-color-emphasis-300); border-radius: 999px; background: var(--ifm-background-surface-color); color: var(--ifm-color-primary); padding: .45rem .8rem; font-weight: 700; cursor: pointer; }
+.workbench { margin: .6rem 0 1.5rem; border: 1px solid var(--ifm-color-emphasis-300); border-radius: 14px; overflow: hidden; background: var(--ifm-background-surface-color); box-shadow: 0 12px 30px rgba(24, 32, 54, .09); }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .7rem .9rem; border-bottom: 1px solid var(--ifm-color-emphasis-200); }
+.header > div:first-child { display: flex; flex-direction: column; }
+.header span { font-size: .72rem; color: var(--ifm-color-emphasis-600); text-transform: uppercase; letter-spacing: .06em; }
+.actions { display: flex; gap: .4rem; }
+.actions button, .approval button { border: 1px solid var(--ifm-color-emphasis-300); border-radius: 7px; background: transparent; color: inherit; padding: .38rem .62rem; cursor: pointer; font-weight: 650; }
+.actions .runButton, .approval .runButton { color: white; border-color: #2a68ff; background: #2a68ff; }
+.fileTabs { display: flex; overflow-x: auto; border-bottom: 1px solid var(--ifm-color-emphasis-200); background: var(--ifm-color-emphasis-100); }
+.fileTabs button { border: 0; border-right: 1px solid var(--ifm-color-emphasis-200); background: transparent; color: var(--ifm-color-emphasis-700); padding: .45rem .75rem; font: 600 .76rem var(--ifm-font-family-monospace); cursor: pointer; }
+.fileTabs .activeFile { background: var(--ifm-background-surface-color); color: var(--ifm-color-primary); box-shadow: inset 0 -2px var(--ifm-color-primary); }
+.editor { height: 360px; text-align: left; }
+.loading { height: 360px; display: grid; place-items: center; color: var(--ifm-color-emphasis-600); margin-top: -360px; pointer-events: none; }
+.inputs { border-top: 1px solid var(--ifm-color-emphasis-200); padding: .55rem .85rem; }
+.inputs summary { cursor: pointer; font-weight: 650; }
+.inputs textarea { width: 100%; min-height: 78px; margin-top: .5rem; font-family: var(--ifm-font-family-monospace); }
+.appInput { display: flex; gap: .45rem; padding: .65rem .85rem; border-top: 1px solid var(--ifm-color-emphasis-200); }
+.appInput input { flex: 1; min-width: 0; border: 1px solid var(--ifm-color-emphasis-300); border-radius: 7px; padding: .5rem .6rem; background: var(--ifm-background-surface-color); color: inherit; }
+.appInput button { border: 0; border-radius: 7px; padding: .45rem .75rem; color: white; background: #2a68ff; font-weight: 700; }
+.posture, .risk { margin: 0; padding: .65rem .85rem; border-top: 1px solid var(--ifm-color-emphasis-200); color: var(--ifm-color-emphasis-700); font-size: .86rem; }
+.risk { background: color-mix(in srgb, var(--ifm-color-primary) 8%, transparent); }
+.error, .output { margin: 0; padding: .8rem; max-height: 260px; overflow: auto; white-space: pre-wrap; border-radius: 0; border-top: 1px solid var(--ifm-color-emphasis-200); }
+.error { background: color-mix(in srgb, #dc3545 10%, var(--ifm-background-surface-color)); color: var(--ifm-color-danger-dark); }
+.output { background: #0d1424; color: #d7e3ff; }
+.approval { display: flex; align-items: center; gap: .5rem; padding: .7rem .85rem; border-top: 1px solid #e3b341; background: color-mix(in srgb, #e3b341 12%, var(--ifm-background-surface-color)); }
+.approval > div { flex: 1; display: flex; flex-direction: column; }
+.approval small { overflow-wrap: anywhere; }
+.graph { border-top: 1px solid var(--ifm-color-emphasis-200); padding: .75rem .85rem; background: var(--ifm-color-emphasis-100); }
+.graphTitle { display: flex; justify-content: space-between; margin-bottom: .45rem; font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--ifm-color-emphasis-600); }
+.node { display: flex; align-items: center; gap: .7rem; padding: .38rem .55rem; margin-top: .25rem; border: 1px solid var(--ifm-color-emphasis-200); border-radius: 7px; background: var(--ifm-background-surface-color); font-family: var(--ifm-font-family-monospace); font-size: .8rem; }
+.node span { color: var(--ifm-color-emphasis-500); }
+@media (max-width: 700px) { .header { align-items: flex-start; flex-direction: column; } .editor, .loading { height: 300px; } .loading { margin-top: -300px; } }

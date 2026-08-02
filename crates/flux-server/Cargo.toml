@@ -13,15 +13,22 @@ introspect = ["flux-auth/introspect"]
 [dependencies]
 flux-core.workspace = true
 flux-a2a.workspace = true
+flux-app.workspace = true
 flux-auth.workspace = true
 flux-config.workspace = true
+flux-capabilities.workspace = true
 flux-credentials.workspace = true
 # The embedded SQLite backend is asked for explicitly: the workspace entry turns default
 # features off so flux-flow can shed the driver (C-274) — see the root Cargo.toml.
 flux-events = { workspace = true, features = ["sqlite"] }
 flux-flow.workspace = true
+flux-lang.workspace = true
+flux-lsp.workspace = true
+flux-provider.workspace = true
 flux-runtime.workspace = true
+flux-sdk.workspace = true
 flux-system.workspace = true
+flux-web.workspace = true
 axum = { workspace = true, features = ["ws"] }
 axum-server.workspace = true
 # C-189: request TimeoutLayer that returns a real `408` (tower's own timeout surfaces an error we
@@ -43,6 +50,8 @@ rustls = "0.23"
 webpki-roots = "1"
 sha2.workspace = true
 base64.workspace = true
+zip.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

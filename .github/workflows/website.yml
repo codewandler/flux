@@ -39,8 +39,9 @@ jobs:
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
       - run: npm ci
         working-directory: website
-      - run: npm run build
-        working-directory: website
+      # Builds the ordinary deployable site and proves the compressed snapshot linked into the
+      # distributed CLI came from exactly the same source. A website edit cannot ship only to one.
+      - run: scripts/build-embedded-docs.sh --check
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         # The published site tracks `main`, not the latest release tag. This reverses the earlier
         # policy on purpose: docs that describe an unreleased change are a smaller problem than docs

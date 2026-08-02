@@ -26,6 +26,18 @@ use crate::hover::hover_at;
 use crate::scope::{self, Symbol};
 use crate::semantic;
 
+/// Controls who selects the workspace root scanned for authored composite operations.
+///
+/// Editor processes use [`ClientProvided`](WorkspacePolicy::ClientProvided). Embedded transports
+/// such as the documentation workbench must use [`Fixed`](WorkspacePolicy::Fixed), so an
+/// untrusted `initialize.rootUri` cannot make the language server inspect arbitrary host paths.
+#[derive(Clone, Debug, Default)]
+pub enum WorkspacePolicy {
+    #[default]
+    ClientProvided,
+    Fixed(Option<PathBuf>),
+}
+
 /// Precomputed, owned completion/hover catalogs + the open-document store.
 pub struct Backend {
     client: Client,
@@ -45,10 +57,16 @@ pub struct Backend {
     /// The last semantic-token stream per document, for `full/delta`.
     tokens: RwLock<HashMap<Url, (String, Vec<SemanticToken>)>>,
     next_result_id: AtomicU64,
+    workspace_policy: WorkspacePolicy,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
+        Self::with_workspace_policy(client, WorkspacePolicy::ClientProvided)
+    }
+
+    /// Construct a backend whose workspace root follows `workspace_policy`.
+    pub fn with_workspace_policy(client: Client, workspace_policy: WorkspacePolicy) -> Self {
         // Build the op catalog once at startup and keep the owned signatures.
         let registry = Arc::new(catalog::authoring_registry());
         let ops = flux_flow::registry::OpRegistry::new(registry.as_ref()).signatures();
@@ -63,6 +81,7 @@ impl Backend {
             workspace_ops: RwLock::new(Vec::new()),
             tokens: RwLock::new(HashMap::new()),
             next_result_id: AtomicU64::new(0),
+            workspace_policy,
         }
     }
 
@@ -191,7 +210,10 @@ pub fn capabilities() -> ServerCapabilities {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        *self.root.write().await = root_from(&params);
+        *self.root.write().await = match &self.workspace_policy {
+            WorkspacePolicy::ClientProvided => root_from(&params),
+            WorkspacePolicy::Fixed(root) => root.clone(),
+        };
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "flux-lsp".into(),

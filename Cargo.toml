@@ -84,6 +84,7 @@ flux-agent = { package = "codewandler-flux-agent", version = "0.51.1", path = "c
 flux-skill = { package = "codewandler-flux-skill", version = "0.51.1", path = "crates/flux-skill" }
 flux-orchestrate = { package = "codewandler-flux-orchestrate", version = "0.51.1", path = "crates/flux-orchestrate" }
 flux-lang = { package = "codewandler-flux-lang", version = "0.51.1", path = "crates/flux-lang" }
+flux-lsp = { version = "0.51.1", path = "crates/flux-lsp" }
 flux-flow = { package = "codewandler-flux-flow", version = "0.51.1", path = "crates/flux-flow" }
 flux-eval = { path = "crates/flux-eval" }
 flux-plugin = { package = "codewandler-flux-plugin", version = "0.51.1", path = "crates/flux-plugin", default-features = false, features = ["host", "hooks", "pack"] }

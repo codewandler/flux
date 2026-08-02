@@ -171,6 +171,80 @@ pub struct Workspace {
     unconfined: bool,
 }
 
+/// An owned, process-local workspace for untrusted ephemeral projects.
+///
+/// Creation and recursive cleanup live in `flux-system`, keeping documentation servers and other
+/// surfaces from growing a second raw-filesystem path. The directory is private on Unix and drop
+/// only removes a direct `flux-scratch-*` child of the base captured at allocation time.
+#[derive(Debug)]
+pub struct ScratchWorkspace {
+    root: PathBuf,
+    base: PathBuf,
+    system: System,
+}
+
+impl ScratchWorkspace {
+    /// Allocate a fresh scratch workspace beneath the operating system's temporary directory.
+    pub fn new() -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join("flux-scratch");
+        std::fs::create_dir_all(&base)
+            .map_err(|error| Error::Config(format!("scratch base {}: {error}", base.display())))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let base = base
+            .canonicalize()
+            .map_err(|error| Error::Config(format!("scratch base: {error}")))?;
+        let root = base.join(format!(
+            "flux-scratch-{}-{}",
+            std::process::id(),
+            NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).map_err(|error| {
+            Error::Config(format!("scratch workspace {}: {error}", root.display()))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let root = root
+            .canonicalize()
+            .map_err(|error| Error::Config(format!("scratch workspace: {error}")))?;
+        let system = System::new(Workspace::new(&root)?);
+        Ok(Self { root, base, system })
+    }
+
+    /// Guarded IO rooted at this scratch directory.
+    pub fn system(&self) -> &System {
+        &self.system
+    }
+
+    /// Physical root for trusted transport wiring such as a fixed-root language server.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for ScratchWorkspace {
+    fn drop(&mut self) {
+        let owned = self.root.parent() == Some(self.base.as_path())
+            && self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("flux-scratch-"));
+        if owned {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
 impl Workspace {
     /// Create a workspace rooted at `root` (canonicalized; must exist).
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
@@ -2729,6 +2803,32 @@ mod tests {
         let dir = sandbox::fixture_dir("sys-test");
         let ws = Workspace::new(&dir).unwrap();
         (dir, System::new(ws))
+    }
+
+    #[tokio::test]
+    async fn scratch_workspace_owns_guarded_io_and_cleans_up_on_drop() {
+        let scratch = ScratchWorkspace::new().unwrap();
+        let root = scratch.root().to_path_buf();
+        scratch
+            .system()
+            .write_file("nested/demo.flux", "flow demo\n  return ()\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            scratch
+                .system()
+                .read_file("nested/demo.flux")
+                .await
+                .unwrap(),
+            "flow demo\n  return ()\n"
+        );
+        assert!(scratch
+            .system()
+            .write_file("../escape", "no")
+            .await
+            .is_err());
+        drop(scratch);
+        assert!(!root.exists());
     }
 
     /// C-209: a transient `TMPDIR` must never capture another test's fixture root.

@@ -17,7 +17,7 @@ be the runtime for steps your application must perform.**
 
 Create `assistant.flux` beside `brief.flux`:
 
-```flux
+```flux runnable="first-app-a" title="First app · Part A"
 agent guide
   tools [search]
   datasources [handbook]
@@ -81,7 +81,7 @@ Press **Ctrl-C** to stop the app.
 
 Replace `assistant.flux` with this version:
 
-```flux
+```flux runnable="first-app-b" title="First app · Part B"
 permissions
   allow [search, "ai.reason", send]
   deny [write, edit, bash]

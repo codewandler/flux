@@ -625,6 +625,45 @@ impl FlowClient {
         finish_outcome(outcome, sink, recorded_usage(&executor.evidence()))
     }
 
+    /// Execute with seeded inputs while forwarding live tool/text events to `sink`.
+    ///
+    /// This combines [`execute_with`](Self::execute_with)'s fresh per-invocation store with
+    /// [`execute_with_sink`](Self::execute_with_sink)'s observable dispatch stream. Inputs remain
+    /// data rather than capabilities, and every operation still traverses `Executor::dispatch`.
+    pub async fn execute_with_seeded_sink(
+        &self,
+        ast: &DraftAst,
+        inputs: serde_json::Map<String, Value>,
+        sink: &mut dyn AgentSink,
+    ) -> Result<ExecutionResult> {
+        let store = FlowStore::in_memory()?;
+        for (name, value) in &inputs {
+            store
+                .seed(&self.session_id, &SymbolName(name.clone()), value)
+                .map_err(|error| Error::Other(error.to_string()))?;
+        }
+        let executor = self.build_executor();
+        let mut tee = TeeSink {
+            consumer: sink,
+            collect: Collector::default(),
+        };
+        let outcome = execute_kernel(
+            &store,
+            &executor,
+            &self.session_id,
+            ExecutionProgram::Flow(ast),
+            &self.composites,
+            &mut tee,
+        )
+        .await?;
+        let names = std::mem::take(&mut tee.collect.0.tool_calls);
+        finish_outcome(
+            outcome,
+            ExecSink { tool_calls: names },
+            recorded_usage(&executor.evidence()),
+        )
+    }
+
     /// Execute `ast` while **streaming** every dispatch to your own [`AgentSink`] as it happens — each
     /// op's `tool_call` **and** `tool_result`, text, and observations — and still returning the
     /// collected [`ExecutionResult`]. The observable counterpart of [`execute`](Self::execute), whose
@@ -1557,6 +1596,38 @@ mod tests {
             seeded_out.result, lit_out.result,
             "a seeded $input must reach the op exactly like a literal-bound one"
         );
+    }
+
+    #[tokio::test]
+    async fn seeded_sink_streams_the_same_guarded_dispatch_it_returns() {
+        #[derive(Default)]
+        struct Calls(Vec<String>);
+        impl AgentSink for Calls {
+            fn tool_call(&mut self, name: &str, _input: &Value) {
+                self.0.push(name.to_string());
+            }
+        }
+
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("seeded-sink"))
+            .unwrap();
+        client.register_op(Arc::new(EchoArgsTool));
+        let ast: DraftAst = serde_json::from_value(json!({
+            "body": [{"kind": "return", "value": {
+                "kind": "call", "op": "echo_args",
+                "args": [{"kind": "var", "name": "input"}]
+            }}]
+        }))
+        .unwrap();
+        let mut sink = Calls::default();
+        let result = client
+            .execute_with_seeded_sink(&ast, one_input("input", json!("live")), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(sink.0, vec!["echo_args"]);
+        assert_eq!(result.tool_calls, sink.0);
+        assert!(result.result.contains("live"));
     }
 
     /// A consumer-injected approver (`FlowClientBuilder::approver`) — not the `auto_approve`

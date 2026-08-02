@@ -39,4 +39,21 @@ pub mod semantic;
 pub mod server;
 pub mod symbols;
 
-pub use server::{capabilities, Backend};
+pub use server::{capabilities, Backend, WorkspacePolicy};
+
+/// Serve the standard Content-Length-framed LSP protocol over arbitrary asynchronous IO.
+///
+/// Stdio and the documentation WebSocket bridge deliberately share this bootstrap; only their
+/// workspace policy differs.
+pub async fn serve_io<I, O>(input: I, output: O, workspace_policy: WorkspacePolicy)
+where
+    I: tokio::io::AsyncRead + Unpin,
+    O: tokio::io::AsyncWrite + Unpin,
+{
+    let (service, socket) = tower_lsp::LspService::new(move |client| {
+        Backend::with_workspace_policy(client, workspace_policy.clone())
+    });
+    tower_lsp::Server::new(input, output, socket)
+        .serve(service)
+        .await;
+}

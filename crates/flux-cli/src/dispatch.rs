@@ -176,6 +176,7 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Catalog { .. }
         | Commands::Skill { .. }
         | Commands::Changelog { .. }
+        | Commands::Docs { .. }
         | Commands::Completion { .. }
         | Commands::Doctor { .. } => None,
     }
@@ -800,6 +801,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 all,
                 unreleased,
             }) => changelog::run(version.as_deref(), all, unreleased),
+            Some(Commands::Docs { bind, model }) => run_docs(bind, model).await,
             Some(Commands::Preset { args }) => preset::run_preset(&args).await,
             Some(Commands::Doctor { json }) => run_doctor(json).await,
             Some(Commands::System { action }) => run_system(action).await,

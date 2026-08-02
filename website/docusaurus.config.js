@@ -130,6 +130,11 @@ const config = {
           position: 'left',
         },
         {
+          to: '/console/',
+          label: 'Playground',
+          position: 'left',
+        },
+        {
           to: '/docs/whats-new',
           label: "What's new",
           position: 'left',

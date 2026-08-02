@@ -21,6 +21,7 @@ mod app_cmd;
 mod args;
 mod auth_cmd;
 mod dispatch;
+mod docs_cmd;
 mod doctor;
 mod execution;
 mod export_cmd;
@@ -43,6 +44,7 @@ use args::*;
 use auth_cmd::*;
 use catalog_cmd::*;
 use dispatch::*;
+use docs_cmd::*;
 use doctor::*;
 use execution::*;
 use export_cmd::*;
@@ -4136,6 +4138,7 @@ mod tests {
             "auth",
             "plugin",
             "skill",
+            "docs",
             "completion",
             "preset",
         ] {
@@ -4427,6 +4430,8 @@ mod tests {
         ok(&["flux", "plugin", "install", "gitlab", "slack@1.2.0"]);
         ok(&["flux", "plugin", "install", "--all"]);
         ok(&["flux", "skill", "--install", "--global"]);
+        ok(&["flux", "docs", "--bind", "0.0.0.0:8788"]);
+        ok(&["flux", "docs", "--model", "mock"]);
         ok(&["flux", "replay", "--turn", "1"]);
         ok(&["flux", "eval", "terminal-bench"]);
         ok(&["flux", "eval", "multi", "--members", "synthetic,mock"]);

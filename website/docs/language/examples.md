@@ -14,7 +14,7 @@ illustrative case studies; their current blockers are stated where they appear.
 
 One read, one budgeted context pack, one model call:
 
-```flux
+```flux runnable="summarize-readme" title="Read and summarize"
 flow summarize-readme
   src = read("README.md")
   ctx brief
@@ -29,7 +29,7 @@ flow summarize-readme
 
 Pure field access and formatting — no shell, no approval pauses:
 
-```flux
+```flux runnable="latest-release" title="Fetch, extract, format"
 flow latest-release
   raw = web.fetch("https://api.github.com/repos/codewandler/flux/releases/latest")
   tag = raw.tag_name
@@ -41,7 +41,7 @@ flow latest-release
 
 A selector picks among declared branches; the case set is fixed before anything runs:
 
-```flux
+```flux title="Bounded routing — check only"
 flow route-ticket(ticket: String)
   route classify(ticket)
     case "bug"
@@ -59,7 +59,7 @@ flow route-ticket(ticket: String)
 Cache first, then the network with backoff — the first branch that succeeds with a non-empty
 result wins:
 
-```flux
+```flux runnable="cached-page" title="Resilient fetch"
 flow cached-page(url: String)
   fallback -> page
     branch
@@ -75,7 +75,7 @@ flow cached-page(url: String)
 
 Independent reads run concurrently; one model call sees a budgeted pack of all three results:
 
-```flux
+```flux title="Repository survey — check only"
 flow repo-survey
   parallel
     branch readme
@@ -97,7 +97,7 @@ flow repo-survey
 A time-bounded loop with an early-exit guard — `path_exists` returns `"true"`/`"false"`, which
 plugs straight into truthiness:
 
-```flux
+```flux runnable="wait-for-artifact" title="Poll until done"
 flow wait-for-artifact
   loop for 1m, every: 2s, until: found -> found
     found = path_exists("target/release/flux")
@@ -109,7 +109,7 @@ flow wait-for-artifact
 
 `-> flat` concatenates per-iteration lists into one:
 
-```flux
+```flux runnable="rust-files" title="Walk directories"
 flow rust-files(dirs: List<String>)
   each dir in dirs -> flat files
     glob(path: dir, pattern: "*.rs")
@@ -126,7 +126,7 @@ runnable verbatim: `adapter: "local"` is a narrative placeholder rather than a s
 and the production flows include additional protected-path and audit steps omitted here. Use the
 checked-in flows linked below when running an improvement round.
 
-```flux
+```flux title="Improvement loop — illustrative"
 flow improve -> EvalReport
   baseline = eval_run(adapter: "local", dir: "suites", trials: 3)
   sessions = eval_sessions(baseline)

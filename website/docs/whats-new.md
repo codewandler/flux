@@ -24,6 +24,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   it against the operations currently available in the session. Its result identifies the exact
   file and flow that ran, plus the input names supplied.
 
+- **Edit and run the examples inside your local docs.** Run `flux docs` to open the exact public
+  documentation shipped with your installed version. Flux code blocks and `/console/` now share a
+  syntax-aware editor with live diagnostics, completion, hover, formatting, graph checks, inputs,
+  output, cancellation, and approval prompts. Declared cookbook examples run in disposable scratch
+  projects, and both first-app tutorial versions stay alive across browser messages. A public
+  `--bind` remains documentation-only; the hosted site remains an editor with no execution backend.
+
 ### Improved
 
 - **It is now clear what Docker, Kubernetes, and microVM support means.** A new execution-placement

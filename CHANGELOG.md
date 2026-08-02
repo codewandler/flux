@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Documentation examples are now real local workbenches** (L-128). Flux code blocks and
+  `/console/` share a lazy Monaco editor backed by the shipped Flux LSP for diagnostics,
+  completion, hover, formatting, and semantic syntax. Declared examples on the language cookbook
+  run through fingerprint-bound approvals in retained scratch workspaces, and both first-app
+  tutorial variants run as persistent browser app sessions. `flux docs --model <spec>` resolves
+  model-backed operations lazily; non-loopback binds construct and mount no runtime, scratch,
+  approval, or LSP surface.
+
 - **Project-adaptive multi-agent review example (L-129).** `examples/review.flux` classifies the
   guarded workspace inventory and recent Git history, derives exactly four structured review
   dimensions from only that classification, fans out to four read-only reviewer roles, joins their
@@ -18,6 +26,14 @@ All notable changes to this project are documented in this file. The format is b
   `examples/review.flux` are reachable without moving them into `.flux/flows`. Path source is reread
   per invocation and lowered against the live operation catalog; results include a route receipt
   with the resolved path, flow name, and seeded input keys.
+
+- **The distributed CLI now serves its release-matched public documentation and a Flux-Lang
+  playground** (L-127). `flux docs` exposes the embedded Docusaurus build at `/flux/`, reports the
+  serving binary at `/version`, and mounts an editable `/console/` over L-126's real source-to-editor
+  projection. The structural debugger provides rewind, previous, play/pause, next, and jump-to-end
+  controls plus a graph visualization; it has no operation host and cannot execute effects. The
+  homepage code sample uses the same explicitly-preview-only playback vocabulary, and website CI
+  byte-checks the deterministic embedded bundle.
 
 - **Hosts can project authored Flux into a versioned visual-editor graph and correlate execution
   back to exact graph nodes** (L-126). The pure language contract round-trips calls, conditions,

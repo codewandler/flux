@@ -39,6 +39,21 @@ impl Harness {
         }
     }
 
+    fn start_fixed(root: std::path::PathBuf) -> Self {
+        let (client_writes, server_reads) = tokio::io::duplex(64 * 1024);
+        let (server_writes, client_reads) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(flux_lsp::serve_io(
+            server_reads,
+            server_writes,
+            flux_lsp::WorkspacePolicy::Fixed(Some(root)),
+        ));
+        Harness {
+            writer: client_writes,
+            reader: BufReader::new(client_reads),
+            next_id: 0,
+        }
+    }
+
     async fn send(&mut self, message: Value) {
         let body = serde_json::to_string(&message).expect("serializable");
         let frame = format!("Content-Length: {}\r\n\r\n{body}", body.len());
@@ -113,6 +128,51 @@ impl Harness {
         .await;
         capabilities
     }
+}
+
+#[tokio::test]
+async fn fixed_workspace_ignores_a_browser_supplied_root() {
+    let fixed = tempfile::tempdir().unwrap();
+    let hostile = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(hostile.path().join(".flux/flows")).unwrap();
+    std::fs::write(
+        hostile.path().join(".flux/flows/host-only.flux"),
+        "op host_only() -> String\n  description \"host only\"\n  risk \"low\"\n  idempotency \"idempotent\"\n  return \"secret\"\n",
+    )
+    .unwrap();
+
+    let mut lsp = Harness::start_fixed(fixed.path().to_path_buf());
+    let hostile_uri = tower_lsp::lsp_types::Url::from_directory_path(hostile.path())
+        .unwrap()
+        .to_string();
+    let response = lsp
+        .request(
+            "initialize",
+            json!({"capabilities": {}, "rootUri": hostile_uri}),
+        )
+        .await;
+    assert_answered("initialize", &response);
+    lsp.notify("initialized", json!({})).await;
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": URI, "languageId": "flux", "version": 1,
+            "text": "flow demo -> String\n  return host_only()\n"
+        }}),
+    )
+    .await;
+
+    let completion = lsp
+        .request(
+            "textDocument/completion",
+            json!({"textDocument": doc(), "position": position(1, 18)}),
+        )
+        .await;
+    let body = serde_json::to_string(&completion["result"]).unwrap();
+    assert!(
+        !body.contains("host_only"),
+        "host root leaked into catalog: {body}"
+    );
 }
 
 fn position(line: u32, character: u32) -> Value {

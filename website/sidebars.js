@@ -115,6 +115,7 @@ const sidebars = {
       items: [
         'language/overview',
         'language/tour',
+        'language/playground',
         {
           type: 'category',
           label: 'Guide',

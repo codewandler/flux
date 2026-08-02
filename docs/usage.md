@@ -286,6 +286,11 @@ flux skill [cli|lang|plugin|ops] # print a generated Claude-format skill's SKILL
 flux changelog                   # show what changed in flux, in plain language (the customer changelog);
                                  #   [<version>] one section, --all every release, --unreleased the
                                  #   not-yet-released (development) section
+flux docs                        # serve this binary's release-matched public documentation and the
+                                 #   Flux-Lang workbench on 127.0.0.1:8788. Declared examples run in
+                                 #   guarded scratch projects with browser approvals; -m/--model
+                                 #   selects their lazy model. A non-loopback --bind disables
+                                 #   execution, scratch sessions, approvals, and LSP entirely
 flux completion [shell]          # print a shell completion script to stdout (defaults to fish); an
                                  #   unknown shell is a usage error (exit 2)
 flux doctor                      # diagnose a flux install end-to-end (C-128): provider credentials
