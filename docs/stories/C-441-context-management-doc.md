@@ -115,3 +115,14 @@ the knob is the fix; a second copy of the knob is not.
   cancellation/empty-summary silent no-ops. Both are real (`engine.rs:1671`, `1686`, `1699`) but are
   internals a user cannot act on; the one user-visible consequence — `/compact` reporting success after
   a no-op — *is* documented. See ADJACENT in the handoff.
+- **Six adjacent findings were reported; the four that are defects are now filed** and were deliberately
+  left unfixed here, because C-441 was a documentation story:
+  [C-465](C-465-compact-claims-success-on-five-no-ops.md) (`/compact` prints "context compacted" for five
+  distinct no-ops, including compaction-disabled and user-cancelled),
+  [C-466](C-466-compact-threshold-default-drifts.md) (the CLI hard-codes the default twice more, so this
+  story's new pin verifies the constant against the page while the CLI can drift from both — plus the
+  served path silently ignores a malformed `FLUX_COMPACT_CHARS` where the CLI warns),
+  [C-469](C-469-tokencounter-has-no-production-implementor.md) (`TokenCounter` has no production
+  implementor, which is *why* C-462 lacks the evidence it asks for), and
+  [C-468](C-468-plugin-host-test-hard-fails-under-tmpfs-pressure.md) (unrelated area, found in the same
+  gate run).
