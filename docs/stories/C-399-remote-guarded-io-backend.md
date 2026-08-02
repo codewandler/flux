@@ -58,9 +58,10 @@ remote backend (`port::UNSERVED` remains only the canonical display spelling), a
 `run_with_stdin`/`spawn_background` build their denials through `deny()` instead of hand-writing the
 same prefix — two literals that had already drifted out of the one-spelling rule.
 
-**The reviewed cost was paid**, as the ownership decision said it would be: three entries in
+**The reviewed cost was paid**, as the ownership decision said it would be: four entries in
 `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` allow-list, with the review
-rationale recorded beside them.
+rationale recorded beside them. C-467 also repaired the gate's pre-existing omission of
+`GuardedWorkspaceFiles` and pinned its trait census against `port.rs`.
 
 ### Not done, and why
 
@@ -68,10 +69,6 @@ rationale recorded beside them.
   modes fail the credential closed as `None` — right for the caller, useless for the operator.
   `RemoteSystem::env_checked` is the inherent escape hatch that keeps them apart; widening the
   `GuardedEnv` trait was not this story's to do.
-- **`GuardedWorkspaceFiles` is still outside the gate's enumeration** (`port.rs` documents this
-  gap). So `remote.rs`'s *fourth* impl — `GuardedWorkspaceFiles for RemoteSystem` — needed no
-  allowance and would have landed unremarked. Closing that is still the two lines `port.rs` names,
-  and is now one impl more worth closing than it was.
 - **No network delegation.** There is no guarded-network port trait yet (C-435), so egress is absent
   from `Delegate` rather than approximated in it.
 

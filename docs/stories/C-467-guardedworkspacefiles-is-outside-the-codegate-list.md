@@ -2,7 +2,7 @@
 id: C-467
 title: "`GuardedWorkspaceFiles` implementors are invisible to the guarded-IO backend guard"
 pillar: Core
-status: ready
+status: done
 priority: 2
 areas: [flux-codegate, flux-system]
 note: "the C-269 guard enumerates three of the four port traits; a new workspace-file backend claiming workspace confinement lands with no gate remarking on it. Surfaced while reviewing C-399, but true on main independently of it"
@@ -50,17 +50,17 @@ C-399.
 
 ## Acceptance
 
-- [ ] A failing-first test: a fixture implementing `GuardedWorkspaceFiles` for an unallowed type is
+- [x] A failing-first test: a fixture implementing `GuardedWorkspaceFiles` for an unallowed type is
       **rejected** by the guard. It must pass (i.e. fail to be rejected) at the merge base.
-- [ ] `GuardedWorkspaceFiles` is in `GUARDED_PORT_TRAITS`, and every existing production implementor is
+- [x] `GuardedWorkspaceFiles` is in `GUARDED_PORT_TRAITS`, and every existing production implementor is
       allowed by name — added deliberately, one at a time, not by widening the allowance shape.
-- [ ] The alias-resistance the guard already has for the other three (a renamed import cannot mint a
+- [x] The alias-resistance the guard already has for the other three (a renamed import cannot mint a
       fresh unreviewed identity — see `spelled_as` at `lib.rs:1073`) covers this trait too, verified by
       a test that renames it on import.
-- [ ] ⚠ Check whether a **fifth** port trait exists that is also outside the list. This story is worth
+- [x] ⚠ Check whether a **fifth** port trait exists that is also outside the list. This story is worth
       doing once; enumerate `crates/flux-system/src/port.rs` rather than fixing only the one that was
       reported.
-- [ ] `cargo test -p flux-codegate` green, and the workspace gate green — adding a trait to this list
+- [x] `cargo test -p flux-codegate` green, and the workspace gate green — adding a trait to this list
       can legitimately flag pre-existing implementors, and each one needs a decision, not a blanket
       allowance.
 
@@ -74,3 +74,14 @@ C-399.
   present in `GUARDED_PORT_TRAITS` is the next best thing, and is the part that keeps this from
   recurring.
 - Filed 2026-08-02 during the C-399 review.
+
+## Outcome
+
+The scanner now recognizes all four public `Guarded*` traits declared in `port.rs`, including renamed
+imports. `System` and C-399's `RemoteSystem` each pay a distinct, single-use
+`GuardedWorkspaceFiles` allowance. A census test parses `port.rs` and compares its public guarded
+traits with `GUARDED_PORT_TRAITS`, so adding a fifth trait without extending the guard fails the gate.
+
+Failing-first proof: before `GuardedWorkspaceFiles` entered the list,
+`port_impl_scanner_rejects_an_unreviewed_workspace_backend` saw zero hits for its `Rogue` fixture;
+after the fix it sees the backend and its canonical trait name.

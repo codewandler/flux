@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Every guarded-IO port backend is now review-enumerated** (C-467). The codegate previously
+  recognized process, host-file and environment backends but silently ignored
+  `GuardedWorkspaceFiles`, the trait that claims workspace confinement. It now rejects an
+  unreviewed workspace backend, resolves renamed imports to the canonical trait, and compares its
+  guarded-trait list with `flux-system`'s declarations so a fifth port cannot recreate the gap.
+
 - **The SDK autonomous posture now carries fail-closed confinement and a finite delegated-tree
   budget** (C-444, C-470). `ClientBuilder` and `FlowClientBuilder` resolve blanket
   `auto_approve(true)` and every injected opaque `Approver` to sandbox `Require` with the sandbox

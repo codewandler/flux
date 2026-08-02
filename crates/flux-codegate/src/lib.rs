@@ -1059,7 +1059,12 @@ pub fn raw_project_metadata_io(src: &str) -> syn::Result<Vec<RawProjectMetadataI
 /// The `flux_system::port` traits whose implementations *are* a guarded IO backend. Implementing one
 /// is a claim to enforce the process/filesystem guarantees `System` enforces, so the set of
 /// implementors has to stay as enumerable as the set of raw `Command` constructions.
-const GUARDED_PORT_TRAITS: &[&str] = &["GuardedProcess", "GuardedHostFiles", "GuardedEnv"];
+const GUARDED_PORT_TRAITS: &[&str] = &[
+    "GuardedEnv",
+    "GuardedProcess",
+    "GuardedHostFiles",
+    "GuardedWorkspaceFiles",
+];
 
 /// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3361,6 +3366,55 @@ impl GuardedEnv for AnotherDouble {}
         assert_eq!(hits[0].spelled_as, None);
     }
 
+    /// C-467's failing-first fixture: workspace confinement is a guarded-IO backend claim too.
+    #[test]
+    fn port_impl_scanner_rejects_an_unreviewed_workspace_backend() {
+        let raw = r#"
+use flux_system::port::GuardedWorkspaceFiles;
+
+impl GuardedWorkspaceFiles for Rogue {}
+"#;
+        let hits = guarded_port_impls(raw).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "an unreviewed workspace backend escaped: {hits:?}"
+        );
+        assert_eq!(hits[0].port, "GuardedWorkspaceFiles");
+        assert_eq!(hits[0].backend, "Rogue");
+    }
+
+    /// C-467's drift pin: the scanner's hand-maintained list must equal the public guarded traits
+    /// declared by `port.rs`, so a fifth port cannot recreate this blind spot.
+    #[test]
+    fn guarded_port_trait_census_matches_port_rs() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let port_rs = crates_dir.join("flux-system/src/port.rs");
+        let source = std::fs::read_to_string(&port_rs).unwrap();
+        let file = syn::parse_file(&source).unwrap();
+        let declared: BTreeSet<String> = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Trait(item)
+                    if matches!(item.vis, syn::Visibility::Public(_))
+                        && item.ident.to_string().starts_with("Guarded") =>
+                {
+                    Some(item.ident.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let guarded: BTreeSet<String> = GUARDED_PORT_TRAITS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            guarded, declared,
+            "guarded-port census drifted from {port_rs:?}"
+        );
+    }
+
     /// A renamed import must not launder a backend past the gate. This is the exact evasion
     /// [`ProcessAliases`] already defends `no_raw_process_command_outside_system` against
     /// (`use std::process::Command as Exec`), so the port gate has to match its sibling — otherwise
@@ -3393,15 +3447,16 @@ impl Exec for Rogue {}
         // A grouped rename, a module rename, and a rename *chain* — the chain also proves resolution
         // is order-insensitive, since `Hop` is defined by a later `use` than the one consuming it.
         let harder = r#"
-use flux_system::port::{GuardedEnv as Env, GuardedHostFiles};
+        use flux_system::port::{GuardedEnv as Env, GuardedHostFiles, GuardedWorkspaceFiles as Workspace};
 use flux_system::port as p;
 use Hop as Chained;
 use flux_system::port::GuardedProcess as Hop;
 
 impl Env for A {}
 impl GuardedHostFiles for B {}
-impl p::GuardedEnv for C {}
-impl Chained for D {}
+        impl p::GuardedEnv for C {}
+        impl Chained for D {}
+        impl Workspace for E {}
 "#;
         let hits = guarded_port_impls(harder).unwrap();
         let mut resolved: Vec<(&str, &str)> = hits
@@ -3416,6 +3471,7 @@ impl Chained for D {}
                 ("GuardedEnv", "C"),
                 ("GuardedHostFiles", "B"),
                 ("GuardedProcess", "D"),
+                ("GuardedWorkspaceFiles", "E"),
             ],
             "every spelling must resolve to its canonical port: {hits:?}"
         );
@@ -3493,6 +3549,11 @@ impl Exec for Double {}
                 "GuardedHostFiles",
                 "System",
             ),
+            (
+                "crates/flux-system/src/port.rs",
+                "GuardedWorkspaceFiles",
+                "System",
+            ),
             ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
             (
                 "crates/flux-system/src/remote.rs",
@@ -3502,6 +3563,11 @@ impl Exec for Double {}
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedHostFiles",
+                "RemoteSystem",
+            ),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedWorkspaceFiles",
                 "RemoteSystem",
             ),
             (
