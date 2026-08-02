@@ -2,7 +2,7 @@
 id: C-444
 title: "`auto_approve(true)` does not imply confinement, and SDK resource ceilings are unbounded by default"
 pillar: Core
-status: in-progress
+status: done
 priority: 3
 design: docs/designs/pi-comparison-remediation.md
 epic: pi-comparison-remediation
@@ -45,7 +45,9 @@ usually about ergonomics; here it is about safety.
       (`crates/flux-sdk/src/envelope.rs:105`). Refusing was rejected because it makes a valid posture
       cost an extra required call, which reads as "autonomy is discouraged" (C-463 says it is not).
       The raise is a floor over *silence* only: `with_sandbox` wins outright, a stricter ambient
-      `FLUX_SANDBOX` still applies, and an injected `Approver` triggers nothing.
+      `FLUX_SANDBOX` still applies. An injected `Approver` receives the same conservative floor:
+      its implementation is opaque, so the SDK cannot distinguish an interactive gate from a
+      three-line blanket allow. Explicit sandbox and resource-limit decisions still win.
 - [x] A default resource ceiling exists, and ⚠ **a delegated tree cannot multiply past it** — per-agent
       ceilings that compose into an unbounded total are the actual finding, not the per-agent number.
       → `ResourceLimits::autonomous()` (`crates/flux-runtime/src/limits.rs`) sets both a per-agent
@@ -54,13 +56,12 @@ usually about ergonomics; here it is about safety.
       because it *refuses* rather than queues, so it cannot enter the wait cycle that makes a shared
       semaphore deadlock (C-299). `LocalSpawner::spawn` takes a place and holds it for the child's whole
       turn. The per-agent semaphore is unchanged.
-- [ ] ⚠ **This is a breaking change for embedders and owes a MINOR** under the pre-1.0 rule. Existing
+- [x] ⚠ **This is a breaking change for embedders and owes a MINOR** under the pre-1.0 rule. Existing
       embedders get behaviour they did not ask for; that is the point, but it must be deliberate, in the
       CHANGELOG, and in WHATS-NEW with an action line.
-      → **Not done: `CHANGELOG.md` and `WHATS-NEW.md` are fenced for this implementor.** Handed to the
-      coordinator. The change is breaking as predicted and the migration line is: an embedder using
-      `auto_approve(true)` on a host with no sandbox backend now fails closed at the first spawn, and
-      declines the raise with `.with_sandbox(Sandbox::resolve(SandboxSettings::off()))`.
+      → `CHANGELOG.md`, `WHATS-NEW.md`, and the tracked website mirror carry the breaking migration:
+      an embedder using automatic or custom approval on a host with no sandbox backend now fails closed
+      at the first spawn, and declines the raise explicitly when an outer boundary already exists.
 - [x] The SDK docs stop *warning* about the gap and describe the new default. A caveat that is no longer
       true is worse than one that is.
       → Rewritten: the `flux-sdk` crate root, the `Sandbox` and `ResourceLimits` re-export docs,
@@ -85,9 +86,10 @@ usually about ergonomics; here it is about safety.
   approval, confinement and ceilings were three independent knobs, so the fix couples them at
   *resolution* rather than making `auto_approve(true)` harder to call. `Envelope::resource_limits`
   became `Option<_>` so silence is distinguishable from a stated ceiling, and `resolve_sandbox` /
-  `resolve_resource_limits` decide against the posture. `is_autonomous()` is deliberately narrow:
-  blanket `auto_approve` **and** no injected approver, because a hand-written `Approver` is a policy
-  this crate cannot read.
+  `resolve_resource_limits` decide against the posture. The interrupted review found that the first
+  `is_autonomous()` predicate was too narrow: a hand-written `Approver` is exactly code this crate
+  cannot read, so it cannot be trusted to imply a human. `needs_autonomous_floor()` now covers both
+  blanket `auto_approve` and every injected approver; explicit posture overrides remain authoritative.
 - The half worth re-reading before changing anything: **the tree ceiling is a census, not a semaphore.**
   C-299 established that sharing the execution semaphore across the `task` boundary deadlocks, and
   that reasoning still holds — so `max_live_agents` bounds the *other* factor in `N × k`. It is safe to
@@ -99,7 +101,12 @@ usually about ergonomics; here it is about safety.
   having that test state `SandboxSettings::off()` explicitly, which is also the correct posture for it:
   it compares an SDK path against an `App` path that does not go through the SDK envelope at all, so the
   raise would have compared two different postures. Any embedder test in this shape needs the same line.
-- Left for the coordinator: the MINOR bump, the CHANGELOG entry and the WHATS-NEW action line (all
-  fenced here). Adjacent, not fixed: `FlowClient` exposes no public `system()`/`resource_limits()`
-  accessors, so `secure_defaults.rs` can only assert the raise on the `Client` door — the shared
-  `Envelope` is what makes the two doors agree, but nothing test-visible proves it on the flow door.
+- The independent envelope-integrity pass is
+  `docs/reviews/single/2026-08-02-c444-sdk-autonomous-posture.md`. It found and closed two material
+  gaps before integration: an injected always-Allow `Approver` escaped the original predicate, and
+  no test observed `LocalSpawner::spawn`'s census admission. The latter is mutation-pinned: deleting
+  the call makes `the_tree_agent_ceiling_refuses_at_the_spawner_boundary` fail, restoring it passes.
+- C-470 closed in the same branch without a public accessor: a crate-internal unit test compares the
+  resolved sandbox and every resource-limit field on `Client` and `FlowClient` from identical inputs.
+- Final gate green after review: fmt, workspace build/test, clippy `-D warnings`, codegate,
+  `FLUX_BWRAP_BIN=/nonexistent/bwrap cargo test --workspace`, and the positive sandbox-backend lane.

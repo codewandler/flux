@@ -156,7 +156,8 @@ impl FlowClientBuilder {
     /// [`ResourceLimits::autonomous`](crate::ResourceLimits::autonomous) ceilings — the same pairing the
     /// CLI applies to its own auto-approved and headless surfaces (C-262 / C-410). Both are floors over
     /// silence: [`with_sandbox`](Self::with_sandbox) and [`resource_limits`](Self::resource_limits) win
-    /// outright, and injecting an [`Approver`] instead of this flag raises nothing. See
+    /// outright. An injected [`Approver`] receives the same conservative floor because the SDK cannot
+    /// distinguish an interactive policy from a blanket allow. See
     /// [`ClientBuilder::auto_approve`](crate::ClientBuilder::auto_approve) for the full contract.
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
@@ -1200,6 +1201,56 @@ mod tests {
         assert!(names.iter().any(|n| n == "ai.extract"));
     }
 
+    /// C-470: the two public SDK doors resolve the same autonomous envelope. This lives inside the
+    /// crate so the proof observes the binding `System` and `ResourceLimits` without publishing a
+    /// new inspection API solely for a test.
+    #[test]
+    fn both_sdk_doors_resolve_the_same_autonomous_posture() {
+        let client = crate::Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .build(
+                Box::new(MockProvider::new(["noop".to_string()])),
+                temp_root("client-posture"),
+            )
+            .unwrap();
+        let flow = FlowClient::builder()
+            .model("mock")
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("flow-posture"))
+            .unwrap();
+
+        let client_system = client.engine().executor.context().system();
+        let client_sandbox = client_system.sandbox().settings();
+        let flow_sandbox = flow.system.sandbox().settings();
+        assert_eq!(flow_sandbox.mode, client_sandbox.mode);
+        assert_eq!(flow_sandbox.network, client_sandbox.network);
+        assert_eq!(flow_sandbox.extra_writable, client_sandbox.extra_writable);
+
+        let client_limits = client.resource_limits();
+        let flow_limits = &flow.resource_limits;
+        assert_eq!(
+            flow_limits.max_concurrent_tool_calls(),
+            client_limits.max_concurrent_tool_calls()
+        );
+        assert_eq!(
+            flow_limits.max_retained_result_bytes(),
+            client_limits.max_retained_result_bytes()
+        );
+        assert_eq!(
+            flow_limits.max_evidence_payload_bytes(),
+            client_limits.max_evidence_payload_bytes()
+        );
+        assert_eq!(
+            flow_limits.max_live_agents(),
+            client_limits.max_live_agents()
+        );
+        assert_eq!(
+            flow_limits.tool_call_queue_timeout(),
+            client_limits.tool_call_queue_timeout()
+        );
+    }
+
     #[tokio::test]
     async fn round_trip_analyze_then_execute_on_a_json_flow() {
         // A hand-authored DraftAst: read a file we control, then return it. Exercises
@@ -1535,6 +1586,15 @@ mod tests {
             .approver(Arc::new(DenyBoom))
             .build(MockProvider::one("noop"), temp_root("approver-policy"))
             .unwrap();
+        assert_eq!(
+            client.system.sandbox().settings().mode,
+            flux_system::sandbox::SandboxMode::Require,
+            "an opaque flow approver must receive the conservative confinement floor"
+        );
+        assert!(
+            !client.resource_limits.is_unbounded(),
+            "an opaque flow approver must receive the delegated-tree ceiling"
+        );
         client.register_op(Arc::new(EchoArgsTool));
         client.register_op(Arc::new(BoomTool));
 

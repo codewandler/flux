@@ -19,10 +19,27 @@
 use async_trait::async_trait;
 use flux_core::Result;
 use flux_provider::{ChunkStream, Provider, Request};
+use flux_sdk::approval::{ApprovalChoice, Approver, IntentSet};
 use flux_sdk::sandbox::SandboxMode;
 use flux_sdk::{Client, Sandbox, SandboxSettings};
+use std::sync::Arc;
 
 struct StubProvider;
+
+/// The smallest custom policy that proves an opaque approver can remove every human decision.
+struct AlwaysAllow;
+
+#[async_trait]
+impl Approver for AlwaysAllow {
+    async fn request(
+        &self,
+        _tool: &str,
+        _subjects: &[String],
+        _intents: &IntentSet,
+    ) -> ApprovalChoice {
+        ApprovalChoice::Allow
+    }
+}
 
 #[async_trait]
 impl Provider for StubProvider {
@@ -115,6 +132,32 @@ fn the_autonomous_posture_closes_the_sandbox_network() {
         !client_posture(&client).settings().network,
         "the autonomous posture must default its sandbox network CLOSED, as the CLI's unattended \
          profile does — an embedder may reopen it explicitly"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An injected approver is opaque to the SDK: it may prompt a human, but it may also be the
+/// three-line blanket allow above. Silence about confinement and ceilings must therefore resolve
+/// conservatively. An embedder that really has an outer boundary can still state both overrides.
+#[test]
+fn an_opaque_approver_cannot_claim_supervision_by_default() {
+    let dir = temp_root("opaque-approver");
+    let client = Client::builder()
+        .model("mock")
+        .approver(Arc::new(AlwaysAllow))
+        .build(Box::new(StubProvider), &dir)
+        .expect("build Client");
+
+    let posture = client_posture(&client);
+    assert_eq!(
+        posture.settings().mode,
+        SandboxMode::Require,
+        "an opaque custom approver escaped the confinement floor"
+    );
+    assert!(
+        !client.resource_limits().is_unbounded(),
+        "an opaque custom approver escaped the delegated-tree resource ceiling"
     );
 
     std::fs::remove_dir_all(&dir).ok();

@@ -70,11 +70,13 @@ attached. Those forms refuse startup when no backend is usable. Every other subc
 explicitly as *not* one of them, so a new subcommand cannot join the list by accident — the rest of
 `flux plugin …` is management rather than operation invocation and stays on the interactive
 contract. The SDK applies the same rule to the one posture it can classify without an argv: a
-`Client`/`FlowClient` built with `auto_approve(true)` and no injected approver resolves to `require`
-with the sandbox network closed, and to autonomous resource ceilings, unless the embedder states a
-sandbox or ceiling of its own — which wins outright. Otherwise direct SDK/server embedders receive no
-automatic posture from `flux-server` and must inject a sandbox or export its environment settings.
-Both default to off with networking open when no posture is selected. Enable confinement with a flag,
+`Client`/`FlowClient` built with `auto_approve(true)` or an injected custom approver resolves to
+`require` with the sandbox network closed, and to autonomous resource ceilings, unless the embedder
+states a sandbox or ceiling of its own — which wins outright. A custom approver is opaque to the SDK:
+it may prompt a human, but it may also blanket-allow, so silence resolves conservatively. Otherwise
+direct SDK/server embedders receive no automatic posture from `flux-server` and must inject a sandbox
+or export its environment settings. The built-in deny posture defaults to off with networking open
+when no posture is selected. Enable confinement with a flag,
 a config table, the environment, or an SDK-injected sandbox. When more than one CLI/config source has
 an opinion,
 the **strictest posture wins** (`require` beats `on` beats off), so

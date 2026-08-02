@@ -326,13 +326,13 @@ pub mod subagents {
 /// taking a direct `flux-system` dependency.
 ///
 /// **Autonomy brings the floor; everything else is yours.** One configuration does infer a posture:
-/// [`auto_approve(true)`](ClientBuilder::auto_approve) with no injected
-/// [`Approver`](approval::Approver) resolves to `require` with the sandbox network closed (C-444),
-/// matching what the `flux` binary pins for every surface with no human approval boundary
-/// (C-262 / C-410). Beyond that, this crate infers nothing — a served HTTP front end or a cron-driven
-/// worker that still routes approval through your own [`Approver`](approval::Approver) resolves the
-/// same way an interactive client does, because that approver is a policy this crate cannot read.
-/// Such a deployment states its posture itself:
+/// [`auto_approve(true)`](ClientBuilder::auto_approve) and an injected opaque
+/// [`Approver`](approval::Approver) both resolve to `require` with the sandbox network closed
+/// (C-444), matching what the `flux` binary pins for every surface where a human boundary is absent
+/// or cannot be established (C-262 / C-410). A custom approver may be interactive, but this crate
+/// cannot distinguish that from a three-line blanket allow. A served HTTP front end or cron-driven
+/// worker states its posture explicitly when an outer boundary or a human-owned policy makes the
+/// conservative floor unnecessary:
 ///
 /// ```ignore
 /// // Explicit, independent of ambient env — the recommended form for a daemon.
@@ -556,8 +556,9 @@ impl ClientBuilder {
     ///
     /// Both are floors over silence. [`with_sandbox`](Self::with_sandbox) and
     /// [`resource_limits`](Self::resource_limits) still win outright, which is how an embedder whose
-    /// isolation comes from an outer container, or whose budget is its own, says so. Injecting an
-    /// [`Approver`] instead of this flag raises nothing: that is your policy to state. See [`Sandbox`].
+    /// isolation comes from an outer container, or whose budget is its own, says so. An injected
+    /// [`Approver`] gets the same conservative floor because its implementation is opaque; explicit
+    /// sandbox and resource-limit decisions remain authoritative. See [`Sandbox`].
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
         self
@@ -838,13 +839,13 @@ impl ClientBuilder {
     /// defaults to 30s and is *not* clamped, so a host that sets an absurd value gets an absurd
     /// wait.
     ///
-    /// **The default depends on the posture (C-444).** State nothing and a supervised client is
-    /// unbounded, as it always was — a human at approval is what bounds it. An autonomous client
-    /// ([`auto_approve(true)`](Self::auto_approve) with no injected approver) resolves to
-    /// [`ResourceLimits::autonomous`] instead, because "unattended *and* unbounded" is the one
-    /// combination the envelope cannot defend. Calling this method wins outright either way, including
-    /// with a deliberately unbounded `ResourceLimits::new()`: stating a ceiling is a decision, and this
-    /// never second-guesses it.
+    /// **The default depends on the posture (C-444).** State nothing and the built-in deny approver is
+    /// unbounded, as it always was — every effect stops there. `auto_approve(true)` and an injected,
+    /// opaque approver resolve to [`ResourceLimits::autonomous`] instead, because the SDK cannot prove
+    /// that custom policy contains a human and "unattended *and* unbounded" is the combination the
+    /// envelope cannot defend. Calling this method wins outright either way, including with a
+    /// deliberately unbounded `ResourceLimits::new()`: stating a ceiling is a decision, and this never
+    /// second-guesses it.
     ///
     /// **Scope: the execution budget is PER AGENT; the agent census is PER TREE (C-299, C-444).** The
     /// ceilings descend into sub-agents — a `task`-delegated child is built with them installed, at

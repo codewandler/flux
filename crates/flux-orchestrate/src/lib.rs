@@ -1464,6 +1464,50 @@ mod tests {
             .is_err());
     }
 
+    /// C-444's load-bearing wiring proof: the tree census is enforced at the actual spawn seam, not
+    /// merely stored and unit-tested inside `ResourceLimits`. With a ceiling of one the root occupies
+    /// the only place, so the child is refused before a provider is even constructed.
+    #[tokio::test]
+    async fn the_tree_agent_ceiling_refuses_at_the_spawner_boundary() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ndescription: recon\ntools: [read]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = provider_calls.clone();
+        let spawner = LocalSpawner::new(
+            Arc::new(move || {
+                observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(MockProvider))
+            }),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_resource_limits(flux_runtime::ResourceLimits::new().with_max_live_agents(1));
+
+        let error = spawner
+            .spawn(
+                SpawnRequest::new("scout", "must not start"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("the root already occupies the only live-agent place");
+
+        assert!(
+            error.to_string().contains("tree-wide ceiling of 1"),
+            "the refusal must name the binding ceiling: {error}"
+        );
+        assert_eq!(
+            provider_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the census must refuse before provider construction or child-engine work"
+        );
+    }
+
     /// C-117 failing-first (the live repro): a persisted composite requiring ops outside a
     /// `tools: [read]` role's narrowed registry must not fail `LocalSpawner::spawn` — before the
     /// fix, EVERY spawn of EVERY role died at child-engine assembly with

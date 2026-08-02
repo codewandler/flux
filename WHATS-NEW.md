@@ -15,6 +15,17 @@
 
 ## [Unreleased]
 
+### Action needed
+
+- **Embedded agents with automatic or custom approval now default to confinement and finite runtime
+  ceilings.** If you use an embedded agent without a human approval prompt, process launches now
+  require an available OS sandbox, the sandbox network starts closed, and delegated work has a finite
+  concurrency and retention budget. Custom approval callbacks receive the same conservative default
+  because flux cannot tell whether they prompt a person or simply allow everything.
+  If an outer container or VM already supplies isolation, state that explicitly with the SDK's sandbox
+  override. Likewise, set explicit resource limits when the built-in ceiling is not right for your
+  workload; explicit choices still win.
+
 ### New
 
 - **What happens when the conversation gets long, finally written down.** A new

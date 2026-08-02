@@ -79,14 +79,15 @@ impl Envelope {
         }
     }
 
-    /// Whether this envelope resolves to an **autonomous** posture — no human in the approval stage.
+    /// Whether this envelope needs the conservative **autonomous floor**.
     ///
-    /// Only the blanket `auto_approve` counts. An injected [`Approver`] does *not*: it is a policy the
-    /// embedder wrote, it may well be interactive or risk-aware, and deciding on its behalf that it
-    /// needs confinement would be guessing at code this crate cannot see. An embedder injecting an
-    /// approver states the rest of its posture too.
-    pub(crate) fn is_autonomous(&self) -> bool {
-        self.auto_approve && self.approver.is_none()
+    /// Blanket `auto_approve` plainly has no human boundary. An injected [`Approver`] is opaque: it
+    /// may prompt a human, but it may just as easily return `Allow` for every request. Treating that
+    /// unknown policy as supervised would let three lines of custom code recover the exact
+    /// unconfined, unbounded posture C-444 removes. The floor therefore applies to either choice;
+    /// explicit sandbox and resource-limit settings remain the embedder's visible escape hatch.
+    pub(crate) fn needs_autonomous_floor(&self) -> bool {
+        self.auto_approve || self.approver.is_some()
     }
 
     /// The OS-sandbox posture: an explicitly injected [`Sandbox`] wins; an autonomous posture is
@@ -107,7 +108,7 @@ impl Envelope {
             return sandbox.clone();
         }
         let mut settings = SandboxSettings::from_env();
-        if self.is_autonomous() {
+        if self.needs_autonomous_floor() {
             // A floor, not an override: `require` is already the strictest mode, and the network
             // narrows to closed unless the environment explicitly opened it — the same default the
             // CLI's unattended profile applies. When the prompt is gone, destination scope is part of
@@ -130,7 +131,7 @@ impl Envelope {
     pub(crate) fn resolve_resource_limits(&self) -> ResourceLimits {
         match &self.resource_limits {
             Some(limits) => limits.clone(),
-            None if self.is_autonomous() => ResourceLimits::autonomous(),
+            None if self.needs_autonomous_floor() => ResourceLimits::autonomous(),
             None => ResourceLimits::new(),
         }
     }
