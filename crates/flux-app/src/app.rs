@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use flux_agent::{AgentSpec, Permissions, DEFAULT_COMPACT_THRESHOLD_CHARS};
+use flux_agent::{AgentProfile, AgentSpec, Permissions, DEFAULT_COMPACT_THRESHOLD_CHARS};
 use flux_core::{Error, Result, Usage};
 use flux_events::EventStore;
 use flux_evidence::{Observation, Phase};
@@ -1800,8 +1800,8 @@ fn build_executor(
 /// Map a program-level [`AgentDecl`] to an [`AgentSpec`]. Without source-declared permissions its
 /// `tools` retain the legacy dual role of visible subset + grants; the shared runtime-profile resolver
 /// later intersects them with any app/agent ceiling. The persona is the
-/// `description` (or a `settings.system_prompt` string), followed by the contents of any
-/// `settings.system_prompt_files` paths — read through the guarded, workspace-confined `system` so a
+/// `description` (or a `settings.instructions` string), followed by the contents of any
+/// `settings.instruction_files` paths — read through the guarded, workspace-confined `system` so a
 /// declarative bot can keep a long persona in `bot/PERSONA.md` instead of inlining it (flux D-11). A
 /// non-string entry or an unreadable path is a clean error. `model` falls back to the host default.
 /// Resolve a served/agentic agent's compaction threshold (A-22). A `run_agent` target binds its
@@ -1829,6 +1829,14 @@ async fn agent_spec_from_decl(
     cwd: PathBuf,
     system: &System,
 ) -> Result<AgentSpec> {
+    if decl.settings.get("system_prompt").is_some()
+        || decl.settings.get("system_prompt_files").is_some()
+    {
+        return Err(Error::Other(format!(
+            "agent `{}`: settings.system_prompt and settings.system_prompt_files were replaced by settings.instructions and settings.instruction_files",
+            decl.name
+        )));
+    }
     let thinking = match decl.settings.get("thinking") {
         Some(value) => value.as_bool().ok_or_else(|| {
             Error::Other(format!(
@@ -1849,30 +1857,54 @@ async fn agent_spec_from_decl(
         ),
         None => None,
     };
+    let profile = match decl.settings.get("profile") {
+        Some(value) => serde_json::from_value::<AgentProfile>(value.clone()).map_err(|_| {
+            Error::Other(format!(
+                "agent `{}`: settings.profile must be general or coding",
+                decl.name
+            ))
+        })?,
+        None => AgentProfile::General,
+    };
+    let configured_instructions = match decl.settings.get("instructions") {
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            Error::Other(format!(
+                "agent `{}`: settings.instructions must be a string",
+                decl.name
+            ))
+        })?),
+        None => None,
+    };
+    if decl.description.is_some() && configured_instructions.is_some() {
+        return Err(Error::Other(format!(
+            "agent `{}`: use either description or settings.instructions, not both",
+            decl.name
+        )));
+    }
     let mut parts: Vec<String> = Vec::new();
-    if let Some(base) = decl.description.clone().or_else(|| {
-        decl.settings
-            .get("system_prompt")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    }) {
+    if let Some(base) = decl
+        .description
+        .as_deref()
+        .or(configured_instructions)
+        .map(str::to_string)
+    {
         parts.push(base);
     }
     if let Some(files) = decl
         .settings
-        .get("system_prompt_files")
+        .get("instruction_files")
         .and_then(|v| v.as_array())
     {
         for f in files {
             let path = f.as_str().ok_or_else(|| {
                 Error::Other(format!(
-                    "agent `{}`: settings.system_prompt_files entries must be strings",
+                    "agent `{}`: settings.instruction_files entries must be strings",
                     decl.name
                 ))
             })?;
             let text = system.read_file(path).await.map_err(|e| {
                 Error::Other(format!(
-                    "agent `{}`: read system_prompt_files `{path}`: {e}",
+                    "agent `{}`: read instruction_files `{path}`: {e}",
                     decl.name
                 ))
             })?;
@@ -1893,11 +1925,7 @@ async fn agent_spec_from_decl(
              relevant record is found, say that the declared datasource does not contain the answer."
         ));
     }
-    let system_prompt = if parts.is_empty() {
-        AgentSpec::default().system_prompt
-    } else {
-        parts.join("\n\n")
-    };
+    let instructions = parts.join("\n\n");
     // Inline knowledge blocks declared in `settings.context` (A-19) — injected into the system prompt as
     // `<knowledge-base>` sections. A non-list or malformed entry is a clean error.
     let context: Vec<flux_core::ContextBlock> = match decl.settings.get("context") {
@@ -1914,7 +1942,8 @@ async fn agent_spec_from_decl(
             .model
             .clone()
             .unwrap_or_else(|| default_model.to_string()),
-        system_prompt,
+        profile,
+        instructions,
         tools: Some(decl.tools.clone()),
         permissions: Permissions {
             allow: decl.tools.clone(),
@@ -3054,11 +3083,12 @@ journey pong
             .await
             .unwrap();
         assert_eq!(spec.model, "host-model"); // falls back to the host default
-        assert!(spec.system_prompt.starts_with("be terse"));
+        assert_eq!(spec.profile, AgentProfile::General);
+        assert!(spec.instructions.starts_with("be terse"));
         assert!(
-            spec.system_prompt.contains("handbook") && spec.system_prompt.contains("search"),
+            spec.instructions.contains("handbook") && spec.instructions.contains("search"),
             "declared knowledge must be visible in the model framing: {}",
-            spec.system_prompt
+            spec.instructions
         );
         // tools are the visible subset AND the pre-allow grants — under DenyApprover only these run.
         assert_eq!(
@@ -3070,6 +3100,42 @@ journey pong
             vec!["search".to_string(), "now".to_string()]
         );
         assert!(spec.permissions.deny.is_empty());
+
+        let coding = AgentDecl {
+            name: "coder".into(),
+            settings: json!({ "profile": "coding" }),
+            ..decl.clone()
+        };
+        let coding_spec = agent_spec_from_decl(&coding, "host-model", PathBuf::from("."), &system)
+            .await
+            .unwrap();
+        assert_eq!(coding_spec.profile, AgentProfile::Coding);
+        assert!(coding_spec
+            .effective_system_prompt()
+            .contains(flux_agent::CODING_PROFILE_PROMPT));
+
+        let ambiguous = AgentDecl {
+            name: "ambiguous".into(),
+            settings: json!({ "instructions": "second authority" }),
+            ..decl
+        };
+        let error = agent_spec_from_decl(&ambiguous, "host-model", PathBuf::from("."), &system)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("either description"), "{error}");
+
+        let obsolete = AgentDecl {
+            name: "obsolete".into(),
+            settings: json!({ "system_prompt": "old override" }),
+            ..coding
+        };
+        let error = agent_spec_from_decl(&obsolete, "host-model", PathBuf::from("."), &system)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("settings.instructions"),
+            "{error}"
+        );
     }
 
     /// An app agent's `datasources` list is an actual capability boundary. With one declared source,
@@ -3309,10 +3375,10 @@ journey pong
     }
 
     #[tokio::test]
-    async fn agent_spec_appends_system_prompt_files() {
+    async fn agent_spec_appends_instruction_files() {
         // A declarative bot keeps its long persona in a file rather than inlining it (flux D-11):
-        // `settings.system_prompt_files` paths are read (workspace-confined) and concatenated after the
-        // base persona.
+        // `settings.instruction_files` paths are read (workspace-confined) and concatenated after
+        // the base persona.
         let dir = std::env::temp_dir().join(format!("flux-persona-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3326,34 +3392,34 @@ journey pong
             datasources: vec![],
             description: Some("be terse".into()),
             permissions: None,
-            settings: json!({ "system_prompt_files": ["persona.md"] }),
+            settings: json!({ "instruction_files": ["persona.md"] }),
         };
         let system = System::new(Workspace::new(&dir).unwrap());
         let spec = agent_spec_from_decl(&decl, "m", dir.clone(), &system)
             .await
             .unwrap();
         assert!(
-            spec.system_prompt.contains("be terse"),
+            spec.instructions.contains("be terse"),
             "the base description is kept: {}",
-            spec.system_prompt
+            spec.instructions
         );
         assert!(
-            spec.system_prompt.contains("PERSONA-MARKER"),
+            spec.instructions.contains("PERSONA-MARKER"),
             "the persona file is appended: {}",
-            spec.system_prompt
+            spec.instructions
         );
 
         // A missing file is a clean, attributed error — not a silently-empty persona.
         let bad = AgentDecl {
             name: "b".into(),
-            settings: json!({ "system_prompt_files": ["nope.md"] }),
+            settings: json!({ "instruction_files": ["nope.md"] }),
             ..decl.clone()
         };
         assert!(
             agent_spec_from_decl(&bad, "m", dir.clone(), &system)
                 .await
                 .is_err(),
-            "an unreadable system_prompt_files path is an error"
+            "an unreadable instruction_files path is an error"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3456,7 +3522,7 @@ journey pong
                     datasources: Vec::new(),
                     description: Some("root-stable agent".into()),
                     permissions: None,
-                    settings: json!({"system_prompt_files": ["persona.md"]}),
+                    settings: json!({"instruction_files": ["persona.md"]}),
                 }],
                 ..Program::default()
             },
@@ -3501,7 +3567,7 @@ journey pong
         )
         .unwrap();
         assert_eq!(
-            roles.get("rooted").unwrap().prompt,
+            roles.get("rooted").unwrap().instructions,
             "ROLE-FROM-ORIGINAL-ROOT"
         );
         let skills = AgentSpec {

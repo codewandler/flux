@@ -10,6 +10,7 @@ mod catalog_cmd;
 #[cfg(test)]
 mod catalog_coherence;
 mod changelog;
+mod context_cmd;
 mod plugin_skill;
 mod preset;
 mod skill_cmd;
@@ -44,6 +45,7 @@ use app_cmd::*;
 use args::*;
 use auth_cmd::*;
 use catalog_cmd::*;
+use context_cmd::*;
 use dispatch::*;
 use docs_cmd::*;
 use doctor::*;
@@ -75,7 +77,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_agent::{
-    AdaptiveLoopPolicy, AgentLoopSpec, AgentSpec, AgentStagePolicy, DEFAULT_SYSTEM_PROMPT,
+    AdaptiveLoopPolicy, AgentLoopSpec, AgentSpec, AgentStagePolicy, PromptCacheClass, PromptLayer,
+    PromptLayerKind, PromptTrust,
 };
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_events::EventStore;
@@ -85,7 +88,8 @@ use flux_flow::AgentSink;
 use flux_orchestrate::{ProviderFactory, Role, RoleRegistry, SubAgents, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_runtime::context::{
-    ContextFragments, EnvContext, GitContext, ProjectFiles, Projector, RepoSignal,
+    ContextFragments, ContextLayerKind, ContextLayerTrust, EnvContext, GitContext, ProjectFiles,
+    Projector, RepoSignal,
 };
 use flux_runtime::{
     scope_runtime_turn, AllowApprover, ApprovalChoice, Approver, ExecutionAuthorization,
@@ -424,6 +428,44 @@ mod tests {
         match cli3.command {
             Some(Commands::Render { out, .. }) => assert_eq!(out.as_deref(), Some("out.png")),
             other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_show_parses_explicit_profile_tools_and_body_policy() {
+        use super::{Cli, Commands, ContextAction, ContextProfile};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "flux",
+            "context",
+            "show",
+            "--profile",
+            "general",
+            "--tool",
+            "read",
+            "--tool",
+            "edit",
+            "--body",
+            "--json",
+        ])
+        .expect("`context show` parses");
+        match cli.command {
+            Some(Commands::Context {
+                action:
+                    ContextAction::Show {
+                        profile,
+                        tools,
+                        body,
+                        json,
+                    },
+            }) => {
+                assert_eq!(profile, ContextProfile::General);
+                assert_eq!(tools, ["read", "edit"]);
+                assert!(body);
+                assert!(json);
+            }
+            other => panic!("expected context show, got {other:?}"),
         }
     }
 

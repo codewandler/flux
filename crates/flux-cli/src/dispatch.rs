@@ -179,6 +179,8 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Docs { .. }
         | Commands::Completion { .. }
         | Commands::Doctor { .. } => None,
+        // Read-only prompt-provenance inspection; no provider, plugin, or operation is invoked.
+        Commands::Context { .. } => None,
         // One foreground, tool-free provider request over already-redacted local facts. No agent
         // turn, plugin, operation dispatch, or process launch exists for the OS sandbox to bound.
         Commands::Insights { .. } => None,
@@ -808,6 +810,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Docs { bind, model }) => run_docs(bind, model).await,
             Some(Commands::Preset { args }) => preset::run_preset(&args).await,
             Some(Commands::Doctor { json }) => run_doctor(json).await,
+            Some(Commands::Context { action }) => run_context(action).await,
             Some(Commands::System { action }) => run_system(action).await,
             // No subcommand → interactive REPL (the one implicit entry point).
             None => run_repl(AgentFlags::from_model_yes(None, false)).await,

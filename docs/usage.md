@@ -215,6 +215,10 @@ flux usage                       # aligned token/cost dashboard for flux + detec
 flux insights                    # derive today's facts from Flux's durable session log, print the
                                  #   auditable fact block, then spend one tool-free model call on a
                                  #   grounded summary; -m/--model overrides the configured model
+flux context show                # inspect the ordered harness/profile/project context manifest
+                                 #   without a provider call; body-free by default, with --json,
+                                 #   explicit --body, --profile general|coding, and repeatable
+                                 #   --tool <op> for conditional operation guidance
 flux replay <session|last>       # TIME MACHINE (C-43/A-45): hermetically re-execute a recorded run —
                                  #   authored or host-derived flows re-parse from durable source, op outputs are served
                                  #   from the recorded cassette: NO model call, NO live IO, side effects

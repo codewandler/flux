@@ -62,10 +62,15 @@ propose source for exactly one composite operation; the host parses, analyzes, s
 before installation rather than executing it on receipt.
 
 The builder carries `allow`/`deny` permission rules, `auto_approve(true)` for trusted headless use,
-an optional system prompt and context blocks, model/token/iteration limits, explicit
+an agent profile plus authored instructions and context blocks, model/token/iteration limits, explicit
 `agent_loop(AgentLoopSpec)`, typed `register_op(stage_fn(...))` stages, and the OS-sandbox posture.
 Because a library has no approval UI, reads are pre-allowed and other gated operations deny by
 default unless you provide a broader policy.
+
+Every SDK agent retains Flux's embedded harness protocol. `Client::builder()` and `AgentSpec::new`
+select `AgentProfile::Coding`; use `.profile(AgentProfile::General).instructions("…")` for a custom
+non-coding persona. `.instructions("…")` specializes the selected profile and never replaces the
+harness. This is the pre-1.0 replacement for the former `.system_prompt("…")` API.
 
 ### Let the agent ask your user
 

@@ -151,7 +151,7 @@ impl Session { pub fn what_if(&self) -> WhatIf; }              // this session =
 impl WhatIf {
     pub fn turn(self, n: usize) -> Self;
     pub fn model(self, m: impl Into<String>) -> Self;          // re-plan under a different model
-    pub fn system_prompt(self, p: impl Into<String>) -> Self;  // re-plan under a different prompt
+    pub fn instructions(self, p: impl Into<String>) -> Self;   // re-plan under different authored instructions
     pub fn policy(self, perms: Permissions) -> Self;           // re-authorize under a different policy
     pub fn substitute(self, op: &str, output: Value) -> Self;  // swap one op's recorded output (pure, no model)
     pub fn substitute_at(self, node: u32, output: Value) -> Self;

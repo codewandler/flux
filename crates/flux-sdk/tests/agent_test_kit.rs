@@ -691,7 +691,7 @@ async fn capture_save_load_replay_round_trip_is_faithful_across_flows() {
 
 // --- D-176: Scenario::check (Engine 2 — world-and-model-pinned re-drive) ------
 
-/// A client whose provider is a scripted mock BUT whose system prompt carries `marker` — used to
+/// A client whose provider is a scripted mock BUT whose authored instructions carry `marker` — used to
 /// prove that a config edit the golden `model.jsonl` doesn't cover falls through to the real
 /// provider and is COUNTED (`Report::model_live`), never silently served.
 fn check_client(
@@ -714,7 +714,7 @@ fn check_client(
             counter: Arc::new(AtomicUsize::new(0)),
         }));
     if let Some(s) = system {
-        builder = builder.system_prompt(s);
+        builder = builder.instructions(s);
     }
     builder
         .build(
@@ -782,7 +782,7 @@ async fn check_re_drive_is_clean_and_costs_nothing_on_an_unchanged_agent() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Honesty: a config edit the golden doesn't cover (here a changed system prompt, which changes the
+/// Honesty: a config edit the golden doesn't cover (here changed agent instructions, which change the
 /// canonicalized request hash) falls through to the real provider and is COUNTED in
 /// `Report::model_live` rather than silently served — the counter that makes "this re-drive was
 /// free and deterministic" a checkable claim instead of an assumption.

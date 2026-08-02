@@ -7,7 +7,7 @@
 //! `first_divergence`, …); `hermetic`/`cost` are D-176 additions meaningful for either.
 //!
 //! [`WhatIf`] re-runs a recorded session under **exactly one changed variable** — a substituted tool
-//! output (pure, offline, no model call), or a different model/system prompt (a genuine re-plan) —
+//! output (pure, offline, no model call), or a different model/instruction set (a genuine re-plan) —
 //! with the rest of the recorded world byte-frozen via a [`flux_flow::cassette::FrozenTape`]. Two
 //! drivers do the re-execution: [`flux_flow::whatif::rerun_pinned`] (the pure-substitution path — it
 //! never dispatches the model, by construction) and [`flux_flow::whatif::replay_turns_prefix`] +
@@ -95,7 +95,7 @@ impl Counterfactual {
     /// Whether this counterfactual stayed entirely on the pinned/recorded world: no live IO, no
     /// latched divergence, no policy denial. `false` the instant the world is left — a pure
     /// `.substitute()` run is `true` by construction (no model call, ever); a `.model()`/
-    /// `.system_prompt()` re-plan is `true` only if the new plan happened to read nothing the
+    /// `.instructions()` re-plan is `true` only if the new plan happened to read nothing the
     /// recording didn't already cover.
     pub fn hermetic(&self) -> bool {
         self.hermetic
@@ -447,14 +447,14 @@ mod mint_gate {
 
 impl Session {
     /// Re-run this recorded session under **exactly one changed variable** — a substituted tool
-    /// output, or a different model/system prompt — with the rest of the recorded world
+    /// output, or a different model/agent instructions — with the rest of the recorded world
     /// byte-frozen. See [`WhatIf`].
     pub fn what_if(&self) -> WhatIf {
         WhatIf {
             session: self.clone(),
             turn: None,
             model: None,
-            system_prompt: None,
+            instructions: None,
             substitute_ops: Vec::new(),
             substitute_nodes: Vec::new(),
             off_tape: OffTape::Halt,
@@ -470,7 +470,7 @@ pub struct WhatIf {
     session: Session,
     turn: Option<usize>,
     model: Option<String>,
-    system_prompt: Option<String>,
+    instructions: Option<String>,
     substitute_ops: Vec<(String, serde_json::Value)>,
     substitute_nodes: Vec<(u32, serde_json::Value)>,
     off_tape: OffTape,
@@ -491,9 +491,9 @@ impl WhatIf {
         self
     }
 
-    /// Re-plan under a different system prompt.
-    pub fn system_prompt(mut self, p: impl Into<String>) -> Self {
-        self.system_prompt = Some(p.into());
+    /// Re-plan under different caller-authored instructions; the Flux harness prefix remains.
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
         self
     }
 
@@ -545,7 +545,7 @@ impl WhatIf {
         WhatIfSpec {
             turn: self.turn,
             model: self.model.clone(),
-            system_prompt: self.system_prompt.clone(),
+            instructions: self.instructions.clone(),
             substitute_ops: self.substitute_ops.clone(),
             substitute_nodes: self.substitute_nodes.clone(),
             off_tape: self.off_tape,
@@ -559,7 +559,7 @@ impl WhatIf {
             session: session.clone(),
             turn: spec.turn,
             model: spec.model,
-            system_prompt: spec.system_prompt,
+            instructions: spec.instructions,
             substitute_ops: spec.substitute_ops,
             substitute_nodes: spec.substitute_nodes,
             off_tape: spec.off_tape,
@@ -569,7 +569,7 @@ impl WhatIf {
 
     /// Run the counterfactual: a pure `.substitute()`/`.substitute_at()` change re-executes the
     /// recorded plan(s) directly under the pinned world — **no model call, ever, by construction**;
-    /// a `.model()`/`.system_prompt()` change hermetically rebuilds every turn before the target,
+    /// a `.model()`/`.instructions()` change hermetically rebuilds every turn before the target,
     /// then drives exactly one LIVE turn (the re-plan) under the pinned scope.
     ///
     /// Runs on a throwaway variant engine sharing this client's event log (so the counterfactual
@@ -585,10 +585,10 @@ impl WhatIf {
             )));
         }
 
-        let replan = self.model.is_some() || self.system_prompt.is_some();
+        let replan = self.model.is_some() || self.instructions.is_some();
         let overrides = VariantOverrides {
             model: self.model.clone(),
-            system_prompt: self.system_prompt.clone(),
+            instructions: self.instructions.clone(),
             permissions: self.permissions.clone(),
             ..Default::default()
         };
@@ -755,8 +755,8 @@ pub struct WhatIfSpec {
     pub turn: Option<usize>,
     /// Re-plan under a different model.
     pub model: Option<String>,
-    /// Re-plan under a different system prompt.
-    pub system_prompt: Option<String>,
+    /// Re-plan under different caller-authored instructions.
+    pub instructions: Option<String>,
     /// `(op, output)` substitutions — see [`WhatIf::substitute`].
     pub substitute_ops: Vec<(String, serde_json::Value)>,
     /// `(node, output)` substitutions — see [`WhatIf::substitute_at`].
@@ -772,7 +772,7 @@ impl Default for WhatIfSpec {
         Self {
             turn: None,
             model: None,
-            system_prompt: None,
+            instructions: None,
             substitute_ops: Vec::new(),
             substitute_nodes: Vec::new(),
             off_tape: OffTape::Halt,

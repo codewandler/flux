@@ -25,9 +25,10 @@ Each model call carries, in order:
 
 1. **The stage prompt** — flux's own instructions for the typed stage being run (intent detection,
    exploration, presentation). Fixed.
-2. **The system prompt block** — the persona plus assembled [project context](./project-context.md):
-   environment, git state, repo shape, and your `AGENTS.md` / `CLAUDE.md` / `.flux/context.md` **read
-   in full**. Assembled once at startup and then fixed for the session.
+2. **The harness context package** — Flux's embedded runtime protocol, an optional behavior profile
+   (`coding` or `general`), authored role/persona instructions, then assembled
+   [project context](./project-context.md). Repository policy and workspace snapshots carry explicit
+   provenance and are fixed for the session.
 3. **Skill bodies** — the full text of every explicitly enabled [skill](./skills-and-roles.md), plus
    a name-and-description listing of the rest. Injected every turn.
 4. **Tool specs** — the schemas of the operations currently visible to the model.
@@ -35,7 +36,7 @@ Each model call carries, in order:
 
 Items 1-4 are roughly constant for the session. **Item 5 is the one that grows**, and it is the only
 one compaction touches. If your context feels large from the first turn, the cause is a long
-conventions file or a large enabled skill, not the transcript — see
+conventions file, coding profile, or a large enabled skill, not the transcript — see
 [project context](./project-context.md) for how to move repo-wide prose into path-scoped fragments
 that load only when relevant.
 

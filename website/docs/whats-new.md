@@ -45,6 +45,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **Agent instructions have clear ownership.** Flux now keeps its runtime protocol inside the
+  harness, adds coding behavior only for coding agents, and labels repository rules and workspace
+  snapshots separately. A project's `AGENTS.md`, `.agents`, or `.claude` content can specialize a
+  run without accidentally becoming Flux's default prompt or granting runtime authority.
+
 - **It is now clear what Docker, Kubernetes, and microVM support means.** A new execution-placement
   matrix separates managing existing infrastructure, choosing where one effect lands, placing a
   whole worker agent, and provisioning the isolation itself. The Docker plugin has a complete setup
@@ -55,6 +60,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 - **Remote-effect evidence identifies its source.** Tool-call and result lifecycle records now say
   whether Flux observed the work locally or received a report from a remote execution system,
   without adding workspace paths or endpoint addresses to the audit trail.
+
+### Action needed
+
+- **Embedded-agent prompt configuration has been split.** Rust SDK users should replace
+  `.system_prompt(text)` with `.instructions(text)` and select `AgentProfile::General` for a
+  non-coding persona; `Role.prompt` is now `Role.instructions`. Program-agent settings use
+  `instructions` and `instruction_files`; the old `system_prompt` names fail with a migration
+  message instead of silently removing Flux's harness protocol.
 
 ## [0.51.1] - 2026-08-02
 

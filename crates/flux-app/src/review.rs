@@ -2,15 +2,14 @@
 //!
 //! **The invariant this module exists to guarantee:** the `review_code` journey and the direct/CLI
 //! flow path must produce the SAME [`flux_tools::cognition::ReviewReport`] for the same inputs. That
-//! is guaranteed *structurally*, not by convention: [`STRICT_REVIEW_FLOW_SRC`] is the ONE checked-in
-//! `examples/strict_review.flux` file (L-10/L-12's already-landed protocol — read-only context
-//! gather, a bounded 3-role reviewer fan-out under `task`, then the deterministic `review.aggregate`
-//! op), embedded verbatim via `include_str!`. [`strict_review_op`] parses that exact text once into a
-//! [`DraftAst`] and wraps it — unmodified — as a [`CompositeOpDecl`] named `strict_review`. The CLI's
-//! `flux review` runs the same source text directly as a bare flow (`FlowClient::run_flow`); the
-//! `review_code` journey below calls the wrapped composite op. Both paths bottom out in the identical
-//! `DraftAst` executing through the identical `Executor::dispatch` envelope — there is no second,
-//! hand-maintained copy of the review protocol anywhere.
+//! is guaranteed *structurally*, not by convention: [`STRICT_REVIEW_FLOW_SRC`] is the crate-owned
+//! L-10/L-12 protocol asset — read-only context gather, a bounded 3-role reviewer fan-out under
+//! `task`, then the deterministic `review.aggregate` op. [`strict_review_op`] parses that exact text
+//! once into a [`DraftAst`] and wraps it — unmodified — as a [`CompositeOpDecl`] named
+//! `strict_review`. The CLI's `flux review` runs the same source text directly as a bare flow
+//! (`FlowClient::run_flow`); the `review_code` journey below calls the wrapped composite op. Both
+//! paths bottom out in the identical [`DraftAst`] executing through the identical
+//! `Executor::dispatch` envelope — there is no second runtime copy of the review protocol.
 
 use flux_lang::ast::{DraftAst, SymbolName};
 use flux_lang::program::{CompositeOpDecl, CompositeOpMeta, JourneyDecl, Module, Program};
@@ -18,29 +17,29 @@ use flux_lang::program::{CompositeOpDecl, CompositeOpMeta, JourneyDecl, Module, 
 use flux_core::{Error, Result};
 use flux_spec::{Effect, Risk};
 
-/// The strict-review protocol's native-text source — the SAME checked-in file L-10/L-12 landed and
-/// `crates/flux-sdk/tests/strict_review.rs` drives directly. Embedded so both the `flux review` CLI
-/// command and the `review_code` journey ship it in the binary (no filesystem dependency at runtime).
-pub const STRICT_REVIEW_FLOW_SRC: &str = include_str!("../../../examples/strict_review.flux");
+/// The strict-review protocol's native-text source. Embedded as a crate asset so both the
+/// `flux review` CLI command and the `review_code` journey ship it in the binary with no repository
+/// or filesystem dependency at runtime. `examples/strict_review.flux` is the runnable public
+/// example of this protocol, not the source of the shipped default.
+pub const STRICT_REVIEW_FLOW_SRC: &str = include_str!("../assets/flows/strict-review.flux");
 
-/// The three built-in reviewer roles the flow's `task` fan-out targets, embedded from the SAME
-/// committed `.flux/agents/review-*.md` files (L-14). Built-in strict-review callers use these
-/// immutable definitions; project roles with the same names are ordinary agent roles and cannot
-/// replace this protocol. Without these in the binary, `flux review` failed "unknown role:
-/// review-security" in every repo but this one — the "self-contained, works in any repo" claim
-/// depends on the roles shipping alongside the flow.
+/// The three built-in reviewer roles the flow's `task` fan-out targets. Their immutable definitions
+/// are crate assets, not project `.flux/agents` files; project roles with the same names are ordinary
+/// agent roles and cannot replace this protocol. Without these in the binary, `flux review` failed
+/// "unknown role: review-security" in every repo but this one — the "self-contained, works in any
+/// repo" claim depends on the roles shipping alongside the flow.
 pub const REVIEW_ROLE_SOURCES: &[(&str, &str)] = &[
     (
         "review-security",
-        include_str!("../../../.flux/agents/review-security.md"),
+        include_str!("../assets/roles/review-security.md"),
     ),
     (
         "review-correctness",
-        include_str!("../../../.flux/agents/review-correctness.md"),
+        include_str!("../assets/roles/review-correctness.md"),
     ),
     (
         "review-maintainability",
-        include_str!("../../../.flux/agents/review-maintainability.md"),
+        include_str!("../assets/roles/review-maintainability.md"),
     ),
 ];
 
@@ -161,8 +160,8 @@ mod tests {
     #[test]
     fn builtin_review_roles_ship_the_three_reviewers_toolless() {
         // L-14: `flux review` must work in ANY repo — the three reviewer roles the flow's `task`
-        // fan-out targets ship in the binary. Each is the committed `.flux/agents/review-*.md`
-        // declaring `tools: []` (read-nothing reviewers).
+        // fan-out targets ship in the binary. Each is a crate asset declaring `tools: []`
+        // (read-nothing reviewers).
         let roles = builtin_review_roles();
         let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
@@ -181,7 +180,7 @@ mod tests {
                 r.name
             );
             assert!(
-                !r.prompt.trim().is_empty(),
+                !r.instructions.trim().is_empty(),
                 "{}: prompt body must be embedded",
                 r.name
             );

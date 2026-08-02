@@ -47,11 +47,12 @@ async fn main() -> Result<()> {
         name: "scout".into(),
         description: "read-only reconnaissance".into(),
         model: None, // inherit the spawner's default model
+        profile: flux_agent::AgentProfile::General,
         thinking: None,
         effort: None,
         agent_loop: None,
         tools: Some(Vec::new()), // a leaf with no tools — it just investigates and reports
-        prompt: "You are a scout. Investigate and report findings tersely.".into(),
+        instructions: "You are a scout. Investigate and report findings tersely.".into(),
     }]);
 
     // The tool surface children may be granted (empty here; a real consumer subsets its own ops).

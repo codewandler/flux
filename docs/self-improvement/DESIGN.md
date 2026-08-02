@@ -240,8 +240,9 @@ The loop is implemented in the L3 crate `flux-eval`, driven by the flux-flow eng
   static musl binary from *candidate* source so the eval measures the worker's edits; `multi.rs` is
   the `MultiAdapter` that grades several members behind one combined score; `mod.rs` wires them up.
 - `crates/flux-eval/terminal_bench/flux_agent.py` — the terminal-bench custom-agent shim (+ `flux-setup.sh`).
-- `crates/flux-agent/src/lib.rs` — flux's shipped `DEFAULT_SYSTEM_PROMPT` (a frequent, legitimate
-  improvement target); `crates/flux-tools` — its built-in tools.
+- `crates/flux-agent/assets/prompts/` — flux's shipped harness protocol, profiles, and conditional
+  operation guidance (frequent, legitimate improvement targets); `crates/flux-tools` — its built-in
+  tools.
 - Loop flow: `examples/improve-tbench.flux`. Offline smoke: `examples/eval-smoke.flux`.
   Sub-agent roles: `crates/flux-eval/agents/` (tracked) → seeded into `.flux/agents/` (gitignored) by the runner.
 

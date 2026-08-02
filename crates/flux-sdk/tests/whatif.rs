@@ -122,7 +122,7 @@ impl Provider for ScriptedMock {
 
 /// Branches on whether the REQUEST's system prompt contains `alt_marker` — same call-phase
 /// structure (intent → one native op → prose) on either branch, but a DIFFERENT op on the alt
-/// branch, so a `.system_prompt(alt)` re-plan genuinely diverges. Keyed per-system-text call count
+/// branch, so an `.instructions(alt)` re-plan genuinely diverges. Keyed per-system-text call count
 /// (not a single global counter) so the original recording and a same-provider counterfactual
 /// re-plan never interfere with each other's phase tracking.
 struct AltPlanMock {
@@ -366,10 +366,10 @@ async fn pure_substitution_costs_zero() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A `.system_prompt()` re-plan variant is honestly reported as non-hermetic, with the first
+/// An `.instructions()` re-plan variant is honestly reported as non-hermetic, with the first
 /// divergence localized to the statement whose op actually changed — never a faked complete diff.
 #[tokio::test]
-async fn system_prompt_replan_is_non_hermetic_with_a_localized_divergence() {
+async fn instructions_replan_is_non_hermetic_with_a_localized_divergence() {
     let dir = tmp_dir("replan-divergence");
     let bump = Arc::new(AtomicUsize::new(0));
     let audit = Arc::new(AtomicUsize::new(0));
@@ -395,7 +395,7 @@ async fn system_prompt_replan_is_non_hermetic_with_a_localized_divergence() {
 
     let cf = session
         .what_if()
-        .system_prompt(format!("You are a helpful agent. {alt_marker}"))
+        .instructions(format!("You are a helpful agent. {alt_marker}"))
         .run()
         .await
         .unwrap();
@@ -444,7 +444,7 @@ async fn off_tape_halt_latches_loudly_on_the_replan_path() {
 
     let cf = session
         .what_if()
-        .system_prompt(format!("You are a helpful agent. {alt_marker}"))
+        .instructions(format!("You are a helpful agent. {alt_marker}"))
         .off_tape(flux_sdk::whatif::OffTape::Halt)
         .run()
         .await
@@ -615,7 +615,7 @@ async fn an_equal_policy_stays_hermetic_and_serves_from_tape() {
 
 // --- D-182: re-plan path self-records served hits ----------------------------
 
-/// Failing-first (D-182): a `.system_prompt()` re-plan whose new plan happens to be BYTE-IDENTICAL
+/// Failing-first (D-182): an `.instructions()` re-plan whose new plan happens to be BYTE-IDENTICAL
 /// to the original — same op, same input — must be fully served from the frozen tape and diff as
 /// `identical`, not as a fake total divergence. Before the fix, the re-plan path drove
 /// `run_turn_pinned` with a bare `NullSink`: a served (non-live) dispatch is never recorded by the
@@ -652,7 +652,7 @@ async fn replan_with_an_identical_plan_is_fully_served_and_diffs_identical() {
 
     let cf = session
         .what_if()
-        .system_prompt("You are a differently-worded but non-alt agent.")
+        .instructions("You are a differently-worded but non-alt agent.")
         .run()
         .await
         .unwrap();
@@ -782,7 +782,7 @@ async fn off_tape_live_replan_records_both_served_and_live_cells() {
 
     let cf = session
         .what_if()
-        .system_prompt(format!("You are a helpful agent. {alt_marker}"))
+        .instructions(format!("You are a helpful agent. {alt_marker}"))
         .off_tape(flux_sdk::whatif::OffTape::Live)
         .run()
         .await
@@ -1002,10 +1002,10 @@ async fn replan_with_a_dead_node_substitution_refuses_before_minting_the_child()
 
     let session = record.open_session(&src).unwrap();
     let no_such_node = 9_999u32;
-    // A `system_prompt` change is what selects the re-plan path.
+    // An `instructions` change is what selects the re-plan path.
     let rendered = match session
         .what_if()
-        .system_prompt("You are a different agent.")
+        .instructions("You are a different agent.")
         .substitute_at(no_such_node, json!("should never be served"))
         .run()
         .await

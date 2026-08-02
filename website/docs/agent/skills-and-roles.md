@@ -143,6 +143,7 @@ reuse. The filename stem is the default role name:
 ```markdown
 ---
 description: Read-only repository reconnaissance
+profile: general
 model: haiku
 thinking: true
 effort: low
@@ -154,6 +155,9 @@ Inspect the requested area quickly. Do not modify files. Return evidence with pa
 
 - Omit `model` to inherit the parent's model. A role's `model` resolves against the parent's
   provider aliases.
+- `profile` defaults to `general`, so the Markdown body is authored instructions after Flux's
+  universal harness protocol. Set `profile: coding` only when the role should inherit the coding
+  lifecycle as well.
 - Omit `thinking` and `effort` to inherit the parent's reasoning policy. Set them explicitly to
   override it for that role (`effort`: `low`, `medium`, `high`, `xhigh`, or `max`).
 - Omit `tools` to inherit the tools available to the parent.
@@ -161,7 +165,12 @@ Inspect the requested area quickly. Do not modify files. Return evidence with pa
 - A listed tool is still subject to policy, approval, and the parent capability floor.
 
 The built-in roles (`scout`, `planner`, `worker`, `reviewer`, `evaluator`, and `summarizer`) are used
-when no file defines that name. Delegate with `task({role: "scout", task: "map the parser"})`.
+when no file defines that name. Their instructions are embedded Flux assets rather than repository
+policy. Delegate with `task({role: "scout", task: "map the parser"})`.
+
+`.agents/skills` and `.claude/skills` are compatibility discovery locations for reusable project
+skills. Their existence does not replace Flux's harness prompt and discovery does not activate a
+skill; only the activation paths described above inject its body.
 
 ## Related docs
 

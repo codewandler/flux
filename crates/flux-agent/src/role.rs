@@ -1,5 +1,5 @@
 //! Agent roles loaded from markdown (`.flux/agents/<name>.md`): frontmatter `description`/`model`/
-//! `tools` plus a body used as the role's system prompt. A [`Role`] is a file-defined agent
+//! `tools` plus a body used as the role's authored instructions. A [`Role`] is a file-defined agent
 //! definition; [`Role::to_spec`] turns it into an [`AgentSpec`](crate::AgentSpec).
 
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use flux_core::{Error, Result};
 use flux_provider::Effort;
 use serde::{Deserialize, Serialize};
 
-use crate::AgentSpec;
+use crate::{AgentProfile, AgentSpec};
 
 /// A sub-agent role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +20,9 @@ pub struct Role {
     /// Model override; `None` inherits the parent's model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional harness behavior after the mandatory core. General by default.
+    #[serde(default)]
+    pub profile: AgentProfile,
     /// Adaptive-thinking override; `None` inherits the parent's setting for spawned roles.
     #[serde(default)]
     pub thinking: Option<bool>,
@@ -33,12 +36,12 @@ pub struct Role {
     /// `Some([])` (an explicit empty list) grants none.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
-    /// The role's system prompt (markdown body).
-    pub prompt: String,
+    /// The role's authored instructions (markdown body).
+    pub instructions: String,
 }
 
 impl Role {
-    /// An [`AgentSpec`] for this role: the role body becomes the system prompt, `tools` becomes the
+    /// An [`AgentSpec`] for this role: the role body becomes authored instructions, `tools` becomes the
     /// tool selection, and the model falls back to `default_model` when the role doesn't override it.
     /// Turn settings (`max_tokens`, `max_iterations`, …) take spec defaults; the caller can override.
     pub fn to_spec(&self, default_model: &str) -> Result<AgentSpec> {
@@ -56,7 +59,8 @@ impl Role {
                 .model
                 .clone()
                 .unwrap_or_else(|| default_model.to_string()),
-            system_prompt: self.prompt.clone(),
+            profile: self.profile,
+            instructions: self.instructions.clone(),
             tools: self.tools.clone(),
             thinking: self.thinking.unwrap_or(false),
             effort: self.effort,
@@ -74,6 +78,7 @@ struct RoleFrontmatter {
     name: String,
     description: String,
     model: Option<String>,
+    profile: AgentProfile,
     thinking: Option<bool>,
     effort: Option<Effort>,
     #[serde(rename = "loop")]
@@ -115,11 +120,12 @@ fn try_parse_role_at(content: &str, name_fallback: &str, source: &str) -> Result
         description: meta.description,
         // an empty `model:` (null/blank) inherits the parent's model
         model: meta.model.filter(|m| !m.is_empty()),
+        profile: meta.profile,
         thinking: meta.thinking,
         effort: meta.effort,
         agent_loop: meta.agent_loop,
         tools: meta.tools,
-        prompt: body.trim().to_string(),
+        instructions: body.trim().to_string(),
     })
 }
 
@@ -130,11 +136,12 @@ pub fn parse_role(content: &str, name_fallback: &str) -> Role {
         name: name_fallback.to_string(),
         description: String::new(),
         model: None,
+        profile: AgentProfile::General,
         thinking: None,
         effort: None,
         agent_loop: None,
         tools: None,
-        prompt: flux_markdown::split_frontmatter(content)
+        instructions: flux_markdown::split_frontmatter(content)
             .1
             .trim()
             .to_string(),
@@ -309,19 +316,20 @@ mod tests {
     #[test]
     fn parses_role_frontmatter() {
         let r = parse_role(
-            "---\ndescription: fast recon\nmodel: haiku\nthinking: true\neffort: high\ntools: [read, grep, ls]\n---\nYou are a scout.",
+            "---\ndescription: fast recon\nmodel: haiku\nprofile: coding\nthinking: true\neffort: high\ntools: [read, grep, ls]\n---\nYou are a scout.",
             "scout",
         );
         assert_eq!(r.name, "scout");
         assert_eq!(r.description, "fast recon");
         assert_eq!(r.model.as_deref(), Some("haiku"));
+        assert_eq!(r.profile, AgentProfile::Coding);
         assert_eq!(r.thinking, Some(true));
         assert_eq!(r.effort, Some(flux_provider::Effort::High));
         assert_eq!(
             r.tools.as_deref(),
             Some(&["read".into(), "grep".into(), "ls".into()][..])
         );
-        assert_eq!(r.prompt, "You are a scout.");
+        assert_eq!(r.instructions, "You are a scout.");
     }
 
     #[test]
@@ -405,7 +413,7 @@ mod tests {
 
         trusted.extend_missing(project);
         let role = trusted.get("worker").unwrap();
-        assert_eq!(role.prompt, "trusted");
+        assert_eq!(role.instructions, "trusted");
         assert_eq!(role.tools, Some(Vec::new()));
     }
 
@@ -437,11 +445,16 @@ mod tests {
     }
 
     #[test]
-    fn to_spec_inherits_model_and_carries_tools() {
+    fn role_body_is_instructions_after_the_harness_core() {
         let r = parse_role("---\ntools: [read, grep]\n---\nBe terse.", "scout");
         let spec = r.to_spec("default-model").unwrap();
         assert_eq!(spec.model, "default-model"); // role omitted model → inherit
-        assert_eq!(spec.system_prompt, "Be terse.");
+        assert_eq!(spec.instructions, "Be terse.");
+        let prompt = spec.effective_system_prompt();
+        assert!(prompt.starts_with(crate::HARNESS_SYSTEM_PROMPT));
+        assert!(prompt.contains("kind=\"instructions\" trust=\"agent_author\""));
+        assert!(prompt.contains("Be terse."));
+        assert!(!prompt.contains(crate::CODING_PROFILE_PROMPT));
         assert_eq!(
             spec.tools.as_deref(),
             Some(&["read".into(), "grep".into()][..])

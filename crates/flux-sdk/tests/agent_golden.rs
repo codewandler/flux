@@ -156,7 +156,7 @@ fn the_committed_fixture_is_portable_and_redacted() {
 /// matches any recorded call — which is exactly why `check` counts the fall-through
 /// (`Report::model_live`) instead of quietly serving a stale answer.
 #[tokio::test]
-async fn editing_the_system_prompt_surfaces_a_plan_divergence() {
+async fn editing_the_agent_instructions_surfaces_a_plan_divergence() {
     let scenario = Scenario::load(fixture()).expect("load the golden");
     let dir = std::env::temp_dir().join(format!("flux-golden-prompt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -166,7 +166,7 @@ async fn editing_the_system_prompt_surfaces_a_plan_divergence() {
     let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let edited = Client::builder()
         .model("never")
-        .system_prompt("You are a COMPLETELY different agent than the one that recorded this.")
+        .instructions("You are a COMPLETELY different agent than the one that recorded this.")
         .storage(Storage::in_memory())
         .build(Box::new(CountingProseProvider(live_calls.clone())), &dir)
         .unwrap();

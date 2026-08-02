@@ -60,6 +60,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Agent context is now an owned, typed package instead of a caller-replaceable prompt** (A-147).
+  Every Flux agent keeps the embedded harness protocol; coding behavior is an explicit profile,
+  operation guidance is emitted only for visible operations, and repository policy/workspace state
+  carry provenance, freshness, hashes, and a body-free startup manifest. `AgentSpec.system_prompt`
+  is replaced by `profile` + `instructions`, `Role.prompt` becomes `Role.instructions`, role bodies
+  use the `general` profile by default, and app settings use `instructions` /
+  `instruction_files`. Root `AGENTS.md` is now a compact, host-agnostic repository contract;
+  Flux-owned prompts and built-in roles live in embedded assets.
+
 - **The ecosystem overview now reflects the shipped connector and Exchange boundaries** (C-455).
   It records dated v0.16.0/v0.13.0 source snapshots, replaces the obsolete claim that Exchange
   serves nothing with its OIDC/connection/grant/`invoke` inventory, and keeps the missing Flux

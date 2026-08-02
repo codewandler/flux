@@ -647,11 +647,52 @@ pub(super) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect the layered prompt context Flux would assemble in this workspace.
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
     /// Serve or inspect the guarded execution-system transport.
     System {
         #[command(subcommand)]
         action: SystemAction,
     },
+}
+
+/// `flux context …` — inspect prompt provenance without starting a model turn.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum ContextAction {
+    /// Show the ordered context manifest. Bodies are omitted unless explicitly requested.
+    Show {
+        /// Agent behavior profile to include after the universal harness protocol.
+        #[arg(long, value_enum, default_value_t)]
+        profile: ContextProfile,
+        /// Include conditional guidance for this visible operation (repeatable).
+        #[arg(long = "tool", value_name = "OP")]
+        tools: Vec<String>,
+        /// Include prompt bodies. The default manifest contains only metadata and hashes.
+        #[arg(long)]
+        body: bool,
+        /// Emit JSON instead of the compact table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ContextProfile {
+    General,
+    #[default]
+    Coding,
+}
+
+impl From<ContextProfile> for flux_agent::AgentProfile {
+    fn from(value: ContextProfile) -> Self {
+        match value {
+            ContextProfile::General => Self::General,
+            ContextProfile::Coding => Self::Coding,
+        }
+    }
 }
 
 /// `flux system …` — explicit operator control of the remote execution substrate.

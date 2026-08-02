@@ -238,8 +238,8 @@ if !cf.hermetic() {
 }
 ```
 
-The builder's variables: `.turn(n)` picks the turn, `.model(..)` and `.system_prompt(..)` re-plan
-under a different model or prompt, `.substitute(op, output)` / `.substitute_at(node, output)` swap
+The builder's variables: `.turn(n)` picks the turn, `.model(..)` and `.instructions(..)` re-plan
+under a different model or authored instruction set, `.substitute(op, output)` / `.substitute_at(node, output)` swap
 recorded outputs without any model call, and `.off_tape(Halt | Live)` chooses what happens when the
 re-run needs something the tape doesn't have — halt hermetically, or bridge to real IO through the
 full live envelope (real approver included).
@@ -259,7 +259,7 @@ and `cost(&pricing)`.
 ### The honesty contract
 
 Hermeticity is reported, never faked. A pure `substitute` is fully offline and produces a
-*complete* diff. A `model`/`system_prompt` variant is hermetic only up to the point where the
+*complete* diff. A `model`/`instructions` variant is hermetic only up to the point where the
 re-plan reads a different input — that miss *is* the causal boundary, and the API says so:
 `hermetic()` returns `false` and `first_divergence()` localizes it. The Lab never fabricates a
 complete diff past the point where the frozen world stopped explaining the run.

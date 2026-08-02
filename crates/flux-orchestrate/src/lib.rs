@@ -4223,11 +4223,12 @@ mod tests {
             name: "scout".into(),
             description: "recon".into(),
             model: None,
+            profile: flux_agent::AgentProfile::General,
             thinking: None,
             effort: None,
             agent_loop: None,
             tools: Some(Vec::new()),
-            prompt: "You are a scout.".into(),
+            instructions: "You are a scout.".into(),
         }]);
         assert_eq!(roles.names(), vec!["scout"]);
         let spawner = LocalSpawner::new(

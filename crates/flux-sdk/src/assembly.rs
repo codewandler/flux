@@ -3,7 +3,7 @@
 //! A [`crate::Client`] assembles its [`FlowEngine`] once, at [`ClientBuilder::build`](crate::ClientBuilder::build).
 //! But the Deterministic Agent Lab's Test Kit (`check()`/`inject_at`, and later Tune's `what_if`)
 //! needs a SECOND, throwaway engine — same tool catalog, same permissions, same authorization floor
-//! — with exactly one thing changed (a model, a system prompt, a provider), or pointed at an
+//! — with exactly one thing changed (a model, authored agent instructions, a provider), or pointed at an
 //! entirely different pair of stores (a fixture's temp work-dir copy) — without perturbing the live
 //! client's single-active-turn state or its own stores.
 //!
@@ -54,7 +54,7 @@ pub(crate) struct EngineAssembly {
 #[allow(dead_code)]
 pub(crate) struct VariantOverrides {
     pub(crate) model: Option<String>,
-    pub(crate) system_prompt: Option<String>,
+    pub(crate) instructions: Option<String>,
     pub(crate) provider: Option<Arc<dyn Provider>>,
     /// D-177: re-authorize the variant under a DIFFERENT permission rule set — the "would the
     /// tightened policy have blocked this?" knob. Replaces the spec's own `allow`/`deny` wholesale
@@ -90,8 +90,8 @@ impl EngineAssembly {
         if let Some(model) = overrides.model {
             spec.model = model;
         }
-        if let Some(system_prompt) = overrides.system_prompt {
-            spec.system_prompt = system_prompt;
+        if let Some(instructions) = overrides.instructions {
+            spec.instructions = instructions;
         }
         if let Some(permissions) = overrides.permissions {
             spec.permissions = permissions;

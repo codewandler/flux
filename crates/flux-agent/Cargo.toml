@@ -25,6 +25,7 @@ flux-tools.workspace = true
 flux-markdown.workspace = true
 serde.workspace = true
 serde_norway.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 flux-policy.workspace = true

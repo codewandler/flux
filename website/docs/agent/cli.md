@@ -48,6 +48,7 @@ and [Safety & approvals](./safety.md).
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
 | `flux insights [-m <provider/model>]` | derive today's sessions, outcomes, time, usage, operations, errors, approvals and subjects from the durable log, then narrate those redacted facts with one tool-free model call |
+| `flux context show` | inspect the ordered, body-free harness/profile/project context manifest (`--json`; add `--body` explicitly to print content, `--profile` / `--tool` to model conditional layers) |
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |

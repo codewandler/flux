@@ -86,7 +86,8 @@ pub use flux_agent::AgentExecutorConfig;
 /// The agent definition ([`ClientBuilder::from_spec`]) plus its permission rules. Re-exported so
 /// the full-control door needs no direct `flux-agent` dependency.
 pub use flux_agent::{
-    AdaptiveLoopPolicy, AgentLoopSpec, AgentSpec, AgentStagePolicy, BuiltinAgentLoop, Permissions,
+    AdaptiveLoopPolicy, AgentLoopSpec, AgentProfile, AgentSpec, AgentStagePolicy, BuiltinAgentLoop,
+    Permissions, PromptCacheClass, PromptLayer, PromptLayerKind, PromptManifestEntry, PromptTrust,
 };
 
 /// The per-turn token accounting carried on [`TurnOutput`]. Re-exported from `flux-core`.
@@ -516,9 +517,14 @@ impl ClientBuilder {
         self.spec.model = m.into();
         self
     }
-    /// Override the system prompt (defaults to the agent's built-in prompt).
-    pub fn system_prompt(mut self, s: impl Into<String>) -> Self {
-        self.spec.system_prompt = s.into();
+    /// Select optional behavior after the mandatory Flux harness protocol.
+    pub fn profile(mut self, profile: AgentProfile) -> Self {
+        self.spec.profile = profile;
+        self
+    }
+    /// Set caller-authored role/persona instructions without replacing the harness protocol.
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.spec.instructions = instructions.into();
         self
     }
     /// Cap the max output tokens per model call.
@@ -3477,12 +3483,12 @@ mod tests {
         // Generous limit: the fixture holds one session, and the bug adds a second.
         let before = events.list(1_000).unwrap().len();
 
-        // A `system_prompt` change is what selects the re-plan path; `NeverMock` panics if the
+        // An `instructions` change is what selects the re-plan path; `NeverMock` panics if the
         // refusal ever fails to fire and the live turn actually runs.
         let session = client.open_session(&sid).unwrap();
         let rendered = match session
             .what_if()
-            .system_prompt("You are a different agent.")
+            .instructions("You are a different agent.")
             .run()
             .await
         {
@@ -3531,7 +3537,7 @@ mod tests {
         let rendered = match session
             .what_if()
             .turn(99)
-            .system_prompt("You are a different agent.")
+            .instructions("You are a different agent.")
             .run()
             .await
         {

@@ -62,6 +62,12 @@ guide](./slack-channel.md) for creating the Slack app and its tokens.
 rendering, and compaction owned by that agent. Omit them for the default (`thinking false`, no effort
 hint); accepted effort values are `"low"`, `"medium"`, `"high"`, `"xhigh"`, and `"max"`.
 
+Program agents use Flux's small universal harness protocol and default to the `general` profile. The
+agent `description` is authored instructions after that protocol; it never replaces the harness.
+Select `profile "coding"` when the agent should also receive Flux's coding lifecycle. A longer
+persona can use `instructions "…"` instead of `description`, or load workspace-confined files with
+`instruction_files ["bot/PERSONA.md"]`.
+
 For deterministic, fixed-step work a trigger can run a **journey** — a named Flux-Lang flow — instead
 of an agent (`run <journey>` with no trigger-level `agent`). A journey may still declare `agent
 <name>` inside its own body: that supplies the execution context without giving the model control of

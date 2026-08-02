@@ -906,47 +906,6 @@ impl Provider for LazyProvider {
     }
 }
 
-/// Built-in sub-agent roles (used when `.flux/agents/*.md` doesn't define them).
-pub(super) const DEFAULT_ROLES: &[(&str, &str, &str)] = &[
-    (
-        "scout",
-        "Fast read-only codebase reconnaissance",
-        "You are a scout. Quickly investigate the codebase with read-only tools and return a \
-         compressed summary of relevant findings. Do not modify anything.",
-    ),
-    (
-        "planner",
-        "Produce a structured implementation plan",
-        "You are a planner. Analyze the task and return a concise, ordered list of concrete \
-         subtasks with any open questions. Do not modify files.",
-    ),
-    (
-        "worker",
-        "Execute a single well-scoped subtask",
-        "You are a worker. Execute the given subtask precisely using the available tools, then \
-         report what you changed.",
-    ),
-    (
-        "reviewer",
-        "Review changes for correctness",
-        "You are a reviewer. Inspect the described changes for bugs and issues and report your \
-         findings. Read-only.",
-    ),
-    (
-        "evaluator",
-        "Judge whether a goal is satisfied",
-        "You are a strict evaluator. Given a goal and the latest result, reply with exactly \
-         `SATISFIED` if the goal is fully met, otherwise `CONTINUE: <one concrete next \
-         instruction>`. Do not do the work yourself.",
-    ),
-    (
-        "summarizer",
-        "Condense a transcript",
-        "You are a summarizer. Condense the conversation so far into a compact set of durable \
-         facts, decisions, and open threads. Preserve file paths, names, and numbers. Be terse.",
-    ),
-];
-
 /// Load repository roles through a confined workspace, while preserving the existing precedence:
 /// trusted user-global control-plane roles override repository definitions, and built-ins fill only
 /// missing names. Malformed/unreadable repository roles are still fatal: silently skipping one
@@ -962,17 +921,18 @@ pub(super) fn load_roles(cwd: &std::path::Path) -> Result<RoleRegistry> {
         RoleRegistry::default()
     };
     reg.extend_missing(project);
-    for (name, desc, prompt) in DEFAULT_ROLES {
-        if reg.get(name).is_none() {
+    for role in flux_agent::BUILTIN_ROLE_ASSETS {
+        if reg.get(role.name).is_none() {
             reg.insert(Role {
-                name: (*name).to_string(),
-                description: (*desc).to_string(),
+                name: role.name.to_string(),
+                description: role.description.to_string(),
                 model: None,
+                profile: flux_agent::AgentProfile::General,
                 thinking: None,
                 effort: None,
                 agent_loop: None,
                 tools: None, // built-in roles inherit the parent's full toolset
-                prompt: (*prompt).to_string(),
+                instructions: role.instructions.trim_end().to_string(),
             });
         }
     }
@@ -1509,7 +1469,7 @@ struct EngineParts {
     executor: flux_runtime::Executor,
     events: Arc<EventStore>,
     model: String,
-    system_prompt: String,
+    prompt_layers: Vec<PromptLayer>,
     groups: Vec<flux_evidence::ToolGroup>,
     ambient_signals: Vec<String>,
     model_stages: std::collections::BTreeMap<String, flux_flow::ModelStageDefinition>,
@@ -1526,6 +1486,39 @@ struct EngineParts {
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     /// Host-owned responder installed on interactive surfaces only.
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
+}
+
+/// Capture the session-stable project layers shared by ordinary CLI assembly and `context show`.
+pub(super) async fn project_prompt_layers(cwd: &std::path::Path) -> Result<Vec<PromptLayer>> {
+    let layers = Projector::new()
+        .with(Box::new(EnvContext::new(cwd)))
+        .with(Box::new(GitContext::new(cwd)))
+        .with(Box::new(RepoSignal::new(cwd)))
+        .with(Box::new(ProjectFiles::new(cwd)))
+        .with(Box::new(ContextFragments::new(cwd)))
+        .try_layers()
+        .await
+        .context("load guarded project context")?
+        .into_iter()
+        .map(|layer| {
+            let kind = match layer.kind {
+                ContextLayerKind::RepositoryPolicy => PromptLayerKind::RepositoryPolicy,
+                ContextLayerKind::WorkspaceSnapshot => PromptLayerKind::WorkspaceSnapshot,
+            };
+            let trust = match layer.trust {
+                ContextLayerTrust::Repository => PromptTrust::Repository,
+                ContextLayerTrust::Data => PromptTrust::Data,
+            };
+            let mut prompt =
+                PromptLayer::new(layer.id, kind, trust, PromptCacheClass::Session, layer.body)
+                    .captured_at(layer.captured_at_unix_secs);
+            if let Some(source) = layer.source {
+                prompt = prompt.with_source(source);
+            }
+            prompt
+        })
+        .collect::<Vec<_>>();
+    Ok(layers)
 }
 
 /// Assemble the [`FlowEngine`] from the resolved parts: install the authored-loop host, load the
@@ -1545,7 +1538,7 @@ async fn assemble_engine(
         executor,
         events,
         model,
-        system_prompt,
+        prompt_layers,
         groups,
         ambient_signals,
         model_stages,
@@ -1558,7 +1551,9 @@ async fn assemble_engine(
     let flow = open_flow_store(events.clone())?;
     let spec = AgentSpec {
         model,
-        system_prompt,
+        profile: flux_agent::AgentProfile::Coding,
+        instructions: String::new(),
+        prompt_layers,
         skills,
         model_invoked_skills,
         max_tokens: flags.max_tokens,
@@ -1583,6 +1578,13 @@ async fn assemble_engine(
         // engine-identity fields.
         ..AgentSpec::default()
     };
+    executor.observe(flux_evidence::Observation::new(
+        "agent.context_manifest",
+        flux_evidence::Phase::Startup,
+        serde_json::json!({
+            "layers": spec.prompt_manifest_for_tools(&executor.registry().names())
+        }),
+    ));
     let mut agent = spec
         .into_engine(Arc::from(provider), executor, events, flow)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1674,15 +1676,7 @@ pub(super) async fn build_agent_with(
     // shape/stack, and project conventions (CLAUDE.md/AGENTS.md) — so the agent isn't cold-starting.
     // `ContextFragments` comes last so the always-loaded conventions land before the guidance that
     // only applies to what the working set is actually touching (A-97).
-    let system_prompt = Projector::new()
-        .with(Box::new(EnvContext::new(cwd.clone())))
-        .with(Box::new(GitContext::new(cwd.clone())))
-        .with(Box::new(RepoSignal::new(cwd.clone())))
-        .with(Box::new(ProjectFiles::new(cwd.clone())))
-        .with(Box::new(ContextFragments::new(cwd.clone())))
-        .try_system_prompt(DEFAULT_SYSTEM_PROMPT)
-        .await
-        .context("load guarded project context")?;
+    let prompt_layers = project_prompt_layers(&cwd).await?;
 
     // Authorization policy floor (built-in local grants + any config grants) and resolved
     // identity — shared by the top-level agent and the sub-agents it spawns.
@@ -2061,7 +2055,7 @@ pub(super) async fn build_agent_with(
             executor,
             events,
             model,
-            system_prompt,
+            prompt_layers,
             groups,
             ambient_signals,
             model_stages,

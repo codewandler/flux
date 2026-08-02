@@ -5,9 +5,10 @@ description: "What flux tells the agent about your repository before the first t
 
 # Project context
 
-Before your first message, flux assembles a picture of the exact directory where the session starts
-and folds it into the agent's system prompt, so the agent isn't cold-starting. That picture comes
-from an ordered chain of providers:
+Before your first message, flux assembles a typed context package for the exact directory where the
+session starts. The package is layered after Flux's embedded harness protocol, the selected agent
+profile, and any authored role instructions, so repository files cannot replace the harness-owned
+contract. Project context comes from an ordered chain of providers:
 
 | Source | What it contributes |
 |---|---|
@@ -16,6 +17,12 @@ from an ordered chain of providers:
 | Repo shape | Detected stack(s) and a top-level listing |
 | Conventions files | `CLAUDE.md`, `AGENTS.md`, `.flux/context.md` — read in full |
 | Guidance fragments | `.flux/context.d/*.md` — read only when they apply (see below) |
+
+Each contribution carries a stable id, a kind (`repository_policy` or `workspace_snapshot`), a trust
+class, a capture time, source path when applicable, byte count, and SHA-256 digest. Flux records a
+body-free `agent.context_manifest` observation at startup for audit tooling; the model receives the
+body in an explicit `<context ...>` block. These trust labels describe prompt provenance only—they
+do not grant runtime authority.
 
 Everything here is rooted at the launch/workspace directory. Flux does not walk upward to find a
 parent repository root or parent conventions file. Git itself may still recognize that the directory
@@ -29,10 +36,22 @@ cache-stable part of the prompt. Editing a conventions file mid-session has no e
 restart.
 :::
 
+Inspect the same ordered startup package without contacting a model or loading plugins:
+
+```bash
+flux context show
+flux context show --json
+flux context show --profile general --tool read --body
+```
+
+The default is body-free. `--body` is explicit because repository policy may contain private
+operational detail. Repeated `--tool` flags add only the embedded guidance for those visible
+operations; Flux does not claim an operation is available merely because prose mentions it.
+
 ## Conventions files
 
 Drop a `CLAUDE.md`, `AGENTS.md`, or `.flux/context.md` in the directory where you launch flux and its
-full contents join the prompt. If those files live at the repository root, launch from that root;
+full contents join the repository-policy layer. If those files live at the repository root, launch from that root;
 starting in a nested directory does not discover the parent copies. This is the right place for rules
 that apply to the whole workspace — code style, the test command, things never to do.
 
@@ -93,7 +112,10 @@ therefore ignored — including one pointing somewhere harmless inside the repo.
 
 ## Choosing where a rule goes
 
-- Applies to the whole repo, always → `AGENTS.md` (or `CLAUDE.md` / `.flux/context.md`).
+- Flux's universal runtime and operation protocol → an embedded `flux-agent` prompt asset. A project
+  must not copy or redefine it in `AGENTS.md`, `.agents/`, or `.claude/`.
+- Applies to the whole repo across coding agents → a short, host-agnostic `AGENTS.md` (or
+  `CLAUDE.md` / `.flux/context.md`).
 - Applies to one subsystem → a fragment with `globs:`.
 - Reference material the agent should consult on demand rather than always carry → a
   [skill](./skills-and-roles.md) instead.

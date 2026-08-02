@@ -32,7 +32,8 @@ tool-based and unchanged.
 ### A-19 · Context-block injection (`add_context`) — Agent pillar
 
 - `AgentSpec` grows `context: Vec<ContextBlock>` where `ContextBlock { id, title, meta, body }`
-  (`flux-agent/src/lib.rs`). At system-prompt assembly the blocks render, after `system_prompt`, as:
+  (`flux-agent/src/lib.rs`). At context-package assembly the blocks render, after the profile,
+  authored instructions, and repository layers, as:
   ```
   <knowledge-base id="hours" title="Opening hours">
   Mon–Fri 09:00–18:00 CET …
@@ -41,8 +42,8 @@ tool-based and unchanged.
   A byte budget bounds the total; over-budget content truncates with a visible marker (never a silent
   drop). Empty context changes the prompt not at all (cache-stable).
 - SDK: `FlowClient::builder().add_context(id, title, body)` and `AgentSpec::with_context(...)`.
-- App path: `flux-app/src/app.rs` `agent_spec_from_decl` renders injected blocks alongside the existing
-  `description`/`system_prompt`/`system_prompt_files` persona assembly.
+- App path: `flux-app/src/app.rs` `agent_spec_from_decl` renders injected blocks alongside the
+  `description`/`instructions`/`instruction_files` persona assembly.
 - Shared renderer `render_knowledge_blocks(records, budget) -> String` in
   `flux-capabilities::datasource`, so datasource records and hand-supplied context produce identical block
   text (a consumer injecting KB records reuses it).

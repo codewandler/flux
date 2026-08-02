@@ -1,13 +1,13 @@
 //! `context` — assembles project context from an ordered chain of providers (the `context` module
 //! of `flux-runtime`, folded in from the former `flux-context` crate).
 //!
-//! Each [`ContextProvider`] contributes an optional block; [`Projector::system_prompt`] appends
-//! them to a base prompt wrapped in `<context source="...">` tags. It ships project-file context
+//! Each [`ContextProvider`] contributes typed, ordered layers; [`Projector::try_system_prompt`]
+//! retains a compatibility renderer for callers that still need one string. It ships project-file context
 //! (`CLAUDE.md`/`AGENTS.md`/`.flux/context.md`), an environment summary, git working-tree state,
 //! repo shape, and path-scoped guidance fragments ([`ContextFragments`]).
 //!
-//! **Assembly happens once, at surface startup — not per turn.** The result is a `String` on
-//! `AgentSpec`, so every provider here runs exactly once per session and the whole block sits in
+//! **Assembly happens once, at surface startup — not per turn.** Every provider runs exactly once
+//! per session and its layer sits in
 //! the cache-stable prompt prefix. A provider that varied its output within a session would
 //! invalidate that prefix; scope any relevance filtering against a session-stable signal (as
 //! [`ContextFragments`] does with the git working set), never against per-turn state.
@@ -30,6 +30,75 @@ pub trait ContextProvider: Send + Sync {
     fn name(&self) -> &str;
     /// A formatted context block, or `None` if there's nothing to contribute.
     async fn render(&self) -> Result<Option<String>>;
+
+    /// Typed contributions for prompt assembly. Providers with one body use this default; providers
+    /// such as project conventions override it to retain per-source provenance.
+    async fn render_layers(&self) -> Result<Vec<ProjectedContextLayer>> {
+        Ok(self
+            .render()
+            .await?
+            .map(|body| {
+                ProjectedContextLayer::new(
+                    self.name(),
+                    ContextLayerKind::WorkspaceSnapshot,
+                    ContextLayerTrust::Data,
+                    body,
+                )
+            })
+            .into_iter()
+            .collect())
+    }
+}
+
+/// Semantic role of a startup context contribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLayerKind {
+    RepositoryPolicy,
+    WorkspaceSnapshot,
+}
+
+/// Authority class of startup context. This is prompt provenance, never an authorization grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLayerTrust {
+    Repository,
+    Data,
+}
+
+/// One typed, session-stable contribution emitted by the project-context projector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedContextLayer {
+    pub id: String,
+    pub kind: ContextLayerKind,
+    pub trust: ContextLayerTrust,
+    pub source: Option<String>,
+    pub captured_at_unix_secs: u64,
+    pub body: String,
+}
+
+impl ProjectedContextLayer {
+    pub fn new(
+        id: impl Into<String>,
+        kind: ContextLayerKind,
+        trust: ContextLayerTrust,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            trust,
+            source: None,
+            captured_at_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            body: body.into(),
+        }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
 }
 
 /// Reads well-known project-context files under `root`.
@@ -49,6 +118,34 @@ impl ProjectFiles {
             ],
         }
     }
+
+    async fn read_layers(&self) -> Result<Vec<ProjectedContextLayer>> {
+        let system = flux_system::System::new(flux_system::Workspace::new(&self.root)?);
+        let mut layers = Vec::new();
+        for file in &self.files {
+            let content = match system.read_file(file).await {
+                Ok(content) => content,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(Error::Config(format!(
+                        "project context `{file}` is unreadable or outside the workspace: {error}"
+                    )))
+                }
+            };
+            if !content.trim().is_empty() {
+                layers.push(
+                    ProjectedContextLayer::new(
+                        format!("repository.policy.{file}"),
+                        ContextLayerKind::RepositoryPolicy,
+                        ContextLayerTrust::Repository,
+                        content.trim_end(),
+                    )
+                    .with_source(file),
+                );
+            }
+        }
+        Ok(layers)
+    }
 }
 
 #[async_trait]
@@ -58,30 +155,19 @@ impl ContextProvider for ProjectFiles {
     }
 
     async fn render(&self) -> Result<Option<String>> {
-        // Project files are repository-controlled inputs. Build a deliberately confined workspace
-        // here instead of borrowing the agent's possibly widened (`--add-dir`/`--allow-all-paths`)
-        // tool workspace: automatic prompt context must never inherit an operator's tool-path
-        // escape hatch.
-        let system = flux_system::System::new(flux_system::Workspace::new(&self.root)?);
         let mut out = String::new();
-        for f in &self.files {
-            let content = match system.read_file(f).await {
-                Ok(content) => content,
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(Error::Config(format!(
-                        "project context `{f}` is unreadable or outside the workspace: {error}"
-                    )))
-                }
-            };
-            if !content.trim().is_empty() {
-                if !out.is_empty() {
-                    out.push_str("\n\n");
-                }
-                out.push_str(&format!("## {f}\n{}", content.trim_end()));
+        for layer in self.read_layers().await? {
+            if !out.is_empty() {
+                out.push_str("\n\n");
             }
+            let source = layer.source.as_deref().unwrap_or(&layer.id);
+            out.push_str(&format!("## {source}\n{}", layer.body));
         }
         Ok((!out.is_empty()).then_some(out))
+    }
+
+    async fn render_layers(&self) -> Result<Vec<ProjectedContextLayer>> {
+        self.read_layers().await
     }
 }
 
@@ -421,6 +507,23 @@ impl ContextProvider for ContextFragments {
         }
         Ok((!out.is_empty()).then_some(out))
     }
+
+    async fn render_layers(&self) -> Result<Vec<ProjectedContextLayer>> {
+        Ok(self
+            .render()
+            .await?
+            .map(|body| {
+                ProjectedContextLayer::new(
+                    "repository.policy.fragments",
+                    ContextLayerKind::RepositoryPolicy,
+                    ContextLayerTrust::Repository,
+                    body,
+                )
+                .with_source(FRAGMENT_DIR)
+            })
+            .into_iter()
+            .collect())
+    }
 }
 
 /// Orders providers and projects them into a system prompt.
@@ -439,26 +542,33 @@ impl Projector {
         self
     }
 
+    /// Build typed, ordered session-start context without flattening provenance into one string.
+    pub async fn try_layers(&self) -> Result<Vec<ProjectedContextLayer>> {
+        let mut layers = Vec::new();
+        for provider in &self.providers {
+            layers.extend(provider.render_layers().await?);
+        }
+        Ok(layers)
+    }
+
     /// Build the full system prompt: `base` followed by each provider's block. Provider failures
     /// are returned to the caller so a repository-controlled guard error cannot silently look like
     /// an absent optional file.
     pub async fn try_system_prompt(&self, base: &str) -> Result<String> {
         let mut out = base.to_string();
-        for p in &self.providers {
-            if let Some(block) = p.render().await? {
-                out.push_str(&format!(
-                    "\n\n<context source=\"{}\">\n{}\n</context>",
-                    p.name(),
-                    block
-                ));
-            }
+        for layer in self.try_layers().await? {
+            out.push_str(&format!(
+                "\n\n<context source=\"{}\">\n{}\n</context>",
+                layer.source.as_deref().unwrap_or(&layer.id),
+                layer.body
+            ));
         }
         Ok(out)
     }
 
     /// Compatibility wrapper for callers that deliberately tolerate unavailable auxiliary
-    /// context. Production agent assembly uses [`Self::try_system_prompt`] so guard failures are
-    /// fail-closed.
+    /// context. Production agent assembly uses [`Self::try_layers`] so guard failures are
+    /// fail-closed without flattening provenance.
     #[deprecated(note = "use try_system_prompt so context guard failures are surfaced")]
     pub async fn system_prompt(&self, base: &str) -> String {
         self.try_system_prompt(base)
@@ -719,7 +829,7 @@ mod tests {
         let sys = projector.try_system_prompt("BASE").await.unwrap();
         assert!(sys.starts_with("BASE"));
         assert!(sys.contains("<context source=\"environment\">"));
-        assert!(sys.contains("<context source=\"project-files\">"));
+        assert!(sys.contains("<context source=\"AGENTS.md\">"));
         assert!(sys.contains("Project rules here."));
         std::fs::remove_dir_all(&dir).ok();
     }
