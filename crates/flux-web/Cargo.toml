@@ -7,6 +7,13 @@ repository.workspace = true
 homepage.workspace = true
 description = "flux native web capabilities: arbitrary HTTP (http.request), readable-markdown fetch, and non-visual browser use — all under one scoped `web` egress policy"
 
+[features]
+default = []
+# PDF extraction is opt-in because the first lopdf line with the recursive-object depth fix requires
+# Rust 1.88. The rest of flux-web keeps the workspace's 1.87 MSRV; enabling this feature raises the
+# feature-specific floor by one compiler release rather than exposing the vulnerable older parser.
+pdf = ["dep:pdf-extract"]
+
 [dependencies]
 flux-core.workspace = true
 flux-runtime.workspace = true
@@ -36,8 +43,9 @@ tokio.workspace = true
 scraper = "0.25"
 # Pure-Rust PDF text extraction (D-161): `web.fetch` returns extracted text for PDF responses instead
 # of a raw lossy byte dump. No native pdfium / C deps — it walks the PDF with `lopdf` + font parsers.
-# 0.12 requires a lopdf line that uses let-chains newer than Rust 1.87.
-pdf-extract = "0.10"
+# 0.12 is the first line using lopdf's recursive-object depth bound (RUSTSEC-2026-0187); never
+# restore the vulnerable 0.10 line merely to lower the compiler floor.
+pdf-extract = { version = "0.12", optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

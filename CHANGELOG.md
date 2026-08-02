@@ -68,12 +68,19 @@ All notable changes to this project are documented in this file. The format is b
   serves nothing with its OIDC/connection/grant/`invoke` inventory, and keeps the missing Flux
   client binding, agent authentication, `subscribe`, hosted channels, workflows, and execution
   records explicit.
+
 ### Fixed
+
+- **Default web.fetch no longer links the PDF parser affected by RUSTSEC-2026-0187** (C-494).
+  Detected PDF bodies stay opaque unless the new pdf feature is enabled; that feature uses the
+  fixed parser line and has a Rust 1.88 feature-specific floor, while the default workspace keeps
+  its declared Rust 1.87 MSRV.
 
 - **The default workspace builds on the declared Rust 1.87 MSRV again** (C-493). Registry-only
   dependency lines for bundled SQLite, PostgreSQL, plugin archives, HTML/PDF extraction, terminal
   stability macros, and Slack serialization stay on their last compatible releases. This repairs
   the published compatibility promise without raising it or introducing a path/git override.
+
 ## [0.52.1] - 2026-08-02
 
 ### Added

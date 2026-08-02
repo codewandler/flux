@@ -59,11 +59,17 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   non-coding persona; `Role.prompt` is now `Role.instructions`. Program-agent settings use
   `instructions` and `instruction_files`; the old `system_prompt` names fail with a migration
   message instead of silently removing Flux's harness protocol.
+
 ### Fixed
+
+- **Default web fetches no longer parse PDFs with an unsafe dependency.** PDF bodies are detected
+  and kept opaque unless the optional safe PDF extractor is enabled. Ordinary HTML and HTTP fetches
+  are unchanged.
 
 - **Flux builds on Rust 1.87 again.** Several dependency updates had started requiring newer
   compilers even though Flux still promised 1.87. The affected database, archive, document,
   terminal, and channel dependencies are back on compatible lines; no toolchain upgrade is needed.
+
 ## [0.52.1] - 2026-08-02
 
 ### Improved

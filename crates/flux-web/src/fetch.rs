@@ -71,12 +71,21 @@ impl WebFetchTool {
 #[async_trait]
 impl Tool for WebFetchTool {
     fn spec(&self) -> ToolSpec {
+        #[cfg(feature = "pdf")]
         let mut description = String::from(
             "Read a web page as a readable document: HTML is returned as condensed markdown \
              (navigation, scripts, and boilerplate stripped) and PDFs are returned as extracted \
              text; other non-HTML content is returned raw. Pass `raw: true` for the unprocessed \
              body. Use this to read a page; for calling an API prefer `http.request`. \
              Loopback/private addresses are blocked unless the `web` egress scope grants them.",
+        );
+        #[cfg(not(feature = "pdf"))]
+        let mut description = String::from(
+            "Read a web page as a readable document: HTML is returned as condensed markdown; \
+             PDF bodies are identified but omitted because this build has no PDF extractor; \
+             other non-HTML content is returned raw. Pass raw: true for the unprocessed body. \
+             Use this to read a page; for calling an API prefer http.request. Loopback/private \
+             addresses are blocked unless the web egress scope grants them.",
         );
         if self.records.is_some() {
             // Disclose the durable side effect in the model-facing spec too (C-58): a read here also
@@ -219,12 +228,18 @@ impl Tool for WebFetchTool {
             let md = condense::html_to_markdown(&body);
             cap_str(md, MAX_BYTES)
         } else if is_pdf {
+            #[cfg(feature = "pdf")]
             // Extract text, capped exactly like the HTML branch. A malformed/truncated/text-less PDF
             // falls back to the raw pass-through rather than erroring the whole fetch.
-            match extract_pdf_text(&capped.bytes) {
+            let rendered = match extract_pdf_text(&capped.bytes) {
                 Some(text) => cap_str(text, MAX_BYTES),
                 None => cap_str(body, MAX_BYTES),
-            }
+            };
+            #[cfg(not(feature = "pdf"))]
+            let rendered = String::from(
+                "[PDF content omitted: this build does not enable the safe pdf extraction feature]",
+            );
+            rendered
         } else {
             cap_str(body, MAX_BYTES)
         };
@@ -325,6 +340,7 @@ fn looks_like_pdf(bytes: &[u8]) -> bool {
 /// Extract readable text from PDF bytes. Returns `None` on any failure — an extraction error, a
 /// panic from a malformed PDF (`pdf-extract` panics on some inputs), or an empty result — so the
 /// caller falls back to the raw pass-through instead of erroring or emptying the whole fetch.
+#[cfg(feature = "pdf")]
 fn extract_pdf_text(bytes: &[u8]) -> Option<String> {
     let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(bytes)
@@ -645,6 +661,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn pdf_body_is_returned_as_extracted_text() {
         // A PDF served with the honest content-type comes back as extracted text — not the raw
@@ -664,6 +681,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn pdf_extracted_via_magic_byte_sniff_when_mislabeled() {
         // Same bytes, but served as `application/octet-stream` (a common mislabel / absent type):
@@ -677,6 +695,25 @@ mod tests {
             r.content
         );
         assert!(!r.content.contains("%PDF"), "no raw bytes: {}", r.content);
+    }
+
+    #[cfg(not(feature = "pdf"))]
+    #[tokio::test]
+    async fn a_pdf_is_opaque_when_the_safe_extractor_is_not_enabled() {
+        let base = one_shot_bytes(
+            "application/octet-stream",
+            make_pdf("REMOTE PDF TEXT MUST NOT LEAK RAW"),
+        )
+        .await;
+        let t = tool(PrivateNetAllow::Any, None);
+        let r = t.execute(&ctx(), json!({ "url": base })).await.unwrap();
+        assert!(r.content.contains("PDF content omitted"), "{}", r.content);
+        assert!(!r.content.contains("%PDF"), "no raw header: {}", r.content);
+        assert!(
+            !r.content.contains("REMOTE PDF TEXT MUST NOT LEAK RAW"),
+            "no embedded content: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
