@@ -2,8 +2,8 @@
 id: C-399
 title: "A remote implementation of the guarded-IO port"
 pillar: Core
-status: ready
-priority: 10
+status: done
+priority: 4
 design: docs/designs/execution-substrate.md
 epic: execution-substrate
 note: "OWNERSHIP DECIDED 2026-08-01: flux owns it, flux-exchange reuses it. flux must be able to do this locally as dev without depending on a service — that is the local-first principle, not a convenience"
@@ -18,13 +18,67 @@ operations somewhere other than its own process while the guarantees stay stated
 
 ## Acceptance
 
-- [ ] a port implementation whose failure modes are distinguishable — a refused operation
+- [x] a port implementation whose failure modes are distinguishable — a refused operation
       and an unreachable delegate must not collapse into one error, since an operator responds to
       them in opposite ways.
-- [ ] fail-closed on every optional operation the delegate does not serve.
+- [x] fail-closed on every optional operation the delegate does not serve.
 
 ## Progress
-- (not started)
+
+**Landed** as `crates/flux-system/src/remote.rs` — `RemoteSystem` serves all four port families by
+handing each operation to a `Delegate`, plus `Loopback` for the in-process far side. Test:
+`crates/flux-system/tests/remote_port_failure_modes.rs` (12 tests, an out-of-crate consumer on
+purpose — a unit test inside the crate could pass while the seam stayed private).
+
+**Three** failure modes, not two. The Acceptance names a refusal and an unreachable delegate;
+implementing it surfaced a third that neither covers and that collapses just as misleadingly:
+*unserved* — the delegate does not implement the operation at all. An operator retries an
+unreachable link, fixes a refusal, and must **implement** an unserved operation; folding it into
+either of the other two sends them somewhere useless. `FailureMode` therefore has three variants
+and `failure_mode(&Error)` recovers which.
+
+**The classification is structural, not textual.** A delegate returns `Answer::Refused` or
+`Err(Unreachable)` — different positions in the type. Only a transport can construct `Unreachable`,
+and `settle` stores the result in `flux_core::Error::GuardedIo` with a typed
+`GuardedIoFailure`. The diagnostic prefix is presentation only, so a delegate whose refusal reason
+begins with the exact unreachable or unserved prefix still classifies as a refusal
+(`a_delegates_wording_cannot_forge_the_other_failure_mode`). Without this, delegate-authored text
+would be able to send an operator to investigate a healthy network.
+
+**No wire format, deliberately.** `Delegate` is a Rust trait; no serialization, transport or
+dependency was added to `flux-system` (its dependency set is still `flux-core` + `tokio` + `url`).
+That keeps `docs/designs/remote-agents.md`'s open question — channel API or port delegation — open,
+and keeps this story to the failure semantics its Acceptance is about.
+
+**The seam nevertheless crosses a real byte wire in its public-surface test.** A test-owned
+length-prefixed protocol implements `Delegate` over `tokio::io::DuplexStream`; the requested path
+and returned file bytes cross the stream, and closing its far side classifies structurally as
+`Unreachable`. That proves an external consumer can supply a transport without making the test
+protocol a product decision. A second compile-and-run proof passes an
+`Arc<dyn GuardedSubstrate>` through `RemoteSystem::loopback`, which is the erased shape a substrate
+registry naturally holds.
+
+**Local-first, verified.** `RemoteSystem::loopback` exercises the whole delegation path with nothing
+running, and a `Loopback` never reports an unreachable link because there is no link to break.
+
+**Two knock-on fixes in `port.rs`:** unserved denials now use the same typed guarded-IO error as the
+remote backend (`port::UNSERVED` remains only the canonical display spelling), and
+`run_with_stdin`/`spawn_background` build their denials through `deny()` instead of hand-writing the
+same prefix — two literals that had already drifted out of the one-spelling rule.
+
+**The reviewed cost was paid**, as the ownership decision said it would be: four entries in
+`flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` allow-list, with the review
+rationale recorded beside them. C-467 also repaired the gate's pre-existing omission of
+`GuardedWorkspaceFiles` and pinned its trait census against `port.rs`.
+
+### Not done, and why
+
+- **`GuardedEnv::env` cannot carry the distinction.** It returns `Option<String>`, so both failure
+  modes fail the credential closed as `None` — right for the caller, useless for the operator.
+  `RemoteSystem::env_checked` is the inherent escape hatch that keeps them apart; widening the
+  `GuardedEnv` trait was not this story's to do.
+- **No network delegation.** There is no guarded-network port trait yet (C-435), so egress is absent
+  from `Delegate` rather than approximated in it.
 
 ## Notes
 - `crates/flux-system/src/port.rs` names *"a remote executor"* among the substrates the port exists

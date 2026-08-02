@@ -26,7 +26,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'Fundamentals',
-      items: ['concepts', 'ecosystem', 'infrastructure'],
+      items: ['concepts', 'ecosystem', 'infrastructure', 'topologies'],
     },
     {
       type: 'category',
@@ -41,6 +41,7 @@ const sidebars = {
             'agent/providers',
             'agent/claude-code',
             'agent/project-context',
+            'agent/context-management',
             'agent/skills-and-roles',
             'agent/claude-compat',
           ],

@@ -197,6 +197,12 @@ impl LocalSpawner {
     /// turn, and the task-local exemption that covers the nested `task` does not cross the spawn the
     /// child is reached through. That reasoning, and why marking delegating ops does not fix it, is on
     /// [`ResourceLimits::independent_copy`].
+    ///
+    /// **k is bounded separately (C-444).** [`ResourceLimits::with_max_live_agents`] caps how many
+    /// agents in this tree may be live at once, and unlike the semaphore that census *is* shared with
+    /// every child — [`LocalSpawner::spawn`] takes a place from it and holds it for the child's whole
+    /// turn. Sharing is sound there because it refuses rather than queues. With both set the tree total
+    /// is `N × max_live_agents`; with only the per-agent number set, it is still unbounded.
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = limits;
         self
@@ -325,6 +331,17 @@ impl Spawner for LocalSpawner {
             .roles
             .get(role_name)
             .ok_or_else(|| Error::Other(format!("unknown role: {role_name}")))?;
+
+        // C-444: claim this child's place in the TREE-WIDE agent census before building anything.
+        // `max_concurrent_tool_calls` is per agent (see `ResourceLimits::independent_copy` for the
+        // deadlock that forces it), so without a bound on the agent count the tree's total was
+        // unbounded — N per agent × k children. The census is the bound on k, and it is shared across
+        // this boundary rather than copied. Held for the whole child turn: `_census_slot` drops when
+        // this function returns, on the error paths and the cancel path alike.
+        let _census_slot = self
+            .resource_limits
+            .admit_agent()
+            .map_err(|refusal| Error::Other(refusal.message()))?;
 
         let provider = (self.provider_factory)()?;
         // Captured before the provider moves into the child engine: the canonical-spec stamp on
@@ -1445,6 +1462,50 @@ mod tests {
             .spawn(SpawnRequest::new("nope", "x"), &cancel)
             .await
             .is_err());
+    }
+
+    /// C-444's load-bearing wiring proof: the tree census is enforced at the actual spawn seam, not
+    /// merely stored and unit-tested inside `ResourceLimits`. With a ceiling of one the root occupies
+    /// the only place, so the child is refused before a provider is even constructed.
+    #[tokio::test]
+    async fn the_tree_agent_ceiling_refuses_at_the_spawner_boundary() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ndescription: recon\ntools: [read]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = provider_calls.clone();
+        let spawner = LocalSpawner::new(
+            Arc::new(move || {
+                observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(MockProvider))
+            }),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_resource_limits(flux_runtime::ResourceLimits::new().with_max_live_agents(1));
+
+        let error = spawner
+            .spawn(
+                SpawnRequest::new("scout", "must not start"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("the root already occupies the only live-agent place");
+
+        assert!(
+            error.to_string().contains("tree-wide ceiling of 1"),
+            "the refusal must name the binding ceiling: {error}"
+        );
+        assert_eq!(
+            provider_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the census must refuse before provider construction or child-engine work"
+        );
     }
 
     /// C-117 failing-first (the live repro): a persisted composite requiring ops outside a

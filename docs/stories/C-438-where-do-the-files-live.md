@@ -3,7 +3,7 @@ id: C-438
 title: "Where do the files live — the question that decides whether a remote agent is usable for coding"
 pillar: Core
 status: ready
-priority: 7
+priority: 5
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-system, docs]

@@ -501,11 +501,14 @@ See the [HTTP API](../agent/http-api.md) and
 
 ### Model, context and cost
 
+What these three actually bound, and what flux deliberately does not manage, is explained in
+[Context management](../agent/context-management.md).
+
 | Variable | Effect |
 |---|---|
 | `FLUX_TURN_TOKEN_BUDGET` | Per-turn token budget. |
-| `FLUX_COMPACT_CHARS` | Character threshold that triggers history compaction. |
-| `FLUX_TOOL_OUTPUT_CAP` | Maximum characters of a single tool result kept in context. |
+| `FLUX_COMPACT_CHARS` | Character threshold (of serialized history) that triggers history compaction; `0` disables it. Default `48000`. Not a fraction of the model's context window — the same count applies to every model. |
+| `FLUX_TOOL_OUTPUT_CAP` | Maximum characters of a single tool result kept in context (default `20000`; `0` disables trimming). |
 | `FLUX_CACHE_TAIL` | Tunes the prompt-cache tail boundary. |
 | `FLUX_BEDROCK_HAIKU_PROFILE` | Bedrock inference profile used for the small/fast model. |
 | `FLUX_CODEX_WS` | Toggles the Codex provider's WebSocket transport. |

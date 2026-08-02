@@ -101,7 +101,7 @@ pub(super) fn draw(
             vp.cols,
         ));
     }
-    tally.drew(rows.len().saturating_sub(usize::from(start > 0)));
+    tally.drew(rows.iter().skip(usize::from(start > 0)).map(|f| f.step.id));
 
     // The one place the thread can put context it has no column for.
     if out.len() < vp.rows.saturating_sub(tally.footer_rows()) {

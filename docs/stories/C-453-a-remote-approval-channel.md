@@ -2,8 +2,8 @@
 id: C-453
 title: "No approver in the tree speaks over a network — a served agent can only allow everything or deny everything"
 pillar: Core
-status: ready
-priority: 4
+status: in-progress
+priority: 2
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-runtime, flux-server]
@@ -32,6 +32,15 @@ shipped remote surface the middle stage does not exist:
 
 So `flux app run --serve` is not "the envelope with a remote UI"; it is the envelope with its human
 stage removed. C-440's implementor hit the same wall independently while writing the topologies page.
+
+⚠ **And the "deny everything" half is not even that.** C-440 found, while tracing the same path:
+`flux app run <program>` **without** `--yes` is not actually protected by `DenyApprover` in practice —
+`assemble_integrations` spawns plugin binaries *before* any journey runs, and a program with no
+capability policy runs under `LEGACY_JOURNEY_ALLOW`, whose pre-authorised ops never reach the approver
+at all. That is why C-410 pinned this surface to the sandbox floor. So the honest statement of today's
+behaviour is **not** "allow-all or deny-all" — it is "allow-all, or deny-all-except-what-was-
+pre-authorised-and-whatever-a-plugin-binary-does-at-startup." Fixing the remote-approval gap should
+state that plainly rather than inheriting the tidier description.
 
 ⚠ `docs/designs/ecosystem.md:122-127` anticipated this as the reason not to fuse runtime and system:
 *"fusing them would force every consumer of the substrate to also take flux's approval model — including

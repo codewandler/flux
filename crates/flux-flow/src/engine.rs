@@ -4698,6 +4698,91 @@ mod tests {
         ValidHistory::new(after).expect("compaction must leave a valid provider history");
     }
 
+    /// C-443: compaction leaves a durable record, and the record carries the replacement.
+    ///
+    /// A-145's sweep of a 112,114-event store found **zero** `Compacted` rows, which left three
+    /// readings open: the threshold is never reached, compaction is disabled, or it replaces the
+    /// history *without recording that it did*. The third would be a correctness bug — every
+    /// replay, export and projection would read a truncated past while believing it complete.
+    ///
+    /// This pins the answer against the **automatic** path, the one an ordinary session takes:
+    /// `TurnProgram::Adaptive` runs `compaction_attempt` before the loop body, not the `/compact`
+    /// command that [`compaction_never_writes_a_user_after_user_history`] drives. It holds the log
+    /// to both halves of the guarantee — the `Compacted` event carries the messages that replaced
+    /// the history, and the superseded messages stay on the stream — so the log can still answer
+    /// "what is the history now" *and* "what was replaced" after the projection has moved on.
+    #[tokio::test]
+    async fn an_adaptive_turn_past_the_threshold_records_a_durable_compacted_event() {
+        // A loop that answers without a provider call, so the one scripted response is consumed by
+        // compaction's summary request and nothing else.
+        let loop_spec = AgentLoopSpec::parse("flow custom -> string\n  return \"answer\"")
+            .expect("custom loop parses");
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose("earlier: we discussed pandas")])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        // Threshold 1 char: any real conversation is over it.
+        let (engine, events) = assemble_test_engine_with_compaction(provider, loop_spec, 1);
+        let engine = engine.unwrap();
+        let session = events.create_session("scripted/test-model").unwrap();
+
+        // Four messages in strict alternation, then a fifth turn to cross the threshold on.
+        let mut log = SessionLog::open(&events, &session).unwrap();
+        for i in 0..2 {
+            log.open_turn(Message::user_text(format!("u{i}"))).unwrap();
+            log.close_turn(AssistantMessage::text(format!("a{i}")).unwrap())
+                .unwrap();
+        }
+        drop(log);
+
+        let mut sink = CollectSink::default();
+        engine
+            .run_turn_cancellable(&session, "u2", &mut sink, &CancellationToken::new())
+            .await
+            .expect("the turn runs");
+
+        let stream = events.conversation_delta(&session, -1).unwrap();
+        let compacted: Vec<&Vec<Message>> = stream
+            .iter()
+            .filter_map(|event| match &event.kind {
+                flux_events::EventKind::Compacted { messages } => Some(messages),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            compacted.len(),
+            1,
+            "an adaptive turn past the threshold records exactly one Compacted event"
+        );
+        // What the history became: the event carries the replacement, not just a marker that
+        // something was dropped.
+        let replacement = compacted[0];
+        assert!(
+            replacement
+                .first()
+                .is_some_and(|m| m.text().starts_with("[summary of earlier conversation]")),
+            "the Compacted event carries the replacement messages: {:?}",
+            replacement.iter().map(|m| m.text()).collect::<Vec<_>>()
+        );
+        // What it replaced: the superseded messages stay on the append-only stream, so the log
+        // still answers the question the projection no longer can.
+        assert!(
+            stream.iter().any(|event| matches!(
+                &event.kind,
+                flux_events::EventKind::Message(m) if m.text() == "u0"
+            )),
+            "the superseded prefix is still on the stream"
+        );
+        assert!(
+            !events
+                .conversation(&session)
+                .unwrap()
+                .iter()
+                .any(|m| m.text() == "u0"),
+            "…and the projection has moved past it"
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_keeps_a_valid_user_assistant_session_shape() {
         let provider: Arc<dyn Provider> = Arc::new(PendingProvider);

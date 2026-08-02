@@ -3,7 +3,7 @@ id: C-439
 title: "Trusting a remote substrate — an unauthenticated endpoint, and a remote that lies about what it did"
 pillar: Core
 status: ready
-priority: 7
+priority: 5
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-system, flux-auth, flux-evidence]

@@ -6,7 +6,88 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Every guarded-IO port backend is now review-enumerated** (C-467). The codegate previously
+  recognized process, host-file and environment backends but silently ignored
+  `GuardedWorkspaceFiles`, the trait that claims workspace confinement. It now rejects an
+  unreviewed workspace backend, resolves renamed imports to the canonical trait, and compares its
+  guarded-trait list with `flux-system`'s declarations so a fifth port cannot recreate the gap.
+
+- **The SDK autonomous posture now carries fail-closed confinement and a finite delegated-tree
+  budget** (C-444, C-470). `ClientBuilder` and `FlowClientBuilder` resolve blanket
+  `auto_approve(true)` and every injected opaque `Approver` to sandbox `Require` with the sandbox
+  network closed, plus `ResourceLimits::autonomous()`, unless the embedder explicitly pins a
+  sandbox or resource-limit decision. The preset bounds tool concurrency per agent, live agents per
+  tree, retained results, and evidence payloads. This is a **breaking pre-1.0 change**: an embedder
+  that previously relied on ambient `Off` or unbounded defaults must now state that choice.
+  Failing-first tests cover blanket and custom approval, both SDK doors resolve the same binding
+  posture, and a mutation-pinned `LocalSpawner` test proves the tree census is enforced before child
+  provider construction.
+
 ### Added
+
+- **The guarded-IO port now has a local-first delegating backend** (C-399). `RemoteSystem` hands
+  process, environment, host-file and workspace-file operations to a `Delegate`, while `Loopback`
+  exercises the same path over an in-process substrate with no service running. Refused,
+  unreachable and unserved operations remain structurally distinct in `flux_core::Error`; a path or
+  delegate reason beginning with another mode's exact diagnostic cannot forge the classification,
+  and an empty delegate fails every optional operation closed. This deliberately defines no wire
+  format or network transport—the consumer supplies one without creating a second IO path.
+
+- **A context-management page that matches the compaction the code implements** (C-441). The mechanism
+  shipped long ago and its entire user-facing documentation was **one row in a config table**
+  (`FLUX_COMPACT_CHARS`), so the question every user asks — *what happens when the conversation gets
+  long* — was answered nowhere. `website/docs/agent/context-management.md` now answers what fills the
+  context, what flux does when it fills, what is kept, what is lost, and what it means afterwards, with
+  the two adjacent pages (`context-packs`, `project-context`) cross-linked in both directions because
+  they answer *different* questions and made the gap look covered from the inside.
+  ⚠ **It corrected a claim the coordinator told it to reuse.** C-443's wording — *"a replay or export
+  can still see what was replaced"* — is true of the **log** and false of both **commands**:
+  `flux replay` reads `run_trace` + `plans_by_key` and never touches the conversation, and
+  `flux export` renders from the turn log, so it shows the **pre**-compaction turns and carries **no
+  compaction marker**. Verified independently before merge. The page states all three readers
+  separately rather than collapsing them into a reassurance that is wrong in the one direction a user
+  would notice.
+  It also does not paper over [C-462](docs/stories/C-462-compaction-threshold-is-context-window-blind.md):
+  the threshold row now says what the number measures — **characters, not a fraction of the context
+  window** — and that `0` disables it.
+  Pinned by a test asserting the literal source strings of compaction's gates, so a behaviour-preserving
+  refactor fails loudly and the fix is to re-read the code rather than loosen the assertion.
+  ⚠ Unverified: the Docusaurus build. `website/node_modules` is absent locally, so
+  `onBrokenLinks`/`onBrokenAnchors: 'throw'` never ran; links and the one anchor were checked by hand.
+
+## [0.49.0] - 2026-08-02
+
+### Added
+
+- **The three-axis loop-view claim, tested and half refuted** (A-146). Internal design artifact. The
+  claim was that depth-limit · condense-completed · optional-detail-pane compose into the five mock
+  layouts, so A-137 could build axes rather than adopt a picture. Measured against A-145's real 191-step
+  session across the full viewport envelope: **two of five reproduce exactly** (the nested tree is
+  `depth 6 · condense off · pane off`), **the split is not in the space at all**, and ⚠ **the flat thread
+  and the nested tree turn out to be the *same point*** — neither hides anything the other shows, and
+  what separates them is **indentation**, which no show/hide axis can express.
+  The measured boundary: the axes reach the split only when the run has **one** top-level step, or the
+  terminal is too short for the split to draw its own rule — 60/60 viewports match on a single recorded
+  turn, **0 of 66** on long-run and fan-out. Structurally, the rail discriminates on **focus** while
+  condensing discriminates on **status**; with one root they coincide.
+  Recommended defaults instead: **depth All · condense on · pane off** — and ⚠ on a real run **condensing
+  is what *buys the room* to show a failure**, the inverse of the worry the story was written around.
+
+- **A topologies page — every way to run flux, and what each one costs** (C-440).
+  `website/docs/topologies.md` covers nine ways to run flux (fully local · OS-sandboxed ·
+  containerized ops · remote system · served agent + thin client · embedded SDK · portable wasm ·
+  hosted exchange · **plain `ssh`**), each with an honest ships/partial/proposed status and the two
+  questions a reader actually has: **where are my files**, and **where does the approval prompt
+  appear**. Commands are pinned by tests, so a CLI change breaks CI rather than the page silently.
+  ⚠ **`ssh` is a peer row, not a footnote** — running flux on the remote box works today, and the
+  remote-system row names it as the bar to beat.
+  **Four status claims were wrong and the page corrects them**: `flux a2a <url>` ships, so the
+  served-agent gap is **approval**, not a client; flux-exchange is v0.11.0 and does not terminate
+  channels; portable wasm is the language core only, with zero host authority; and the OS-sandbox row
+  needed the caveat that **interactive runs default to `Off`** while only unattended surfaces default
+  to `Require`.
 
 - **The loop-view comparison now runs on a real recorded session** (A-145). A 191-step, 9-turn session is
   captured to `crates/flux-tui/src/loopmock/captures/` and drives all five mocks, replacing a fixture
@@ -105,6 +186,20 @@ All notable changes to this project are documented in this file. The format is b
   it affects every channel that puts structure beside `text`.
 
 ### Fixed
+
+- **Pinned that compaction records a durable `Compacted` event** (C-443). An audit of the local event
+  store found **zero `Compacted` rows in 112,114 events**, which raised the question of whether history
+  was being replaced with no record — that would have silently corrupted every `flux replay`,
+  `flux export` and log reconstruction.
+  ⚠ **It is not.** Compaction replaces history *by calling* the `Compacted` writer, so the record **is**
+  the replacement mechanism and no code path can do one without the other. Now pinned by the first test
+  on the automatic adaptive path, and the first to assert the durable event rather than only the
+  resulting projection.
+  **The real answer is that the threshold is never reached**: 85% of the store is two-message one-shot
+  runs, the mean conversation among sessions long enough to qualify is **9% of the 48,000-char
+  threshold**, and the single session that ever crossed it did so at its *final* message — so the
+  next-turn check never ran. The default is unchanged and its reasoning is now recorded where a reader
+  meets the number. ⚠ Honest limit stated: zero rows measures *this workload*, not the threshold.
 
 - **A room-triggered journey authorizes and audits as the speaker, not as the local operator**
   (C-415). A journey woken by a room message ran at the assembly-time identity — under `flux app run`

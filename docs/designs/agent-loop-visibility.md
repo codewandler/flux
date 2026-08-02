@@ -1,6 +1,6 @@
 # Design: Watch the agent think — the loop as a live thread, expandable down to the graph
 
-**Status:** proposed · **Pillar:** Agent · **Stories:** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md) · [A-145](../stories/A-145-a-real-run-as-the-mock-fixture.md) · [A-137](../stories/A-137-the-step-thread.md) · [A-138](../stories/A-138-expand-a-step-into-its-graph.md) · [A-139](../stories/A-139-the-loop-view-under-load.md)
+**Status:** proposed · **Pillar:** Agent · **Stories:** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md) · [A-145](../stories/A-145-a-real-run-as-the-mock-fixture.md) · [A-146](../stories/A-146-three-axes-not-five-pictures.md) · [A-137](../stories/A-137-the-step-thread.md) · [A-138](../stories/A-138-expand-a-step-into-its-graph.md) · [A-139](../stories/A-139-the-loop-view-under-load.md)
 
 > **The layout is chosen, by looking at it.** [A-144](../stories/A-144-five-tui-mocks-of-one-flow.md)
 > drew five hard-coded layouts of one flow under four load cases and a swept viewport envelope; the
@@ -34,6 +34,13 @@
 > ⚠ And the fidelity table the reconstruction produced — what the durable log can and cannot
 > rebuild — is in the same document, and is the start of what [C-422](../stories/C-422-the-render-projection.md)
 > owes.
+>
+> **[A-146](../stories/A-146-three-axes-not-five-pictures.md) then tested whether the five are
+> really three knobs** — and the headline changed again. **A-137 should build the axes and ship
+> `depth All · condense on · pane off`**, but *not* on the reasoning that the axes reproduce the
+> five: they reproduce the tree exactly, they cannot reach the split at all, and the flat thread and
+> the tree turn out to be the same point. The correction, with the claim it corrects named as mine,
+> is in "Three axes — the claim, and the measurement that partly refuted it" below.
 
 ## Why
 
@@ -85,41 +92,78 @@ variants**. The data is largely there; the projection is not.
 it can and cannot rebuild **is** the beginning of C-422's fidelity table, and anything the log cannot
 supply is a finding about the *record*, not a gap in a mock.
 
-## ⚠ The five are not five candidates — they are points in a space with three axes
+## ⚠ Three axes — the claim, and the measurement that partly refuted it
 
-Owner-directed after driving the mocks, 2026-08-02, and it supersedes "pick one of five":
+Owner-directed after driving the mocks, 2026-08-02, and it superseded "pick one of five":
 
 > *"they are all quite good — what would be nice would be the option to \[choose\] nesting level to
 > display, and that things which happened already could be condensed. Then also an optional detail
 > view."*
 
-Three controls, and they are **orthogonal**:
+Three controls, claimed to be **orthogonal** and to span the five:
 
-| axis | what it does | which mock it turns you into |
+| axis | what it does | which mock it was claimed to turn you into |
 |---|---|---|
 | **depth limit** | how many nesting levels are drawn | flat thread ↔ tree |
 | **condense completed** | finished work collapses to one row | the long-run win |
 | **detail pane** | optional, toggled — not always-on | tree ↔ split |
 
-Compose them and the mocks stop being rivals: **the flat thread with condensing and a depth limit and
-an optional pane *is* the split.** The tree is the same thing at depth ∞ with the pane off. So A-137
-should build the **axes**, not adopt a picture — and a user who wants any of the five can have it.
+The claim attached to that table was mine, stated here as fact on my own say-so: *"the flat thread
+with condensing and a depth limit and an optional pane **is** the split; the tree is the same thing at
+depth ∞ with the pane off."*
 
-⚠ **This converges with what the review independently found**, from the other direction. A-144's
-comparison was confounded because only mock 3 had phase-condensing, which forced the recommendation to
-*"condense finished phases first, then build the split"* — the two being separable was the finding.
-The owner's read says the same thing and goes further: **all three are separable**, and separating them
-is the design rather than a caveat on it.
+⚠ **[A-146](../stories/A-146-three-axes-not-five-pictures.md) built the three controls and tested it.
+Half of it is wrong, and this section is a correction rather than an unmarked reversal.** The controls
+were swept over all twelve combinations × four load cases × the same 18×28 viewport envelope the five
+mocks are held to; the tests are in `crates/flux-tui/tests/loop_mocks.rs` and the pictures in
+[agent-loop-visibility-mocks.md](agent-loop-visibility-mocks.md). What survived:
 
-Two consequences worth stating, because they are what this buys:
+1. ✅ **The tree is a point in the space**, exactly: `depth 6 · condense off · pane off`, on every load
+   case, 6 being `plan.rs`'s `MAX_TREE_DEPTH`. And the flat thread's *view* is `depth ∞ · condense off ·
+   pane off`, also exactly.
+2. ❌ **The depth limit does not move between the thread and the tree — they are the SAME POINT.**
+   Both draw every step at every depth; on both recorded cases their step sets are identical, and
+   neither hides anything the other shows. What separates them is **indentation**, a drawing decision
+   no show/hide control can express, and therefore a *fourth* axis if A-137 wants both pictures. My
+   table assigned the depth limit a job that is not its job. (It is still a real control — it is what
+   makes a deep sub-agent fan-out readable — but A-145 measured real nesting at three levels, so on a
+   real run it never has to fire.)
+3. ❌ **The split is not reachable at all.** The axes reach it only when the run has **one top-level
+   step**, or the terminal is too short for the split to draw its own rule. On the real nine-turn
+   session there are 24 viewports where the split both draws its whole rail and withholds something,
+   and **zero** matches in them. The structural reason: mock 3's rail is *one row per top-level step
+   plus the focused top-level step's entire subtree, completed work included* — so it discriminates on
+   **focus**, while condensing discriminates on **status**. With one root the two rules coincide; with
+   nine turns they cannot.
 
-- **The floors move.** The split's cost was a 64-column, 10-row floor, nearly double the others'. With
-  the pane *optional*, that floor applies only when it is on — the fallback stops being a second layout
-  and becomes the same layout with a toggle off.
-- ⚠ **Defaults are now the real decision, and they are where honesty lives.** A default depth that hides
-  a sub-agent's work, or condensing that swallows a failed step, would make the view flatter than the
-  run. Every axis must default to showing *more* than it hides, and elision stays visible at every
-  setting — the property A-144's rework made unconditional.
+⚠ **So what A-137 owes is not a fourth picture but a fourth decision: condensing's GRANULARITY.**
+"Finished work collapses to one row" does not say *at what level*, and the answer changes what you
+get — fold uniformly and you get every turn's shape at one row per phase; fold only at the top level
+and you get mock 3's rail. A one-bit toggle cannot express the difference, and it should be decided
+explicitly rather than inherited from whichever gets written first.
+
+⚠ **The claim did converge with A-144's review on the part that held.** That comparison was confounded
+because only mock 3 had phase-condensing, which forced the recommendation to *"condense finished phases
+first, then build the split"* — the two being separable was the finding, and separability is confirmed.
+
+Three consequences, all now measured rather than predicted:
+
+- **The floors move, and the measurement retires a claim.** A-144 charged the split a 64-column,
+  10-row floor and recommended the flat thread as a separate sub-64-column *fallback*. That floor is
+  the **pane's**: with the pane off the composed view draws every load case at 40×6, the lowest floor
+  of the five, and with it on it refuses one column under 64 exactly as mock 3 does. **The fallback is
+  not a second layout; it is this layout with a toggle off.**
+- ⚠ **Defaults are the real decision, and the measured answer is `depth All · condense on · pane off`.**
+  Depth `All` withholds nothing; condensing folds only finished *and wholly successful* subtrees, each
+  into a row carrying `+N`; the pane is off because it owns the 64-column floor and at 52 columns —
+  where most of this is read — pane-on refuses entirely while pane-off draws.
+- ⚠ **The honesty worry inverted.** The risk this epic carried was that condensing would swallow a
+  failed step. On the real run the opposite happens: **condensing is what buys the room to show one.**
+  Session `s_1477` turn 7's `git_stage` failed `exit 128` inside an `execute_batch` that then closed
+  `ok` — a `Done` parent holding a `Failed` child, a shape nobody would have authored. Uncondensed it
+  is 166 steps back and off screen; condensed, the clean turns fold, turn 7 *refuses to fold because it
+  holds a failure*, and the `✗` is visible. Elision stays visible at every setting, and a depth limit
+  reports how many **levels** it withheld and how many of the withheld steps failed.
 
 ## Approach
 

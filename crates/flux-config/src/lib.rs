@@ -839,6 +839,9 @@ pub struct Limits {
     /// task-local exemption that covers the nested `task` does not survive the spawn the child is
     /// reached through. See `flux_runtime::ResourceLimits::independent_copy`.
     ///
+    /// **Bounding the tree needs `max_live_agents` too (C-444):** this number alone leaves k — and so
+    /// the process total — unbounded. Set both and the total is `N × max_live_agents`.
+    ///
     /// Applied by the `flux` binary (`flux-cli` reads this table at executor assembly) and by an
     /// embedding host through `flux_runtime::ResourceLimits::from_config` →
     /// `ClientBuilder::resource_limits`.
