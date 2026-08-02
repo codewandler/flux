@@ -2693,6 +2693,73 @@ mod tests {
     /// under review — which is the only way "exempt" stays a decision rather than a habit.
     const MAX_PIN_EXEMPTIONS: usize = 1;
 
+    /// Tracked paths that sit below a Cargo output directory. Kept pure so the directory predicate
+    /// is pinned independently from the Git-index census that supplies its production input.
+    fn tracked_cargo_output_paths(paths: &[&str]) -> Vec<String> {
+        let mut violations = paths
+            .iter()
+            .filter(|path| {
+                let components = path.split('/').collect::<Vec<_>>();
+                components
+                    .iter()
+                    .take(components.len().saturating_sub(1))
+                    .any(|component| *component == "target" || component.starts_with("target-"))
+            })
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
+        violations.sort();
+        violations.dedup();
+        violations
+    }
+
+    #[test]
+    fn tracked_build_output_detector_rejects_forced_cargo_outputs() {
+        let paths = [
+            "target/debug/flux",
+            "target-int/debug/deps/flux",
+            "plugins/target/release/plugin",
+            "crates/fixture/target-check/debug/helper",
+            "docs/target-platform.md",
+            "assets/targets/icon.svg",
+        ];
+
+        assert_eq!(
+            tracked_cargo_output_paths(&paths),
+            [
+                "crates/fixture/target-check/debug/helper",
+                "plugins/target/release/plugin",
+                "target-int/debug/deps/flux",
+                "target/debug/flux",
+            ]
+        );
+    }
+
+    /// C-489: `.gitignore` is advisory and `git add -f` bypasses it. Read the index itself so a
+    /// force-added Cargo tree fails before it can be merged into main.
+    #[test]
+    fn no_cargo_build_output_is_tracked() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["-C", repo_root.to_str().unwrap(), "ls-files", "-z"])
+            .output()
+            .expect("run git ls-files");
+        assert!(output.status.success(), "git ls-files failed");
+        let tracked = std::str::from_utf8(&output.stdout).expect("tracked paths are UTF-8");
+        let paths = tracked
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        let violations = tracked_cargo_output_paths(&paths);
+
+        assert!(
+            violations.is_empty(),
+            "Cargo build output is tracked despite its ignore rule:\n  {}\n\
+             remove it from the index and history; never use `git add -f` for target trees (C-489)",
+            violations.join("\n  ")
+        );
+    }
+
     /// The non-empty reason of a `// <marker> <reason>` waiver in the comment block immediately above
     /// `line`. A bare marker with no reason is not a waiver.
     fn allow_reason(source: &str, line: usize, marker: &str) -> Option<String> {

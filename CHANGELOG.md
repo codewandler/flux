@@ -33,6 +33,9 @@ All notable changes to this project are documented in this file. The format is b
   per invocation and lowered against the live operation catalog; results include a route receipt
   with the resolved path, flow name, and seeded input keys.
 
+- **Tracked Cargo-output gate (C-489).** `flux-codegate` now rejects force-added `target/` and
+  `target-*` directory contents before compiled binaries can enter shared history.
+
 - **The distributed CLI now serves its release-matched public documentation and a Flux-Lang
   playground** (L-127). `flux docs` exposes the embedded Docusaurus build at `/flux/`, reports the
   serving binary at `/version`, and mounts an editable `/console/` over L-126's real source-to-editor

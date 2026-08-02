@@ -1,4 +1,5 @@
 /target
+/target-*/
 **/*.rs.bk
 # `.flux/` is local scaffolding (session state, seeded self-improvement roles, …) and stays
 # gitignored — EXCEPT a few checked-in artifacts that ship with the repo (they are part of
@@ -52,4 +53,3 @@ __pycache__/
 # I-03 measurement raw recordings (local evidence, re-derivable reports)
 bench/ttff/results/
 bench/tbench-compare/results/
-target-int/
