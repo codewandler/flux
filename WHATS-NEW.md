@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-08-02
+
 ### Action needed
 
 - **Embedded agents with automatic or custom approval now default to confinement and finite runtime

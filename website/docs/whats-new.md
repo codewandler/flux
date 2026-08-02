@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.50.0] - 2026-08-02
+
 ### Action needed
 
 - **Embedded agents with automatic or custom approval now default to confinement and finite runtime

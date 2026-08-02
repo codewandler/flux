@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-08-02
+
 ### Changed
 
 - **The documented HTTP secret allowlist now reaches the CLI's real web tool** (C-464). A new
