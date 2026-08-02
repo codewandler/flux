@@ -163,10 +163,10 @@ fn every_flux_file_in_the_repository_canonicalizes_soundly() {
             checked += 1;
         }
     }
-    // The shipped corpus at the time of writing: 16 `examples/`, the built-in `agent-loop.flux`,
+    // The shipped corpus at the time of writing: 17 `examples/`, the built-in `agent-loop.flux`,
     // two `flux-app` examples, the portable-parity flow, and the LSP's large fixture.
     assert!(
-        checked >= 21,
+        checked >= 22,
         "expected the whole shipped .flux corpus, checked {checked} of {} files",
         paths.len()
     );
