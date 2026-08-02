@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The three-axis loop-view claim, tested and half refuted** (A-146). Internal design artifact. The
+  claim was that depth-limit · condense-completed · optional-detail-pane compose into the five mock
+  layouts, so A-137 could build axes rather than adopt a picture. Measured against A-145's real 191-step
+  session across the full viewport envelope: **two of five reproduce exactly** (the nested tree is
+  `depth 6 · condense off · pane off`), **the split is not in the space at all**, and ⚠ **the flat thread
+  and the nested tree turn out to be the *same point*** — neither hides anything the other shows, and
+  what separates them is **indentation**, which no show/hide axis can express.
+  The measured boundary: the axes reach the split only when the run has **one** top-level step, or the
+  terminal is too short for the split to draw its own rule — 60/60 viewports match on a single recorded
+  turn, **0 of 66** on long-run and fan-out. Structurally, the rail discriminates on **focus** while
+  condensing discriminates on **status**; with one root they coincide.
+  Recommended defaults instead: **depth All · condense on · pane off** — and ⚠ on a real run **condensing
+  is what *buys the room* to show a failure**, the inverse of the worry the story was written around.
+
 ### Fixed
 
 - **Pinned that compaction records a durable `Compacted` event** (C-443). An audit of the local event

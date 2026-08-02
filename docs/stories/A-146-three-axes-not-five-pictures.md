@@ -2,12 +2,11 @@
 id: A-146
 title: "Give the mocks the three controls — depth limit, condense-completed, optional detail pane"
 pillar: Agent
-status: in-progress
-priority: 5
+status: done
 design: docs/designs/agent-loop-visibility.md
 epic: agent-loop-visibility
 areas: [flux-tui]
-note: "⚠ owner-directed after driving A-144's mocks: the five are not five candidates, they are points in a space with three ORTHOGONAL axes. The flat thread with condensing + a depth limit + an optional pane IS the split. Prove that in the mocks before A-137 commits to it"
+note: "⚠ REFUTED, which was the valuable outcome. Two of five layouts are exact points (tree, flat thread) — and those two are the SAME point, separated only by indentation, which no show/hide axis expresses. The split is not in the space at all. Defaults recommended instead: depth All · condense on · pane off"
 ---
 
 # Turn the five pictures into three knobs
