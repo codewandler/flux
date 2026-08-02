@@ -108,7 +108,7 @@ review pass (findings fixed before commit).
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 16 | Graph projection from AST/HIR; node inspector; trace-to-node mapping | ⬜ | only ASCII `render.rs` today |
+| 16 | Graph projection from AST/HIR; node inspector; trace-to-node mapping | 🟡 | `src/editor.rs` provides a versioned structured v1 projection for call/bind, `when`, bounded `repeat`/`each`, `parallel` and `return`, canonical lowering, source-range limitations and stable editor ids; `runtime::execute_flow_traced` reports value-free node lifecycle/branch events with loop occurrences. Operation inspectors are supplied by the host's existing `OpCatalog`; layouts and a richer visual vocabulary remain host work |
 
 ## Example operation packs (PRD §4/§7, §19)
 

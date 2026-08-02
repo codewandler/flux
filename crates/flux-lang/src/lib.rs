@@ -35,6 +35,7 @@ pub mod canonicalize;
 pub mod context_slice;
 mod cst_decode;
 pub mod dsl;
+pub mod editor;
 pub mod effects;
 pub mod error;
 pub mod expr;
