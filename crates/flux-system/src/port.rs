@@ -173,11 +173,7 @@ pub trait GuardedProcess: Send + Sync {
         timeout: Duration,
     ) -> Guarded<'a, ProcessOutput> {
         let _ = (argv, stdin, timeout);
-        Box::pin(async {
-            Err(Error::Other(
-                "this guarded substrate cannot feed a child process stdin".into(),
-            ))
-        })
+        Box::pin(async { Err(deny("feed a child process stdin")) })
     }
 
     /// Start a long-lived child and hand back its live handle, for a process started in one call and
@@ -188,9 +184,7 @@ pub trait GuardedProcess: Send + Sync {
     /// this default and denies rather than pretending to have spawned something.
     fn spawn_background(&self, argv: &[String], env: &[(String, String)]) -> Result<ManagedChild> {
         let _ = (argv, env);
-        Err(Error::Other(
-            "this guarded substrate cannot host long-lived child processes".into(),
-        ))
+        Err(deny("host long-lived child processes"))
     }
 }
 
@@ -348,10 +342,18 @@ pub trait GuardedWorkspaceFiles: Send + Sync {
     }
 }
 
+/// The one spelling of "the substrate does not serve this", as a prefix.
+///
+/// Public because it is the *only* way a consumer can tell a capability the substrate does not offer
+/// from a guard that rejected its path — the two are both `Error::Other`, so the distinction lives in
+/// this prefix and nowhere else. [`remote`](crate::remote) matches on it to classify a delegated
+/// failure, which is why it is a named constant rather than a literal inside [`deny`].
+pub const UNSERVED: &str = "this guarded substrate cannot ";
+
 /// The refusal an unserved optional port operation returns. One spelling, so a consumer can tell a
 /// capability the substrate does not offer from a guard that rejected its path.
 fn deny(operation: &str) -> Error {
-    Error::Other(format!("this guarded substrate cannot {operation}"))
+    Error::Other(format!("{UNSERVED}{operation}"))
 }
 
 // ---------------------------------------------------------------------------

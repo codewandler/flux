@@ -3473,8 +3473,19 @@ impl Exec for Double {}
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let repo_root = crates_dir.parent().unwrap();
 
-        // The reviewed backends: `flux-system`'s native delegations, and nothing else. A new entry
-        // here is a security review, not a formality — read `crates/flux-system/src/port.rs` first.
+        // The reviewed backends: `flux-system`'s native delegations, and the two delegating backends
+        // C-399 added beside them. A new entry here is a security review, not a formality — read
+        // `crates/flux-system/src/port.rs` first.
+        //
+        // Why `remote.rs`'s entries are reviewable rather than alarming: `RemoteSystem` and
+        // `Loopback` hold no workspace, open no file and start no process. Each operation is a
+        // hand-off to a `Delegate`, so neither type can add a permission or remove one — the
+        // guarantees remain whatever the far side already enforced. What they own is the *failure
+        // semantics* of delegation (a guard's refusal, an unreachable delegate and an unserved
+        // operation stay three distinguishable errors), and every operation the delegate does not
+        // serve denies in `port.rs`'s own words. This allowance is the cost C-399's ownership
+        // decision accepted on purpose: the alternative was an out-of-repo backend this gate cannot
+        // see at all.
         const ALLOW: &[(&str, &str, &str)] = &[
             ("crates/flux-system/src/port.rs", "GuardedProcess", "System"),
             (
@@ -3483,6 +3494,21 @@ impl Exec for Double {}
                 "System",
             ),
             ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedProcess",
+                "RemoteSystem",
+            ),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedHostFiles",
+                "RemoteSystem",
+            ),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedEnv",
+                "RemoteSystem",
+            ),
         ];
         let mut allowance_use = vec![0usize; ALLOW.len()];
 

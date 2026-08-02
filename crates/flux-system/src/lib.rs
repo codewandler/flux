@@ -8,6 +8,9 @@
 //! [`System`] is the **native** guarded backend. The same guarded operations are also stated as
 //! capability traits in [`port`], so a non-syscall substrate (a Wasm embedder reaching host imports,
 //! a remote executor, a test double) can serve them — see that module for what is and is not a port.
+//! [`remote`] is the in-repo *delegating* backend: it serves the port by handing each operation to
+//! another substrate, and keeps a guard's refusal, a broken link and an operation the far side does
+//! not serve as three distinguishable failures. It needs no service running.
 //!
 //! # Binding `flux-system` without `flux-runtime`
 //!
@@ -134,6 +137,7 @@ use flux_core::{Error, Result};
 
 pub mod net;
 pub mod port;
+pub mod remote;
 pub mod sandbox;
 
 use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};

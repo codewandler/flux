@@ -42,6 +42,7 @@ consequence.
 | Argv-only spawn | one `System::build_command`; env cleared to a non-secret allow-list; output byte-capped |
 | OS sandbox | `sandbox::Backend` — bubblewrap (Linux), Seatbelt (macOS); `SpawnPolicy`, `Confinement` |
 | The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`; fail-closed defaults; `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` enumerates in-repo backends |
+| A delegating backend | `remote::RemoteSystem` + `remote::Loopback` (C-399) — serves the port from a `Delegate`, three distinguishable failure modes, no wire format and no new dependency |
 | Published | yes — `codewandler-flux-system`, lib name `flux_system` |
 
 So the substrate is real and shipped. What is missing is narrower than it looks.
@@ -120,10 +121,41 @@ flux's to build:
   allowance that an out-of-repo one does not.
 - flux's own CLI has no use for either.
 
-They are therefore filed as `backlog` with ownership stated as open
+They were therefore filed with ownership stated as open
 ([C-397](../stories/C-397-container-process-backend.md),
-[C-399](../stories/C-399-remote-guarded-io-backend.md)), not as `ready` work. The decision belongs
-with whoever needs one first, and the epic should not pretend otherwise.
+[C-399](../stories/C-399-remote-guarded-io-backend.md)), not as `ready` work. The decision belonged
+with whoever needed one first, and the epic did not pretend otherwise.
+
+**Resolved for the remote backend (C-399): flux owns it.** The alternative — leaving it to the first
+consumer that needed it — would have put a locally-executing runtime behind a service, and flux must
+be able to do this on a developer's own machine with nothing running. That is
+[vision.md](../vision.md)'s local-first principle on the runtime axis, not a convenience.
+
+`crates/flux-system/src/remote.rs` is the implementation: `RemoteSystem` serves all four port
+families by handing each operation to a `Delegate`, and `Loopback` serves `Delegate` from any
+in-process substrate — so the delegation path is exercisable with no service. It adds **no
+dependency**: `Delegate` is a Rust trait, not a protocol, which is what keeps
+[remote-agents.md](remote-agents.md)'s open question (is the remote wire a channel API or a port
+delegation?) genuinely open. A wire format chosen here would have pre-answered it.
+
+What the story turned out to be about is **three** failure modes rather than the two its Acceptance
+named, because an operator's response to each is different and all three are ways one delegated
+operation fails:
+
+| Mode | What happened | What an operator does |
+|---|---|---|
+| `Refused` | The far side answered; the answer was no. A guard did its job. | Fix the request or widen the grant. Retrying unchanged is pointless. |
+| `Unreachable` | No answer arrived. Whether the operation happened is **unknown**. | Investigate the link. Retrying is meaningful. |
+| `Unserved` | The delegate does not implement the operation at all. | Implement it, or stop asking. Retrying never helps. |
+
+The classification is **structural**: a delegate returns `Answer::Refused` or `Err(Unreachable)`,
+which are different positions in the type, and only a transport can construct the latter. The marker
+prefixes `failure_mode` matches on are written by `remote.rs` rather than by the delegate, so a
+refusal whose reason reads *"the substrate is unreachable"* still classifies as a refusal. That
+matters more than it looks: delegate-authored text that could reclassify a refusal would send an
+operator to investigate a perfectly healthy network.
+
+The container backend (C-397) is untouched by this and its ownership remains open.
 
 ## What this epic explicitly does not do
 
@@ -145,3 +177,7 @@ ones a well-meaning implementation would skip:
 - C-396 must show that a raw-ICMP target with insufficient capability is refused **at construction**,
   not at first send. A capability check that happens on the wire is a check that already leaked the
   attempt.
+- C-399 must show that a delegate **cannot forge a failure mode with its wording** — the check a
+  well-meaning implementation skips because it tests its own two fixtures against each other and
+  both agree. A refusal reading "unreachable" that classifies as unreachable would be a backend that
+  is worse than none: it sends an operator to investigate a healthy link on a delegate's say-so.
