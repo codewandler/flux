@@ -138,6 +138,35 @@ pub struct HttpBytesResponse {
     pub bytes: Vec<u8>,
 }
 
+/// A large HTTP response retained in the host blob store instead of crossing the plugin protocol.
+#[derive(Debug)]
+pub struct HttpBlobResponse {
+    /// Opaque handle accepted by the `blob.*` host calls.
+    pub blob_ref: String,
+    /// Complete response body size in bytes.
+    pub size: usize,
+    /// SHA-256 digest of the complete response body.
+    pub sha256: String,
+}
+
+/// One plugin-visible WebSocket event. Ping/pong remain host-owned protocol traffic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSocketEvent {
+    /// A UTF-8 text message.
+    Text(String),
+    /// A byte-exact binary message.
+    Binary(Vec<u8>),
+    /// No data arrived before the bounded read deadline; the connection remains open.
+    Timeout,
+    /// The peer closed the connection (or the stream reached EOF).
+    Close {
+        /// RFC 6455 close code, when the peer supplied one.
+        code: Option<u16>,
+        /// Peer-supplied close reason, if any.
+        reason: String,
+    },
+}
+
 impl HttpResponse {
     /// Parse the body as JSON.
     pub fn json(&self) -> Result<Value, String> {
@@ -339,6 +368,153 @@ impl Host<'_> {
             Vec::new()
         };
         Ok(HttpBytesResponse { status, bytes })
+    }
+
+    /// Download an HTTP response directly into the host blob store by endpoint reference.
+    ///
+    /// The response bytes never cross the plugin protocol. `max_bytes` and `timeout_ms` are
+    /// mandatory resource bounds, and the host publishes the returned reference only after the
+    /// complete response has arrived. The plugin manifest must declare both `http` and `blob`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn http_blob_ref(
+        &mut self,
+        endpoint_ref: &str,
+        method: &str,
+        path: &str,
+        auth_purpose: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        name: &str,
+        max_bytes: usize,
+        timeout_ms: u64,
+    ) -> Result<HttpBlobResponse, String> {
+        let mut payload = json!({
+            "method": method,
+            "endpoint_ref": endpoint_ref,
+            "path": path,
+            "response_blob": {
+                "name": name,
+                "max_bytes": max_bytes,
+            },
+            "timeout_ms": timeout_ms,
+        });
+        if let Some(purpose) = auth_purpose {
+            payload["auth_purpose"] = json!(purpose);
+        }
+        if !headers.is_empty() {
+            let map: serde_json::Map<String, Value> = headers
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), json!(value)))
+                .collect();
+            payload["headers"] = Value::Object(map);
+        }
+        if let Some(bytes) = body {
+            payload["body_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+
+        let value = self.inner.host_call("http.do", payload)?;
+        let blob_ref = value
+            .get("blob_ref")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "http_blob_ref: host returned no blob_ref".to_string())?
+            .to_string();
+        let size = value
+            .get("size")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "http_blob_ref: host returned no valid size".to_string())?;
+        let sha256 = value
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "http_blob_ref: host returned no sha256".to_string())?
+            .to_string();
+        Ok(HttpBlobResponse {
+            blob_ref,
+            size,
+            sha256,
+        })
+    }
+
+    /// Open a host-owned WebSocket by endpoint reference. The plugin never receives the resolved
+    /// URL or credential; the manifest must declare `websocket: true` and the endpoint/auth method.
+    pub fn ws_connect(
+        &mut self,
+        endpoint_ref: &str,
+        path: &str,
+        auth_purpose: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<u64, String> {
+        let mut payload = json!({
+            "endpoint_ref": endpoint_ref,
+            "path": path,
+            "timeout_ms": timeout_ms,
+        });
+        if let Some(purpose) = auth_purpose {
+            payload["auth_purpose"] = json!(purpose);
+        }
+        self.inner
+            .host_call("ws.connect", payload)?
+            .get("ws_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "ws.connect: host returned no ws_id".to_string())
+    }
+
+    /// Read one text/binary/close event with an explicit deadline. Ping/pong are handled by the
+    /// host and never surface as application data.
+    pub fn ws_read(&mut self, ws_id: u64, timeout_ms: u64) -> Result<WebSocketEvent, String> {
+        let value = self
+            .inner
+            .host_call("ws.read", json!({"ws_id": ws_id, "timeout_ms": timeout_ms}))?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("text") => Ok(WebSocketEvent::Text(
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )),
+            Some("binary") => {
+                let encoded = value
+                    .get("data_b64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "ws.read: host returned binary without data_b64".to_string())?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|error| format!("ws.read: bad data_b64: {error}"))?;
+                Ok(WebSocketEvent::Binary(bytes))
+            }
+            Some("timeout") => Ok(WebSocketEvent::Timeout),
+            Some("close") => Ok(WebSocketEvent::Close {
+                code: value
+                    .get("code")
+                    .and_then(Value::as_u64)
+                    .and_then(|code| u16::try_from(code).ok()),
+                reason: value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            Some(kind) => Err(format!(
+                "ws.read: host returned unknown event kind `{kind}`"
+            )),
+            None => Err("ws.read: host returned no event kind".into()),
+        }
+    }
+
+    /// Gracefully close a host-owned WebSocket. Returns `false` when it was already absent.
+    pub fn ws_close(&mut self, ws_id: u64, timeout_ms: u64) -> Result<bool, String> {
+        Ok(self
+            .inner
+            .host_call(
+                "ws.close",
+                json!({"ws_id": ws_id, "timeout_ms": timeout_ms}),
+            )?
+            .get("closed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     /// Convenience: GET an endpoint-reference path (optional auth purpose) and parse the JSON body,
@@ -1534,6 +1710,11 @@ pub struct MockHost {
     pub conn_script: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
     /// An in-memory `blob.*` store: `blob_ref -> (name, bytes)`.
     pub blobs: std::cell::RefCell<HashMap<String, (String, Vec<u8>)>>,
+    /// FIFO application events returned by `ws.read`; ping/pong are intentionally not representable.
+    pub websocket_events: std::cell::RefCell<std::collections::VecDeque<WebSocketEvent>>,
+    /// Open mock WebSocket ids.
+    pub websockets: std::cell::RefCell<std::collections::HashSet<u64>>,
+    next_websocket: std::cell::Cell<u64>,
     /// The `server_version` a host-terminated `conn.authenticate` reports back (D-31). Default
     /// `"16.2"`; override with [`with_pg_server_version`](MockHost::with_pg_server_version).
     pub pg_server_version: String,
@@ -1563,6 +1744,9 @@ impl Default for MockHost {
             conn_buf: std::cell::RefCell::new(Vec::new()),
             conn_script: std::cell::RefCell::new(std::collections::VecDeque::new()),
             blobs: std::cell::RefCell::new(HashMap::new()),
+            websocket_events: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            websockets: std::cell::RefCell::new(std::collections::HashSet::new()),
+            next_websocket: std::cell::Cell::new(1),
             pg_server_version: "16.2".to_string(),
             calls: std::cell::RefCell::new(Vec::new()),
         }
@@ -1631,6 +1815,14 @@ impl MockHost {
     /// Canned raw bytes for any binary `http.do` (response_binary) whose URL contains `url_substr`.
     pub fn with_http_bytes(mut self, url_substr: &str, bytes: Vec<u8>) -> Self {
         self.http_bytes.push((url_substr.into(), bytes));
+        self
+    }
+    /// Script application-visible events for subsequent `ws.read` calls.
+    pub fn with_websocket_events(
+        mut self,
+        events: impl IntoIterator<Item = WebSocketEvent>,
+    ) -> Self {
+        self.websocket_events.get_mut().extend(events);
         self
     }
     /// Queue canned server bytes the next `conn.read`(s) return (FIFO, one chunk per call) — the
@@ -1731,6 +1923,53 @@ impl GuestHost for MockHost {
                         json!({ "status": 200, "body": serde_json::to_string(&body).unwrap() }),
                     );
                 }
+                // Host-owned response-to-blob path: retain canned bytes in the mock blob store and
+                // return metadata only, mirroring the real host's protocol boundary.
+                if let Some(response_blob) = payload.get("response_blob") {
+                    if payload.get("timeout_ms").and_then(Value::as_u64).is_none()
+                        && payload
+                            .get("timeout_secs")
+                            .and_then(Value::as_u64)
+                            .is_none()
+                    {
+                        return Err("mock: response_blob requires an explicit timeout".into());
+                    }
+                    let name = response_blob
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| "mock: response_blob requires a name".to_string())?
+                        .to_string();
+                    let max_bytes = response_blob
+                        .get("max_bytes")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            "mock: response_blob requires a positive max_bytes".to_string()
+                        })?;
+                    let bytes = self
+                        .http_bytes
+                        .iter()
+                        .find(|(sub, _)| url.contains(sub.as_str()))
+                        .map(|(_, bytes)| bytes.clone())
+                        .ok_or_else(|| format!("mock: no canned http_bytes for `{url}`"))?;
+                    if bytes.len() > max_bytes {
+                        return Err(format!(
+                            "mock: response exceeds response_blob.max_bytes ({max_bytes})"
+                        ));
+                    }
+                    let blob_ref = format!("mockblob-{}", self.blobs.borrow().len() + 1);
+                    let size = bytes.len();
+                    self.blobs
+                        .borrow_mut()
+                        .insert(blob_ref.clone(), (name, bytes));
+                    return Ok(json!({
+                        "blob_ref": blob_ref.clone(),
+                        "size": size,
+                        "sha256": blob_ref,
+                    }));
+                }
                 // Binary download path: return base64 of canned raw bytes, matching the host.
                 if payload
                     .get("response_binary")
@@ -1755,6 +1994,56 @@ impl GuestHost for MockHost {
                     .map(|(_, v)| v.clone())
                     .ok_or_else(|| format!("mock: no canned http for `{url}`"))?;
                 Ok(json!({ "status": 200, "body": serde_json::to_string(&body).unwrap() }))
+            }
+            "ws.connect" => {
+                let endpoint_ref = payload
+                    .get("endpoint_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "mock: ws.connect requires endpoint_ref".to_string())?;
+                if !self.endpoint_refs.contains_key(endpoint_ref) {
+                    return Err(format!("mock: no endpoint_ref `{endpoint_ref}`"));
+                }
+                if payload.get("timeout_ms").and_then(Value::as_u64).is_none() {
+                    return Err("mock: ws.connect requires timeout_ms".into());
+                }
+                let id = self.next_websocket.get();
+                self.next_websocket.set(id + 1);
+                self.websockets.borrow_mut().insert(id);
+                Ok(json!({"ws_id": id}))
+            }
+            "ws.read" => {
+                let id = payload
+                    .get("ws_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "mock: ws.read requires ws_id".to_string())?;
+                if !self.websockets.borrow().contains(&id) {
+                    return Err(format!("mock: no open websocket {id}"));
+                }
+                let event = self
+                    .websocket_events
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(WebSocketEvent::Timeout);
+                let value = match event {
+                    WebSocketEvent::Text(text) => json!({"kind": "text", "text": text}),
+                    WebSocketEvent::Binary(bytes) => json!({
+                        "kind": "binary",
+                        "data_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                    }),
+                    WebSocketEvent::Timeout => json!({"kind": "timeout"}),
+                    WebSocketEvent::Close { code, reason } => {
+                        self.websockets.borrow_mut().remove(&id);
+                        json!({"kind": "close", "code": code, "reason": reason})
+                    }
+                };
+                Ok(value)
+            }
+            "ws.close" => {
+                let id = payload
+                    .get("ws_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "mock: ws.close requires ws_id".to_string())?;
+                Ok(json!({"closed": self.websockets.borrow_mut().remove(&id)}))
             }
             "process.spawn" => Ok(json!({ "proc_id": self.spawn_proc_id })),
             "process.read" => {
@@ -2381,6 +2670,121 @@ mod tests {
         assert!(host
             .http_bytes_ref("nope.endpoint", "GET", "x", None, &[], None, true)
             .is_err());
+    }
+
+    #[test]
+    fn http_blob_ref_keeps_response_bytes_host_side_and_sends_explicit_bounds() {
+        let raw = vec![0, 159, 146, 150, 255];
+        let mut backend = MockHost::default()
+            .with_endpoint_ref("svc.endpoint", "https://svc.test/api")
+            .with_http_bytes("/api/recording", raw.clone());
+        let response = {
+            let mut host = Host {
+                inner: &mut backend,
+            };
+            host.http_blob_ref(
+                "svc.endpoint",
+                "GET",
+                "recording",
+                Some("api"),
+                &[("accept", "audio/wav")],
+                None,
+                "recording.wav",
+                1024,
+                5_000,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(response.size, raw.len());
+        assert_eq!(response.sha256, response.blob_ref);
+        assert_eq!(
+            backend
+                .blobs
+                .borrow()
+                .get(&response.blob_ref)
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+            Some(("recording.wav", raw.as_slice()))
+        );
+        let calls = backend.calls.borrow();
+        let (_, payload) = calls.last().unwrap();
+        assert_eq!(payload["response_blob"]["max_bytes"], 1024);
+        assert_eq!(payload["timeout_ms"], 5_000);
+        assert_eq!(payload["auth_purpose"], "api");
+        assert!(payload.get("response_binary").is_none());
+        assert!(payload.get("body").is_none());
+        assert!(payload.get("body_b64").is_none());
+    }
+
+    #[test]
+    fn http_blob_ref_mock_does_not_publish_an_over_limit_partial() {
+        let mut backend = MockHost::default()
+            .with_endpoint_ref("svc.endpoint", "https://svc.test/api")
+            .with_http_bytes("/api/recording", vec![7; 8]);
+        let error = {
+            let mut host = Host {
+                inner: &mut backend,
+            };
+            host.http_blob_ref(
+                "svc.endpoint",
+                "GET",
+                "recording",
+                None,
+                &[],
+                None,
+                "recording.wav",
+                4,
+                5_000,
+            )
+            .unwrap_err()
+        };
+        assert!(error.contains("max_bytes"), "{error}");
+        assert!(backend.blobs.borrow().is_empty());
+    }
+
+    #[test]
+    fn websocket_sdk_keeps_endpoint_and_frames_typed() {
+        let mut backend = MockHost::default()
+            .with_endpoint_ref("events.endpoint", "ws://events.test/ari")
+            .with_websocket_events([
+                WebSocketEvent::Text("event".into()),
+                WebSocketEvent::Binary(vec![0, 159, 255]),
+                WebSocketEvent::Close {
+                    code: Some(1000),
+                    reason: "done".into(),
+                },
+            ]);
+        {
+            let mut host = Host {
+                inner: &mut backend,
+            };
+            let id = host
+                .ws_connect("events.endpoint", "/events?app=flux", Some("ari"), 1_000)
+                .unwrap();
+            assert_eq!(
+                host.ws_read(id, 500).unwrap(),
+                WebSocketEvent::Text("event".into())
+            );
+            assert_eq!(
+                host.ws_read(id, 500).unwrap(),
+                WebSocketEvent::Binary(vec![0, 159, 255])
+            );
+            assert_eq!(
+                host.ws_read(id, 500).unwrap(),
+                WebSocketEvent::Close {
+                    code: Some(1000),
+                    reason: "done".into()
+                }
+            );
+            assert!(host.ws_read(id, 500).is_err());
+            assert!(!host.ws_close(id, 500).unwrap());
+        }
+
+        let (_, connect) = backend.calls.borrow()[0].clone();
+        assert_eq!(connect["endpoint_ref"], "events.endpoint");
+        assert_eq!(connect["auth_purpose"], "ari");
+        assert_eq!(connect["timeout_ms"], 1_000);
+        assert!(connect.get("url").is_none(), "the plugin never holds a URL");
     }
 
     /// D-32: the gated `config` capability reads a declared non-secret config value by name — the

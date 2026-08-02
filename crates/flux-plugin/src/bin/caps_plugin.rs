@@ -58,6 +58,14 @@ impl PluginHandler for Caps {
                     process: vec!["printf ok".into()],
                     ..OperationSpec::default()
                 },
+                OperationSpec {
+                    name: "wsprobe".into(),
+                    description: "Attempt a WebSocket callback without a manifest grant".into(),
+                    input_schema: json!({"type": "object"}),
+                    effects: Vec::new(),
+                    risk: None,
+                    ..OperationSpec::default()
+                },
             ],
             capabilities: PluginCapabilities {
                 process: vec!["printf".into()],
@@ -84,6 +92,14 @@ impl PluginHandler for Caps {
                 let argv = input.get("argv").cloned().unwrap_or(Value::Null);
                 host.host_call("process.run", json!({ "argv": argv }))
             }
+            "wsprobe" => host.host_call(
+                "ws.connect",
+                json!({
+                    "endpoint_ref": "undeclared.endpoint",
+                    "path": "/events",
+                    "timeout_ms": 100
+                }),
+            ),
             "readenv" => {
                 // Read this plugin process's OWN environment directly (NOT via the host). Under the
                 // guarded spawn path the env is cleared to the allow-list, so a non-allow-listed

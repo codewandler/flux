@@ -1,12 +1,15 @@
 //! `asterisk` — a flux integration plugin for the Asterisk PBX via the Asterisk Manager Interface
-//! (AMI) over a raw TCP socket.  All IO goes through the host `conn.*` capability; secrets are read
+//! (AMI) over a raw TCP socket and the Asterisk REST Interface (ARI) over guarded host HTTP. AMI IO
+//! goes through the host `conn.*` capability; secrets are read
 //! via `host.secret("username")` and `host.secret("secret")`.  The AMI host:port is a **non-secret
 //! config value**, read through the gated `config` capability (`ami_host` / `ami_port`, declared
 //! over the `ASTERISK_AMI_HOST` / `ASTERISK_AMI_PORT` env vars — it was never a URL, so it is not
 //! an endpoint); if unset it falls back to `localhost:5038`.  The dial itself stays behind the
 //! gated, SSRF-guarded `conn` capability host-side.
 //!
-//! The plugin implements 8 ops:
+//! The plugin implements 8 hand-written AMI ops, 108 generated ARI REST ops, the official ARI event
+//! WebSocket opener and two explicitly plugin-owned bounded read/close lifecycle controls.
+//! The AMI operations are:
 //!   - asterisk.ami.ping        (read)
 //!   - asterisk.channel.list    (read)
 //!   - asterisk.peer.list       (read; param technology)
@@ -19,6 +22,8 @@
 //! Protocol: AMI speaks "Key: Value\r\n" blocks terminated by a blank line.  Login sends
 //! `Action: Login\r\nUsername: ..\r\nSecret: ..\r\nEvents: off\r\n\r\n` and expects
 //! `Response: Success`.  List actions accumulate `Event:` blocks until a named "complete" event.
+
+mod ari;
 
 use host_kit::*;
 use schemars::JsonSchema;
@@ -166,15 +171,19 @@ struct CommandInput {
     command: String,
 }
 
-fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("asterisk", env!("CARGO_PKG_VERSION"))
+fn manifest_builder() -> Result<PluginBuilder, String> {
+    let builder = PluginBuilder::new("asterisk", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             conn: vec!["tcp:*:5038".into()],
             private_hosts: vec!["*".into()],
             secrets: vec![
                 "ASTERISK_AMI_USERNAME".into(),
                 "ASTERISK_AMI_SECRET".into(),
+                "ASTERISK_ARI_PASSWORD".into(),
             ],
+            http: true,
+            websocket: true,
+            blob: true,
             ..Default::default()
         })
         .auth(AuthMethod {
@@ -187,6 +196,22 @@ fn manifest_builder() -> PluginBuilder {
             purpose: "secret".into(),
             env: vec!["ASTERISK_AMI_SECRET".into()],
             description: "Asterisk AMI secret/password".into(),
+            ..Default::default()
+        })
+        .auth(AuthMethod {
+            purpose: "ari_basic".into(),
+            env: vec!["ASTERISK_ARI_PASSWORD".into()],
+            user_env: vec!["ASTERISK_ARI_USERNAME".into()],
+            scheme: AuthScheme::Basic,
+            description: "Asterisk ARI Basic authentication".into(),
+            ..Default::default()
+        })
+        .endpoint(EndpointSpec {
+            name: "asterisk.ari".into(),
+            env: vec!["ASTERISK_ARI_URL".into()],
+            http_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+            description: "Asterisk REST Interface base URL, including the /ari/ prefix".into(),
+            default: Some("http://localhost:8088/ari/".into()),
             ..Default::default()
         })
         .config(ConfigSpec {
@@ -268,7 +293,8 @@ fn manifest_builder() -> PluginBuilder {
                 op
             },
             ami_command,
-        )
+        );
+    ari::register_recordings_and_events(builder)
 }
 
 /// AMI key:value block.
@@ -1330,7 +1356,7 @@ fn ami_command(input: Value, host: &mut Host) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), String> {
-    manifest_builder().try_serve()
+    manifest_builder()?.try_serve()
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,8 +1405,38 @@ mod tests {
     }
 
     fn call(op: &str, input: Value, mock: &mut MockHost) -> Result<Value, String> {
-        let plugin = manifest_builder().build();
+        let plugin = manifest_builder().expect("manifest contracts").build();
         plugin.call(op, input, mock)
+    }
+
+    #[test]
+    fn ari_manifest_delegates_basic_auth_and_declares_guarded_http_and_blob_io() {
+        let manifest = manifest_builder().expect("manifest contracts").manifest();
+        assert!(manifest.capabilities.http);
+        assert!(manifest.capabilities.websocket);
+        assert!(manifest.capabilities.blob);
+        assert!(manifest
+            .capabilities
+            .secrets
+            .iter()
+            .any(|secret| secret == "ASTERISK_ARI_PASSWORD"));
+        let auth = manifest
+            .auth
+            .iter()
+            .find(|auth| auth.purpose == "ari_basic")
+            .expect("ARI Basic auth declaration");
+        assert!(matches!(auth.scheme, AuthScheme::Basic));
+        assert_eq!(auth.user_env, ["ASTERISK_ARI_USERNAME"]);
+        let endpoint = manifest
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == "asterisk.ari")
+            .expect("ARI endpoint declaration");
+        assert_eq!(endpoint.env, ["ASTERISK_ARI_URL"]);
+        assert_eq!(
+            endpoint.default.as_deref(),
+            Some("http://localhost:8088/ari/")
+        );
     }
 
     // ---- 1. ami.ping -------------------------------------------------------
@@ -2003,11 +2059,14 @@ mod schema_contract {
     #[test]
     fn derived_schemas_match_legacy_contract() {
         let ops = contracts();
-        let manifest = manifest_builder().build().manifest();
+        let manifest = manifest_builder()
+            .expect("manifest contracts")
+            .build()
+            .manifest();
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
-            .filter(|o| !o.internal)
+            .filter(|operation| ops.iter().any(|(name, _)| *name == operation.name.as_str()))
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

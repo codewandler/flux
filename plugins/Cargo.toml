@@ -33,18 +33,15 @@ members = [
 ]
 
 # The PACK version below is the plugin binaries' distribution version, independent of both flux and
-# the 1.x protocol line. 0.1.3 carries the MySQL/MariaDB half of D-196…D-198: the host learned the
-# MySQL handshake in flux 0.30.1, but the `COM_QUERY` client and the dialect-aware introspection ops
-# live in `sql/` and ship only from here, so a flux release alone leaves a host that can authenticate
-# to MariaDB talking to a plugin that cannot query it. The wire contract did not move, so host-kit
-# stays at 1.0.0 and its publish step is a no-op.
+# the 1.x protocol line. 0.1.6 carries Asterisk's complete official ARI 22.10.1 surface, including
+# host-owned event WebSockets and bounded recording-to-blob delivery (D-239…D-248).
 #
 # Keep `version` within the first few lines of the section: release-plugins.yml reads it from a
 # bounded window after the section header, and a comment between the two hid it once already.
 [workspace.package]
 edition = "2021"
 rust-version = "1.87"
-version = "0.1.5"
+version = "0.1.6"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -56,7 +53,7 @@ license = "MIT OR Apache-2.0"
 # `scripts/check-host-kit-protocol-drift.sh` reads to answer "which wire does a plugin built against
 # this host-kit actually speak" — and `^1` records a floor of 1.0.0, so it keeps reporting drift no
 # matter how often the pack is republished. Bump this alongside the protocol crate's MINOR.
-flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.2", path = "../crates/flux-plugin-protocol" }
+flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.3", path = "../crates/flux-plugin-protocol" }
 flux-datasource = { package = "codewandler-flux-datasource", version = "1", path = "../crates/flux-datasource" }
 flux-secret = { package = "codewandler-flux-secret", version = "1", path = "../crates/flux-secret" }
 flux-spec = { package = "codewandler-flux-spec", version = "1", path = "../crates/flux-spec" }

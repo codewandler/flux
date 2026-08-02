@@ -1136,18 +1136,23 @@ dependencies = [
  "codewandler-flux-secret",
  "codewandler-flux-spec",
  "codewandler-flux-system",
+ "futures-util",
  "hmac 0.13.0",
  "lzma-rs",
  "minisign",
  "minisign-verify",
  "rand 0.10.2",
+ "rcgen",
  "reqwest 0.13.4",
  "rquickjs",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tar",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.30.0",
  "toml",
  "url",
  "zip",
@@ -1155,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-plugin-protocol"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "codewandler-flux-datasource",
  "codewandler-flux-evidence",

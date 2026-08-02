@@ -70,8 +70,29 @@ async fn host_services_plugin_capability_callback() {
     host.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn plugin_websocket_callback_cannot_bypass_the_manifest_grant() {
+    let exe = env!("CARGO_BIN_EXE_caps_plugin");
+    let system = test_system();
+    let mut host = PluginHost::spawn(&system, exe, &[]).await.unwrap();
+    let manifest = host.manifest().await.unwrap();
+    assert!(!manifest.capabilities.websocket);
+    let caps = flux_plugin::SystemHostCaps::new(Arc::new(test_system())).with_manifest(&manifest);
+
+    let error = host
+        .call_with_host("wsprobe", json!({}), &caps)
+        .await
+        .expect_err("a guest callback cannot grant itself websocket access");
+    assert!(
+        error.to_string().contains("websocket not granted"),
+        "{error}"
+    );
+    host.shutdown().await.unwrap();
+}
+
 struct BlockingCaps {
     entered: tokio::sync::Semaphore,
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -79,6 +100,11 @@ impl HostCapabilities for BlockingCaps {
     async fn handle(&self, _command: &str, _payload: &Value) -> Result<Value, String> {
         self.entered.add_permits(1);
         std::future::pending().await
+    }
+
+    fn cancel_session(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -94,6 +120,7 @@ async fn cancellation_during_callback_does_not_desynchronize_next_dispatch() {
     ));
     let blocking = Arc::new(BlockingCaps {
         entered: tokio::sync::Semaphore::new(0),
+        cancelled: std::sync::atomic::AtomicBool::new(false),
     });
 
     let cancelled = tokio::spawn({
@@ -114,6 +141,10 @@ async fn cancellation_during_callback_does_not_desynchronize_next_dispatch() {
         .forget();
     cancelled.abort();
     assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert!(
+        blocking.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "abandoning a plugin exchange cancels its host-owned session resources"
+    );
 
     let next = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         host.lock()

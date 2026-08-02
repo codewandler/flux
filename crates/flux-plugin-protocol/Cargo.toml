@@ -6,7 +6,9 @@ edition.workspace = true
 # host?". A flux release does not move it; a wire change does. `scripts/cut-release.sh` therefore
 # never touches this file, and `flux_plugin_protocol::PROTOCOL` is the runtime half of the same
 # promise. See docs/designs/plugin-protocol-decoupling.md.
-version = "1.2.0"
+# 1.3.0 (D-241): additive, default-false WebSocket capability declaration. Existing manifests
+# remain byte-compatible at runtime and the protocol marker stays `flux.plugin.v1`.
+version = "1.3.0"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

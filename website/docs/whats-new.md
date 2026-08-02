@@ -12,6 +12,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Control Asterisk through its complete REST interface, including live events and recordings.**
+  The Asterisk plugin now exposes every operation in the official ARI 22.10.1 description while
+  preserving its existing AMI tools. Flux keeps the PBX address and credentials on the host side,
+  applies your private-network grant, opens the event WebSocket itself, and streams stored recordings
+  into bounded blob storage instead of carrying large base64 values through the plugin. Invalid call
+  origination, external-media and snoop combinations are rejected before any request is sent.
+
 ## [0.51.0] - 2026-08-02
 
 ### Action needed

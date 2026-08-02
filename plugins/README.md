@@ -36,6 +36,9 @@ plugin protocol, serviced by flux's guarded host (the same safety boundary as th
 - **http** — method/headers/body; the host injects auth per the declared `AuthScheme`
   (Bearer/Basic/Header/Query) so the plugin never sees the raw token; binary bodies via
   `body_b64`/`response_binary` (byte-exact up/download).
+- **websocket** — endpoint-reference connect/read/close with the same host-side auth, destination and
+  private-network checks as HTTP; connection ids, frames, queues and deadlines are host-owned and
+  bounded.
 - **endpoint (by reference)** — endpoints are declared in the manifest and addressed **by
   reference** (`http_ref`/`get_json_ref`/`send_json_ref`/`conn_dial_ref`): the host resolves the
   base URL from declared env keys and puts it on the wire; the plugin never sees the URL.
@@ -43,7 +46,8 @@ plugin protocol, serviced by flux's guarded host (the same safety boundary as th
   host-managed background child (`process.spawn`/`read`/`status`/`kill`, e.g. `kubectl port-forward`).
 - **conn** — a guarded raw TCP/Unix byte stream (`conn.dial`/`read`/`write`/`close`) for non-HTTP
   protocols (SQL wire, the Docker socket, AMI).
-- **blob** — a scratch blob store (`blob.put`/`get`/`info`) so file up/downloads aren't inlined as base64.
+- **blob** — a scratch blob store (`blob.put`/`get`/`info`) so file up/downloads aren't inlined as
+  base64; bounded HTTP responses can stream directly into it without crossing the plugin wire.
 - **datasource records** — a plugin contributes `flux-datasource` `Record`s that become searchable
   knowledge in the D-07 index (via the host's `DatasourceHostCaps` bridge).
 
@@ -77,7 +81,7 @@ endpoint-reference forms/`run`/`contribute`), a `PluginBuilder` (collect a manif
 | `aws` | STS / EC2 / EKS / RDS / S3 / CloudWatch read ops | AWS access key env via host-managed CLI | — |
 | `docker` | core Docker Engine container/image/network/volume/system lifecycle | local Docker Unix socket | `docker.container` / `image` / `network` / `volume` |
 | `sql` | PostgreSQL read-only query + database/table/index introspection | SQL DSN + username/password | `sql.query_result` |
-| `asterisk` | AMI ping / channels / peers / queues / device states / originate / hangup / command | AMI username/secret | — |
+| `asterisk` | 8 AMI operations + all 109 official ARI Swagger operations (REST, recordings and events) | AMI username/secret + ARI Basic auth | — |
 | `homer` | SIP search / calls / QoS / PCAP export / aliases | Homer username/password JWT login | `homer.message` / `call` / `alias` |
 | `vault` | Vault sys diagnostics + KV-v2 list/read/write/version ops | `X-Vault-Token` from `VAULT_TOKEN` | `vault.kv_key` metadata only |
 | `onepassword` | 1Password Connect server/vault/item/file ops | Bearer `OP_CONNECT_TOKEN` | `onepassword.vault` / `item` / `file` metadata only |

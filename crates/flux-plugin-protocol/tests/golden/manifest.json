@@ -57,7 +57,8 @@
     ],
     "secrets": [
       "FIXTURE_TOKEN"
-    ]
+    ],
+    "websocket": true
   },
   "config": [
     {

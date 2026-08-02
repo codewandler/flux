@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The Asterisk plugin now covers the complete official ARI 22.10.1 Swagger surface** (D-239…D-248).
+  Its manifest accounts for all 109 vendor operations: 108 guarded REST calls and the authenticated
+  event WebSocket, alongside the existing eight byte-pinned AMI operations. Generated closed input
+  contracts and resolved response schemas come from a deterministic, hash-pinned development-only
+  Swagger corpus; channel preflights reject invalid conditional combinations before host IO.
+
+- **Plugins can request guarded endpoint-reference WebSockets and stream bounded HTTP responses
+  directly into the host blob store** (D-241, D-242). WebSocket auth, DNS pinning, TLS/SNI,
+  destination policy and private-network grants remain host-owned; connection, frame, queue and
+  deadline limits fail closed, terminal handles are reaped, and opaque discovered endpoints stay
+  redacted. Blob publication requires HTTP and blob grants, a finite explicit byte/deadline budget,
+  a complete successful response and returns only its reference, size and SHA-256.
+
 ## [0.51.0] - 2026-08-02
 
 ### Added

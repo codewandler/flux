@@ -435,6 +435,7 @@ pub(super) fn capability_widenings(
         process,
         secrets,
         http,
+        websocket,
         http_hosts,
         private_hosts,
         conn,
@@ -462,6 +463,7 @@ pub(super) fn capability_widenings(
             .map(|scope| format!("`fs` gains `{}` (secret: {})", scope.path, scope.secret)),
     );
     widenings.extend(turned_on("http", granted.http, *http));
+    widenings.extend(turned_on("websocket", granted.websocket, *websocket));
     widenings.extend(turned_on("blob", granted.blob, *blob));
     widenings.extend(turned_on("discover", granted.discover, *discover));
     widenings.extend(turned_on("credential", granted.credential, *credential));

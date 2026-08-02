@@ -24,6 +24,7 @@
 #   FLUX_SMOKE_DOCKER=1 (needs Docker socket) → docker.info
 #   SQL_DSN or SQL_URL (+ optional SQL_USERNAME/PASSWORD) → sql.test
 #   ASTERISK_AMI_USERNAME + ASTERISK_AMI_SECRET (+ host/port) → asterisk.ami.ping
+#   ASTERISK_ARI_USERNAME + ASTERISK_ARI_PASSWORD (+ optional URL) → asterisk.ari.asterisk.ping
 #   HOMER_URL + HOMER_USERNAME + HOMER_PASSWORD → homer.test
 #   VAULT_ADDR + VAULT_TOKEN               → vault.health
 #   OP_CONNECT_HOST + OP_CONNECT_TOKEN     → onepassword.health
@@ -85,6 +86,47 @@ run_case() {
   fi
 }
 
+assert_asterisk_generated_skill() {
+  local exe="$BIN/flux-plugin-asterisk"
+  if [ ! -x "$exe" ]; then
+    bad "asterisk generated skill (binary missing: $exe)"
+    return
+  fi
+  if ! "$FLUX" plugin add asterisk "$exe" >/dev/null 2>&1; then
+    bad "asterisk generated skill (isolated plugin registration failed)"
+    return
+  fi
+  if ! (cd "$ROOT" && "$FLUX" plugin skill --install --global) >/dev/null 2>&1; then
+    bad "asterisk generated skill (isolated render/install failed)"
+    return
+  fi
+  local reference="$SMOKE_HOME/.claude/skills/flux-plugin/references/asterisk.md"
+  if [ ! -f "$reference" ]; then
+    bad "asterisk generated skill (missing isolated reference)"
+    return
+  fi
+  local required
+  for required in \
+    'asterisk.ami.ping' \
+    'ASTERISK_AMI_USERNAME' \
+    'ASTERISK_AMI_SECRET' \
+    'asterisk.ari.asterisk.ping' \
+    'asterisk.ari.events.eventWebsocket' \
+    'asterisk.ari.control.events.read' \
+    'asterisk.ari.control.events.close' \
+    'ASTERISK_ARI_PASSWORD' \
+    'ASTERISK_ARI_URL'; do
+    if ! grep -Fq "$required" "$reference"; then
+      bad "asterisk generated skill (missing $required)"
+      return
+    fi
+  done
+  ok "asterisk generated skill → isolated reference includes AMI + ARI setup and operations"
+}
+
+step "generated plugin skill (isolated HOME)"
+assert_asterisk_generated_skill
+
 step "plugin op round-trips (skipped when the key is absent)"
 run_case websearch  websearch.search     '{"query":"warm transfer","max_results":2}' TAVILY_API_KEY
 run_case gitlab     gitlab.project.list  '{}'                                         GITLAB_PERSONAL_TOKEN
@@ -135,6 +177,15 @@ if [ -n "${ASTERISK_AMI_USERNAME:-}" ] && [ -n "${ASTERISK_AMI_SECRET:-}" ]; the
   run_case asterisk asterisk.ami.ping '{}' ASTERISK_AMI_USERNAME
 else
   skip "asterisk.ami.ping (ASTERISK_AMI_USERNAME / ASTERISK_AMI_SECRET not set)"
+fi
+
+if [ -n "${ASTERISK_ARI_USERNAME:-}" ] && [ -n "${ASTERISK_ARI_PASSWORD:-}" ]; then
+  # ARI is normally loopback/private. This grant lives only in SMOKE_HOME and is still intersected
+  # with the Asterisk manifest's private_hosts; no operator config or credential value is copied.
+  printf '%s\n' '[private_net.plugins]' 'asterisk = ["*"]' >"$SMOKE_HOME/.flux/config.toml"
+  run_case asterisk asterisk.ari.asterisk.ping '{}' ASTERISK_ARI_USERNAME
+else
+  skip "asterisk.ari.asterisk.ping (ASTERISK_ARI_USERNAME / ASTERISK_ARI_PASSWORD not set)"
 fi
 
 if [ -n "${HOMER_URL:-}" ] && [ -n "${HOMER_USERNAME:-}" ] && [ -n "${HOMER_PASSWORD:-}" ]; then

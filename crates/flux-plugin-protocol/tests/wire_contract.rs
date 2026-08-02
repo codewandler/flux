@@ -140,6 +140,7 @@ fn maximal_manifest() -> PluginManifest {
             process: vec!["kubectl get".into()],
             secrets: vec!["FIXTURE_TOKEN".into()],
             http: true,
+            websocket: true,
             http_hosts: vec!["example.invalid".into()],
             private_hosts: vec!["10.0.0.1".into()],
             conn: vec!["tcp:*:5432".into()],
@@ -182,6 +183,18 @@ fn manifest_wire_surface_is_pinned() {
         "manifest.json",
         &serde_json::to_value(maximal_manifest()).unwrap(),
     );
+}
+
+#[test]
+fn websocket_capability_round_trips_as_an_explicit_deny_by_default_wire_grant() {
+    let decoded: PluginCapabilities = serde_json::from_value(json!({"websocket": true}))
+        .expect("additive websocket capability should deserialize");
+    let wire = serde_json::to_value(decoded).expect("capability should serialize");
+    assert_eq!(wire.get("websocket"), Some(&json!(true)));
+
+    let denied = serde_json::to_value(PluginCapabilities::default())
+        .expect("default capabilities should serialize");
+    assert_eq!(denied.get("websocket"), Some(&json!(false)));
 }
 
 #[test]
