@@ -382,6 +382,7 @@ flux → sidecar   {"id":1,"cmd":"join","room":"standup@conference.example.org",
                  {"id":4,"cmd":"mute","muted":true}    {"id":5,"cmd":"level"}    {"id":6,"cmd":"leave"}
 
 sidecar → flux   {"ready":"flux.room-media.v1","owns_device_routing":true}
+                 {"ready":"flux.room-media.v1","owns_device_routing":false,"routing_error":"audio server … is unreachable"}
                  {"id":1,"ok":true}   {"id":5,"ok":true,"level":{"rms":0.12,"peak":0.31}}
                  {"id":2,"ok":false,"error":"no published audio track"}
                  {"event":"audio_frame","from":"…/timo","audio":{…}}
@@ -397,7 +398,9 @@ Four decisions in it are load-bearing, and each one is a measured finding rather
 - **What crosses the seam instead is a claim.** `owns_device_routing` in the handshake, **defaulting to
   `false`**. flux refuses to publish audio through a sidecar that has not taken ownership — because both
   ways of *not* owning it (Chrome 150 ignoring `--use-fake-device-for-media-capture`, `setAudioInputDevice`
-  not sticking) fail by reporting success.
+  not sticking) fail by reporting success. A sidecar that can diagnose the refusal sends
+  `routing_error`; flux carries that reason into the publication failure, so a masked Pulse socket names
+  the socket and required grant instead of masquerading as zero RMS.
 - **Publication is checked with a level probe, never a mute-state read** (invariant 8, below).
 - **Stdout noise is skipped and counted, never fatal.** A browser harness prints. Ending a live call over
   a stray log line is the worse failure; only a line that *claims* to be protocol and is malformed is
@@ -442,7 +445,10 @@ to get audio a human could hear, and it is the checklist to run **before** a cal
    argv-only, cwd-pinned, with the environment cleared to a minimal allow-list; `DISPLAY`,
    `XDG_RUNTIME_DIR`, `PULSE_SERVER` and friends **do not** reach it, while `HOME`, `USER`, `PATH` and
    `TMPDIR` do. So the audio server rides in argv, which flux never interprets:
-   `media { sidecar ["flux-room-media", "--audio-server", "unix:/run/user/1000/pulse/native"] }`.
+   `media { sidecar ["flux-room-media", "--audio-server", "unix:/run/user/1000/pulse/native",
+   "--token", secret "ROOM_TOKEN"] }`. The JaaS token uses the same redacted argv seam; it is never
+   added to flux-system's deliberately non-secret environment allow-list. Host process listings can
+   expose argv, so the operator must treat access to `/proc/<pid>/cmdline` as credential access.
 
    ⚠ **Measured 2026-08-02 (D-232): that is necessary but not sufficient.** `bubblewrap_argv` masks
    `/run` with `--tmpfs /run` — deliberately, since that is what keeps `docker.sock` and D-Bus
@@ -470,6 +476,13 @@ to get audio a human could hear, and it is the checklist to run **before** a cal
    sidecar keeps a `--no-sandbox` flag for hosts that refuse namespace nesting, off by default —
    forcing it would trade Chrome's purpose-built sandbox for a weaker generic one, the same trade
    `spawn_debug_pipe` declines.
+9. **The Jitsi browser bundle is an exact reviewed release, not ambient remote code.** There is no
+   source by default; a join must explicitly opt in with `--jitsi <local-path>`. URL schemes are
+   refused because fetching from the spawned sidecar would bypass flux-system's guarded-egress seam.
+   The shipped pins for that source are 8x8 release **6869**, SHA-256
+   `09f03ed9d03f4c7dc4691d9e8781f9872ca89660c07a59dad5c292c83f89a0e1`. The local file requires the
+   `sha256-…` integrity value; bytes are refused before CDP evaluation on mismatch. Updating the tenant
+   release is therefore an explicit reviewed artifact change, never something a URL can do at runtime.
 
 ## Multi-party is the design problem; the plumbing is the easy half
 

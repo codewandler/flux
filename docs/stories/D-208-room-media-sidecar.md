@@ -85,12 +85,12 @@ working with the sidecar absent.
   1. That a real browser publishes audible audio. Every level number here comes from a scripted double —
      the probe is only as honest as the in-page RMS measurement behind it.
   2. That the PipeWire null-sink + `move-source-output` recipe survives being driven by a *spawned*
-     sidecar with a **cleared environment**. flux clears `DISPLAY`/`XDG_RUNTIME_DIR`/`PULSE_SERVER`; the
-     seam therefore requires argv to carry anything the sidecar needs about the host audio server. That
-     is documented and not exercised.
-  3. That Chrome runs at all inside flux's bubblewrap confinement. `spawn_interactive` is `Sandboxed`,
-     and Chrome's content sandbox needs a nested user namespace — the reason tier-3 browsing has an
-     explicit exemption. Untested against a live call; may need `FLUX_SANDBOX=off`.
+     sidecar with a **cleared environment**. **Answered by D-232/D-235:** argv must carry the audio
+     server, and bubblewrap's `/run` mask means the operator must also bind the Pulse directory with
+     `[sandbox] writable = ["/run/user/<uid>/pulse"]`. The shipped preflight names both pieces.
+  3. That Chrome runs at all inside flux's bubblewrap confinement. **Answered by D-232:** Chrome 150,
+     its nested content sandbox, and the real track probe all pass inside flux's ordinary
+     `Confinement::Sandboxed`; no exemption or default `--no-sandbox` is needed.
   4. Anything about ICE/DTLS/simulcast/Jingle behaviour. Nothing in this diff opens a WebRTC session.
 
   **Also not done** (out of this story's Acceptance, worth filing): the media plane does not
@@ -105,7 +105,11 @@ working with the sidecar absent.
 - The virtual-device approach is Linux-specific. The seam must keep that inside the sidecar so the port
   stays portable. **Held**: the control protocol has no device/sink/source/audio-server field, pinned on
   the rendered wire by `protocol.rs::the_protocol_never_names_a_capture_device` rather than by a comment.
-  Host specifics ride in the sidecar's argv, which flux passes through and never interprets.
+  Host specifics ride in the sidecar's argv, which flux passes through and never interprets. That is
+  necessary but not sufficient for a host socket under `/run`: the matching directory must also be
+  explicitly re-bound through `[sandbox] writable`. D-235 pins the no-grant diagnostic and the real
+  masked/granted composition. The JaaS token uses `--token` in this redacted argv; it is deliberately
+  absent from flux-system's non-secret environment allow-list (D-236).
 - D-204 expected the media events to arrive as new `RoomEvent` variants. They did not: they are
   `media::MediaEvent` on a separate stream from a separate port, so a text consumer's `match` never grows
   a browser-shaped arm and `RoomEvent` stays free of the feature. `rooms/mod.rs` records the change where

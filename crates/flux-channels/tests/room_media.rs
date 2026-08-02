@@ -162,6 +162,7 @@ fn ready(owns_device_routing: bool) -> String {
     serde_json::to_string(&Ready {
         ready: MEDIA_PROTOCOL.into(),
         owns_device_routing,
+        routing_error: None,
     })
     .unwrap()
 }
@@ -339,6 +340,37 @@ async fn a_sidecar_that_does_not_own_device_routing_may_not_publish_audio() {
     .expect("video does not depend on audio capture");
 }
 
+/// D-235: preserve the sidecar's concrete routing failure through the handshake and publication
+/// refusal. A masked Pulse socket must not collapse into generic "device routing" or a zero level.
+#[tokio::test]
+async fn a_masked_audio_socket_survives_as_the_publication_failure_reason() {
+    let handshake = serde_json::to_string(&Ready {
+        ready: MEDIA_PROTOCOL.into(),
+        owns_device_routing: false,
+        routing_error: Some(
+            "audio server /run/user/1000/pulse/native is unreachable; flux's sandbox masks `/run`; \
+             add [sandbox] writable = [\"/run/user/1000/pulse\"]"
+                .into(),
+        ),
+    })
+    .unwrap();
+    let (peer, double) = connect(Some(handshake), |r| Some(ok(r.id)), config()).await;
+    let peer = peer.expect("a diagnosed routing failure still completes the control handshake");
+
+    let error = peer
+        .publish_audio(&chunk())
+        .await
+        .expect_err("the masked socket must stop publication")
+        .to_string();
+    assert!(error.contains("/run/user/1000/pulse/native"), "{error}");
+    assert!(error.contains("sandbox masks `/run`"), "{error}");
+    assert!(error.contains("[sandbox] writable"), "{error}");
+    assert!(
+        double.commands().is_empty(),
+        "publication was refused before a silent track reached the wire"
+    );
+}
+
 /// Invariant 8 of the design, end to end over the wire: publish succeeds, mute reads false, and the
 /// probe says the track is silent — so publication is a **failure**.
 #[tokio::test]
@@ -403,6 +435,7 @@ async fn a_protocol_mismatch_is_refused_rather_than_negotiated() {
     let mismatched = serde_json::to_string(&Ready {
         ready: "flux.room-media.v9".into(),
         owns_device_routing: true,
+        routing_error: None,
     })
     .unwrap();
     let (peer, _double) = connect(Some(mismatched), |r| Some(ok(r.id)), config()).await;

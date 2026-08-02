@@ -8,6 +8,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The room-media browser harness now fails closed at every exercised live host seam** (D-232;
+  closes D-234, D-235 and D-238; advances D-236 and D-237).
+  Joining requires an explicit local `--jitsi` source whose SHA-256 matches the reviewed 8x8 release
+  pin before any browser evaluation; the no-argument path has no source, and URL schemes are refused
+  so the sidecar cannot bypass `flux-system`'s guarded-egress and DNS-pinning boundary.
+  JaaS guest tokens travel through the redacted `--token` argv path instead of an environment entry
+  `flux-system` deliberately clears, and exact-token redaction covers page/protocol failures.
+  `MediaSettings` now redacts resolved argv in `Debug` as well as the downstream sidecar config.
+  Pulse reachability is preflighted and its handshake diagnosis names bubblewrap's `/run` mask plus
+  the required `[sandbox] writable` bind. A live bwrap/Chrome/Pulse test proves the same argv fails
+  without the bind and routes with it; the device-routing census now enumerates every shipped media
+  JavaScript asset. Failing-first tests pin token delivery/redaction, integrity-before-evaluation,
+  masked-socket diagnostics and config-level redaction; a `page.js` mutation proves the expanded
+  routing guard.
+
 - **The SDK autonomous posture now carries fail-closed confinement and a finite delegated-tree
   budget** (C-444, C-470). `ClientBuilder` and `FlowClientBuilder` resolve blanket
   `auto_approve(true)` and every injected opaque `Approver` to sandbox `Require` with the sandbox

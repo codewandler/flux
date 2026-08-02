@@ -2,7 +2,7 @@
 id: D-235
 title: "Argv alone does not reach the host audio server — the sandbox masks the socket"
 pillar: Agent
-status: ready
+status: done
 priority: 3
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -43,17 +43,26 @@ elsewhere" is not a defence — the guarantee is fine, the *discoverability* is 
 
 ## Acceptance
 
-- [ ] The argv-only claim is corrected wherever it is stated: D-208's Notes, the sidecar's own docs, and
+- [x] The argv-only claim is corrected wherever it is stated: D-208's Notes, the sidecar's own docs, and
       any website page that describes bringing real audio to a room.
-- [ ] The companion grant is documented as part of the same recipe, with a concrete example, and stated
+- [x] The companion grant is documented as part of the same recipe, with a concrete example, and stated
       as **required**, not optional.
-- [ ] ⚠ A failing-first test pinning the composition, not just the prose: with argv correct and the
+- [x] ⚠ A failing-first test pinning the composition, not just the prose: with argv correct and the
       socket path **not** in `[sandbox] writable`, the sidecar's audio path fails in a way that names
       the masked socket rather than reporting a zero level. A diagnosable failure is the deliverable;
       silence is the bug.
-- [ ] ⚠ **No env passthrough is added to `flux-system`.** The env-clearing at the seam is deliberate and
+- [x] ⚠ **No env passthrough is added to `flux-system`.** The env-clearing at the seam is deliberate and
       correct; this story documents and diagnoses, it does not loosen the sandbox.
-- [ ] The `/run` tmpfs mask and the `:2563` invariant are unchanged.
+- [x] The `/run` tmpfs mask and the `:2563` invariant are unchanged.
+
+## Result
+
+The sidecar now runs `pactl info` against the named server before asserting routing ownership and
+returns a `routing_error` that names the socket, bubblewrap's `/run` mask, and the exact
+`[sandbox] writable` directory. `SidecarMediaPeer` preserves that reason in its pre-publication
+refusal. The ignored live composition test ran both postures against real bwrap, Chrome and Pulse:
+the same argv failed diagnostically without the bind and routed with it. No environment entry or
+`/run` masking rule changed.
 
 ## Notes
 

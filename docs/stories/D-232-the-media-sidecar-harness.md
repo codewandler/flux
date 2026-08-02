@@ -7,7 +7,7 @@ priority: 1
 design: docs/designs/meeting-rooms.md
 epic: meeting-rooms
 areas: [flux-channels]
-note: "⚠ THE Thursday-critical piece. Both D-208 risks are now ANSWERED (2026-08-02): Chrome runs fine under bubblewrap and needs no `--no-sandbox`; but `--tmpfs /run` masks the pulse socket, so argv alone is NOT enough — the operator must also grant `[sandbox] writable = [\"/run/user/<uid>/pulse\"]`. The harness and a genuine in-page RMS probe are in and measured against real Chrome 150. STILL OPEN: nothing has joined a live room, so the lib-jitsi-meet join/publish path is unexercised and no human has confirmed audio"
+note: "⚠ JITSI-SPECIFIC, not the Thursday Google Meet path. Both D-208 risks are now ANSWERED (2026-08-02): Chrome runs fine under bubblewrap and needs no `--no-sandbox`; but `--tmpfs /run` masks the pulse socket, so argv alone is NOT enough — the operator must also grant `[sandbox] writable = [\"/run/user/<uid>/pulse\"]`. The harness and a genuine in-page RMS probe are in and measured against real Chrome 150. STILL OPEN: nothing has joined a live Jitsi room, so the lib-jitsi-meet join/publish path is unexercised and no human has confirmed audio"
 ---
 
 # The half that has to meet a real browser
@@ -59,8 +59,8 @@ real harness**, because if either risk bites, the harness's shape changes.
       the precedent — audio out worked and *"was confirmed audible by the human in the call."*
       → **NOT DONE.** No human was in a call, and I cannot put one there. Everything up to the room
       boundary is measured (below); the `join` path against a live Brave Talk room is unexercised, so the
-      `lib-jitsi-meet` publish path is code-reviewed, not run. **This is the remaining Thursday risk**;
-      the runbook to close it is in Progress.
+      `lib-jitsi-meet` publish path is code-reviewed, not run. **This is the remaining Jitsi acceptance
+      risk, not a Google Meet or Thursday dependency**; the runbook to close it is in Progress.
 - [x] ⚠ **The level probe reports a genuine in-page RMS measurement.** D-208 is explicit that flux
       enforces the floor but cannot verify the number: *"a sidecar that hardcodes `rms: 0.5` passes."*
       → `assets/room-media/page.js`'s `measure()` reads real sample frames off the **published
@@ -81,13 +81,15 @@ real harness**, because if either risk bites, the harness's shape changes.
       the source-outputs whose `application.process.id` is our own Chrome or a descendant of it (matched
       by walking `/proc/<pid>/stat`, since capture happens in a child audio-service process).
       `tests/room_media_harness.rs::the_harness_routes_per_stream_and_never_moves_the_default_source`
-      greps the shipped file and fails on `set-default-source`/`set-default-sink` and on the three
+      enumerates every JavaScript asset under `assets/room-media/`, strips comments, and fails on
+      calls to `set-default-source`/`set-default-sink` and on the three
       measured dead ends (`use-fake-device-for-media-capture`, `use-file-for-fake-audio-capture`,
-      `setAudioInputDevice`). That guard caught a real violation while I wrote it — the forbidden verb
-      appeared in a *comment* — which is what says it greps the file rather than the intent.
+      `setAudioInputDevice`). A deliberate `setAudioInputDevice()` insertion in `page.js` failed with
+      that filename; explanatory comments may still name the rejected APIs.
 - [x] Linux-specific machinery stays **inside** the sidecar, per D-208's seam, so the flux-side port
-      stays portable. → no flux-side Rust behaviour changed at all. The only Rust here is a new test
-      file; `pactl`, PulseAudio, `/proc` and Chrome flags appear exclusively under `assets/room-media/`.
+      stays portable. → `pactl`, PulseAudio, `/proc` and Chrome flags remain exclusively under
+      `assets/room-media/`; the portable Rust protocol gained only an optional `routing_error` string
+      so a sidecar can carry its diagnosis into flux's publication refusal.
 
 ## Notes
 
@@ -207,12 +209,21 @@ real harness**, because if either risk bites, the harness's shape changes.
   as a fallback, because lib-jitsi-meet's API for this differs across builds), the JWT plumbing, and
   whether the bridge accepts a canvas-style synthesized audio track at all.
 
-  Also: **`lib-jitsi-meet` is fetched from the network at join time by default**
-  (`https://8x8.vc/libs/lib-jitsi-meet.min.js`, verified reachable, 1 089 184 bytes). That is
-  **not reproducible offline and impossible in CI**. `--jitsi <path>` takes a filesystem path instead,
-  which is read and injected — the vendored, offline route, and the one to use for anything repeatable.
-  Nothing is fetched at build time; no Rust dependency was added; CI never touches either path because
-  every browser test is `#[ignore]`d.
+  That initial default was unsafe: it fetched and evaluated whatever bytes the moving 8x8 URL served.
+  D-237 closed it before the live join. The no-argument path now has no source and cannot fetch;
+  URL schemes are refused because sidecar egress would bypass flux-system's guard. An explicit local
+  `--jitsi /path/to/lib-jitsi-meet-6869.min.js` uses defaults pinning 8x8 release **6869** and SHA-256
+  `09f03ed9d03f4c7dc4691d9e8781f9872ca89660c07a59dad5c292c83f89a0e1`; the local path is refused
+  before evaluation unless its bytes match `--jitsi-integrity`. An operator fetch on 2026-08-02
+  re-verified all 1 089 184 bytes. Updating the supplied bundle is now a source review, not runtime
+  drift.
+
+  D-235/D-236/D-238 closed the other three review findings in the same pass. The sidecar preflights
+  the Pulse socket and sends the exact masked-socket + `[sandbox] writable` diagnosis in its handshake;
+  a real bwrap test proved the same argv fails without the bind and routes with it. The guest JWT now
+  enters through `--token` in `MediaSidecarConfig`'s redacted argv, never the cleared environment, and
+  exact-token redaction prevents a page exception from echoing it into a protocol error. The routing
+  census now walks every shipped JavaScript asset.
 
   ### The runbook to close the last gap (needs a human in a room)
 
@@ -221,14 +232,14 @@ real harness**, because if either risk bites, the harness's shape changes.
   cargo test -p flux-channels --features room-media --test room_media_harness \
       -- --ignored the_in_page_probe_measures_a_real_track --nocapture
 
-  # 2. against a real room: grant the pulse socket, then join and probe
-  #    [sandbox] writable = ["/run/user/1000/pulse"]
-  node crates/flux-channels/assets/room-media/sidecar.js \
-      --audio-server unix:/run/user/1000/pulse/native
-  # then on stdin:
-  {"id":1,"cmd":"join","room":"<room>@conference.<tenant>.8x8.vc","nick":"flux","kind":"agent"}
-  {"id":2,"cmd":"publish_audio","audio":{"pcm16_le":"<b64 speech>","sample_rate_hz":48000,"channels":1}}
-  {"id":3,"cmd":"level"}      # must read > 0.01, and a human must confirm hearing it
+  # 2. against an operator-owned live room: a human joins and listens first. The ignored test mints
+  #    the guest JWT internally, confines Chrome with the Pulse bind, joins, publishes a three-second
+  #    tone, and requires a real RMS. No credential is pasted or printed.
+  FLUX_LIVE_BRAVE_ROOM=<owned-room-handle> \
+  FLUX_LIVE_JITSI_PATH=/tmp/lib-jitsi-meet-6869.min.js \
+  cargo test -p flux-channels --features room-media --test room_media_harness \
+      -- --ignored audible_audio_reaches_an_owned_live_brave_room --nocapture
+  # A green test is not the last checkbox: the listening human must confirm hearing the tone.
   ```
 
   Expect the first live run to fail in `join`, not in the probe — that is where the untested code is.

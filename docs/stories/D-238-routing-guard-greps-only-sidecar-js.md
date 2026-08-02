@@ -2,7 +2,7 @@
 id: D-238
 title: "The device-routing guard greps only `sidecar.js`, so `page.js` can reintroduce what it forbids"
 pillar: Agent
-status: ready
+status: done
 priority: 5
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -32,17 +32,24 @@ not route devices"; the guard is "one file does not mention routing".
 
 ## Acceptance
 
-- [ ] A failing-first test: `setAudioInputDevice` (or either of the other two forbidden names) placed in
+- [x] A failing-first test: `setAudioInputDevice` (or either of the other two forbidden names) placed in
       `page.js` **fails** the guard. It must pass — i.e. go unnoticed — at the merge base.
-- [ ] The guard covers every asset under `crates/flux-channels/assets/room-media/`, enumerated from the
+- [x] The guard covers every asset under `crates/flux-channels/assets/room-media/`, enumerated from the
       directory rather than by a hand-maintained file list — a list is what drifted here in the first
       place, and a fourth asset added later must be covered without anyone remembering to add it.
-- [ ] ⚠ The comments at `page.js:30-31` that legitimately *name* the forbidden APIs must not force the
+- [x] ⚠ The comments at `page.js:30-31` that legitimately *name* the forbidden APIs must not force the
       guard to be weakened to accommodate them. Distinguish a mention from a call, or move the
       explanation somewhere the guard does not read — but do not solve it by exempting `page.js`, which
       reproduces the current bug under a different name.
-- [ ] The guard's own message says what it checked, so a future reader can tell its scope without
+- [x] The guard's own message says what it checked, so a future reader can tell its scope without
       reading its implementation.
+
+## Result
+
+The guard enumerates every `.js` asset in the directory, removes line/block comments, compacts
+whitespace, and rejects executable call spellings while preserving the explanatory comments. Mutation
+proof: inserting `globalThis.setAudioInputDevice()` into `page.js` failed the focused test and named
+that file; removing the mutation restored green.
 
 ## Notes
 

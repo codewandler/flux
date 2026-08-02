@@ -25,6 +25,7 @@
 //!
 //! ```text
 //! {"ready":"flux.room-media.v1","owns_device_routing":true}
+//! {"ready":"flux.room-media.v1","owns_device_routing":false,"routing_error":"audio server … is unreachable"}
 //! {"id":1,"ok":true}
 //! {"id":5,"ok":true,"level":{"rms":0.12,"peak":0.31}}
 //! {"id":2,"ok":false,"error":"no published audio track"}
@@ -183,6 +184,10 @@ pub struct Ready {
     /// older or naive sidecar fail loudly instead of quietly.
     #[serde(default)]
     pub owns_device_routing: bool,
+    /// Why device routing could not be established. A sidecar should name a masked/missing socket
+    /// here so flux refuses publication with the cause rather than with an unexplained zero level.
+    #[serde(default)]
+    pub routing_error: Option<String>,
 }
 
 /// A published track's measured signal.
@@ -402,6 +407,7 @@ mod tests {
             Some(SidecarLine::Ready(Ready {
                 ready: MEDIA_PROTOCOL.into(),
                 owns_device_routing: true,
+                routing_error: None,
             }))
         );
         // An omitted claim is not a claim: the default is the refusing one.
@@ -410,6 +416,7 @@ mod tests {
             Some(SidecarLine::Ready(Ready {
                 ready: MEDIA_PROTOCOL.into(),
                 owns_device_routing: false,
+                routing_error: None,
             }))
         );
         assert_eq!(

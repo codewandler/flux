@@ -365,16 +365,21 @@ pub struct RoomSettings {
 /// plus a per-stream `pactl move-source-output`, measured 2026-07-30), and it lives *inside* the
 /// sidecar. flux states which room to join and what to publish; the sidecar owns how a capture
 /// stream reaches the browser. Host specifics an operator needs to pass ride in
-/// [`sidecar`](Self::sidecar) argv, which flux never interprets.
+/// [`sidecar`](Self::sidecar) argv, which flux never interprets. A host socket masked by the OS
+/// sandbox also needs its directory in `[sandbox] writable`; argv cannot expose an absent mount.
 ///
 /// `#[non_exhaustive]`: D-209…D-211 will add knobs to this bag.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[non_exhaustive]
 pub struct MediaSettings {
     /// The sidecar's argv, `argv[0]` first. Executed through `flux_system::System` like every other
     /// flux subprocess: argv-only (no shell), workspace-pinned cwd, and an environment **cleared**
     /// to the minimal non-secret allow-list — so a sidecar that needs to know anything about the
     /// host's audio server must be told in argv, never through an inherited variable.
+    /// On Linux the Pulse socket directory must additionally be granted through
+    /// `[sandbox] writable`. Credentials may use `--token`; this struct and the downstream
+    /// [`crate::rooms::media::MediaSidecarConfig`] both redact resolved argv in custom `Debug`
+    /// implementations.
     pub sidecar: Vec<String>,
     /// How long to wait for the sidecar's `ready` handshake. Defaults to
     /// `DEFAULT_MEDIA_HANDSHAKE_TIMEOUT`. A browser cold start is seconds, not milliseconds.
@@ -396,9 +401,69 @@ pub struct MediaSettings {
     pub min_publish_rms: Option<f32>,
 }
 
+impl std::fmt::Debug for MediaSettings {
+    /// Follow [`WebhookSettings`]' exact rule: keep diagnosable shape, never offer a host-resolved
+    /// secret to a formatter. The program identifies the sidecar; every following argv value is
+    /// opaque and may be a resolved `secret "…"` reference.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaSettings")
+            .field("program", &self.sidecar.first())
+            .field(
+                "args",
+                &format_args!("{} <redacted>", self.sidecar.len().saturating_sub(1)),
+            )
+            .field("handshake_timeout_secs", &self.handshake_timeout_secs)
+            .field("command_timeout_secs", &self.command_timeout_secs)
+            .field("event_buffer", &self.event_buffer)
+            .field("min_publish_rms", &self.min_publish_rms)
+            .finish()
+    }
+}
+
 /// The nick flux joins a room under when the declaration does not say. A room containing humans is
 /// owed an honest answer about what just joined it.
 pub const DEFAULT_ROOM_NICK: &str = "flux";
+
+#[cfg(test)]
+mod media_debug_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// D-234: the resolved sidecar token must not be offered to a formatter at either typed config
+    /// layer. Keeping argv[0] makes the selected sidecar diagnosable; everything after it is shape.
+    #[test]
+    fn media_and_room_debug_redact_the_resolved_sidecar_argv() {
+        let room: RoomSettings = serde_json::from_value(json!({
+            "backend": "jaas",
+            "room": "owned-room",
+            "media": {
+                "sidecar": ["flux-room-media", "--token", "jwt.D234.never-print-me"],
+                "command_timeout_secs": 30,
+            },
+        }))
+        .expect("the room settings deserialize");
+        let media = room.media.as_ref().expect("media is present");
+
+        for text in [format!("{media:?}"), format!("{room:?}")] {
+            assert!(
+                text.contains("flux-room-media"),
+                "program stays visible: {text}"
+            );
+            assert!(
+                text.contains("<redacted>"),
+                "argv shape stays visible: {text}"
+            );
+            assert!(
+                !text.contains("--token"),
+                "argv past zero is redacted: {text}"
+            );
+            assert!(
+                !text.contains("never-print-me"),
+                "secret reached Debug: {text}"
+            );
+        }
+    }
+}
 
 /// `kind = "slack"` settings (compiled in by default; gated only for `--no-default-features` builds).
 #[cfg(feature = "slack")]

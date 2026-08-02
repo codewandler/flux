@@ -28,6 +28,15 @@
 
 ### New
 
+- **The optional meeting-room browser is ready for a real-room acceptance run without trusting
+  ambient host state.** It now checks that the audio socket is actually reachable through the OS
+  sandbox and tells you the exact writable-path grant when it is not. Room credentials use the
+  redacted process-argument path instead of an environment variable that never survived launch, and
+  the browser library is loaded only from an explicit local file; its release and digest must match
+  before any code runs. The live test mints its guest credential internally, so the final
+  audible-room check needs a reviewed local bundle, a room you created, and a listening human—not a
+  token pasted into a prompt or terminal transcript.
+
 - **What happens when the conversation gets long, finally written down.** A new
   [context management](https://flux.codewandler.dev/docs/agent/context-management) page answers the
   question you have been asking: what fills up, what flux does about it when it does, what it keeps,

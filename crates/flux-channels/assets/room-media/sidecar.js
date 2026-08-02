@@ -10,8 +10,10 @@
 // ## Usage
 //
 //   flux-room-media --audio-server unix:/run/user/1000/pulse/native \
+//                   --token <jaas-guest-jwt> \
 //                   [--chrome /usr/bin/google-chrome-stable] \
-//                   [--jitsi <url-or-path>] [--no-sandbox] [--probe-window-ms 300]
+//                   --jitsi <local-path> [--jitsi-release 6869] \
+//                   [--jitsi-integrity sha256-…] [--no-sandbox] [--probe-window-ms 300]
 //
 // ## The cleared environment, and why every host fact is a flag
 //
@@ -20,7 +22,8 @@
 // working, not a bug to route around, so anything about the host arrives in argv and this file
 // re-exports what Chrome itself needs into *its* environment. `HOME` and `USER` do survive, so
 // `--audio-server` is defaulted from the conventional `/run/user/<uid>/pulse/native` rather than
-// being mandatory.
+// being mandatory. The JaaS credential is also an argv flag: flux deliberately clears secret env
+// variables, and `MediaSidecarConfig` redacts argv after the program in every `Debug` rendering.
 //
 // ## Measured on 2026-08-02, and both answers changed the shape of this file
 //
@@ -42,6 +45,7 @@
 "use strict";
 
 const { spawn, execFile } = require("node:child_process");
+const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -58,9 +62,15 @@ function parseArgs(argv) {
   const options = {
     chrome: process.env.CHROME || "/usr/bin/google-chrome-stable",
     audioServer: `unix:/run/user/${uid}/pulse/native`,
-    // Where `lib-jitsi-meet` comes from. A URL is fetched by the page; a filesystem path is read and
-    // injected, which is the offline/vendored route. See `resolveJitsi`.
-    jitsi: "https://8x8.vc/libs/lib-jitsi-meet.min.js",
+    token: null,
+    // 8x8's release 6869, fetched and measured 2026-08-02. The URL may move; the release header and
+    // digest may not. Updating this snapshot is an explicit reviewed change, never a runtime drift.
+    // No ambient network execution: joining requires an explicit local source, while the reviewed
+    // tenant release and integrity stay pinned as the defaults for that opt-in. The sidecar may not
+    // bypass flux-system's guarded egress by fetching code itself.
+    jitsi: null,
+    jitsiRelease: "6869",
+    jitsiIntegrity: "sha256-CfA+2dA/TH3EaR2eh4H5hyyolmDAelna1cKSyD+JoOE=",
     noSandbox: false,
     probeWindowMs: 300,
     nick: "flux",
@@ -75,7 +85,10 @@ function parseArgs(argv) {
     switch (arg) {
       case "--audio-server": options.audioServer = next(); break;
       case "--chrome": options.chrome = next(); break;
+      case "--token": options.token = next(); break;
       case "--jitsi": options.jitsi = next(); break;
+      case "--jitsi-release": options.jitsiRelease = next(); break;
+      case "--jitsi-integrity": options.jitsiIntegrity = next(); break;
       case "--nick": options.nick = next(); break;
       case "--probe-window-ms": options.probeWindowMs = Number(next()); break;
       // Off by default: Chrome's own sandbox works under flux's bwrap policy (measured). This is for
@@ -101,6 +114,15 @@ function write(object) {
 // non-protocol stdout lines rather than dying on them, but relying on that would be sloppy.
 function log(message) {
   process.stderr.write(`flux-room-media: ${message}\n`);
+}
+
+/// Remove known credentials before an exception can cross stderr or the NDJSON error seam.
+function safeError(error, secrets) {
+  let message = String((error && error.message) || error);
+  for (const secret of secrets) {
+    if (secret) message = message.split(secret).join("[REDACTED]");
+  }
+  return message;
 }
 
 // ── Chrome over CDP ──────────────────────────────────────────────────────────────────────────────
@@ -200,28 +222,46 @@ async function launchChrome(options) {
   return { child, ws, evaluate };
 }
 
-/// Where `lib-jitsi-meet` comes from, and whether that is reproducible offline.
-///
-/// A **filesystem path** is read here and injected as a script — the vendored, offline-reproducible
-/// route, and the one to use for anything repeatable. A **URL** is fetched by the page at join time,
-/// which is how the 8x8 tenant serves the exact build its own bridge expects; convenient, not
-/// reproducible, and impossible in CI (which has no network). Neither is a build-time dependency of
-/// flux: nothing here is fetched unless a sidecar actually joins a room.
-async function injectJitsi(evaluate, source) {
-  if (!/^https?:/.test(source)) {
-    const code = fs.readFileSync(source, "utf8");
-    await evaluate(`(() => { ${code}\n; return typeof JitsiMeetJS; })()`);
-    return `vendored:${source}`;
+/// Load the exact reviewed `lib-jitsi-meet` bytes, then inject them only after integrity succeeds.
+/// Only a local file is accepted. Network schemes are refused before IO so this child cannot bypass
+/// flux-system's guarded-egress path; the local bytes still need the mandatory digest check.
+async function injectJitsi(evaluate, source, expectedIntegrity, expectedRelease) {
+  if (!source) {
+    throw new Error(
+      "lib-jitsi-meet source is required; opt in with --jitsi <local-path> and a reviewed integrity pin",
+    );
   }
-  await evaluate(`(async () => {
-    const response = await fetch(${JSON.stringify(source)});
-    if (!response.ok) throw new Error("lib-jitsi-meet: HTTP " + response.status);
-    const code = await response.text();
-    (0, eval)(code);
+  if (/^[a-z][a-z0-9+.-]*:/i.test(source)) {
+    throw new Error(
+      `lib-jitsi-meet network sources are refused (${source}); obtain the reviewed bundle through ` +
+        "a guarded host path and pass its local file with --jitsi",
+    );
+  }
+  if (!expectedIntegrity || !expectedIntegrity.startsWith("sha256-")) {
+    throw new Error(`lib-jitsi-meet integrity is required for ${source}`);
+  }
+
+  const bytes = fs.readFileSync(source);
+
+  const observedIntegrity = `sha256-${createHash("sha256").update(bytes).digest("base64")}`;
+  if (observedIntegrity !== expectedIntegrity) {
+    throw new Error(
+      `lib-jitsi-meet integrity mismatch for ${source}: expected ${expectedIntegrity}, ` +
+        `received ${observedIntegrity}`,
+    );
+  }
+
+  // Base64 keeps the bundle out of the CDP expression's syntax; the indirect eval preserves the
+  // global scope the upstream browser bundle expects. Integrity was checked before this point.
+  const encoded = bytes.toString("base64");
+  await evaluate(`(() => {
+    const raw = atob(${JSON.stringify(encoded)});
+    const bytes = Uint8Array.from(raw, (char) => char.charCodeAt(0));
+    (0, eval)(new TextDecoder().decode(bytes));
     if (!globalThis.JitsiMeetJS) throw new Error("lib-jitsi-meet loaded but exported nothing");
     return true;
   })()`);
-  return source;
+  return `local:${source}`;
 }
 
 // ── device routing: per-stream, never the default source ─────────────────────────────────────────
@@ -233,6 +273,21 @@ const pactl = (args, audioServer) =>
       resolve(stdout);
     });
   });
+
+/// Fail before the handshake if the named Pulse server is masked or absent. A zero RMS is evidence
+/// about a track; it is not an acceptable diagnostic for a socket the sandbox never exposed.
+async function preflightAudioServer(audioServer) {
+  const reachable = await pactl(["info"], audioServer);
+  if (reachable !== null) return true;
+
+  const socket = audioServer.replace(/^unix:/, "");
+  const directory = path.dirname(socket);
+  throw new Error(
+    `audio server ${socket} is unreachable; flux's sandbox masks \`/run\` by default. ` +
+      `Pass --audio-server ${audioServer} and add [sandbox] writable = [${JSON.stringify(directory)}] ` +
+      `so the socket is bound into confinement`,
+  );
+}
 
 /// Move **only Chrome's own** capture stream onto the agent's private source.
 ///
@@ -246,6 +301,11 @@ const pactl = (args, audioServer) =>
 /// Returns whether routing was established, which is what the handshake's `owns_device_routing`
 /// reports. Saying `true` when this returned `false` would defeat the check flux uses it for.
 async function routeOwnCaptureStream(audioServer, chromePid) {
+  try {
+    await preflightAudioServer(audioServer);
+  } catch (error) {
+    return { routed: false, why: safeError(error, []) };
+  }
   const sinkName = `fluxagent_${process.pid}`;
   const sourceName = `${sinkName}_mic`;
 
@@ -330,7 +390,11 @@ async function main() {
   if (!routing.routed) log(`device routing not established: ${routing.why}`);
   else log(`device routing: ${routing.source} (moved ${routing.movedStreams.length} stream(s))`);
 
-  write({ ready: PROTOCOL, owns_device_routing: routing.routed });
+  write({
+    ready: PROTOCOL,
+    owns_device_routing: routing.routed,
+    ...(!routing.routed && routing.why ? { routing_error: routing.why } : {}),
+  });
 
   // Forward queued in-page events as protocol lines.
   const pump = setInterval(async () => {
@@ -344,22 +408,15 @@ async function main() {
 
   const handlers = {
     join: async (request) => {
-      const jitsi = await injectJitsi(evaluate, options.jitsi);
-      log(`lib-jitsi-meet from ${jitsi}`);
-      // `room` is the MUC JID the JaaS focus allocation returned (D-206), so the tenant and the
-      // domain are derived from it rather than re-guessed.
-      const jid = String(request.room);
-      const [local, domainPart] = jid.split("@");
-      const domain = (domainPart || "").replace(/^conference\./, "");
-      const tenant = domain.split(".")[0];
-      const result = await evaluate(`FluxRoomMedia.join(${JSON.stringify({
-        room: local,
-        nick: request.nick || options.nick,
-        tenant,
-        token: process.env.FLUX_ROOM_TOKEN || null,
-        serviceUrl: `wss://8x8.vc/${tenant}/xmpp-websocket?room=${local}`,
-        hosts: { domain, muc: domainPart },
-      })})`);
+      const jitsi = await injectJitsi(
+        evaluate,
+        options.jitsi,
+        options.jitsiIntegrity,
+        options.jitsiRelease,
+      );
+      log(`lib-jitsi-meet release ${options.jitsiRelease} from ${jitsi}`);
+      const join = buildJoinOptions(request, options);
+      const result = await evaluate(`FluxRoomMedia.join(${JSON.stringify(join)})`);
       return { ok: true, joined: result.joined };
     },
     leave: async () => {
@@ -412,7 +469,7 @@ async function main() {
       write({ id: request.id, ...reply });
     } catch (error) {
       // Every failure is an operation failure, with a reason — flux's posture, mirrored here.
-      write({ id: request.id, ok: false, error: String((error && error.message) || error) });
+      write({ id: request.id, ok: false, error: safeError(error, [options.token]) });
     }
   }
 
@@ -425,7 +482,34 @@ async function main() {
   chrome.child.kill("SIGKILL");
 }
 
-main().catch((error) => {
-  log(`fatal: ${(error && error.stack) || error}`);
-  process.exit(1);
-});
+/// Build the page's join options from the server-spelled MUC JID and the argv-resolved credential.
+function buildJoinOptions(request, options) {
+  const jid = String(request.room);
+  const [local, domainPart] = jid.split("@");
+  const domain = (domainPart || "").replace(/^conference\./, "");
+  const tenant = domain.split(".")[0];
+  return {
+    room: local,
+    nick: request.nick || options.nick,
+    tenant,
+    token: options.token,
+    serviceUrl: `wss://8x8.vc/${tenant}/xmpp-websocket?room=${local}`,
+    hosts: { domain, muc: domainPart },
+  };
+}
+
+module.exports = {
+  buildJoinOptions,
+  injectJitsi,
+  parseArgs,
+  preflightAudioServer,
+  safeError,
+};
+
+if (require.main === module) {
+  main().catch((error) => {
+    const tokenArg = parseArgs(process.argv.slice(2)).token;
+    log(`fatal: ${safeError((error && error.stack) || error, [tokenArg])}`);
+    process.exit(1);
+  });
+}

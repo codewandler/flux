@@ -2,7 +2,7 @@
 id: D-236
 title: "The sidecar reads its room token from an env var flux clears, so it can never authenticate"
 pillar: Agent
-status: ready
+status: in-progress
 priority: 3
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -45,18 +45,28 @@ argv path is not merely available, it is the path the code was already hardened 
 
 ## Acceptance
 
-- [ ] A failing-first test: a token supplied through the chosen seam reaches the sidecar's join, and is
+- [x] A failing-first test: a token supplied through the chosen seam reaches the sidecar's join, and is
       not `null`. It must fail at the merge base.
-- [ ] The token arrives by the seam the design already chose — an argv flag — rather than by widening
+- [x] The token arrives by the seam the design already chose — an argv flag — rather than by widening
       `flux-system`'s env allow-list. ⚠ **Adding `FLUX_ROOM_TOKEN` to the allow-list is the wrong fix**
       and must not be the one taken: the allow-list is explicitly a *non-secret* list, and putting a
       credential on it inverts its purpose for every subprocess flux spawns, not just this one.
-- [ ] `sidecar.js` no longer reads a credential from `process.env` — a line that cannot work is worse
+- [x] `sidecar.js` no longer reads a credential from `process.env` — a line that cannot work is worse
       than absent, because it reads as a supported configuration path.
-- [ ] ⚠ The token does not reach a log, a trace, or a protocol `error` line. See Notes: there is a known
+- [x] ⚠ The token does not reach a log, a trace, or a protocol `error` line. See Notes: there is a known
       shape here that is currently moot only because the token is always `null`.
 - [ ] The runbook in the story/doc comments is updated to the path that actually works, and someone can
-      follow it to an authenticated join.
+      follow it to an authenticated join. → The ignored live-room test mints the JWT internally and
+      places it in the redacted argv; the authenticated join awaits D-232's human-run acceptance.
+
+## Result
+
+`--token` is parsed from `MediaSidecarConfig`'s already-redacted argv and copied into the exact join
+options the page receives. `process.env.FLUX_ROOM_TOKEN` is gone and flux-system's non-secret allow-list
+is unchanged. Every handler/fatal diagnostic replaces the exact token before writing stderr or an
+NDJSON error. The failing-first Node-backed test proved both delivery and redaction; the live-room test
+keeps minting internal so the token is neither typed nor printed. Host `/proc` readers can still see
+argv, which the operator runbook now states explicitly.
 
 ## Notes
 

@@ -14,6 +14,13 @@
 //! > `TMPDIR` do survive, so a sidecar can derive the conventional `/run/user/<uid>/pulse/native`
 //! > for itself.
 //!
+//! On Linux, argv is only half of the audio recipe: bubblewrap masks `/run`, so the operator must
+//! also bind the Pulse socket directory back with
+//! `[sandbox] writable = ["/run/user/<uid>/pulse"]`. The shipped sidecar preflights the socket and
+//! reports that exact grant through [`Ready::routing_error`] instead of degrading into zero RMS.
+//! Room credentials use `--token` in the redacted argv; they are never added to the non-secret env
+//! allow-list.
+//!
 //! That is not a workaround for the env-clearing rule; it is the rule working. A media sidecar is a
 //! subprocess like any other, and flux does not hand subprocesses the host's environment.
 //!
@@ -54,7 +61,8 @@ use crate::config::MediaSettings;
 use crate::rooms::{RoomId, RoomIdentity};
 
 /// Everything flux needs to know about a media sidecar. Note what is not here: no device, no audio
-/// server, no display. Those are the sidecar's, and they ride in [`argv`](Self::argv).
+/// server, no display. Those are the sidecar's, and they ride in [`argv`](Self::argv); Linux host
+/// sockets additionally need the matching sandbox bind described in the module header.
 ///
 /// `Debug` is **hand-written**, for the reason `WebhookSettings` gives: a channel declaration's
 /// values are host-resolved before this struct is built, so an operator who wrote
@@ -163,6 +171,9 @@ pub struct SidecarMediaPeer {
     /// The sidecar's own claim that it routes its capture device. Refusing to publish audio without
     /// it is what stops a browser-default (and therefore silent) track from reaching a real room.
     owns_device_routing: bool,
+    /// The sidecar's explanation when that claim is false. Preserved so a masked Pulse socket is
+    /// reported as a confinement/configuration failure rather than as generic silence.
+    routing_error: Option<String>,
     /// Handed out once, by [`MediaPeer::join`]. The reader task starts at connect — the handshake
     /// needs it — so the stream exists before anyone has joined.
     stream: Mutex<Option<MediaStream>>,
@@ -180,6 +191,7 @@ impl std::fmt::Debug for SidecarMediaPeer {
         f.debug_struct("SidecarMediaPeer")
             .field("config", &self.config)
             .field("owns_device_routing", &self.owns_device_routing)
+            .field("routing_error", &self.routing_error)
             .field("death_reason", &self.death_reason())
             .finish()
     }
@@ -287,6 +299,7 @@ impl SidecarMediaPeer {
             writer: tokio::sync::Mutex::new(Box::new(writer)),
             next_id: AtomicU64::new(1),
             owns_device_routing: ready.owns_device_routing,
+            routing_error: ready.routing_error,
             stream: Mutex::new(Some(stream)),
             _child: child,
             reader: Mutex::new(task.disarm()),
@@ -514,12 +527,18 @@ impl MediaPeer for SidecarMediaPeer {
 
     async fn publish_audio(&self, audio: &AudioChunk) -> Result<()> {
         if !self.owns_device_routing {
+            let cause = self
+                .routing_error
+                .as_deref()
+                .map(|reason| format!(" — {reason}"))
+                .unwrap_or_default();
             return Err(Error::Other(format!(
                 "room media: the sidecar `{}` does not claim to own device routing, so flux will \
                  not publish audio through it — a browser-default capture is silent on Chrome 150 \
                  (measured 2026-07-30: `--use-fake-device-for-media-capture` ignored, \
-                 `setAudioInputDevice` did not stick) and every status reads healthy while it is",
-                self.config.argv.first().map(String::as_str).unwrap_or("")
+                 `setAudioInputDevice` did not stick) and every status reads healthy while it is{}",
+                self.config.argv.first().map(String::as_str).unwrap_or(""),
+                cause
             )));
         }
         self.command(MediaCommand::PublishAudio {
