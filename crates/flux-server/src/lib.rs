@@ -22,6 +22,7 @@
 
 mod a2a;
 mod resource;
+pub mod system;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

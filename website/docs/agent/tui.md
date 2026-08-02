@@ -15,11 +15,16 @@ flux tui                       # start in the current workspace
 flux tui -m opus               # pick a model for the session
 flux tui --yes                 # auto-approve every admitted tool call (no approval sheet)
 flux tui -c                    # continue the most recent session
+flux tui --remote https://worker.example:8790  # approve here; effects land there
 ```
 
 `flux tui` takes the same turn-control flags as `flux run` — see [CLI](./cli.md#turn-controls) for
 `-m`, `--effort`, `--max-tokens`, `--turn-budget`, `--loop`, `--skill`, and the rest, and
 [CLI](./cli.md#global-flags) for the flags that apply to every command.
+
+In remote mode the header continuously shows the endpoint and canonical remote workspace. It is not
+a startup notice that scrolls away. The directory where the TUI started remains the local control
+plane; flux does not synchronize it with the remote tree.
 
 Press `F1` at any time for the in-app keybinding and slash-command list. That overlay is
 generated from the same tables the UI dispatches on, so it can never drift from the running binary.

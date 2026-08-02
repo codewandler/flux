@@ -899,11 +899,16 @@ pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {
     // provider prompt prefix that caches on it) cannot churn mid-session. Minting the sink first is
     // what makes that an assembly-time decision instead of a per-call one.
     let panes = flux_tui::PaneQueue::new();
+    let interactions = flux_tui::InteractionQueue::new();
     let (agent, session_id, model_spec, _spawner) =
-        build_agent_with_surface(&flags, panes.clone()).await?;
+        build_agent_with_surface(&flags, panes.clone(), interactions.clone()).await?;
     let initial_rules = agent.executor.allow_rules();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let options = tui_options(auto_approve, model_spec, &cwd, panes);
+    let mut options = tui_options(auto_approve, model_spec, &cwd, panes, interactions);
+    if let Some(endpoint) = flags.remote.as_deref() {
+        let identity = agent.executor.execution_system().substrate_identity();
+        options.execution_target = Some(format!("remote {endpoint} · {}", identity.workspace));
+    }
     // Persist even when the TUI returns an error: an earlier "always allow" choice remains a user
     // decision and must not vanish because terminal restoration or a later turn failed.
     let executor = agent.executor.clone();
@@ -922,9 +927,11 @@ fn tui_options(
     model_spec: String,
     cwd: &std::path::Path,
     panes: Arc<flux_tui::PaneQueue>,
+    interactions: Arc<flux_tui::InteractionQueue>,
 ) -> flux_tui::TuiRunOptions {
     let mut options = flux_tui::TuiRunOptions::new(auto_approve, Some(model_spec));
     options.pane_queue = Some(panes);
+    options.interaction_queue = Some(interactions);
     options.model_resolver = Some(Arc::new(CliTuiModelResolver));
     options.file_commands = load_command_files(cwd, TUI_BUILTIN_COMMANDS);
     // C-104: the persisted theme choice (user-level, project override wins per the merge rules).
@@ -1124,14 +1131,22 @@ mod tui_surface_wiring {
     use flux_runtime::{PaneCommand, PaneData, PaneLifetime, PaneSlot, PaneSpec, SurfaceSink};
 
     #[test]
-    fn the_options_carry_the_very_pane_channel_the_agent_was_given() {
+    fn the_options_carry_the_surface_channels_the_agent_was_given() {
         let cwd = std::env::temp_dir().join(format!("flux-c305-options-{}", std::process::id()));
         std::fs::create_dir_all(&cwd).expect("create the test cwd");
 
         // The handle `run_tui` passes to `build_agent_with_surface`.
         let panes = flux_tui::PaneQueue::new();
         let sink: Arc<dyn SurfaceSink> = panes.clone();
-        let options = tui_options(false, "mock/mock".into(), &cwd, panes);
+        let interactions = flux_tui::InteractionQueue::new();
+        let options = tui_options(false, "mock/mock".into(), &cwd, panes, interactions.clone());
+        assert!(Arc::ptr_eq(
+            options
+                .interaction_queue
+                .as_ref()
+                .expect("typed question queue reaches the TUI options"),
+            &interactions
+        ));
 
         // One command, emitted exactly as a `pane.*` op's `SurfaceReporter` emits it.
         sink.emit(PaneCommand::Open(PaneSpec::new(

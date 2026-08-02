@@ -394,6 +394,9 @@ impl Spawner for LocalSpawner {
             .clone()
             .unwrap_or_else(|| self.system.clone());
         let mut ctx = ToolContext::new(child_system.clone());
+        if let Some(execution_system) = request.execution_system.clone() {
+            ctx = ctx.with_execution_system(execution_system);
+        }
         if child_can_delegate {
             // Bounded nested delegation: the child keeps both halves of the delegation capability —
             // the `task` tool in its registry AND a depth-incremented spawner in its context. The
@@ -1192,6 +1195,7 @@ impl Tool for TaskTool {
             // spawned inside a worktree session inherits the transitioned root (with its own
             // independent WorkspaceContext — a child transition never affects the parent).
             system: Some(ctx.system()),
+            execution_system: Some(ctx.execution_system()),
         };
         let spawned = if let Some(supervisor) = supervisor {
             let spawner = spawner.clone();
@@ -4423,6 +4427,7 @@ mod tests {
     /// inheritance (the recorded root) and isolation (the parent's root afterwards).
     struct RootProbe {
         seen: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+        execution_seen: Option<Arc<std::sync::Mutex<Option<String>>>>,
         transition_to: std::path::PathBuf,
     }
     #[async_trait]
@@ -4433,6 +4438,13 @@ mod tests {
         async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
             let system = ctx.system();
             *self.seen.lock().unwrap() = Some(system.workspace().root().to_path_buf());
+            if let Some(seen) = &self.execution_seen {
+                *seen.lock().unwrap() = Some(
+                    ctx.execution_system()
+                        .read_file("execution-target.marker")
+                        .await?,
+                );
+            }
             // The child transitions ITS OWN context — the parent must never observe this.
             let rerooted = Arc::new(system.rerooted(&self.transition_to)?);
             ctx.workspace_context().enter_worktree(
@@ -4481,11 +4493,18 @@ mod tests {
         let assembly = unique_system("c100-assembly");
         let parent_worktree = unique_system("c100-parent-wt");
         let child_worktree = unique_system("c100-child-wt");
+        let remote_target = unique_system("c474-child-remote");
+        remote_target
+            .write_file("execution-target.marker", "remote")
+            .await
+            .unwrap();
         let parent_worktree_root = parent_worktree.workspace().root().to_path_buf();
         let child_worktree_root = child_worktree.workspace().root().to_path_buf();
 
         // The parent context enters a worktree (rerooted system, session recorded).
-        let parent_ctx = ToolContext::new(assembly.clone());
+        let parent_ctx = ToolContext::new(assembly.clone()).with_execution_system(Arc::new(
+            flux_system::remote::RemoteSystem::loopback(remote_target),
+        ));
         let transitioned = Arc::new(assembly.rerooted(&parent_worktree_root).unwrap());
         parent_ctx
             .workspace_context()
@@ -4496,9 +4515,11 @@ mod tests {
             .unwrap();
 
         let seen = Arc::new(std::sync::Mutex::new(None));
+        let execution_seen = Arc::new(std::sync::Mutex::new(None));
         let mut base = ToolRegistry::new();
         base.register(Arc::new(RootProbe {
             seen: seen.clone(),
+            execution_seen: Some(execution_seen.clone()),
             transition_to: child_worktree_root.clone(),
         }));
         let mut roles = RoleRegistry::default();
@@ -4524,6 +4545,7 @@ mod tests {
         // As `TaskTool` would: snapshot the parent context's ACTIVE system onto the request.
         let request = SpawnRequest {
             system: Some(parent_ctx.system()),
+            execution_system: Some(parent_ctx.execution_system()),
             ..SpawnRequest::new("scout", "probe the root")
         };
         let out = spawner
@@ -4538,6 +4560,11 @@ mod tests {
             seen.lock().unwrap().clone().expect("probe ran"),
             canon(&parent_worktree_root),
             "child context must be seeded from the parent's active-system snapshot"
+        );
+        assert_eq!(
+            execution_seen.lock().unwrap().as_deref(),
+            Some("remote"),
+            "child effects must inherit the parent's selected execution target"
         );
         // Isolation: the child's own transition (into `child_worktree_root`) never reached the
         // parent — the parent still sits in ITS worktree, with its session intact.

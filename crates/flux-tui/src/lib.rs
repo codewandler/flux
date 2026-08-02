@@ -8,6 +8,7 @@
 
 mod controller;
 pub mod fleet;
+mod interaction;
 pub mod loopmock;
 mod panes;
 mod projection;
@@ -22,6 +23,7 @@ use controller::{
     approval_key, send_action_event, show_next_approval, ApprovalAction, ChannelApprover,
     ChannelSink, ModelCallTiming, PendingApproval, UiEvent,
 };
+pub use interaction::InteractionQueue;
 use panes::PaneStore;
 pub use panes::{PaneListing, PaneQueue};
 #[cfg(test)]
@@ -83,6 +85,8 @@ pub struct TuiRunOptions {
     pub auto_approve: bool,
     /// Canonical provider/model spec used for header display and cost attribution.
     pub model_spec: Option<String>,
+    /// Persistent execution-target identity shown by the surface. `None` means native local mode.
+    pub execution_target: Option<String>,
     /// Optional surface-owned resolver that enables `/model <spec>`.
     pub model_resolver: Option<Arc<dyn ModelResolver>>,
     /// Command files (D-186) discovered by the surface — already filtered against its own
@@ -94,6 +98,8 @@ pub struct TuiRunOptions {
     /// the same handle the agent's `pane.*` ops write to. `None` leaves the agent with no pane
     /// vocabulary at all — the caller must not register the ops without passing it.
     pub pane_queue: Option<Arc<PaneQueue>>,
+    /// Typed-question channel minted before agent assembly; `None` keeps the surface headless.
+    pub interaction_queue: Option<Arc<InteractionQueue>>,
 }
 
 impl TuiRunOptions {
@@ -101,10 +107,12 @@ impl TuiRunOptions {
         Self {
             auto_approve,
             model_spec,
+            execution_target: None,
             model_resolver: None,
             file_commands: Vec::new(),
             theme: None,
             pane_queue: None,
+            interaction_queue: None,
         }
     }
 }
@@ -1062,12 +1070,14 @@ impl ChatState {
             transcript_layout: RefCell::new(None),
             input: fresh_textarea(),
             approval: None,
+            interaction: None,
             assistant_open: false,
             phase: Phase::Idle,
             turn_start: None,
             session_id,
             model,
             model_spec: None,
+            execution_target: None,
             workspace_root: String::new(),
             file_commands: Vec::new(),
             theme: Theme::default(),
@@ -1124,6 +1134,7 @@ impl ChatState {
             ctrl_c_armed_at: None,
             panes: PaneStore::default(),
             pane_queue: None,
+            interaction_queue: None,
             panes_overflowing: false,
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
@@ -1142,6 +1153,15 @@ impl ChatState {
     /// Attach the pane channel the surface minted before assembling the agent (C-305).
     pub fn with_pane_queue(mut self, queue: Arc<crate::panes::PaneQueue>) -> Self {
         self.pane_queue = Some(queue);
+        self
+    }
+
+    /// Attach the typed-question channel minted before agent assembly.
+    pub fn with_interaction_queue(
+        mut self,
+        queue: Arc<crate::interaction::InteractionQueue>,
+    ) -> Self {
+        self.interaction_queue = Some(queue);
         self
     }
 
@@ -2547,13 +2567,19 @@ impl ChatState {
     /// The top header bar: identity + model on the left, cumulative session tokens on the right.
     fn header_line(&self, width: u16) -> Line<'static> {
         let t = &self.theme;
+        let target = self
+            .execution_target
+            .as_deref()
+            .map(|target| format!(" · {target}"))
+            .unwrap_or_default();
         let left = vec![
             Span::styled("flux", t.accent_style().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(
-                    "  {} · {}",
+                    "  {} · {}{}",
                     self.session_id,
-                    self.model_spec.as_deref().unwrap_or(&self.model)
+                    self.model_spec.as_deref().unwrap_or(&self.model),
+                    target,
                 ),
                 t.muted_style(),
             ),
@@ -3373,6 +3399,9 @@ pub fn session_state(
     if let Some(queue) = options.pane_queue.clone() {
         state = state.with_pane_queue(queue);
     }
+    if let Some(queue) = options.interaction_queue.clone() {
+        state = state.with_interaction_queue(queue);
+    }
     // C-104: resolve the configured theme for this terminal (NO_COLOR → mono, truecolor → RGB).
     let (theme_name, theme) = resolve_theme(options.theme.as_deref());
     state.theme = theme;
@@ -3389,6 +3418,7 @@ pub fn session_state(
     if let Some(spec) = options.model_spec.clone() {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
+    state.execution_target = options.execution_target.clone();
     state.project_session(&agent.events, session_id)?;
     state.previous_sessions = previous_session_count(&agent.events, session_id)?;
     state.history = load_history(&agent.events);
@@ -3482,6 +3512,8 @@ where
     let mut cancel = CancellationToken::new();
     let mut pending_reply: Option<(String, oneshot::Sender<ApprovalChoice>)> = None;
     let mut approval_queue: VecDeque<PendingApproval> = VecDeque::new();
+    let mut pending_interaction_reply: Option<oneshot::Sender<flux_runtime::InteractionResponse>> =
+        None;
     // A message typed while a turn was running, started as soon as the turn finishes.
     let mut pending_ui: Option<UiEvent> = None;
     let mut exit_after_finish = false;
@@ -3494,6 +3526,23 @@ where
         // `Finished` clears `turn`-lifetime panes, and draining after it would let a command from
         // the turn that just ended reopen one that should have expired with it.
         state.apply_pending_panes();
+        if pending_interaction_reply
+            .as_ref()
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            pending_interaction_reply = None;
+            state.interaction = None;
+        }
+        if state.interaction.is_none() && state.approval.is_none() {
+            if let Some((request, reply)) = state
+                .interaction_queue
+                .as_ref()
+                .and_then(|queue| queue.pop())
+            {
+                state.interaction = Some(interaction::InteractionView::new(request));
+                pending_interaction_reply = Some(reply);
+            }
+        }
         // Drain everything the running turn has produced.
         while let Some(ev) = pending_ui.take().or_else(|| rx.try_recv().ok()) {
             let Some(ev) = state.accept_ui_event(ev) else {
@@ -3666,7 +3715,25 @@ where
         match ev {
             Event::Resize(_, _) => continue,
             Event::Paste(text) => {
-                state.input.insert_str(text);
+                if let Some(view) = state.interaction.as_mut() {
+                    match &view.control {
+                        interaction::InteractionControl::Json => view.input.push_str(&text),
+                        interaction::InteractionControl::Form(fields) => {
+                            let index = view.selected.min(fields.len().saturating_sub(1));
+                            if matches!(
+                                fields[index].control,
+                                interaction::FormFieldControl::String
+                                    | interaction::FormFieldControl::Integer
+                                    | interaction::FormFieldControl::Number
+                            ) {
+                                view.form_inputs[index].push_str(&text);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    state.input.insert_str(text);
+                }
                 continue;
             }
             Event::Mouse(m) => {
@@ -3743,6 +3810,223 @@ where
                             }
                             state.approval = None;
                             show_next_approval(state, &mut pending_reply, &mut approval_queue);
+                        }
+                    }
+                    continue;
+                }
+
+                // Typed question: native yes/no, single-select and multi-select controls; schemas
+                // outside that common set get a JSON editor. Invalid values keep this sheet open.
+                if let Some(view) = state.interaction.as_mut() {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let interrupt_turn = key.code == KeyCode::Char('c') && ctrl;
+                    let mut answer = None;
+                    let mut assemble_form = false;
+                    let mut cancel_interaction = false;
+                    match &mut view.control {
+                        interaction::InteractionControl::Boolean => match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                answer = Some(serde_json::Value::Bool(true))
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                answer = Some(serde_json::Value::Bool(false))
+                            }
+                            KeyCode::Esc => cancel_interaction = true,
+                            _ => {}
+                        },
+                        interaction::InteractionControl::Single(options) => match key.code {
+                            KeyCode::Up => {
+                                view.selected = view.selected.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                view.selected =
+                                    (view.selected + 1).min(options.len().saturating_sub(1));
+                            }
+                            KeyCode::Enter => answer = options.get(view.selected).cloned(),
+                            KeyCode::Esc => cancel_interaction = true,
+                            _ => {}
+                        },
+                        interaction::InteractionControl::Multi(options) => match key.code {
+                            KeyCode::Up => {
+                                view.selected = view.selected.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                view.selected =
+                                    (view.selected + 1).min(options.len().saturating_sub(1));
+                            }
+                            KeyCode::Char(' ') => {
+                                if let Some(checked) = view.checked.get_mut(view.selected) {
+                                    *checked = !*checked;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                answer = Some(serde_json::Value::Array(
+                                    options
+                                        .iter()
+                                        .zip(&view.checked)
+                                        .filter(|(_, checked)| **checked)
+                                        .map(|(value, _)| value.clone())
+                                        .collect(),
+                                ));
+                            }
+                            KeyCode::Esc => cancel_interaction = true,
+                            _ => {}
+                        },
+                        interaction::InteractionControl::Form(fields) => {
+                            let field_index = view.selected.min(fields.len().saturating_sub(1));
+                            match key.code {
+                                KeyCode::Up => {
+                                    view.selected = view.selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    view.selected =
+                                        (view.selected + 1).min(fields.len().saturating_sub(1));
+                                }
+                                KeyCode::Left | KeyCode::Right => {
+                                    let forward = key.code == KeyCode::Right;
+                                    match &fields[field_index].control {
+                                        interaction::FormFieldControl::Boolean => {
+                                            let value = match view.form_values[field_index]
+                                                .as_ref()
+                                                .and_then(serde_json::Value::as_bool)
+                                            {
+                                                Some(current) => !current,
+                                                None => forward,
+                                            };
+                                            view.form_values[field_index] = Some(value.into());
+                                        }
+                                        interaction::FormFieldControl::Single(options) => {
+                                            let cursor = &mut view.form_cursors[field_index];
+                                            *cursor = if forward {
+                                                (*cursor + 1).min(options.len().saturating_sub(1))
+                                            } else {
+                                                cursor.saturating_sub(1)
+                                            };
+                                            view.form_values[field_index] =
+                                                options.get(*cursor).cloned();
+                                        }
+                                        interaction::FormFieldControl::Multi(options) => {
+                                            let cursor = &mut view.form_cursors[field_index];
+                                            *cursor = if forward {
+                                                (*cursor + 1).min(options.len().saturating_sub(1))
+                                            } else {
+                                                cursor.saturating_sub(1)
+                                            };
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                KeyCode::Char(' ') => {
+                                    if let interaction::FormFieldControl::Multi(options) =
+                                        &fields[field_index].control
+                                    {
+                                        let cursor = view.form_cursors[field_index];
+                                        if let Some(checked) =
+                                            view.form_checked[field_index].get_mut(cursor)
+                                        {
+                                            *checked = !*checked;
+                                        }
+                                        view.form_values[field_index] =
+                                            Some(serde_json::Value::Array(
+                                                options
+                                                    .iter()
+                                                    .zip(&view.form_checked[field_index])
+                                                    .filter(|(_, checked)| **checked)
+                                                    .map(|(value, _)| value.clone())
+                                                    .collect(),
+                                            ));
+                                    } else if matches!(
+                                        fields[field_index].control,
+                                        interaction::FormFieldControl::String
+                                    ) {
+                                        view.form_inputs[field_index].push(' ');
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if matches!(
+                                        fields[field_index].control,
+                                        interaction::FormFieldControl::String
+                                            | interaction::FormFieldControl::Integer
+                                            | interaction::FormFieldControl::Number
+                                    ) {
+                                        view.form_inputs[field_index].pop();
+                                    }
+                                }
+                                KeyCode::Char(c)
+                                    if !ctrl
+                                        && matches!(
+                                            fields[field_index].control,
+                                            interaction::FormFieldControl::String
+                                                | interaction::FormFieldControl::Integer
+                                                | interaction::FormFieldControl::Number
+                                        ) =>
+                                {
+                                    view.form_inputs[field_index].push(c)
+                                }
+                                KeyCode::Enter => assemble_form = true,
+                                KeyCode::Esc => cancel_interaction = true,
+                                _ => {}
+                            }
+                        }
+                        interaction::InteractionControl::Json => match key.code {
+                            KeyCode::Enter => match serde_json::from_str(&view.input) {
+                                Ok(value) => answer = Some(value),
+                                Err(error) => view.error = Some(format!("invalid JSON: {error}")),
+                            },
+                            KeyCode::Backspace => {
+                                view.input.pop();
+                            }
+                            KeyCode::Char(c) if !ctrl => view.input.push(c),
+                            KeyCode::Esc => cancel_interaction = true,
+                            _ => {}
+                        },
+                    }
+                    if assemble_form {
+                        match view.form_value() {
+                            Ok(value) => answer = Some(value),
+                            Err(error) => view.error = Some(error),
+                        }
+                    }
+                    if interrupt_turn {
+                        cancel_interaction = true;
+                    }
+                    if let Some(value) = answer {
+                        let oversized = serde_json::to_vec(&value)
+                            .map(|encoded| {
+                                encoded.len() > flux_runtime::MAX_INTERACTION_RESPONSE_BYTES
+                            })
+                            .unwrap_or(true);
+                        if oversized {
+                            view.error = Some(format!(
+                                "response exceeds {} bytes",
+                                flux_runtime::MAX_INTERACTION_RESPONSE_BYTES
+                            ));
+                        } else {
+                            match jsonschema::validator_for(&view.request.schema) {
+                                Ok(validator) if validator.is_valid(&value) => {
+                                    if let Some(reply) = pending_interaction_reply.take() {
+                                        let _ = reply
+                                            .send(interaction::InteractionView::response(value));
+                                    }
+                                    state.interaction = None;
+                                }
+                                Ok(validator) => {
+                                    view.error = validator
+                                        .iter_errors(&value)
+                                        .next()
+                                        .map(|error| error.to_string())
+                                        .or_else(|| Some("value does not match the schema".into()));
+                                }
+                                Err(error) => view.error = Some(format!("invalid schema: {error}")),
+                            }
+                        }
+                    } else if cancel_interaction {
+                        if let Some(reply) = pending_interaction_reply.take() {
+                            let _ = reply.send(flux_runtime::InteractionResponse::Cancelled);
+                        }
+                        state.interaction = None;
+                        if interrupt_turn {
+                            interrupt_active_action(state, &cancel, &mut interrupted_action_id);
                         }
                     }
                     continue;
@@ -9729,5 +10013,20 @@ mod tests {
         assert!(content.contains('✗'), "{content}");
         assert!(content.contains("echo"), "{content}");
         assert!(content.contains("boom"), "{content}");
+    }
+
+    #[test]
+    fn remote_execution_target_stays_visible_in_the_header() {
+        let mut state = ChatState::new("mock".into());
+        state.session_id = "s_remote".into();
+        state.execution_target = Some("remote https://worker.example:8790 · /srv/project".into());
+        let header = state
+            .header_line(160)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("https://worker.example:8790"), "{header}");
+        assert!(header.contains("/srv/project"), "{header}");
     }
 }

@@ -41,7 +41,7 @@ fn cargo_run(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>> {
     Box::pin(async move {
         let out = ctx
-            .system()
+            .execution_system()
             .run(&argv, Duration::from_secs(CARGO_TIMEOUT_SECS))
             .await?;
         let mut body = String::new();

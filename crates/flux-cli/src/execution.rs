@@ -1063,10 +1063,12 @@ pub(super) fn implicit_plugin_group(
 /// Read-only ops pre-allowed by default when no `[permissions].allow` is configured, so the common
 /// case needs no config. `read`/`glob`/`grep`/`search` are the workspace reads; `now`/`cwd`/`home_dir`/
 /// `sys_info` are zero-arg ambient reads (no IO, no permission subjects) that carry no approval-worthy
-/// effect — gating them only adds friction (e.g. a `now()` in a stored flow would otherwise prompt, and
+/// effect. `user.ask` exists only when this process attached a human input surface; pre-allowing it
+/// avoids asking for approval to ask a question (the answer remains data, never authorization).
+/// Gating these only adds friction (e.g. a `now()` in a stored flow would otherwise prompt, and
 /// auto-deny on a non-TTY). A configured allow-list replaces this default entirely.
 pub(super) const DEFAULT_ALLOW: &[&str] = &[
-    "read", "glob", "grep", "search", "now", "cwd", "home_dir", "sys_info",
+    "read", "glob", "grep", "search", "now", "cwd", "home_dir", "sys_info", "user.ask",
 ];
 
 /// Turn the operator's `[limits]` table into runtime ceilings (C-299) — the **one** place the CLI
@@ -1119,7 +1121,22 @@ pub(super) fn assemble_cli_execution_environment(
 pub(super) async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None, None, None).await
+    build_agent_with(flags, true, None, None, None, None).await
+}
+
+/// Build for the local line-oriented terminal, with typed questions enabled.
+pub(super) async fn build_agent_interactive(
+    flags: &AgentFlags,
+) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+    build_agent_with(
+        flags,
+        true,
+        None,
+        None,
+        None,
+        Some(Arc::new(crate::user_interaction::StdinUserInteraction)),
+    )
+    .await
 }
 
 /// [`build_agent`] for a surface whose approver is neither the terminal prompt nor `--yes` (C-453).
@@ -1132,7 +1149,7 @@ pub(super) async fn build_agent_with_approver(
     flags: &AgentFlags,
     approver: Arc<dyn Approver>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None, None, Some(approver)).await
+    build_agent_with(flags, true, None, None, Some(approver), None).await
 }
 
 /// [`build_agent`] for a surface that has a human terminal to draw on (C-305).
@@ -1145,8 +1162,17 @@ pub(super) async fn build_agent_with_approver(
 pub(super) async fn build_agent_with_surface(
     flags: &AgentFlags,
     surface_sink: Arc<dyn flux_runtime::SurfaceSink>,
+    user_interaction: Arc<dyn flux_runtime::UserInteraction>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None, Some(surface_sink), None).await
+    build_agent_with(
+        flags,
+        true,
+        None,
+        Some(surface_sink),
+        None,
+        Some(user_interaction),
+    )
+    .await
 }
 
 /// [`build_agent`] with a LAZY provider (C-11): `flux flow run` / `flux preset --run` replay
@@ -1159,7 +1185,7 @@ pub(super) async fn build_agent_lazy(
     flags: &AgentFlags,
     session_override: Option<String>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, false, session_override, None, None).await
+    build_agent_with(flags, false, session_override, None, None, None).await
 }
 
 /// Build the workspace view used by every saved-flow consumer. Agent construction creates the two
@@ -1242,6 +1268,39 @@ fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
     } else {
         flux_system::net::PrivateNetAllow::None
     }
+}
+
+/// Resolve the explicit execution target. Absence is meaningful: the environment then follows its
+/// native [`WorkspaceContext`], preserving local worktree transitions exactly as before.
+async fn resolve_selected_execution_system(
+    flags: &AgentFlags,
+    local: &System,
+) -> Result<Option<Arc<dyn flux_system::port::ExecutionSystem>>> {
+    let Some(endpoint) = flags.remote.as_deref() else {
+        return Ok(None);
+    };
+    let token = local
+        .env(&flags.remote_token_env)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "remote-system token environment variable `{}` is unset or empty",
+                flags.remote_token_env
+            )
+        })?;
+    let private_net = fleet_private_net();
+    let remote = if let Some(path) = flags.remote_ca.as_deref() {
+        let pem = local
+            .read_file_bytes(path.to_string_lossy().as_ref())
+            .await
+            .with_context(|| format!("read remote-system CA `{}`", path.display()))?;
+        flux_server::system::connect_remote_system_with_ca_pem(endpoint, token, &private_net, &pem)
+            .await
+    } else {
+        flux_server::system::connect_remote_system(endpoint, token, &private_net).await
+    }
+    .with_context(|| format!("connect remote execution system `{endpoint}`"))?;
+    Ok(Some(Arc::new(remote)))
 }
 
 /// The whole fleet surface, in one place: worker **lifecycle** (C-243) plus outbound A2A **dispatch**
@@ -1465,6 +1524,8 @@ struct EngineParts {
     /// C-305: the assembling surface's pane channel, `Some` only for the TUI. Carried through so the
     /// engine installs the very sink whose presence registered the `pane.*` ops above.
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
+    /// Host-owned responder installed on interactive surfaces only.
+    user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
 }
 
 /// Assemble the [`FlowEngine`] from the resolved parts: install the authored-loop host, load the
@@ -1492,6 +1553,7 @@ async fn assemble_engine(
         skills,
         model_invoked_skills,
         surface_sink,
+        user_interaction,
     } = parts;
     let flow = open_flow_store(events.clone())?;
     let spec = AgentSpec {
@@ -1530,6 +1592,9 @@ async fn assemble_engine(
     if let Some(sink) = surface_sink {
         agent = agent.with_surface_sink(sink);
     }
+    if let Some(interaction) = user_interaction {
+        agent = agent.with_user_interaction(interaction);
+    }
     agent.loop_host.set_model_stages(model_stages);
     let env_budget = match std::env::var("FLUX_TURN_TOKEN_BUDGET") {
         Ok(v) => Some(v.trim().parse::<u64>().map_err(|e| {
@@ -1551,6 +1616,7 @@ pub(super) async fn build_agent_with(
     session_override: Option<String>,
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     approver_override: Option<Arc<dyn Approver>>,
+    user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
@@ -1598,6 +1664,8 @@ pub(super) async fn build_agent_with(
     let system = Arc::new(
         System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
     );
+    let selected_execution_system = resolve_selected_execution_system(flags, &system).await?;
+    let remote_mode = selected_execution_system.is_some();
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
     let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());
@@ -1679,6 +1747,26 @@ pub(super) async fn build_agent_with(
     // run`, `flux-server` or SDK embedding passes `None` and never advertises a pane op, which
     // matters because a registered op with no `group` is advertised unconditionally.
     flux_tools::try_register_surface_ops(&mut registry, surface_sink.is_some())?;
+    flux_tools::try_register_user_interaction(
+        &mut registry,
+        user_interaction
+            .as_ref()
+            .map(|interaction| interaction.capabilities()),
+    )?;
+    let mut remote_unsupported_ops = std::collections::HashSet::new();
+    if remote_mode {
+        remote_unsupported_ops.extend(
+            [
+                "sqlite_query",
+                "sys_info",
+                "git_worktree_enter",
+                "git_worktree_leave",
+                "fleet.isolate",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
 
     // Model-backed cognition ops (ai.extract/rank/judge/reason, synth, ai.rewrite): the L3
     // CognitionPack, advertised on the real CLI path so a plan can call the model as a typed op.
@@ -1696,6 +1784,7 @@ pub(super) async fn build_agent_with(
                 None
             }
         };
+    let before_outer_packs = registry.names();
     register_tool_packs(
         &mut registry,
         cog_provider,
@@ -1705,13 +1794,30 @@ pub(super) async fn build_agent_with(
         &canonical_spec,
         &events,
     )?;
+    if remote_mode {
+        remote_unsupported_ops.extend(
+            registry
+                .names()
+                .into_iter()
+                .filter(|name| !before_outer_packs.contains(name)),
+        );
+    }
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
     // backend is also the sink `web.fetch` contributes `web.page` records to (below), so read pages
     // are groundable.
     let backend = build_doc_index(&system).await;
+    let before_datasources = registry.names();
     flux_capabilities::try_register_datasource_ops(&mut registry, backend.clone())?;
+    if remote_mode {
+        remote_unsupported_ops.extend(
+            registry
+                .names()
+                .into_iter()
+                .filter(|name| !before_datasources.contains(name)),
+        );
+    }
 
     // This run's session on the store opened above. `session_override` (L-25's `flow run --resume`)
     // wins outright — it names an already-halted session to continue, distinct from the REPL's own
@@ -1744,6 +1850,7 @@ pub(super) async fn build_agent_with(
             store: events.clone(),
             stream: session_id.clone(),
         });
+        let before_web = registry.names();
         flux_web::try_register_web(
             &mut registry,
             &flux_web::WebOptions {
@@ -1759,8 +1866,17 @@ pub(super) async fn build_agent_with(
                 allowed_secrets: cfg.web.allowed_secrets.clone(),
             },
         )?;
+        if remote_mode {
+            remote_unsupported_ops.extend(
+                registry
+                    .names()
+                    .into_iter()
+                    .filter(|name| !before_web.contains(name)),
+            );
+        }
     }
 
+    let before_integrations = registry.names();
     let integrations = assemble_integrations(
         system.clone(),
         Arc::new(super::app_cmd::WorkspaceSystemSource(
@@ -1776,6 +1892,14 @@ pub(super) async fn build_agent_with(
     .await?;
     for (source, tool) in integrations.tools {
         registry.try_register_from(source, tool)?;
+    }
+    if remote_mode {
+        remote_unsupported_ops.extend(
+            registry
+                .names()
+                .into_iter()
+                .filter(|name| !before_integrations.contains(name)),
+        );
     }
     let plugin_groups = integrations.groups;
     let mut ambient_signals = integrations.ambient_signals;
@@ -1844,7 +1968,7 @@ pub(super) async fn build_agent_with(
         hooks,
     } = resolve_permissions(&cwd, &cfg, flags, approver_override);
 
-    let executor = assemble_cli_execution_environment(
+    let mut environment = assemble_cli_execution_environment(
         system.clone(),
         registry,
         perms,
@@ -1858,8 +1982,11 @@ pub(super) async fn build_agent_with(
         // one configured ceiling, one semaphore, counted across the agent and its children.
         resource_limits,
     )
-    .with_workspace(session_workspace)
-    .into_executor();
+    .with_workspace(session_workspace);
+    if let Some(selected) = selected_execution_system {
+        environment = environment.with_execution_system(selected);
+    }
+    let executor = environment.into_executor();
     // C-162: resolve `[tools] disable` against the now-final registry (exact op names or
     // `family.*` globs) and install it on the executor — surface-only + defense-in-depth (the
     // engine narrows the per-turn advertised set by it, and `Executor::gate` separately refuses a
@@ -1875,7 +2002,9 @@ pub(super) async fn build_agent_with(
             ))
         );
     }
-    let executor = executor.with_disabled_ops(disabled_tools.disabled);
+    let mut disabled = disabled_tools.disabled;
+    disabled.extend(remote_unsupported_ops);
+    let executor = executor.with_disabled_ops(disabled);
     // Record the available toolchain as a startup observation (audit backbone).
     executor.observe(flux_evidence::Observation::new(
         "toolchain",
@@ -1940,6 +2069,7 @@ pub(super) async fn build_agent_with(
             skills,
             model_invoked_skills,
             surface_sink,
+            user_interaction,
         },
         &cwd,
         &cfg,
@@ -2001,7 +2131,7 @@ pub(super) async fn resurrect_on_open(
 
 /// One-shot agentic turn.
 pub(super) async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()> {
-    let (agent, session_id, model_spec, _spawner) = build_agent(flags).await?;
+    let (agent, session_id, model_spec, _spawner) = build_agent_interactive(flags).await?;
     eprintln!(
         "{}",
         style::dim(&format!("{} · session {session_id}", agent.model))

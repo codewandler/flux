@@ -298,6 +298,21 @@ name (`pane.update:build`). They are `Conditional` rather than `Idempotent` on p
 pane command is safe, but `Idempotent` would let the op cache answer without the surface ever seeing
 the repeat. Design: [`agent-authored-surface.md`](../../../docs/designs/agent-authored-surface.md).
 
+## Typed user interaction (interactive surfaces only)
+
+`user.ask` is registered only when the host attaches a `UserInteraction` responder. The stock
+plain terminal and TUI attach one; stream-JSON, served/A2A, app and other headless assemblies do
+not advertise the operation. A human answer is data, never an approval decision.
+
+| op | signature | risk | description |
+|---|---|---|---|
+| `user.ask` | `prompt, schema` | Low | Present `prompt: {text, audio?}` through the attached host UI and wait for a value matching `schema`. Boolean, enum, unique enum-array and simple flat-object schemas map to native controls; other bounded schemas use validated JSON input. Returns `{status: "submitted", value, input_mode}` or `{status: "cancelled"}`. Audio is an opaque host asset reference and is accepted only when the host declares support |
+
+The runtime bounds and validates the schema before presentation and validates the submitted value
+again before it becomes a tool result. Remote references, secret-shaped fields, password/write-only
+fields and secret-bearing responses fail closed. Design:
+[`user-interaction.md`](../../../docs/designs/user-interaction.md).
+
 ## Eval & self-improvement ops (group `eval`)
 
 Registered by `flux_eval::try_register_eval_ops`, wired into the production catalog by

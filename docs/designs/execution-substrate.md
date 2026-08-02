@@ -129,7 +129,7 @@ consumer that needed it — would have put a locally-executing runtime behind a 
 be able to do this on a developer's own machine with nothing running. That is
 [vision.md](../vision.md)'s local-first principle on the runtime axis, not a convenience.
 
-`crates/flux-system/src/remote.rs` is the implementation: `RemoteSystem` serves all four port
+`crates/flux-system/src/remote.rs` is the implementation: `RemoteSystem` serves all five port
 families by handing each operation to a `Delegate`, and `Loopback` serves `Delegate` from any
 in-process substrate — so the delegation path is exercisable with no service. It adds **no
 dependency**: `Delegate` is a Rust trait, not a protocol, which is what keeps

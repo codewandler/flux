@@ -146,6 +146,12 @@ flux tui        # full-screen UI
 flux app run --serve 127.0.0.1:8787 --yes    # HTTP server
 ```
 
+Effects are local by default. To keep the model, runtime and approval UI on your machine while file,
+process and network effects land in a separately administered workspace, select the remote mode with
+`flux tui --remote https://worker.example:8790`. The remote side is an authenticated TLS service;
+setup, trust boundaries and the deliberate no-sync rule are covered in the
+[topologies guide](https://codewandler.github.io/flux/topologies#local-runtime-remote-system).
+
 ## Safety and execution model
 
 Every operation passes the same chain:

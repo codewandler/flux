@@ -2,7 +2,7 @@
 id: C-435
 title: "The port has no network trait — and no guarded inbound primitive at all"
 pillar: Core
-status: ready
+status: in-progress
 priority: 4
 design: docs/designs/execution-substrate.md
 epic: execution-substrate
@@ -17,7 +17,7 @@ note: "⚠ measured 2026-08-01: port.rs declares FOUR traits — GuardedEnv, Gua
 State the guarded network operations as port traits, including **inbound**, so a substrate or an
 embedded protocol stack can be served by flux's guard rather than opening its own sockets.
 
-## What the code says today
+## What the code said when filed
 
 `crates/flux-system/src/port.rs` declares exactly four traits: `GuardedEnv`, `GuardedProcess`,
 `GuardedHostFiles`, `GuardedWorkspaceFiles`. **There is no network trait.** Egress guarding lives in
@@ -43,23 +43,23 @@ both directions). ⚠ **The third does not exist.**
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test driving guarded network operations through the port with a substituted
+- [x] **Failing-first**: a test driving guarded network operations through the port with a substituted
       implementation — failing at the merge base because the trait does not exist.
-- [ ] A network port following `port.rs`'s stated shape: ⚠ **no god trait** — *"the port is split by
+- [x] A network port following `port.rs`'s stated shape: ⚠ **no god trait** — *"the port is split by
       guarded resource, and a consumer names only the traits it uses"* — and a consumer spanning
       families *"declares its own bundle (see `flux_plugin::PluginSystem`)"*. Follow that precedent
       rather than inventing a second convention.
-- [ ] ⚠ **Nothing relaxes a guarantee.** `port.rs` is explicit: *"This is not a second IO path… The port
+- [x] ⚠ **Nothing relaxes a guarantee.** `port.rs` is explicit: *"This is not a second IO path… The port
       makes the caller substitutable, not the guard."* A port implementation must gain no ability the
       caller did not already have. This is the sentence to test against, not merely to cite.
-- [ ] The outbound side delegates to the existing `net.rs` guard — `guard_url_scoped`,
+- [x] The outbound side delegates to the existing `net.rs` guard — `guard_url_scoped`,
       `guard_target_host_pinned`, `DialTarget` — with **no second range check, hostname rule or
       allowlist derived anywhere.** `AGENTS.md` forbids a second URL guard and C-396's review confirmed
       the shared-helper discipline.
 - [ ] ⚠ **Inbound is defined, and it is the new part.** What it means to bind and accept under flux's
       guarantees, in one place — so C-409's finding (adapters binding listeners with none of
       flux-server's hardening) becomes structurally impossible rather than repeatedly fixed.
-- [ ] Resolution is a seam: C-396's tests already inject a `FixedResolver`/`RebindingResolver`, so the
+- [x] Resolution is a seam: C-396's tests already inject a `FixedResolver`/`RebindingResolver`, so the
       shape exists — lift it rather than deriving a third.
 - [ ] Full gate green.
 
@@ -79,3 +79,8 @@ both directions). ⚠ **The third does not exist.**
 ## Progress
 
 - Filed 2026-08-01, after the SIP epic surfaced the gap.
+- 2026-08-02: `GuardedNetwork` now returns opaque bounded stream/listener/datagram resources. Native
+  outbound uses the existing pinned-address guard; inbound requires loopback or authenticated
+  exposure and carries connection/frame/timeout limits. Remote delegation and HTTPS/WSS transport
+  exercise all three resource shapes. The remaining unchecked item is migrating older server and
+  channel listeners so C-409's scattered-bind class becomes structurally impossible everywhere.

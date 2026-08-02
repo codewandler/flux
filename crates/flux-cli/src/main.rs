@@ -33,6 +33,8 @@ mod review;
 mod session;
 mod splash;
 mod stream_json;
+mod system_cmd;
+mod user_interaction;
 mod wakeup_cmd;
 
 use a2a_cmd::*;
@@ -52,6 +54,7 @@ use rendering::*;
 use review::*;
 use session::*;
 use stream_json::*;
+use system_cmd::*;
 use wakeup_cmd::*;
 
 use std::future::Future;
@@ -173,6 +176,37 @@ mod tests {
         assert!(help.contains("high"), "{help}");
         assert!(help.contains("--max-model-calls"), "{help}");
         assert!(help.contains("--max-iterations"), "{help}");
+        assert!(help.contains("--remote"), "{help}");
+        assert!(help.contains("--remote-token-env"), "{help}");
+        assert!(help.contains("--remote-ca"), "{help}");
+    }
+
+    #[test]
+    fn remote_mode_is_explicit_and_keeps_the_token_out_of_argv() {
+        use clap::Parser;
+
+        let local = super::AgentFlagsOnly::parse_from(["flux"]).agent;
+        assert!(local.remote.is_none());
+
+        let remote = super::AgentFlagsOnly::parse_from([
+            "flux",
+            "--remote",
+            "https://worker.example:8790",
+            "--remote-token-env",
+            "WORKER_TOKEN",
+            "--remote-ca",
+            "worker-ca.pem",
+        ])
+        .agent;
+        assert_eq!(
+            remote.remote.as_deref(),
+            Some("https://worker.example:8790")
+        );
+        assert_eq!(remote.remote_token_env, "WORKER_TOKEN");
+        assert_eq!(
+            remote.remote_ca.as_deref(),
+            Some(std::path::Path::new("worker-ca.pem"))
+        );
     }
 
     #[tokio::test]
@@ -3604,11 +3638,11 @@ mod tests {
 
     /// C-91: while a prompt holds the gate the spinner ticker gets no paint permit — the prompt
     /// owns the stderr line; painting resumes once the guard drops.
-    #[test]
-    fn prompt_gate_blocks_painting_while_held() {
+    #[tokio::test]
+    async fn prompt_gate_blocks_painting_while_held() {
         let gate = super::PromptGate::new();
         assert!(gate.begin_paint().is_some(), "free gate paints");
-        let guard = gate.acquire();
+        let guard = gate.acquire().await;
         assert!(gate.begin_paint().is_none(), "held gate must not paint");
         drop(guard);
         assert!(gate.begin_paint().is_some(), "released gate paints again");
@@ -3616,11 +3650,11 @@ mod tests {
 
     /// C-91: `stop_spinner`'s line clear is suppressed while a prompt holds the gate — a
     /// `planning(false)` drained during the approval wait must not wipe the prompt line.
-    #[test]
-    fn prompt_gate_suppresses_clear_only_while_held() {
+    #[tokio::test]
+    async fn prompt_gate_suppresses_clear_only_while_held() {
         let gate = super::PromptGate::new();
         gate.painter_started();
-        let guard = gate.acquire();
+        let guard = gate.acquire().await;
         assert!(
             !gate.painter_stopped(),
             "clear suppressed while the prompt owns the line"
@@ -3631,6 +3665,26 @@ mod tests {
             gate.painter_stopped(),
             "no holder -> caller clears normally"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_gate_serializes_approval_and_interaction_readers() {
+        let gate = super::PromptGate::new();
+        let first = gate.acquire().await;
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let gate = gate.clone();
+            let acquired = acquired.clone();
+            tokio::spawn(async move {
+                let _second = gate.acquire().await;
+                acquired.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
+        drop(first);
+        waiter.await.unwrap();
+        assert!(acquired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// C-91: the whole-plan prompt carries the batch content — the plain CLI renders no plan tree

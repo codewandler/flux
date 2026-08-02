@@ -1112,15 +1112,64 @@ pub struct ChildStatus {
 /// `run_with_env` output cap (here per managed stream, drained on each [`ManagedChild::read_output`]).
 const MANAGED_OUTPUT_CAP: usize = 256 * 1024;
 
-/// A host-managed background process spawned by [`System::spawn_background`] — a long-lived child
-/// (e.g. `kubectl port-forward`) started in one call and stopped/queried in later ones.
+/// The object-safe lifecycle of a guarded long-lived process.
+///
+/// Implementations may own a native child or proxy an opaque process handle served by another
+/// substrate. Dropping the enclosing [`ManagedChild`] calls [`ManagedProcess::kill`], so neither a
+/// native nor a remote implementation may silently orphan the represented process.
+pub trait ManagedProcess: Send {
+    /// Drain output accumulated since the preceding call.
+    fn read_output(&mut self) -> (String, String);
+
+    /// Return a non-blocking liveness snapshot.
+    fn status(&mut self) -> ChildStatus;
+
+    /// Stop the process. Implementations must make repeated calls harmless.
+    fn kill(&mut self);
+}
+
+/// A substrate-neutral managed background process spawned through guarded IO.
 ///
 /// stdout/stderr are continuously drained by background tasks into capped in-memory buffers, so the
 /// child never blocks on a full pipe even if nothing reads it for a while.
 /// [`read_output`](Self::read_output) drains what has accumulated, [`status`](Self::status) polls
-/// liveness without blocking, and [`kill`](Self::kill) terminates the child and stops the drain
-/// tasks. Dropping the handle kills the child (`kill_on_drop`).
+/// liveness without blocking, and [`kill`](Self::kill) terminates it. The concrete handle remains
+/// opaque so native, remote and embedded substrates can all implement the same lifecycle.
 pub struct ManagedChild {
+    inner: Box<dyn ManagedProcess>,
+}
+
+impl ManagedChild {
+    /// Wrap a substrate-owned managed-process handle.
+    pub fn from_handle(handle: impl ManagedProcess + 'static) -> Self {
+        Self {
+            inner: Box::new(handle),
+        }
+    }
+
+    /// Drain output accumulated since the preceding call.
+    pub fn read_output(&mut self) -> (String, String) {
+        self.inner.read_output()
+    }
+
+    /// Return a non-blocking liveness snapshot.
+    pub fn status(&mut self) -> ChildStatus {
+        self.inner.status()
+    }
+
+    /// Stop the process. Idempotent.
+    pub fn kill(&mut self) {
+        self.inner.kill();
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        self.inner.kill();
+    }
+}
+
+struct NativeManagedProcess {
     child: tokio::process::Child,
     group: Option<ProcessGroup>,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
@@ -1129,12 +1178,12 @@ pub struct ManagedChild {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl ManagedChild {
+impl ManagedProcess for NativeManagedProcess {
     /// Drain and return whatever stdout/stderr has accumulated since the last call, clearing the
     /// buffers. Bytes are decoded with `from_utf8_lossy` (never panics off a UTF-8 boundary, the same
     /// guarantee as `String::from_utf8_lossy`; a multibyte codepoint straddling two reads degrades to a
     /// replacement char rather than erroring.
-    pub fn read_output(&mut self) -> (String, String) {
+    fn read_output(&mut self) -> (String, String) {
         let out = drain_locked(&self.stdout_buf);
         let err = drain_locked(&self.stderr_buf);
         (
@@ -1144,7 +1193,7 @@ impl ManagedChild {
     }
 
     /// Non-blocking liveness check (via `try_wait`): does not reap-block on a still-running child.
-    pub fn status(&mut self) -> ChildStatus {
+    fn status(&mut self) -> ChildStatus {
         match self.child.try_wait() {
             Ok(Some(es)) => {
                 // Reaping makes the numeric PID available for reuse. Stop any descendants now,
@@ -1171,7 +1220,7 @@ impl ManagedChild {
     }
 
     /// Kill the child and abort the stdout/stderr drain tasks. Idempotent.
-    pub fn kill(&mut self) {
+    fn kill(&mut self) {
         if let Some(group) = self.group {
             group.terminate();
         }
@@ -1185,7 +1234,7 @@ impl ManagedChild {
     }
 }
 
-impl Drop for ManagedChild {
+impl Drop for NativeManagedProcess {
     fn drop(&mut self) {
         self.kill();
     }
@@ -2555,14 +2604,14 @@ impl System {
             tokio::spawn(drain_stream(stdout, stdout_buf.clone(), MANAGED_OUTPUT_CAP));
         let stderr_task =
             tokio::spawn(drain_stream(stderr, stderr_buf.clone(), MANAGED_OUTPUT_CAP));
-        Ok(ManagedChild {
+        Ok(ManagedChild::from_handle(NativeManagedProcess {
             child,
             group: Some(group),
             stdout_buf,
             stderr_buf,
             stdout_task: Some(stdout_task),
             stderr_task: Some(stderr_task),
-        })
+        }))
     }
 
     /// Spawn an **interactive** child for a bidirectional stdin/stdout protocol — used to launch a

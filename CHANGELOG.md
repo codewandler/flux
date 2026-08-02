@@ -6,6 +6,49 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Local agents can now place guarded effects on an explicit remote execution system** (C-436,
+  C-475, C-476). `flux system serve` exposes one canonical workspace over bearer-authenticated TLS;
+  `--remote <https-url>` on agent paths keeps the runtime, model, approval UI, credentials, sessions
+  and evidence local while port-aware file/process/network effects cross bounded HTTPS/WSS. The TUI
+  persistently shows endpoint and remote root. Caller operation ids, request fingerprints and a
+  bounded argument-free delivery ledger prevent duplicate replay and report an honest `Unknown`
+  after accepted work whose terminal receipt cannot be proven.
+
+- **Interactive agents can now ask schema-driven questions through a host-owned UI** (C-472).
+  The conditional `user.ask` operation accepts a text/optional opaque-audio prompt and bounded JSON
+  Schema, then returns an explicit submitted or cancelled wrapper after runtime validation. The
+  plain CLI and TUI provide native yes/no, select, multi-select and flat-form controls with a JSON
+  fallback; `ClientBuilder::with_user_interaction` exposes the responder contract to embedders.
+  Headless, served/A2A, stream-JSON and app assemblies do not advertise the operation, and answers
+  remain structurally separate from approval decisions.
+
+### Changed
+
+- **A turn can now carry an explicitly selected guarded execution substrate without changing the
+  native default** (C-474). `ToolContext` and `ExecutionEnvironment` retain the local `System` for
+  control-plane assembly while an object-safe `ExecutionSystem` owns port-aware effects; sub-agents
+  inherit the same immutable selection. With no override, effects continue to follow context-local
+  worktree transitions exactly as before. Under remote mode, unported packs and native-only resource
+  operations are hidden and refused instead of falling back to the local host.
+
+- **Managed processes and guarded network resources are now substrate-neutral** (C-435, C-473).
+  Opaque process, byte-stream, listener and datagram handles let native and delegated systems share
+  lifecycle semantics without leaking Tokio handles into the port. Native inbound TCP/UDP carries
+  exposure, connection, frame and timeout limits; outbound still uses the single pinned-address
+  guard. This is a **breaking pre-1.0 API change**: `GuardedProcess::spawn_background` is asynchronous,
+  and exhaustive matches on `GuardedIoFailure` must handle the new `Unknown` outcome.
+
+- **The proposed remote-system mode now has explicit workspace and guarantee semantics** (C-437,
+  C-438). Native execution remains the default and remote execution is an operator-selected target.
+  The remote workspace is canonical with no implicit local synchronization; authorization,
+  approval, model calls, sessions and evidence remain local, while physical confinement, sandboxing
+  and egress enforcement become the remote substrate's responsibility. Documentation now states the
+  unavoidable secret boundary: model credentials stay local, but an operation-bound tool secret
+  crosses the encrypted link when a remote effect must use it, and the resulting evidence is marked
+  as remotely reported rather than locally observed.
+
 ## [0.50.0] - 2026-08-02
 
 ### Changed

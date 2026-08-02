@@ -16,7 +16,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use flux_system::port::{GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles};
+use flux_system::net::{BindExposure, DialTarget, InboundLimits, PrivateNetAllow};
+use flux_system::port::{
+    GuardedEnv, GuardedHostFiles, GuardedNetwork, GuardedProcess, GuardedWorkspaceFiles,
+};
 use flux_system::remote::{
     failure_mode, Answer, Answered, Delegate, Delivered, FailureMode, Loopback, RemoteSystem,
     Unreachable,
@@ -261,6 +264,7 @@ async fn a_delegates_wording_cannot_forge_the_other_failure_mode() {
         FailureMode::Unreachable.prefix(),
         FailureMode::Unserved.prefix(),
         FailureMode::Refused.prefix(),
+        FailureMode::Unknown.prefix(),
     ] {
         for detail in [
             marker.to_string(),
@@ -299,6 +303,7 @@ async fn a_path_cannot_forge_a_failure_mode_on_the_loopback_path() {
     for marker in [
         FailureMode::Unreachable.prefix(),
         FailureMode::Unserved.prefix(),
+        FailureMode::Unknown.prefix(),
     ] {
         // A filename that opens with a marker, holding bytes that are not valid UTF-8.
         let name = format!("{marker}forged.bin").replace('/', "_");
@@ -410,8 +415,50 @@ async fn every_operation_an_empty_delegate_does_not_serve_fails_closed() {
                 .err(),
         ),
     ];
+    let network_errors = vec![
+        (
+            "dial_scoped",
+            nothing
+                .dial_scoped(
+                    &DialTarget::Tcp {
+                        host: "example.test".into(),
+                        port: 443,
+                    },
+                    &PrivateNetAllow::None,
+                )
+                .await
+                .err(),
+        ),
+        (
+            "bind_tcp",
+            nothing
+                .bind_tcp(
+                    "127.0.0.1:0".parse().unwrap(),
+                    BindExposure::LoopbackOnly,
+                    InboundLimits::default(),
+                )
+                .await
+                .err(),
+        ),
+        (
+            "bind_udp",
+            nothing
+                .bind_udp(
+                    "127.0.0.1:0".parse().unwrap(),
+                    BindExposure::LoopbackOnly,
+                    InboundLimits::default(),
+                    PrivateNetAllow::None,
+                )
+                .await
+                .err(),
+        ),
+    ];
 
-    for (label, error) in process_errors.into_iter().chain(file_errors) {
+    for (label, error) in process_errors
+        .into_iter()
+        .chain(file_errors)
+        .chain(network_errors)
+    {
         let error = error.unwrap_or_else(|| {
             panic!("`{label}` must fail closed when the delegate does not serve it")
         });
@@ -434,7 +481,7 @@ async fn every_operation_an_empty_delegate_does_not_serve_fails_closed() {
     );
 
     // A long-lived native child cannot be fabricated across a wire at all.
-    match nothing.spawn_background(&argv, &[]) {
+    match nothing.spawn_background(&argv, &[]).await {
         Err(error) => assert_eq!(failure_mode(&error), Some(FailureMode::Unserved)),
         Ok(_) => panic!("a remote delegate cannot hand back a live native child"),
     }
@@ -463,6 +510,20 @@ async fn the_loopback_delegate_serves_the_port_with_no_service_running() {
         .await
         .unwrap();
     assert_eq!(out.stdout.trim(), "loopback");
+
+    let mut child = remote
+        .spawn_background(&["sh".into(), "-c".into(), "printf managed".into()], &[])
+        .await
+        .unwrap();
+    let mut managed_output = String::new();
+    for _ in 0..100 {
+        managed_output.push_str(&child.read_output().0);
+        if managed_output == "managed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(managed_output, "managed");
 
     std::fs::remove_dir_all(&root).ok();
 }

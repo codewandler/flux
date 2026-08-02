@@ -105,11 +105,12 @@ pub(super) struct SpinnerState {
 /// so no shared construction scope exists to thread an instance through.
 pub(super) struct PromptGate {
     state: std::sync::Mutex<GateState>,
+    serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct GateState {
-    /// Prompt-hold depth. Plain-CLI prompts are strictly sequential; depth keeps even an
-    /// unexpected overlap safe.
+    /// Prompt-hold depth. The async serial lock makes this 0/1; a count keeps painter bookkeeping
+    /// defensive if a future prompt acquires through a nested helper.
     holders: usize,
     /// Live spinner tickers (0 or 1 in practice) — lets `acquire` know whether there is a painted
     /// line to clear, so piped stderr stays free of control bytes.
@@ -123,6 +124,7 @@ pub(super) struct PaintPermit<'a>(#[allow(dead_code)] std::sync::MutexGuard<'a, 
 /// Releases the prompt's hold on drop — including when the turn future is cancelled mid-approval.
 pub(super) struct PromptGuard {
     gate: Arc<PromptGate>,
+    _serial: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl PromptGate {
@@ -132,6 +134,7 @@ impl PromptGate {
                 holders: 0,
                 painters: 0,
             }),
+            serial: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -163,10 +166,11 @@ impl PromptGate {
         st.holders == 0
     }
 
-    /// Take the stderr line for a prompt: clears the live spinner line once (only when a painter
-    /// is registered — nothing is emitted on piped stderr), then blocks all repainting and clearing
-    /// until the guard drops.
-    pub(super) fn acquire(self: &Arc<Self>) -> PromptGuard {
+    /// Take the one interactive-input slot and stderr line. Approval and typed-question readers
+    /// share this lock, so two concurrent operations cannot compete for stdin. Once acquired, clear
+    /// a live spinner line and block repainting/clearing until the guard drops.
+    pub(super) async fn acquire(self: &Arc<Self>) -> PromptGuard {
+        let serial = self.serial.clone().lock_owned().await;
         let mut st = self.state.lock().unwrap();
         st.holders += 1;
         if st.painters > 0 {
@@ -176,6 +180,7 @@ impl PromptGate {
         drop(st);
         PromptGuard {
             gate: Arc::clone(self),
+            _serial: serial,
         }
     }
 }

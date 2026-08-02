@@ -2,6 +2,13 @@
 
 use super::*;
 
+fn option_label(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
 /// A centered sub-rect `w`×`h` (clamped to `area`).
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
@@ -79,10 +86,14 @@ fn render_empty_state_card(frame: &mut Frame, state: &ChatState, area: Rect) {
     }
     let t = &state.theme;
     let model = state.model_spec.as_deref().unwrap_or(&state.model);
-    let identity = if state.workspace_root.is_empty() {
+    let workspace = state
+        .execution_target
+        .as_deref()
+        .unwrap_or(&state.workspace_root);
+    let identity = if workspace.is_empty() {
         model.to_string()
     } else {
-        format!("{model}  ·  {}", state.workspace_root)
+        format!("{model}  ·  {workspace}")
     };
     let card_width = area.width.min(60);
     let mut lines = vec![
@@ -666,6 +677,152 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         );
     }
 
+    if let Some(view) = &state.interaction {
+        let t = &state.theme;
+        let mut rows = vec![Line::styled(
+            crate::trust::sanitize(&view.request.prompt.text),
+            t.panel_style(),
+        )];
+        match &view.control {
+            crate::interaction::InteractionControl::Boolean => rows.push(Line::from(vec![
+                Span::styled("[y]", t.ok_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" yes  ", t.muted_style()),
+                Span::styled("[n]", t.err_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" no", t.muted_style()),
+            ])),
+            crate::interaction::InteractionControl::Single(options) => {
+                for (index, option) in options.iter().enumerate() {
+                    let marker = if index == view.selected { "› " } else { "  " };
+                    rows.push(Line::styled(
+                        format!("{marker}{}", crate::trust::sanitize(&option_label(option))),
+                        if index == view.selected {
+                            t.accent_style().add_modifier(Modifier::BOLD)
+                        } else {
+                            t.muted_style()
+                        },
+                    ));
+                }
+                rows.push(Line::styled("↑/↓ choose · Enter submit", t.muted_style()));
+            }
+            crate::interaction::InteractionControl::Multi(options) => {
+                for (index, (option, checked)) in options.iter().zip(&view.checked).enumerate() {
+                    let marker = if index == view.selected { "›" } else { " " };
+                    let check = if *checked { "x" } else { " " };
+                    rows.push(Line::styled(
+                        format!(
+                            "{marker} [{check}] {}",
+                            crate::trust::sanitize(&option_label(option))
+                        ),
+                        if index == view.selected {
+                            t.accent_style().add_modifier(Modifier::BOLD)
+                        } else {
+                            t.muted_style()
+                        },
+                    ));
+                }
+                rows.push(Line::styled(
+                    "↑/↓ choose · Space toggle · Enter submit",
+                    t.muted_style(),
+                ));
+            }
+            crate::interaction::InteractionControl::Form(fields) => {
+                for (index, field) in fields.iter().enumerate() {
+                    let marker = if index == view.selected { "›" } else { " " };
+                    let required = if field.required { "*" } else { " " };
+                    let value = match &field.control {
+                        crate::interaction::FormFieldControl::Boolean => view.form_values[index]
+                            .as_ref()
+                            .and_then(serde_json::Value::as_bool)
+                            .map(|value| if value { "yes" } else { "no" }.to_string())
+                            .unwrap_or_else(|| "—".into()),
+                        crate::interaction::FormFieldControl::Single(_) => view.form_values[index]
+                            .as_ref()
+                            .map(option_label)
+                            .unwrap_or_else(|| "—".into()),
+                        crate::interaction::FormFieldControl::Multi(options) => {
+                            let cursor = view.form_cursors[index];
+                            let option = options
+                                .get(cursor)
+                                .map(option_label)
+                                .unwrap_or_else(|| "—".into());
+                            let checked = view.form_checked[index]
+                                .get(cursor)
+                                .copied()
+                                .unwrap_or(false);
+                            format!("{} {option}", if checked { "[x]" } else { "[ ]" })
+                        }
+                        crate::interaction::FormFieldControl::String
+                        | crate::interaction::FormFieldControl::Integer
+                        | crate::interaction::FormFieldControl::Number => {
+                            if view.form_inputs[index].is_empty() {
+                                "—".into()
+                            } else {
+                                view.form_inputs[index].clone()
+                            }
+                        }
+                    };
+                    rows.push(Line::styled(
+                        format!(
+                            "{marker} {required}{}: {}",
+                            crate::trust::sanitize(&field.label),
+                            crate::trust::sanitize(&value)
+                        ),
+                        if index == view.selected {
+                            t.accent_style().add_modifier(Modifier::BOLD)
+                        } else {
+                            t.muted_style()
+                        },
+                    ));
+                }
+                if let Some(description) = fields
+                    .get(view.selected)
+                    .and_then(|field| field.description.as_deref())
+                {
+                    rows.push(Line::styled(
+                        crate::trust::sanitize(description),
+                        t.muted_style(),
+                    ));
+                }
+                rows.push(Line::styled(
+                    "↑/↓ field · ←/→ choice · Space toggle · Enter submit · * required",
+                    t.muted_style(),
+                ));
+            }
+            crate::interaction::InteractionControl::Json => {
+                rows.push(Line::from(vec![
+                    Span::styled("JSON: ", t.accent_style()),
+                    Span::styled(view.input.clone(), t.panel_style()),
+                    Span::styled("▍", t.accent_style()),
+                ]));
+                rows.push(Line::styled("Enter submit", t.muted_style()));
+            }
+        }
+        if let Some(error) = &view.error {
+            rows.push(Line::styled(crate::trust::sanitize(error), t.err_style()));
+        }
+        rows.push(Line::styled("Esc cancel", t.muted_style()));
+        let max_h = (frame.area().height / 2).max(6);
+        let height = (rows.len() as u16 + 2)
+            .min(max_h)
+            .min(input_area.y.saturating_sub(1))
+            .max(5);
+        let area = Rect {
+            x: frame.area().x,
+            y: input_area.y.saturating_sub(height),
+            width: frame.area().width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(rows).style(t.panel_style()).block(
+                Block::bordered()
+                    .border_style(t.accent_style())
+                    .title(Span::styled(" question · user input ", t.accent_style())),
+            ),
+            area,
+        );
+    }
+
     if let Some(view) = &state.approval {
         let t = &state.theme;
         // C-115: a pending edit/write shows its hunk diff inside the sheet — the decision point
@@ -823,6 +980,40 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_text(state: &ChatState) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn typed_question_sheet_renders_host_chrome_and_multi_select_controls() {
+        let mut state = ChatState::new("mock".into());
+        state.interaction = Some(crate::interaction::InteractionView::new(
+            flux_runtime::UserInteractionRequest {
+                origin: flux_runtime::InteractionOrigin::Agent,
+                prompt: flux_runtime::UserPrompt::text("Pick environments\u{1b}[31m"),
+                schema: serde_json::json!({
+                    "type":"array",
+                    "uniqueItems":true,
+                    "items":{"enum":["staging","production"]}
+                }),
+            },
+        ));
+
+        let text = render_text(&state);
+        assert!(text.contains("question · user input"));
+        assert!(text.contains("[ ] staging"));
+        assert!(text.contains("Space toggle"));
+        assert!(!text.contains('\u{1b}'));
+    }
 
     /// C-152: `selected` (clamped into range) is always inside the returned window, for every
     /// combination of a small `total`/`cap`/`selected` — including `total == 0` and `total == 1`,

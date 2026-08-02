@@ -41,7 +41,7 @@ something may happen. `flux-system` is where it happens."*
 | **Fully local** | everything on your machine — `flux tui` | ships |
 | **Local, OS-sandboxed** | effects confined at the single spawn choke point (bubblewrap / Seatbelt) | ships (D-134…D-137); unattended runs default to it since C-410 |
 | **Local runtime, containerized ops** | effects in a container | [C-397](C-397-container-process-backend.md), backlog |
-| **Local runtime, remote system** | `flux tui --remote <addr>` — approval local, effects remote | this epic; [C-399](C-399-remote-guarded-io-backend.md) ready |
+| **Local runtime, remote system** | `flux tui --remote <HTTPS_URL>` — approval local, effects remote | ships; local remains the no-flag default |
 | **Served agent, thin client** | the whole agent runs elsewhere — A2A card, JSON-RPC `message/send`/`message/stream`, sessions | server side **ships** (`flux app run --serve`); the client is the gap |
 | **Embedded (SDK)** | another Rust program embeds `flux-sdk` | ships |
 | **Portable wasm** | a wasm embedder serves the port through host imports | [C-268](C-268-portable-wasm-runtime-epic.md) epic |
@@ -64,12 +64,10 @@ board, and the board is not the code.
 - [x] Each row answers **"where are my files"** and **"where does the approval prompt appear"** — the two
       questions a reader actually has, and the ones that differ most between topologies. → both are
       columns of the at-a-glance table (pinned) and a bullet in every section.
-- [ ] The guarantees column comes from [C-437](C-437-which-guarantees-travel.md) rather than being
+- [x] The guarantees column comes from [C-437](C-437-which-guarantees-travel.md) rather than being
       re-derived. ⚠ Two divergent statements about what flux guarantees is worse than one late one.
-      → **not done, deliberately.** C-437 is still `ready`, so there is nothing to source from. Rather
-      than re-derive a guarantees column and create the second divergent statement this item exists to
-      prevent, the page carries no such column; the remote-system section states the open question and
-      defers. C-437 adds the column.
+      → C-437 is done; the remote-system section now carries its per-guarantee classification,
+      including operation-bound secrets and weaker remote-reported evidence provenance.
 - [x] ⚠ **`ssh` is named as a legitimate option**, not omitted. Running flux on the remote box over `ssh`
       works today and is the right answer for some people; a page that hides it to make the product look
       necessary is not credible about the rest. → a full row and section of its own, and the
@@ -101,9 +99,8 @@ board, and the board is not the code.
   already the executable contract for exactly that class. The pins:
   `topologies_page_runnable_commands_are_real_cli_surface` resolves every `flux …` line in an `sh`
   fence against the shipped binary's own `--help`, walking the subcommand tree and matching each long
-  flag on a word boundary; `topologies_page_does_not_present_unbuilt_surface_as_runnable` fails **when
-  `flux tui --remote` starts to exist**, so the row's status is updated by the change that makes it
-  stale rather than by someone noticing later; `topologies_page_states_a_status_for_every_row_and_names_ssh`
+  flag on a word boundary; `topologies_page_remote_system_surface_is_real_and_shipping` pins both
+  ends of the released daemon/client surface; `topologies_page_states_a_status_for_every_row_and_names_ssh`
   requires a status word on every table row, both reader-questions as columns, and `ssh` on the page.
 - Fence convention the page and the tests share: an `sh` fence runs **today**; a proposed spelling goes
   in a `text` fence. Neither a reader nor the test can confuse the two.
@@ -126,8 +123,6 @@ board, and the board is not the code.
   - **The OS sandbox** needed a caveat the table omitted: the *interactive* default is `Off`; only
     unattended surfaces default to `Require`. Windows has no backend, so unattended refuses to start
     and interactive runs unconfined.
-- ⚠ **Acceptance item 4 (the guarantees column from C-437) is deliberately deferred, not forgotten.**
-  C-437 is still `ready`, so there is nothing to source from, and re-deriving a guarantees column here
-  would manufacture exactly the second divergent statement that item exists to prevent. The page
-  therefore carries no guarantees column; the remote-system section states the open question and
-  defers. **C-437 adds the column** — that story, not a follow-up.
+- 2026-08-02: C-436 and C-437 shipped. The remote-system row is now a runnable local-or-remote mode,
+  and the page owns the public setup, canonical-workspace/no-sync rule, port-aware catalog, typed
+  delivery outcomes, and the guarantees table sourced from C-437.

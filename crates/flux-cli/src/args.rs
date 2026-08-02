@@ -101,6 +101,27 @@ pub(super) struct AgentFlags {
     #[arg(short = 'm', long)]
     pub(super) model: Option<String>,
 
+    /// Execute guarded tool effects on this remote-system HTTPS endpoint. Omit for the native local
+    /// substrate. Model calls, credentials, approvals, session storage, and authored definitions
+    /// remain local; the selected execution target is immutable for the session and inherited by
+    /// sub-agents.
+    #[arg(long, value_name = "HTTPS_URL")]
+    pub(super) remote: Option<String>,
+
+    /// Name of the environment variable containing the remote-system bearer token. The token is
+    /// never accepted as a command-line value. Used only with `--remote`.
+    #[arg(
+        long = "remote-token-env",
+        value_name = "ENV",
+        default_value = "FLUX_REMOTE_SYSTEM_TOKEN",
+        requires = "remote"
+    )]
+    pub(super) remote_token_env: String,
+
+    /// PEM certificate for an additional private CA trusted by the remote-system client.
+    #[arg(long = "remote-ca", value_name = "PEM", requires = "remote")]
+    pub(super) remote_ca: Option<std::path::PathBuf>,
+
     /// Ask capable providers/models to expose adaptive thinking for every call owned by this agent.
     #[arg(long)]
     pub(super) think: bool,
@@ -607,6 +628,38 @@ pub(super) enum Commands {
         /// Machine-readable JSON output for scripting.
         #[arg(long)]
         json: bool,
+    },
+    /// Serve or inspect the guarded execution-system transport.
+    System {
+        #[command(subcommand)]
+        action: SystemAction,
+    },
+}
+
+/// `flux system …` — explicit operator control of the remote execution substrate.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum SystemAction {
+    /// Serve one canonical workspace over authenticated TLS.
+    Serve {
+        /// Listener address. Non-loopback binds are allowed only because every route is authenticated.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8790")]
+        bind: std::net::SocketAddr,
+        /// Canonical workspace made visible to remote sessions.
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        workspace: std::path::PathBuf,
+        /// PEM certificate chain served over TLS.
+        #[arg(long, value_name = "PEM")]
+        cert: std::path::PathBuf,
+        /// PEM private key for `--cert`.
+        #[arg(long, value_name = "PEM")]
+        key: std::path::PathBuf,
+        /// Environment variable containing the required bearer token.
+        #[arg(
+            long = "token-env",
+            value_name = "ENV",
+            default_value = "FLUX_REMOTE_SYSTEM_TOKEN"
+        )]
+        token_env: String,
     },
 }
 

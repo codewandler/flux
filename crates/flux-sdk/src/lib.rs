@@ -170,6 +170,14 @@ pub mod approval {
     pub use flux_spec::IntentSet;
 }
 
+/// Typed, host-rendered interaction requested by an agent turn.
+pub mod interaction {
+    pub use flux_runtime::{
+        InteractionCapabilities, InteractionInputMode, InteractionOrigin, InteractionResponse,
+        PromptAudioRef, UserInteraction, UserInteractionRequest, UserPrompt,
+    };
+}
+
 /// **Authorization floor.** Every SDK executor carries an [`ExecutionAuthorization`] profile.
 /// Builders use [`ExecutionAuthorization::local`] by default; embedding services should install a
 /// resolved policy and identity with `with_authorization(...)`.
@@ -454,6 +462,7 @@ pub struct ClientBuilder {
     sub_agent_adaptive_policy: Option<AdaptiveLoopPolicy>,
     // D-178: `None` ⇒ derive from the storage's durability at `build` (on for durable stores).
     auto_resurrect: Option<bool>,
+    user_interaction: Option<Arc<dyn interaction::UserInteraction>>,
 }
 
 impl Default for ClientBuilder {
@@ -473,6 +482,7 @@ impl Default for ClientBuilder {
             sub_agents: None,
             auto_resurrect: None,
             sub_agent_adaptive_policy: None,
+            user_interaction: None,
         }
     }
 }
@@ -498,6 +508,7 @@ impl ClientBuilder {
             sub_agents: None,
             sub_agent_adaptive_policy: None,
             auto_resurrect: None,
+            user_interaction: None,
         }
     }
     /// Set the model id every turn uses.
@@ -886,6 +897,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Install a host-owned typed interaction handler and expose `user.ask` to this agent.
+    ///
+    /// The runtime validates both the request schema and submitted value. Installing the handler
+    /// pre-allows only this operation; an explicit deny still wins.
+    pub fn with_user_interaction(
+        mut self,
+        interaction: Arc<dyn interaction::UserInteraction>,
+    ) -> Self {
+        self.user_interaction = Some(interaction);
+        if !self.envelope.allow.iter().any(|name| name == "user.ask") {
+            self.envelope.allow.push("user.ask".to_string());
+        }
+        if let Some(tools) = self.spec.tools.as_mut() {
+            if !tools.iter().any(|name| name == "user.ask") {
+                tools.push("user.ask".to_string());
+            }
+        }
+        self
+    }
+
     /// Build the client with `provider` and a workspace rooted at `root`. Sessions live in the
     /// configured [`Storage`] (in-memory unless set). The turn runs on [`FlowEngine`] (the model
     /// plans, the runtime runs the flux-lang agent loop).
@@ -916,6 +947,12 @@ impl ClientBuilder {
         // told apart below: a `tools` subset restricts the *base* catalog, but must not silently
         // drop a tool the consumer explicitly registered.
         let base_names: std::collections::HashSet<String> = registry.names().into_iter().collect();
+        if let Some(interaction) = &self.user_interaction {
+            flux_tools::try_register_user_interaction(
+                &mut registry,
+                Some(interaction.capabilities()),
+            )?;
+        }
         // Consumer ops/packs join the same registry the envelope gates — registration grants
         // existence, not permission (the safety envelope still gates every dispatch).
         for (source, tool) in self.ops {
@@ -1031,8 +1068,13 @@ impl ClientBuilder {
             environment: environment.clone(),
             provider: provider.clone(),
             events: events.clone(),
+            user_interaction: self.user_interaction.clone(),
         });
         let engine = spec.assemble_in(provider, environment, events, flow)?;
+        let engine = match self.user_interaction {
+            Some(interaction) => engine.with_user_interaction(interaction),
+            None => engine,
+        };
         Ok(Client {
             engine: Arc::new(engine),
             model,
@@ -1173,6 +1215,22 @@ mod tests {
     use flux_provider::{ChunkStream, Request};
     use std::sync::Mutex;
 
+    struct FixedInteraction;
+
+    #[async_trait]
+    impl interaction::UserInteraction for FixedInteraction {
+        fn capabilities(&self) -> interaction::InteractionCapabilities {
+            interaction::InteractionCapabilities::text()
+        }
+
+        async fn request(
+            &self,
+            _request: interaction::UserInteractionRequest,
+        ) -> Result<interaction::InteractionResponse> {
+            Ok(interaction::InteractionResponse::Cancelled)
+        }
+    }
+
     fn parse_role(content: &str, name_fallback: &str) -> crate::subagents::Role {
         crate::subagents::try_parse_role(content, name_fallback).unwrap()
     }
@@ -1267,6 +1325,47 @@ mod tests {
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.cache_read_input_tokens, 16);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn user_ask_is_registered_only_when_a_responder_is_installed() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-sdk-interaction-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = || {
+            Box::new(OneShotMock {
+                chunks: Mutex::new(Some(Vec::new())),
+            }) as Box<dyn Provider>
+        };
+        let headless = Client::builder()
+            .model("mock")
+            .build(provider(), &dir)
+            .unwrap();
+        assert!(headless
+            .engine
+            .executor
+            .registry()
+            .get("user.ask")
+            .is_none());
+
+        let interactive = Client::builder()
+            .model("mock")
+            .with_user_interaction(Arc::new(FixedInteraction))
+            .tools(["read"])
+            .build(provider(), &dir)
+            .unwrap();
+        assert!(interactive
+            .engine
+            .executor
+            .registry()
+            .get("user.ask")
+            .is_some());
+        assert!(interactive
+            .engine
+            .executor
+            .allow_rules()
+            .iter()
+            .any(|rule| rule == "user.ask"));
     }
 
     /// A mock that records every request's system prompt (segments + legacy `system`) so a test can

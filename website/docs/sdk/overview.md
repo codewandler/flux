@@ -67,6 +67,47 @@ an optional system prompt and context blocks, model/token/iteration limits, expl
 Because a library has no approval UI, reads are pre-allowed and other gated operations deny by
 default unless you provide a broader policy.
 
+### Let the agent ask your user
+
+An embedded conversational client can install a schema-driven question handler. Installing it adds
+and pre-allows `user.ask`; an explicit deny still wins. The runtime validates the request before
+your code sees it and validates the returned value again:
+
+```rust,ignore
+use std::sync::Arc;
+use async_trait::async_trait;
+use flux_sdk::interaction::{
+    InteractionCapabilities, InteractionResponse, UserInteraction, UserInteractionRequest,
+};
+
+struct ProductUi;
+
+#[async_trait]
+impl UserInteraction for ProductUi {
+    fn capabilities(&self) -> InteractionCapabilities {
+        InteractionCapabilities::text()
+    }
+
+    async fn request(
+        &self,
+        request: UserInteractionRequest,
+    ) -> flux_core::Result<InteractionResponse> {
+        // Render request.prompt and request.schema, then return reviewed JSON.
+        todo!()
+    }
+}
+
+let client = flux_sdk::Client::builder()
+    .with_user_interaction(Arc::new(ProductUi))
+    .build(provider, ".")?;
+```
+
+Yes/no, enum and unique enum-array schemas naturally map to toggles and selectors. Unsupported
+shapes can use a JSON editor. Audio-capable hosts return `InteractionCapabilities::with_audio()`
+and resolve `PromptAudioRef.asset_id` inside their own asset store; recordings never enter the
+runtime response. This interaction contract is deliberately separate from `Approver`—a product
+answer cannot approve an effect.
+
 ### `FlowClient`: one flow's lifecycle
 
 ```rust
@@ -202,6 +243,7 @@ internal crate so consumer code names only `flux_sdk::…`.
 |---|---|---|
 | `tools` | `Tool`, `tool_fn`, `ToolSpec`/`Risk`, `ToolContext`, `ToolResult`, `ToolRegistry` — custom operations. | [`FlowClient`](./flow-client.md) |
 | `approval` | `Approver`, `ApprovalChoice`, `RiskApprover`, `IntentSet` — your approval policy. | [Safety and approvals](../agent/safety.md) |
+| `interaction` | `UserInteraction`, request/response and capability types — schema-driven questions rendered by your host. | [above](#let-the-agent-ask-your-user) |
 | `authorization` | `AuthorizationPolicy`, `Caller`, `Trust`, `ExecutionAuthorization`, `IdentityCell` — the policy floor and resolved identity. | [Safety and approvals](../agent/safety.md) |
 | `observe` | `Message`, `TurnSummary`, `RunEvent`, `ModelCost`, `EfficiencySummary`, `RunDiff`/`DiffRow`, the `EventStore`/`FlowStore` handles, and the evidence-gating types (`ToolGroup`, `SignalMatch`, `Observation`, `KIND_SIGNAL`). | [Sessions](./sessions.md#reading-a-session-back) |
 | `subagents` | `SubAgents`, `SpawnLimits`, `ProviderFactory`, `Role`, `RoleRegistry`, `try_parse_role`. | above, and [Skills and roles](../agent/skills-and-roles.md) |

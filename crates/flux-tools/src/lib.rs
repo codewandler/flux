@@ -20,6 +20,7 @@ mod skill_load;
 pub mod surface;
 pub mod toolchains;
 pub mod transform;
+pub mod user_ask;
 
 pub use command_invoke::{register_command_invoke, try_register_command_invoke};
 pub use evidence::{install_evidence, register_evidence, try_register_evidence};
@@ -30,6 +31,7 @@ pub use flows::{
 pub use reflect::{install_reflect, register_reflect, try_register_reflect};
 pub use render::{register_render, try_register_render};
 pub use surface::{try_register_surface_ops, PANE_OPS};
+pub use user_ask::{try_register_user_interaction, USER_ASK_OP};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -177,7 +179,7 @@ fn norm_key(path: &str) -> String {
 /// Record that `path`'s current content has been seen (read or just written), with its mtime — the
 /// baseline for the read-before-write guard. Best-effort.
 async fn note_read(ctx: &ToolContext, path: &str) {
-    if let Ok(m) = ctx.system().file_mtime(path).await {
+    if let Ok(m) = ctx.execution_system().file_mtime(path).await {
         ctx.record_read(&norm_key(path), m);
     }
 }
@@ -189,7 +191,7 @@ async fn note_read(ctx: &ToolContext, path: &str) {
 async fn guard_unchanged(ctx: &ToolContext, path: &str, require_seen: bool) -> Result<()> {
     match ctx.read_mtime(&norm_key(path)) {
         Some(seen) => {
-            if let Ok(now) = ctx.system().file_mtime(path).await {
+            if let Ok(now) = ctx.execution_system().file_mtime(path).await {
                 if now > seen {
                     return Err(Error::Other(format!(
                         "{path} changed on disk since you last read it; re-read it before editing"
@@ -639,7 +641,7 @@ impl Tool for ReadTool {
 
         // Single-file path (offset/limit paging applies here only).
         let path = &paths[0];
-        if ctx.system().is_dir(path).await? {
+        if ctx.execution_system().is_dir(path).await? {
             return Ok(ToolResult::error(directory_read_guidance(path)));
         }
         let offset = u64_arg(&params, "offset").unwrap_or(0) as usize;
@@ -648,7 +650,7 @@ impl Tool for ReadTool {
         // Stat BEFORE materializing: an unbounded read of an over-cap file returns guidance without
         // ever slurping it, so a multi-GB file can't OOM the host (C-79). The windowed branch below
         // streams within `READ_BYTE_CAP`, and the bounded read guards the rest.
-        let stat_size = ctx.system().file_size(path).await?;
+        let stat_size = ctx.execution_system().file_size(path).await?;
         if offset == 0 && limit.is_none() && stat_size > READ_BYTE_CAP as u64 {
             return Ok(ToolResult::ok(format!(
                 "{path} is {stat_size} bytes (over the {READ_BYTE_CAP}-byte read cap); read a range \
@@ -659,7 +661,7 @@ impl Tool for ReadTool {
         // Bounded read: never materialize more than `MAX_READ_FILE_BYTES`, and reject non-regular
         // files (a FIFO/device would otherwise stream forever and hang the tool).
         let (bytes, _over_cap) = ctx
-            .system()
+            .execution_system()
             .read_file_bytes_capped(path, MAX_READ_FILE_BYTES)
             .await?;
         let total_bytes = bytes.len();
@@ -785,8 +787,12 @@ impl Tool for WriteTool {
         // Soft guard: refuse only if we saw this file and it changed on disk since (don't clobber).
         guard_unchanged(ctx, path, false).await?;
         // Read prior content for a diff (a missing/binary file ⇒ empty `before` = all additions).
-        let before = ctx.system().read_file(path).await.unwrap_or_default();
-        ctx.system().write_file(path, content).await?;
+        let before = ctx
+            .execution_system()
+            .read_file(path)
+            .await
+            .unwrap_or_default();
+        ctx.execution_system().write_file(path, content).await?;
         note_read(ctx, path).await; // we now know current content
         let status = format!("wrote {} bytes to {path}", content.len());
         Ok(edit_result(status, &unified_diff(path, &before, content)))
@@ -862,7 +868,7 @@ impl Tool for EditTool {
 
         // Must have read (or written) this file this session, and it must not have changed since.
         guard_unchanged(ctx, path, true).await?;
-        let content = ctx.system().read_file(path).await?;
+        let content = ctx.execution_system().read_file(path).await?;
         let count = content.matches(old).count();
 
         // Exact path (honors `replace_all` and the uniqueness guard).
@@ -879,7 +885,7 @@ impl Tool for EditTool {
             } else {
                 content.replacen(old, new, 1)
             };
-            ctx.system().write_file(path, &updated).await?;
+            ctx.execution_system().write_file(path, &updated).await?;
             note_read(ctx, path).await;
             let n = if replace_all { count } else { 1 };
             let status = format!(
@@ -893,7 +899,7 @@ impl Tool for EditTool {
         // doesn't burn a turn re-guessing the exact bytes.
         match fuzzy_locate(&content, old, new) {
             Ok((strategy, updated)) => {
-                ctx.system().write_file(path, &updated).await?;
+                ctx.execution_system().write_file(path, &updated).await?;
                 note_read(ctx, path).await;
                 let mut status = format!("edited {path} (matched via {})", strategy.label());
                 if strategy.cautious() {
@@ -1329,12 +1335,12 @@ impl Tool for BashTool {
             Some(reporter) => {
                 let observer: flux_system::OutputObserver =
                     std::sync::Arc::new(move |line: &str| reporter.report(line));
-                ctx.system()
+                ctx.execution_system()
                     .run_observed(&argv, Duration::from_secs(timeout), observer)
                     .await?
             }
             None => {
-                ctx.system()
+                ctx.execution_system()
                     .run(&argv, Duration::from_secs(timeout))
                     .await?
             }
@@ -1506,7 +1512,10 @@ impl Tool for GlobTool {
                     .to_string(),
             ));
         }
-        let files = ctx.system().walk_files(base, WALK_FILE_CAP).await?;
+        let files = ctx
+            .execution_system()
+            .walk_files(base, WALK_FILE_CAP)
+            .await?;
         let mut matches: Vec<String> = files
             .into_iter()
             .filter(|f| wildcard_match(pattern, f))
@@ -1583,7 +1592,10 @@ impl Tool for GrepTool {
             None => line.contains(pattern),
         };
 
-        let files = ctx.system().walk_files(base, WALK_FILE_CAP).await?;
+        let files = ctx
+            .execution_system()
+            .walk_files(base, WALK_FILE_CAP)
+            .await?;
         let mut out = Vec::new();
         'files: for f in files {
             if let Some(g) = glob {
@@ -1592,7 +1604,7 @@ impl Tool for GrepTool {
                 }
             }
             // Best-effort: skip binary/non-UTF-8/unreadable files rather than failing the search.
-            let Ok(content) = ctx.system().read_file(&f).await else {
+            let Ok(content) = ctx.execution_system().read_file(&f).await else {
                 continue;
             };
             // Per-file scan guard: bound the line-scan at GREP_FILE_BYTE_CAP so one huge matched file
@@ -1682,7 +1694,7 @@ impl Tool for AppendTool {
         let path = args.path.as_str();
         let content = args.content.as_str();
         guard_unchanged(ctx, path, false).await?;
-        ctx.system().append_file(path, content).await?;
+        ctx.execution_system().append_file(path, content).await?;
         note_read(ctx, path).await;
         Ok(ToolResult::ok(format!(
             "appended {} bytes to {path}",
@@ -1701,7 +1713,7 @@ pub struct ReadManyTool;
 async fn read_section(ctx: &ToolContext, path: &str) -> (String, String) {
     // C-32: a directory in the list gets the same repairable guidance as the single-file path,
     // scoped to its own section — it doesn't halt the other paths in the same call.
-    match ctx.system().is_dir(path).await {
+    match ctx.execution_system().is_dir(path).await {
         Ok(true) => {
             let sec = format!("==> {path} <== ({})", directory_read_guidance(path));
             return (sec.clone(), sec);
@@ -1712,7 +1724,7 @@ async fn read_section(ctx: &ToolContext, path: &str) -> (String, String) {
             return (sec.clone(), sec);
         }
     }
-    match ctx.system().read_file_bytes(path).await {
+    match ctx.execution_system().read_file_bytes(path).await {
         Ok(bytes) => {
             let total_bytes = bytes.len();
             match decode_text(path, bytes) {
@@ -1784,7 +1796,7 @@ impl Tool for ReadManyTool {
                 "read_many: `paths` must be a non-empty array of strings".to_string(),
             ));
         }
-        let system = ctx.system();
+        let system = ctx.execution_system();
         let existence =
             futures::future::join_all(args.paths.iter().map(|path| system.path_exists(path))).await;
         let all_missing = existence.iter().all(|result| matches!(result, Ok(false)));
@@ -1827,7 +1839,7 @@ async fn resolve_read_paths(ctx: &ToolContext, params: &Value) -> Result<Vec<Str
         Some(Value::String(s)) if s.contains('*') || s.contains('?') => {
             // Treat as a glob pattern: walk the workspace and filter by wildcard.
             let mut files = ctx
-                .system()
+                .execution_system()
                 .walk_files(".", WALK_FILE_CAP)
                 .await
                 .unwrap_or_default();
@@ -1968,7 +1980,7 @@ impl Tool for PatchTool {
             .and_then(|v| v.as_array())
             .ok_or_else(|| Error::Other("patch: `edits` must be an array".to_string()))?;
         guard_unchanged(ctx, path, true).await?;
-        let content = ctx.system().read_file(path).await?;
+        let content = ctx.execution_system().read_file(path).await?;
         let crlf = content.contains("\r\n");
         let had_final_nl = content.ends_with('\n');
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -2094,7 +2106,7 @@ impl Tool for PatchTool {
             updated.push_str(ending);
         }
 
-        ctx.system().write_file(path, &updated).await?;
+        ctx.execution_system().write_file(path, &updated).await?;
         note_read(ctx, path).await;
         let status_line = format!("patched {path} ({} edits)", ops.len());
         Ok(edit_result(
@@ -2157,7 +2169,10 @@ impl Tool for GitStageTool {
         }
         let mut argv = vec!["git".to_string(), "add".to_string(), "--".to_string()];
         argv.extend(args.paths);
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -2229,7 +2244,10 @@ impl Tool for GitCommitTool {
             "-m".to_string(),
             full_message,
         ];
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -2294,7 +2312,10 @@ impl Tool for GitStatusTool {
             "status".to_string(),
             "--short".to_string(),
         ];
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -2376,7 +2397,10 @@ impl Tool for GitDiffTool {
             argv.push("--".to_string());
             argv.push(p.to_string());
         }
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -2445,7 +2469,10 @@ impl Tool for GitLogTool {
             format!("-{limit}"),
             "--oneline".to_string(),
         ];
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -2615,7 +2642,7 @@ fn preflight_unavailable(op: &str, what: &str, detail: &str) -> ToolResult {
 
 /// `git status --porcelain`, as a refusal on any failure.
 async fn tree_status(
-    system: &flux_system::System,
+    system: &dyn flux_system::port::ExecutionSystem,
     op: &str,
 ) -> std::result::Result<String, ToolResult> {
     match run_git(system, &["status", "--porcelain"]).await {
@@ -2675,7 +2702,7 @@ fn dirty_tree_refusal(p: &TreePrecondition, status: &str) -> ToolResult {
 /// and nothing was touched. `None` means the op may proceed, and (part 1 of the policy) that any
 /// in-progress marker it later sees is one it created itself.
 async fn require_tree_precondition(
-    system: &flux_system::System,
+    system: &dyn flux_system::port::ExecutionSystem,
     p: &TreePrecondition,
 ) -> Option<ToolResult> {
     for (marker, owner) in p.in_flight {
@@ -2797,7 +2824,7 @@ impl Tool for GitMergeTool {
                  not a ref"
             )));
         }
-        let system = ctx.system();
+        let system = ctx.execution_system();
 
         // The family's shared tree precondition (C-249). For `git_merge` that is the in-flight
         // check and deliberately NOT a clean tree — see `GIT_MERGE_TREE` for both reasons.
@@ -2805,7 +2832,7 @@ impl Tool for GitMergeTool {
         // The in-flight half is what licenses the abort further down: reaching that path PROVES no
         // merge was in progress when this call began, so the `MERGE_HEAD` seen there is one this
         // call created and aborting it destroys nothing it did not create.
-        if let Some(refusal) = require_tree_precondition(&system, &GIT_MERGE_TREE).await {
+        if let Some(refusal) = require_tree_precondition(system.as_ref(), &GIT_MERGE_TREE).await {
             return Ok(refusal);
         }
 
@@ -2819,7 +2846,7 @@ impl Tool for GitMergeTool {
         argv.push("--no-edit".to_string());
         argv.push(branch.clone());
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let (ok, out) = run_git(&system, &argv).await?;
+        let (ok, out) = run_git(system.as_ref(), &argv).await?;
         if ok {
             return Ok(ToolResult::ok(if out.is_empty() {
                 format!("merged {branch}")
@@ -2830,12 +2857,15 @@ impl Tool for GitMergeTool {
         // A failed merge with MERGE_HEAD present stopped on a conflict — and because the guard
         // above proved none was in flight beforehand, this MERGE_HEAD is ours. Name the unmerged
         // paths, abort, and hand back a recoverable error: never left half-merged silently.
-        let (in_progress, _) =
-            run_git(&system, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
+        let (in_progress, _) = run_git(
+            system.as_ref(),
+            &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        )
+        .await?;
         if in_progress {
             let (_, unmerged) =
-                run_git(&system, &["diff", "--name-only", "--diff-filter=U"]).await?;
-            let (aborted, abort_out) = run_git(&system, &["merge", "--abort"]).await?;
+                run_git(system.as_ref(), &["diff", "--name-only", "--diff-filter=U"]).await?;
+            let (aborted, abort_out) = run_git(system.as_ref(), &["merge", "--abort"]).await?;
             if !aborted {
                 return Ok(ToolResult::error(format!(
                     "git_merge: the merge of `{branch}` failed AND `git merge --abort` failed — \
@@ -2913,7 +2943,10 @@ impl Tool for GitPushTool {
         if let Some(b) = args.branch {
             argv.push(b);
         }
-        let out = ctx.system().run(&argv, Duration::from_secs(60)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(60))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -2998,7 +3031,10 @@ impl Tool for GitCheckoutTool {
             argv.push("-c".to_string());
         }
         argv.push(branch.clone());
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -3086,13 +3122,13 @@ impl Tool for GitRevertTool {
                  not a ref"
             )));
         }
-        let system = ctx.system();
+        let system = ctx.execution_system();
 
         // The family's shared tree precondition (C-249). For `git_revert` that is a clean tree —
         // DELIBERATELY stricter than git, which only refuses a dirty index or unstaged changes to
         // the paths it would touch — plus no revert/cherry-pick already in flight, which is what
         // licenses the blanket `git revert --abort` below. See `GIT_REVERT_TREE`.
-        if let Some(refusal) = require_tree_precondition(&system, &GIT_REVERT_TREE).await {
+        if let Some(refusal) = require_tree_precondition(system.as_ref(), &GIT_REVERT_TREE).await {
             return Ok(refusal);
         }
 
@@ -3106,9 +3142,9 @@ impl Tool for GitRevertTool {
         }
         argv.push(commit.clone());
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let (ok, out) = run_git(&system, &argv).await?;
+        let (ok, out) = run_git(system.as_ref(), &argv).await?;
         if ok {
-            let (_, head) = run_git(&system, &["log", "-1", "--oneline"]).await?;
+            let (_, head) = run_git(system.as_ref(), &["log", "-1", "--oneline"]).await?;
             return Ok(ToolResult::ok(if out.is_empty() {
                 format!("reverted {commit} — {head}")
             } else {
@@ -3118,15 +3154,19 @@ impl Tool for GitRevertTool {
 
         // A revert that never started (bad rev, …) leaves no REVERT_HEAD and an untouched
         // tree; one that started and stopped is a conflict — name the files, then abort.
-        let (started, _) =
-            run_git(&system, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]).await?;
+        let (started, _) = run_git(
+            system.as_ref(),
+            &["rev-parse", "-q", "--verify", "REVERT_HEAD"],
+        )
+        .await?;
         if !started {
             return Ok(ToolResult::error(format!(
                 "git_revert: git revert `{commit}` failed: {out}"
             )));
         }
-        let (_, conflicts) = run_git(&system, &["diff", "--name-only", "--diff-filter=U"]).await?;
-        let (aborted, abort_out) = run_git(&system, &["revert", "--abort"]).await?;
+        let (_, conflicts) =
+            run_git(system.as_ref(), &["diff", "--name-only", "--diff-filter=U"]).await?;
+        let (aborted, abort_out) = run_git(system.as_ref(), &["revert", "--abort"]).await?;
         if !aborted {
             return Ok(ToolResult::error(format!(
                 "git_revert: the revert of `{commit}` conflicted and the abort ALSO failed \
@@ -3234,7 +3274,10 @@ impl Tool for GitBranchTool {
             argv.push("-d".to_string());
         }
         argv.push(name.clone());
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -3314,7 +3357,10 @@ impl Tool for GitUnstageTool {
             "--staged".to_string(),
         ];
         argv.extend(args.paths);
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
@@ -3576,7 +3622,10 @@ impl Tool for GitHunksTool {
             Err(why) => return Ok(ToolResult::error(why)),
         };
         let argv = hunk_diff_argv(&args.path, context);
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         if out.exit_code != 0 {
             let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
             return Ok(ToolResult::error(format!(
@@ -3678,7 +3727,10 @@ impl Tool for GitStageHunksTool {
         // matched against the working tree as of this call, which is what makes a concurrent edit
         // a refusal instead of a wrong commit.
         let argv = hunk_diff_argv(&args.path, context);
-        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let out = ctx
+            .execution_system()
+            .run(&argv, Duration::from_secs(30))
+            .await?;
         if out.exit_code != 0 {
             let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
             return Ok(ToolResult::error(format!(
@@ -3790,7 +3842,10 @@ static WORKTREE_BRANCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 /// Run `git <args>` argv-only through the given guarded system. Returns `(succeeded, combined
 /// trimmed output)`; spawn-level failures propagate as errors.
-async fn run_git(system: &flux_system::System, args: &[&str]) -> Result<(bool, String)> {
+async fn run_git(
+    system: &dyn flux_system::port::ExecutionSystem,
+    args: &[&str],
+) -> Result<(bool, String)> {
     let argv: Vec<String> = std::iter::once("git".to_string())
         .chain(args.iter().map(|s| (*s).to_string()))
         .collect();
@@ -3854,14 +3909,15 @@ impl Tool for GitWorktreeEnterTool {
         let original_root = system.workspace().root().display().to_string();
 
         // Preflight 1: inside a git repository.
-        let (ok, body) = run_git(&system, &["rev-parse", "--is-inside-work-tree"]).await?;
+        let (ok, body) = run_git(system.as_ref(), &["rev-parse", "--is-inside-work-tree"]).await?;
         if !ok || body != "true" {
             return Ok(ToolResult::error(format!(
                 "git_worktree_enter: not inside a git repository: {body}"
             )));
         }
         // Preflight 2: on branch `main` (detached HEAD rejected).
-        let (ok, branch_now) = run_git(&system, &["symbolic-ref", "--short", "HEAD"]).await?;
+        let (ok, branch_now) =
+            run_git(system.as_ref(), &["symbolic-ref", "--short", "HEAD"]).await?;
         if !ok {
             return Ok(ToolResult::error(format!(
                 "git_worktree_enter: HEAD is detached (no branch checked out); requires a clean \
@@ -3875,11 +3931,13 @@ impl Tool for GitWorktreeEnterTool {
         }
         // Preflight 3: the family's shared tree precondition (C-249) — a clean checkout, and
         // nothing mid-merge/mid-revert. See `GIT_WORKTREE_ENTER_TREE`.
-        if let Some(refusal) = require_tree_precondition(&system, &GIT_WORKTREE_ENTER_TREE).await {
+        if let Some(refusal) =
+            require_tree_precondition(system.as_ref(), &GIT_WORKTREE_ENTER_TREE).await
+        {
             return Ok(refusal);
         }
         // Capture `main`'s HEAD — the base the eventual merge is verified against.
-        let (ok, head) = run_git(&system, &["rev-parse", "HEAD"]).await?;
+        let (ok, head) = run_git(system.as_ref(), &["rev-parse", "HEAD"]).await?;
         if !ok || head.is_empty() {
             return Ok(ToolResult::error(format!(
                 "git_worktree_enter: could not resolve HEAD: {head}"
@@ -3893,7 +3951,7 @@ impl Tool for GitWorktreeEnterTool {
         let parent = system.allocate_worktree_dir()?;
         let checkout = parent.join("checkout");
         let (ok, add_out) = run_git(
-            &system,
+            system.as_ref(),
             &[
                 "worktree",
                 "add",
@@ -3916,11 +3974,11 @@ impl Tool for GitWorktreeEnterTool {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 let _ = run_git(
-                    &system,
+                    system.as_ref(),
                     &["worktree", "remove", &checkout.display().to_string()],
                 )
                 .await;
-                let _ = run_git(&system, &["branch", "-d", &branch]).await;
+                let _ = run_git(system.as_ref(), &["branch", "-d", &branch]).await;
                 let _ = system.remove_worktree_dir(&parent);
                 return Ok(ToolResult::error(format!(
                     "git_worktree_enter: could not derive a system rooted at the worktree: {e}"
@@ -3937,11 +3995,11 @@ impl Tool for GitWorktreeEnterTool {
         };
         if let Err(e) = ctx.workspace_context().enter_worktree(session, rerooted) {
             let _ = run_git(
-                &system,
+                system.as_ref(),
                 &["worktree", "remove", &checkout.display().to_string()],
             )
             .await;
-            let _ = run_git(&system, &["branch", "-d", &branch]).await;
+            let _ = run_git(system.as_ref(), &["branch", "-d", &branch]).await;
             let _ = system.remove_worktree_dir(&parent);
             return Ok(ToolResult::error(format!("git_worktree_enter: {e}")));
         }
@@ -4039,14 +4097,14 @@ impl Tool for GitWorktreeLeaveTool {
             // precondition (C-249); see `GIT_WORKTREE_LEAVE_SESSION_TREE`.
             let active = ctx.system();
             if let Some(refusal) =
-                require_tree_precondition(&active, &GIT_WORKTREE_LEAVE_SESSION_TREE).await
+                require_tree_precondition(active.as_ref(), &GIT_WORKTREE_LEAVE_SESSION_TREE).await
             {
                 return Ok(refusal);
             }
             // (2) The original `main` must be untouched since enter: still on `main`, clean, and
             // at the captured base commit. Otherwise error and stay in the worktree.
             let (ok, orig_branch) =
-                run_git(&original, &["symbolic-ref", "--short", "HEAD"]).await?;
+                run_git(original.as_ref(), &["symbolic-ref", "--short", "HEAD"]).await?;
             if !ok || orig_branch != "main" {
                 return Ok(ToolResult::error(format!(
                     "git_worktree_leave: the original checkout is no longer on `main` (now: \
@@ -4057,11 +4115,12 @@ impl Tool for GitWorktreeLeaveTool {
             // abort: the trial merge below is ALWAYS aborted. Shared tree precondition (C-249);
             // see `GIT_WORKTREE_LEAVE_ORIGINAL_TREE`.
             if let Some(refusal) =
-                require_tree_precondition(&original, &GIT_WORKTREE_LEAVE_ORIGINAL_TREE).await
+                require_tree_precondition(original.as_ref(), &GIT_WORKTREE_LEAVE_ORIGINAL_TREE)
+                    .await
             {
                 return Ok(refusal);
             }
-            let (ok, orig_head) = run_git(&original, &["rev-parse", "HEAD"]).await?;
+            let (ok, orig_head) = run_git(original.as_ref(), &["rev-parse", "HEAD"]).await?;
             if !ok || orig_head != session.base_commit {
                 return Ok(ToolResult::error(format!(
                     "git_worktree_leave: original `main` has moved since enter (was {}, now \
@@ -4074,11 +4133,15 @@ impl Tool for GitWorktreeLeaveTool {
             // the real merge would conflict — abort restores `main` untouched and we stay in the
             // worktree. A clean trial leaves MERGE_HEAD staged (no commit), which the abort clears
             // (unless the trial was a no-op "Already up to date", which leaves nothing to abort).
-            let (trial_ok, trial_out) =
-                run_git(&original, &["merge", "--no-commit", "--no-ff", &branch]).await?;
+            let (trial_ok, trial_out) = run_git(
+                original.as_ref(),
+                &["merge", "--no-commit", "--no-ff", &branch],
+            )
+            .await?;
             let trial_noop = trial_out.contains("Already up to date");
             if !trial_noop {
-                let (abort_ok, abort_out) = run_git(&original, &["merge", "--abort"]).await?;
+                let (abort_ok, abort_out) =
+                    run_git(original.as_ref(), &["merge", "--abort"]).await?;
                 if !abort_ok {
                     return Ok(ToolResult::error(format!(
                         "git_worktree_leave: trial-merge abort failed on the original `main` \
@@ -4095,10 +4158,13 @@ impl Tool for GitWorktreeLeaveTool {
                 )));
             }
             // Real merge — the trial proved it cannot leave `main` conflicted.
-            let (ok, merge_out) =
-                run_git(&original, &["merge", "--no-ff", "--no-edit", &branch]).await?;
+            let (ok, merge_out) = run_git(
+                original.as_ref(),
+                &["merge", "--no-ff", "--no-edit", &branch],
+            )
+            .await?;
             if !ok {
-                let _ = run_git(&original, &["merge", "--abort"]).await;
+                let _ = run_git(original.as_ref(), &["merge", "--abort"]).await;
                 return Ok(ToolResult::error(format!(
                     "git_worktree_leave: git merge failed unexpectedly after a clean trial \
                      ({merge_out}); the merge was aborted and the context stays in the worktree"
@@ -4112,7 +4178,7 @@ impl Tool for GitWorktreeLeaveTool {
         // without re-merging.
         if session.checkout.exists() {
             let (ok, out) = run_git(
-                &original,
+                original.as_ref(),
                 &[
                     "worktree",
                     "remove",
@@ -4125,12 +4191,12 @@ impl Tool for GitWorktreeLeaveTool {
             }
         } else {
             // A retry after the checkout was already removed: drop the stale registration.
-            let (ok, out) = run_git(&original, &["worktree", "prune"]).await?;
+            let (ok, out) = run_git(original.as_ref(), &["worktree", "prune"]).await?;
             if !ok {
                 return Ok(Self::cleanup_pending("git worktree prune", &out));
             }
         }
-        let (ok, out) = run_git(&original, &["branch", "-d", &branch]).await?;
+        let (ok, out) = run_git(original.as_ref(), &["branch", "-d", &branch]).await?;
         if !ok && !out.contains("not found") {
             return Ok(Self::cleanup_pending("git branch -d", &out));
         }
@@ -4143,7 +4209,7 @@ impl Tool for GitWorktreeLeaveTool {
 
         // Only after full cleanup: restore the original root and clear the session.
         ctx.workspace_context().leave_worktree()?;
-        let (_, merge_commit) = run_git(&original, &["rev-parse", "HEAD"]).await?;
+        let (_, merge_commit) = run_git(original.as_ref(), &["rev-parse", "HEAD"]).await?;
         let restored_root = original.workspace().root().display().to_string();
         let result = serde_json::json!({
             "left_worktree": true,
@@ -4305,7 +4371,7 @@ impl Tool for FleetIsolateTool {
         let caller_root = system.workspace().root().display().to_string();
 
         // Preflight 2: inside a git repository.
-        let (ok, body) = run_git(&system, &["rev-parse", "--is-inside-work-tree"]).await?;
+        let (ok, body) = run_git(system.as_ref(), &["rev-parse", "--is-inside-work-tree"]).await?;
         if !ok || body != "true" {
             return Ok(ToolResult::error(format!(
                 "fleet.isolate: not inside a git repository: {body}"
@@ -4317,7 +4383,7 @@ impl Tool for FleetIsolateTool {
         // about a BRANCH and cannot be triggered by a tag or a remote-tracking ref that happens to
         // share the name.
         let (exists, _) = run_git(
-            &system,
+            system.as_ref(),
             &[
                 "rev-parse",
                 "--verify",
@@ -4336,12 +4402,13 @@ impl Tool for FleetIsolateTool {
         // Preflight 4: a clean base — the family's shared tree precondition (C-249), not a check
         // of this op's own. See `FLEET_ISOLATE_TREE` for why this op needs it despite aborting
         // nothing.
-        if let Some(refusal) = require_tree_precondition(&system, &FLEET_ISOLATE_TREE).await {
+        if let Some(refusal) = require_tree_precondition(system.as_ref(), &FLEET_ISOLATE_TREE).await
+        {
             return Ok(refusal);
         }
         // The commit the worker starts from, reported so a coordinator can verify what it handed
         // out rather than assume it.
-        let (ok, head) = run_git(&system, &["rev-parse", "HEAD"]).await?;
+        let (ok, head) = run_git(system.as_ref(), &["rev-parse", "HEAD"]).await?;
         if !ok || head.is_empty() {
             return Ok(ToolResult::error(format!(
                 "fleet.isolate: could not resolve HEAD: {head}"
@@ -4350,14 +4417,14 @@ impl Tool for FleetIsolateTool {
         // The branch HEAD sits on, when it is on one — informational, and `null` on a detached
         // HEAD, which is legal here (the base is the commit, not the branch).
         let (on_branch, base_branch) =
-            run_git(&system, &["symbolic-ref", "--short", "HEAD"]).await?;
+            run_git(system.as_ref(), &["symbolic-ref", "--short", "HEAD"]).await?;
 
         // One fresh 0700 parent per call: this is what makes two concurrent calls disjoint without
         // any coordination between them.
         let parent = system.allocate_worktree_dir()?;
         let checkout = parent.join("checkout");
         let (ok, add_out) = run_git(
-            &system,
+            system.as_ref(),
             &[
                 "worktree",
                 "add",
@@ -4404,7 +4471,7 @@ impl Tool for FleetIsolateTool {
 /// `flux_reload` — recompile flux-cli, then instruct a manual restart (dev mode only).
 ///
 /// Safety: this tool is only registered when `--dev` is active. It runs `cargo build -p flux-cli`
-/// synchronously through the guarded system (`ctx.system().run`, argv-only — never model input). It is
+/// synchronously through the guarded system (`ctx.execution_system().run`, argv-only — never model input). It is
 /// deliberately **rebuild-only**: replacing the running process image (`execv`, or spawning a
 /// replacement) would be a direct OS-process seam outside `flux_system::System`'s single guarded path
 /// (AGENTS.md, "One guarded path starts every OS process"). A re-exec cannot reuse
@@ -4578,6 +4645,59 @@ mod tests {
             System::new(Workspace::new(&dir).unwrap()).with_worktree_base(pinned_worktree_base()),
         ));
         (dir, c)
+    }
+
+    /// C-474 failing-first: a turn may retain its native control-plane `System` while core coding
+    /// effects use an explicitly selected guarded substrate. Conflicting local content makes any
+    /// accidental fallback observable.
+    #[tokio::test]
+    async fn core_coding_ops_use_the_selected_execution_system() {
+        let (local_dir, local_ctx) = ctx();
+        std::fs::write(local_dir.join("target.txt"), "local").unwrap();
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let remote_dir =
+            std::env::temp_dir().join(format!("flux-tools-remote-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("target.txt"), "remote").unwrap();
+        let remote_native = Arc::new(
+            System::new(Workspace::new(&remote_dir).unwrap())
+                .with_worktree_base(pinned_worktree_base()),
+        );
+        let selected: Arc<dyn flux_system::port::ExecutionSystem> =
+            Arc::new(flux_system::remote::RemoteSystem::loopback(remote_native));
+        let remote_ctx = local_ctx.with_execution_system(selected);
+
+        let read = ReadTool
+            .execute(&remote_ctx, json!({"path": "target.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(read.content, "remote");
+        WriteTool
+            .execute(
+                &remote_ctx,
+                json!({"path": "target.txt", "content": "changed remotely"}),
+            )
+            .await
+            .unwrap();
+        let run = BashTool
+            .execute(&remote_ctx, json!({"command": "pwd"}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(local_dir.join("target.txt")).unwrap(),
+            "local",
+            "selected execution must never fall back to the local workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(remote_dir.join("target.txt")).unwrap(),
+            "changed remotely"
+        );
+        assert_eq!(run.content.trim(), remote_dir.display().to_string());
+
+        std::fs::remove_dir_all(local_dir).ok();
+        std::fs::remove_dir_all(remote_dir).ok();
     }
 
     #[derive(Default)]

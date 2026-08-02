@@ -638,6 +638,7 @@ fn operations_reference_covers_the_registered_public_catalog() {
     // design. Named here as literals for the same reason `op.register` is: an op a real session
     // dispatches must be documented, whatever registers it.
     names.extend(flux_tools::PANE_OPS.into_iter().map(str::to_string));
+    names.push(flux_tools::USER_ASK_OP.to_string());
     names.extend(
         [
             "ask",
@@ -2042,8 +2043,8 @@ fn subcommand_names(help: &str) -> Vec<String> {
 ///
 /// **The convention this shares with the page**: a `sh` fence holds commands that run *today*. A
 /// topology that has not landed shows its proposed spelling in a `text` fence instead, so neither a
-/// reader nor this check can confuse the two — see
-/// `topologies_page_does_not_present_unbuilt_surface_as_runnable`.
+/// reader nor this check can confuse the two. Shipping surfaces are separately pinned by
+/// `topologies_page_remote_system_surface_is_real_and_shipping`.
 #[test]
 fn topologies_page_runnable_commands_are_real_cli_surface() {
     let page = read(TOPOLOGIES);
@@ -2112,45 +2113,57 @@ fn topologies_page_runnable_commands_are_real_cli_surface() {
     );
 }
 
-/// The page's honest-status column is only worth having if it cannot silently go stale in the
-/// *optimistic* direction — a topology that lands leaves the page understating what ships, and
-/// nobody gets a bug report for that. The remote-system row (C-436) is the one currently marked
-/// proposed and the one most likely to land next, so it is pinned to the CLI: when `flux tui
-/// --remote` exists, this fails, and the change that made it exist is the change that must update
-/// the row.
+/// C-436: the shipping remote-system row stays pinned to both ends of its real CLI surface.
 ///
-/// The second half enforces the fence convention: while a surface does not exist, no `sh` block may
-/// print it, because `sh` is what the page promises is runnable.
+/// A docs-only claim that remote effects ship is worthless if either the daemon or client flag is
+/// renamed. The runnable-fence test above validates individual commands; this test also prevents the
+/// row from being downgraded to proposed while the surface remains present.
 #[test]
-fn topologies_page_does_not_present_unbuilt_surface_as_runnable() {
+fn topologies_page_remote_system_surface_is_real_and_shipping() {
     let page = read(TOPOLOGIES);
 
     assert!(
-        !mentions_flag(&flux_help(&["tui"]), "--remote"),
-        "`flux tui --remote` now ships (C-436) — {TOPOLOGIES} still files the local-runtime / \
-         remote-system row as proposed. Update the row's status, move its command into an `sh` \
-         fence, and relax this pin."
-    );
-    // Ground the distinction in the shipped binary rather than in this test's own reading of it:
-    // `--remote-approval` must really exist, or `mentions_flag` is drawing a line between a real
-    // flag and an imaginary one.
-    let app_run_help = flux_help(&["app", "run"]);
-    assert!(
-        mentions_flag(&app_run_help, "--remote-approval"),
-        "`flux app run --remote-approval` (C-453) is gone from the CLI, so the exception carved \
-         out below is no longer about anything real"
+        mentions_flag(&flux_help(&["tui"]), "--remote"),
+        "{TOPOLOGIES} says remote effects ship, but `flux tui --remote` is absent"
     );
     assert!(
-        !mentions_flag(&app_run_help, "--remote"),
-        "`flux app run --remote` now exists — the `sh`-fence guard below would start reading it as \
-         C-436's unbuilt flag"
+        flux_help(&["system", "serve"]).contains("--workspace"),
+        "{TOPOLOGIES} says remote effects ship, but `flux system serve --workspace` is absent"
+    );
+    assert!(
+        page.contains("| [Local runtime, remote system](#local-runtime-remote-system) | **ships**"),
+        "{TOPOLOGIES} must mark the local-runtime / remote-system row as shipping"
     );
 
-    for block in fenced_blocks(&page, "sh") {
+    assert!(
+        fenced_blocks(&page, "sh")
+            .iter()
+            .any(|block| mentions_flag(block, "--remote")),
+        "{TOPOLOGIES} must show the shipping `--remote` mode in a runnable `sh` fence"
+    );
+}
+
+/// C-437/C-438: the remote-system row commits to semantics that shape the wire.
+/// Keep those decisions executable so a later implementation cannot quietly
+/// choose local fallback, claim every native guarantee travels, or repeat the old "credentials
+/// never leave" promise after an operation-bound secret has to cross the link.
+#[test]
+fn remote_system_topology_states_workspace_and_guarantee_boundaries() {
+    let page = normalized_prose(&read(TOPOLOGIES));
+
+    for required in [
+        "remote workspace is canonical",
+        "no implicit synchronization",
+        "authorization and approval stay local",
+        "path confinement becomes the remote system s responsibility",
+        "model credentials stay local",
+        "operation-bound secret",
+        "crosses the encrypted link",
+        "remote reported",
+    ] {
         assert!(
-            !mentions_flag(&block, "--remote"),
-            "{TOPOLOGIES} prints `--remote` in a runnable `sh` fence, but no such flag exists. \
-             Proposed spellings belong in a `text` fence."
+            page.contains(required),
+            "{TOPOLOGIES} is missing the remote-system contract `{required}`"
         );
     }
 }

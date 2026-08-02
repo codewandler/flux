@@ -1,7 +1,7 @@
 //! Serving the guarded-IO [`port`](crate::port) by **delegating to another substrate** (C-399).
 //!
 //! [`port`](crate::port) names *"a remote executor"* among the substrates it exists for. This module
-//! is that substrate: [`RemoteSystem`] implements all four port families by handing each operation to
+//! is that substrate: [`RemoteSystem`] implements all five port families by handing each operation to
 //! a [`Delegate`] and turning what comes back into a `flux_core::Result`. A caller therefore runs
 //! operations somewhere other than its own process while the guarantees stay stated in exactly one
 //! place — `port.rs` — because nothing here re-states them.
@@ -30,7 +30,7 @@
 //! capability the personal coding agent does not have. A `Loopback` also never reports an
 //! unreachable link, because there is no link to break.
 //!
-//! ## The three failure modes, and why they are kept apart
+//! ## The four failure modes, and why they are kept apart
 //!
 //! An operator responds to these in *opposite* ways, so collapsing them would make the backend
 //! actively misleading — worse than one that reported nothing:
@@ -38,7 +38,8 @@
 //! | Mode | What happened | What an operator does |
 //! |---|---|---|
 //! | [`FailureMode::Refused`] | The far side answered, and the answer was no. A guard did its job. | Fix the request, or widen the grant. **Do not** retry unchanged. |
-//! | [`FailureMode::Unreachable`] | No answer arrived. Whether the operation happened is **unknown**. | Investigate the link. Retrying is meaningful. |
+//! | [`FailureMode::Unreachable`] | No answer arrived; acceptance is not known. | Query by operation id. Never mint a new id for an automatic mutation retry. |
+//! | [`FailureMode::Unknown`] | The far side accepted the operation but cannot prove its terminal outcome. | Reconcile state. **Never** retry a mutation automatically. |
 //! | [`FailureMode::Unserved`] | The delegate does not implement this operation at all. | Implement it, or stop asking. Retrying never helps. |
 //!
 //! [`failure_mode`] recovers the mode from `flux_core::Error`'s typed guarded-IO variant, so a
@@ -78,35 +79,46 @@
 //!
 //! ## What this module does not do
 //!
-//! - **No network port.** There is no guarded-network trait to delegate yet — that is C-435 — so
-//!   egress is absent from `Delegate` rather than approximated in it.
-//! - **No long-lived children.** `spawn_background` hands back a [`ManagedChild`](crate::ManagedChild)
-//!   owning a real `tokio::process::Child`, which no wire can carry. `RemoteSystem` leaves
-//!   `port.rs`'s denial in place rather than pretending to have spawned something.
+//! - **It does not make native guarantees travel over a wire.** A local runtime can authorize and
+//!   approve before delegation, but physical path confinement, argv/env construction, sandboxing
+//!   and egress pinning are enforced by the far-side substrate. Returned bytes are a remote report,
+//!   not a local observation. A credential value required by a remote effect necessarily becomes
+//!   visible to that substrate even when credential storage and model credentials stay local.
+//! - **No production wire.** Network and managed-resource ports are representable here, but a
+//!   delegate still has to implement their transport and lifecycle. An empty delegate denies every
+//!   one; nothing falls back to a local socket or process.
 //! - **No relaxation.** `RemoteSystem` adds no permission of its own. Where the far side is a native
 //!   `System`, the workspace jail, argv-only spawning and env clearing are exactly the far side's,
 //!   and an escape it refuses is refused through the delegation too.
 //!
 //! ## The cost this pays on purpose
 //!
-//! Being in-repo, these four impls cost reviewed entries in `flux-codegate`'s
+//! Being in-repo, these five impls cost reviewed entries in `flux-codegate`'s
 //! `no_unreviewed_guarded_port_backend_outside_system` allow-list. C-399 accepted that deliberately:
 //! the alternative was an unreviewed backend living somewhere the gate cannot see.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use flux_core::{Error, GuardedIoError, GuardedIoFailure as FailureMode, Result};
 
-use crate::port::{Guarded, GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles};
-use crate::{OutputObserver, ProcessOutput, ScopedFileRead};
+use crate::net::{
+    BindExposure, DatagramEndpoint, DialTarget, InboundLimits, NetworkListener, NetworkStream,
+    PrivateNetAllow,
+};
+use crate::port::{
+    ExecutionIdentity, Guarded, GuardedEnv, GuardedHostFiles, GuardedNetwork, GuardedProcess,
+    GuardedWorkspaceFiles, SubstrateIdentity,
+};
+use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead};
 
 /// The failure mode behind a guarded error, or `None` if it did not come from a delegated operation.
 ///
 /// Matching is on the shared error variant, never on formatted text, so a refusal whose reason
 /// begins with another mode's canonical prefix is still a refusal. `None` means the error is not one
 /// this module produced (an unrelated `Error::Io`, say), which a consumer should treat as it would
-/// any other error rather than as a fourth mode.
+/// any other error rather than as a delegated failure mode.
 pub fn failure_mode(error: &Error) -> Option<FailureMode> {
     match error {
         Error::GuardedIo(failure) => Some(failure.kind()),
@@ -129,6 +141,8 @@ pub enum Answer<T> {
     /// The far side does not implement this operation. Carries the phrase completing
     /// "this guarded substrate cannot …", so an unserved operation names itself.
     Unserved(String),
+    /// The far side accepted the operation but cannot prove whether/how it completed.
+    Unknown(String),
 }
 
 /// **No answer arrived.** The link, not the operation, is what failed — so nothing is known about
@@ -170,21 +184,13 @@ pub type Delivered<T> = std::result::Result<Answer<T>, Unreachable>;
 pub type Answered<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Delivered<T>> + Send + 'a>>;
 
-/// The guarded surface a substrate has to serve to be delegable — the port's four families, bundled.
+/// The guarded surface a substrate has to serve to be delegable — the port's five families, bundled.
 ///
 /// This follows `flux_plugin::PluginSystem`'s precedent rather than introducing a god trait: the
 /// bundle is declared *at the consumer that spans the families*, and the operations themselves stay
 /// in [`port`](crate::port). The blanket impl means the native [`System`](crate::System) satisfies
 /// it for free, and so does a [`RemoteSystem`] — which is what makes a delegation chain typecheck.
-pub trait GuardedSubstrate:
-    GuardedProcess + GuardedHostFiles + GuardedEnv + GuardedWorkspaceFiles
-{
-}
-
-impl<T> GuardedSubstrate for T where
-    T: GuardedProcess + GuardedHostFiles + GuardedEnv + GuardedWorkspaceFiles + ?Sized
-{
-}
+pub use crate::port::ExecutionSystem as GuardedSubstrate;
 
 /// The far side of a [`RemoteSystem`] — one method per delegable port operation, every one optional.
 ///
@@ -248,6 +254,51 @@ pub trait Delegate: Send + Sync {
         unserved("feed a child process stdin")
     }
 
+    /// Start a long-lived process and return a substrate-neutral lifecycle handle.
+    fn spawn_background<'a>(
+        &'a self,
+        argv: &'a [String],
+        env: &'a [(String, String)],
+    ) -> Answered<'a, ManagedChild> {
+        let _ = (argv, env);
+        unserved("host long-lived child processes")
+    }
+
+    // -- network ----------------------------------------------------------------------------------
+
+    /// Open an egress-guarded connection on the far side.
+    fn dial_scoped<'a>(
+        &'a self,
+        target: &'a DialTarget,
+        allow: &'a PrivateNetAllow,
+    ) -> Answered<'a, NetworkStream> {
+        let _ = (target, allow);
+        unserved("open a guarded network connection")
+    }
+
+    /// Bind a guarded TCP listener on the far side.
+    fn bind_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+    ) -> Answered<'a, NetworkListener> {
+        let _ = (addr, exposure, limits);
+        unserved("bind a guarded TCP listener")
+    }
+
+    /// Bind a guarded UDP endpoint on the far side.
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+        allow: PrivateNetAllow,
+    ) -> Answered<'a, DatagramEndpoint> {
+        let _ = (addr, exposure, limits, allow);
+        unserved("bind a guarded UDP endpoint")
+    }
+
     // -- host files -------------------------------------------------------------------------------
 
     /// Reduce a host path to its physical identity on the far side. Synchronous, mirroring
@@ -301,6 +352,7 @@ pub trait Delegate: Send + Sync {
                 },
                 Answer::Refused(detail) => Ok(Answer::Refused(detail)),
                 Answer::Unserved(what) => Ok(Answer::Unserved(what)),
+                Answer::Unknown(detail) => Ok(Answer::Unknown(detail)),
             }
         })
     }
@@ -394,6 +446,10 @@ fn settle<T>(delivered: Delivered<T>) -> Result<T> {
             FailureMode::Unserved,
             what,
         ))),
+        Ok(Answer::Unknown(detail)) => Err(Error::GuardedIo(GuardedIoError::new(
+            FailureMode::Unknown,
+            detail,
+        ))),
         Err(unreachable) => Err(Error::GuardedIo(GuardedIoError::new(
             FailureMode::Unreachable,
             unreachable.0,
@@ -408,18 +464,36 @@ fn settle<T>(delivered: Delivered<T>) -> Result<T> {
 /// semantics — see the module docs.
 pub struct RemoteSystem {
     delegate: Arc<dyn Delegate>,
+    identity: SubstrateIdentity,
 }
 
 impl RemoteSystem {
     /// Serve the port from `delegate`.
     pub fn new(delegate: Arc<dyn Delegate>) -> Self {
-        Self { delegate }
+        Self {
+            delegate,
+            identity: SubstrateIdentity {
+                kind: "remote".into(),
+                workspace: "<unreported>".into(),
+                confinement: "unreported by remote substrate".into(),
+                remotely_reported: true,
+            },
+        }
+    }
+
+    /// Serve the port from `delegate` with identity established by a transport handshake.
+    pub fn identified(delegate: Arc<dyn Delegate>, mut identity: SubstrateIdentity) -> Self {
+        identity.remotely_reported = true;
+        Self { delegate, identity }
     }
 
     /// Serve the port by delegating to an **in-process** substrate — the local-first path, which
     /// needs no service running and cannot report an unreachable link.
     pub fn loopback<T: GuardedSubstrate + ?Sized + 'static>(substrate: Arc<T>) -> Self {
-        Self::new(Arc::new(Loopback::new(substrate)))
+        let mut identity = substrate.substrate_identity();
+        identity.kind = format!("loopback/{}", identity.kind);
+        identity.remotely_reported = true;
+        Self::identified(Arc::new(Loopback::new(substrate)), identity)
     }
 
     /// The delegate this backend serves from, for a caller that needs to swap or inspect it.
@@ -440,6 +514,12 @@ impl RemoteSystem {
     }
 }
 
+impl ExecutionIdentity for RemoteSystem {
+    fn substrate_identity(&self) -> SubstrateIdentity {
+        self.identity.clone()
+    }
+}
+
 impl std::fmt::Debug for RemoteSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteSystem").finish_non_exhaustive()
@@ -454,8 +534,6 @@ impl GuardedEnv for RemoteSystem {
     }
 }
 
-// `spawn_background` is deliberately left at `port.rs`'s denial: a `ManagedChild` owns a real
-// `tokio::process::Child`, which no wire can carry, so there is nothing to delegate.
 impl GuardedProcess for RemoteSystem {
     fn run_with_env<'a>(
         &'a self,
@@ -493,6 +571,43 @@ impl GuardedProcess for RemoteSystem {
         timeout: Duration,
     ) -> Guarded<'a, ProcessOutput> {
         Box::pin(async move { settle(self.delegate.run_with_stdin(argv, stdin, timeout).await) })
+    }
+
+    fn spawn_background<'a>(
+        &'a self,
+        argv: &'a [String],
+        env: &'a [(String, String)],
+    ) -> Guarded<'a, ManagedChild> {
+        Box::pin(async move { settle(self.delegate.spawn_background(argv, env).await) })
+    }
+}
+
+impl GuardedNetwork for RemoteSystem {
+    fn dial_scoped<'a>(
+        &'a self,
+        target: &'a DialTarget,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, NetworkStream> {
+        Box::pin(async move { settle(self.delegate.dial_scoped(target, allow).await) })
+    }
+
+    fn bind_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+    ) -> Guarded<'a, NetworkListener> {
+        Box::pin(async move { settle(self.delegate.bind_tcp(addr, exposure, limits).await) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+        allow: PrivateNetAllow,
+    ) -> Guarded<'a, DatagramEndpoint> {
+        Box::pin(async move { settle(self.delegate.bind_udp(addr, exposure, limits, allow).await) })
     }
 }
 
@@ -601,6 +716,7 @@ fn relay<T>(result: Result<T>) -> Delivered<T> {
             FailureMode::Unreachable => Err(Unreachable::new(failure.detail())),
             FailureMode::Unserved => Ok(Answer::Unserved(failure.detail().to_string())),
             FailureMode::Refused => Ok(Answer::Refused(failure.detail().to_string())),
+            FailureMode::Unknown => Ok(Answer::Unknown(failure.detail().to_string())),
         },
         // An ordinary failure came back from the far side, so it is an answered refusal rather than
         // evidence that the transport broke.
@@ -645,6 +761,41 @@ impl<T: GuardedSubstrate + ?Sized> Delegate for Loopback<T> {
         timeout: Duration,
     ) -> Answered<'a, ProcessOutput> {
         Box::pin(async move { relay(self.substrate.run_with_stdin(argv, stdin, timeout).await) })
+    }
+
+    fn spawn_background<'a>(
+        &'a self,
+        argv: &'a [String],
+        env: &'a [(String, String)],
+    ) -> Answered<'a, ManagedChild> {
+        Box::pin(async move { relay(self.substrate.spawn_background(argv, env).await) })
+    }
+
+    fn dial_scoped<'a>(
+        &'a self,
+        target: &'a DialTarget,
+        allow: &'a PrivateNetAllow,
+    ) -> Answered<'a, NetworkStream> {
+        Box::pin(async move { relay(self.substrate.dial_scoped(target, allow).await) })
+    }
+
+    fn bind_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+    ) -> Answered<'a, NetworkListener> {
+        Box::pin(async move { relay(self.substrate.bind_tcp(addr, exposure, limits).await) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+        allow: PrivateNetAllow,
+    ) -> Answered<'a, DatagramEndpoint> {
+        Box::pin(async move { relay(self.substrate.bind_udp(addr, exposure, limits, allow).await) })
     }
 
     fn host_path_identity(&self, path: &str) -> Delivered<String> {
@@ -730,22 +881,17 @@ mod tests {
     /// Prefixes remain distinct for readable diagnostics even though classification no longer reads
     /// them.
     #[test]
-    fn the_three_markers_are_mutually_non_prefixing() {
-        for (a, b) in [
-            (
-                FailureMode::Refused.prefix(),
-                FailureMode::Unreachable.prefix(),
-            ),
-            (
-                FailureMode::Refused.prefix(),
-                FailureMode::Unserved.prefix(),
-            ),
-            (
-                FailureMode::Unreachable.prefix(),
-                FailureMode::Unserved.prefix(),
-            ),
-        ] {
-            assert!(!a.starts_with(b) && !b.starts_with(a), "{a:?} vs {b:?}");
+    fn the_four_markers_are_mutually_non_prefixing() {
+        let markers = [
+            FailureMode::Refused.prefix(),
+            FailureMode::Unreachable.prefix(),
+            FailureMode::Unserved.prefix(),
+            FailureMode::Unknown.prefix(),
+        ];
+        for (index, a) in markers.iter().enumerate() {
+            for b in &markers[index + 1..] {
+                assert!(!a.starts_with(b) && !b.starts_with(a), "{a:?} vs {b:?}");
+            }
         }
     }
 

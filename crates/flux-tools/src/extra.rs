@@ -78,7 +78,7 @@ impl Tool for FileStatTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Other("file_stat: required param `path` missing".into()))?;
 
-        let bytes = ctx.system().read_file_bytes(path).await?;
+        let bytes = ctx.execution_system().read_file_bytes(path).await?;
         let size = bytes.len();
         // Count lines only for text files (skip binary sniff — just count \n bytes).
         let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
@@ -170,7 +170,7 @@ impl Tool for PathExistsTool {
 
         // Attempt to read metadata via a lightweight guarded probe.
         // read_file_bytes will error if the path doesn't exist or escapes the jail.
-        let exists = ctx.system().file_mtime(path).await.is_ok();
+        let exists = ctx.execution_system().file_mtime(path).await.is_ok();
         Ok(ToolResult::ok(if exists { "true" } else { "false" }))
     }
 }
@@ -501,8 +501,11 @@ impl Tool for HomeDirTool {
         IntentSet::new()
     }
 
-    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/home"));
+    async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        let home = ctx
+            .execution_system()
+            .env("HOME")
+            .unwrap_or_else(|| String::from("/home"));
         Ok(ToolResult::ok(home))
     }
 }
@@ -609,7 +612,7 @@ impl Tool for CwdTool {
 
     async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
         Ok(ToolResult::ok(
-            ctx.system().workspace().root().display().to_string(),
+            ctx.execution_system().substrate_identity().workspace,
         ))
     }
 }

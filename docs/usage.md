@@ -157,6 +157,11 @@ flux run -v "..."                # show tool output in full (no truncation); als
 flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR unset; global flag)
 flux tui                         # dense ratatui chat UI (queue, session replay, approval sheet)
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
+flux system serve --workspace /srv/project --cert cert.pem --key key.pem
+                                 # authenticated TLS daemon for remote effects; bearer token comes
+                                 #   from FLUX_REMOTE_SYSTEM_TOKEN (or --token-env). Select it from
+                                 #   an agent command with --remote https://host:8790; omit --remote
+                                 #   to keep the default local execution mode
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux run workflows.flux --entry triage --arg queue=new
                                  # select one named top-level flow from a multi-flow module and exit;

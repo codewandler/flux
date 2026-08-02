@@ -663,7 +663,7 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
     // Decorative boot splash, before any other output. Blocks the runtime thread for a
     // few seconds at most — nothing else is in flight this early in the REPL.
     crate::splash::maybe_splash();
-    let (mut agent, mut session_id, _spec, spawner) = build_agent(&flags).await?;
+    let (mut agent, mut session_id, _spec, spawner) = build_agent_interactive(&flags).await?;
     let cost = TurnCost::load();
     let initial_rules = agent.executor.allow_rules();
     // Command files (D-186): discovered once at REPL start, not gated behind a flag like skills —
@@ -1300,7 +1300,7 @@ pub(super) async fn read_choice(prompt: String, always: ApprovalChoice) -> Appro
     // repaint/clear until the answer is read — including sink events (`planning(false)`, spinner
     // ticks) drained while the turn future waits here. Without this the prompt is erased within
     // one 80 ms tick and the user sees only a spinner that looks hung.
-    let _line = PromptGate::global().acquire();
+    let _line = PromptGate::global().acquire().await;
     eprint!("{prompt}");
     std::io::stderr().flush().ok();
     if !std::io::stdin().is_terminal() {
@@ -1322,7 +1322,7 @@ pub(super) async fn read_choice(prompt: String, always: ApprovalChoice) -> Appro
 /// terminal in raw mode.
 pub(super) struct RawModeGuard;
 impl RawModeGuard {
-    fn enable() -> std::io::Result<Self> {
+    pub(super) fn enable() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         Ok(Self)
     }

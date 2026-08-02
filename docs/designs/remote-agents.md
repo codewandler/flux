@@ -1,6 +1,6 @@
 # Design: Remote agents — run the agent here, land the effects there
 
-**Status:** proposed · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md) · [C-453](../stories/C-453-a-remote-approval-channel.md)
+**Status:** shipped (v1, port-aware catalog) · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md) · [C-473](../stories/C-473-remotely-representable-guarded-resources.md) · [C-474](../stories/C-474-selectable-execution-system.md) · [C-475](../stories/C-475-remote-system-https-protocol.md) · [C-476](../stories/C-476-remote-operation-delivery.md) · [C-453](../stories/C-453-a-remote-approval-channel.md)
 
 ## Why
 
@@ -11,6 +11,17 @@ execution, or to microVMs in Kubernetes.
 
 `flux tui --remote <addr>` is that: the agent you drive is here, the system it acts on is there.
 
+This is an **additional operator-selected mode**, never a replacement for native execution. With no
+target option, the runtime binds the native `System` exactly as it does today. A remote target is
+explicit, immutable for the turn and unavailable to model-authored input. That is compatible with
+the connector rule that a connector declares its runtime kind: the connector still decides *what
+kind of effect it is*; the operator-selected system decides *where that guarded effect lands*.
+
+The first production transport is an authenticated HTTPS daemon with WSS for long-lived byte
+streams. The remote workspace is canonical in v1: there is no implicit file synchronizer, and the
+surface must say that a local editor is not viewing the tree being changed unless the operator has
+explicitly attached or mounted it.
+
 ## ⚠ "Remote agent" means two different things, and one of them is already shipped
 
 This is the first thing to settle, because the two have opposite consequences and the same name.
@@ -20,7 +31,7 @@ This is the first thing to settle, because the two have opposite consequences an
 | what moves | the entire agent — planning, model calls, approval | only *where effects land* |
 | what stays local | a thin client | the runtime, the approver, the model choice, credentials |
 | the analogy | the Docker **CLI**: a thin client, daemon does everything | a local process with a **remote executor** |
-| status | **largely shipped** | this epic |
+| status | **largely shipped** | **ships (v1 port-aware catalog)** |
 
 The first already exists. `flux app run --serve` exposes an agent over HTTP/A2A: a
 `/.well-known/agent-card.json` discovery card, `POST /a2a` JSON-RPC with `message/send` and
@@ -50,13 +61,20 @@ traits are unsealed.
 
 So the substrate work is already filed, under [execution-substrate](execution-substrate.md):
 
-- **[C-399](../stories/C-399-remote-guarded-io-backend.md)** — a remote implementation of the guarded-IO
-  port. `ready`, and its ownership is already decided in this direction: *"flux owns it, flux-exchange
-  reuses it."*
+- **[C-399](../stories/C-399-remote-guarded-io-backend.md)** — the shipped remote implementation of
+  the guarded-IO port. It deliberately defines a Rust `Delegate`, not a production wire.
 - **[C-397](../stories/C-397-container-process-backend.md)** — the container process backend.
-- **[C-435](../stories/C-435-a-guarded-network-port.md)** — no network port trait exists yet, and no
-  guarded inbound primitive at all.
+- **[C-435](../stories/C-435-a-guarded-network-port.md)** — the guarded network port now provides
+  bounded outbound streams plus authenticated/loopback inbound TCP and UDP resources. Migrating
+  older adapter-owned listeners remains follow-up work.
 - **[C-398]** — what binding `flux-system` without `flux-runtime` means; the guarantees question.
+
+Inspection after C-399 found two additional prerequisites, now shipped. The production execution
+environment carries an object-safe `ExecutionSystem` selection ([C-474]), and native process/socket
+handles were replaced at the port by opaque guarded resources ([C-473]). C-475 supplies the
+versioned HTTPS/WSS product protocol; C-476 owns the unsafe retry window rather than hiding it inside
+the TUI story. Remote mode deliberately hides operations that have not crossed this port yet, so an
+unsupported integration cannot silently execute on the local host.
 
 ⚠ **This epic is not a second copy of that work.** It is the *product* on top: the CLI surface, the
 guarantees statement a user can act on, the workspace question, and the trust model. If a story here
@@ -202,13 +220,9 @@ remote link is a place it can quietly stop meaning anything.
 - **Failure modes must stay distinguishable** — C-399's own acceptance: *"a refused operation and an
   unreachable delegate must not collapse into one error, since an operator responds to them in opposite
   ways."* Over a network that stops being a nicety.
-- **Open:** does the model call stay local? Keeping it local preserves your key and your choice; moving
-  it saves bandwidth for large contexts. They are different products.
-- **Open:** one remote or several? A single `--remote` is simple; a fleet across several substrates is
-  where the Kubernetes case actually points.
-- **Open:** where does the sandbox live? If the remote is already a microVM, flux's own OS sandbox may be
-  redundant, doubled, or absent — and "absent because the remote is isolated" needs to be a stated
-  decision rather than an emergent one.
+- **Settled for v1:** model calls stay local; one immutable `--remote` target is selected per
+  session; physical sandboxing and egress enforcement live on the remote execution host and are
+  reported in its handshake.
 
 ## Acceptance / done
 
@@ -217,5 +231,6 @@ remote link is a place it can quietly stop meaning anything.
 - A user can read, in one place, exactly which of flux's guarantees hold over a remote link and which
   become the remote's responsibility.
 - The workspace question is answered, not deferred, and the answer is stated where a user will hit it.
-- A remote that is unreachable, that refuses, and that lies are three distinguishable outcomes.
+- Refused, unserved, unreachable and accepted-with-unknown-outcome are structurally distinguishable;
+  remote reports are labeled as reports rather than local observations.
 - Nothing here makes a remote — or flux-exchange — required for local use.

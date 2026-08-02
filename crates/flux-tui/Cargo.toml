@@ -11,6 +11,7 @@ flux-credentials.workspace = true
 flux-flow.workspace = true
 flux-provider.workspace = true
 flux-runtime.workspace = true
+jsonschema.workspace = true
 flux-spec.workspace = true
 # C-182: the plan-approval sheet reads typed authority requirements (`ResourceKind`) off the
 # approval request so it can name what a plan will touch.

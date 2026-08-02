@@ -42,6 +42,7 @@ pub(crate) struct EngineAssembly {
     pub(crate) environment: ExecutionEnvironment,
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) events: Arc<EventStore>,
+    pub(crate) user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
 }
 
 /// What a variant engine may override relative to the retained assembly. `None` fields reuse the
@@ -96,6 +97,10 @@ impl EngineAssembly {
             spec.permissions = permissions;
         }
         let provider = overrides.provider.unwrap_or_else(|| self.provider.clone());
-        spec.assemble_in(provider, self.environment.clone(), events, flow)
+        let engine = spec.assemble_in(provider, self.environment.clone(), events, flow)?;
+        Ok(match &self.user_interaction {
+            Some(interaction) => engine.with_user_interaction(interaction.clone()),
+            None => engine,
+        })
     }
 }

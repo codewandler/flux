@@ -116,6 +116,11 @@ fn production_catalog() -> ToolRegistry {
     // `[consult] model` and `[wakeup] enabled` are: an op only an interactive surface assembles is
     // still an op that reaches `Executor::dispatch`, and a reader looking it up must find it.
     flux_tools::try_register_surface_ops(&mut registry, true).expect("the pane ops register");
+    flux_tools::try_register_user_interaction(
+        &mut registry,
+        Some(flux_runtime::InteractionCapabilities::text()),
+    )
+    .expect("the user interaction op registers");
     registry
         .try_register_from(TASK_OP_SOURCE, Arc::new(flux_orchestrate::TaskTool))
         .expect("the task op registers");
@@ -549,6 +554,10 @@ fn the_census_is_strictly_wider_than_the_builtin_pack() {
             "pane.open",
             "the agent-authored surface (sink-presence gated)",
         ),
+        (
+            "user.ask",
+            "typed user interaction (responder-presence gated)",
+        ),
     ] {
         assert!(
             catalog.get(op).is_some(),
@@ -615,6 +624,7 @@ const COVERED_REGISTRATION_SEAMS: &[&str] = &[
     "try_register_builtins",
     "try_register_dev_builtins",
     "try_register_surface_ops",
+    "try_register_user_interaction",
     "try_register_eval_ops",
     "try_register_reflect",
     "try_register_flows",

@@ -22,7 +22,8 @@ flux-events = { workspace = true, features = ["sqlite"] }
 flux-flow.workspace = true
 flux-runtime.workspace = true
 flux-system.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+axum-server.workspace = true
 # C-189: request TimeoutLayer that returns a real `408` (tower's own timeout surfaces an error we
 # would have to hand-map to a response; tower-http's is Infallible-clean for axum). The body cap
 # uses axum's built-in `DefaultBodyLimit` — no dependency needed there.
@@ -37,6 +38,11 @@ async-trait.workspace = true
 futures.workspace = true
 # A-57: push-notification webhook delivery (one pooled client on the task registry).
 reqwest.workspace = true
+tokio-tungstenite.workspace = true
+rustls = "0.23"
+webpki-roots = "1"
+sha2.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
@@ -44,3 +50,4 @@ tower = { version = "0.5", features = ["util"] }
 flux-policy.workspace = true
 flux-provider.workspace = true
 flux-tools.workspace = true
+rcgen = "0.14"

@@ -11,12 +11,16 @@ pub struct ChatState {
     pub(super) input: TextArea<'static>,
     /// When set, an approval sheet is shown over the transcript.
     pub approval: Option<ApprovalView>,
+    /// Active typed question, rendered above the composer and outside the transcript.
+    pub(crate) interaction: Option<crate::interaction::InteractionView>,
     pub(super) assistant_open: bool,
     pub(super) phase: Phase,
     pub(super) turn_start: Option<Instant>,
     pub(super) session_id: String,
     pub(super) model: String,
     pub(super) model_spec: Option<String>,
+    /// Remote endpoint + canonical workspace, kept visible for the whole session.
+    pub(super) execution_target: Option<String>,
     /// The surface's cwd at launch, shown as-is in the empty-transcript orientation card (C-157).
     /// Empty for headless/test construction, which just omits the segment rather than showing a
     /// placeholder.
@@ -134,6 +138,8 @@ pub struct ChatState {
     /// another task, while the store may only be touched by the event loop that draws it.
     /// [`ChatState::apply_pending_panes`] is the one crossing point.
     pub(super) pane_queue: Option<Arc<crate::panes::PaneQueue>>,
+    /// Agent-to-event-loop typed question bridge.
+    pub(super) interaction_queue: Option<Arc<crate::interaction::InteractionQueue>>,
     /// Whether the last drain of [`ChatState::pane_queue`] found the channel refusing commands
     /// (C-324) — the edge [`ChatState::report_dropped_panes`] triggers on, so a sustained overflow
     /// costs the transcript one notice rather than one per frame.

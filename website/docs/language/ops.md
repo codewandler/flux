@@ -309,6 +309,20 @@ the mark that identifies a region as agent-authored, and the payload carries no 
 Permission rules may scope a pane by name (`pane.update:build`), and pane content passes the same
 redactor as every other tool result before it reaches the screen.
 
+## Typed user interaction
+
+The local terminal and TUI can expose one schema-driven question operation. Headless, served,
+stream-JSON and app surfaces omit it, so an agent never waits on a human where no question UI exists.
+
+| op | arguments | risk | description |
+|---|---|---|---|
+| `user.ask` | `prompt, schema` | Low | Ask through the attached UI and wait for a schema-valid value. Boolean, single-choice, multi-choice and simple form schemas use native controls; unusual schemas fall back to validated JSON. Returns an explicit `submitted` value or `cancelled` status |
+
+Questions and approvals are separate: answering a question cannot authorize an operation. Schemas
+and answers are size-bounded, validated on both sides of the UI, and refused if they request or
+contain secret material. Audio prompts use opaque host-owned asset references and work only in an
+SDK host that declares audio support; the stock terminal surfaces are text-only.
+
 ## Model-invoked skills
 
 Opt-in Claude-style progressive skill disclosure (`--skills-model-invoked` / `[skills]

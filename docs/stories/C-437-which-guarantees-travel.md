@@ -2,8 +2,7 @@
 id: C-437
 title: "Which guarantees travel over a remote link — and which quietly become someone else's problem"
 pillar: Core
-status: ready
-priority: 5
+status: done
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-system, docs]
@@ -33,19 +32,19 @@ and its meaning shifts the moment a remote exists.
 
 ## Acceptance
 
-- [ ] A per-guarantee table: **travels · becomes the remote's · does not apply**, with a one-line reason
+- [x] A per-guarantee table: **travels · becomes the remote's · does not apply**, with a one-line reason
       each. ⚠ "Mostly the same" is not a statement — the table is the deliverable.
-- [ ] ⚠ **The secret-handling row is worked out explicitly**, because *"never off the machine"* has to be
+- [x] ⚠ **The secret-handling row is worked out explicitly**, because *"never off the machine"* has to be
       re-stated once there are two machines. What crosses the link, what does not, and what an operator
       must assume.
-- [ ] Each row cites where the guarantee is stated (`AGENTS.md`, `vision.md`, the relevant module doc)
+- [x] Each row cites where the guarantee is stated (`AGENTS.md`, `vision.md`, the relevant module doc)
       so a reader can check rather than trust.
-- [ ] ⚠ **Where a guarantee does not travel, the code says so at the boundary** — not only the doc. A
+- [x] ⚠ **Where a guarantee does not travel, the code says so at the boundary** — not only the doc. A
       guarantee that silently stops applying is this repo's recurring defect class, on the surface where
       it would cost most.
-- [ ] Consistent with [C-398], which owns the same question for `flux-system` bound without
+- [x] Consistent with [C-398], which owns the same question for `flux-system` bound without
       `flux-runtime`. ⚠ Extend that statement rather than writing a second, divergent one.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -60,3 +59,8 @@ and its meaning shifts the moment a remote exists.
 ## Progress
 
 - Filed 2026-08-01 with the remote-agents epic.
+- 2026-08-02: the public topologies page now carries the per-guarantee table and links to C-398's
+  native substrate contract. The secret row distinguishes model/provider credentials (local) from
+  an operation-bound tool secret (crosses encrypted transport when the remote effect needs it).
+  `flux-system::remote` states the same boundary at the implementation seam. A website contract
+  pins the workspace, guarantee, secret and provenance language.

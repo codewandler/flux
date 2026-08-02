@@ -147,6 +147,19 @@ then derive the same exact requirements: `datasource.read` on `<domain>/<entity>
 backend resource. Filters, cursors, row IDs, and weak references never become authority grants, and
 real backend IO still uses the guarded host surfaces supplied through `ToolContext`.
 
+## Typed user interaction
+
+Conversational clients can install an `Arc<dyn flux_sdk::interaction::UserInteraction>` with
+`ClientBuilder::with_user_interaction`. This conditionally registers and pre-allows `user.ask`; an
+explicit deny remains authoritative. The handler receives redacted prompt text plus a bounded JSON
+Schema and returns either a reviewed JSON value or `Cancelled`. Flux validates the schema before the
+handler runs and validates the response again afterward.
+
+The interaction contract is not an approval API: no answer can authorize an effect. Audio-capable
+SDK hosts may advertise `InteractionCapabilities::with_audio()` and resolve opaque
+`PromptAudioRef` asset ids internally. Raw audio cannot appear in `InteractionResponse`. The stock
+CLI and TUI advertise text controls only.
+
 ## Authorization and approval
 
 Every `Client` and `FlowClient` has a mandatory authorization profile. The default is the documented

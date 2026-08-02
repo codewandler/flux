@@ -23,6 +23,7 @@ const OP_FILES: &[&str] = &[
     "crates/flux-tools/src/reflect.rs",
     "crates/flux-tools/src/cognition.rs",
     "crates/flux-tools/src/toolchains.rs",
+    "crates/flux-tools/src/user_ask.rs",
     "crates/flux-eval/src/ops.rs",
     "crates/flux-eval/src/git.rs",
     "crates/flux-eval/src/gate.rs",

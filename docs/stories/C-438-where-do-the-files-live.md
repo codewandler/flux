@@ -2,8 +2,7 @@
 id: C-438
 title: "Where do the files live — the question that decides whether a remote agent is usable for coding"
 pillar: Core
-status: ready
-priority: 5
+status: done
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-system, docs]
@@ -34,18 +33,18 @@ easiest to implement first. C-395 made the workspace-confined file surface a por
 
 ## Acceptance
 
-- [ ] The decision is made and written down, with its cost stated rather than minimized.
-- [ ] ⚠ **The failure mode of the chosen shape is documented where a user will hit it**, not in a design
+- [x] The decision is made and written down, with its cost stated rather than minimized.
+- [x] ⚠ **The failure mode of the chosen shape is documented where a user will hit it**, not in a design
       doc. If files are remote, say that the local editor is not the tree being edited. If local, say
       what happens when sync is mid-flight or fails.
-- [ ] ⚠ A test pins the chosen semantics, including the disagreement case — local and remote holding
+- [x] ⚠ A test pins the chosen semantics, including the disagreement case — local and remote holding
       different content is the state that must not be silent.
-- [ ] Path confinement survives. The workspace guarantee is that operations stay inside the workspace;
+- [x] Path confinement survives. The workspace guarantee is that operations stay inside the workspace;
       whatever shape is chosen, a remote must not be able to widen it. ⚠ A remote that resolves paths
       itself is a place confinement can quietly stop applying.
-- [ ] The answer covers the other locality-sensitive resources too, or explicitly defers each: the
+- [x] The answer covers the other locality-sensitive resources too, or explicitly defers each: the
       evidence log, the cassette/session store, and the plugin store.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -59,4 +58,11 @@ easiest to implement first. C-395 made the workspace-confined file surface a por
 
 ## Progress
 
-- Filed 2026-08-01 with the remote-agents epic.
+- **Decision (2026-08-02): the remote workspace is canonical in v1.** Every project-relative read,
+  write, discovery operation and process cwd resolves on the selected remote substrate. There is no
+  implicit sync engine and no local fallback. A local editor sees a different tree unless the
+  operator explicitly mounts or attaches to the remote workspace; the TUI must state the remote
+  identity and canonical root persistently.
+- Local control-plane state does not move: provider/model configuration, the credential store,
+  sessions, cassettes and the evidence log stay with the local runtime. Remote operation delivery
+  has its own bounded receipt ledger (C-476), not a second session store.

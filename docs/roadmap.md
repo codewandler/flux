@@ -259,12 +259,13 @@ flux does not have. The in-repo Pi comparison is a starting hypothesis, not a fi
 *"asks more of the embedder"* — which is precisely what documentation exists to pay down, but it scored
 **code, not docs**. Design: [docs-completeness.md](designs/docs-completeness.md).
 
-### Remote agents — run the agent here, land the effects there (epic) — 🔄 **PROPOSED (C-436…C-440 filed, none started)**
+### Remote effects — run the agent here, land the effects there (epic) — ✅ **SHIPPED (local remains the default; remote is an explicit mode)**
 
 Run an agent on your machine and your machine is what it touches. Sometimes that is the problem: you
 want the *experience* local — your terminal, your approval prompt, your model — and the *blast radius*
 elsewhere, wired to Docker, sandboxed process execution, or microVMs in Kubernetes.
-`flux tui --remote <addr>`.
+`flux tui --remote https://worker.example:8790`. Omitting `--remote` preserves the native local
+execution system; these are two supported modes of the same runtime, not competing product paths.
 
 ⚠ **"Remote agent" names two different things, and one is already shipped.** *Serving a whole agent* —
 planning, model calls and approval all move, your terminal is a thin client — is the A2A surface that
@@ -277,11 +278,16 @@ approve on your machine, and the effect lands in a microVM.**
 
 **It rides on a boundary that already exists** — `execution-substrate.md`'s rule, *"`flux-runtime`
 decides whether something may happen. `flux-system` is where it happens"*, put across a network; and
-`port.rs` already names *"a remote executor"* among the substrates the port exists for. So the
-substrate half is done: [C-399](stories/C-399-remote-guarded-io-backend.md) (ownership decided
-as *"flux owns it, flux-exchange reuses it"*), [C-397](stories/C-397-container-process-backend.md),
-[C-435](stories/C-435-a-guarded-network-port.md). ⚠ This epic is the **product on top**, not a second
-copy: [C-436](stories/C-436-flux-tui-remote.md) the surface (remoteness must be *unmissable* — an
+`port.rs` already names *"a remote executor"* among the substrates the port exists for. The port now
+spans files, environment, managed processes and guarded network resources. [C-399](stories/C-399-remote-guarded-io-backend.md)
+established delegation; [C-473](stories/C-473-remotely-representable-guarded-resources.md) made
+long-lived handles remotely representable; [C-474](stories/C-474-selectable-execution-system.md)
+made the target selectable without changing the local default; [C-475](stories/C-475-remote-system-https-protocol.md)
+ships authenticated HTTPS/WSS; and [C-476](stories/C-476-remote-operation-delivery.md) makes a dropped
+receipt an explicit `Unknown` outcome rather than an unsafe retry. [C-435](stories/C-435-a-guarded-network-port.md)
+remains in progress for migration of older listener-owning adapters; the remote-system port itself
+uses the new bounded inbound primitives. ⚠ This epic is the **product on top**, not a second copy:
+[C-436](stories/C-436-flux-tui-remote.md) is the surface (remoteness must be *unmissable* — an
 operator who forgets which machine they are on approves the wrong thing);
 [C-437](stories/C-437-which-guarantees-travel.md) a per-guarantee table of what travels, what becomes
 the remote's, and what stops applying — ⚠ *"secrets never off the machine"* has to be restated once
@@ -291,7 +297,7 @@ coding loop is read-edit-test and either files are remote (your editor shows a d
 [C-439](stories/C-439-trusting-a-remote-substrate.md) an unauthenticated endpoint, and ⚠ **a remote
 that lies** about what it did, which is where the evidence chain quietly stops meaning anything.
 
-[C-440](stories/C-440-the-topologies-page.md) is **useful now rather than after the epic**: a public
+[C-440](stories/C-440-the-topologies-page.md) is the public decision guide: a page
 page enumerating *every* way to run flux — fully local · OS-sandboxed · containerized ops · remote
 system · served agent + thin client · embedded SDK · portable wasm · hosted exchange — with pros, cons
 and the command that does it. A topology is decided by where four things sit and they move

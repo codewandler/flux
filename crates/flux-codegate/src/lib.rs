@@ -1064,6 +1064,7 @@ const GUARDED_PORT_TRAITS: &[&str] = &[
     "GuardedProcess",
     "GuardedHostFiles",
     "GuardedWorkspaceFiles",
+    "GuardedNetwork",
 ];
 
 /// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
@@ -1286,7 +1287,7 @@ pub const UNATTENDED_ARGV_FLAGS: &[&str] = &["--yes", "-y", "--serve"];
 /// tokens. C-410 needs that: `flux plugin call` is unattended, while the rest of `flux plugin …` is
 /// operator-driven management that is not — a bare `plugin` entry would demand a posture
 /// declaration from every `plugin ls`/`status`/`refresh` spawn and buy nothing.
-pub const FLAGLESS_UNATTENDED_SUBCOMMANDS: &[&str] = &["review", "plugin call"];
+pub const FLAGLESS_UNATTENDED_SUBCOMMANDS: &[&str] = &["review", "plugin call", "system serve"];
 
 /// The file extension that turns a `run` into **program mode** — a channel daemon, pinned to the
 /// fail-closed profile with or without `--yes` (C-410).
@@ -3555,6 +3556,7 @@ impl Exec for Double {}
                 "System",
             ),
             ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
+            ("crates/flux-system/src/port.rs", "GuardedNetwork", "System"),
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedProcess",
@@ -3573,6 +3575,11 @@ impl Exec for Double {}
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedEnv",
+                "RemoteSystem",
+            ),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedNetwork",
                 "RemoteSystem",
             ),
         ];

@@ -53,9 +53,10 @@
 //! `Command::new` itself. What these traits are is a *contract*, not a permission — implementing one
 //! grants no ability, it only claims to uphold the guarantees documented on each method.
 //!
-//! **The gate is in-repo only, and it enumerates three of the four ports.** `flux-codegate`'s
+//! **The gate is in-repo only, and it enumerates all five ports.** `flux-codegate`'s
 //! `no_unreviewed_guarded_port_backend_outside_system` reports every production `impl` of
-//! [`GuardedProcess`], [`GuardedHostFiles`] and [`GuardedEnv`] — resolving renamed imports, and
+//! [`GuardedProcess`], [`GuardedHostFiles`], [`GuardedWorkspaceFiles`], [`GuardedNetwork`] and
+//! [`GuardedEnv`] — resolving renamed imports, and
 //! excusing only `#[cfg(test)]` — so a second backend for one of those cannot appear inside flux
 //! without a reviewed allowance. Its reach ends at this repo's two workspaces: it walks
 //! `crates/*/src` and `plugins/*/src` and nothing else. It says nothing about downstream
@@ -63,15 +64,9 @@
 //! mirrors) it does not see macro-generated impls or sources pulled in from outside `src/` via
 //! `#[path]`.
 //!
-//! [`GuardedWorkspaceFiles`] is **not** in that enumeration. C-395's acceptance required the port to
-//! land without adding an entry to the gate's allow-list, and adding the trait to
-//! `GUARDED_PORT_TRAITS` would have forced exactly that for the native delegation below. So the one
-//! in-repo implementor is the reviewed one by construction rather than by check, and a second
-//! in-repo workspace-file backend would land unremarked. That is a scope call, not a claim that such
-//! a backend is harmless: an implementation of this port claims workspace confinement just as
-//! literally as a `GuardedProcess` implementation claims argv-only spawning. Closing the gap is two
-//! lines — the trait name in `GUARDED_PORT_TRAITS` and the `(port.rs, GuardedWorkspaceFiles, System)`
-//! allowance beside its three siblings.
+//! C-467 closed the former `GuardedWorkspaceFiles` blind spot, and C-435 adds the network family to
+//! the same census in the commit that introduces it. A sixth `Guarded*` trait now fails the census
+//! until the reviewer explicitly teaches the gate about its implementors.
 //!
 //! So: inside flux, "one guarded path starts every OS process" is mechanically enforced. Outside
 //! flux, a consumer that implements these traits is taking responsibility for the guarantees itself.
@@ -93,7 +88,12 @@ use std::time::Duration;
 
 pub use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
 
+use crate::net::{
+    BindExposure, DatagramEndpoint, DialTarget, InboundLimits, NetworkListener, NetworkStream,
+    PrivateNetAllow,
+};
 use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead, System};
+use std::net::SocketAddr;
 
 /// The future a guarded port operation returns.
 ///
@@ -102,6 +102,25 @@ use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead, System}
 /// yet dyn-compatible. Hand-rolling the box keeps `flux-system`'s dependency set at
 /// `flux-core` + `tokio` + `url`, which matters for a crate the portable core has to compile.
 pub type Guarded<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Immutable operator-visible identity of one execution substrate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubstrateIdentity {
+    /// Stable kind/name reported by the substrate (`native`, `remote`, `container`, ...).
+    pub kind: String,
+    /// Canonical workspace root as understood by that substrate.
+    pub workspace: String,
+    /// Human-readable physical confinement posture.
+    pub confinement: String,
+    /// Whether results are reports from another trust boundary rather than local observations.
+    pub remotely_reported: bool,
+}
+
+/// Identify where effects land. Identity is immutable for a live execution-system handle.
+pub trait ExecutionIdentity: Send + Sync {
+    /// Snapshot the identity displayed and recorded for this substrate.
+    fn substrate_identity(&self) -> SubstrateIdentity;
+}
 
 /// Read the process environment through the guarded boundary.
 ///
@@ -176,15 +195,57 @@ pub trait GuardedProcess: Send + Sync {
         Box::pin(async { Err(deny("feed a child process stdin")) })
     }
 
-    /// Start a long-lived child and hand back its live handle, for a process started in one call and
-    /// queried or stopped in a later one.
-    ///
-    /// The one port operation whose *result* is irreducibly native — [`ManagedChild`] owns a real
-    /// `tokio::process::Child`. A substrate with no OS processes cannot construct one, so it leaves
-    /// this default and denies rather than pretending to have spawned something.
-    fn spawn_background(&self, argv: &[String], env: &[(String, String)]) -> Result<ManagedChild> {
+    /// Start a long-lived child and hand back its opaque live handle, for a process started in one
+    /// call and queried or stopped in a later one. The future allows a remote substrate to mint the
+    /// handle across a link; the returned [`ManagedChild`] contains no native-handle requirement.
+    fn spawn_background<'a>(
+        &'a self,
+        argv: &'a [String],
+        env: &'a [(String, String)],
+    ) -> Guarded<'a, ManagedChild> {
         let _ = (argv, env);
-        Err(deny("host long-lived child processes"))
+        Box::pin(async { Err(deny("host long-lived child processes")) })
+    }
+}
+
+/// Open network connections through the one guarded egress policy.
+///
+/// The native implementation delegates to [`crate::net::dial_scoped`], which owns DNS resolution,
+/// private-range checks and address pinning. Implementations must not derive a second hostname or
+/// range policy; a non-native substrate enforces the same contract at its own physical boundary.
+pub trait GuardedNetwork: Send + Sync {
+    /// Guard and open `target`, returning an opaque connection rather than a native socket.
+    fn dial_scoped<'a>(
+        &'a self,
+        target: &'a DialTarget,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, NetworkStream> {
+        let _ = (target, allow);
+        Box::pin(async { Err(deny("open a guarded network connection")) })
+    }
+
+    /// Bind a bounded stream listener. Non-loopback exposure requires an authenticated posture.
+    fn bind_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+    ) -> Guarded<'a, NetworkListener> {
+        let _ = (addr, exposure, limits);
+        Box::pin(async { Err(deny("bind a guarded TCP listener")) })
+    }
+
+    /// Bind a bounded datagram endpoint. Sends from it remain subject to `allow` and the shared
+    /// destination guard.
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+        allow: PrivateNetAllow,
+    ) -> Guarded<'a, DatagramEndpoint> {
+        let _ = (addr, exposure, limits, allow);
+        Box::pin(async { Err(deny("bind a guarded UDP endpoint")) })
     }
 }
 
@@ -342,6 +403,34 @@ pub trait GuardedWorkspaceFiles: Send + Sync {
     }
 }
 
+/// The complete execution-facing guarded substrate available to a tool turn.
+///
+/// This bundle is declared at the consumer boundary, following the same pattern as
+/// `flux_plugin::PluginSystem`: the resource traits remain narrow and independently useful, while
+/// a runtime that intentionally spans all current families can store one object-safe handle. It is
+/// deliberately free of native-only workspace and sandbox accessors; those belong to [`System`]
+/// and cannot be truthfully implemented by every remote or Wasm substrate.
+pub trait ExecutionSystem:
+    GuardedProcess
+    + GuardedHostFiles
+    + GuardedEnv
+    + GuardedWorkspaceFiles
+    + GuardedNetwork
+    + ExecutionIdentity
+{
+}
+
+impl<T> ExecutionSystem for T where
+    T: GuardedProcess
+        + GuardedHostFiles
+        + GuardedEnv
+        + GuardedWorkspaceFiles
+        + GuardedNetwork
+        + ExecutionIdentity
+        + ?Sized
+{
+}
+
 /// The one spelling of "the substrate does not serve this", as a prefix.
 ///
 /// Public so diagnostics can quote the canonical spelling without copying it. Classification is
@@ -365,6 +454,17 @@ fn deny(operation: &str) -> Error {
 impl GuardedEnv for System {
     fn env(&self, key: &str) -> Option<String> {
         System::env(self, key)
+    }
+}
+
+impl ExecutionIdentity for System {
+    fn substrate_identity(&self) -> SubstrateIdentity {
+        SubstrateIdentity {
+            kind: "native".into(),
+            workspace: self.workspace().root().display().to_string(),
+            confinement: self.sandbox().describe(),
+            remotely_reported: false,
+        }
     }
 }
 
@@ -412,8 +512,48 @@ impl GuardedProcess for System {
         Box::pin(System::run_with_stdin(self, argv, stdin, timeout))
     }
 
-    fn spawn_background(&self, argv: &[String], env: &[(String, String)]) -> Result<ManagedChild> {
-        System::spawn_background(self, argv, env)
+    fn spawn_background<'a>(
+        &'a self,
+        argv: &'a [String],
+        env: &'a [(String, String)],
+    ) -> Guarded<'a, ManagedChild> {
+        Box::pin(async move { System::spawn_background(self, argv, env) })
+    }
+}
+
+impl GuardedNetwork for System {
+    fn dial_scoped<'a>(
+        &'a self,
+        target: &'a DialTarget,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, NetworkStream> {
+        let _ = self;
+        Box::pin(async move {
+            crate::net::dial_scoped(target, allow)
+                .await
+                .map(NetworkStream::from_handle)
+        })
+    }
+
+    fn bind_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+    ) -> Guarded<'a, NetworkListener> {
+        let _ = self;
+        Box::pin(crate::net::bind_tcp(addr, exposure, limits))
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        exposure: BindExposure,
+        limits: InboundLimits,
+        allow: PrivateNetAllow,
+    ) -> Guarded<'a, DatagramEndpoint> {
+        let _ = self;
+        Box::pin(crate::net::bind_udp(addr, exposure, limits, allow))
     }
 }
 
@@ -492,8 +632,126 @@ impl GuardedWorkspaceFiles for System {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sandbox, Workspace};
+    use crate::net::DuplexStream;
+    use crate::{sandbox, ChildStatus, ManagedProcess, Workspace};
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_non_native_process_port_can_own_a_managed_child_lifecycle() {
+        #[derive(Default)]
+        struct State {
+            reads: usize,
+            stopped: bool,
+        }
+
+        struct Handle(Arc<std::sync::Mutex<State>>);
+        impl ManagedProcess for Handle {
+            fn read_output(&mut self) -> (String, String) {
+                let mut state = self.0.lock().unwrap();
+                state.reads += 1;
+                ("remote output".into(), String::new())
+            }
+
+            fn status(&mut self) -> ChildStatus {
+                ChildStatus {
+                    running: !self.0.lock().unwrap().stopped,
+                    exit_code: None,
+                }
+            }
+
+            fn kill(&mut self) {
+                self.0.lock().unwrap().stopped = true;
+            }
+        }
+
+        struct NonNative(Arc<std::sync::Mutex<State>>);
+        impl GuardedProcess for NonNative {
+            fn run_with_env<'a>(
+                &'a self,
+                _argv: &'a [String],
+                _env: &'a [(String, String)],
+                _timeout: Duration,
+            ) -> Guarded<'a, ProcessOutput> {
+                Box::pin(async { Err(deny("run a foreground process")) })
+            }
+
+            fn spawn_background<'a>(
+                &'a self,
+                _argv: &'a [String],
+                _env: &'a [(String, String)],
+            ) -> Guarded<'a, ManagedChild> {
+                let state = self.0.clone();
+                Box::pin(async move { Ok(ManagedChild::from_handle(Handle(state))) })
+            }
+        }
+
+        let state = Arc::new(std::sync::Mutex::new(State::default()));
+        let port: &dyn GuardedProcess = &NonNative(state.clone());
+        let mut child = port
+            .spawn_background(&["remote-program".into()], &[])
+            .await
+            .unwrap();
+
+        assert!(child.status().running);
+        assert_eq!(child.read_output().0, "remote output");
+        child.kill();
+        assert!(!child.status().running);
+        assert_eq!(state.lock().unwrap().reads, 1);
+        drop(child);
+        assert!(state.lock().unwrap().stopped);
+    }
+
+    #[tokio::test]
+    async fn guarded_network_calls_are_substitutable_without_native_sockets() {
+        struct MemoryStream(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl DuplexStream for MemoryStream {
+            fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>> {
+                Box::pin(async move { Ok(b"reply"[..max.min(5)].to_vec()) })
+            }
+
+            fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()> {
+                let written = self.0.clone();
+                Box::pin(async move {
+                    written.lock().unwrap().extend_from_slice(data);
+                    Ok(())
+                })
+            }
+
+            fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        struct MemoryNetwork(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl GuardedNetwork for MemoryNetwork {
+            fn dial_scoped<'a>(
+                &'a self,
+                _target: &'a DialTarget,
+                _allow: &'a PrivateNetAllow,
+            ) -> Guarded<'a, NetworkStream> {
+                let written = self.0.clone();
+                Box::pin(async move { Ok(NetworkStream::from_handle(MemoryStream(written))) })
+            }
+        }
+
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port: &dyn GuardedNetwork = &MemoryNetwork(written.clone());
+        let mut stream = port
+            .dial_scoped(
+                &DialTarget::Tcp {
+                    host: "example.test".into(),
+                    port: 443,
+                },
+                &PrivateNetAllow::None,
+            )
+            .await
+            .unwrap();
+        stream.write_all(b"request").await.unwrap();
+
+        assert_eq!(stream.read(5).await.unwrap(), b"reply");
+        assert_eq!(&*written.lock().unwrap(), b"request");
+    }
 
     /// The native backend reaches the guarded exec path *through the port*, not only through its
     /// inherent methods — so an erased `dyn GuardedProcess` is a usable substitute for `&System`.
@@ -564,7 +822,7 @@ mod tests {
             .contains("cannot feed a child process"));
 
         // `ManagedChild` is not `Debug` (it owns a live child), so match rather than `expect_err`.
-        let spawn_error = match port.spawn_background(&argv, &[]) {
+        let spawn_error = match port.spawn_background(&argv, &[]).await {
             Err(error) => error,
             Ok(_) => panic!("a long-lived native child cannot be fabricated"),
         };

@@ -15,6 +15,31 @@
 
 ## [Unreleased]
 
+### Action needed
+
+- **Embedders implementing the guarded system port need to update two exhaustive contracts.**
+  Starting a managed background process is now asynchronous so a remote target can return a live
+  handle, and guarded-operation failures now include `Unknown`: the far side accepted the work but
+  its terminal result cannot be proved. Treat that state as reconciliation-required; never
+  automatically retry a mutation under a new identity.
+
+### New
+
+- **Keep the agent and approval prompt here while its effects land on another machine.** Start a
+  single-workspace daemon with `flux system serve`, then pass `--remote https://…` to `flux tui` or
+  another agent command. The model, credentials, approvals, sessions, and evidence stay local; the
+  remote workspace is canonical and is not synchronized with your local directory. The TUI keeps
+  the endpoint and remote root visible, TLS and a bearer token are mandatory, and an interrupted
+  accepted mutation is reported as unknown instead of being retried. Operations that cannot yet use
+  the remote port are unavailable in this mode rather than quietly running on your laptop.
+
+- **An agent can ask you a real question without pretending it is an approval.** In the local CLI
+  and TUI, agents can now show yes/no choices, single or multiple selections, and small forms, then
+  continue with a checked answer. You can cancel the question explicitly, and unusual data shapes
+  fall back to validated JSON. Embedded applications can supply their own question UI, including
+  reviewed audio workflows; unattended and served agents do not expose the operation unless their
+  host installs a responder.
+
 ## [0.50.0] - 2026-08-02
 
 ### Action needed

@@ -17,6 +17,8 @@ pub enum GuardedIoFailure {
     Refused,
     /// No answer arrived from the delegated substrate.
     Unreachable,
+    /// The substrate accepted the operation but cannot prove its terminal outcome.
+    Unknown,
     /// The substrate does not implement the operation.
     Unserved,
 }
@@ -30,6 +32,7 @@ impl GuardedIoFailure {
         match self {
             Self::Refused => "the remote guarded substrate refused: ",
             Self::Unreachable => "the remote guarded delegate is unreachable: ",
+            Self::Unknown => "the remote guarded operation has an unknown outcome: ",
             Self::Unserved => "this guarded substrate cannot ",
         }
     }

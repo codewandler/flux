@@ -30,6 +30,7 @@ and [Safety & approvals](./safety.md).
 | `flux run <module.flux> --entry <flow>` | select one top-level flow from a multi-flow module, execute it once with `--inputs` / repeatable `--arg`, and exit |
 | `flux` | interactive REPL |
 | `flux tui` | the full-screen [chat UI](./tui.md) with an in-UI approval sheet |
+| `flux system serve …` | serve one canonical workspace as an authenticated TLS [remote execution system](../topologies.md#local-runtime-remote-system) |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
 | `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
@@ -86,6 +87,15 @@ reasoning behind each lives with the model it belongs to:
 
 None of these replace the approval envelope; they change what an *approved* action is allowed to
 touch. See [Safety and approvals](./safety.md).
+
+## Local or remote effects
+
+Agent-path commands accept `--remote <HTTPS_URL>` to keep the runtime, model, session, credentials,
+and approval UI local while guarded file/process/network effects land on a remote system. With no
+flag, effects remain local. Tokens are read from `FLUX_REMOTE_SYSTEM_TOKEN`, or from the environment
+variable named by `--remote-token-env`; `--remote-ca <PEM>` adds a private CA. See
+[Topologies](../topologies.md#local-runtime-remote-system) for daemon setup, workspace semantics,
+the no-sync rule, and which guarantees are enforced on each side.
 
 ### `--store <DIR>` — point the session tools at another store {#store-flag}
 

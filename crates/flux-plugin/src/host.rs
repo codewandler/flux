@@ -851,6 +851,7 @@ impl HostCapabilities for SystemHostCaps {
                 let child = self
                     .system()
                     .spawn_background(&argv, &env)
+                    .await
                     .map_err(|e| e.to_string())?;
                 let id = self
                     .next_proc

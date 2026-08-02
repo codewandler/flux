@@ -52,7 +52,7 @@ flag breaks the build rather than quietly turning a documented topology into a l
 | [Fully local](#fully-local) | **ships** | your machine | your machine | your machine, unconfined | your terminal |
 | [Local, OS-sandboxed](#local-os-sandboxed) | **ships** on Linux and macOS | your machine | your machine, confined | your machine; only the workspace is writable | your terminal |
 | [Local runtime, containerized ops](#local-runtime-containerized-ops) | **proposed** | your machine | a container | undecided | your terminal |
-| [Local runtime, remote system](#local-runtime-remote-system) | **proposed** | your machine | the remote host | undecided — the open question | your terminal, which is the whole point |
+| [Local runtime, remote system](#local-runtime-remote-system) | **ships** | your machine | the remote host | the remote workspace is canonical | your terminal, which is the whole point |
 | [Served agent, thin client](#served-agent-thin-client) | **ships** | the server | the server | the server's | your choice: over the network (`--remote-approval`), or nowhere (`--yes`) |
 | [Embedded in your program](#embedded-in-your-program) | **ships** | your process | your process | your process's working dir | whichever approver you install |
 | [Portable WebAssembly](#portable-webassembly) | **partial** — language core only | the embedder | nothing; there is no host authority | none | none; there is nothing to approve |
@@ -129,35 +129,76 @@ shipped worker runtimes are an OS process and an externally-managed one — neit
 
 ## Local runtime, remote system {#local-runtime-remote-system}
 
-**Status: proposed.** Designed in
+**Status: ships.** Designed in
 [remote-agents](https://github.com/codewandler/flux/blob/main/docs/designs/remote-agents.md); the
 substrate half is [C-399](https://github.com/codewandler/flux/blob/main/docs/stories/C-399-remote-guarded-io-backend.md).
 
 The one where the agent you drive is here and the system it acts on is there — you approve on your
-machine, the effect lands in a container or a microVM somewhere else, and your model choice and
-credentials never leave your box.
+machine and the effect lands in a container or a microVM somewhere else. The local mode remains the
+default; this is an explicit operator-selected execution target, never a mode the model may select.
 
-```text
-flux tui --remote <addr>     # proposed spelling; this flag does not exist
+```sh
+# On the execution host. Use a CA-issued certificate in production.
+export FLUX_REMOTE_SYSTEM_TOKEN='generate-a-long-random-token'
+flux system serve --workspace /srv/project --bind 0.0.0.0:8790 \
+  --cert server-cert.pem --key server-key.pem
+
+# On the machine where you run the model and approve effects.
+export FLUX_REMOTE_SYSTEM_TOKEN='the-same-token'
+flux tui --remote https://worker.example:8790 --remote-ca worker-ca.pem
 ```
 
-The seam it would ride on **does** exist: the guarded-IO surface is already stated as capability
-traits precisely so a non-native substrate — "a WebAssembly embedder, a remote executor, or a test
-double" — can serve the same operations. Today the only implementor of those traits is the native
-system.
+The same `--remote` turn controls are available on `flux run`, `flux tui`, `flux fork`, `flux record`,
+and agent-backed app runs. Omit the flag and flux uses the native local system exactly as before.
+The bearer value comes only from the environment variable named by `--remote-token-env` (default
+`FLUX_REMOTE_SYSTEM_TOKEN`); it is never accepted in the URL or as a literal CLI flag. Publicly
+trusted certificates need no `--remote-ca`. A private/loopback endpoint also requires the explicit
+global `--allow-private-net` grant.
 
-- **Where your files are:** ⚠ **undecided, and it is the question that decides whether this is
-  usable.** A coding loop is read, edit, run the tests. Either the files are remote (every read
-  crosses the network, and your editor is looking at something else) or they are local (and you have
-  a synchronisation problem). There is no third answer that is free.
+The v1 daemon serves one canonical workspace over authenticated HTTPS, with authenticated WSS for
+managed processes and guarded network streams. The TUI keeps the endpoint and the canonical remote
+workspace in its header for the entire session. Port-aware coding operations are available; tools
+that still own native-only resources are hidden and refused in remote mode, never run on the local
+machine as a fallback.
+
+- **Where your files are:** the **remote workspace is canonical**. Every project-relative read,
+  write, discovery operation and process cwd uses that tree. There is **no implicit synchronization**
+  with the directory from which the local TUI was started. A local editor sees a different tree
+  unless you explicitly mount or attach it to the remote workspace.
 - **Where the approval prompt appears:** your terminal. That is the property this topology exists to
   keep, and the reason it is not the same thing as serving an agent.
-- **What it would cost:** latency on every operation, and a new trust question — a remote substrate
-  reports what happened, so "unreachable", "refused" and "lied" have to stay three distinguishable
-  outcomes.
+- **What it costs:** latency on every operation, a deliberately smaller operation catalog while
+  native-only integrations are ported, and a new trust question. `Refused`, `Unserved`,
+  `Unreachable`, and `Unknown` are structurally distinct. `Unknown` means the daemon accepted an
+  effect but cannot prove its terminal result; flux does not automatically retry a mutation.
 
-If you want this today, use [`ssh`](#ssh-to-the-box). It is free, it works, and it is the bar this
-topology has to beat.
+The daemon stores a bounded delivery ledger at `.flux/remote-system-delivery.json` in the remote
+workspace. It contains operation ids, request fingerprints, states, and timestamps—not arguments,
+results, or secret values. Replaying the same id cannot execute the effect twice; reusing it for a
+different request is refused.
+
+### Which guarantees cross the link
+
+The split below extends the native-substrate contract in [Concepts](./concepts.md#binding-flux-system-without-flux-runtime)
+rather than redefining it. "Remote" does not mean "mostly the same":
+
+| Guarantee | Remote classification | Why |
+|---|---|---|
+| Default-deny authorization and approval | **travels — stays local** | The local `flux-runtime` dispatches and approves before sending an operation. Authorization and approval stay local. |
+| Model selection and provider credentials | **travels — stays local** | Model calls are made by the local runtime; the remote system receives no provider key. |
+| Workspace path confinement | **becomes the remote system's responsibility** | Only the remote host can resolve symlinks and physical paths against its canonical root. The local side can validate spelling but cannot prove the remote filesystem result. |
+| Argv-only spawning, cleared child environment and output caps | **becomes the remote system's responsibility** | The daemon must use its guarded `System`; a report from an arbitrary endpoint is not proof that it did. |
+| OS sandbox and egress guard | **becomes the remote system's responsibility** | Bubblewrap/Seatbelt and DNS/IP pinning act where the process or socket is created, which is now remote. |
+| Redaction and evidence recording | **travels, with weaker provenance** | The local runtime redacts returned bytes and records them, but the record is **remote reported**, not locally observed. The remote must also redact its own diagnostics and logs. |
+| Tool credentials needed by a remote effect | **changes meaning** | The credential store and model credentials stay local, but an **operation-bound secret crosses the encrypted link** when the selected remote operation must use it. The daemon may hold it only in memory for that operation and must never log or persist it. |
+
+The last row corrects an easy but unsafe shorthand: remote mode cannot promise that every credential
+value stays on the local machine while also promising that an authenticated process or request runs
+on the remote one. The operator must treat the selected remote system as able to observe any secret
+explicitly delivered for an approved effect.
+
+For a full remote shell and editor rather than split runtime/effect placement, [`ssh`](#ssh-to-the-box)
+remains the simpler option.
 
 ## Served agent, thin client {#served-agent-thin-client}
 
@@ -249,7 +290,7 @@ With no prompt it opens an interactive session against the remote agent instead.
 - **What it costs:** the model choice and the credentials live on the server, and under
   `--remote-approval` every guarded effect costs a network round trip and a human. If what you
   wanted was "my terminal's approval prompt, someone else's blast radius", this is still the wrong
-  row — that is [local runtime, remote system](#local-runtime-remote-system), which is not built.
+  row — that is [local runtime, remote system](#local-runtime-remote-system).
 
 ## Embedded in your program {#embedded-in-your-program}
 
@@ -371,5 +412,6 @@ See [Providers](./agent/providers.md).
 - Someone else's machine should do the work, and you accept losing the approval prompt → **served
   agent**, or just **`ssh`**.
 - You want the approval prompt to stay yours while effects land elsewhere → that is **local runtime,
-  remote system**, and it is not built. Use `ssh` today.
+  remote system**. Use `--remote` when you specifically want the local approval and model boundary;
+  use `ssh` when moving the whole terminal is simpler.
 - Building a product on flux → **embedded**, and set the sandbox yourself.

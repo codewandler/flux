@@ -17,6 +17,14 @@ pub use remote_approval::{
     APPROVAL_TIMEOUT_ENV, DEFAULT_APPROVAL_TIMEOUT_SECS, MAX_APPROVAL_TIMEOUT_SECS,
 };
 
+mod interaction;
+pub use interaction::{
+    InteractionCapabilities, InteractionInputMode, InteractionOrigin, InteractionResponse,
+    PromptAudioRef, UserInteraction, UserInteractionReporter, UserInteractionRequest, UserPrompt,
+    MAX_INTERACTION_CONTROLS, MAX_INTERACTION_PROMPT_BYTES, MAX_INTERACTION_RESPONSE_BYTES,
+    MAX_INTERACTION_SCHEMA_BYTES, MAX_INTERACTION_SCHEMA_DEPTH,
+};
+
 mod fn_tool;
 pub use fn_tool::{tool_fn, FnTool};
 
@@ -53,7 +61,7 @@ use flux_policy::{
 };
 use flux_secret::Redactor;
 use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, StagingDisposition, ToolSpec};
-use flux_system::{PathAccess, System};
+use flux_system::{port::ExecutionSystem, PathAccess, System};
 
 /// The result of executing a tool.
 ///
@@ -701,6 +709,7 @@ pub struct RuntimeTurnContext {
     identity: Option<TurnIdentity>,
     tool_progress: Option<Arc<dyn ToolProgressSink>>,
     surface: Option<Arc<dyn SurfaceSink>>,
+    user_interaction: Option<Arc<dyn UserInteraction>>,
 }
 
 /// The caller and trust assertion frozen for one runtime turn.
@@ -815,6 +824,12 @@ impl RuntimeTurnContext {
         self
     }
 
+    /// Carry the request/reply channel a tool uses to ask the attached human a typed question.
+    pub fn with_user_interaction(mut self, interaction: Arc<dyn UserInteraction>) -> Self {
+        self.user_interaction = Some(interaction);
+        self
+    }
+
     /// Carry the owner for sub-agent tasks started during this turn.
     pub fn with_spawn_supervisor(mut self, supervisor: Arc<SpawnTaskSupervisor>) -> Self {
         self.spawn_supervisor = Some(supervisor);
@@ -865,6 +880,10 @@ impl RuntimeTurnContext {
         self.surface.clone()
     }
 
+    pub(crate) fn user_interaction(&self) -> Option<Arc<dyn UserInteraction>> {
+        self.user_interaction.clone()
+    }
+
     /// The immutable authorization identity carried by this turn, when explicitly installed.
     pub fn identity(&self) -> Option<TurnIdentity> {
         self.identity.clone()
@@ -879,6 +898,7 @@ impl RuntimeTurnContext {
             && self.identity.is_none()
             && self.tool_progress.is_none()
             && self.surface.is_none()
+            && self.user_interaction.is_none()
     }
 }
 
@@ -889,6 +909,7 @@ impl std::fmt::Debug for RuntimeTurnContext {
             .field("session", &self.session)
             .field("spawn_activity", &self.spawn_activity.is_some())
             .field("spawn_supervisor", &self.spawn_supervisor.is_some())
+            .field("user_interaction", &self.user_interaction.is_some())
             .field(
                 "identity",
                 &self
@@ -940,6 +961,10 @@ pub struct SpawnRequest {
     /// child's own enter/leave never affects the parent (and vice versa). `None` falls back to the
     /// spawner's assembly-time system.
     pub system: Option<Arc<System>>,
+    /// Snapshot of the parent's execution-facing guarded substrate. A local child defaults to its
+    /// native `system`; a remote-aware parent carries the selected target explicitly so delegation
+    /// cannot switch effects back to the coordinator's machine.
+    pub execution_system: Option<Arc<dyn ExecutionSystem>>,
 }
 
 impl std::fmt::Debug for SpawnRequest {
@@ -954,6 +979,7 @@ impl std::fmt::Debug for SpawnRequest {
                 "system",
                 &self.system.as_ref().map(|s| s.workspace().root()),
             )
+            .field("execution_system", &self.execution_system.is_some())
             .finish()
     }
 }
@@ -968,6 +994,7 @@ impl SpawnRequest {
             parent_session: None,
             activity: None,
             system: None,
+            execution_system: None,
         }
     }
 }
@@ -1280,6 +1307,11 @@ impl WorkspaceContext {
 #[derive(Clone)]
 pub struct ToolContext {
     workspace: WorkspaceContext,
+    /// The guarded substrate selected for effect IO. The native system remains separately available
+    /// to local control-plane code until every native-only operation has an honest port equivalent.
+    /// A remote target never changes `workspace`; operations migrated to this handle therefore
+    /// cannot silently fall back to the local filesystem.
+    execution_system: Option<Arc<dyn ExecutionSystem>>,
     pub redactor: Redactor,
     pub spawner: Option<Arc<dyn Spawner>>,
     /// D-188: on-demand skill-body loader, installed by the flow engine when the opt-in
@@ -1316,6 +1348,8 @@ pub struct ToolContext {
     /// Stored pane-channel fallback; see `cancel`. Ordinary engine turns carry the surface's sink
     /// lexically with the rest of [`RuntimeTurnContext`].
     surface: Arc<Mutex<Option<Arc<dyn SurfaceSink>>>>,
+    /// Stored user-interaction fallback; live engines carry this lexically per turn.
+    user_interaction: Arc<Mutex<Option<Arc<dyn UserInteraction>>>>,
     /// Stored sub-agent supervisor fallback for deliberately pinned spawned runtimes. Ordinary
     /// conversational turns carry it lexically with the rest of [`RuntimeTurnContext`].
     spawn_supervisor: Arc<Mutex<Option<Arc<SpawnTaskSupervisor>>>>,
@@ -1345,6 +1379,7 @@ impl ToolContext {
     pub fn over_workspace(workspace: WorkspaceContext) -> Self {
         Self {
             workspace,
+            execution_system: None,
             redactor: Redactor::new(),
             spawner: None,
             skill_loader: None,
@@ -1358,6 +1393,7 @@ impl ToolContext {
             spawn_supervisor: Arc::new(Mutex::new(None)),
             tool_progress: Arc::new(Mutex::new(None)),
             surface: Arc::new(Mutex::new(None)),
+            user_interaction: Arc::new(Mutex::new(None)),
             identity: None,
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
@@ -1368,6 +1404,24 @@ impl ToolContext {
     /// (C-97) is observed by the next call.
     pub fn system(&self) -> Arc<System> {
         self.workspace.active()
+    }
+
+    /// Snapshot the execution-facing guarded substrate selected by the operator.
+    ///
+    /// It defaults to the same native [`System`] returned by [`Self::system`]. Remote-aware tools
+    /// use this method; native-only control-plane operations continue to use `system` and must not
+    /// be exposed by a remote catalog until their semantics are ported.
+    pub fn execution_system(&self) -> Arc<dyn ExecutionSystem> {
+        self.execution_system
+            .clone()
+            .unwrap_or_else(|| self.workspace.active())
+    }
+
+    /// Select the execution-facing guarded substrate while retaining the native control-plane
+    /// system. This is host assembly, never a model-facing operation.
+    pub fn with_execution_system(mut self, system: Arc<dyn ExecutionSystem>) -> Self {
+        self.execution_system = Some(system);
+        self
     }
 
     /// The context-local workspace handle — the worktree ops drive transitions through this.
@@ -1463,6 +1517,20 @@ impl ToolContext {
             })
     }
 
+    /// Install a stored interaction responder for direct/one-shot runtimes. Conversational engines
+    /// should carry it in their lexical [`RuntimeTurnContext`] instead.
+    pub fn set_user_interaction(&self, interaction: Arc<dyn UserInteraction>) {
+        *self.user_interaction.lock().unwrap() = Some(interaction);
+    }
+
+    /// A redacting, validating handle for asking the attached human a typed question.
+    pub fn user_interaction(&self) -> Option<UserInteractionReporter> {
+        let turn = self.runtime_turn_context();
+        turn.user_interaction().map(|interaction| {
+            interaction::reporter(self.redactor.clone(), interaction, turn.cancel_token())
+        })
+    }
+
     /// Snapshot the identity frozen for the active lexical turn. Direct one-shot runtimes may see
     /// an inherited construction-time snapshot; an ordinary context outside a turn returns `None`.
     pub fn turn_identity(&self) -> Option<TurnIdentity> {
@@ -1482,6 +1550,7 @@ impl ToolContext {
             identity: self.identity.clone(),
             tool_progress: self.tool_progress.lock().unwrap().clone(),
             surface: self.surface.lock().unwrap().clone(),
+            user_interaction: self.user_interaction.lock().unwrap().clone(),
         })
     }
 
@@ -1495,6 +1564,7 @@ impl ToolContext {
         *self.spawn_supervisor.lock().unwrap() = turn.spawn_supervisor;
         *self.tool_progress.lock().unwrap() = turn.tool_progress;
         *self.surface.lock().unwrap() = turn.surface;
+        *self.user_interaction.lock().unwrap() = turn.user_interaction;
         self.identity = turn.identity;
     }
 
@@ -2500,6 +2570,7 @@ impl ExecutionAuthorization {
 #[derive(Clone)]
 pub struct ExecutionEnvironment {
     system: Arc<System>,
+    execution_system: Option<Arc<dyn ExecutionSystem>>,
     registry: ToolRegistry,
     permissions: PermissionManager,
     approver: Arc<dyn Approver>,
@@ -2540,6 +2611,7 @@ impl ExecutionEnvironment {
     ) -> Self {
         Self {
             system,
+            execution_system: None,
             registry,
             permissions,
             approver,
@@ -2567,8 +2639,10 @@ impl ExecutionEnvironment {
         authorization: ExecutionAuthorization,
         context: ToolContext,
     ) -> Self {
+        let execution_system = context.execution_system.clone();
         Self {
             system: context.system(),
+            execution_system,
             registry,
             permissions,
             approver,
@@ -2587,6 +2661,23 @@ impl ExecutionEnvironment {
     /// The exact guarded system shared by every executor derived from this environment.
     pub fn system(&self) -> &Arc<System> {
         &self.system
+    }
+
+    /// The guarded substrate effect operations will use. Native execution is the default.
+    pub fn execution_system(&self) -> Arc<dyn ExecutionSystem> {
+        self.execution_system
+            .clone()
+            .unwrap_or_else(|| self.system.clone())
+    }
+
+    /// Select a non-native guarded substrate for effect IO. The native `System` remains the local
+    /// control-plane handle; catalogs exposed under this mode must contain only port-aware tools.
+    pub fn with_execution_system(mut self, system: Arc<dyn ExecutionSystem>) -> Self {
+        self.execution_system = Some(system.clone());
+        if let Some(context) = self.exact_context.take() {
+            self.exact_context = Some(context.with_execution_system(system));
+        }
+        self
     }
 
     /// The operation catalog this environment will install.
@@ -2713,6 +2804,9 @@ impl ExecutionEnvironment {
                     None => ToolContext::new(self.system),
                 }
                 .with_redactor(self.redactor);
+                if let Some(execution_system) = self.execution_system {
+                    context = context.with_execution_system(execution_system);
+                }
                 if let Some(spawner) = self.spawner {
                     context = context.with_spawner(spawner);
                 }
@@ -3301,6 +3395,11 @@ impl Drop for CapScopeGuard<'_> {
 }
 
 impl Executor {
+    /// The immutable guarded execution target installed for this executor.
+    pub fn execution_system(&self) -> Arc<dyn ExecutionSystem> {
+        self.ctx.execution_system()
+    }
+
     fn record_dispatch_event(
         &self,
         kind: &str,

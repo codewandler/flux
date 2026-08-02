@@ -22,6 +22,7 @@ flux-skill.workspace = true
 flux-markdown.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+jsonschema.workspace = true
 serde_norway.workspace = true
 async-trait.workspace = true
 tokio-util.workspace = true

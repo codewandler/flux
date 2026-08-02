@@ -9,8 +9,206 @@
 //! use only a URL-returning compatibility API do not receive that DNS-rebinding guarantee.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::Duration;
 
 use flux_core::{Error, Result};
+
+use crate::port::Guarded;
+
+/// Object-safe byte operations for a guarded connection.
+///
+/// A handle may wrap a native socket or proxy an opaque remote stream. Reads are caller-capped and
+/// writes are all-or-error, preserving [`DialStream`]'s stream/datagram semantics without exposing a
+/// native socket type.
+pub trait DuplexStream: Send {
+    /// Read at most `max` bytes.
+    fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>>;
+
+    /// Write the complete payload or fail.
+    fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()>;
+
+    /// Gracefully shut down the connection where the transport supports it.
+    fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()>;
+}
+
+/// A substrate-neutral guarded network connection.
+///
+/// Dropping the handle closes its native or proxied resource. Call [`Self::shutdown`] when protocol
+/// semantics require a graceful half-close before that disposition.
+pub struct NetworkStream {
+    inner: Box<dyn DuplexStream>,
+}
+
+/// Whether an inbound endpoint may be exposed beyond loopback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindExposure {
+    /// Only loopback addresses may be bound.
+    LoopbackOnly,
+    /// The serving protocol authenticates every accepted request or frame.
+    Authenticated,
+}
+
+/// Resource ceilings applied at the guarded inbound boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundLimits {
+    /// Maximum simultaneously accepted TCP connections.
+    pub max_connections: usize,
+    /// Maximum bytes in one read, write or datagram.
+    pub max_frame_bytes: usize,
+    /// Deadline for one read, write, accept or datagram operation.
+    pub io_timeout: Duration,
+}
+
+impl Default for InboundLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_frame_bytes: 1024 * 1024,
+            io_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+fn validate_inbound(addr: SocketAddr, exposure: BindExposure, limits: InboundLimits) -> Result<()> {
+    if !addr.ip().is_loopback() && exposure != BindExposure::Authenticated {
+        return Err(Error::Other(format!(
+            "refusing unauthenticated non-loopback bind {addr}"
+        )));
+    }
+    if limits.max_connections == 0 || limits.max_frame_bytes == 0 || limits.io_timeout.is_zero() {
+        return Err(Error::Other(
+            "inbound network limits must be non-zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Object-safe accept lifecycle for a bounded guarded stream listener.
+pub trait StreamListener: Send {
+    /// The physical address selected by the substrate.
+    fn local_addr(&self) -> Result<SocketAddr>;
+
+    /// Accept one connection, waiting for a concurrency slot before asking the OS.
+    fn accept<'a>(&'a mut self) -> Guarded<'a, (NetworkStream, SocketAddr)>;
+
+    /// Stop accepting. Implementations must make repeated calls harmless.
+    fn close(&mut self);
+}
+
+/// A substrate-neutral guarded stream listener. Dropping it closes the listener.
+pub struct NetworkListener {
+    inner: Box<dyn StreamListener>,
+}
+
+impl NetworkListener {
+    /// Wrap a substrate-owned listener.
+    pub fn from_handle(handle: impl StreamListener + 'static) -> Self {
+        Self {
+            inner: Box::new(handle),
+        }
+    }
+
+    /// The physical address selected by the substrate.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Accept one bounded connection.
+    pub async fn accept(&mut self) -> Result<(NetworkStream, SocketAddr)> {
+        self.inner.accept().await
+    }
+
+    /// Stop accepting. Idempotent.
+    pub fn close(&mut self) {
+        self.inner.close();
+    }
+}
+
+impl Drop for NetworkListener {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
+/// Object-safe receive/send lifecycle for a guarded datagram endpoint.
+pub trait DatagramHandle: Send {
+    /// The physical address selected by the substrate.
+    fn local_addr(&self) -> Result<SocketAddr>;
+
+    /// Receive one complete datagram and its peer.
+    fn recv_from<'a>(&'a mut self) -> Guarded<'a, (Vec<u8>, SocketAddr)>;
+
+    /// Send one complete datagram to a destination guarded by the endpoint's egress policy.
+    fn send_to<'a>(&'a mut self, data: &'a [u8], host: &'a str, port: u16) -> Guarded<'a, ()>;
+
+    /// Close the endpoint. Implementations must make repeated calls harmless.
+    fn close(&mut self);
+}
+
+/// A substrate-neutral guarded datagram endpoint. Dropping it closes the endpoint.
+pub struct DatagramEndpoint {
+    inner: Box<dyn DatagramHandle>,
+}
+
+impl DatagramEndpoint {
+    /// Wrap a substrate-owned datagram endpoint.
+    pub fn from_handle(handle: impl DatagramHandle + 'static) -> Self {
+        Self {
+            inner: Box::new(handle),
+        }
+    }
+
+    /// The physical address selected by the substrate.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Receive one bounded datagram.
+    pub async fn recv_from(&mut self) -> Result<(Vec<u8>, SocketAddr)> {
+        self.inner.recv_from().await
+    }
+
+    /// Send one bounded datagram to a guarded destination.
+    pub async fn send_to(&mut self, data: &[u8], host: &str, port: u16) -> Result<()> {
+        self.inner.send_to(data, host, port).await
+    }
+
+    /// Close the endpoint. Idempotent.
+    pub fn close(&mut self) {
+        self.inner.close();
+    }
+}
+
+impl Drop for DatagramEndpoint {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
+impl NetworkStream {
+    /// Wrap a substrate-owned duplex stream.
+    pub fn from_handle(handle: impl DuplexStream + 'static) -> Self {
+        Self {
+            inner: Box::new(handle),
+        }
+    }
+
+    /// Read at most `max` bytes.
+    pub async fn read(&mut self, max: usize) -> Result<Vec<u8>> {
+        self.inner.read(max).await
+    }
+
+    /// Write the complete payload or fail.
+    pub async fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.inner.write_all(data).await
+    }
+
+    /// Gracefully shut down the connection.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.inner.shutdown().await
+    }
+}
 
 /// What one egress caller is allowed to reach beyond public addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -378,6 +576,240 @@ impl DialStream {
         }
         .map_err(|e| Error::Other(format!("conn shutdown: {e}")))
     }
+}
+
+impl DuplexStream for DialStream {
+    fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>> {
+        Box::pin(DialStream::read(self, max))
+    }
+
+    fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()> {
+        Box::pin(DialStream::write_all(self, data))
+    }
+
+    fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
+        Box::pin(DialStream::shutdown(self))
+    }
+}
+
+struct LimitedTcpStream {
+    stream: tokio::net::TcpStream,
+    _admission: tokio::sync::OwnedSemaphorePermit,
+    limits: InboundLimits,
+}
+
+impl DuplexStream for LimitedTcpStream {
+    fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>> {
+        Box::pin(async move {
+            if max > self.limits.max_frame_bytes {
+                return Err(Error::Other(format!(
+                    "conn read cap {max} exceeds inbound frame ceiling {}",
+                    self.limits.max_frame_bytes
+                )));
+            }
+            tokio::time::timeout(self.limits.io_timeout, async {
+                let mut buf = vec![0; max];
+                let count = tokio::io::AsyncReadExt::read(&mut self.stream, &mut buf)
+                    .await
+                    .map_err(|error| Error::Other(format!("conn read: {error}")))?;
+                buf.truncate(count);
+                Ok(buf)
+            })
+            .await
+            .map_err(|_| Error::Other("conn read timed out".into()))?
+        })
+    }
+
+    fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()> {
+        Box::pin(async move {
+            if data.len() > self.limits.max_frame_bytes {
+                return Err(Error::Other(format!(
+                    "conn write size {} exceeds inbound frame ceiling {}",
+                    data.len(),
+                    self.limits.max_frame_bytes
+                )));
+            }
+            tokio::time::timeout(
+                self.limits.io_timeout,
+                tokio::io::AsyncWriteExt::write_all(&mut self.stream, data),
+            )
+            .await
+            .map_err(|_| Error::Other("conn write timed out".into()))?
+            .map_err(|error| Error::Other(format!("conn write: {error}")))
+        })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
+        Box::pin(async move {
+            tokio::time::timeout(
+                self.limits.io_timeout,
+                tokio::io::AsyncWriteExt::shutdown(&mut self.stream),
+            )
+            .await
+            .map_err(|_| Error::Other("conn shutdown timed out".into()))?
+            .map_err(|error| Error::Other(format!("conn shutdown: {error}")))
+        })
+    }
+}
+
+struct NativeStreamListener {
+    listener: Option<tokio::net::TcpListener>,
+    admission: Arc<tokio::sync::Semaphore>,
+    limits: InboundLimits,
+}
+
+impl StreamListener for NativeStreamListener {
+    fn local_addr(&self) -> Result<SocketAddr> {
+        self.listener
+            .as_ref()
+            .ok_or_else(|| Error::Other("network listener is closed".into()))?
+            .local_addr()
+            .map_err(|error| Error::Other(format!("listener address: {error}")))
+    }
+
+    fn accept<'a>(&'a mut self) -> Guarded<'a, (NetworkStream, SocketAddr)> {
+        Box::pin(async move {
+            let permit = tokio::time::timeout(
+                self.limits.io_timeout,
+                self.admission.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| Error::Other("listener admission timed out".into()))?
+            .map_err(|_| Error::Other("network listener is closed".into()))?;
+            let listener = self
+                .listener
+                .as_ref()
+                .ok_or_else(|| Error::Other("network listener is closed".into()))?;
+            let (stream, peer) = tokio::time::timeout(self.limits.io_timeout, listener.accept())
+                .await
+                .map_err(|_| Error::Other("listener accept timed out".into()))?
+                .map_err(|error| Error::Other(format!("listener accept: {error}")))?;
+            Ok((
+                NetworkStream::from_handle(LimitedTcpStream {
+                    stream,
+                    _admission: permit,
+                    limits: self.limits,
+                }),
+                peer,
+            ))
+        })
+    }
+
+    fn close(&mut self) {
+        self.listener.take();
+        self.admission.close();
+    }
+}
+
+struct NativeDatagramEndpoint {
+    socket: Option<tokio::net::UdpSocket>,
+    allow: PrivateNetAllow,
+    limits: InboundLimits,
+}
+
+impl DatagramHandle for NativeDatagramEndpoint {
+    fn local_addr(&self) -> Result<SocketAddr> {
+        self.socket
+            .as_ref()
+            .ok_or_else(|| Error::Other("datagram endpoint is closed".into()))?
+            .local_addr()
+            .map_err(|error| Error::Other(format!("datagram address: {error}")))
+    }
+
+    fn recv_from<'a>(&'a mut self) -> Guarded<'a, (Vec<u8>, SocketAddr)> {
+        Box::pin(async move {
+            let socket = self
+                .socket
+                .as_ref()
+                .ok_or_else(|| Error::Other("datagram endpoint is closed".into()))?;
+            let mut bytes = vec![0; self.limits.max_frame_bytes.saturating_add(1)];
+            let (count, peer) =
+                tokio::time::timeout(self.limits.io_timeout, socket.recv_from(&mut bytes))
+                    .await
+                    .map_err(|_| Error::Other("datagram receive timed out".into()))?
+                    .map_err(|error| Error::Other(format!("datagram receive: {error}")))?;
+            if count > self.limits.max_frame_bytes {
+                return Err(Error::Other(format!(
+                    "datagram exceeds inbound frame ceiling {}",
+                    self.limits.max_frame_bytes
+                )));
+            }
+            bytes.truncate(count);
+            Ok((bytes, peer))
+        })
+    }
+
+    fn send_to<'a>(&'a mut self, data: &'a [u8], host: &'a str, port: u16) -> Guarded<'a, ()> {
+        Box::pin(async move {
+            if data.len() > self.limits.max_frame_bytes {
+                return Err(Error::Other(format!(
+                    "datagram size {} exceeds inbound frame ceiling {}",
+                    data.len(),
+                    self.limits.max_frame_bytes
+                )));
+            }
+            let addresses = guard_target_host_pinned(host, port, &self.allow, &SystemHostResolver)?;
+            let address = addresses.first().copied().ok_or_else(|| {
+                Error::Other(format!(
+                    "refusing to send datagram to {host}:{port} — DNS returned no vetted addresses"
+                ))
+            })?;
+            let socket = self
+                .socket
+                .as_ref()
+                .ok_or_else(|| Error::Other("datagram endpoint is closed".into()))?;
+            let sent = tokio::time::timeout(self.limits.io_timeout, socket.send_to(data, address))
+                .await
+                .map_err(|_| Error::Other("datagram send timed out".into()))?
+                .map_err(|error| Error::Other(format!("datagram send: {error}")))?;
+            if sent != data.len() {
+                return Err(Error::Other(format!(
+                    "datagram truncated ({sent} of {} bytes sent)",
+                    data.len()
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn close(&mut self) {
+        self.socket.take();
+    }
+}
+
+/// Bind a bounded guarded TCP listener.
+pub async fn bind_tcp(
+    addr: SocketAddr,
+    exposure: BindExposure,
+    limits: InboundLimits,
+) -> Result<NetworkListener> {
+    validate_inbound(addr, exposure, limits)?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| Error::Other(format!("tcp bind {addr}: {error}")))?;
+    Ok(NetworkListener::from_handle(NativeStreamListener {
+        listener: Some(listener),
+        admission: Arc::new(tokio::sync::Semaphore::new(limits.max_connections)),
+        limits,
+    }))
+}
+
+/// Bind a bounded guarded UDP endpoint. Every outbound peer is re-vetted by the shared egress guard.
+pub async fn bind_udp(
+    addr: SocketAddr,
+    exposure: BindExposure,
+    limits: InboundLimits,
+    allow: PrivateNetAllow,
+) -> Result<DatagramEndpoint> {
+    validate_inbound(addr, exposure, limits)?;
+    let socket = tokio::net::UdpSocket::bind(addr)
+        .await
+        .map_err(|error| Error::Other(format!("udp bind {addr}: {error}")))?;
+    Ok(DatagramEndpoint::from_handle(NativeDatagramEndpoint {
+        socket: Some(socket),
+        allow,
+        limits,
+    }))
 }
 
 fn finish_write(outcome: std::io::Result<()>) -> Result<()> {
@@ -750,7 +1182,7 @@ pub async fn dial(target: &DialTarget, allow_private: bool) -> Result<DialStream
     dial_scoped(target, &PrivateNetAllow::from_legacy_bool(allow_private)).await
 }
 
-fn guard_target_host_pinned(
+pub fn guard_target_host_pinned(
     host: &str,
     port: u16,
     allow: &PrivateNetAllow,
@@ -1480,5 +1912,84 @@ mod tests {
         stream.write_all(b"echo").await.unwrap();
         assert_eq!(&stream.read(64).await.unwrap(), b"echo");
         stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_bind_refuses_public_exposure_without_authentication() {
+        let address = SocketAddr::from(([0, 0, 0, 0], 0));
+        let error = bind_tcp(
+            address,
+            BindExposure::LoopbackOnly,
+            InboundLimits::default(),
+        )
+        .await
+        .err()
+        .expect("an open public listener must be refused before bind");
+        assert!(error.to_string().contains("unauthenticated non-loopback"));
+    }
+
+    #[tokio::test]
+    async fn guarded_tcp_accept_applies_frame_limits() {
+        let limits = InboundLimits {
+            max_connections: 1,
+            max_frame_bytes: 4,
+            io_timeout: Duration::from_secs(2),
+        };
+        let mut listener = bind_tcp(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            BindExposure::LoopbackOnly,
+            limits,
+        )
+        .await
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(address).await.unwrap() });
+        let (mut accepted, _) = listener.accept().await.unwrap();
+        let _client = client.await.unwrap();
+
+        assert!(accepted
+            .read(5)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("frame ceiling"));
+        assert!(accepted
+            .write_all(b"12345")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("frame ceiling"));
+    }
+
+    #[tokio::test]
+    async fn guarded_udp_receive_and_send_share_the_limits_and_egress_guard() {
+        let limits = InboundLimits {
+            max_connections: 1,
+            max_frame_bytes: 8,
+            io_timeout: Duration::from_secs(2),
+        };
+        let mut endpoint = bind_udp(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            BindExposure::LoopbackOnly,
+            limits,
+            PrivateNetAllow::from_hosts(["127.0.0.1".to_string()]),
+        )
+        .await
+        .unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(b"hello", endpoint.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (received, peer_addr) = endpoint.recv_from().await.unwrap();
+        assert_eq!(received, b"hello");
+
+        endpoint
+            .send_to(b"reply", "127.0.0.1", peer_addr.port())
+            .await
+            .unwrap();
+        let mut response = [0; 8];
+        let count = peer.recv(&mut response).await.unwrap();
+        assert_eq!(&response[..count], b"reply");
     }
 }

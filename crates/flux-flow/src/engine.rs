@@ -187,6 +187,8 @@ pub struct FlowEngine {
     /// therefore invisible to every op in every real turn — a wiring that reads as correct and
     /// delivers nothing.
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
+    /// Host-owned typed interaction channel, copied into every lexical turn context.
+    user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
     /// One active public turn per engine. Nested authored operations stay inside the already-held
     /// lifecycle and call the runtime directly, so they never recursively acquire this gate.
     turn_gate: tokio::sync::Mutex<()>,
@@ -383,6 +385,7 @@ impl FlowEngine {
             sticky_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
             surface_sink: None,
+            user_interaction: None,
             turn_gate: tokio::sync::Mutex::new(()),
         })
     }
@@ -396,6 +399,15 @@ impl FlowEngine {
     /// actionably instead of writing into a void.
     pub fn with_surface_sink(mut self, sink: Arc<dyn flux_runtime::SurfaceSink>) -> Self {
         self.surface_sink = Some(sink);
+        self
+    }
+
+    /// Attach the host's typed user-interaction channel to every turn.
+    pub fn with_user_interaction(
+        mut self,
+        interaction: Arc<dyn flux_runtime::UserInteraction>,
+    ) -> Self {
+        self.user_interaction = Some(interaction);
         self
     }
 
@@ -583,6 +595,9 @@ impl FlowEngine {
         // this scope is authoritative including the fields it omits.
         if let Some(surface) = &self.surface_sink {
             runtime = runtime.with_surface_sink(surface.clone());
+        }
+        if let Some(interaction) = &self.user_interaction {
+            runtime = runtime.with_user_interaction(interaction.clone());
         }
         // D-175: `run_turn_pinned` supplies the WHOLE cassette scope for this turn — explicitly
         // WINNING over `FLUX_CASSETTE=0`. The kill switch governs only whether an ordinary turn
@@ -4171,6 +4186,76 @@ mod tests {
             1,
             "the engine's installed sink never reached the turn's `RuntimeTurnContext`"
         );
+    }
+
+    /// C-472: deleting the engine→turn interaction attachment makes this fail inside the probe op.
+    #[tokio::test]
+    async fn an_installed_user_interaction_is_reachable_from_inside_a_turn() {
+        #[derive(Default)]
+        struct CancellingInteraction(AtomicUsize);
+
+        #[async_trait]
+        impl flux_runtime::UserInteraction for CancellingInteraction {
+            fn capabilities(&self) -> flux_runtime::InteractionCapabilities {
+                flux_runtime::InteractionCapabilities::text()
+            }
+
+            async fn request(
+                &self,
+                _request: flux_runtime::UserInteractionRequest,
+            ) -> Result<flux_runtime::InteractionResponse> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(flux_runtime::InteractionResponse::Cancelled)
+            }
+        }
+
+        struct InteractionProbeTool;
+
+        #[async_trait]
+        impl Tool for InteractionProbeTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only(
+                    "interaction_probe",
+                    "Ask through the attached interaction responder.",
+                    json!({"type": "object", "additionalProperties": false}),
+                )
+            }
+
+            async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+                let reporter = ctx.user_interaction().ok_or_else(|| {
+                    Error::Other("no user interaction is attached to this turn".to_string())
+                })?;
+                let response = reporter
+                    .request(
+                        flux_runtime::InteractionOrigin::Agent,
+                        flux_runtime::UserPrompt::text("Continue?"),
+                        json!({"type":"boolean"}),
+                    )
+                    .await?;
+                Ok(ToolResult::ok(serde_json::to_string(&response)?))
+            }
+        }
+
+        let interaction = Arc::new(CancellingInteraction::default());
+        let (engine, events, _root) = tool_engine(
+            Arc::new(InteractionProbeTool),
+            DraftAst {
+                body: vec![Node::Return {
+                    value: Box::new(call_node("interaction_probe")),
+                }],
+                ..Default::default()
+            },
+        );
+        let engine = engine.with_user_interaction(interaction.clone());
+        let session = events.create_session("test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "probe interaction", &mut sink)
+            .await
+            .expect("the interaction responder is installed in the lexical turn");
+
+        assert_eq!(interaction.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
