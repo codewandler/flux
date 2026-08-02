@@ -1,35 +1,35 @@
 ---
 id: A-128
-title: fleet.start/.stop/.status ops and the cluster-monitor journey
+title: Fleet monitor journey over the shipped worker lifecycle
 pillar: Agent
 status: backlog
 epic: agent-fleet-runtime
 design: docs/designs/agent-fleet-runtime.md
-areas: [flux-fleet, flux-app]
-note: "the epic's headline proof — start a discovered worker, dispatch to it, watch it through Ready/Busy/Exited, stop it, offline in CI"
+areas: [flux-orchestrate, flux-app]
+note: "C-243 shipped fleet.start/worker_status/stop; the remaining headline proof joins discovery, dispatch/task status and worker liveness in one offline monitor journey"
 ---
 
 # fleet.start/.stop/.status ops and the cluster-monitor journey
 
 ## Goal
-Put the runtime port in the agent's hands and in the coordinator's sweep: model-facing
-`fleet.start` / `fleet.stop` / `fleet.status` ops over `AgentRuntime`, and a monitor journey that
-reconciles the fleet the way the [coordinator's sweep](../designs/fleet-coordinator.md) reconciles
-the board. This is where "the coordinator can monitor and control the cluster" becomes true.
+C-243 put `fleet.start`, `fleet.worker_status`, and `fleet.stop` over `AgentRuntime` in the agent's
+hands. Finish the coordinator sweep that joins worker liveness to `fleet.dispatch` / `fleet.status`
+task state and reconciles the fleet the way the
+[coordinator's sweep](../designs/fleet-coordinator.md) reconciles the board. This is where "the
+coordinator can monitor and control the cluster" becomes true.
 
 ## Acceptance
-- [ ] `fleet.start` / `fleet.stop` / `fleet.status` ops in `flux-fleet`, dispatching to the runtime
-      resolved from the address's scheme.
-- [ ] Accurate `effects`, `Risk`, `Idempotency` and **concrete `permission_subjects`** — the
-      resolved program path / image ref / workload, never `*` and never empty. `fleet.start` on a
-      `proc://` address is `bash`-class power and is gated as such (A-122).
+- [x] `fleet.start` / `fleet.worker_status` / `fleet.stop` dispatch through the shipped runtime.
+      `fleet.status` remains the separate A2A task-status operation; the names must not be conflated.
+- [x] The shipped process lifecycle ops declare accurate effects/risk/idempotency and concrete
+      permission subjects through C-243's reviewed guarded-spawn contract.
 - [ ] A monitor journey on a `schedule` channel: for each known agent, `fleet.status`; an `Exited`
       or `Unreachable` worker holding a `Claimed`/`InProgress` board item releases that item back to
       `Ready` so it is re-dispatched.
-- [ ] **Failing-first test — the epic's headline proof, offline:** a coordinator discovers a worker
-      (A-126), starts it on the `proc://flux` runtime, dispatches a board item, observes
-      `Starting → Ready → Busy`, kills it, and the monitor journey moves the item back to `Ready`.
-      No credentials, no network.
+- [ ] **Failing-first test — the epic's headline proof, offline:** a coordinator discovers or starts
+      a process worker (A-126/C-243), dispatches a board item, observes a live worker plus a working
+      task, kills it, and the monitor journey observes `WorkerState::Dead` and moves the item back to
+      `Ready`. No credentials or external network.
 - [ ] Failing-first test: a worker whose task still reports `working` but whose runtime reports
       `Exited` is treated as **failed**. This is the concrete trap: an in-flight task at restart
       reports `working` forever (`crates/flux-server/src/a2a.rs:1195-1199`) and the TTL sweep that
@@ -38,10 +38,13 @@ the board. This is where "the coordinator can monitor and control the cluster" b
       only its own agents.
 
 ## Progress
-- (not started)
+
+- 2026-08-02: narrowed to the remaining monitor journey. C-243 already shipped the three worker
+  lifecycle operations under their exact public names.
 
 ## Notes
 - Design: [agent-fleet-runtime.md](../designs/agent-fleet-runtime.md).
-- Depends on A-121, A-122, A-126; the board interaction depends on A-113 and A-130.
+- Depends on A-126; the lifecycle baseline is C-243 and the board interaction depends on A-113 and
+  A-130 (all but A-126 are done).
 - Deliberately not here: restart policy, autoscaling, load balancing. See the design's "What this
   does not attempt".

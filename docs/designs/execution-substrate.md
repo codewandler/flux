@@ -1,6 +1,6 @@
 # Design: the execution substrate — `flux-system` for a second consumer
 
-**Status:** proposed · **Pillar:** Core · **Epic:** [C-394](../stories/C-394-execution-substrate-epic.md)
+**Status:** partially shipped · **Pillar:** Core · **Epic:** [C-394](../stories/C-394-execution-substrate-epic.md)
 · **Extends:** [portable-wasm-runtime.md](portable-wasm-runtime.md) (which introduced the port seam)
 · **Context:** [ecosystem.md](ecosystem.md)
 
@@ -41,8 +41,8 @@ consequence.
 | TCP dial | `net::DialTarget` / `DialStream` / `dial_scoped` / `dial_scoped_pinned` |
 | Argv-only spawn | one `System::build_command`; env cleared to a non-secret allow-list; output byte-capped |
 | OS sandbox | `sandbox::Backend` — bubblewrap (Linux), Seatbelt (macOS); `SpawnPolicy`, `Confinement` |
-| The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`, `port::GuardedWorkspaceFiles`; fail-closed defaults; `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` enumerates in-repo backends and pins its trait census to `port.rs` |
-| A delegating backend | `remote::RemoteSystem` + `remote::Loopback` (C-399) — serves the port from a `Delegate`, three distinguishable failure modes, no wire format and no new dependency |
+| The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`, `port::GuardedWorkspaceFiles`, `port::GuardedNetwork`, plus `ExecutionSystem`; fail-closed defaults; `flux-codegate` enumerates in-repo backends and pins its trait census to `port.rs` |
+| A delegating backend | `remote::RemoteSystem` + `remote::Loopback` (C-399), with the authenticated HTTPS/WSS production transport from C-475/C-476 and four typed delivery outcomes |
 | Published | yes — `codewandler-flux-system`, lib name `flux_system` |
 
 So the substrate is real and shipped. What is missing is narrower than it looks.
@@ -108,21 +108,17 @@ confinement, env clearing, output capping), and which are `flux-runtime`'s and *
 authorization, approval, redaction of tool output, evidence). A consumer taking only the first set is
 supported; a consumer that assumes it got the second is the failure this contract prevents.
 
-### 4. Container and remote backends — ownership undecided
+### 4. Container and remote backends — ownership settled
 
 A `container` runtime (spawn inside docker/k8s) and a `remote` runtime (delegate to another
-substrate) are both named in [ecosystem.md](ecosystem.md)'s runtime table. Neither is obviously
-flux's to build:
+substrate) are both named in [ecosystem.md](ecosystem.md)'s runtime table. The original design left
+ownership open because the port is unsealed. That decision is now settled:
 
-- The port is **unsealed**, so an out-of-repo consumer can implement either without flux changing.
-- `flux-codegate`'s backend gate reaches only this repository, so an in-repo backend costs a reviewed
-  allowance that an out-of-repo one does not.
-- flux's own CLI has no use for either.
-
-They were therefore filed with ownership stated as open
-([C-397](../stories/C-397-container-process-backend.md),
-[C-399](../stories/C-399-remote-guarded-io-backend.md)), not as `ready` work. The decision belonged
-with whoever needed one first, and the epic did not pretend otherwise.
+- **Flux owns both backends.** Local-first use must not depend on an out-of-repo service, while the
+  unsealed port still lets other consumers provide their own implementations.
+- The reviewed codegate allowance is an intentional cost: in-repo guarded-IO implementations must
+  be visible to the repository's no-bypass checks.
+- The CLI now uses the remote backend directly through explicit `--remote` selection.
 
 **Resolved for the remote backend (C-399): flux owns it.** The alternative — leaving it to the first
 consumer that needed it — would have put a locally-executing runtime behind a service, and flux must
@@ -159,7 +155,8 @@ the exact unreachable diagnostic therefore still classifies as a refusal. That
 matters more than it looks: delegate-authored text that could reclassify a refusal would send an
 operator to investigate a perfectly healthy network.
 
-The container backend (C-397) is untouched by this and its ownership remains open.
+The container backend (C-397) remains open, but its ownership is no longer open: Flux owns it and
+external consumers may reuse it.
 
 ## What this epic explicitly does not do
 

@@ -43,6 +43,9 @@ user-facing workflow has no way to offer it.
 - (not started — filed from the 2026-07-28 Amp feature-mining pass)
 
 ## Notes
+- C-472 introduces the typed, redacting `UserInteraction` request/reply seam and local renderers for
+  the built-in `user.ask` operation. Reuse that contract for plugin prompts; C-163 still owns the
+  manifest capability, plugin attribution/trusted chrome, protocol frames and command registration.
 - Source: [../research/amp.md](../research/amp.md) — Amp plugins register tools *and* commands
   (`amp.registerCommand`) and can drive UI interactions (notify / confirm / input / select).
 - Evidence the gap is real: `crates/flux-plugin-protocol/src/lib.rs:515-578` (`PluginCapabilities`

@@ -1,18 +1,26 @@
 # Agent fleet runtime — addressing, lifecycle and discovery for a fleet of agents
 
-Story: [A-119](../stories/A-119-agent-fleet-runtime-epic.md) · Pillar: Agent · Status: design
+Story: [A-119](../stories/A-119-agent-fleet-runtime-epic.md) · Pillar: Agent · Status: partially shipped
+
+> **Implementation update (2026-08-02).** C-243 shipped the lifecycle seam in a narrower shape than
+> this original design proposed: `AgentRuntime` lives in L2 `flux-runtime`; `ProcessRuntime` and
+> `ExternalRuntime` live in L5 `flux-orchestrate`; and `fleet.start` / `fleet.worker_status` /
+> `fleet.stop` are registered in the CLI. There is no `flux-fleet` crate and no runtime-selecting
+> `AgentAddress` URI. Docker/Kubernetes backends, discovery, and role-address routing remain open.
+> Sections below describe both the retained design direction and, where labeled, the superseded
+> original shape.
 
 ## The two questions, and the tree's honest answers
 
-The [fleet coordinator](fleet-coordinator.md) design assumes workers exist at known URLs. It never
-says who starts them or how the coordinator finds them. Both answers today are the same word:
-**nobody**.
+The [fleet coordinator](fleet-coordinator.md) design assumes workers exist at known URLs. C-243 now
+answers the first half locally: `ProcessRuntime` starts guarded child Flux workers and
+`ExternalRuntime` represents operator-managed ones. Discovery is still absent; callers supply or
+receive endpoints directly.
 
 ### Who starts an A2A-reachable agent?
 
-A human, in a shell. There is exactly one OS process — the `flux` CLI you typed a command into — and
-every A2A-reachable agent is a long-lived `Arc<FlowEngine>` inside its Tokio runtime. Two shipped
-paths bind a listener:
+Either a human/operator starts a served agent, or `fleet.start` starts a child through
+`ProcessRuntime` and the single guarded process-spawn path. Served-agent paths still include:
 
 - `flux app run --serve <addr>` (`crates/flux-cli/src/app_cmd.rs:311` → `:373` →
   `flux_server::serve`, `crates/flux-server/src/lib.rs:447`), and
@@ -23,11 +31,10 @@ paths bind a listener:
 `StaticResolver`, `crates/flux-server/src/lib.rs:903`) is implemented and tested but has **no
 production caller** — it is an embedder-only library surface.
 
-What flux supervises is *tasks inside* that process: cancellation tokens, a `JoinSet`, turn gates,
-TTL sweeps. What it supervises about the **process** is nothing. `crates/flux-channels/src/host.rs:63-78`
-is the whole supervision story, and a fatal channel error tears the entire process down with no
-restart and no backoff. `GET /health` exists and nothing consumes it. There is no Dockerfile, no
-systemd unit, no k8s manifest, no `--daemon`, and flux never spawns `flux`.
+`ProcessRuntime` supervises the children it starts, waits for the serving announcement, retains exit
+status/output, kills on drop, and exposes status/stop. It is deliberately not a keep-alive process
+manager. There is still no shipped Docker worker, Kubernetes worker, OCI image, or Kubernetes
+deployment artifact.
 
 ### How does an agent learn another agent exists?
 
@@ -97,10 +104,10 @@ below makes that explicit rather than incidental.
 
 ## The `AgentRuntime` port
 
-A new **L5 crate, `flux-fleet`**, classified in `crates/flux-codegate/src/lib.rs`'s `layer()` map.
-It is the one home for "coordination of agents as processes", and its layer lets it reach
-`flux-system` (L2, guarded spawn), `flux-plugin` (L4, docker/k8s providers) and `flux-a2a` (L1,
-the transport client).
+The shipped port is in **L2 `flux-runtime`**, with concrete lifecycle implementations in L5
+`flux-orchestrate`. This avoids the proposed `flux-fleet` crate and keeps the port independent of
+plugin/A2A implementation details. The original sketch below is historical; the authoritative
+signature is `crates/flux-runtime/src/agent_runtime.rs`.
 
 ```rust
 #[async_trait]
@@ -120,9 +127,8 @@ pub trait AgentRuntime: Send + Sync {
 pub enum AgentStatus { Starting, Ready, Busy, Unreachable, Exited { code: Option<i32> } }
 ```
 
-Backends, in shipping order: `ExternalRuntime` (start/stop are refusals, `status` is a card fetch —
-this is the one that already works today and it is the contract suite's baseline), `ProcessRuntime`,
-`DockerRuntime`, `KubernetesRuntime`.
+Shipped backends: `ProcessRuntime` and `ExternalRuntime`. Proposed next backends:
+`DockerRuntime` (A-124) and `KubernetesRuntime` (A-125).
 
 **Readiness is `status`, not `start` returning.** `start` returns a handle; the agent is usable only
 when `status` reports `Ready`, which for the `a2a` transport means the agent card answered. This is
@@ -139,8 +145,9 @@ take a turn.
   shape one layer up, and C-160's line vocabulary
   ([ndjson-agent-protocol.md](ndjson-agent-protocol.md)) is the wire.
 
-For `proc://flux`, the child is `flux app run --serve 127.0.0.1:0` on an ephemeral port; the parent
-learns the port from the child's first stdout line and then speaks ordinary A2A to loopback.
+For the shipped process runtime, the child is `flux app run --serve=<loopback-address>` on the first
+available port in a bounded configured range. The parent waits for the child's canonical serving
+announcement and then returns the ordinary A2A endpoint.
 
 ## Discovery: the endpoint broker, with agents as a product
 
@@ -232,14 +239,16 @@ Three genuinely new authorities, each of which must be gated rather than assumed
 | ID | Story | Notes |
 |---|---|---|
 | [A-119](../stories/A-119-agent-fleet-runtime-epic.md) | **Epic** — agent fleet runtime | |
-| [A-120](../stories/A-120-flux-fleet-crate-and-agent-address.md) | The `flux-fleet` crate + `AgentAddress` | new crate ⇒ `flux-codegate` layer map |
-| [A-121](../stories/A-121-agent-runtime-port.md) | `AgentRuntime` port + `ExternalRuntime` + contract suite | |
-| [A-122](../stories/A-122-process-runtime.md) | `ProcessRuntime` over `flux-system` guarded spawn | ⚠ process-spawn authority |
-| [A-123](../stories/A-123-ndjson-transport.md) | NDJSON/stdio transport — `proc://claude`, `proc://codex` | needs C-160 |
+| [A-120](../stories/A-120-flux-fleet-crate-and-agent-address.md) | Original `flux-fleet` crate + `AgentAddress` cut | **superseded by C-243**; no new crate/URI |
+| [A-121](../stories/A-121-agent-runtime-port.md) | Original port shape | **superseded by C-243**; narrower port ships in `flux-runtime` |
+| [A-122](../stories/A-122-process-runtime.md) | Original process-runtime cut | **superseded/implemented by C-243** |
+| [A-123](../stories/A-123-ndjson-transport.md) | NDJSON/stdio worker transport | C-160/C-243 ship; ready without the old URI |
 | [A-124](../stories/A-124-docker-runtime.md) | `DockerRuntime` | |
 | [A-125](../stories/A-125-kubernetes-runtime.md) | `KubernetesRuntime` over the existing k8s plugin | |
 | [A-126](../stories/A-126-fleet-discovery-over-endpoint-broker.md) | Agents as an endpoint-broker product; `fleet.list` | |
-| [A-127](../stories/A-127-roles-carry-an-address.md) | Roles carry an address; `task` routes local/remote | ⚠ cap_scope across trust domains |
-| [A-128](../stories/A-128-fleet-lifecycle-ops-and-monitor.md) | `fleet.start`/`.stop`/`.status` + the monitor journey | |
+| [A-127](../stories/A-127-roles-carry-an-address.md) | Roles carry a typed fleet target; `task` routes local/remote | ⚠ cap_scope across trust domains |
+| [A-128](../stories/A-128-fleet-lifecycle-ops-and-monitor.md) | Monitor journey over shipped lifecycle ops | |
 
-Order: A-120 → A-121 → {A-122, A-126} → {A-123, A-124, A-125} → A-127 → A-128.
+Current order: A-123/A-124/A-125/A-126 are independently ready against C-160/C-243's shipped
+contracts. A-127 consumes A-126's target vocabulary; A-128 then joins discovery, worker liveness,
+task state and board recovery. None waits on a new crate or runtime-selecting URI.

@@ -3400,6 +3400,17 @@ impl Executor {
         self.ctx.execution_system()
     }
 
+    /// Host-stamped provenance for every dispatch record. Deliberately excludes the workspace and
+    /// endpoint: evidence needs to say whether bytes were locally observed or remotely reported,
+    /// without turning the audit trail into a new path/address disclosure surface.
+    fn execution_provenance(&self) -> Value {
+        let identity = self.ctx.execution_system().substrate_identity();
+        json!({
+            "kind": identity.kind,
+            "remotely_reported": identity.remotely_reported,
+        })
+    }
+
     fn record_dispatch_event(
         &self,
         kind: &str,
@@ -3411,6 +3422,7 @@ impl Executor {
         let mut data = serde_json::Map::from_iter([
             ("dispatch".to_string(), json!(dispatch)),
             ("tool".to_string(), json!(name)),
+            ("execution".to_string(), self.execution_provenance()),
             (
                 "elapsed_us".to_string(),
                 json!(started.elapsed().as_micros().min(u64::MAX as u128) as u64),
@@ -4116,6 +4128,7 @@ impl Executor {
                     PolicyCallerKind::Agent => "agent",
                     PolicyCallerKind::System => "system",
                 },
+                "execution": self.execution_provenance(),
             }),
         )];
         if intents.is_destructive() {
@@ -5098,6 +5111,53 @@ mod tests {
         assert!(lifecycle
             .iter()
             .all(|o| o.data["dispatch"] == lifecycle[0].data["dispatch"]));
+    }
+
+    /// C-439: evidence must distinguish a local observation from a remote substrate's report. The
+    /// provenance is host-stamped from the immutable selected system, never supplied by the tool or
+    /// inferred from result text.
+    #[tokio::test]
+    async fn dispatch_evidence_stamps_local_and_remote_substrate_provenance() {
+        async fn provenance(ctx: ToolContext) -> (Value, Value) {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(EchoTool));
+            let executor = Executor::new(
+                registry,
+                PermissionManager::new(),
+                Arc::new(AllowApprover),
+                ctx,
+            );
+            let result = executor.dispatch("echo", json!({"text": "hi"})).await;
+            assert!(!result.is_error);
+            let evidence = executor.evidence();
+            let call = evidence
+                .by_kind("tool_call")
+                .next()
+                .expect("tool_call evidence")
+                .data["execution"]
+                .clone();
+            let ended = evidence
+                .by_kind("tool.ended")
+                .next()
+                .expect("tool.ended evidence")
+                .data["execution"]
+                .clone();
+            (call, ended)
+        }
+
+        let local_ctx = test_ctx();
+        let local = provenance(local_ctx).await;
+        assert_eq!(local.0["kind"], "native");
+        assert_eq!(local.0["remotely_reported"], false);
+        assert_eq!(local.1, local.0, "call and result provenance must agree");
+
+        let native = test_ctx().execution_system();
+        let remote = Arc::new(flux_system::remote::RemoteSystem::loopback(native));
+        let remote_ctx = test_ctx().with_execution_system(remote);
+        let remote = provenance(remote_ctx).await;
+        assert_eq!(remote.0["kind"], "loopback/native");
+        assert_eq!(remote.0["remotely_reported"], true);
+        assert_eq!(remote.1, remote.0, "call and result provenance must agree");
     }
 
     fn test_ctx() -> ToolContext {

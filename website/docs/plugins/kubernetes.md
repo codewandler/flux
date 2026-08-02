@@ -15,6 +15,15 @@ The plugin drives the **`kubectl` CLI** through the host's process capability. I
 Kubernetes API of its own and declares no auth purpose: your kubeconfig is what authenticates, and
 `kubectl` must be on `PATH`.
 
+:::important Managing Kubernetes is not worker placement
+This plugin manages resources in an existing cluster. It **does not place guarded effects** in a pod,
+and it does not implement the proposed `KubernetesRuntime` that would start a whole fleet worker as a
+pod. In agent `--remote` mode, native plugins are currently hidden and refused rather than executed
+locally as a fallback. To land core file/process/network effects in a pod today, deploy the generic
+[`flux system serve` remote system](../remote-system-deployment.md) there; that is a BYO deployment,
+not Kubernetes provisioning by Flux.
+:::
+
 ## 1. Install
 
 ```bash

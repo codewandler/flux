@@ -2,11 +2,11 @@
 id: A-122
 title: ProcessRuntime — fork an agent through flux-system's guarded spawn
 pillar: Agent
-status: backlog
+status: done
 epic: agent-fleet-runtime
 design: docs/designs/agent-fleet-runtime.md
 areas: [flux-fleet, flux-system]
-note: "⚠ process-spawn authority — this is bash-class power; it must be opt-in and subject-scoped, never ambient"
+note: "SUPERSEDED and implemented by C-243: ProcessRuntime plus fleet.start/worker_status/stop ship through guarded spawn with bounded nesting and worker count"
 ---
 
 # ProcessRuntime — fork an agent through flux-system's guarded spawn
@@ -36,7 +36,11 @@ weaker one.
       restarted worker answers `tasks/get` with not-found for everything it ever did.
 
 ## Progress
-- (not started)
+
+- Closed as superseded and implemented by C-243. The implementation chose a bounded loopback port
+  range rather than `:0`, returns only after the served child announces readiness, uses
+  `spawn_background`, inherits sandbox posture, binds a persistent A2A context id, kills on drop,
+  and bounds recursive workers. C-243 owns the reviewed acceptance and regression suite.
 
 ## Notes
 - Design: [agent-fleet-runtime.md](../designs/agent-fleet-runtime.md) — "`ProcessRuntime` reuses two
