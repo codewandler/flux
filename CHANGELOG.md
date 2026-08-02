@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-08-03
+
 ### Added
 
 - **Release-matched interactive engineering presentation (C-491).** `/flux/presentation/` is a

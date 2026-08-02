@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.53.0] - 2026-08-03
+
 ### New
 
 - **Present Flux to your engineering team from the docs.** The new 15-minute presentation explains
