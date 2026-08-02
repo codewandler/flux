@@ -2,7 +2,7 @@
 id: C-399
 title: "A remote implementation of the guarded-IO port"
 pillar: Core
-status: ready
+status: in-progress
 priority: 4
 design: docs/designs/execution-substrate.md
 epic: execution-substrate

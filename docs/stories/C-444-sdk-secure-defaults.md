@@ -2,7 +2,7 @@
 id: C-444
 title: "`auto_approve(true)` does not imply confinement, and SDK resource ceilings are unbounded by default"
 pillar: Core
-status: ready
+status: in-progress
 priority: 3
 design: docs/designs/pi-comparison-remediation.md
 epic: pi-comparison-remediation

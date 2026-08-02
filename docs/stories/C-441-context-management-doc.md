@@ -2,7 +2,7 @@
 id: C-441
 title: "A context-management section — the question every user asks, answered nowhere"
 pillar: Core
-status: ready
+status: in-progress
 priority: 5
 design: docs/designs/docs-completeness.md
 epic: docs-completeness
