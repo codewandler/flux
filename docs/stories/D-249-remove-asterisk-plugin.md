@@ -2,7 +2,7 @@
 id: D-249
 title: "Remove Asterisk from Flux after moving ARI to connectors"
 pillar: Agent
-status: in-progress
+status: done
 priority: 1
 design: docs/designs/asterisk-ari.md
 epic: asterisk-ari
@@ -30,7 +30,7 @@ mistaken ARI implementation. Asterisk ARI is an API-spec-generated REST connecto
       storage and bounded response reading remain.
 - [x] Protocol/host-kit/plugin-pack versions follow their independent breaking-release contract and
       lockfiles/goldens are regenerated.
-- [ ] Root and nested-plugin gates pass, engineering/customer changelogs explain the correction, and
+- [x] Root and nested-plugin gates pass, engineering/customer changelogs explain the correction, and
       corrective core and plugin-pack releases are cut and watched green.
 - [x] The user-owned dirty `docs/stories/C-163-plugin-commands-and-host-ui.md` in the primary checkout
       is never touched; all work runs from the isolated clone at exact base `1f6146ea`.
@@ -47,6 +47,12 @@ mistaken ARI implementation. Asterisk ARI is an API-spec-generated REST connecto
 - 2026-08-02: source-breaking removals move `codewandler-flux-plugin-protocol` and host-kit to
   2.0.0 and the pack to 0.2.0. The wire marker deliberately remains `flux.plugin.v1`: serde ignores
   the retired optional key, and the compatibility test proves old non-Asterisk manifests load.
+- 2026-08-02: root build/test/Clippy/format/codegate and the nested plugin workspace's
+  build/test/Clippy/format gates passed. Flux v0.52.0 release run 30758984304 and crates.io run
+  30758984277 completed successfully; the transient no-backend CI failure passed on attempt 2.
+- 2026-08-02: plugin-pack run 30759474628 published `plugins-v0.2.0` and
+  `codewandler-flux-host-kit` 2.0.0. `gh release view` measured 92 assets—18 remaining plugin
+  binaries across five targets plus the signed index pair—and zero Asterisk-named assets.
 
 ## Notes
 
