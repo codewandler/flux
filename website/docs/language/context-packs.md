@@ -87,6 +87,9 @@ extra`.
 
 ## Related docs
 
+- [Context management](../agent/context-management.md) — the session-level counterpart: what happens
+  to a conversation's history as it grows. A `ctx` pack bounds one model call; compaction bounds the
+  transcript.
 - [Pure data shaping](./pure-data.md) — the other pure-node family.
 - [Operations](./ops.md) — model-facing cognition ops that consume packs.
 - [Execution model](./execution-model.md) — how symbols and values are stored.
