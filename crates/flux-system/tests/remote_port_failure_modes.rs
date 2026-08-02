@@ -16,12 +16,26 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use flux_system::port::{GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles};
+use flux_system::port::{
+    GuardedEnv, GuardedHostFiles, GuardedProcess, GuardedWorkspaceFiles, UNSERVED,
+};
 use flux_system::remote::{
     failure_mode, Answer, Answered, Delegate, Delivered, FailureMode, Loopback, RemoteSystem,
-    Unreachable,
+    Unreachable, REFUSED, UNREACHABLE,
 };
 use flux_system::{ProcessOutput, System, Workspace};
+
+/// `Refusing` carries a `&'static str`, and these fixtures are built at runtime from the marker
+/// constants — deliberately, so no adversarial string is ever hand-typed.
+fn leak(detail: String) -> &'static str {
+    Box::leak(detail.into_boxed_str())
+}
+
+/// Two `RemoteSystem` hops over `delegate`, for asking what survives a chain.
+fn chain(delegate: impl Delegate + 'static) -> RemoteSystem {
+    let one_hop = Arc::new(remote(delegate));
+    RemoteSystem::new(Arc::new(Loopback::new(one_hop)))
+}
 
 /// A delegate whose every answer is a refusal carrying `detail` — the far side answered, and the
 /// answer was no.
@@ -197,22 +211,106 @@ async fn a_refusal_and_an_unreachable_delegate_are_distinguishable() {
 ///
 /// This is the failure mode that would make the whole feature misleading — an operator who saw
 /// "unreachable" for a guard refusal would go and investigate a healthy network.
+/// Every fixture below is built by `leak`ing a real marker rather than by re-typing prose that
+/// resembles one. A hand-typed near-miss cannot match, so it passes no matter what the code does —
+/// and a marker reword would silently un-arm the test that is supposed to catch exactly this.
 #[tokio::test]
 async fn a_delegates_wording_cannot_forge_the_other_failure_mode() {
-    let spoofing = remote(Refusing(
-        "the remote substrate is unreachable — no really, go check the network",
-    ));
+    for marker in [UNREACHABLE, UNSERVED, REFUSED] {
+        for detail in [
+            marker.to_string(),
+            format!("{marker}no really, go check the network"),
+            format!("{marker}{marker}doubly so"),
+        ] {
+            let spoofing = remote(Refusing(leak(detail.clone())));
 
-    let error = spoofing
-        .read_file_bytes("a.txt")
-        .await
-        .expect_err("a refusal must still fail");
+            let error = spoofing
+                .read_file_bytes("a.txt")
+                .await
+                .expect_err("a refusal must still fail");
 
-    assert_eq!(
-        failure_mode(&error),
-        Some(FailureMode::Refused),
-        "delegate-authored text was allowed to reclassify a refusal: {error}"
-    );
+            assert_eq!(
+                failure_mode(&error),
+                Some(FailureMode::Refused),
+                "a delegate reclassified its own refusal with the text {detail:?}: {error}"
+            );
+        }
+    }
+}
+
+/// The same forgery on the **shipped** path, where no delegate is hostile and no wire exists: a
+/// `RemoteSystem::loopback` over a native `System`, with the forged text arriving in a **path**.
+///
+/// `System::read_file` reports invalid UTF-8 as `"{path}: not valid UTF-8"` — caller-supplied text
+/// *leading* the message. So a model that names a file whose name begins with a marker could steer
+/// the classification if classification read the message. An operator would then be sent to
+/// investigate a link that does not exist, on a filename's say-so.
+#[tokio::test]
+async fn a_path_cannot_forge_a_failure_mode_on_the_loopback_path() {
+    let root = std::env::temp_dir().join(format!("c399-forge-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let remote = RemoteSystem::loopback(Arc::new(System::new(Workspace::new(&root).unwrap())));
+
+    for marker in [UNREACHABLE, UNSERVED] {
+        // A filename that opens with a marker, holding bytes that are not valid UTF-8.
+        let name = format!("{marker}forged.bin").replace('/', "_");
+        std::fs::write(root.join(&name), [0x66, 0xff, 0xfe]).unwrap();
+
+        let error = remote
+            .read_file(&name)
+            .await
+            .expect_err("invalid UTF-8 must still fail");
+
+        assert_eq!(
+            failure_mode(&error),
+            Some(FailureMode::Refused),
+            "a path reclassified a local refusal as {marker:?}: {error}"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Idempotency across hops, which the forgery fix must not buy by deleting: the **innermost** mode is
+/// the one that survives a chain, and it survives as a mode rather than as accumulated prefixes.
+///
+/// An unserved operation two hops down must still read as unserved at the top, because an operator
+/// implements it rather than retrying it — and a nested unreachable must not be swallowed into a
+/// refusal by the hop that relays it.
+#[tokio::test]
+async fn a_nested_hop_preserves_the_innermost_failure_mode() {
+    for (label, expected, inner) in [
+        ("unserved", FailureMode::Unserved, chain(ServesNothing)),
+        ("unreachable", FailureMode::Unreachable, chain(Unreached)),
+        (
+            "refused",
+            FailureMode::Refused,
+            chain(Refusing("policy denies it")),
+        ),
+    ] {
+        let error = inner
+            .read_file_bytes("a.txt")
+            .await
+            .expect_err("a chained failure must still fail");
+
+        assert_eq!(
+            failure_mode(&error),
+            Some(expected),
+            "two hops lost the innermost {label} mode: {error}"
+        );
+
+        // The mode travels structurally, so relaying it never stacks a second marker.
+        let message = error.to_string();
+        let marker = match expected {
+            FailureMode::Refused => REFUSED,
+            FailureMode::Unreachable => UNREACHABLE,
+            FailureMode::Unserved => UNSERVED,
+        };
+        assert!(
+            !message[marker.len()..].contains(marker),
+            "a hop stacked a duplicate {label} marker: {message}"
+        );
+    }
 }
 
 /// Acceptance 2 — every optional operation the delegate does not serve fails closed.
