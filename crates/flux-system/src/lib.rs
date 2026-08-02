@@ -139,6 +139,7 @@ pub mod net;
 pub mod port;
 pub mod remote;
 pub mod sandbox;
+pub mod secret_scope;
 
 use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};
 

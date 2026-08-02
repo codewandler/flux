@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The documented HTTP secret allowlist now reaches the CLI's real web tool** (C-464). A new
+  `[web] allowed_secrets` config table carries bare or C-459-scoped entries into `http.request`;
+  absent config preserves `FLUX_WEB_SECRET_ALLOW`, while an explicit empty list remains deny-all.
+  The environment form is now public documentation instead of a live control hidden from the
+  reference. A binary-level test pins the complete config → tool → guarded request path.
+
 - **Every guarded-IO port backend is now review-enumerated** (C-467). The codegate previously
   recognized process, host-file and environment backends but silently ignored
   `GuardedWorkspaceFiles`, the trait that claims workspace confinement. It now rejects an
@@ -26,6 +32,14 @@ All notable changes to this project are documented in this file. The format is b
   provider construction.
 
 ### Added
+
+- **Named HTTP secrets can now carry destination, principal, and placement scopes** (C-459).
+  `http.request` allowlist entries accept `NAME;to=<host>;by=<principal>;in=header|query`; every
+  declared axis denies non-matching uses before the environment value is read, and redirects are
+  re-authorized at every hop. Destination authorization uses a private-field token minted only by
+  the egress guard alongside the exact connection pins, so callers cannot assert that an arbitrary
+  hostname/address pair was vetted. Bare names retain their previous unscoped behavior and are
+  explicitly reportable as unscoped.
 
 - **The guarded-IO port now has a local-first delegating backend** (C-399). `RemoteSystem` hands
   process, environment, host-file and workspace-file operations to a `Delegate`, while `Loopback`

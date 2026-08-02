@@ -88,12 +88,19 @@ pub struct WebOptions {
     /// `PATH` discovery).
     pub browser_bin: Option<String>,
     /// Allowlist of environment-variable names that `http.request` may resolve via a
-    /// `{"$secret": "NAME"}` header reference. This is a security boundary: without it a
+    /// `{"$secret": "NAME"}` header or query reference. This is a security boundary: without it a
     /// prompt-injected model could exfiltrate *any* process env var (`AWS_SECRET_ACCESS_KEY`,
     /// `GITHUB_TOKEN`, …) to an arbitrary host in one unapproved call. `None` (the default) means
-    /// "fall back to the `FLUX_WEB_SECRET_ALLOW` env var" (comma/whitespace-separated names);
+    /// "fall back to the `FLUX_WEB_SECRET_ALLOW` env var" (comma/whitespace-separated entries);
     /// `Some(vec![])` is an explicit **deny-all**. A name absent from the resolved list is refused
     /// before its value is ever read. See story C-76.
+    ///
+    /// Since C-459 an entry may also carry the **scope** the secret is granted under —
+    /// `NAME;to=<host>;by=<principal>;in=header|query`, parsed by
+    /// [`flux_system::secret_scope::SecretAllowlist`]. Each declared axis is default-deny and the
+    /// destination is matched against the address the egress guard vetted, never the hostname the
+    /// caller typed. A bare `NAME` stays valid and unscoped, so an existing allowlist keeps its
+    /// exact meaning.
     pub allowed_secrets: Option<Vec<String>>,
 }
 

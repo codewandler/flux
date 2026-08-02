@@ -97,6 +97,23 @@ impl PrivateNetConfig {
     }
 }
 
+/// Native web-operation settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Environment-variable names `http.request` may resolve from a `{"$secret": "NAME"}` marker.
+    /// Entries may carry C-459 scope parameters (`NAME;to=host;by=principal;in=header|query`).
+    /// `None` preserves the `FLUX_WEB_SECRET_ALLOW` fallback; `Some([])` is explicit deny-all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_secrets: Option<Vec<String>>,
+}
+
+impl WebConfig {
+    fn is_default(&self) -> bool {
+        self.allowed_secrets.is_none()
+    }
+}
+
 /// Endpoint-discovery / cross-plugin credential brokerage grants (D-27). Deny-by-default: a consumer
 /// plugin can only have a credential owned by a *different* provider plugin materialized on its behalf
 /// if an operator listed the `(consumer, provider)` pair here — exactly like the `process`/`conn`/
@@ -696,6 +713,9 @@ pub struct Config {
     /// Scoped private-network egress grants.
     #[serde(default, skip_serializing_if = "PrivateNetConfig::is_default")]
     pub private_net: PrivateNetConfig,
+    /// Native web-operation settings, including the `$secret` allowlist.
+    #[serde(default, skip_serializing_if = "WebConfig::is_default")]
+    pub web: WebConfig,
     /// Endpoint-discovery / cross-plugin credential brokerage grants (D-27).
     #[serde(default, skip_serializing_if = "EndpointConfig::is_default")]
     pub endpoint: EndpointConfig,
@@ -1220,6 +1240,13 @@ fn merge(user: Config, project: Config) -> Config {
         theme: project.theme.or(user.theme),
         allow_private_net: user.allow_private_net || project.allow_private_net,
         private_net: merge_private_net(user.private_net, project.private_net),
+        web: WebConfig {
+            allowed_secrets: match (user.web.allowed_secrets, project.web.allowed_secrets) {
+                (None, None) => None,
+                (Some(entries), None) | (None, Some(entries)) => Some(dedupe(entries)),
+                (Some(user), Some(project)) => Some(dedupe([user, project].concat())),
+            },
+        },
         endpoint: EndpointConfig {
             cross_plugin_credentials: dedupe(
                 [
@@ -1732,6 +1759,41 @@ mod tests {
     fn unknown_top_level_config_key_is_rejected() {
         let err = toml::from_str::<Config>("future_knob = true").unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn web_secret_entries_parse_with_their_scope_and_merge_without_dropping_either_layer() {
+        let user = toml::from_str::<Config>(
+            r#"
+[web]
+allowed_secrets = ["GITHUB_TOKEN;to=api.github.com;in=header"]
+"#,
+        )
+        .unwrap();
+        let project = toml::from_str::<Config>(
+            r#"
+[web]
+allowed_secrets = ["ISSUE_TOKEN;to=issues.example;by=alice"]
+"#,
+        )
+        .unwrap();
+
+        let merged = merge(user, project);
+        assert_eq!(
+            merged.web.allowed_secrets,
+            Some(vec![
+                "GITHUB_TOKEN;to=api.github.com;in=header".into(),
+                "ISSUE_TOKEN;to=issues.example;by=alice".into(),
+            ])
+        );
+        assert_eq!(
+            toml::from_str::<Config>("[web]\nallowed_secrets = []")
+                .unwrap()
+                .web
+                .allowed_secrets,
+            Some(Vec::new()),
+            "an explicit empty list must remain distinguishable from the env-fallback default"
+        );
     }
 
     /// C-290: a file-configured host reaches the runtime resource ceilings through `[limits]`,
