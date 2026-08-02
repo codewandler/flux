@@ -26,7 +26,8 @@ pub(super) async fn run_app_cmd(prompt: Vec<String>, flags: &AgentFlags) -> Resu
             prompt[1..].join(" ")
         );
     }
-    run_app(Some(path), flags, None).await
+    // `flux run <app.flux>` never serves, so there is no approval posture to select here.
+    run_app(Some(path), flags, None, false).await
 }
 
 /// A [`flux_plugin::SystemSource`] over the session's [`flux_runtime::WorkspaceContext`] (C-122):
@@ -370,10 +371,103 @@ pub(super) fn app_run_approver(auto_approve: bool) -> Arc<dyn Approver> {
     }
 }
 
+/// Which approval posture a **served** agent (`flux app run --serve`, no program) runs under.
+///
+/// The envelope is *authorization → approval → guarded IO*, and approval is the only stage with a
+/// human in it. Varying that stage is choosing a posture; removing either of the other two would be
+/// a bug. Both variants here are legitimate, and which is right is a property of the job:
+///
+/// - [`Unattended`](Self::Unattended) (`--yes`) — do not ask; let authorization policy, the
+///   fail-closed sandbox floor this surface is pinned to, and the resource budgets constrain
+///   instead. The right design for high-autonomy work (research, security hardening, long
+///   exploration), where stopping at every effect is a broken agent rather than a careful one.
+/// - [`Remote`](Self::Remote) (`--remote-approval`) — park each guarded effect and wait for a
+///   human's answer over `/approvals`. Silence denies.
+///
+/// ⚠ **What changed in C-453.** Before it, only the first was reachable: every approver in the tree
+/// was local, so a served agent could be `AllowApprover` or `DenyApprover` and nothing with a human
+/// in it. The no-flag form did not default to one of them — it refused to start — so an operator
+/// serving an agent today has been running the unattended posture, not because they weighed it but
+/// because it was the only one that would boot. The refusal still stands; it now names both choices
+/// rather than pointing at the single available one.
+#[derive(Debug)]
+pub(super) enum ServedApprovalPosture {
+    /// `--yes`: constrain through policy + sandbox + budget, never prompt.
+    Unattended,
+    /// `--remote-approval`: a human answers each guarded effect over the network. Holds the ONE
+    /// queue that both the engine's approver and the router's `/approvals` routes share.
+    Remote(Arc<flux_runtime::ApprovalQueue>),
+}
+
+impl ServedApprovalPosture {
+    /// Resolve the flags into exactly one posture, or refuse.
+    ///
+    /// ⚠ Neither flag is a refusal, not a default: a served agent's approval posture is a decision
+    /// with real consequences either way, and guessing it for the operator is how someone ends up
+    /// running unattended without having chosen to. Both flags together is also a refusal — they
+    /// are contradictory instructions, and silently letting one win would mean the operator's
+    /// command line and the server's behavior disagree.
+    pub(super) fn select(auto_approve: bool, remote_approval: bool) -> Result<Self> {
+        match (auto_approve, remote_approval) {
+            (true, true) => bail!(
+                "`--yes` and `--remote-approval` are opposite approval postures: `--yes` never \
+                 asks (policy, the sandbox floor and resource budgets do the constraining), while \
+                 `--remote-approval` asks a human over the network before each guarded effect. \
+                 Pick one"
+            ),
+            (true, false) => Ok(Self::Unattended),
+            (false, true) => Ok(Self::Remote(Arc::new(
+                flux_runtime::ApprovalQueue::from_env(),
+            ))),
+            (false, false) => bail!(
+                "`flux app run --serve` (no program) needs an approval posture — HTTP requests \
+                 have no terminal to prompt at, so one has to be chosen:\n  \
+                 --remote-approval   ask a human over the network before each guarded effect \
+                 (GET /approvals, POST /approvals/{{id}}); an effect nobody answers is denied\n  \
+                 --yes               never ask; authorization policy, the sandbox floor and \
+                 resource budgets constrain instead"
+            ),
+        }
+    }
+
+    /// The approver the served engine's executor runs its effects through.
+    pub(super) fn approver(&self) -> Arc<dyn Approver> {
+        match self {
+            Self::Unattended => Arc::new(AllowApprover),
+            Self::Remote(queue) => Arc::new(flux_runtime::RemoteApprover::new(Arc::clone(queue))),
+        }
+    }
+
+    /// The queue the router serves — the same `Arc` [`approver`](Self::approver) parks on.
+    pub(super) fn gate(&self) -> flux_server::ApprovalGate {
+        match self {
+            Self::Unattended => flux_server::ApprovalGate::none(),
+            Self::Remote(queue) => flux_server::ApprovalGate::serving(Arc::clone(queue)),
+        }
+    }
+
+    /// What the operator is told at startup. The posture must be **visible**: someone reading a log
+    /// six months from now should be able to tell whether a human was in the loop.
+    pub(super) fn announcement(&self) -> String {
+        match self {
+            Self::Unattended => "Approval posture: unattended (--yes) — every guarded effect is \
+                                 auto-approved; authorization policy, the sandbox floor and \
+                                 resource budgets are what constrain this agent."
+                .to_string(),
+            Self::Remote(queue) => format!(
+                "Approval posture: remote (--remote-approval) — each guarded effect waits up to \
+                 {}s for a decision at /approvals, and is DENIED if nobody answers.",
+                queue.timeout().as_secs()
+            ),
+        }
+    }
+}
+
 pub(super) async fn run_app(
     path: Option<&str>,
     flags: &AgentFlags,
     serve: Option<String>,
+    remote_approval: bool,
 ) -> Result<()> {
     use flux_lang::program::{ChannelDecl, Module, Program};
 
@@ -385,15 +479,12 @@ pub(super) async fn run_app(
                  built-in coding agent over HTTP/A2A)"
             )
         })?;
-        if !flags.yes {
-            bail!(
-                "`flux app run --serve` (no program) requires `--yes` (HTTP requests have no \
-                   interactive approver)"
-            );
-        }
-        // The coding agent auto-approves every tool call, so an unauthenticated listener is remote code
-        // execution. Require authentication for any non-loopback bind: per-request principal auth
-        // when `[server] introspect_url` is configured (D-69), else a bearer token (`FLUX_SERVER_TOKEN`).
+        let posture = ServedApprovalPosture::select(flags.yes, remote_approval)?;
+        // An unauthenticated listener is remote code execution against whatever posture the agent
+        // runs under — including the remote-approval one, where an anonymous caller could simply
+        // approve the agent's effects itself. Require authentication for any non-loopback bind:
+        // per-request principal auth when `[server] introspect_url` is configured (D-69), else a
+        // bearer token (`FLUX_SERVER_TOKEN`).
         let auth = server_auth_from_config()?;
         if matches!(auth, flux_server::ServerAuth::Open) && !addr_is_loopback(&addr) {
             bail!(
@@ -409,7 +500,13 @@ pub(super) async fn run_app(
         // own tests (`resolve_disabled_*` in flux-runtime, `disabled_ops_*` in flux-flow, and the
         // real-binary `tools_disable_unmatched_entry_warns_at_startup` in flux-cli's mock_smoke.rs —
         // that test drives `flux run`, which shares this exact function).
-        let (agent, _session_id, _spec, _spawner) = build_agent(flags).await?;
+        // C-453: the posture decides the approver the served engine is built with, and the queue
+        // (if any) the router serves. Both halves come from ONE value, so a server can never end up
+        // advertising `/approvals` for a queue the agent does not park on, or parking on a queue
+        // nobody serves.
+        eprintln!("{}", posture.announcement());
+        let (agent, _session_id, _spec, _spawner) =
+            build_agent_with_approver(flags, posture.approver()).await?;
         // C-126: this is the ONE `flux app run --serve` shape that shares the persistent,
         // file-backed `~/.flux/events.db` with occasional CLI turns on the same host (design doc
         // R1's "daemon + occasional CLI turns" topology, C-25's scenario) — a long-lived process
@@ -432,7 +529,7 @@ pub(super) async fn run_app(
                 }
             }
         });
-        let result = flux_server::serve(&addr, agent, auth).await;
+        let result = flux_server::serve_with_approvals(&addr, agent, auth, posture.gate()).await;
         checkpoint_task.abort();
         return result;
     };
@@ -883,6 +980,129 @@ mod app_run_approval_posture {
         assert!(
             matches!(choice, ApprovalChoice::Allow),
             "`flux app run --yes` must still auto-approve; this approver answered {choice:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod served_approval_posture {
+    //! C-453: the **served** agent's approval posture — `flux app run --serve` with no program.
+    //!
+    //! Two postures, both legitimate, neither a default. What is asserted here is the choosing: the
+    //! flags resolve to exactly one posture or to a refusal, the posture's two halves (the engine's
+    //! approver and the router's queue) are the same object, and the operator is told which one
+    //! they got.
+
+    use super::*;
+
+    use flux_runtime::ApprovalChoice;
+    use flux_spec::IntentSet;
+
+    /// ⚠ Neither flag is a refusal, not a silent default. An operator who does not say which
+    /// posture they want must not be given one — that is how someone ends up running unattended
+    /// without having weighed it.
+    #[test]
+    fn no_posture_flag_refuses_and_names_both_choices() {
+        let err = ServedApprovalPosture::select(false, false)
+            .expect_err("a served agent with no posture chosen must not start")
+            .to_string();
+        assert!(err.contains("--remote-approval"), "{err}");
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    /// ⚠ Contradictory instructions are a refusal, not a precedence rule: if one silently won, the
+    /// operator's command line and the server's behavior would disagree.
+    #[test]
+    fn both_posture_flags_refuse() {
+        let err = ServedApprovalPosture::select(true, true)
+            .expect_err("`--yes --remote-approval` are opposite postures")
+            .to_string();
+        assert!(err.contains("Pick one"), "{err}");
+    }
+
+    /// The `--yes` posture is unchanged and still explicit: it auto-approves, and it says so.
+    #[tokio::test]
+    async fn the_unattended_posture_still_auto_approves_and_announces_itself() {
+        let posture = ServedApprovalPosture::select(true, false).unwrap();
+        let choice = posture
+            .approver()
+            .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
+            .await;
+        assert!(
+            matches!(choice, ApprovalChoice::Allow),
+            "`--yes` must still auto-approve; answered {choice:?}"
+        );
+        let announcement = posture.announcement();
+        assert!(announcement.contains("unattended"), "{announcement}");
+        assert!(announcement.contains("--yes"), "{announcement}");
+    }
+
+    /// ⚠ The remote posture fails closed. Nobody is serving the queue in this test, which is the
+    /// worst case — and the worst case must be a denial.
+    ///
+    /// The queue is built here with a zero wait rather than through `select` + an env var: the
+    /// point is the *direction* of the fallback, not the clock, and mutating the process
+    /// environment from one test in a parallel suite is how a neighbouring test starts flaking.
+    #[tokio::test]
+    async fn the_remote_posture_denies_when_nobody_answers() {
+        let posture = ServedApprovalPosture::Remote(Arc::new(
+            flux_runtime::ApprovalQueue::new(std::time::Duration::ZERO),
+        ));
+        let choice = posture
+            .approver()
+            .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
+            .await;
+        assert!(
+            matches!(choice, ApprovalChoice::Deny),
+            "⚠ an unanswered remote approval must deny; answered {choice:?}"
+        );
+    }
+
+    /// ⚠ The two halves must be ONE queue. A router serving a different queue than the engine parks
+    /// on would list nothing forever while every effect timed out — safe, silently useless, and
+    /// indistinguishable from "the agent is idle". Asserted by pushing a request through the
+    /// approver and reading it back out of the gate, rather than by comparing handles, so a future
+    /// indirection that copied the queue instead of sharing it would still be caught.
+    #[tokio::test]
+    async fn the_approver_and_the_served_gate_share_one_queue() {
+        let posture = ServedApprovalPosture::select(false, true).unwrap();
+        let ServedApprovalPosture::Remote(queue) = &posture else {
+            panic!("`--remote-approval` must select the remote posture");
+        };
+        let approver = posture.approver();
+        let asking = tokio::spawn(async move {
+            approver
+                .request("write", &["report.txt".to_string()], &IntentSet::default())
+                .await
+        });
+
+        // Read it back through the queue the ROUTER would be handed.
+        let gate_queue = Arc::clone(queue);
+        let request = loop {
+            match gate_queue.pending().into_iter().next() {
+                Some(request) => break request,
+                None => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
+            }
+        };
+        assert_eq!(request.subjects, vec!["report.txt".to_string()]);
+        gate_queue
+            .decide(&request.id, &request.fingerprint, ApprovalChoice::Allow)
+            .expect("the gate's queue is the approver's queue");
+        assert!(matches!(asking.await.unwrap(), ApprovalChoice::Allow));
+    }
+
+    /// The posture is visible at startup, including how long an operator has to answer — a log six
+    /// months from now should say whether a human was in the loop.
+    #[test]
+    fn the_remote_posture_announces_its_deadline() {
+        let announcement = ServedApprovalPosture::select(false, true)
+            .unwrap()
+            .announcement();
+        assert!(announcement.contains("remote"), "{announcement}");
+        assert!(announcement.contains("/approvals"), "{announcement}");
+        assert!(
+            announcement.contains("DENIED"),
+            "the fail-closed behaviour must be stated where the operator reads it: {announcement}"
         );
     }
 }

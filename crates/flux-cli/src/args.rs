@@ -662,12 +662,21 @@ pub(super) enum AppAction {
         program: Option<String>,
         /// Expose an agent over the HTTP/A2A API at this address (defaults to `127.0.0.1:8787`). With a
         /// program, serves its agent; with none, serves the built-in coding agent — that no-program
-        /// form requires `--yes` (HTTP requests have no interactive approver). Give `<program>` BEFORE
-        /// a bare `--serve` (`flux app run prog.flux --serve`) or attach a custom address with `=`
-        /// (`--serve=0.0.0.0:8787`) — `--serve <addr>` followed by a program path swallows the path as
-        /// the address instead (clap's usual optional-value-flag ambiguity).
+        /// form needs an approval posture chosen: `--yes` or `--remote-approval`. Give `<program>`
+        /// BEFORE a bare `--serve` (`flux app run prog.flux --serve`) or attach a custom address with
+        /// `=` (`--serve=0.0.0.0:8787`) — `--serve <addr>` followed by a program path swallows the path
+        /// as the address instead (clap's usual optional-value-flag ambiguity).
         #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:8787")]
         serve: Option<String>,
+        /// Ask a human, over the network, before each guarded effect (C-453). Parks every call that
+        /// needs approval and serves it at `GET /approvals`; answer with `POST /approvals/{id}`.
+        /// An effect nobody answers within `FLUX_APPROVAL_TIMEOUT_SECS` (default 120) is DENIED.
+        ///
+        /// This is the posture with a human in it. The alternative is `--yes` — do not ask, and let
+        /// authorization policy, the sandbox floor and resource budgets do the constraining, which
+        /// is the right design for high-autonomy work. Pick one; they contradict each other.
+        #[arg(long, requires = "serve")]
+        remote_approval: bool,
     },
 }
 

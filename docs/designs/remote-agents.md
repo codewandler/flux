@@ -1,6 +1,6 @@
 # Design: Remote agents — run the agent here, land the effects there
 
-**Status:** proposed · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md)
+**Status:** proposed · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md) · [C-453](../stories/C-453-a-remote-approval-channel.md)
 
 ## Why
 
@@ -101,6 +101,68 @@ unattended runs default to it since C-410) · **local runtime, containerized ops
 **hosted / multi-tenant** (flux-exchange). ⚠ Every row must carry its status, and `ssh` must be named as
 a legitimate option — a page that hides the free alternative to make the product look necessary is not
 credible about anything else on it.
+
+### C-453 — the approval stage, over a network
+
+**Shipped.** `flux app run --serve --remote-approval` parks each guarded effect at `GET /approvals`
+and waits for `POST /approvals/{id}`. Implemented as `flux_runtime::RemoteApprover` — one more
+implementation of the existing `Approver` contract, not a second approval concept — plus the
+`ApprovalGate` the server mounts those two routes over.
+
+⚠ **State what shipped before, because an operator is running it right now.** The envelope is
+**authorization → approval → guarded IO**, and approval is the only one of the three with a *human*
+in it. Which posture that stage runs under is a real choice, and both answers are defensible:
+
+| posture | who decides an effect | when it is the right answer |
+|---|---|---|
+| **unattended** (`--yes`) | nobody is asked; authorization policy, the fail-closed sandbox floor this surface is pinned to (C-410), and resource budgets constrain instead | high-autonomy work — research, security hardening, long exploration — where stopping at every effect is a broken agent, not a careful one |
+| **remote approval** (`--remote-approval`, C-453) | a human, over the network, per effect | anything whose effects you would want to see before they land |
+| **refuse** (`DenyApprover`) | nothing outside what was pre-authorised runs | a program surface with no operator attached |
+
+The hole was not that flux shipped the wrong posture. It was that **a served agent could not choose
+one.** Every approver in the tree was local — `StdinApprover` (a terminal), the TUI's
+`ChannelApprover` (an *in-process* channel), `SubAgentApprover` (headless policy) — and `grep` for
+approval across `flux-server` and `flux-a2a` returned nothing. So the served surface offered
+`AllowApprover` or `DenyApprover`, and since the no-flag form refused to boot, **an operator serving
+an agent today has been running the unattended posture** — reasonably, but not because they weighed
+it against an alternative that existed.
+
+⚠ And "refuse everything" was never quite that. C-440 traced two paths around it on the *program*
+form: `assemble_integrations` spawns every installed plugin binary at startup, before any journey
+exists and without consulting an approver; and a program declaring no capability policy dispatches
+under `LEGACY_JOURNEY_ALLOW`, whose pre-authorised ops resolve to `Allow` and never reach an approver
+either. That is why `flux app run` is pinned to the sandbox floor in its own right (C-410), and it
+is unchanged by C-453 — the remote approver governs the effects that reach the approval stage, which
+is not all of them on the program form.
+
+**The four things it has to get right, and how each is held:**
+
+1. **Silence denies.** Every non-answer — timeout, no transport, a disconnected transport, a
+   cancelled turn — resolves to `Deny`. A channel that allowed on silence would be *worse* than
+   `AllowApprover`, because it would look like a control. Pinned by
+   `an_effect_nobody_answers_is_refused`.
+2. **An approval is bound to the effect it was granted for.** A decision must echo the request's
+   `fingerprint`, which is the canonical form of the effect **itself, not a digest of it** — so
+   there is no collision to hunt for, and a `yes` shown for `write → notes.txt` cannot be delivered
+   against `write → credentials.txt`. Pinned by
+   `an_approval_cannot_be_delivered_against_a_different_effect`. This is also why `request_plan` is
+   overridden rather than inherited: the trait default renders a whole plan as `N op(s) · summary`,
+   so two unrelated plans sharing a count and a summary would share a fingerprint.
+3. **Single use.** Answering removes the request; a replay finds nothing. Pinned by
+   `a_replayed_decision_is_refused`.
+4. **Who may answer is who may authenticate.** The routes sit inside the server's auth layer, and an
+   unauthenticated non-loopback bind is still refused at router construction. A decision endpoint
+   outside auth would be strictly worse than having no approval stage. Pinned by
+   `answering_an_approval_requires_authentication`.
+
+**Deliberately not built:** a remote `AllowAlways`. Standing grants are not wrong — that is what the
+unattended posture *is* — but accumulating one click by click is a posture nobody chose. And there
+is no "wait forever" timeout: an unbounded wait is not a denial, it is a wedged turn.
+
+**The road not taken.** Anthropic's Managed Agents solve the same problem by not having per-effect
+approval at all — the caller steers or interrupts. That is a coherent design and, for high-autonomy
+work, often the better one; it is the same thing flux's unattended posture offers. What C-453 adds
+is the *choice*, not a verdict about which choice is correct.
 
 ### C-439 — trusting a remote substrate
 

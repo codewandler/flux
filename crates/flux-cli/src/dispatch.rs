@@ -714,8 +714,9 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                         agent,
                         program,
                         serve,
+                        remote_approval,
                     },
-            }) => run_app(program.as_deref(), &agent, serve).await,
+            }) => run_app(program.as_deref(), &agent, serve, remote_approval).await,
             Some(Commands::Flow {
                 action: FlowAction::List,
             }) => run_flow_list(),

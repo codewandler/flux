@@ -53,7 +53,7 @@ flag breaks the build rather than quietly turning a documented topology into a l
 | [Local, OS-sandboxed](#local-os-sandboxed) | **ships** on Linux and macOS | your machine | your machine, confined | your machine; only the workspace is writable | your terminal |
 | [Local runtime, containerized ops](#local-runtime-containerized-ops) | **proposed** | your machine | a container | undecided | your terminal |
 | [Local runtime, remote system](#local-runtime-remote-system) | **proposed** | your machine | the remote host | undecided — the open question | your terminal, which is the whole point |
-| [Served agent, thin client](#served-agent-thin-client) | **ships**, with no approval boundary | the server | the server | the server's | **nowhere** — a served agent auto-approves |
+| [Served agent, thin client](#served-agent-thin-client) | **ships** | the server | the server | the server's | your choice: over the network (`--remote-approval`), or nowhere (`--yes`) |
 | [Embedded in your program](#embedded-in-your-program) | **ships** | your process | your process | your process's working dir | whichever approver you install |
 | [Portable WebAssembly](#portable-webassembly) | **partial** — language core only | the embedder | nothing; there is no host authority | none | none; there is nothing to approve |
 | [Hosted / multi-tenant](#hosted-multi-tenant) | **partial**, and early | flux-exchange | flux-exchange, HTTP only | not applicable | not applicable |
@@ -163,27 +163,70 @@ topology has to beat.
 
 **Status: ships** — both halves, server and client.
 
-⚠ **Read this before choosing it: a served agent has no approval boundary, and cannot have one
-today.** Every approver flux ships is local — the terminal prompt, the TUI modal, the sub-agent
-approver. **No approver in the tree speaks over a network.** So a served agent's only settings are
-*approve everything* or *approve nothing*: it runs auto-approved, and the alternative is a
-configuration that refuses every guarded operation. There is no middle position where a human is
-asked. This is the single fact that decides whether this topology is right for you.
+Here the *whole* agent runs elsewhere — planning, model calls, tools — and you talk to it. This is
+the Docker-CLI shape: a thin client, and the far side does everything.
 
-What stands in for approval is the mandatory sandbox floor on the serving surface plus whatever
-capability policy the program declares — mechanisms, not a person. Treat the endpoint's
-authentication as the real boundary, and do not serve one onto a network you do not control.
+### Choose the approval posture — it is not chosen for you
 
-With that said: here the *whole* agent runs elsewhere — planning, model calls, tools — and you talk
-to it. This is the Docker-CLI shape: a thin client, and the far side does everything.
-
-Serve one:
+flux's envelope is **authorization → approval → guarded IO**. Approval is the only one of those
+three with a *human* in it, so which posture it runs under is a decision, and both answers are
+legitimate:
 
 ```sh
-flux app run --serve 127.0.0.1:8787
+# Ask me, over the network, before each guarded effect.
+flux app run --serve 127.0.0.1:8787 --remote-approval
+
+# Do not ask. Constrain through policy, the sandbox floor and budgets instead.
+flux app run --serve 127.0.0.1:8787 --yes
 ```
 
-That exposes a `/.well-known/agent-card.json` discovery card, `POST /a2a` JSON-RPC with
+There is no default. Starting a served agent without one of those flags is refused, because
+guessing is how someone ends up unattended without meaning to.
+
+**`--remote-approval`** parks every guarded effect and waits for a human:
+
+```sh
+curl -s localhost:8787/approvals
+# { "approvals": [ { "id": "ap_…", "fingerprint": "…", "tool": "write",
+#                    "subjects": ["report.txt"], "mutating": true, … } ],
+#   "timeout_secs": 120 }
+
+curl -s -X POST localhost:8787/approvals/ap_… \
+  -H 'content-type: application/json' \
+  -d '{"fingerprint":"…","decision":"allow"}'
+```
+
+Three properties worth knowing before you build a client against it:
+
+- **An effect nobody answers is denied.** The wait is `FLUX_APPROVAL_TIMEOUT_SECS` (default 120),
+  and there is no "wait forever" — an unbounded wait is a wedged turn, not a decision.
+- **You must echo the `fingerprint`.** It is the effect in canonical form, and it is what binds your
+  `yes` to the effect you were shown; a decision that names a different one is refused with `409`.
+  A decision is also single-use, so it cannot be replayed onto the next effect.
+- **Only authenticated callers may answer.** The routes sit behind the server's auth, and an
+  unauthenticated non-loopback bind is refused outright — anyone who can approve the agent's effects
+  can make it do anything it is authorized to do.
+
+**`--yes`** never asks. That is not safety switched off: authorization policy, the mandatory
+fail-closed sandbox floor on this surface, and the resource budgets are still doing the
+constraining, and for high-autonomy work — research, security hardening, long exploration — that is
+often the *better* design. Interrupting an agent for every effect is not caution if nobody is going
+to read the prompts.
+
+Either way, treat the endpoint's authentication as a real boundary and do not serve one onto a
+network you do not control.
+
+:::note What this looked like before
+Until this landed, no approver in flux spoke over a network — every one was local (the terminal
+prompt, the TUI modal, the sub-agent approver). A served agent therefore had no posture to pick: it
+was `--yes` or it did not start. **If you are running a served agent today, you have been running
+the unattended posture.** That may well still be the right one for your job — but it is now
+something you choose rather than something that was chosen for you.
+:::
+
+### The rest of the surface
+
+Either posture exposes a `/.well-known/agent-card.json` discovery card, `POST /a2a` JSON-RPC with
 `message/send` and `message/stream`, and a session REST subtree (`POST /sessions`,
 `GET /sessions/{id}`, `POST /sessions/{id}/messages`, plus an SSE stream). See
 [HTTP API](./agent/http-api.md) and [A2A](./agent/a2a.md).
@@ -198,13 +241,14 @@ With no prompt it opens an interactive session against the remote agent instead.
 
 - **Where your files are:** the server's. The agent edits the tree *it* was started in; your local
   files are not in the picture at all.
-- **Where the approval prompt appears:** ⚠ **nowhere** — see the caveat above. Allow everything or
-  deny everything; there is no third setting.
+- **Where the approval prompt appears:** wherever your client puts it. Under `--remote-approval`
+  the server parks each effect at `/approvals` and it is your client's job to show it to a human;
+  under `--yes` nobody is asked.
 - **Good for:** giving a team or another agent access to one configured agent; agent-to-agent work.
-- **What it costs:** you give up the approval prompt and the model choice, and the credentials live
-  on the server. If what you wanted was "my approval, someone else's blast radius", this is the
-  wrong row — that is [local runtime, remote system](#local-runtime-remote-system), which is not
-  built.
+- **What it costs:** the model choice and the credentials live on the server, and under
+  `--remote-approval` every guarded effect costs a network round trip and a human. If what you
+  wanted was "my terminal's approval prompt, someone else's blast radius", this is still the wrong
+  row — that is [local runtime, remote system](#local-runtime-remote-system), which is not built.
 
 ## Embedded in your program {#embedded-in-your-program}
 
