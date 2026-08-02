@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.51.1] - 2026-08-02
+
 ### Added
 
 - **The Asterisk plugin now covers the complete official ARI 22.10.1 Swagger surface** (D-239…D-248).

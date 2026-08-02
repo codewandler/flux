@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.51.1] - 2026-08-02
+
 ### New
 
 - **Control Asterisk through its complete REST interface, including live events and recordings.**
