@@ -162,6 +162,9 @@ Long sessions are summarized once they exceed a character budget
 FLUX_COMPACT_CHARS=0 flux run "…"     # never compact (may hit the provider context limit)
 ```
 
+What compaction keeps, what it replaces, and what a compacted session looks like afterwards:
+[Context management](./agent/context-management.md).
+
 ## How do I resume a previous session?
 
 ```bash

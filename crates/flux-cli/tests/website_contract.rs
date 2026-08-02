@@ -1798,6 +1798,199 @@ fn board_pages_enumerate_every_generated_board_operation_and_query_row_field() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
+// The context-management page (C-441)
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+const CONTEXT_PAGE: &str = "website/docs/agent/context-management.md";
+
+/// C-441: the context-management page's numbers and knob names come off the code, not off prose.
+///
+/// The page exists because compaction's entire user-facing documentation was one row in a 500-line
+/// config table. The hazard in fixing that by writing a concept page is the usual one — a second
+/// copy of a value that then drifts from the constant. So every quantity the page states is read
+/// back out of the source that owns it: the threshold default off `DEFAULT_COMPACT_THRESHOLD_CHARS`,
+/// the per-result cap off `tool_output_cap`, and the message floor and keep count off
+/// `compaction_attempt` itself.
+///
+/// Two of these assertions are about *honesty* rather than coverage, and they are the ones worth
+/// keeping if this test is ever trimmed:
+///
+/// - the threshold is a **character** count, not a fraction of the model's context window
+///   (C-462 is filed against exactly that), so the page must not imply the latter; and
+/// - the summary **replaces** the live history, which changes what a later reader of the session
+///   sees — the page must say so rather than leave a user to discover it.
+#[test]
+fn context_management_page_matches_the_compaction_the_code_implements() {
+    let page = read(CONTEXT_PAGE);
+
+    // The threshold default, read off the constant that owns it rather than retyped. Both the
+    // grouped Rust spelling and the digit-grouped prose spelling are accepted — the page is prose.
+    let agent_src = read("crates/flux-agent/src/lib.rs");
+    let default_threshold: usize = agent_src
+        .split_once("pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = ")
+        .expect("DEFAULT_COMPACT_THRESHOLD_CHARS is declared in flux-agent")
+        .1
+        .split(';')
+        .next()
+        .expect("terminated constant")
+        .trim()
+        .replace('_', "")
+        .parse()
+        .expect("the compaction default is a number");
+    let grouped = |n: usize| {
+        let digits = n.to_string();
+        let mut out = String::new();
+        for (idx, ch) in digits.chars().enumerate() {
+            if idx > 0 && (digits.len() - idx).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(ch);
+        }
+        out
+    };
+    assert!(
+        page.contains(&grouped(default_threshold)) || page.contains(&default_threshold.to_string()),
+        "{CONTEXT_PAGE} never states the compaction default ({default_threshold}) the code uses"
+    );
+
+    // The per-result cap is the other half of what bounds the transcript, and it has the same
+    // one-row-in-a-table problem. Same treatment: read the default off the resolver.
+    let runtime_src = read("crates/flux-runtime/src/lib.rs");
+    let tool_cap: usize = runtime_src
+        .split_once("pub fn tool_output_cap() -> usize {")
+        .expect("tool_output_cap resolves the per-result cap")
+        .1
+        .split_once(".unwrap_or(")
+        .expect("tool_output_cap has a default")
+        .1
+        .split(')')
+        .next()
+        .expect("terminated default")
+        .trim()
+        .replace('_', "")
+        .parse()
+        .expect("the per-result cap default is a number");
+    assert!(
+        page.contains(&grouped(tool_cap)) || page.contains(&tool_cap.to_string()),
+        "{CONTEXT_PAGE} never states the per-result output cap ({tool_cap}) the code uses"
+    );
+
+    // Every knob the page names must be a variable shipped code actually reads, and must be
+    // documented in the reference the page links to rather than re-specified here.
+    let config = read("website/docs/reference/config.md");
+    for knob in [
+        "FLUX_COMPACT_CHARS",
+        "FLUX_TOOL_OUTPUT_CAP",
+        "FLUX_TURN_TOKEN_BUDGET",
+    ] {
+        assert!(
+            page.contains(knob),
+            "{CONTEXT_PAGE} omits `{knob}`, one of the controls that bounds context"
+        );
+        assert!(
+            config.contains(knob),
+            "website/docs/reference/config.md omits `{knob}` — the page links there for the value"
+        );
+    }
+
+    // The gates compaction actually applies, read off `compaction_attempt`. A page that says
+    // "at least four messages" while the code says three is worse than one that says neither.
+    let engine_src = read("crates/flux-flow/src/engine.rs");
+    let attempt = engine_src
+        .split_once("async fn compaction_attempt(")
+        .expect("compaction_attempt is the one compaction path")
+        .1;
+    assert!(
+        attempt.contains("if messages.len() < 4 {"),
+        "the message floor moved — update {CONTEXT_PAGE} and this assertion together"
+    );
+    assert!(
+        attempt.contains("let keep = 2.min(messages.len());"),
+        "the keep count moved — update {CONTEXT_PAGE} and this assertion together"
+    );
+    assert!(
+        attempt.contains("if self.compact_threshold_chars == 0 {"),
+        "`0` no longer disables compaction — update {CONTEXT_PAGE} and this assertion together"
+    );
+    for claim in ["four messages", "0"] {
+        assert!(
+            page.contains(claim),
+            "{CONTEXT_PAGE} must state the `{claim}` half of when compaction does not fire"
+        );
+    }
+
+    // C-462: the threshold counts characters of serialized history. It does NOT consult the
+    // model's context window — nothing in the tree does, since `TokenCounter` has no
+    // implementation. A page that implies a window fraction would be documenting a feature that
+    // does not exist, and would paper over the defect C-462 is filed for.
+    assert!(
+        page.contains("does not")
+            && (page.contains("context window") || page.contains("context-window")),
+        "{CONTEXT_PAGE} must say plainly that the threshold does not consult the model's context \
+         window (C-462), not imply it scales with the model"
+    );
+
+    // The claim a user is most surprised by, so the page carries it explicitly: compaction
+    // replaces the live history. `SessionLog::rewrite` is simultaneously the only
+    // history-replacement path and the only `Compacted` writer (C-443), which is what makes the
+    // "the superseded messages stay in the log" half true — pin both halves.
+    let log_src = read("crates/flux-events/src/session_log.rs");
+    assert!(
+        log_src.contains("NewEvent::compacted("),
+        "`SessionLog::rewrite` no longer writes the `Compacted` event — the page's durability \
+         claim rests on rewrite being the sole writer"
+    );
+    assert!(
+        attempt.contains("log.rewrite(rewritten)"),
+        "compaction no longer replaces history through `SessionLog::rewrite` — recheck what the \
+         page claims a replay or export can still see"
+    );
+    let projection_src = read("crates/flux-events/src/projection.rs");
+    assert!(
+        projection_src.contains("EventKind::Compacted { messages } => {")
+            && projection_src.contains("out.clear();"),
+        "the conversation projection no longer resets on `Compacted` — the page describes it as \
+         replacing what the model sees"
+    );
+    assert!(
+        page.contains("replace") || page.contains("Replace"),
+        "{CONTEXT_PAGE} must state that compaction replaces the live history"
+    );
+    assert!(
+        page.contains("Compacted"),
+        "{CONTEXT_PAGE} must name the `Compacted` event a session reader will meet"
+    );
+
+    // Honest about the absences (the story's hardest requirement). These are the things a reader
+    // arriving from another harness assumes exist; each is verified absent above in review, and
+    // the page must say so rather than let the reader infer it.
+    for absent in ["retrieval", "per-tool"] {
+        assert!(
+            page.contains(absent),
+            "{CONTEXT_PAGE} must say explicitly whether flux does `{absent}` — a reader who \
+             assumes it exists is the failure this page is for"
+        );
+    }
+
+    // The three pages that look like alternatives must stop looking like alternatives.
+    for neighbour in ["context-packs", "project-context"] {
+        assert!(
+            page.contains(neighbour),
+            "{CONTEXT_PAGE} must relate itself to `{neighbour}` — three pages that each look \
+             complete is why this gap was invisible"
+        );
+    }
+
+    // A page nothing links to is a page nobody finds, which was half the original defect.
+    let sidebar = read("website/sidebars.js");
+    assert!(
+        sidebar.contains("agent/context-management"),
+        "website/sidebars.js does not list the context-management page — an unlinked page \
+         reproduces the findability half of C-441"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
 // The topologies page (C-440)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
