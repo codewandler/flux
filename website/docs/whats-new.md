@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.52.0] - 2026-08-02
+
 ### Action needed
 
 - **Asterisk is no longer included in Flux's plugin pack.** Its REST interface belongs in the

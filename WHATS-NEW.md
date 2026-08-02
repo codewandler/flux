@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-08-02
+
 ### Action needed
 
 - **Asterisk is no longer included in Flux's plugin pack.** Its REST interface belongs in the

@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-08-02
+
 ### Removed
 
 - **Asterisk no longer ships as a Flux plugin** (D-249). The complete 30-file AMI/ARI subtree,
