@@ -114,7 +114,7 @@ the loop budget/yield discipline its own doc-comments promise, `confirm` approva
 axis. Done means the review's triage flips to `handled` with every finding owned. Design:
 [flux-lang-hardening](designs/flux-lang-hardening.md).
 
-### The execution substrate — `flux-system` for a second consumer (epic) — 🔄 **PROPOSED (C-394; C-395…C-399 filed, none started)**
+### The execution substrate — `flux-system` for a second consumer (epic) — 🔄 **IN PROGRESS (C-395, C-396, C-398, C-399 done; C-397 ready)**
 
 `flux-system` has had exactly one consumer since it was written. That is about to stop being true:
 [flux-exchange](designs/ecosystem.md) is a service that runs operations for many callers, and the
@@ -143,10 +143,10 @@ got wrong quietly: `AGENTS.md` says *"Every tool runs through `Executor::dispatc
 capping) and which are `flux-runtime`'s and do not (default-deny authorization, approval, redaction,
 evidence).
 
-**C-397** (container backend) and **C-399** (remote port backend) are members but sit in `backlog`
-with **ownership undecided** — the port is unsealed, so an out-of-repo consumer can implement either
-without flux changing, an in-repo backend costs a reviewed codegate allowance, and flux's own CLI has
-no use for either. Deciding that is their first acceptance criterion, deliberately.
+**C-397** (container backend) remains `ready` with ownership undecided. **C-399** (remote port
+backend) is done with the opposite decision: flux owns the transport-neutral `Delegate` seam and
+local `Loopback`, and flux-exchange may implement the far side. The port remains unsealed, while
+every in-repo backend pays an explicit, single-use codegate allowance.
 
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
@@ -278,7 +278,7 @@ approve on your machine, and the effect lands in a microVM.**
 **It rides on a boundary that already exists** — `execution-substrate.md`'s rule, *"`flux-runtime`
 decides whether something may happen. `flux-system` is where it happens"*, put across a network; and
 `port.rs` already names *"a remote executor"* among the substrates the port exists for. So the
-substrate half is filed: [C-399](stories/C-399-remote-guarded-io-backend.md) (ready, ownership decided
+substrate half is done: [C-399](stories/C-399-remote-guarded-io-backend.md) (ownership decided
 as *"flux owns it, flux-exchange reuses it"*), [C-397](stories/C-397-container-process-backend.md),
 [C-435](stories/C-435-a-guarded-network-port.md). ⚠ This epic is the **product on top**, not a second
 copy: [C-436](stories/C-436-flux-tui-remote.md) the surface (remoteness must be *unmissable* — an

@@ -41,7 +41,7 @@ consequence.
 | TCP dial | `net::DialTarget` / `DialStream` / `dial_scoped` / `dial_scoped_pinned` |
 | Argv-only spawn | one `System::build_command`; env cleared to a non-secret allow-list; output byte-capped |
 | OS sandbox | `sandbox::Backend` — bubblewrap (Linux), Seatbelt (macOS); `SpawnPolicy`, `Confinement` |
-| The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`; fail-closed defaults; `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` enumerates in-repo backends |
+| The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`, `port::GuardedWorkspaceFiles`; fail-closed defaults; `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system` enumerates in-repo backends and pins its trait census to `port.rs` |
 | A delegating backend | `remote::RemoteSystem` + `remote::Loopback` (C-399) — serves the port from a `Delegate`, three distinguishable failure modes, no wire format and no new dependency |
 | Published | yes — `codewandler-flux-system`, lib name `flux_system` |
 
@@ -49,15 +49,13 @@ So the substrate is real and shipped. What is missing is narrower than it looks.
 
 ## What is missing
 
-### 1. The workspace-confined file surface is not a port
+### 1. The workspace-confined file surface is a port
 
-`port.rs` says so itself: *"The workspace-confined file surface (`read_file`, `write_file`, …) is
-**not yet a port** — see C-269's story notes. Its consumers all still hold a concrete `System`, and a
-trait with no call sites would be indirection without a seam."*
-
-That reasoning was correct and is now **expired**. A second consumer is precisely the call site the
-deferral was waiting for. This is [C-395](../stories/C-395-file-surface-port.md), and it is the only
-story in this epic whose justification is a deferral condition being met rather than a new idea.
+C-395 closed the old deferral: `GuardedWorkspaceFiles` now states the workspace-confined file
+surface (`read_file`, `write_file`, …), with fail-closed defaults and the same confinement proof as
+the concrete `System`. C-467 then brought that fourth trait into the codegate's reviewed-backend
+enumeration and added a census against `port.rs`, so a future fifth `Guarded*` trait cannot be
+silently omitted.
 
 ### 2. `DialTarget` covers TCP, not UDP or ICMP
 
@@ -137,6 +135,11 @@ in-process substrate — so the delegation path is exercisable with no service. 
 dependency**: `Delegate` is a Rust trait, not a protocol, which is what keeps
 [remote-agents.md](remote-agents.md)'s open question (is the remote wire a channel API or a port
 delegation?) genuinely open. A wire format chosen here would have pre-answered it.
+
+The out-of-crate test still proves that seam over bytes: it implements one operation using a
+test-owned length-prefixed protocol over `tokio::io::DuplexStream`, verifies the request and response
+cross the stream, and verifies a closed stream becomes `Unreachable`. The proof is real without
+promoting its framing into a production protocol.
 
 What the story turned out to be about is **three** failure modes rather than the two its Acceptance
 named, because an operator's response to each is different and all three are ways one delegated

@@ -22,6 +22,8 @@ use flux_system::remote::{
     Unreachable,
 };
 use flux_system::{ProcessOutput, System, Workspace};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::Mutex;
 
 /// `Refusing` carries a `&'static str`, and these fixtures are built at runtime from the marker
 /// constants — deliberately, so no adversarial string is ever hand-typed.
@@ -108,6 +110,47 @@ impl Delegate for Unreached {
 struct ServesNothing;
 
 impl Delegate for ServesNothing {}
+
+/// One consumer-owned wire: a length-prefixed request and response over an async byte stream.
+///
+/// This is intentionally test-only. C-399 owns the delegation seam and its failure semantics, not a
+/// product protocol, but the story's "over a wire" goal still needs proof that an out-of-crate
+/// consumer can put real bytes behind `Delegate` rather than only wrapping an in-process object.
+struct ByteWireRead {
+    stream: Mutex<DuplexStream>,
+}
+
+impl Delegate for ByteWireRead {
+    fn read_file_bytes<'a>(&'a self, path: &'a str) -> Answered<'a, Vec<u8>> {
+        Box::pin(async move {
+            let mut stream = self.stream.lock().await;
+            let path = path.as_bytes();
+            let path_len = u32::try_from(path.len())
+                .map_err(|_| Unreachable::new("request path exceeds the test wire"))?;
+            stream.write_all(&path_len.to_be_bytes()).await?;
+            stream.write_all(path).await?;
+            stream.flush().await?;
+
+            let mut header = [0_u8; 5];
+            stream.read_exact(&mut header).await?;
+            let status = header[0];
+            let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+            let mut body = vec![0_u8; len];
+            stream.read_exact(&mut body).await?;
+
+            match status {
+                0 => Ok(Answer::Served(body)),
+                1 => Ok(Answer::Refused(String::from_utf8_lossy(&body).into_owned())),
+                2 => Ok(Answer::Unserved(
+                    String::from_utf8_lossy(&body).into_owned(),
+                )),
+                other => Err(Unreachable::new(format!(
+                    "unknown test-wire response status {other}"
+                ))),
+            }
+        })
+    }
+}
 
 fn remote(delegate: impl Delegate + 'static) -> RemoteSystem {
     RemoteSystem::new(Arc::new(delegate))
@@ -420,6 +463,58 @@ async fn the_loopback_delegate_serves_the_port_with_no_service_running() {
         .await
         .unwrap();
     assert_eq!(out.stdout.trim(), "loopback");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The public seam is transport-capable, not merely an object adapter: the request path and file
+/// contents cross an actual async byte stream owned entirely by this out-of-crate consumer.
+#[tokio::test]
+async fn a_consumer_can_serve_the_port_over_a_byte_wire() {
+    let (client, mut server) = tokio::io::duplex(256);
+    let server_task = tokio::spawn(async move {
+        let mut len = [0_u8; 4];
+        server.read_exact(&mut len).await.unwrap();
+        let mut path = vec![0_u8; u32::from_be_bytes(len) as usize];
+        server.read_exact(&mut path).await.unwrap();
+        assert_eq!(path, b"notes/from-wire.txt");
+
+        let body = b"crossed the wire";
+        server.write_all(&[0]).await.unwrap();
+        server
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        server.write_all(body).await.unwrap();
+    });
+
+    let remote = remote(ByteWireRead {
+        stream: Mutex::new(client),
+    });
+    assert_eq!(
+        remote.read_file("notes/from-wire.txt").await.unwrap(),
+        "crossed the wire"
+    );
+    server_task.await.unwrap();
+
+    let error = remote
+        .read_file("notes/after-close.txt")
+        .await
+        .expect_err("a closed byte stream must make the delegate unreachable");
+    assert_eq!(failure_mode(&error), Some(FailureMode::Unreachable));
+}
+
+/// `loopback` accepts the erased substrate shape consumers naturally keep in registries.
+#[tokio::test]
+async fn loopback_accepts_a_dynamically_dispatched_substrate() {
+    let root = std::env::temp_dir().join(format!("c399-erased-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let substrate: Arc<dyn flux_system::remote::GuardedSubstrate> =
+        Arc::new(System::new(Workspace::new(&root).unwrap()));
+    let remote = RemoteSystem::loopback(substrate);
+
+    remote.write_file("erased.txt", "works").await.unwrap();
+    assert_eq!(remote.read_file("erased.txt").await.unwrap(), "works");
 
     std::fs::remove_dir_all(&root).ok();
 }

@@ -418,7 +418,7 @@ impl RemoteSystem {
 
     /// Serve the port by delegating to an **in-process** substrate — the local-first path, which
     /// needs no service running and cannot report an unreachable link.
-    pub fn loopback<T: GuardedSubstrate + 'static>(substrate: Arc<T>) -> Self {
+    pub fn loopback<T: GuardedSubstrate + ?Sized + 'static>(substrate: Arc<T>) -> Self {
         Self::new(Arc::new(Loopback::new(substrate)))
     }
 

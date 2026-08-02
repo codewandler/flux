@@ -2,7 +2,7 @@
 id: C-399
 title: "A remote implementation of the guarded-IO port"
 pillar: Core
-status: in-progress
+status: done
 priority: 4
 design: docs/designs/execution-substrate.md
 epic: execution-substrate
@@ -27,7 +27,7 @@ operations somewhere other than its own process while the guarantees stay stated
 
 **Landed** as `crates/flux-system/src/remote.rs` — `RemoteSystem` serves all four port families by
 handing each operation to a `Delegate`, plus `Loopback` for the in-process far side. Test:
-`crates/flux-system/tests/remote_port_failure_modes.rs` (10 tests, an out-of-crate consumer on
+`crates/flux-system/tests/remote_port_failure_modes.rs` (12 tests, an out-of-crate consumer on
 purpose — a unit test inside the crate could pass while the seam stayed private).
 
 **Three** failure modes, not two. The Acceptance names a refusal and an unreachable delegate;
@@ -49,6 +49,14 @@ would be able to send an operator to investigate a healthy network.
 dependency was added to `flux-system` (its dependency set is still `flux-core` + `tokio` + `url`).
 That keeps `docs/designs/remote-agents.md`'s open question — channel API or port delegation — open,
 and keeps this story to the failure semantics its Acceptance is about.
+
+**The seam nevertheless crosses a real byte wire in its public-surface test.** A test-owned
+length-prefixed protocol implements `Delegate` over `tokio::io::DuplexStream`; the requested path
+and returned file bytes cross the stream, and closing its far side classifies structurally as
+`Unreachable`. That proves an external consumer can supply a transport without making the test
+protocol a product decision. A second compile-and-run proof passes an
+`Arc<dyn GuardedSubstrate>` through `RemoteSystem::loopback`, which is the erased shape a substrate
+registry naturally holds.
 
 **Local-first, verified.** `RemoteSystem::loopback` exercises the whole delegation path with nothing
 running, and a `Loopback` never reports an unreachable link because there is no link to break.
