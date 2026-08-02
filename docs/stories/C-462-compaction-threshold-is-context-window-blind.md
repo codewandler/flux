@@ -1,5 +1,5 @@
 ---
-id: C-444
+id: C-462
 title: "The compaction threshold is a flat character count, blind to the model's context window"
 pillar: Core
 status: ready
@@ -66,3 +66,4 @@ Compaction is not free: it spends a provider call and permanently replaces detai
   default (`crates/flux-app/src/app.rs`, `crates/flux-cli/src/execution.rs`).
 - Related: [C-441](C-441-context-management-doc.md) documents the threshold; if this story changes it,
   that page changes with it.
+- ⚠ Renumbered C-444 → C-462 at integration: C-444 was already taken by the SDK secure-defaults story, filed in a parallel epic while this agent was running.

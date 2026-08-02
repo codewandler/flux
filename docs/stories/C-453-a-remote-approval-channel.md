@@ -3,7 +3,7 @@ id: C-453
 title: "No approver in the tree speaks over a network — a served agent can only allow everything or deny everything"
 pillar: Core
 status: ready
-priority: 4
+priority: 2
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-runtime, flux-server]

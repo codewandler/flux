@@ -3,7 +3,7 @@ id: C-457
 title: "Could flux be the environment worker for someone else's brain? — the one place our envelope plugs into another harness"
 pillar: Core
 status: ready
-priority: 7
+priority: 6
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-cli, flux-runtime]

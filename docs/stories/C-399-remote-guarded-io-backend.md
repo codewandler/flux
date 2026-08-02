@@ -3,7 +3,7 @@ id: C-399
 title: "A remote implementation of the guarded-IO port"
 pillar: Core
 status: ready
-priority: 10
+priority: 4
 design: docs/designs/execution-substrate.md
 epic: execution-substrate
 note: "OWNERSHIP DECIDED 2026-08-01: flux owns it, flux-exchange reuses it. flux must be able to do this locally as dev without depending on a service — that is the local-first principle, not a convenience"

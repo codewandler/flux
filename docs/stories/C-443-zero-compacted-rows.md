@@ -2,8 +2,7 @@
 id: C-443
 title: "Zero `Compacted` rows in 112,114 events — does compaction ever actually fire?"
 pillar: Core
-status: in-progress
-priority: 5
+status: done
 design: docs/designs/docs-completeness.md
 epic: docs-completeness
 areas: [flux-flow, flux-events]
@@ -119,7 +118,7 @@ than unreachable. Settling it needs a store from sustained interactive use, whic
   the model's actual context window — arguably mis-scaled against a 200k/1M-token model, where it errs
   toward compacting early. Re-scaling it to the model's window is a tuning change needing its own
   evidence and its own story: filed as
-  [C-444](C-444-compaction-threshold-is-context-window-blind.md).
+  [C-462](C-462-compaction-threshold-is-context-window-blind.md).
 
 ### For [C-441](C-441-context-management-doc.md) — the honest wording
 
@@ -182,6 +181,6 @@ than unreachable. Settling it needs a store from sustained interactive use, whic
   the store to render. What C-443 adds is that **both** views are reconstructible: the `Compacted` event
   carries the replacement, and the superseded `Message` events are never removed.
 - Spun the one finding this story declined to act on out into
-  [C-444](C-444-compaction-threshold-is-context-window-blind.md) (`ready`): the threshold is a flat
+  [C-462](C-462-compaction-threshold-is-context-window-blind.md) (`ready`): the threshold is a flat
   character count that never consults the model's context window.
 - Next: C-441 lifts the wording block above; nothing else blocks it.

@@ -3,7 +3,7 @@ id: C-435
 title: "The port has no network trait — and no guarded inbound primitive at all"
 pillar: Core
 status: ready
-priority: 6
+priority: 4
 design: docs/designs/execution-substrate.md
 epic: execution-substrate
 areas: [flux-system]

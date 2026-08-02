@@ -3,7 +3,7 @@ id: C-437
 title: "Which guarantees travel over a remote link — and which quietly become someone else's problem"
 pillar: Core
 status: ready
-priority: 7
+priority: 5
 design: docs/designs/remote-agents.md
 epic: remote-agents
 areas: [flux-system, docs]
