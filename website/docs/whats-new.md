@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.52.2] - 2026-08-03
+
 ### Fixed
 
 - **Flux builds on Rust 1.87 again.** Several dependency updates had started requiring newer

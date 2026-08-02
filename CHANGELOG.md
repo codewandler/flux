@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.52.2] - 2026-08-03
+
 ### Fixed
 
 - **The default workspace builds on the declared Rust 1.87 MSRV again** (C-493). Registry-only
