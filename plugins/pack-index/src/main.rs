@@ -272,6 +272,23 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn retired_asterisk_is_absent_from_the_pack_workspace() {
+        let plugins = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("pack-index lives in the plugins workspace");
+        let workspace = std::fs::read_to_string(plugins.join("Cargo.toml")).unwrap();
+
+        assert!(
+            !workspace.lines().any(|line| line.trim() == "\"asterisk\","),
+            "Asterisk must not remain a plugin-pack workspace member"
+        );
+        assert!(
+            !plugins.join("asterisk").exists(),
+            "the retired plugins/asterisk subtree must be deleted"
+        );
+    }
+
     /// A unique scratch dir per test (std-only; the plugins workspace carries no tempfile dep).
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pack-index-{tag}-{}", std::process::id()));

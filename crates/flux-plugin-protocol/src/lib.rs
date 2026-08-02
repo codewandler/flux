@@ -756,10 +756,6 @@ pub struct PluginCapabilities {
     /// Whether `http.do` is permitted at all (host-side SSRF guard still applies).
     #[serde(default)]
     pub http: bool,
-    /// Whether the host-owned `ws.connect/read/close` capability is permitted. WebSocket IO
-    /// remains endpoint/host guarded and deny-by-default independently of request/response HTTP.
-    #[serde(default)]
-    pub websocket: bool,
     /// Allowed public HTTP hosts for `http.do` in addition to declared endpoint hosts.
     #[serde(default)]
     pub http_hosts: Vec<String>,

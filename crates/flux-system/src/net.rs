@@ -443,7 +443,7 @@ fn is_blocked_v4(v4: Ipv4Addr) -> bool {
 
 // ---------------------------------------------------------------------------
 // Guarded socket dialer — the raw-connection equivalent of `guard_url`, for plugins whose backend
-// speaks a wire protocol over a TCP or Unix socket rather than HTTP (sql, docker, asterisk). The
+// speaks a wire protocol over a TCP or Unix socket rather than HTTP (SQL and Docker). The
 // same SSRF egress policy applies to TCP; Unix sockets are local and gated by capability, not here.
 // Story D-12 (plugin protocol parity).
 //

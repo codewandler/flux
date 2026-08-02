@@ -1,6 +1,12 @@
 # Asterisk ARI from the official Swagger contract
 
-## Decision
+**Status:** superseded 2026-08-02 by [D-249](../stories/D-249-remove-asterisk-plugin.md)
+
+> This records the implementation that shipped in v0.51.1; it is not current ownership guidance.
+> The owner correction is that ARI's spec-described REST surface belongs in `flux-connectors`, while
+> Flux retains neither ARI nor the AMI plugin. Connector event/channel design is deferred.
+
+## Superseded decision
 
 Asterisk remains a native Flux plugin. It is a stateful, private-network, protocol-rich technology
 adapter, so it does not become a generated provider in `flux-connectors`. The existing eight AMI

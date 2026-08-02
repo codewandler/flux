@@ -15,7 +15,8 @@ edition.workspace = true
 # `credential_shape` are now two views of one private `scrub` pipeline, pinned by
 # `a_reported_shape_and_a_changed_text_are_the_same_fact`. Nothing was removed or renamed and the
 # secret-purpose wire vocabulary did not move, so a plugin pinned to `1` keeps resolving.
-version = "1.2.0"
+# 1.2.1 (D-249): documentation removes the retired AMI example; no API or wire behavior changes.
+version = "1.2.1"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

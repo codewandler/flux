@@ -7,8 +7,8 @@ rust-version.workspace = true
 # against it speak?" — a question flux releases do not change the answer to. The former lockstep
 # (bumped by scripts/cut-release.sh on every cut) republished it unchanged every release and forced
 # a plugin-pack rebuild for wire-irrelevant reasons.
-# 1.2.0 (D-241/D-242): additive guarded WebSocket connect/read/close and bounded HTTP-response-to-
-# blob helpers over protocol 1.3.0. Existing plugin helper signatures and behavior remain stable.
+# 2.0.0 (D-249): breaking removal of the Asterisk-only WebSocket and HTTP-response-to-blob helpers,
+# rebuilt over protocol 2.0.0.
 # 1.1.0 (C-312): the wire moved (protocol 1.1.1 -> 1.2.0, adding `OperationSpec::platform`), and
 # this is the version that answers "which wire does a plugin built against this speak?" — so it
 # moves with it. Additive on both counts: `PlatformSourcing` joins the re-exported protocol
@@ -17,7 +17,7 @@ rust-version.workspace = true
 # 1.1.0 (C-311, same unpublished wire): `OperationSpec::reaches` joins it, and `VendorReach` joins
 # the re-exported vocabulary. Additive again — an op that says nothing about vendor reach
 # serializes byte-identically to one written before the field existed.
-version = "1.2.0"
+version = "2.0.0"
 license.workspace = true
 description = "Shared SDK for flux integration plugins: typed host-capability calls (secret-by-purpose, http+bearer, endpoint, datasource records) + a manifest/op builder over the flux plugin wire protocol"
 repository = "https://github.com/codewandler/flux"

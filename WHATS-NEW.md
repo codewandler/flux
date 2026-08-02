@@ -53,6 +53,18 @@
   snapshots separately. A project's `AGENTS.md`, `.agents`, or `.claude` content can specialize a
   run without accidentally becoming Flux's default prompt or granting runtime authority.
 
+### Action needed
+
+- **Embedded-agent prompt configuration has been split.** Rust SDK users should replace
+  `.system_prompt(text)` with `.instructions(text)` and select `AgentProfile::General` for a
+  non-coding persona; `Role.prompt` is now `Role.instructions`. Program-agent settings use
+  `instructions` and `instruction_files`; the old `system_prompt` names fail with a migration
+  message instead of silently removing Flux's harness protocol.
+
+## [0.52.1] - 2026-08-02
+
+### Improved
+
 - **It is now clear what Docker, Kubernetes, and microVM support means.** A new execution-placement
   matrix separates managing existing infrastructure, choosing where one effect lands, placing a
   whole worker agent, and provisioning the isolation itself. The Docker plugin has a complete setup
@@ -64,13 +76,19 @@
   whether Flux observed the work locally or received a report from a remote execution system,
   without adding workspace paths or endpoint addresses to the audit trail.
 
+## [0.52.0] - 2026-08-02
+
 ### Action needed
 
-- **Embedded-agent prompt configuration has been split.** Rust SDK users should replace
-  `.system_prompt(text)` with `.instructions(text)` and select `AgentProfile::General` for a
-  non-coding persona; `Role.prompt` is now `Role.instructions`. Program-agent settings use
-  `instructions` and `instruction_files`; the old `system_prompt` names fail with a migration
-  message instead of silently removing Flux's harness protocol.
+- **Asterisk is no longer included in Flux's plugin pack.** Its REST interface belongs in the
+  generated connector catalogue instead; live event support will follow once connector channels
+  have a settled contract. Remove any locally registered Asterisk plugin and install plugin pack
+  0.2.0 for the corrected set. Existing non-Asterisk plugin binaries remain wire-compatible.
+
+- **Rust plugin authors using the removed WebSocket or direct HTTP-to-blob helpers must update.**
+  The protocol and host-kit libraries move to 2.0.0 because those public APIs are gone. Guarded
+  request/response HTTP, raw connections, the ordinary blob store, and capped binary responses are
+  unchanged.
 
 ## [0.51.1] - 2026-08-02
 

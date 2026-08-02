@@ -56,8 +56,8 @@ below). This list mirrors the `CRATES` array in `scripts/publish-crates-io.sh` i
 7.  flux-secret
 8.  flux-evidence
 9.  flux-spec           (→ policy)
-10. flux-plugin-protocol (→ spec, evidence, datasource)  — the plugin WIRE CONTRACT, on the
-    independent 1.x line (C-143); publishes from this workspace, unlike host-kit
+10. flux-plugin-protocol (→ spec, evidence, datasource)  — the plugin WIRE CONTRACT, on an
+    independent semver line (C-143); publishes from this workspace, unlike host-kit
 11. flux-config         (→ core, policy, evidence; required by flux-runtime)
 12. flux-skill          (→ markdown)
 13. flux-system
@@ -81,7 +81,7 @@ below). This list mirrors the `CRATES` array in `scripts/publish-crates-io.sh` i
 ```
 
 **Not in this list: `host-kit`.** Since C-146 it ships with the plugin pack from
-`.github/workflows/release-plugins.yml`, not with a flux release — it sits on the independent 1.x
+`.github/workflows/release-plugins.yml`, not with a flux release — it sits on the independent
 protocol line, so a flux cut cannot change its version. It depends on `flux-plugin-protocol`, which
 IS published here, so the pack workflow refuses to publish until that version is live on crates.io.
 
@@ -108,8 +108,9 @@ path-only; all three now carry a `version` (the last packaging blockers). `scrip
 these in lockstep with `[workspace.package].version` on every release. The plugin surface
 (`flux-datasource`, `flux-credentials`, `flux-plugin`) was added to the closure in v0.9.4. The
 protocol-line crates (`flux-plugin-protocol`, `flux-spec`, `flux-policy`, `flux-secret`,
-`flux-evidence`, `flux-datasource`, and `host-kit`) carry an explicit `1.x` version that the release
-script deliberately does NOT touch (C-143).
+`flux-evidence`, `flux-datasource`, and `host-kit`) carry explicit independent versions that the
+release script deliberately does NOT touch (C-143). D-249 moved protocol and host-kit to 2.x while
+the serde-compatible framed marker remained v1.
 
 ## 4. Pre-flight (no registry writes)
 

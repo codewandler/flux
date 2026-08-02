@@ -1,6 +1,6 @@
 # flux — roadmap & status
 
-Status as of **0.51.1 (2026-08-02)**: public + installable at
+Status as of **0.52.1 (2026-08-02)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
 (`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green
@@ -1171,8 +1171,8 @@ An external user pointed a MariaDB endpoint at the `sql` plugin and got
 normalizes to `Dialect::MySql` (`plugins/sql/src/main.rs:339`) and all six ops call
 `require_postgres()` before doing anything (`:932,967,1003,1062,1134,1249`) — and it is the residual
 [D-31](stories/D-31-host-terminated-rawsocket-auth.md) recorded when it host-terminated the Postgres
-handshake: *"mysql + Asterisk AMI host-termination (seam in place, clear error, credential cap
-retained for them)"*. A user has now walked into that seam. The design's first job is answering why
+handshake: *"mysql + another raw-socket host-termination consumer (seam in place, clear error,
+credential cap retained for them)"*. A user has now walked into that seam. The design's first job is answering why
 this needs writing at all, because the obvious objection is strong: a SQL connection is a TCP
 connection, Go injects one with `RegisterDialContext`, and flux already has the transport —
 `ConnStream` is `std::io::Read + Write` (`plugins/host-kit/src/lib.rs:818+`). Three things block the
@@ -1191,7 +1191,7 @@ per-dialect SQL. D-198 is the one that is easy to under-scope: `table.list`/`ind
 engines but means *schemas in the current database* on Postgres and *actual databases* on MySQL. A
 "trusted plugin" tier that dials directly with credentials was considered and **rejected**: it would
 make an invariant that is currently absolute and testable into a conditional one. Non-goals: SQLite
-(still needs a host file capability), writes, AMI, and `caching_sha2_password`/`ed25519`/`parsec`
+(still needs a host file capability), writes, and `caching_sha2_password`/`ed25519`/`parsec`
 (follow-ons). Two things the plan did not foresee, both caught while implementing: `pg_lit()` escapes
 only `'`, but MySQL treats `\` as an escape character, so a name containing `\'` could have broken out
 of a literal (new `my_lit()`); and MySQL names *every* primary key `PRIMARY`, so porting the Postgres
@@ -1219,8 +1219,8 @@ code reads it back and the pack index records nothing — matching version numbe
 standing in for a contract nobody wrote down. Worse, **every plugin compiles `flux-lang`**: the
 guest wire surface names exactly one type from it (`FlowEffect`, `protocol.rs:7`/`:140`, a *tag
 vocabulary*), and that one edge drags a 75-crate subtree through
-`flux-lang → flux-plugin → host-kit → all 21 plugins`. The epic extracts the wire contract into
-`codewandler-flux-plugin-protocol` on its own `1.x` semver line, moves the serde-only leaves it
+`flux-lang → flux-plugin → host-kit → all 21 pack workspace packages`. The epic extracts the wire contract into
+`codewandler-flux-plugin-protocol` on its own semver line, moves the serde-only leaves it
 needs onto that line, and takes `plugins/` out of the cut entirely — with the guards that make the
 split honest: the host validates the protocol marker, golden JSON fixtures pin the wire rather
 than the Rust signatures, a snapshot guard forces a deliberate version bump, and CI runs the
@@ -2003,8 +2003,8 @@ aggregator/generator surfaces (vision/websearch-aggregator/openapi) are explicit
   opsgenie, huggingface; HTTP, needs D-12 auth).
 - **[D-16](stories/D-16-datastore-infra-plugins.md) — Datastore & infra pack** (sql, docker, aws; needs D-12
   conn + blob).
-- **[D-17](stories/D-17-telephony-plugins.md) — Telephony pack** (asterisk, homer; serves downstream voice
-  surfaces; asterisk needs D-12 conn).
+- **[D-17](stories/D-17-telephony-plugins.md) — Telephony pack** (Homer SIP search/QoS/PCAP; the
+  mis-owned PBX adapter was removed by D-249).
 
 ### Subscription providers & cross-provider cost (epic) — **shipped 2026-07-02 (C-03..C-09 all done, C-07 live-verified)**
 

@@ -50,14 +50,6 @@ All notable changes to this project are documented in this file. The format is b
   homepage code sample uses the same explicitly-preview-only playback vocabulary, and website CI
   byte-checks the deterministic embedded bundle.
 
-- **Hosts can project authored Flux into a versioned visual-editor graph and correlate execution
-  back to exact graph nodes** (L-126). The pure language contract round-trips calls, conditions,
-  bounded loops, parallel branches and returns; valid unsupported source remains explicitly
-  source-only with byte ranges. An opt-in interpreter entry point emits value-free node lifecycle,
-  branch and occurrence records without changing ordinary execution or bypassing the operation
-  host. Identity reconciliation preserves nodes across in-place source edits and graph reordering
-  derives fresh runtime paths instead of trusting stale projection metadata.
-
 ### Changed
 
 - **Agent context is now an owned, typed package instead of a caller-replaceable prompt** (A-147).
@@ -75,6 +67,20 @@ All notable changes to this project are documented in this file. The format is b
   client binding, agent authentication, `subscribe`, hosted channels, workflows, and execution
   records explicit.
 
+## [0.52.1] - 2026-08-02
+
+### Added
+
+- **Hosts can project authored Flux into a versioned visual-editor graph and correlate execution
+  back to exact graph nodes** (L-126). The pure language contract round-trips calls, conditions,
+  bounded loops, parallel branches and returns; valid unsupported source remains explicitly
+  source-only with byte ranges. An opt-in interpreter entry point emits value-free node lifecycle,
+  branch and occurrence records without changing ordinary execution or bypassing the operation
+  host. Identity reconciliation preserves nodes across in-place source edits and graph reordering
+  derives fresh runtime paths instead of trusting stale projection metadata.
+
+### Changed
+
 - **Remote dispatch evidence now records the selected execution substrate as host-stamped
   provenance** (C-439). `tool_call` and dispatch lifecycle observations carry the immutable
   substrate kind plus whether results are remotely reported, so evidence no longer presents a
@@ -87,6 +93,24 @@ All notable changes to this project are documented in this file. The format is b
   production contract with BYO container, pod and VM/microVM deployment profiles for
   `flux system serve`. Internal execution-substrate/fleet status now reflects the shipped remote and
   process runtimes while keeping C-397, A-124 and A-125 open.
+
+## [0.52.0] - 2026-08-02
+
+### Removed
+
+- **Asterisk no longer ships as a Flux plugin** (D-249). The complete 30-file AMI/ARI subtree,
+  pack registration, live smoke, and active documentation were removed after correcting ownership:
+  spec-described ARI REST operations belong in `flux-connectors`, while eventing waits for its
+  channel model. The Asterisk-only plugin WebSocket grant and host/host-kit implementation, plus
+  direct HTTP-response-to-blob delivery, are removed; generic guarded HTTP, raw connections,
+  ordinary blob storage, and capped inline responses remain.
+
+### Changed
+
+- **The plugin protocol and host-kit crates move to 2.0.0, and the corrective plugin pack moves to
+  0.2.0** (D-249). These are source-breaking removals for Rust plugin authors, but the framed wire
+  marker remains `flux.plugin.v1`: old non-Asterisk plugin binaries remain compatible because the
+  retired manifest key was optional and unknown JSON fields are ignored.
 
 ## [0.51.1] - 2026-08-02
 

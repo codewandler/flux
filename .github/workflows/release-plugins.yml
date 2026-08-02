@@ -1,7 +1,7 @@
 # Plugin pack release channel (D-46, docs/designs/plugin-distribution.md).
 #
 # Hand-written on purpose — cargo-dist is NOT extended to the plugins workspace (dist models one
-# app per package; 17 lockstep packages would collide with the core release series). Deliberately
+# app per package; 20 nested-workspace packages would collide with the core release series). Deliberately
 # `workflow_dispatch`, NOT a tag push: the dist-generated release.yml triggers on the tag glob
 # '**[0-9]+.[0-9]+.[0-9]+*', which any semver-ish plugins tag would also match and red-X dist's
 # plan job. This workflow creates the `plugins-v<version>` tag + release itself via GITHUB_TOKEN
