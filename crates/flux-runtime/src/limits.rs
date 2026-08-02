@@ -111,21 +111,37 @@ tokio::task_local! {
 /// **Scope of that sharing (C-299).** Clones share the budget *within one agent* — including the
 /// fresh executor a surface mints per run, which is what keeps `FlowClient::build_executor` from
 /// escaping the ceiling. A **sub-agent** is different: it gets an
-/// [`independent_copy`](Self::independent_copy), so the ceiling is **per agent**, not one budget for
-/// the whole process. That is a deliberate, safety-driven choice, not an oversight — see
-/// [`independent_copy`](Self::independent_copy) for the deadlock that sharing across the `task`
-/// boundary produces.
+/// [`independent_copy`](Self::independent_copy), so the *concurrency* ceiling is **per agent**, not
+/// one budget for the whole process. That is a deliberate, safety-driven choice, not an oversight —
+/// see [`independent_copy`](Self::independent_copy) for the deadlock that sharing the execution
+/// semaphore across the `task` boundary produces.
+///
+/// **What bounds the tree, then (C-444).** A per-agent ceiling that composes into an unbounded total
+/// is only half a ceiling: `max_concurrent_tool_calls = N` with k live children permits N×(k+1)
+/// simultaneous calls, and nothing bounded k. So a second, **tree-wide** ceiling rides alongside it —
+/// [`max_live_agents`](Self::max_live_agents), enforced by a census that *is* shared across
+/// [`independent_copy`](Self::independent_copy). Bounding k is what turns N×(k+1) into a finite
+/// number. The two ceilings are deliberately different shapes because they have different failure
+/// modes: the execution semaphore *queues* (and would deadlock if shared), while the agent census
+/// *refuses immediately* (and so cannot deadlock, no matter how deep the tree).
 ///
 /// Everything is off by default — an unconfigured runtime behaves exactly as it did before C-290.
+/// [`autonomous`](Self::autonomous) is the preset an auto-approving SDK embedder gets by default
+/// (C-444), because an unattended posture with no ceiling was the actual finding.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceLimits {
     max_concurrent_tool_calls: Option<usize>,
     queue_timeout: Option<Duration>,
     max_retained_result_bytes: Option<usize>,
     max_evidence_payload_bytes: Option<usize>,
+    max_live_agents: Option<usize>,
     /// Present iff a concurrency ceiling is configured. Shared across clones — that sharing is the
     /// whole point (see the type doc).
     slots: Option<Arc<Semaphore>>,
+    /// Present iff an agent ceiling is configured. Shared across clones **and** across
+    /// [`independent_copy`](Self::independent_copy) — unlike `slots`, because this is the ceiling
+    /// that bounds the whole delegated tree rather than one agent in it.
+    agents: Option<Arc<AgentCensus>>,
 }
 
 impl ResourceLimits {
@@ -168,6 +184,32 @@ impl ResourceLimits {
     /// truncated result.
     pub fn with_max_retained_result_bytes(mut self, bytes: usize) -> Self {
         self.max_retained_result_bytes = Some(bytes);
+        self
+    }
+
+    /// Cap how many agents may be **live at once across the whole delegated tree** — the root plus
+    /// every transitively spawned sub-agent (C-444).
+    ///
+    /// This is the ceiling that makes
+    /// [`max_concurrent_tool_calls`](Self::with_max_concurrent_tool_calls) bound a *tree* rather than
+    /// an agent. Because a child gets its own execution budget (see
+    /// [`independent_copy`](Self::independent_copy) for why it must), N per agent with an unbounded
+    /// agent count is an unbounded total; with this set, the tree's simultaneous tool calls are
+    /// bounded by `N × max_live_agents`, which is finite and stated.
+    ///
+    /// `0` is meaningless (the root itself is an agent), so it is read as `1` — which means "no
+    /// delegation": the root runs and every `task` is refused.
+    ///
+    /// **This ceiling refuses; it never queues.** A spawn that would exceed it fails immediately with
+    /// an actionable message rather than waiting for a sibling to finish. That is deliberate and it is
+    /// what makes the census safe to share across the delegation boundary that the execution
+    /// semaphore cannot cross: a waiting spawn could be waiting on an ancestor that is waiting on it,
+    /// which is precisely the deadlock [`independent_copy`](Self::independent_copy) documents. A
+    /// refusal has no such shape — the model reads it and proceeds with fewer children.
+    pub fn with_max_live_agents(mut self, n: usize) -> Self {
+        let n = n.max(1);
+        self.max_live_agents = Some(n);
+        self.agents = Some(Arc::new(AgentCensus::new(n)));
         self
     }
 
@@ -225,11 +267,54 @@ impl ResourceLimits {
         self.max_evidence_payload_bytes
     }
 
+    /// The configured tree-wide live-agent ceiling, if any (C-444).
+    pub fn max_live_agents(&self) -> Option<usize> {
+        self.max_live_agents
+    }
+
     /// Whether any ceiling at all is configured.
     pub fn is_unbounded(&self) -> bool {
         self.max_concurrent_tool_calls.is_none()
             && self.max_retained_result_bytes.is_none()
             && self.max_evidence_payload_bytes.is_none()
+            && self.max_live_agents.is_none()
+    }
+
+    /// The ceilings an **autonomous** posture carries (C-444): the shape an SDK embedder gets by
+    /// default when it chooses auto-approval, and the reason that choice is not a hole.
+    ///
+    /// Running without per-effect approval is a valid posture, not safety switched off (C-463). What
+    /// makes it valid is that the constraint budget moves from human latency to policy, isolation and
+    /// **budgets** — so the budgets have to exist. These are that: a bounded number of simultaneous
+    /// tool calls per agent, a bounded number of live agents across the tree (so the two compose to a
+    /// finite total), and bounded retention.
+    ///
+    /// The numbers are deliberately generous rather than tight. They are a *ceiling on runaway*, not a
+    /// throttle on legitimate work: an exploratory research agent should never notice them, while a
+    /// delegated tree that has started multiplying hits something finite. A host with a real workload
+    /// in mind should state its own — this is the floor for one that has not.
+    pub fn autonomous() -> Self {
+        Self::new()
+            // Enough for a wide `parallel` block; far short of unbounded fan-out.
+            .with_max_concurrent_tool_calls(16)
+            // With the above: at most 16 × 8 = 128 simultaneous tool calls across the whole tree.
+            .with_max_live_agents(8)
+            // 64 MiB of op-cache retention; eviction is correctness-neutral (a miss re-runs the op).
+            .with_max_retained_result_bytes(64 * 1024 * 1024)
+            // 32 MiB of evidence payload; elision is legible as elision (C-298) and keeps every
+            // observation's count, order, kind and phase intact.
+            .with_max_evidence_payload_bytes(32 * 1024 * 1024)
+    }
+
+    /// Claim a place in the tree-wide agent census for one sub-agent, or refuse (C-444). The returned
+    /// guard frees the place when the child's turn ends.
+    ///
+    /// `Ok(None)` when no agent ceiling is configured — the unbounded default.
+    pub fn admit_agent(&self) -> std::result::Result<Option<AgentSlot>, AgentCensusRefusal> {
+        match self.agents.as_ref() {
+            None => Ok(None),
+            Some(census) => census.clone().admit().map(Some),
+        }
     }
 
     /// The same ceilings, with a **fresh concurrency budget** — the shape a sub-agent inherits
@@ -268,13 +353,25 @@ impl ResourceLimits {
     ///
     /// The honest consequence, which every doc site states: `max_concurrent_tool_calls = N` bounds
     /// **each agent** at N, so k live sub-agents may run up to N×(k+1) tool calls at once.
+    ///
+    /// ⚠ **C-444 bounds k rather than reopening this.** The reasoning above is unchanged and the
+    /// execution semaphore is still per agent — but a per-agent ceiling whose total is unbounded was
+    /// itself the finding, so [`max_live_agents`](Self::with_max_live_agents) bounds how many agents
+    /// can be live at once, and *that* census is **shared** by this copy rather than duplicated. It
+    /// can be shared precisely because it refuses instead of queueing, so it introduces none of the
+    /// waiting this method exists to avoid. With both set the tree total is `N × max_live_agents` —
+    /// finite, and stated.
     pub fn independent_copy(&self) -> Self {
         let mut copy = Self {
             max_concurrent_tool_calls: self.max_concurrent_tool_calls,
             queue_timeout: self.queue_timeout,
             max_retained_result_bytes: self.max_retained_result_bytes,
             max_evidence_payload_bytes: self.max_evidence_payload_bytes,
+            max_live_agents: self.max_live_agents,
             slots: None,
+            // Shared, NOT copied: this is the ceiling on the whole delegated tree, so a child that
+            // got its own census would defeat the very multiplication it exists to bound.
+            agents: self.agents.clone(),
         };
         if let Some(n) = self.max_concurrent_tool_calls {
             // A fresh semaphore of the same size: same ceiling, separate budget.
@@ -354,6 +451,93 @@ impl ExecutionSlot {
         let mut held = HELD_SLOTS.try_with(Clone::clone).unwrap_or_default();
         held.push(id);
         HELD_SLOTS.scope(held, future).await
+    }
+}
+
+/// The tree-wide live-agent census behind [`ResourceLimits::with_max_live_agents`] (C-444).
+///
+/// Shared across the `task` boundary — including through
+/// [`ResourceLimits::independent_copy`] — because bounding the *tree* is the whole point. A plain
+/// counter rather than a [`Semaphore`] for a load-bearing reason: it must never make a caller wait.
+/// The execution semaphore cannot be shared across delegation because an ancestor holds a permit for
+/// its child's whole turn, so a waiting child waits on itself; a census that refuses on the spot has
+/// no such cycle to enter.
+#[derive(Debug)]
+pub(crate) struct AgentCensus {
+    /// The ceiling, counting the root agent. Children admitted = `limit - 1` at most.
+    limit: usize,
+    /// Agents currently live, root included — hence the census starts at 1.
+    live: std::sync::atomic::AtomicUsize,
+}
+
+impl AgentCensus {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            // The root agent occupies the first place: `max_live_agents = 1` therefore means "no
+            // delegation", not "one child".
+            live: std::sync::atomic::AtomicUsize::new(1),
+        }
+    }
+
+    /// Admit one agent, or refuse. A compare-and-swap loop rather than a bare `fetch_add`, so a
+    /// refused spawn never transiently overshoots the ceiling it is being refused by (two concurrent
+    /// `task` calls at the boundary would otherwise both add, then both roll back — and a census
+    /// reader in between would see the ceiling breached).
+    fn admit(self: Arc<Self>) -> std::result::Result<AgentSlot, AgentCensusRefusal> {
+        let mut live = self.live.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            if live >= self.limit {
+                return Err(AgentCensusRefusal { limit: self.limit });
+            }
+            match self.live.compare_exchange_weak(
+                live,
+                live + 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(AgentSlot { census: self }),
+                Err(observed) => live = observed,
+            }
+        }
+    }
+}
+
+/// One live sub-agent's place in the tree-wide census (C-444). Dropping it frees the place, so a
+/// child that finishes — or panics — never leaks its slot.
+#[derive(Debug)]
+pub struct AgentSlot {
+    census: Arc<AgentCensus>,
+}
+
+impl Drop for AgentSlot {
+    fn drop(&mut self) {
+        self.census
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A sub-agent spawn refused because the tree-wide live-agent ceiling was already met (C-444).
+///
+/// Transient in the same sense as [`ConcurrencyRefusal`]: the same delegation may succeed once a
+/// sibling finishes. It is *not* an authorization denial — nothing was forbidden, the tree is simply
+/// at its budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCensusRefusal {
+    /// The tree-wide ceiling that bound this spawn, counting the root agent.
+    pub limit: usize,
+}
+
+impl AgentCensusRefusal {
+    /// The refusal the caller sees: what bound it, and what to do about it.
+    pub fn message(&self) -> String {
+        format!(
+            "sub-agent refused: the runtime's tree-wide ceiling of {} live agent(s) — the root plus \
+             every delegated child — is already met. Wait for a delegated child to finish, delegate \
+             less at once, or raise `max_live_agents`.",
+            self.limit
+        )
     }
 }
 
@@ -663,5 +847,126 @@ mod tests {
             cache.insert(key, ToolResult::ok("x"), None);
         }
         assert_eq!(cache.bytes(), 1, "the entry bound reset the cache");
+    }
+
+    // -- C-444: the tree-wide agent census -------------------------------------------------------
+
+    /// **The finding, stated as arithmetic.** A per-agent concurrency ceiling with no bound on the
+    /// agent count has an unbounded total; bounding the agent count makes the total finite. This is
+    /// what `max_live_agents` buys, and it is the half `independent_copy` deliberately cannot.
+    #[test]
+    fn the_agent_ceiling_is_what_makes_the_tree_total_finite() {
+        let unbounded_tree = ResourceLimits::new().with_max_concurrent_tool_calls(4);
+        assert_eq!(
+            unbounded_tree.max_live_agents(),
+            None,
+            "a concurrency ceiling alone leaves the agent count — and so the tree total — unbounded"
+        );
+
+        let bounded_tree = ResourceLimits::new()
+            .with_max_concurrent_tool_calls(4)
+            .with_max_live_agents(3);
+        assert_eq!(bounded_tree.max_live_agents(), Some(3));
+        // 4 per agent × 3 live agents = 12 simultaneous tool calls, tree-wide. Finite, and stated.
+        assert_eq!(bounded_tree.max_concurrent_tool_calls(), Some(4));
+    }
+
+    /// The census is **shared** across `independent_copy`, unlike the execution semaphore. That is
+    /// the whole mechanism: a child that got its own census would restore the multiplication.
+    #[test]
+    fn a_delegated_child_shares_the_agent_census_but_not_the_execution_budget() {
+        let parent = ResourceLimits::new()
+            .with_max_concurrent_tool_calls(2)
+            .with_max_live_agents(2);
+        let child = parent.independent_copy();
+
+        assert_eq!(child.max_live_agents(), Some(2), "the numbers descend");
+        // Separate execution budgets (the C-299 deadlock constraint) …
+        let parent_slots = parent.slots.as_ref().expect("parent semaphore");
+        let child_slots = child.slots.as_ref().expect("child semaphore");
+        assert!(
+            !Arc::ptr_eq(parent_slots, child_slots),
+            "the execution semaphore must stay per agent — sharing it across the `task` boundary \
+             deadlocks (see `independent_copy`)"
+        );
+        // … but ONE census, so the tree cannot multiply past the ceiling.
+        let parent_census = parent.agents.as_ref().expect("parent census");
+        let child_census = child.agents.as_ref().expect("child census");
+        assert!(
+            Arc::ptr_eq(parent_census, child_census),
+            "the agent census must be SHARED across delegation — a per-child census would defeat \
+             the tree-wide bound it exists to enforce"
+        );
+    }
+
+    /// The ceiling counts the root, admits up to `limit - 1` children, and **refuses** rather than
+    /// queueing. Refusing is what makes a shared census deadlock-free.
+    #[test]
+    fn the_census_admits_up_to_the_ceiling_then_refuses() {
+        let limits = ResourceLimits::new().with_max_live_agents(3);
+        // The root occupies one place, so two children fit.
+        let first = limits.admit_agent().expect("first child admitted");
+        let second = limits.admit_agent().expect("second child admitted");
+        let refused = limits
+            .admit_agent()
+            .expect_err("the third child exceeds a ceiling of 3 counting the root");
+        assert_eq!(refused.limit, 3);
+        assert!(
+            refused.message().contains("max_live_agents"),
+            "the refusal must name the knob to raise, got: {}",
+            refused.message()
+        );
+
+        // A place frees when a child's turn ends, so the same delegation succeeds later: transient,
+        // not an authorization denial.
+        drop(second);
+        let third = limits.admit_agent().expect("a freed place is reusable");
+        drop((first, third));
+    }
+
+    /// `max_live_agents = 1` means "no delegation": the root itself is an agent.
+    #[test]
+    fn a_ceiling_of_one_admits_no_children_at_all() {
+        let limits = ResourceLimits::new().with_max_live_agents(1);
+        assert!(
+            limits.admit_agent().is_err(),
+            "a ceiling of 1 is the root alone — every `task` must be refused"
+        );
+        // `0` is meaningless as a ceiling and reads as 1 rather than refusing the root's existence.
+        assert_eq!(
+            ResourceLimits::new()
+                .with_max_live_agents(0)
+                .max_live_agents(),
+            Some(1)
+        );
+    }
+
+    /// The unbounded default is untouched: configuring nothing admits every agent, as before C-444.
+    #[test]
+    fn no_agent_ceiling_admits_every_agent() {
+        let limits = ResourceLimits::new();
+        for _ in 0..64 {
+            assert!(
+                limits.admit_agent().expect("unbounded admits").is_none(),
+                "an unconfigured census must hand back no slot at all, not a bounded one"
+            );
+        }
+        assert!(limits.is_unbounded());
+    }
+
+    /// The autonomous preset is genuinely bounded on every axis — including the tree — because
+    /// "unattended *and* unbounded" is the configuration C-444 exists to remove.
+    #[test]
+    fn the_autonomous_preset_bounds_the_tree_as_well_as_the_agent() {
+        let limits = ResourceLimits::autonomous();
+        assert!(!limits.is_unbounded());
+        assert!(limits.max_concurrent_tool_calls().is_some());
+        assert!(
+            limits.max_live_agents().is_some(),
+            "an autonomous posture must bound the agent count too — a per-agent ceiling alone \
+             multiplies across a delegated tree, which is finding F4"
+        );
+        assert!(limits.max_retained_result_bytes().is_some());
+        assert!(limits.max_evidence_payload_bytes().is_some());
     }
 }

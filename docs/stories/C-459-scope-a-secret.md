@@ -2,7 +2,7 @@
 id: C-459
 title: "A secret has no scope — once resolved it can go anywhere the egress guard already allows"
 pillar: Core
-status: ready
+status: in-progress
 priority: 5
 design: docs/designs/secrets-the-agent-never-sees.md
 epic: secrets-the-agent-never-sees

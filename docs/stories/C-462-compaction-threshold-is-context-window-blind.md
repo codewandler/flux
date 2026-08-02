@@ -62,6 +62,15 @@ Compaction is not free: it spends a provider call and permanently replaces detai
 - Does flux know a model's context window at all? If not, that is the first sub-question — a derived
   threshold needs a per-model window table or a provider-reported value, and inventing one badly is
   worse than the flat budget.
+- ⚠ **Blocked in practice on [C-469](C-469-tokencounter-has-no-production-implementor.md).** The
+  adjacent question now has an answer: flux does not know a request's *token count* either.
+  `TokenCounter` (`crates/flux-provider/src/lib.rs:210`) has no production implementor, and the one
+  call site passes `None`, so every budget in the tree runs on a 4-chars-per-token estimate. A scaling
+  decision made on top of an estimate of an estimate is not evidence. Do C-469 first, or scale on
+  characters deliberately and say so.
+- ⚠ Before re-scaling, note that the number lives in **three** places on the CLI path —
+  [C-466](C-466-compact-threshold-default-drifts.md) consolidates them. Changing the constant today does
+  not change the CLI's default.
 - Precedence to preserve: per-agent `settings.compact_threshold_chars` > `FLUX_COMPACT_CHARS` >
   default (`crates/flux-app/src/app.rs`, `crates/flux-cli/src/execution.rs`).
 - Related: [C-441](C-441-context-management-doc.md) documents the threshold; if this story changes it,
