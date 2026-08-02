@@ -6,7 +6,7 @@
 [D-198](../stories/D-198-dialect-aware-introspection-ops.md)
 
 Completes the residual [D-31](../stories/D-31-host-terminated-rawsocket-auth.md) left open — *"mysql
-+ Asterisk AMI host-termination (seam in place, clear error, credential cap retained for them)"* —
++ the then-planned second raw-socket host-termination consumer"* —
 and the one [D-16](../stories/D-16-datastore-infra-plugins.md) recorded as *"MySQL/SQLite explicit
 residuals"*. Prerequisite reading: [endpoint-discovery.md](endpoint-discovery.md), whose reference
 invariant is the constraint that shapes every decision below.
@@ -190,7 +190,7 @@ old plugin. Host and pack must ship together.
 - **SQLite** — unchanged and still unsupported by design: a local file, and plugins have no
   filesystem capability (`conn.*` is sockets only, `:527`). Would need a new host file capability.
 - **Writes** — the plugin stays read-only on every dialect.
-- **Asterisk AMI** host-termination — the other D-31 residual; unaffected by this epic.
+- The other D-31 residual was retired with the plugin that needed it (D-249).
 - **`caching_sha2_password` / `ed25519` / `parsec`** — deliberate follow-ons, filed when D-196 lands
   rather than pre-emptively.
 - A `direct_dial` escape hatch (see *Rejected* above).

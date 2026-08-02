@@ -38,7 +38,7 @@ pub struct EndpointRef {
     /// Product class this endpoint serves (`postgres`, `prometheus`, …); empty if generic.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub product: String,
-    /// Wire protocol hint (`http`, `postgres`, `ami`, …).
+    /// Wire protocol hint (`http`, `postgres`, `mysql`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     /// Whether this came from config or discovery.

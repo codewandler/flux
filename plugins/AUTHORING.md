@@ -104,10 +104,9 @@ All requested via the `host-kit` `Host`/`GuestHost`; serviced by `SystemHostCaps
 | `config` | `config` (declared names) | Resolve a declared **non-secret** config value (e.g. jira's `cloud_id`); a secret-classified env key is refused. |
 | `credential` | `credential: true` | Materialize a credential **reference** into its raw value for in-band-auth raw-socket protocols (e.g. Postgres SCRAM); redactor-registered, never returned via any discovery/endpoint path. |
 | `http.do` | `http: true` + `http_hosts` + SSRF guard | HTTP method/headers/body; **auth injected by the host** per `AuthScheme`; binary via `body_b64` (request) / `response_binary` → `body_b64` (response, 16 MiB cap). Private hosts require `private_hosts` plus config. |
-| `ws.connect`/`read`/`close` | `websocket: true` + endpoint hosts + SSRF guard | Host-owned endpoint-reference WebSocket. URL and auth remain host-side; connections, frames, queued messages and deadlines are bounded; ping/pong and close are handled by the host. Private hosts require `private_hosts` plus config. |
 | `process.run` | `process` (argv-**prefix** allow-list, C-90) | Run a subprocess to completion; captured, capped output. |
 | `process.spawn`/`read`/`status`/`kill` | `process` | Start/drain/poll/stop a long-lived host-managed child (e.g. `kubectl port-forward`). |
-| `conn.dial`/`read`/`write`/`close` | `conn` (`tcp:host:port` / `unix:/path` allow-list, SSRF-guarded; `*` matches one segment and Unix `.`/`..` paths are denied) | A raw TCP/Unix byte stream for non-HTTP protocols (SQL wire, Docker socket, AMI). |
+| `conn.dial`/`read`/`write`/`close` | `conn` (`tcp:host:port` / `unix:/path` allow-list, SSRF-guarded; `*` matches one segment and Unix `.`/`..` paths are denied) | A raw TCP/Unix byte stream for non-HTTP protocols (SQL wire, Docker socket). |
 | `conn.authenticate` | `conn` (an already-dialed `conn_id`) + a declared auth method or endpoint credential ref | **Host-terminated** in-band auth (D-31): the host speaks the startup + SCRAM/MD5 handshake itself and hands back a post-auth connection — the plugin never receives the password. |
 | `endpoint.discover` | `discover: true` | Cross-plugin endpoint discovery (D-26): ask the host what endpoints exist for a product. |
 | `fs.read` | `fs` (`FsReadScope` path allow-list) | Read a **host** file outside the workspace jail matching a declared scope; `..` traversal rejected, size-capped; `secret: true` scopes are redactor-registered. |
@@ -151,7 +150,7 @@ never base64 in-plugin, never read the token from env — declare the scheme and
 
 ## The rules (checklist)
 
-1. **Declare everything in the manifest** — every op, every `secrets`/`process`/`conn`/`http`/`websocket`/`blob`/
+1. **Declare everything in the manifest** — every op, every `secrets`/`process`/`conn`/`http`/`blob`/
    `config`/`credential`/`fs`/`discover` capability, every `http_hosts`/`private_hosts` entry, every
    auth method and endpoint, every datasource. Undeclared → denied at runtime with a clear error.
 2. **Never do IO directly** — no `reqwest`, `std::net`, `std::fs`, `std::process::Command`. Use the
@@ -218,7 +217,7 @@ order as an override mechanism.
 `host-kit` (`plugins/host-kit/src/lib.rs`) is the SDK: `PluginBuilder`,
 `operation_typed`/`operation_flexible`, `read_op_typed`/`write_op_typed`, the typed
 `Host` (`secret`/`config`/`http`/`get_json`/`send_json`/`http_bytes`/`http_ref`/`http_bytes_ref`/
-`get_json_ref`/`send_json_ref`/`ws_connect`/`ws_read`/`ws_close`/`run`/`process_*`/`conn_*`/`conn_dial_ref`/`conn_authenticate`/
+`get_json_ref`/`send_json_ref`/`run`/`process_*`/`conn_*`/`conn_dial_ref`/`conn_authenticate`/
 `credential`/`credential_for_endpoint`/`blob_*`/`contribute`), and `MockHost`. Contract types
 (`AuthMethod`/`AuthScheme`/`OperationSpec`/`PluginCapabilities`) live in `crates/flux-plugin/src/lib.rs`,
 re-exported through host-kit.

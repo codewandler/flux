@@ -11,6 +11,9 @@ note: "EPIC — preserve 8 AMI ops; account for all 109 official ARI operations,
 
 # Asterisk ARI — complete official Swagger surface behind guarded host IO
 
+> **Superseded by [D-249](D-249-remove-asterisk-plugin.md).** This story remains done as historical
+> evidence of what v0.51.1 shipped; its ownership decision is no longer current.
+
 ## Goal
 
 Make the existing Asterisk plugin a complete ARI client generated from Asterisk's pinned official

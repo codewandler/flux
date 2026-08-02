@@ -1063,7 +1063,7 @@ pub(super) enum EndpointAction {
         /// Product class (`postgres`, `prometheus`, …) — drives op surfacing and display.
         #[arg(long)]
         product: Option<String>,
-        /// Wire-protocol hint (`postgres`, `http`, `ami`, …).
+        /// Wire-protocol hint (`postgres`, `http`, `mysql`, …).
         #[arg(long)]
         protocol: Option<String>,
         /// Credential *location*: `env/KEY`, `kubernetes/<ns>/<name>/<key>`, or

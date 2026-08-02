@@ -165,7 +165,7 @@ decide *before* running it:
 
 - **The bump.** Cargo pre-1.0 SemVer: for `0.y.z` the **minor** position is the breaking signal. Scan `[Unreleased]` and the commits since the last tag for `!` titles / "BREAKING": **any breaking change → minor**; additive/fixes only → patch. Never use patch as a rolling counter.
 - **Two changelogs, two audiences.** `CHANGELOG.md` is the engineering log (story IDs, crates). **`WHATS-NEW.md` is the CUSTOMER changelog** — every user-visible change adds a plain-language entry (no story IDs, no crate names). Internal-only changes skip it. An empty customer section is legal only for internal-only releases. *A bare `WHATS-NEW.md` edit reds the gate* until you regenerate the tracked website mirror in the same commit.
-- **The plugin PROTOCOL LINE is the one exception to single-version** (C-143): the crates a plugin compiles against carry an independent `1.x`, so `cut-release.sh` **never touches anything under `plugins/`**, and a pack release is cut separately by hand. A wire change implies a pack release is owed. CI enforces this (`check-crate-versions.sh`, `check-plugin-compat.sh`, `check-host-kit-protocol-drift.sh`). Design: `docs/designs/plugin-protocol-decoupling.md`.
+- **The plugin PROTOCOL LINE is the one exception to single-version** (C-143): the crates a plugin compiles against carry independent semver, so `cut-release.sh` **never touches anything under `plugins/`**, and a pack release is cut separately by hand. A protocol API change implies a pack release is owed. CI enforces this (`check-crate-versions.sh`, `check-plugin-compat.sh`, `check-host-kit-protocol-drift.sh`). Design: `docs/designs/plugin-protocol-decoupling.md`.
 
 ---
 

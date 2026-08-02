@@ -14,17 +14,16 @@ members = [
     "loki",
     "prometheus",
     "slack",
-    # fluxplane-plugins parity — observability/AI pack (D-15) + telephony/infra HTTP (D-16/D-17)
+    # fluxplane-plugins parity — observability/AI pack (D-15) + infra HTTP (D-16/D-17)
     "alertmanager",
     "grafana",
     "opsgenie",
     "huggingface",
     "aws",
     "homer",
-    # conn-wave (D-16 sql/docker + D-17 asterisk) — hand-rolled wire clients over the host-kit ConnStream
+    # conn-wave (D-16 sql/docker) — hand-rolled wire clients over the host-kit ConnStream
     "sql",
     "docker",
-    "asterisk",
     # secret-management plugins (D-85/D-86)
     "vault",
     "onepassword",
@@ -33,15 +32,15 @@ members = [
 ]
 
 # The PACK version below is the plugin binaries' distribution version, independent of both flux and
-# the 1.x protocol line. 0.1.6 carries Asterisk's complete official ARI 22.10.1 surface, including
-# host-owned event WebSockets and bounded recording-to-blob delivery (D-239…D-248).
+# the protocol line. 0.2.0 is the breaking corrective pack that removes Asterisk and rebuilds every
+# remaining binary against protocol 2.0 (D-249).
 #
 # Keep `version` within the first few lines of the section: release-plugins.yml reads it from a
 # bounded window after the section header, and a comment between the two hid it once already.
 [workspace.package]
 edition = "2021"
 rust-version = "1.87"
-version = "0.1.6"
+version = "0.2.0"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -49,15 +48,15 @@ license = "MIT OR Apache-2.0"
 # version. A flux release does not move these, so `scripts/cut-release.sh` never edits this file
 # and a plugin binary is rebuilt only when the wire itself changes. Path deps keep local
 # development working against the sibling crates.
-# Pinned to the protocol MINOR, not bare `^1`. host-kit's published dependency requirement is what
+# Pinned to the protocol MAJOR.MINOR, not a bare major. host-kit's published dependency requirement is what
 # `scripts/check-host-kit-protocol-drift.sh` reads to answer "which wire does a plugin built against
 # this host-kit actually speak" — and `^1` records a floor of 1.0.0, so it keeps reporting drift no
 # matter how often the pack is republished. Bump this alongside the protocol crate's MINOR.
-flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.3", path = "../crates/flux-plugin-protocol" }
+flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "2.0", path = "../crates/flux-plugin-protocol" }
 flux-datasource = { package = "codewandler-flux-datasource", version = "1", path = "../crates/flux-datasource" }
 flux-secret = { package = "codewandler-flux-secret", version = "1", path = "../crates/flux-secret" }
 flux-spec = { package = "codewandler-flux-spec", version = "1", path = "../crates/flux-spec" }
-host-kit = { package = "codewandler-flux-host-kit", version = "1", path = "host-kit" }
+host-kit = { package = "codewandler-flux-host-kit", version = "2", path = "host-kit" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

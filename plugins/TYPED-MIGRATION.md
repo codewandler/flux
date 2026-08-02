@@ -17,7 +17,6 @@ until each vendor result family is typed without erasing vendor-specific semanti
 | Plugin | Typed executable handlers | Next migration unit |
 | --- | --- | --- |
 | alertmanager | pending | status/alert list result families |
-| asterisk | pending | ping/channel list, then AMI command variants |
 | aws | pending | caller identity/list outputs before credential-heavy operations |
 | confluence | pending | test/page show/list outputs |
 | docker | pending | version/container list, then stream variants |

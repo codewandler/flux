@@ -53,34 +53,6 @@ impl Drop for ProtocolExchange {
     }
 }
 
-/// Closes host-owned session resources when a plugin exchange is abandoned by transport failure
-/// or task cancellation. A completed operation keeps its long-lived resources for the next call.
-struct HostSessionExchange<'a> {
-    host: &'a dyn HostCapabilities,
-    complete: bool,
-}
-
-impl<'a> HostSessionExchange<'a> {
-    fn new(host: &'a dyn HostCapabilities) -> Self {
-        Self {
-            host,
-            complete: false,
-        }
-    }
-
-    fn complete(&mut self) {
-        self.complete = true;
-    }
-}
-
-impl Drop for HostSessionExchange<'_> {
-    fn drop(&mut self) {
-        if !self.complete {
-            self.host.cancel_session();
-        }
-    }
-}
-
 impl PluginHost {
     /// Spawn a plugin binary through flux's **single guarded process path**
     /// ([`flux_system::System::spawn_interactive`]): the plugin runs argv-only, in the workspace root,
@@ -275,7 +247,6 @@ impl PluginHost {
         host: &dyn HostCapabilities,
     ) -> Result<Value> {
         let mut exchange = ProtocolExchange::new(self.poisoned.clone());
-        let mut host_session = HostSessionExchange::new(host);
         self.restart_if_poisoned().await?;
         self.next_id += 1;
         let call_id = format!("r{}", self.next_id);
@@ -300,7 +271,6 @@ impl PluginHost {
                 FrameKind::Response => {
                     if f.id == call_id {
                         exchange.complete();
-                        host_session.complete();
                         return if f.ok {
                             Ok(f.result)
                         } else {
@@ -455,7 +425,7 @@ pub(super) fn plugin_tool_spec(
     // `access`, not `effects` (`authority_requirements_from_declaration`), so an op projected with
     // neither would carry NO requirement at all and skip the authorization floor entirely.
     let mut access = vec![AccessKind::Process];
-    if capabilities.http || capabilities.websocket {
+    if capabilities.http {
         access.push(AccessKind::Network);
     }
     if !capabilities.conn.is_empty() {
@@ -560,7 +530,7 @@ impl Tool for PluginTool {
                     | "host.write"
             )
         });
-        if self.capabilities.http || self.capabilities.websocket {
+        if self.capabilities.http {
             let hosts = if self.capabilities.http_hosts.is_empty() {
                 vec![self.plugin.as_str()]
             } else {
@@ -739,10 +709,6 @@ impl HostCapabilities for OpScopedCaps<'_> {
             }
         }
         self.inner.handle(command, payload).await
-    }
-
-    fn cancel_session(&self) {
-        self.inner.cancel_session();
     }
 }
 

@@ -21,14 +21,14 @@ install. Since v0.2.14, `flux plugin install <name>` fetches from the signed rel
 
 The facts the design builds on:
 
-- **The pack is 17 thin binaries.** `plugins/` is a nested cargo workspace (deliberately excluded
+- **The pack is 18 thin binaries.** `plugins/` is a nested cargo workspace (deliberately excluded
   from the root gate via `Cargo.toml` `exclude = ["plugins"]`), one `[[bin]] flux-plugin-<name>` per
-  integration (alertmanager, asterisk, aws, confluence, docker, gitlab, grafana, homer, huggingface,
-  jira, kubernetes, loki, opsgenie, prometheus, slack, sql, websearch) plus the `host-kit` guest SDK
+  integration (alertmanager, aws, confluence, docker, gitlab, grafana, homer, huggingface,
+  jira, kubernetes, loki, onepassword, opsgenie, prometheus, slack, sql, vault, websearch) plus the `host-kit` guest SDK
   library. Because the host does **all** privileged IO (no vendor SDKs, no TLS stacks in plugins),
   release binaries are 1.3–4 MB each, ~28 MB uncompressed for the whole pack on x86_64-linux, and the
   plugin sources contain **zero** `cfg(unix)`/`cfg(windows)` code — they are stdio loops over
-  `flux.plugin.v1` (`crates/flux-plugin/src/lib.rs:28`).
+  `flux.plugin.v1` (`crates/flux-plugin-protocol/src/lib.rs`).
 - **Versioning is lockstep.** All pack crates share `workspace.package.version` (currently `0.1.0`),
   and every plugin reports its version in its manifest (`PluginManifest.version`, populated by
   host-kit's `ManifestBuilder`).

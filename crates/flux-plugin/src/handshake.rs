@@ -84,8 +84,8 @@ pub(crate) async fn terminate_handshake(
         "mysql" | "mariadb" => crate::mysql::authenticate(stream, params, password, timeout).await,
         other => Err(format!(
             "conn.authenticate: host-terminated auth is not implemented for protocol {other:?} \
-             (postgres and mysql/mariadb are terminated; AMI is a follow-on); the gated \
-             `credential` capability remains for those"
+             (postgres and mysql/mariadb are terminated); the gated `credential` capability \
+             remains for other protocols"
         )),
     }
 }

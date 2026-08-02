@@ -37,11 +37,11 @@ so no host call site changes.
 The dependency shape the epic is aiming at:
 
 ```
-crates/flux-plugin-protocol  1.0.0        wire types + guest stdio SDK (serde only)
+crates/flux-plugin-protocol  independent  wire types + guest stdio SDK (serde only)
         ↑                        ↑
-crates/flux-plugin 0.29.0    plugins/host-kit 1.0.x
+crates/flux-plugin 0.29.0    plugins/host-kit independent
    (host half)                   ↑
-                             plugins/*  →  flux-plugin-protocol = "1", host-kit = "1"
+                             plugins/*  →  matching protocol + host-kit majors
 ```
 
 **Order matters.** C-141 (relocate `FlowEffect`) lands first and alone is worth shipping: it
@@ -52,7 +52,7 @@ exists and its dependency graph is clean does C-143 split the version lines.
 **What sits on the protocol line.** The wire vocabulary reaches into serde-only leaf crates:
 `flux-spec` (`Effect`, `Idempotency`, `Risk`, `StagingDisposition`), `flux-evidence`
 (`SignalMatch`, `ToolGroup`, `KIND_TURN_INTENT`), `flux-datasource` (`Declaration`), `flux-secret`.
-These come off `version.workspace = true` and join the `1.x` line, so the protocol crate's graph
+These come off `version.workspace = true` and join an independent semver line, so the protocol crate's graph
 contains nothing that a flux cut moves. This is a deliberate, documented exception to the
 one-version-for-every-crate rule in AGENTS.md — the rule exists to stop version drift going
 unnoticed, and C-146's changed-crate assertion replaces that guarantee mechanically.
@@ -87,6 +87,9 @@ of" line, the board's Status block) is hand-done and drifts.
   and keeps one definition.
 - **`PROTOCOL` stays a string, not a number.** It is already on the wire as `flux.plugin.v1` in
   shipped binaries; changing its shape would itself be a breaking wire change.
+- **D-249 separates source and wire compatibility.** Removing the optional Asterisk-only capability
+  field is a Rust API break, so protocol and host-kit become 2.0.0; serde still ignores that old JSON
+  key, so the framed marker stays `flux.plugin.v1` and non-Asterisk binaries remain compatible.
 - **Out of scope:** the pack index gaining compatibility metadata (a natural follow-on once the
   protocol has a version worth recording), and any change to the plugin capability model.
 

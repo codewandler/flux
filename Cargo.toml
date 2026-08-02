@@ -87,10 +87,9 @@ flux-lang = { package = "codewandler-flux-lang", version = "0.51.1", path = "cra
 flux-flow = { package = "codewandler-flux-flow", version = "0.51.1", path = "crates/flux-flow" }
 flux-eval = { path = "crates/flux-eval" }
 flux-plugin = { package = "codewandler-flux-plugin", version = "0.51.1", path = "crates/flux-plugin", default-features = false, features = ["host", "hooks", "pack"] }
-# The plugin wire contract. Versioned on its own line (1.x) — see crates/flux-plugin-protocol.
-# `1.2.0`, not `1.1.0`: `flux-plugin` and `flux-cli` read `OperationSpec::platform` (C-312), which
-# 1.1.x does not have — the requirement has to name the wire the source actually needs.
-flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1.3.0", path = "crates/flux-plugin-protocol" }
+# The plugin wire contract. Versioned independently from flux; 2.0 removes the retired
+# Asterisk-only WebSocket grant (D-249).
+flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "2.0.0", path = "crates/flux-plugin-protocol" }
 flux-auth = { path = "crates/flux-auth" }
 # `1.1`, not `1`. `flux-runtime` calls `EvidenceLog::{set_max_payload_bytes,
 # retained_payload_bytes, compaction_notice}`, which exist only from 1.1.0 — so a bare `"1"` lets a

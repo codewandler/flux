@@ -27,7 +27,6 @@ const MIGRATED_PLUGINS: &[&str] = &[
     "gitlab",
     "slack",
     "sql",
-    "asterisk",
     "grafana",
     "prometheus",
     "loki",
@@ -39,7 +38,6 @@ const MIGRATED_PLUGINS: &[&str] = &[
 /// `operation_flexible`. The deprecated `operation` alias must not hide that distinction.
 const FIRST_PARTY_PLUGINS: &[&str] = &[
     "alertmanager",
-    "asterisk",
     "aws",
     "confluence",
     "docker",

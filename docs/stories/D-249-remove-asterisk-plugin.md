@@ -20,20 +20,20 @@ mistaken ARI implementation. Asterisk ARI is an API-spec-generated REST connecto
 
 ## Acceptance
 
-- [ ] A failing-first inventory test proves the Asterisk plugin is still a workspace member before
+- [x] A failing-first inventory test proves the Asterisk plugin is still a workspace member before
       deletion and absent afterwards.
-- [ ] All 30 tracked files under `plugins/asterisk/` and every active registration, smoke-test,
+- [x] All 30 tracked files under `plugins/asterisk/` and every active registration, smoke-test,
       documentation and distribution reference are removed; historical changelog/story evidence is
       preserved and marked superseded where it otherwise states current ownership.
-- [ ] The plugin WebSocket capability and HTTP-response-to-blob helper introduced solely for
+- [x] The plugin WebSocket capability and HTTP-response-to-blob helper introduced solely for
       Asterisk are removed from protocol, host and host-kit; generic connection, guarded HTTP, blob
       storage and bounded response reading remain.
-- [ ] Protocol/host-kit/plugin-pack versions follow their independent breaking-release contract and
+- [x] Protocol/host-kit/plugin-pack versions follow their independent breaking-release contract and
       lockfiles/goldens are regenerated.
 - [ ] Root and nested-plugin gates pass, engineering/customer changelogs explain the correction, and
       corrective core and plugin-pack releases are cut and watched green.
-- [ ] The user-owned dirty `docs/stories/C-163-plugin-commands-and-host-ui.md` in the primary checkout
-      is never touched; all work runs from this clean clone at `41fc0777`.
+- [x] The user-owned dirty `docs/stories/C-163-plugin-commands-and-host-ui.md` in the primary checkout
+      is never touched; all work runs from the isolated clone at exact base `1f6146ea`.
 
 ## Progress
 
@@ -41,6 +41,12 @@ mistaken ARI implementation. Asterisk ARI is an API-spec-generated REST connecto
   entire plugin be deleted. Eventing is deferred to future connector channel design.
 - 2026-08-02: `git ls-files plugins/asterisk | wc -l` measured 30 tracked files. Production-caller
   searches found no non-Asterisk consumer of the plugin WebSocket or HTTP-response-to-blob helpers.
+- 2026-08-02: failing-first inventory and protocol tests were observed red before deletion. The
+  final pack has 18 plugin binaries across 20 nested-workspace packages; Asterisk's 30 files and
+  empty directory skeleton are absent.
+- 2026-08-02: source-breaking removals move `codewandler-flux-plugin-protocol` and host-kit to
+  2.0.0 and the pack to 0.2.0. The wire marker deliberately remains `flux.plugin.v1`: serde ignores
+  the retired optional key, and the compatibility test proves old non-Asterisk manifests load.
 
 ## Notes
 

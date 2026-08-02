@@ -15,6 +15,18 @@
 
 ## [Unreleased]
 
+### Action needed
+
+- **Asterisk is no longer included in Flux's plugin pack.** Its REST interface belongs in the
+  generated connector catalogue instead; live event support will follow once connector channels
+  have a settled contract. Remove any locally registered Asterisk plugin and install plugin pack
+  0.2.0 for the corrected set. Existing non-Asterisk plugin binaries remain wire-compatible.
+
+- **Rust plugin authors using the removed WebSocket or direct HTTP-to-blob helpers must update.**
+  The protocol and host-kit libraries move to 2.0.0 because those public APIs are gone. Guarded
+  request/response HTTP, raw connections, the ordinary blob store, and capped binary responses are
+  unchanged.
+
 ## [0.51.1] - 2026-08-02
 
 ### New

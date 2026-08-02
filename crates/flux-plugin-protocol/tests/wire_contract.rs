@@ -8,7 +8,7 @@
 //! Three guarantees:
 //!
 //! 1. **Backward compatibility.** JSON captured from the shipped `flux.plugin.v1` wire still
-//!    deserializes. A plugin built against protocol 1.0 keeps working against this host.
+//!    deserializes. Non-Asterisk plugins built against v1 keep working against this host.
 //! 2. **Surface visibility.** A maximal instance — every field set, built with exhaustive struct
 //!    literals so a *new* field fails to compile here — serializes to a checked-in golden. You
 //!    cannot change the wire without this test making you look at it and decide whether
@@ -140,7 +140,6 @@ fn maximal_manifest() -> PluginManifest {
             process: vec!["kubectl get".into()],
             secrets: vec!["FIXTURE_TOKEN".into()],
             http: true,
-            websocket: true,
             http_hosts: vec!["example.invalid".into()],
             private_hosts: vec!["10.0.0.1".into()],
             conn: vec!["tcp:*:5432".into()],
@@ -186,15 +185,18 @@ fn manifest_wire_surface_is_pinned() {
 }
 
 #[test]
-fn websocket_capability_round_trips_as_an_explicit_deny_by_default_wire_grant() {
-    let decoded: PluginCapabilities = serde_json::from_value(json!({"websocket": true}))
-        .expect("additive websocket capability should deserialize");
-    let wire = serde_json::to_value(decoded).expect("capability should serialize");
-    assert_eq!(wire.get("websocket"), Some(&json!(true)));
+fn retired_asterisk_only_wire_surface_is_absent() {
+    let wire = serde_json::to_value(PluginCapabilities::default()).unwrap();
+    assert!(
+        wire.get("websocket").is_none(),
+        "the Asterisk-only WebSocket grant must leave the public wire contract"
+    );
+    assert_eq!(PROTOCOL, "flux.plugin.v1");
 
-    let denied = serde_json::to_value(PluginCapabilities::default())
-        .expect("default capabilities should serialize");
-    assert_eq!(denied.get("websocket"), Some(&json!(false)));
+    let old: PluginCapabilities = serde_json::from_value(json!({"websocket": true}))
+        .expect("the retired optional key remains wire-compatible for old v1 manifests");
+    let normalized = serde_json::to_value(old).unwrap();
+    assert!(normalized.get("websocket").is_none());
 }
 
 #[test]
@@ -233,7 +235,7 @@ fn a_minimal_foreign_manifest_still_loads() {
     assert!(manifest.operations[0].semantic_effects.is_empty());
 }
 
-/// A frame as emitted by a plugin built against protocol 1.0 — no more, no less.
+/// A frame as emitted by a plugin built against protocol v1 — no more, no less.
 #[test]
 fn a_v1_frame_from_an_older_plugin_still_loads() {
     let frame: Frame = serde_json::from_value(json!({
@@ -244,7 +246,7 @@ fn a_v1_frame_from_an_older_plugin_still_loads() {
         "ok": true,
         "result": {"name": "old", "operations": []}
     }))
-    .expect("a 1.0-shaped frame must load");
+    .expect("a v1-shaped frame must load");
 
     assert_eq!(frame.protocol, PROTOCOL);
     assert!(frame.ok);

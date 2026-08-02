@@ -268,7 +268,7 @@ so they resolve from declared env directly. host-kit grows `Host::http(.., auth_
 
 ## Slice B — raw connection dialer (`conn.*`)
 
-sql (MySQL/PG/SQLite), docker (unix socket), asterisk (AMI over TCP), and a native client-go-style kubernetes
+sql (MySQL/PG/SQLite), docker (unix socket), and a native client-go-style kubernetes
 all need a **socket**, not HTTP. flux-system has no dialer — only `guard_url`. Add one, reusing the same egress
 policy (host→IP resolution, loopback/private/link-local rejection unless allowed).
 
@@ -290,7 +290,7 @@ an undeclared target is denied before the guard even runs. The registry is per-`
 scope), so connections don't leak across plugin invocations.
 
 host-kit: `Host::conn_dial(target) -> Conn`, where `Conn` implements `Read`/`Write` by round-tripping
-`conn.read`/`conn.write` — so a Rust DB/AMI/Docker client library can be handed a `Conn` as its transport.
+`conn.read`/`conn.write` — so a Rust database/Docker client can be handed a `Conn` as its transport.
 
 ## Slice C — blob store (`blob.*`)
 
@@ -356,7 +356,7 @@ same safety envelope as the agent's own tools.
 | **Native, shallow** — port-deepen to full op set ✅ **done (D-14)** | confluence, gitlab, jira, kubernetes, loki, prometheus, slack, websearch | **D-14** |
 | **Native — HTTP pack** ✅ **done (D-15)** | alertmanager, grafana, opsgenie, huggingface | **D-15** |
 | **Native — datastore/infra pack** ✅ **done (D-16)** | sql, docker, aws | **D-16** |
-| **Native — telephony pack** ✅ **done (D-17)** | asterisk, homer | **D-17** |
+| **Native — telephony pack** ✅ **done (D-17, corrected by D-249)** | homer | **D-17** |
 | **Covered differently — NOT ported** | clock→`now`, system→`sys_info`, sleep→builtin, git→tool group, openai/ollama→providers, duckduckgo/tavily→folded into flux `websearch` | — |
 | **Deliberate divergence — NOT ported** | vision/websearch *aggregators*, openapi *generator* | — |
 
@@ -381,7 +381,7 @@ flux's `SystemHostCaps` (`crates/flux-plugin/src/lib.rs`) services `process.run`
    `Authorization: Basic base64(email:token)` *inside the plugin* today; alertmanager/grafana/homer/opsgenie
    need basic / `config` / `GenieKey`. Unblocks D-15 and lets D-14 delete the base64 hand-rolling.
 2. **Raw connection dialer** (`conn.*`) — a guarded tcp/unix socket dialer (flux-system has none today, only
-   `guard_url`). sql/docker/asterisk reach backends over a socket, not HTTP. Gates D-16/D-17.
+   `guard_url`). sql/docker reach backends over a socket, not HTTP. Gates D-16.
 3. **Blob store** (`blob.*`) — a `blob_ref` indirection so file-upload ops don't inline base64. Gates the
    file-upload ops in D-14/D-15.
 
@@ -405,12 +405,13 @@ D-12 (protocol: auth → conn → blob)         D-13 (flux plugin skill)   ← t
         ├── D-14 (deepen the 8, drop base64) ────────┤  (skill refresh after each)
         ├── D-15 (alertmanager, grafana, opsgenie, huggingface)   [needs auth]
         ├── D-16 (sql, docker, aws)                              [needs conn + blob]
-        └── D-17 (asterisk, homer)                               [needs conn]
+        └── D-17 (homer)                                        [needs auth]
 ```
 
 D-13 is independent (no protocol dependency) and shipped first. D-12's auth/conn/blob slices unlocked the
 native ports. **D-14 through D-17 have shipped**: the original 8 plugins were deepened to op-parity, then the
-9 remaining portable plugins were ported natively. Each plugin slice was developed package-scoped, then the
+remaining portable plugins were ported natively. D-249 later removed the mis-owned Asterisk port. Each
+plugin slice was developed package-scoped, then the
 full `plugins/` workspace gate was run together.
 
 ### Host protocol extensions landed with D-14

@@ -89,7 +89,7 @@ itself to be immutable. Reinstalling the same resolved commit is an idempotent n
 | Infra & observability | `kubernetes`, `docker`, `aws`, `prometheus`, `loki`, `grafana`, `alertmanager`, `opsgenie` |
 | Messaging | `slack` |
 | Data | `sql` (PostgreSQL and MySQL/MariaDB read-only query + introspection) |
-| Telephony | `asterisk` (AMI), `homer` (SIP search / QoS / PCAP) |
+| Telephony | `homer` (SIP search / QoS / PCAP) |
 | Secret management | `vault` (KV-v2 administration), `onepassword` (Connect server) |
 
 Run `flux plugin skill` for the live per-plugin operation reference generated from the manifests
