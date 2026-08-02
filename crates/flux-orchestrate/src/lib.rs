@@ -197,6 +197,12 @@ impl LocalSpawner {
     /// turn, and the task-local exemption that covers the nested `task` does not cross the spawn the
     /// child is reached through. That reasoning, and why marking delegating ops does not fix it, is on
     /// [`ResourceLimits::independent_copy`].
+    ///
+    /// **k is bounded separately (C-444).** [`ResourceLimits::with_max_live_agents`] caps how many
+    /// agents in this tree may be live at once, and unlike the semaphore that census *is* shared with
+    /// every child — [`LocalSpawner::spawn`] takes a place from it and holds it for the child's whole
+    /// turn. Sharing is sound there because it refuses rather than queues. With both set the tree total
+    /// is `N × max_live_agents`; with only the per-agent number set, it is still unbounded.
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = limits;
         self
@@ -325,6 +331,17 @@ impl Spawner for LocalSpawner {
             .roles
             .get(role_name)
             .ok_or_else(|| Error::Other(format!("unknown role: {role_name}")))?;
+
+        // C-444: claim this child's place in the TREE-WIDE agent census before building anything.
+        // `max_concurrent_tool_calls` is per agent (see `ResourceLimits::independent_copy` for the
+        // deadlock that forces it), so without a bound on the agent count the tree's total was
+        // unbounded — N per agent × k children. The census is the bound on k, and it is shared across
+        // this boundary rather than copied. Held for the whole child turn: `_census_slot` drops when
+        // this function returns, on the error paths and the cancel path alike.
+        let _census_slot = self
+            .resource_limits
+            .admit_agent()
+            .map_err(|refusal| Error::Other(refusal.message()))?;
 
         let provider = (self.provider_factory)()?;
         // Captured before the provider moves into the child engine: the canonical-spec stamp on

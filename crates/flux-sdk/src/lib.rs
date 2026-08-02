@@ -14,15 +14,23 @@
 //! [`recipes`] is a cookbook of reusable, parameterized flow builders (routing, lookup, the loop
 //! family, resilience).
 //!
-//! **The OS-sandbox floor is yours, not the SDK's.** The `flux` binary classifies its own argv and
-//! raises the posture to fail-closed `require` for every surface with no human approval boundary —
-//! auto-approved turns, serving listeners, `flux plugin call` (C-262 / C-410). That classifier is
-//! part of the CLI and none of it runs here: a library has no argv to classify, so
+//! **An autonomous posture carries its own floor.** The safety envelope is
+//! *authorization → approval → guarded IO*, and approval is the only stage with a human in it.
+//! Varying that stage is choosing a posture, not switching safety off — research, hardening and long
+//! exploration are cases where prompting per effect is the wrong design. So
 //! [`auto_approve(true)`](ClientBuilder::auto_approve) — the embedded analogue of `flux run --yes` —
-//! does **not** imply confinement. What a built client resolves instead is the ambient environment
-//! (`FLUX_SANDBOX` / `FLUX_SANDBOX_NET` / `FLUX_SANDBOX_WRITABLE`, and `off` when unset), or
-//! whatever [`with_sandbox`](ClientBuilder::with_sandbox) pins. An unattended embedder that wants
-//! the CLI's floor has to ask for it — see [`Sandbox`] for both ways.
+//! brings the rest of the posture with it (C-444), the same way the `flux` binary pins every surface
+//! with no approval boundary to a fail-closed sandbox (C-262 / C-410). A client built with blanket
+//! auto-approval resolves to sandbox `require` with the sandbox network closed, and to
+//! [`ResourceLimits::autonomous`] ceilings that bound a delegated tree and not just one agent.
+//! A supervised client is unchanged: it resolves the ambient environment (`FLUX_SANDBOX` /
+//! `FLUX_SANDBOX_NET` / `FLUX_SANDBOX_WRITABLE`, and `off` when unset).
+//!
+//! Both raises are floors over silence, never overrides. An explicit
+//! [`with_sandbox`](ClientBuilder::with_sandbox) or
+//! [`resource_limits`](ClientBuilder::resource_limits) wins outright — one visible line in your own
+//! source is how you say "isolation comes from the outer container" or "this budget is mine" — and a
+//! *stricter* ambient `FLUX_SANDBOX` still applies. See [`Sandbox`] for the confinement side.
 //!
 //! ```ignore
 //! // Runnable hermetic version: `cargo run -p codewandler-flux-sdk --example client_basic`.
@@ -317,11 +325,14 @@ pub mod subagents {
 /// builder via [`ClientBuilder::with_sandbox`]/[`flow::FlowClientBuilder::with_sandbox`] without
 /// taking a direct `flux-system` dependency.
 ///
-/// **An embedder owns this floor.** Nothing in this crate infers a posture from how the client is
-/// configured: `auto_approve(true)`, a served HTTP front end, or a cron-driven worker all resolve
-/// the same way an interactive one does. The CLI's fail-closed classification of unattended
-/// surfaces (C-262 / C-410) lives in the `flux` binary and is not reachable from a library. So an
-/// unattended deployment states the posture itself, either way round:
+/// **Autonomy brings the floor; everything else is yours.** One configuration does infer a posture:
+/// [`auto_approve(true)`](ClientBuilder::auto_approve) with no injected
+/// [`Approver`](approval::Approver) resolves to `require` with the sandbox network closed (C-444),
+/// matching what the `flux` binary pins for every surface with no human approval boundary
+/// (C-262 / C-410). Beyond that, this crate infers nothing — a served HTTP front end or a cron-driven
+/// worker that still routes approval through your own [`Approver`](approval::Approver) resolves the
+/// same way an interactive client does, because that approver is a policy this crate cannot read.
+/// Such a deployment states its posture itself:
 ///
 /// ```ignore
 /// // Explicit, independent of ambient env — the recommended form for a daemon.
@@ -329,17 +340,19 @@ pub mod subagents {
 /// use flux_sdk::sandbox::SandboxMode;
 /// let mut settings = SandboxSettings::off();
 /// settings.mode = SandboxMode::Require;   // refuse to spawn at all with no usable backend
-/// settings.network = false;               // what the CLI's unattended profile also defaults to
+/// settings.network = false;               // what an autonomous posture also defaults to
 /// let client = Client::builder()
-///     .auto_approve(true)
+///     .with_approver(my_policy)
 ///     .with_sandbox(Sandbox::resolve(settings))
 ///     .build(provider, ".")?;
 /// ```
 ///
 /// or by exporting `FLUX_SANDBOX=require` before `build`, which is what
-/// [`SandboxSettings::from_env`] reads when no sandbox is injected. Either way, verify with
-/// [`Sandbox::ensure_available`] rather than assuming: a `require` posture on a host with no
-/// backend is an error you want at startup, not at the first spawn.
+/// [`SandboxSettings::from_env`] reads when no sandbox is injected. An explicit `with_sandbox` is
+/// also the escape hatch in the other direction — an autonomous client whose isolation comes from an
+/// outer container says so here, in one visible line, and that decision wins outright. Either way,
+/// verify with [`Sandbox::ensure_available`] rather than assuming: a `require` posture on a host with
+/// no backend is an error you want at startup, not at the first spawn.
 pub use flux_system::sandbox::{Sandbox, SandboxSettings};
 
 /// The sandbox posture enum and backend discovery behind [`Sandbox`], re-exported for an embedder
@@ -352,9 +365,18 @@ pub mod sandbox {
 /// constructs — via [`ClientBuilder::resource_limits`] or
 /// [`FlowClientBuilder::resource_limits`](flow::FlowClientBuilder::resource_limits) — without
 /// taking a direct `flux-runtime` dependency. These bound what the runtime *uses* (simultaneously
-/// executing tool calls, retained result bytes), where `context_budget` / `max_iterations` /
-/// `max_tokens` bound what it *spends*.
-pub use flux_runtime::{ConcurrencyRefusal, ResourceLimits, DEFAULT_TOOL_CALL_QUEUE_TIMEOUT};
+/// executing tool calls, live agents in a delegated tree, retained result bytes), where
+/// `context_budget` / `max_iterations` / `max_tokens` bound what it *spends*.
+///
+/// **A tree, not an agent (C-444).** `max_concurrent_tool_calls` is per agent, and a sub-agent gets its
+/// own execution budget by construction — sharing one across the `task` boundary deadlocks. So the
+/// per-agent number alone has no tree-wide total: `N` per agent times an unbounded agent count is
+/// unbounded. [`ResourceLimits::with_max_live_agents`] bounds the other factor, making the total
+/// `N × max_live_agents`, and [`ResourceLimits::autonomous`] — what an auto-approving client resolves
+/// when you state nothing — sets both.
+pub use flux_runtime::{
+    AgentCensusRefusal, ConcurrencyRefusal, ResourceLimits, DEFAULT_TOOL_CALL_QUEUE_TIMEOUT,
+};
 
 /// The Rust **embedded DSL** for authoring flows — builder primitives that construct the Flux-Lang
 /// AST. Build a [`flux_lang::ast::DraftAst`] with `dsl::Flow`/`dsl::Block` (loops and control-flow are
@@ -521,12 +543,21 @@ impl ClientBuilder {
         self.envelope.deny.push(rule.into());
         self
     }
-    /// Approve every tool call automatically (no human in the loop). Use with care.
+    /// Approve every tool call automatically — an **autonomous posture**, the library analogue of
+    /// `flux run --yes`.
     ///
-    /// This is the library analogue of `flux run --yes`, with one deliberate difference: the CLI
-    /// also raises the OS-sandbox posture to fail-closed `require` for that form, and this does
-    /// **not**. The embedder owns that floor — [`with_sandbox`](Self::with_sandbox), or
-    /// `FLUX_SANDBOX=require` in the environment. See [`Sandbox`].
+    /// This is a valid choice, not safety switched off: research, security hardening and long
+    /// exploration are cases where interrupting per effect is the wrong design. What it changes is
+    /// which stage of the envelope constrains — with no human at approval, isolation and budgets are,
+    /// so choosing this **brings both with it** (C-444). Unless you state otherwise, a client built
+    /// this way resolves to sandbox `require` with the sandbox network closed, and to
+    /// [`ResourceLimits::autonomous`] ceilings that bound a delegated tree as well as one agent — the
+    /// same pairing the CLI applies to its own unattended surfaces (C-262 / C-410).
+    ///
+    /// Both are floors over silence. [`with_sandbox`](Self::with_sandbox) and
+    /// [`resource_limits`](Self::resource_limits) still win outright, which is how an embedder whose
+    /// isolation comes from an outer container, or whose budget is its own, says so. Injecting an
+    /// [`Approver`] instead of this flag raises nothing: that is your policy to state. See [`Sandbox`].
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
         self
@@ -704,15 +735,16 @@ impl ClientBuilder {
         self
     }
     /// Inject an explicit OS-sandbox [`Sandbox`] that the built client's guarded `System` enforces on
-    /// every spawn. When left unset (the default), the posture is resolved from the environment at
-    /// [`build`](Self::build) via `Sandbox::resolve(SandboxSettings::from_env())` — so a consumer that
-    /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
-    /// Pass one only to pin a posture independent of ambient env.
+    /// every spawn. When left unset (the default), the posture is resolved at [`build`](Self::build)
+    /// from the environment — `Sandbox::resolve(SandboxSettings::from_env())`, so a consumer that
+    /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe) —
+    /// except under an autonomous posture, where [`auto_approve(true)`](Self::auto_approve) raises the
+    /// floor to fail-closed `require` with the network closed (C-444).
     ///
-    /// **These two are the whole story for an embedder** — nothing in this crate infers a posture
-    /// from the client's configuration the way the CLI infers one from its argv (C-262 / C-410), so
-    /// an unattended deployment that does neither runs its spawns unconfined. [`Sandbox`] shows
-    /// both forms.
+    /// **This call wins outright**, in either direction: it pins a posture independent of ambient env,
+    /// and it is also how an autonomous embedder whose isolation comes from elsewhere — an outer
+    /// container, a VM, a disposable host — declines the raise in one line that is visible in its own
+    /// source. [`Sandbox`] shows both forms.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.envelope.sandbox = Some(sandbox);
         self
@@ -804,33 +836,41 @@ impl ClientBuilder {
     /// truncation; the wait before that refusal is bounded by
     /// [`with_tool_call_queue_timeout`](ResourceLimits::with_tool_call_queue_timeout), which
     /// defaults to 30s and is *not* clamped, so a host that sets an absurd value gets an absurd
-    /// wait. Unbounded by default.
+    /// wait.
     ///
-    /// **Scope: these ceilings are PER AGENT (C-299).** They now descend into sub-agents — a
-    /// `task`-delegated child is built with them installed, at every delegation depth, where before
-    /// it ran on a fresh **unbounded** executor. But each agent gets its **own budget**, not a share
-    /// of one:
+    /// **The default depends on the posture (C-444).** State nothing and a supervised client is
+    /// unbounded, as it always was — a human at approval is what bounds it. An autonomous client
+    /// ([`auto_approve(true)`](Self::auto_approve) with no injected approver) resolves to
+    /// [`ResourceLimits::autonomous`] instead, because "unattended *and* unbounded" is the one
+    /// combination the envelope cannot defend. Calling this method wins outright either way, including
+    /// with a deliberately unbounded `ResourceLimits::new()`: stating a ceiling is a decision, and this
+    /// never second-guesses it.
+    ///
+    /// **Scope: the execution budget is PER AGENT; the agent census is PER TREE (C-299, C-444).** The
+    /// ceilings descend into sub-agents — a `task`-delegated child is built with them installed, at
+    /// every delegation depth, where before it ran on a fresh **unbounded** executor:
     ///
     /// * [`with_max_concurrent_tool_calls`](ResourceLimits::with_max_concurrent_tool_calls)`(N)`
-    ///   bounds **each agent** at N simultaneous tool calls. It is *not* a process-wide bound: with k
-    ///   live sub-agents this client's tree may be running up to N×(k+1) tool calls at once. Size it
-    ///   with the delegation fan-out in mind. One shared semaphore would be the stronger guarantee
-    ///   and it deadlocks — see [`ResourceLimits::independent_copy`] for exactly why, and why marking
-    ///   delegating ops does not rescue it.
+    ///   bounds **each agent** at N simultaneous tool calls, and each agent gets its own budget rather
+    ///   than a share of one. One shared semaphore would be the stronger guarantee and it deadlocks —
+    ///   see [`ResourceLimits::independent_copy`] for exactly why, and why marking delegating ops does
+    ///   not rescue it.
+    /// * [`with_max_live_agents`](ResourceLimits::with_max_live_agents)`(k)` is what gives the tree a
+    ///   total anyway: it bounds the *other* factor, so the whole delegated tree runs at most N×k tool
+    ///   calls at once. Unlike the semaphore it is shared across the delegation boundary, which is
+    ///   sound because it **refuses** rather than queueing — a refusal cannot join the wait cycle that
+    ///   made a shared semaphore deadlock. Set neither and the tree total is unbounded; that pairing,
+    ///   not the per-agent number, was the finding.
     /// * The byte ceilings are per agent for the plainer reason that each executor owns its own op
     ///   cache and evidence log, so there is nothing shared to bound.
     ///
     /// Within one agent the ceiling *is* shared across every executor derived from it, including the
     /// fresh one a surface mints per run — so `FlowClient::build_executor` cannot escape it.
     ///
-    /// What is still **not** bounded is the *number* of live sub-agents; that is
-    /// [`SubAgents::max_depth`](flux_orchestrate::SubAgents::max_depth) plus whatever fan-out the
-    /// caller or model produces.
-    ///
     /// A file-configured host builds the same value from `[limits]` with
     /// [`ResourceLimits::from_config`].
     pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
-        self.envelope.resource_limits = limits;
+        self.envelope.resource_limits = Some(limits);
         self
     }
 
@@ -946,7 +986,10 @@ impl ClientBuilder {
         }
         spec.cwd = root;
         let authorization = self.envelope.authorization.clone();
-        let resource_limits = self.envelope.resource_limits.clone();
+        // C-444: silence resolves against the approval posture — an autonomous client is bounded by
+        // `ResourceLimits::autonomous` rather than left unbounded. An explicit `resource_limits(..)`
+        // is honored verbatim.
+        let resource_limits = self.envelope.resolve_resource_limits();
         let mut environment = ExecutionEnvironment::new(
             system.clone(),
             registry,
