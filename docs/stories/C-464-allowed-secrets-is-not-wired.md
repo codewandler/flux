@@ -2,7 +2,7 @@
 id: C-464
 title: "`[web] allowed_secrets` is never wired — the error message tells operators to edit a key that does nothing"
 pillar: Core
-status: ready
+status: done
 priority: 4
 design: docs/designs/secrets-the-agent-never-sees.md
 epic: secrets-the-agent-never-sees
@@ -37,17 +37,17 @@ boundary and has not.
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test asserting a `[web] allowed_secrets` value in config reaches
+- [x] **Failing-first**: a test asserting a `[web] allowed_secrets` value in config reaches
       `http.request`'s allowlist — failing at the merge base, where `execution.rs:1741` hard-codes
       `None`.
-- [ ] Config wiring exists, or ⚠ **the error message stops naming a key that does not work.** Either
+- [x] Config wiring exists, or ⚠ **the error message stops naming a key that does not work.** Either
       resolution is acceptable; leaving the message pointing at dead config is not.
-- [ ] Whatever ends up being the real control is **documented**. If `FLUX_WEB_SECRET_ALLOW` stays a
+- [x] Whatever ends up being the real control is **documented**. If `FLUX_WEB_SECRET_ALLOW` stays a
       live control it comes off `NON_PUBLIC_ENV`; if it becomes an internal escape hatch, config is the
       documented path.
-- [ ] ⚠ **The default is unchanged.** This story is about *reachability*, not about tightening or
+- [x] ⚠ **The default is unchanged.** This story is about *reachability*, not about tightening or
       loosening what is allowed — do not quietly change the deny/allow default while wiring it.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -64,3 +64,10 @@ boundary and has not.
 
 - Filed 2026-08-02 from C-459's adjacent findings, after verifying both halves at `execution.rs:1741`
   and confirming the third claimed finding was not one.
+- Closed 2026-08-02. `[web] allowed_secrets` is an optional list in `flux-config` and is passed
+  unchanged into `WebOptions`; `None` preserves the environment fallback while `Some([])` remains
+  explicit deny-all. User and project lists merge without dropping either. The failing-first binary
+  test runs a deterministic Flux program through the real CLI, real `http.request`, config loader,
+  scope check, and a test-owned socket; before the fix the config failed to parse at `[web]`, and
+  after it the scoped header secret reaches the socket and never stdout/stderr. The public config
+  reference now documents both the table and the still-live environment form.

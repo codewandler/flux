@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The documented HTTP secret allowlist now reaches the CLI's real web tool** (C-464). A new
+  `[web] allowed_secrets` config table carries bare or C-459-scoped entries into `http.request`;
+  absent config preserves `FLUX_WEB_SECRET_ALLOW`, while an explicit empty list remains deny-all.
+  The environment form is now public documentation instead of a live control hidden from the
+  reference. A binary-level test pins the complete config → tool → guarded request path.
+
 - **Every guarded-IO port backend is now review-enumerated** (C-467). The codegate previously
   recognized process, host-file and environment backends but silently ignored
   `GuardedWorkspaceFiles`, the trait that claims workspace confinement. It now rejects an

@@ -28,6 +28,13 @@
 
 ### New
 
+- **HTTP credentials can be limited to where—and for whom—they work.** An `http.request` secret
+  allowlist entry can now name destination hosts, the person allowed to cause its use, and whether
+  it may appear in a header or query parameter. The check happens before flux reads the value and is
+  repeated for redirects. Existing bare-name entries still work as before and are explicitly
+  unscoped. Configure entries with `[web] allowed_secrets`; the existing
+  `FLUX_WEB_SECRET_ALLOW` environment form remains available and is now documented.
+
 - **What happens when the conversation gets long, finally written down.** A new
   [context management](https://flux.codewandler.dev/docs/agent/context-management) page answers the
   question you have been asking: what fills up, what flux does about it when it does, what it keeps,
