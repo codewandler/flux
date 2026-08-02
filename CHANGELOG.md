@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Every guarded-IO port backend is now review-enumerated** (C-467). The codegate previously
+  recognized process, host-file and environment backends but silently ignored
+  `GuardedWorkspaceFiles`, the trait that claims workspace confinement. It now rejects an
+  unreviewed workspace backend, resolves renamed imports to the canonical trait, and compares its
+  guarded-trait list with `flux-system`'s declarations so a fifth port cannot recreate the gap.
+
 - **The SDK autonomous posture now carries fail-closed confinement and a finite delegated-tree
   budget** (C-444, C-470). `ClientBuilder` and `FlowClientBuilder` resolve blanket
   `auto_approve(true)` and every injected opaque `Approver` to sandbox `Require` with the sandbox
@@ -20,6 +26,14 @@ All notable changes to this project are documented in this file. The format is b
   provider construction.
 
 ### Added
+
+- **The guarded-IO port now has a local-first delegating backend** (C-399). `RemoteSystem` hands
+  process, environment, host-file and workspace-file operations to a `Delegate`, while `Loopback`
+  exercises the same path over an in-process substrate with no service running. Refused,
+  unreachable and unserved operations remain structurally distinct in `flux_core::Error`; a path or
+  delegate reason beginning with another mode's exact diagnostic cannot forge the classification,
+  and an empty delegate fails every optional operation closed. This deliberately defines no wire
+  format or network transport—the consumer supplies one without creating a second IO path.
 
 - **A context-management page that matches the compaction the code implements** (C-441). The mechanism
   shipped long ago and its entire user-facing documentation was **one row in a config table**

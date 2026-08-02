@@ -91,7 +91,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-pub use flux_core::{Error, Result};
+pub use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
 
 use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead, System};
 
@@ -173,11 +173,7 @@ pub trait GuardedProcess: Send + Sync {
         timeout: Duration,
     ) -> Guarded<'a, ProcessOutput> {
         let _ = (argv, stdin, timeout);
-        Box::pin(async {
-            Err(Error::Other(
-                "this guarded substrate cannot feed a child process stdin".into(),
-            ))
-        })
+        Box::pin(async { Err(deny("feed a child process stdin")) })
     }
 
     /// Start a long-lived child and hand back its live handle, for a process started in one call and
@@ -188,9 +184,7 @@ pub trait GuardedProcess: Send + Sync {
     /// this default and denies rather than pretending to have spawned something.
     fn spawn_background(&self, argv: &[String], env: &[(String, String)]) -> Result<ManagedChild> {
         let _ = (argv, env);
-        Err(Error::Other(
-            "this guarded substrate cannot host long-lived child processes".into(),
-        ))
+        Err(deny("host long-lived child processes"))
     }
 }
 
@@ -348,10 +342,16 @@ pub trait GuardedWorkspaceFiles: Send + Sync {
     }
 }
 
+/// The one spelling of "the substrate does not serve this", as a prefix.
+///
+/// Public so diagnostics can quote the canonical spelling without copying it. Classification is
+/// structural through [`GuardedIoFailure::Unserved`], never inferred from this text.
+pub const UNSERVED: &str = GuardedIoFailure::Unserved.prefix();
+
 /// The refusal an unserved optional port operation returns. One spelling, so a consumer can tell a
 /// capability the substrate does not offer from a guard that rejected its path.
 fn deny(operation: &str) -> Error {
-    Error::Other(format!("this guarded substrate cannot {operation}"))
+    Error::GuardedIo(GuardedIoError::new(GuardedIoFailure::Unserved, operation))
 }
 
 // ---------------------------------------------------------------------------
