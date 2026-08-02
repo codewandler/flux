@@ -15,6 +15,15 @@
 
 ## [Unreleased]
 
+### New
+
+- **What happens when the conversation gets long, finally written down.** A new
+  [context management](https://flux.codewandler.dev/docs/agent/context-management) page answers the
+  question you have been asking: what fills up, what flux does about it when it does, what it keeps,
+  what it summarizes away, and what that means for the rest of the session. It also says plainly what
+  the size limit actually counts and how to turn it off, and points you at the two neighbouring
+  features — context packs and project context — that answer different questions.
+
 ## [0.49.0] - 2026-08-02
 
 ### Action needed

@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A context-management page that matches the compaction the code implements** (C-441). The mechanism
+  shipped long ago and its entire user-facing documentation was **one row in a config table**
+  (`FLUX_COMPACT_CHARS`), so the question every user asks — *what happens when the conversation gets
+  long* — was answered nowhere. `website/docs/agent/context-management.md` now answers what fills the
+  context, what flux does when it fills, what is kept, what is lost, and what it means afterwards, with
+  the two adjacent pages (`context-packs`, `project-context`) cross-linked in both directions because
+  they answer *different* questions and made the gap look covered from the inside.
+  ⚠ **It corrected a claim the coordinator told it to reuse.** C-443's wording — *"a replay or export
+  can still see what was replaced"* — is true of the **log** and false of both **commands**:
+  `flux replay` reads `run_trace` + `plans_by_key` and never touches the conversation, and
+  `flux export` renders from the turn log, so it shows the **pre**-compaction turns and carries **no
+  compaction marker**. Verified independently before merge. The page states all three readers
+  separately rather than collapsing them into a reassurance that is wrong in the one direction a user
+  would notice.
+  It also does not paper over [C-462](docs/stories/C-462-compaction-threshold-is-context-window-blind.md):
+  the threshold row now says what the number measures — **characters, not a fraction of the context
+  window** — and that `0` disables it.
+  Pinned by a test asserting the literal source strings of compaction's gates, so a behaviour-preserving
+  refactor fails loudly and the fix is to re-read the code rather than loosen the assertion.
+  ⚠ Unverified: the Docusaurus build. `website/node_modules` is absent locally, so
+  `onBrokenLinks`/`onBrokenAnchors: 'throw'` never ran; links and the one anchor were checked by hand.
+
 ## [0.49.0] - 2026-08-02
 
 ### Added
