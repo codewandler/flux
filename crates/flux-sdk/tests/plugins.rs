@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use flux_core::Result;
 use flux_provider::{ChunkStream, Provider, Request};
 use flux_sdk::plugins::PluginDescriptor;
-use flux_sdk::FlowClient;
+use flux_sdk::{FlowClient, Sandbox, SandboxSettings};
 use serde_json::json;
 
 /// The plugin op dispatches directly (no planning), so the provider is never called — panic if it
@@ -56,6 +56,10 @@ async fn plugin_op_registers_dispatches_and_uppercases_when_allowed() {
     let mut client = FlowClient::builder()
         .model("mock")
         .auto_approve(true)
+        // This test exercises approval and plugin projection, not OS confinement. The child is the
+        // workspace-built fixture binary; make that test-only posture explicit so the autonomous
+        // SDK default does not require a host sandbox in CI's no-backend leg.
+        .with_sandbox(Sandbox::resolve(SandboxSettings::off()))
         .build(Arc::new(NeverProvider), &root)
         .unwrap();
     client
