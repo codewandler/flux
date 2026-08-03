@@ -20,40 +20,56 @@ ever receiving vendor credentials.
 
 ## Acceptance
 
-- [ ] `flux exchange local start`, `status` and `stop` own one loopback-only local Exchange lifecycle
-      with deterministic state and useful idempotency: repeated start/status/stop calls either report
-      the same state or a specific machine-readable refusal, never silently create a second service.
+- [ ] `flux exchange local start`, `status` and `stop` consume C-510's pinned, verified and
+      process-owned local Exchange lifecycle. This story adds no second downloader, verifier,
+      executable discovery rule or lifecycle state machine.
 - [ ] Human/operator bootstrap is a separate ceremony from the Service Account Flux uses at runtime.
-      A one-time Service Account token moves directly from Exchange into an OS credential store (or
-      another explicitly reviewed owner-only store), never through argv, environment variables,
-      stdout, logs, model-visible output or project configuration; an unavailable secure store
-      refuses setup instead of degrading to plaintext.
+      A one-time Service Account token moves over an Exchange-owned direct TTY, browser or inherited
+      file-descriptor handoff into an OS credential store (or another explicitly reviewed owner-only
+      store). Flux never parses or buffers the token, and neither bootstrap nor later runtime accepts
+      it through argv, an environment variable, JSON, stdin shared with Flux, stdout, logs,
+      model-visible output or project configuration. An unavailable secure store or handoff refuses
+      setup instead of degrading to plaintext; this Milestone 1 path explicitly supersedes any
+      environment-token bootstrap that C-503 used while proving the lower-level client.
 - [ ] `flux integration connect <connector> --name <name>` consumes Exchange X-125's single
-      machine-readable labelled-connection plan backed by Connectors C-508 declarations. Interactive
-      prompts and scriptable flags/JSON cover every declared non-secret setting, while vendor secrets
-      are accepted only by an Exchange-owned secure surface and Flux keeps neither their values nor a
+      machine-readable labelled-connection plan backed by Connectors C-87/C-508 declarations. Flux
+      accepts exactly `exchange.connection-plan.v1` before showing a prompt or writing any state and
+      refuses every absent, unknown or incompatible plan version. Interactive prompts cover every
+      declared non-secret setting; vendor secrets use an Exchange-owned direct TTY, browser or
+      inherited file-descriptor handoff, so Flux never parses or receives them and never accepts them
+      through argv, environment variables or JSON. Flux keeps neither their values nor a
       connector-specific form schema.
 - [ ] A failing-first CLI projection corpus covers GitLab's custom HTTPS `endpoint`, Jira Cloud's
       `site` and account settings, and Zendesk's declared `domain` as well as credential fields. A
-      convenience option such as `--endpoint`, `--site` or `--domain` must map to the declaration;
-      unknown, omitted required or unprojected fields visibly refuse rather than producing an
-      incomplete connection.
-- [ ] `flux integration grant` previews and then applies Exchange metadata-selector grants;
-      `flux integration list` reports labelled connection and effective-operation state; and
+      scriptable convenience option such as `--endpoint`, `--site` or `--domain` exists only when it
+      maps from a field identity or alias published by the plan; every non-secret field remains
+      scriptable through a generic `--field <identity>=<value>` fallback. Flux maintains no vendor
+      alias list. Unknown aliases/identities, omitted required or unprojected fields visibly refuse
+      before submission rather than producing an incomplete connection.
+- [ ] `flux integration grant` first previews and applies a low-risk metadata-selector read grant;
+      the tutorial proves a write remains refused under it, then previews and applies a high-risk
+      metadata-selector grant and separately asks for the concrete write approval before that write
+      executes. `flux integration list` reports labelled connection and effective-operation state;
       `flux integration doctor` distinguishes local-process, human-bootstrap, Service Account auth,
       incomplete settings, missing grant, Exchange refusal and Exchange-unavailable outcomes without
-      printing credential-shaped data.
+      printing credential-shaped data. No grant is an operation-name allowlist.
 - [ ] Every command has a non-interactive JSON mode with no hidden prompt, stable success/refusal
       categories and deterministic exit status. Repeating an identical lifecycle, connection or
       grant request is idempotent; a conflicting connection definition refuses and names the
       connector plus label, never a setting or secret value.
 - [ ] A failing-first clean-machine end-to-end test and the user documentation execute this exact
-      sequence against a non-published workspace that locally binds Flux, flux-connectors and
-      flux-exchange: start Exchange; connect `gitlab/company` with a custom endpoint; connect
-      `jira/company` with its Cloud site; preview/apply read grants; list and diagnose effective
-      tools; complete one read and one separately approved write from Flux; then stop Exchange.
-      The proof asserts that no vendor credential enters Flux output, logs, events, session state or
-      persisted configuration and that stopping Exchange removes only official external tools.
+      sequence against both the released clean-machine path and a non-published workspace that locally
+      binds Flux, flux-connectors and flux-exchange: install/start the compatible Exchange from
+      C-510/X-126; connect `gitlab/company` with a custom endpoint; connect `jira/company` with its
+      Cloud site; preview/apply the low-risk read grant; list and diagnose effective tools; complete
+      one read; prove a write is refused; preview/apply the high-risk metadata grant; separately
+      approve and complete that write from Flux; then stop Exchange. The proof asserts that no vendor
+      credential or Service Account token enters Flux output, logs, events, session state or persisted
+      configuration and that stopping Exchange removes only official external tools.
+- [ ] The local Flux client and Exchange runtime are tested as an HTTP process boundary. Their Rust
+      engine dependency lines may differ and are never unified with path/git dependencies or a
+      combined Cargo workspace; compatibility comes only from C-510's pinned release and supported
+      HTTP API/connection-plan versions.
 
 ## Progress
 
@@ -62,10 +78,13 @@ ever receiving vendor credentials.
 ## Notes
 
 - Cross-repository source: `../flux-roadmap/decisions/0002-declaration-driven-connection-onboarding.md`.
-- Depends on Flux C-503, Connectors C-508 and Exchange X-125. C-508 extends the existing connector
-  settings foundation in C-87; X-125 closes the complete-settings projection gap left by X-80.
-- The independent CLI command/output skeleton may proceed alongside C-503/C-508/X-125. The exact
-  clean-machine tutorial is complete only when all four contracts converge in the local three-repo
-  acceptance proof.
+- The separately released runtime and compatibility boundary come from
+  `../flux-roadmap/decisions/0004-flux-manages-a-verified-local-exchange.md`.
+- Depends on Flux C-503 and C-510, Connectors C-87/C-508, and Exchange X-125/X-126. C-508 extends the
+  existing connector settings foundation in C-87; X-125 closes the complete-settings projection gap
+  left by X-80; X-126 and C-510 supply the separately released, verified local executable.
+- The independent CLI command/output skeleton may proceed alongside C-503/C-508/X-125/X-126/C-510.
+  The exact clean-machine tutorial is complete only when all six contracts converge in the released
+  clean-machine proof and the local three-repository acceptance workspace.
 - The connection name is Exchange's existing tenant-scoped label. It is not a tenant, authority,
   endpoint, credential address or caller-selected runtime placement.
