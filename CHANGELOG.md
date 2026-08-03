@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.54.3] - 2026-08-03
+
 ### Changed
 
 - **All official integrations now have one documented connector destination** (C-500, C-501).

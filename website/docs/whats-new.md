@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.54.3] - 2026-08-03
+
 ### Improved
 
 - **Every official integration now has one destination.** Rich integrations such as Docker,
