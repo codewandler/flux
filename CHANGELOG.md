@@ -35,6 +35,12 @@ All notable changes to this project are documented in this file. The format is b
   Cargo build script. Adding, moving, renaming or upgrading a direct dependency now fails with the
   exact regeneration command until its lock diff is acknowledged.
 
+- **The provider guide now states the supported breadth and the rule for extending it** (C-449).
+  Flux ships eight production text-provider prefixes over four wire codecs plus one optional realtime
+  implementation; the maintained strategy is a narrow in-tree registry, OpenRouter for the catalogue
+  tail, and the Rust `Provider` interface for embedders—not one built-in prefix per vendor or a model
+  provider loader hidden in connectors/plugins.
+
 - **The contributor vision now classifies every decision-bearing finding from the comparative source
   review exactly once** (C-452). It separates real engineering gaps from deliberate costs of the
   mandatory effect envelope and from adoption evidence that code cannot manufacture, with an explicit

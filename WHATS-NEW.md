@@ -28,6 +28,11 @@
 
 ### Improved
 
+- **The model guide now explains how to use a provider Flux does not name.** Use an OpenRouter
+  catalogue id for hosted models, either Ollama wire for local models, or implement the Rust provider
+  interface in an embedded product. Flux keeps a small, fully maintained built-in set instead of
+  promising a separate adapter for every vendor.
+
 - **The integration guides now distinguish today's plugin compatibility path from its replacement.**
   The signed plugin pack still works today while adapters migrate. The embedded Exchange client is
   now the official path, with Exchange executing connector runtimes and no local fallback; adapter
