@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.52.3] - 2026-08-03
+
 ### Fixed
 
 - **Default web fetches no longer parse PDFs with an unsafe dependency.** PDF bodies are detected

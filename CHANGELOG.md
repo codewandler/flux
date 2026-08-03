@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.52.3] - 2026-08-03
+
 ### Security
 
 - **Default web.fetch no longer links the PDF parser affected by RUSTSEC-2026-0187** (C-494).
