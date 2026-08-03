@@ -56,7 +56,7 @@ both directions). ⚠ **The third does not exist.**
       `guard_target_host_pinned`, `DialTarget` — with **no second range check, hostname rule or
       allowlist derived anywhere.** `AGENTS.md` forbids a second URL guard and C-396's review confirmed
       the shared-helper discipline.
-- [ ] ⚠ **Inbound is defined, and it is the new part.** What it means to bind and accept under flux's
+- [x] ⚠ **Inbound is defined, and it is the new part.** What it means to bind and accept under flux's
       guarantees, in one place — so C-409's finding (adapters binding listeners with none of
       flux-server's hardening) becomes structurally impossible rather than repeatedly fixed.
 - [x] Resolution is a seam: C-396's tests already inject a `FixedResolver`/`RebindingResolver`, so the
@@ -82,5 +82,25 @@ both directions). ⚠ **The third does not exist.**
 - 2026-08-02: `GuardedNetwork` now returns opaque bounded stream/listener/datagram resources. Native
   outbound uses the existing pinned-address guard; inbound requires loopback or authenticated
   exposure and carries connection/frame/timeout limits. Remote delegation and HTTPS/WSS transport
-  exercise all three resource shapes. The remaining unchecked item is migrating older server and
-  channel listeners so C-409's scattered-bind class becomes structurally impossible everywhere.
+  exercise all three resource shapes. At that point the remaining item was migrating older server
+  and channel listeners so C-409's scattered-bind class became structurally impossible everywhere.
+- 2026-08-03: the remaining long-lived production listeners (`flux-server` single/multi-agent and
+  A2A/webhook/connector channels) bind through the selected `ExecutionSystem`. Axum consumes the
+  opaque stream through a bounded in-process bridge, so physical accept/read/write remain behind
+  `GuardedNetwork`. A syntax-aware production census permits only the native implementation, two
+  finite loopback OAuth callbacks, and the static public-docs listener; renamed imports are covered
+  by a mutation test. The full workspace gate remains pending while concurrent lanes converge.
+- 2026-08-03 follow-up: a failing-first backpressure test reproduced head-of-line blocking in the
+  original single bridge pump: unread inbound bytes could prevent a streaming response. Guarded
+  streams now split into independently cancellable read/write halves, including multiplexed remote
+  wire handling (protocol v2). Native and HTTPS-loopback tests prove simultaneous traffic, protocol
+  drop closes the stream and releases a one-connection admission permit, and failed accepts back off
+  rather than hot-loop while listener drop closes exactly once.
+- 2026-08-03 adversarial follow-up: removed the public already-bound native-listener server seams.
+  Standalone single-agent serving now takes its `ExecutionSystem` from the engine executor, while
+  multi-agent serving requires the host-selected system explicitly. Failing-first probes refuse the
+  selected bind and prove no native fallback occurs. The source census now detects ordinary aliases,
+  fully-qualified native listener types, obvious listener calls inside macro tokens, and direct
+  socket2/libc/nix constructors. It cannot expand procedural/build-script macros or inspect downstream
+  source; the public server API no longer accepts a native listener through which downstream code
+  could bypass the guarded port.

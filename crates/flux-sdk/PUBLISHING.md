@@ -152,15 +152,18 @@ Merging that PR is the whole release action; its resulting push to `release` sta
 
 `.github/workflows/release-flow.yml` runs the live smoke, asks the tool-less release scribe for the
 two changelog sections, has the host derive and cut the version, and creates a local release commit
-plus annotated tag. Before running Flux unattended, the workflow installs bubblewrap, enables the
+plus annotated tag. The automatic cut delegates its full repository gate to the candidate workflow;
+that is the only path allowed to pass `--no-gate` to `cut-release.sh`. Before running Flux unattended, the workflow installs bubblewrap, enables the
 user-namespace primitive restricted by the hosted Ubuntu AppArmor default, and self-tests the
 backend; agentic and served smoke legs remain confined instead of weakening the fail-closed sandbox
 posture for CI. Its host-owned promotion step then:
 
 1. stages the cut commit at `refs/heads/release-candidates/vX.Y.Z`;
-2. dispatches `.github/workflows/release.yml` from that exact ref and waits for all five cargo-dist
-   targets;
-3. verifies the candidate's version/SHA/run receipt and exact-SHA lookup;
+2. dispatches `.github/workflows/release.yml` from that exact ref; that workflow verifies its
+   checked-out SHA, runs `scripts/release-full-gate.sh` once, and only then builds all five
+   cargo-dist targets;
+3. verifies the candidate's version/SHA/run receipt, including the
+   `mandatory-full-v1` gate marker and gated commit SHA;
 4. advances `main`, then pushes the annotated tag; and
 5. waits for both tag workflows, verifies the public GitHub Release, and only then deletes the
    candidate ref.
@@ -168,6 +171,10 @@ posture for CI. Its host-owned promotion step then:
 The matching tag run verifies the receipt and promotes those artifacts without recompiling, while
 retaining the normal public-release asset verification. The tag simultaneously starts the
 idempotent crates.io publisher.
+
+If any full-gate command fails, the candidate run creates no receipt. The promotion helper is
+waiting with `--exit-status`, so it retains the candidate ref for diagnosis and leaves both `main`
+and the tag untouched.
 
 Three Actions secrets are required for the default path, with one optional provider override:
 
@@ -193,7 +200,8 @@ a rehearsal. Neither manual mode calls the promotion helper or moves a remote re
 ### Manual build-once path
 
 If the automation itself is unavailable, run `scripts/cut-release.sh <version|patch|minor>` from a
-clean `main` checkout. It prints this exact sequence; do not advance `main` or push the tag before
+clean `main` checkout. Its default remains the full local gate; `--no-gate` is rejected outside the
+automatic release-branch push. It prints this exact sequence; do not advance `main` or push the tag before
 the candidate and receipt checks are green:
 
 ```sh

@@ -30,6 +30,22 @@ pub trait DuplexStream: Send {
 
     /// Gracefully shut down the connection where the transport supports it.
     fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()>;
+
+    /// Consume the connection into independently-drivable read and write halves. This is required
+    /// rather than emulated with a mutex: a blocked read must never prevent a streaming response,
+    /// and a backpressured response must never prevent the peer's input from being drained.
+    fn split(self: Box<Self>) -> (Box<dyn DuplexReadHalf>, Box<dyn DuplexWriteHalf>);
+}
+
+/// The receive side of a split guarded connection.
+pub trait DuplexReadHalf: Send {
+    fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>>;
+}
+
+/// The send side of a split guarded connection.
+pub trait DuplexWriteHalf: Send {
+    fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()>;
+    fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()>;
 }
 
 /// A substrate-neutral guarded network connection.
@@ -207,6 +223,55 @@ impl NetworkStream {
     /// Gracefully shut down the connection.
     pub async fn shutdown(&mut self) -> Result<()> {
         self.inner.shutdown().await
+    }
+
+    /// Consume this connection into independently-drivable guarded halves.
+    pub fn into_split(self) -> (Box<dyn DuplexReadHalf>, Box<dyn DuplexWriteHalf>) {
+        self.inner.split()
+    }
+
+    /// Adapt this opaque guarded stream to Tokio's byte-stream traits without exposing a native
+    /// socket. Protocol stacks consume one end of a bounded in-process bridge; the pump keeps every
+    /// physical read and write behind this stream's guarded implementation.
+    pub fn into_async_io(self, frame_bytes: usize) -> tokio::io::DuplexStream {
+        let frame_bytes = frame_bytes.max(1);
+        let (protocol, bridge) = tokio::io::duplex(frame_bytes);
+        let (mut stream_read, mut stream_write) = self.into_split();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let (mut outbound, mut inbound) = tokio::io::split(bridge);
+            {
+                let read_half = async {
+                    loop {
+                        let bytes = stream_read.read(frame_bytes).await?;
+                        if bytes.is_empty() {
+                            return Ok::<(), Error>(());
+                        }
+                        if inbound.write_all(&bytes).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                };
+                let write_half = async {
+                    let mut bytes = vec![0u8; frame_bytes];
+                    loop {
+                        let count = match outbound.read(&mut bytes).await {
+                            Ok(0) | Err(_) => return Ok::<(), Error>(()),
+                            Ok(count) => count,
+                        };
+                        stream_write.write_all(&bytes[..count]).await?;
+                    }
+                };
+                tokio::pin!(read_half, write_half);
+                tokio::select! {
+                    _ = &mut read_half => {}
+                    _ = &mut write_half => {}
+                };
+            }
+            let _ = stream_write.shutdown().await;
+        });
+        protocol
     }
 }
 
@@ -590,12 +655,184 @@ impl DuplexStream for DialStream {
     fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
         Box::pin(DialStream::shutdown(self))
     }
+
+    fn split(self: Box<Self>) -> (Box<dyn DuplexReadHalf>, Box<dyn DuplexWriteHalf>) {
+        split_dial_stream(*self)
+    }
+}
+
+enum DialReadHalf {
+    Tcp(tokio::net::tcp::OwnedReadHalf),
+    #[cfg(unix)]
+    Unix(tokio::net::unix::OwnedReadHalf),
+    Udp(Arc<tokio::net::UdpSocket>),
+    Icmp(Arc<IcmpSocket>),
+}
+
+enum DialWriteHalf {
+    Tcp(tokio::net::tcp::OwnedWriteHalf),
+    #[cfg(unix)]
+    Unix(tokio::net::unix::OwnedWriteHalf),
+    Udp(Arc<tokio::net::UdpSocket>),
+    Icmp(Arc<IcmpSocket>),
+}
+
+fn split_dial_stream(stream: DialStream) -> (Box<dyn DuplexReadHalf>, Box<dyn DuplexWriteHalf>) {
+    let (read, write) = match stream {
+        DialStream::Tcp(stream) => {
+            let (read, write) = stream.into_split();
+            (DialReadHalf::Tcp(read), DialWriteHalf::Tcp(write))
+        }
+        #[cfg(unix)]
+        DialStream::Unix(stream) => {
+            let (read, write) = stream.into_split();
+            (DialReadHalf::Unix(read), DialWriteHalf::Unix(write))
+        }
+        DialStream::Udp(stream) => {
+            let stream = Arc::new(stream);
+            (
+                DialReadHalf::Udp(stream.clone()),
+                DialWriteHalf::Udp(stream),
+            )
+        }
+        DialStream::Icmp(stream) => {
+            let stream = Arc::new(stream);
+            (
+                DialReadHalf::Icmp(stream.clone()),
+                DialWriteHalf::Icmp(stream),
+            )
+        }
+    };
+    (Box::new(read), Box::new(write))
+}
+
+impl DuplexReadHalf for DialReadHalf {
+    fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>> {
+        Box::pin(async move {
+            let datagram = matches!(self, Self::Udp(_) | Self::Icmp(_));
+            let mut buf = vec![0u8; if datagram { max.saturating_add(1) } else { max }];
+            let count = match self {
+                Self::Tcp(stream) => stream.read(&mut buf).await,
+                #[cfg(unix)]
+                Self::Unix(stream) => stream.read(&mut buf).await,
+                Self::Udp(stream) => stream.recv(&mut buf).await,
+                Self::Icmp(stream) => stream.recv(&mut buf).await,
+            }
+            .map_err(|error| Error::Other(format!("conn read: {error}")))?;
+            if datagram && count > max {
+                return Err(Error::Other(format!(
+                    "conn read: datagram exceeds the {max}-byte read buffer — the kernel discarded \
+                     the remainder, so the reply cannot be validated; read with a larger buffer"
+                )));
+            }
+            buf.truncate(count);
+            Ok(buf)
+        })
+    }
+}
+
+impl DuplexWriteHalf for DialWriteHalf {
+    fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()> {
+        Box::pin(async move {
+            let sent = match self {
+                Self::Tcp(stream) => return finish_write(stream.write_all(data).await),
+                #[cfg(unix)]
+                Self::Unix(stream) => return finish_write(stream.write_all(data).await),
+                Self::Udp(stream) => stream.send(data).await,
+                Self::Icmp(stream) => stream.send(data).await,
+            }
+            .map_err(|error| Error::Other(format!("conn write: {error}")))?;
+            if sent != data.len() {
+                return Err(Error::Other(format!(
+                    "conn write: datagram truncated ({sent} of {} bytes sent)",
+                    data.len()
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
+        Box::pin(async move {
+            match self {
+                Self::Tcp(stream) => stream.shutdown().await,
+                #[cfg(unix)]
+                Self::Unix(stream) => stream.shutdown().await,
+                Self::Udp(_) | Self::Icmp(_) => return Ok(()),
+            }
+            .map_err(|error| Error::Other(format!("conn shutdown: {error}")))
+        })
+    }
 }
 
 struct LimitedTcpStream {
     stream: tokio::net::TcpStream,
     _admission: tokio::sync::OwnedSemaphorePermit,
     limits: InboundLimits,
+}
+
+struct LimitedTcpReadHalf {
+    stream: tokio::net::tcp::OwnedReadHalf,
+    _admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+    limits: InboundLimits,
+}
+
+impl DuplexReadHalf for LimitedTcpReadHalf {
+    fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>> {
+        Box::pin(async move {
+            if max > self.limits.max_frame_bytes {
+                return Err(Error::Other(format!(
+                    "conn read cap {max} exceeds inbound frame ceiling {}",
+                    self.limits.max_frame_bytes
+                )));
+            }
+            tokio::time::timeout(self.limits.io_timeout, async {
+                let mut buf = vec![0; max];
+                let count = self
+                    .stream
+                    .read(&mut buf)
+                    .await
+                    .map_err(|error| Error::Other(format!("conn read: {error}")))?;
+                buf.truncate(count);
+                Ok(buf)
+            })
+            .await
+            .map_err(|_| Error::Other("conn read timed out".into()))?
+        })
+    }
+}
+
+struct LimitedTcpWriteHalf {
+    stream: tokio::net::tcp::OwnedWriteHalf,
+    _admission: Arc<tokio::sync::OwnedSemaphorePermit>,
+    limits: InboundLimits,
+}
+
+impl DuplexWriteHalf for LimitedTcpWriteHalf {
+    fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()> {
+        Box::pin(async move {
+            if data.len() > self.limits.max_frame_bytes {
+                return Err(Error::Other(format!(
+                    "conn write size {} exceeds inbound frame ceiling {}",
+                    data.len(),
+                    self.limits.max_frame_bytes
+                )));
+            }
+            tokio::time::timeout(self.limits.io_timeout, self.stream.write_all(data))
+                .await
+                .map_err(|_| Error::Other("conn write timed out".into()))?
+                .map_err(|error| Error::Other(format!("conn write: {error}")))
+        })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
+        Box::pin(async move {
+            tokio::time::timeout(self.limits.io_timeout, self.stream.shutdown())
+                .await
+                .map_err(|_| Error::Other("conn shutdown timed out".into()))?
+                .map_err(|error| Error::Other(format!("conn shutdown: {error}")))
+        })
+    }
 }
 
 impl DuplexStream for LimitedTcpStream {
@@ -649,6 +886,28 @@ impl DuplexStream for LimitedTcpStream {
             .map_err(|_| Error::Other("conn shutdown timed out".into()))?
             .map_err(|error| Error::Other(format!("conn shutdown: {error}")))
         })
+    }
+
+    fn split(self: Box<Self>) -> (Box<dyn DuplexReadHalf>, Box<dyn DuplexWriteHalf>) {
+        let LimitedTcpStream {
+            stream,
+            _admission,
+            limits,
+        } = *self;
+        let (read, write) = stream.into_split();
+        let admission = Arc::new(_admission);
+        (
+            Box::new(LimitedTcpReadHalf {
+                stream: read,
+                _admission: admission.clone(),
+                limits,
+            }),
+            Box::new(LimitedTcpWriteHalf {
+                stream: write,
+                _admission: admission,
+                limits,
+            }),
+        )
     }
 }
 
@@ -1960,6 +2219,116 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("frame ceiling"));
+    }
+
+    #[tokio::test]
+    async fn opaque_inbound_stream_drives_async_protocol_io_without_exposing_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let limits = InboundLimits {
+            max_connections: 1,
+            max_frame_bytes: 64,
+            io_timeout: Duration::from_secs(2),
+        };
+        let mut listener = bind_tcp(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            BindExposure::LoopbackOnly,
+            limits,
+        )
+        .await
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(b"request").await.unwrap();
+            let mut response = [0; 8];
+            stream.read_exact(&mut response).await.unwrap();
+            response
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut protocol = stream.into_async_io(limits.max_frame_bytes);
+        let mut request = [0; 7];
+        protocol.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        protocol.write_all(b"response").await.unwrap();
+        assert_eq!(&client.await.unwrap(), b"response");
+    }
+
+    #[tokio::test]
+    async fn protocol_writes_progress_while_unread_peer_bytes_apply_backpressure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let limits = InboundLimits {
+            max_connections: 1,
+            max_frame_bytes: 8,
+            io_timeout: Duration::from_secs(2),
+        };
+        let mut listener = bind_tcp(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            BindExposure::LoopbackOnly,
+            limits,
+        )
+        .await
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let flooding = tokio::spawn(async move {
+                stream.write_all(&[b'x'; 64]).await.unwrap();
+                stream
+            });
+            let mut stream = flooding.await.unwrap();
+            let mut response = [0; 8];
+            tokio::time::timeout(Duration::from_millis(250), stream.read_exact(&mut response))
+                .await
+                .expect("outbound traffic must not wait for inbound bridge capacity")
+                .unwrap();
+            response
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut protocol = stream.into_async_io(limits.max_frame_bytes);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        protocol.write_all(b"response").await.unwrap();
+        assert_eq!(&peer.await.unwrap(), b"response");
+    }
+
+    #[tokio::test]
+    async fn dropping_protocol_io_closes_the_guarded_stream_and_releases_admission() {
+        use tokio::io::AsyncReadExt as _;
+
+        let limits = InboundLimits {
+            max_connections: 1,
+            max_frame_bytes: 64,
+            io_timeout: Duration::from_secs(2),
+        };
+        let mut listener = bind_tcp(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            BindExposure::LoopbackOnly,
+            limits,
+        )
+        .await
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_peer = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream.into_async_io(limits.max_frame_bytes));
+
+        let mut first_peer = first_peer;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), first_peer.read(&mut byte))
+                .await
+                .expect("dropping protocol IO must close the guarded stream")
+                .unwrap(),
+            0
+        );
+
+        let second_peer = tokio::spawn(tokio::net::TcpStream::connect(address));
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("the first stream must release its connection permit")
+            .unwrap();
+        second_peer.await.unwrap().unwrap();
     }
 
     #[tokio::test]

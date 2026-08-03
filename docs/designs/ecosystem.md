@@ -1,11 +1,14 @@
 # Design: the flux ecosystem — three repositories, one vocabulary
 
-**Status:** accepted, owner-confirmed 2026-08-03 · **Scope:** cross-repository · **Produces:**
+**Status:** amended by C-508 and flux-roadmap Decision 0001, 2026-08-03 · **Scope:** Flux's local
+contract within the cross-repository program · **Produces:**
 [`docs/ecosystem.md`](../ecosystem.md) (the end-user description), amendments to
 `flux-connectors/docs/vision.md`, and the charter for `codewandler/flux-exchange`
 
-> This document is the *reasoning*. `docs/ecosystem.md` is the *description* derived from it. Where
-> they disagree, this one is the argument and that one is the summary — fix both.
+> Cross-repository architecture, ordering and milestone scope are owned by the sibling
+> `flux-roadmap` repository. This document is Flux's local reasoning and implementation contract;
+> `docs/ecosystem.md` is the public description derived from it. Where either conflicts with
+> flux-roadmap Decision 0001, amend the local contract before implementation.
 >
 > Measurements were taken on **2026-08-01** against the working trees at
 > `~/projects/flux`, `~/projects/flux-connectors`, and the downstream product tree that consumes
@@ -39,9 +42,9 @@ Three consequences worth stating because they are the ones people get wrong:
 - **A vendor definition belongs in the public flux-connectors repository whenever the API it
   describes is public** — that is what makes it a vendor fact rather than a private one. An
   *identity adapter* for one company never does, because it is true only of that company.
-- **A connector is not a plugin's rival.** See §The runtime axis — a plugin becomes one *runtime
-  kind* a connector can declare, which is what dissolves the false dichotomy the current charters
-  encode.
+- **A connector replaces an official plugin; it does not create another Flux extension path.** A
+  connector-owned artifact may temporarily speak the framed stdio protocol behind Exchange, but it
+  is never installed, executed or released by Flux.
 - **No flux-family repository names a downstream company.** The rule is the fourth row applied to
   the documentation itself: a product's name is true only of that product, so it belongs in that
   product's repository. This document's own first draft violated it, which is evidence the rule
@@ -66,13 +69,10 @@ name"* two months before this document. The replacement framing:
 Docker, Kubernetes and SQL do not need to be plugins-rather-than-connectors; they need a runtime
 other than HTTP, which is a different statement.
 
-**3. "Being flux's execution path" as a non-goal.** This was already amended once for the
-multi-tenant host, and the amendment did not go far enough — flux-exchange *is* a path flux traffic
-takes in a hosted deployment. The line that survives, and that must survive, is narrower:
-
-> **flux must never *require* flux-exchange.** A `.flux` program loading a connector module on a
-> laptop is a complete path. Trading plugin-binary distribution pain for service lock-in would be a
-> bad trade made twice.
+**3. "Flux can execute the same connector locally."** Superseded. Flux remains a complete language,
+agent loop and core-tool product without Exchange, but official external integrations require
+Exchange. When Exchange is absent, those tools are unavailable; Flux does not fall back to a plugin,
+connector bundle or vendor adapter.
 
 ## The runtime axis — what replaces the plugin/connector dichotomy
 
@@ -81,16 +81,15 @@ plugin protocol, cross-compilation, GitHub release artifacts, a signed pack inde
 install step for every user. That tax is real and it is not intrinsic to the *protocol* — it is
 intrinsic to shipping a binary to every user.
 
-**Reframe: a plugin is one runtime kind a connector may declare.**
+**Reframe: runtime is a connector declaration that Exchange executes.**
 
-| Runtime | Executes by | Status in `flux-system` |
+| Runtime | Exchange executes by | Ownership |
 |---|---|---|
-| `http` | a guarded request | `flux-web`'s `http.request`, egress guarded by `net::guard_url_scoped` |
-| `socket` | a guarded dial | `net::DialTarget` / `DialStream` / `dial_scoped` exist; UDP and ICMP are new variants on the same enums |
-| `process` | a guarded, argv-only spawn | exists — one `build_command`, sandbox backends for bubblewrap and Seatbelt |
-| `container` | a spawn inside docker/k8s | new `Backend` variants, or a `GuardedProcess` port implementation |
-| `remote` | delegation to another substrate | anticipated by `flux-system`'s `port` module, which names *"a remote executor"* |
-| `plugin` | the flux plugin protocol over stdio | a special case of `process` |
+| `http` | evaluating the connector's compiled Flux through guarded HTTP | declaration in flux-connectors; credential, grant and execution in Exchange |
+| `socket` | a guarded connector-declared socket plan | declaration/artifact in flux-connectors; execution and lifecycle in Exchange |
+| `process` | a guarded, argv-only runtime artifact | immutable artifact in flux-connectors; installation and execution in Exchange |
+| `container` | a digest-pinned isolated runtime artifact | immutable artifact in flux-connectors; installation and execution in Exchange |
+| `plugin` | a temporary framed-stdio artifact behind Exchange | connector/Exchange pipeline only; never a Flux release artifact |
 
 The invariant that must survive the generalization, because it is the one that makes the whole thing
 reviewable:
@@ -101,10 +100,11 @@ reviewable:
 ### The physical ownership consequence
 
 Every official integration moves to flux-connectors, including adapters whose implementation remains
-hand-written Rust. Flux retains generic guarded runtime mechanisms and may retain the stdio plugin
-protocol as one runtime; it does not retain vendor-specific Docker, Kubernetes, SQL, observability,
-secret-store, or collaboration adapters as a second catalogue. Connector-specific binaries and
-images are immutable bundle artifacts owned and attested with their declarations.
+hand-written Rust. Exchange is the only official execution placement and owns credential resolution,
+grants, runtime execution and lifecycle. Flux retains its safety envelope and guarded mechanisms for
+core capabilities, but no connector runtime host, stdio plugin protocol, vendor adapter or local
+fallback. Connector-specific binaries and images are immutable artifacts built by the
+connector/Exchange pipeline and attested with their declarations.
 
 Measured on 2026-08-03 with
 `find plugins -mindepth 2 -maxdepth 2 -name Cargo.toml -printf '%h\n' | sort`, the current Flux tree
@@ -124,14 +124,14 @@ descriptors.
 > single-tenant deployment (which is exactly local-dev mode: one operator, no login) or per-tenant
 > isolation at the OS or pod level.
 
-Because the manifest *declares* its runtime, a hosted deployment can **refuse** a `process` connector
+Because the manifest *declares* its runtime, an Exchange deployment can **refuse** a `process` connector
 mechanically rather than relying on an operator noticing. That is a fail-closed rule and it costs one
 check.
 
 ## `flux-system` as the shared substrate
 
-Three consumers want the same execution primitives with different policy: the flux CLI,
-flux-exchange, and at least one downstream product. The instinct is to create a new crate for it.
+Flux core tools and Exchange runtimes can need the same execution primitives under different policy.
+The instinct is to create a new crate for it.
 That instinct is wrong, because the crate already exists and a new one would collide with
 `flux-runtime` — which is the **opposite** concern.
 
@@ -148,7 +148,8 @@ No new crate, no new name. Two follow-ons:
 - The workspace-confined **file surface becomes a port** (C-269 deferred this on the correct
   grounds that its consumers all held a concrete `System`, so a trait had no seam — a second
   consumer is exactly the condition that changes).
-- New runtime backends land as `Backend` variants or port implementations, never as a second IO path.
+- New shared execution primitives may land as `Backend` variants or port implementations, never as a
+  Flux-side official connector dispatcher or second IO path.
 
 ## The three lifetimes
 
@@ -170,16 +171,20 @@ mechanism under a colliding name: flux's `session` already means an event-source
 the two have opposite lifetimes and opposite owners. `lease` is used so that a sentence about one can
 never be misread as a sentence about the other.
 
-## The remote binding: `invoke` and `subscribe`
+## The embedded Exchange binding: one-shot first, lifecycle later
 
-A connector declares two directions, so a host can serve either one remotely. The seam is therefore
-not "channels" — it is a **remote connector binding with two verbs**, and the symmetry is the design.
+The core Flux binary embeds one native Exchange client. It is not an operator-selected placement,
+helper executable, plugin or installed pack. The first useful slice is deliberately smaller than the
+event and runtime lifecycle:
 
-- **`invoke`** — the caller names an operation id and arguments. The host resolves the credential,
+- **Milestone 1: effective catalogue plus `invoke`.** Exchange returns only the connected and granted
+  operations available to one Service Account, with a stable generation identity. Flux refreshes
+  that projection only between turns, then sends an operation id and arguments. The host resolves the credential,
   evaluates the operation's own compiled Flux to build the request, and dispatches. This exists in
   the non-published `flux-connectors/crates/connectors-api` proof host and, for tenant/grant-scoped
   HTTP operations, in flux-exchange v0.13.0.
-- **`subscribe`** — the host terminates the vendor webhook, holds the socket, or runs the poll; it
+- **Milestone 3: `subscribe`, streams, cancellation and leases.** The host terminates the vendor
+  webhook, holds the socket, or runs the poll; it
   verifies the signature **with the credential it owns**; it maps the payload through the binding the
   manifest declares; and it emits a normalized, typed event to a subscriber. Exchange v0.16.0 has
   the generated WebSocket-channel slice for declared socket event sets; webhooks, polls, arbitrary
@@ -208,21 +213,20 @@ tenant already has.
 
 ### Transport
 
-**HTTP** for everything one-shot: catalogue reads, credential and connection management, stateless
-`invoke`, the whole management surface.
+**HTTP** is the complete Milestone 1 Flux client surface: effective catalogue and stateless
+`invoke`. Credential and connection management remain operator surfaces rather than Service Account
+client responsibilities.
 
-**One websocket per connected caller** for the three things that do not fit request/response, which
+**One websocket per connected caller** is later lifecycle work for the three things that do not fit request/response, which
 are all the same shape — a long-lived authenticated bidirectional frame stream:
 
 1. inbound events (`subscribe`),
 2. streamed operation output (`logs -f`, process stdout, a socket read loop),
 3. lease liveness — the host must learn the holder died so it can release what it is holding.
 
-flux needs no new trigger concept to consume this. `flux-channels` already has a generic `connector`
-channel kind that reads a manifest and drives a deliberately narrow webhook binding locally. A
-future `mode = "remote"` setting can open a stream instead of binding a listener while keeping event
-labels unchanged. Exchange's authenticated `/api/subscribe` exists for its generated socket slice;
-Flux's remote channel mode and the general stream protocol do not.
+Flux needs no new trigger concept to consume this. Exchange's authenticated `/api/subscribe` exists
+for its generated socket slice; projecting those events, streamed operation output, cancellation and
+lease liveness into Flux requires a separate lifecycle story and is not acceptance for C-503.
 
 ## Principals and grants
 
@@ -330,17 +334,18 @@ Two patterns generalize from the first adoption and are worth stating for the ne
 The accepted direction is filed as one cross-repository program rather than left as an architectural
 wish:
 
-- Flux C-500 is the epic; C-501 aligns its public contract, C-502 hosts connector runtime artifacts
-  locally, C-503 binds the same addresses to Exchange, C-504 proves placement parity, C-505 retires
-  integration-specific native crates, and C-506 decides the remaining generic plugin infrastructure.
+- Flux C-500 is the epic; C-501 aligns its public contract, C-502 closes the rejected local runtime
+  host without implementation, C-503 embeds the Milestone 1 effective-catalogue/one-shot HTTP client,
+  C-504 provides per-adapter legacy-versus-Exchange conformance, C-505 retires adapters incrementally,
+  and C-506 unconditionally deletes the remaining plugin support and release infrastructure.
 - flux-connectors C-495 is the declaration/artifact epic with C-497…C-505 covering runtime bindings,
   artifacts, migration waves, pack projection, and the cutover gate.
 - Exchange X-111 is the hosted-runtime epic with X-113…X-120 covering protocol completion, dispatch,
   tenant isolation, streams, leases, artifact trust, and conformance journeys.
 
-The plan consumes rather than duplicates work visible in linked worktrees: Flux's remote-approval
-C-453 and generated-channel C-481…C-488 branches, flux-connectors' instance-aware host-port C-494
-branch and active C-155 semantic-effects branch, and Exchange's delivered X-107 Service Account work.
+The plan consumes rather than duplicates delivered Flux approval/catalogue seams and Exchange's
+Service Account work. Live branch and story status comes from each repository, while cross-repository
+ordering comes from `flux-roadmap`; neither is copied into this design.
 
 ## Open questions
 

@@ -459,6 +459,8 @@ pub struct DirectIoCall {
     pub line: usize,
     pub api: DirectIoApi,
     pub function: String,
+    /// Canonical call path after resolving imports, renames and local aliases.
+    pub path: Vec<String>,
 }
 
 #[derive(Default)]
@@ -607,6 +609,24 @@ fn classify_direct_io(segments: &[String]) -> Option<DirectIoApi> {
             | ["tokio", "net", "UnixStream", "connect", ..]
             | ["std", "os", "unix", "net", "UnixListener", "bind", ..]
             | ["tokio", "net", "UnixListener", "bind", ..]
+            | [
+                "socket2",
+                "Socket",
+                "new" | "from_raw_fd" | "from_raw_socket",
+                ..
+            ]
+            | [
+                "libc",
+                "socket" | "bind" | "listen" | "accept" | "accept4",
+                ..
+            ]
+            | [
+                "nix",
+                "sys",
+                "socket",
+                "socket" | "bind" | "listen" | "accept" | "accept4",
+                ..
+            ]
     ) {
         return Some(DirectIoApi::Socket);
     }
@@ -626,6 +646,33 @@ fn classify_direct_io(segments: &[String]) -> Option<DirectIoApi> {
         return Some(DirectIoApi::Database);
     }
     None
+}
+
+#[cfg(test)]
+fn is_obvious_native_listener_constructor(segments: &[String]) -> bool {
+    let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+    matches!(
+        parts.as_slice(),
+        ["std" | "tokio", "net", "TcpListener", "bind", ..]
+            | [
+                "socket2",
+                "Socket",
+                "new" | "from_raw_fd" | "from_raw_socket",
+                ..
+            ]
+            | [
+                "libc",
+                "socket" | "bind" | "listen" | "accept" | "accept4",
+                ..
+            ]
+            | [
+                "nix",
+                "sys",
+                "socket",
+                "socket" | "bind" | "listen" | "accept" | "accept4",
+                ..
+            ]
+    )
 }
 
 /// Collect a production file's import, module, rename and type aliases into [`ImportAliases`].
@@ -711,12 +758,67 @@ impl DirectIoVisitor<'_> {
             self.hits.insert(DirectIoCall {
                 line: start_line(path.span()),
                 api,
+                path: resolved,
                 function: self
                     .functions
                     .last()
                     .cloned()
                     .unwrap_or_else(|| "<module>".into()),
             });
+        }
+    }
+
+    /// Scan the otherwise-opaque body of a macro for an obvious path call. This deliberately does
+    /// not pretend to expand macros; it closes a simple macro body containing a listener bind while
+    /// preserving the AST scanner's honest boundary around generated code from
+    /// dependencies or build scripts.
+    fn scan_macro_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        let trees = tokens.into_iter().collect::<Vec<_>>();
+        let mut index = 0;
+        while index < trees.len() {
+            match &trees[index] {
+                proc_macro2::TokenTree::Ident(first) => {
+                    let mut segments = vec![first.to_string()];
+                    let mut cursor = index + 1;
+                    while cursor + 2 < trees.len()
+                        && matches!(&trees[cursor], proc_macro2::TokenTree::Punct(p) if p.as_char() == ':')
+                        && matches!(&trees[cursor + 1], proc_macro2::TokenTree::Punct(p) if p.as_char() == ':')
+                    {
+                        let proc_macro2::TokenTree::Ident(next) = &trees[cursor + 2] else {
+                            break;
+                        };
+                        segments.push(next.to_string());
+                        cursor += 3;
+                    }
+
+                    if let Some(proc_macro2::TokenTree::Group(arguments)) = trees.get(cursor) {
+                        if arguments.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                            let resolved = self.resolve(&segments);
+                            if let Some(api) = classify_direct_io(&resolved) {
+                                self.hits.insert(DirectIoCall {
+                                    line: start_line(first.span()),
+                                    api,
+                                    path: resolved,
+                                    function: self
+                                        .functions
+                                        .last()
+                                        .cloned()
+                                        .unwrap_or_else(|| "<module>".into()),
+                                });
+                            }
+                            self.scan_macro_tokens(arguments.stream());
+                            index = cursor + 1;
+                            continue;
+                        }
+                    }
+                    index = cursor.max(index + 1);
+                }
+                proc_macro2::TokenTree::Group(group) => {
+                    self.scan_macro_tokens(group.stream());
+                    index += 1;
+                }
+                _ => index += 1,
+            }
         }
     }
 }
@@ -735,6 +837,12 @@ impl<'ast> Visit<'ast> for DirectIoVisitor<'_> {
         self.functions.push(item.sig.ident.to_string());
         syn::visit::visit_item_fn(self, item);
         self.functions.pop();
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_macro(self, item);
+        }
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
@@ -788,6 +896,11 @@ impl<'ast> Visit<'ast> for DirectIoVisitor<'_> {
         self.record_call(call);
         syn::visit::visit_expr_call(self, call);
     }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.scan_macro_tokens(mac.tokens.clone());
+        syn::visit::visit_macro(self, mac);
+    }
 }
 
 /// Resolve direct filesystem, process, socket, HTTP-client, and database opens from parsed Rust.
@@ -806,6 +919,64 @@ pub fn raw_direct_io_calls(src: &str) -> syn::Result<Vec<DirectIoCall>> {
     };
     visitor.visit_file(&file);
     Ok(visitor.hits.into_iter().collect())
+}
+
+#[cfg(test)]
+struct NativeListenerTypeVisitor<'a> {
+    aliases: &'a ImportAliases,
+    lines: BTreeSet<usize>,
+}
+
+#[cfg(test)]
+impl<'ast> Visit<'ast> for NativeListenerTypeVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+    }
+
+    fn visit_type_path(&mut self, ty: &'ast syn::TypePath) {
+        let segments = ty
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>();
+        let resolved = self.aliases.resolve(&segments);
+        let parts = resolved.iter().map(String::as_str).collect::<Vec<_>>();
+        if matches!(parts.as_slice(), ["std" | "tokio", "net", "TcpListener"]) {
+            self.lines.insert(start_line(ty.path.span()));
+        }
+        syn::visit::visit_type_path(self, ty);
+    }
+}
+
+/// Production references to a native TCP-listener type. A served API accepting this type has
+/// already crossed the guarded constructor boundary, even when its caller performed the bind.
+#[cfg(test)]
+fn native_tcp_listener_type_lines(src: &str) -> syn::Result<Vec<usize>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = ImportAliases::default();
+    ImportAliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_type_aliases();
+    let mut visitor = NativeListenerTypeVisitor {
+        aliases: &aliases,
+        lines: BTreeSet::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.lines.into_iter().collect())
 }
 
 /// One raw filesystem call in a function that names project-controlled metadata.
@@ -3395,6 +3566,167 @@ fn opens() {
             "direct I/O outside flux-system in model-facing operation crates:\n  {}",
             violations.join("\n  ")
         );
+    }
+
+    /// C-435: production listeners are guarded resources, not adapter-owned sockets. The native
+    /// `TcpListener::bind` constructor exists once, behind `GuardedNetwork::bind_tcp`; every served
+    /// surface consumes that port. Obvious raw/socket2 constructors and macro-contained calls are
+    /// included as bypass shapes. This is deliberately a source census rather than a grep, so test
+    /// doubles and comments do not count and renamed imports cannot hide a second bind.
+    #[test]
+    fn every_production_tcp_listener_bind_is_inside_flux_system() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let mut found = Vec::new();
+        let mut locations = Vec::new();
+
+        for file in workspace_source_files(repo_root) {
+            let relative = file
+                .strip_prefix(repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = std::fs::read_to_string(&file).unwrap();
+            for hit in raw_direct_io_calls(&source).unwrap_or_else(|error| {
+                panic!("parse {} for listener census: {error}", file.display())
+            }) {
+                if is_obvious_native_listener_constructor(&hit.path) {
+                    locations.push(format!("{}:{} ({})", relative, hit.line, hit.function));
+                    found.push((relative.clone(), hit.function));
+                }
+            }
+        }
+
+        // Filesystem traversal order differs across runners; the census is exact, but its
+        // comparison and diagnostic must be stable everywhere.
+        found.sort();
+        locations.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                // Single-use OAuth callbacks are finite loopback protocol handshakes, not served
+                // agent surfaces. They close after one code and cannot use the long-lived HTTP
+                // listener adapter without changing their protocol lifecycle.
+                (
+                    "crates/flux-cli/src/auth_cmd.rs".to_string(),
+                    "wait_for_codex_callback".to_string()
+                ),
+                (
+                    "crates/flux-cli/src/auth_cmd.rs".to_string(),
+                    "wait_for_oauth_callback".to_string()
+                ),
+                // Public documentation may intentionally be unauthenticated off-loopback and has
+                // no execution routes. GuardedNetwork truthfully permits only loopback-open or
+                // authenticated public listeners, so this static-only server remains explicit.
+                (
+                    "crates/flux-server/src/public_docs.rs".to_string(),
+                    "serve".to_string()
+                ),
+                // The sole native constructor implementing GuardedNetwork::bind_tcp.
+                (
+                    "crates/flux-system/src/net.rs".to_string(),
+                    "bind_tcp".to_string()
+                ),
+                // The native guarded network implementation's reviewed raw-ICMP constructor. A
+                // raw socket is not a served listener, but the broad native-socket mutation gate
+                // intentionally keeps every such constructor visible here.
+                (
+                    "crates/flux-system/src/net.rs".to_string(),
+                    "open".to_string()
+                ),
+            ],
+            "a production listener bypasses GuardedNetwork::bind_tcp; move the bind behind the \
+             selected ExecutionSystem or add a narrowly reasoned single-use disposition. The exact \
+             census is a mutation guard: additions and removals both require review: {locations:?}"
+        );
+    }
+
+    #[test]
+    fn listener_census_resolves_renamed_imports() {
+        let fixture = r#"
+use tokio::net::TcpListener as Listener;
+fn serve() { Listener::bind("127.0.0.1:0"); }
+"#;
+        let hits = raw_direct_io_calls(fixture).unwrap();
+        assert!(hits.iter().any(|hit| {
+            hit.path
+                == ["tokio", "net", "TcpListener", "bind"]
+                    .map(str::to_string)
+                    .to_vec()
+        }));
+    }
+
+    #[test]
+    fn listener_census_sees_macros_and_obvious_alternative_socket_constructors() {
+        let fixture = r#"
+macro_rules! raw_listener {
+    () => { tokio::net::TcpListener::bind("127.0.0.1:0") };
+}
+fn alternatives() {
+    socket2::Socket::new(domain, kind, protocol);
+    libc::socket(domain, kind, protocol);
+}
+"#;
+        let paths = raw_direct_io_calls(fixture)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.path.join("::"))
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("tokio::net::TcpListener::bind"), "{paths:?}");
+        assert!(paths.contains("socket2::Socket::new"), "{paths:?}");
+        assert!(paths.contains("libc::socket"), "{paths:?}");
+    }
+
+    #[test]
+    fn production_native_listener_types_are_confined_to_the_native_port() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let mut violations = Vec::new();
+        let mut native_port_mentions = 0usize;
+
+        for file in workspace_source_files(repo_root) {
+            let relative = file
+                .strip_prefix(repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = std::fs::read_to_string(&file).unwrap();
+            for line in native_tcp_listener_type_lines(&source).unwrap_or_else(|error| {
+                panic!(
+                    "parse {} for native-listener type census: {error}",
+                    file.display()
+                )
+            }) {
+                if relative == "crates/flux-system/src/net.rs" {
+                    native_port_mentions += 1;
+                } else {
+                    violations.push(format!("{relative}:{line}"));
+                }
+            }
+        }
+
+        assert!(
+            native_port_mentions > 0,
+            "native listener implementation disappeared"
+        );
+        assert!(
+            violations.is_empty(),
+            "a production API or implementation names an already-bound native TcpListener outside \
+             flux-system; accept NetworkListener/GuardedNetwork instead: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn native_listener_type_census_resolves_aliases_and_fully_qualified_types() {
+        let fixture = r#"
+use tokio::net::TcpListener as Listener;
+pub fn aliased(listener: Listener) {}
+pub fn qualified(listener: std::net::TcpListener) {}
+#[cfg(test)]
+pub fn test_only(listener: tokio::net::TcpListener) {}
+"#;
+        assert_eq!(native_tcp_listener_type_lines(fixture).unwrap().len(), 2);
     }
 
     #[test]

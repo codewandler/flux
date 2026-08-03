@@ -88,8 +88,18 @@ jobs:
             echo "::error::candidate version $CANDIDATE_VERSION does not match workspace version $workspace_version"
             exit 1
           fi
-          scripts/release-candidate.sh write "$RUNNER_TEMP/request-receipt" \
-            "$CANDIDATE_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID"
+      - name: Install pinned release-gate toolchain
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt, clippy
+      - name: Cache release-gate cargo state
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Mandatory full gate for the exact candidate SHA
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: scripts/release-full-gate.sh "$GITHUB_SHA"
       - name: Check release token is configured
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         env:

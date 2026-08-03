@@ -707,10 +707,14 @@ pub(crate) async fn run_draft_ast_with_composites(
 pub(super) fn direct_flow_runtime_turn(
     session_id: &str,
     activity: Arc<dyn SpawnActivitySink>,
+    registry: Arc<ToolRegistry>,
+    registry_base: Arc<ToolRegistry>,
 ) -> RuntimeTurnContext {
     RuntimeTurnContext::new()
         .with_session(session_id)
         .with_spawn_activity_sink(activity)
+        .with_tool_registry(registry)
+        .with_tool_registry_base(registry_base)
 }
 
 /// [`run_draft_ast_with_composites`] plus L-25's opt-in resumable mode for `flux flow run`.
@@ -908,14 +912,11 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
     // Risk preview (informational; every op still gates at dispatch through the engine's approver,
     // which `build_agent` set from `--yes`). Scoped to the whole plan even when resuming — dispatch
     // itself never re-runs the skipped prefix, so this stays a harmless over-approval preview.
+    let registry = engine.executor.live_catalog().snapshot();
     let risk = if active_composites.is_empty() {
-        flux_flow::runtime::plan_risk(ast, engine.executor.registry())
+        flux_flow::runtime::plan_risk(ast, &registry)
     } else {
-        flux_flow::runtime::plan_risk_with_composites(
-            ast,
-            engine.executor.registry(),
-            &active_composites,
-        )
+        flux_flow::runtime::plan_risk_with_composites(ast, &registry, &active_composites)
     };
     eprintln!(
         "\n{}  {}{}",
@@ -936,6 +937,7 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
         Some(engine.system_prompt.clone()),
         shared.clone(),
         None,
+        registry.clone(),
         None,
     );
     // `set_turn` deliberately returns (rather than retains) the live child reporter. Scope that
@@ -943,7 +945,8 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
     // direct or resumable interpreter inherits the same A-80 turn context. The executor is reused
     // by the CLI, so pinning this on its long-lived ToolContext would leak an obsolete reporter into
     // a later run.
-    let runtime_turn = direct_flow_runtime_turn(&session_id, activity);
+    let registry_base = Arc::new(engine.executor.registry().clone());
+    let runtime_turn = direct_flow_runtime_turn(&session_id, activity, registry, registry_base);
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
     let outcome = scope_runtime_turn(runtime_turn, async {

@@ -2199,10 +2199,35 @@ flow main
         }
     }
 
+    struct DirectNestedAdapter;
+    #[async_trait]
+    impl Tool for DirectNestedAdapter {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                "direct_nested_adapter",
+                "open a direct nested runtime",
+                json!({"type": "object"}),
+            )
+        }
+        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> CoreResult<ToolResult> {
+            let mut client = FlowClient::builder().auto_approve(true).build(
+                MockProvider::one("noop"),
+                temp_root("nested-direct-catalog"),
+            )?;
+            client.register_op(Arc::new(ReporterProbe));
+            let ast: DraftAst = serde_json::from_value(json!({
+                "body": [{ "kind": "call", "op": "reporter_probe", "args": [] }]
+            }))
+            .unwrap();
+            Ok(ToolResult::ok(client.execute(&ast).await?.result))
+        }
+    }
+
     #[tokio::test]
-    async fn streamed_nested_runtime_pins_the_lexical_spawn_reporter() {
+    async fn streamed_nested_runtime_inherits_reporter_but_not_parent_executor_catalog() {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(StreamedNestedAdapter));
+        let parent_catalog = Arc::new(registry.clone());
         let ctx = ToolContext::new(Arc::new(System::new(
             Workspace::new(temp_root("outer-stream-reporter")).unwrap(),
         )));
@@ -2214,9 +2239,41 @@ flow main
             ctx,
         );
 
-        let result = executor
-            .dispatch("streamed_nested_adapter", json!({}))
-            .await;
+        let result = flux_runtime::scope_runtime_turn(
+            flux_runtime::RuntimeTurnContext::new()
+                .with_spawn_activity_sink(Arc::new(NoopSpawnActivity))
+                .with_tool_registry(parent_catalog),
+            executor.dispatch("streamed_nested_adapter", json!({})),
+        )
+        .await;
+
+        // The nested FlowClient deliberately registered ReporterProbe in its own registry. If
+        // inherit_runtime_turn copied the parent executor's catalog, the nested dispatch would be
+        // "unknown tool" here even though the reporter capability itself was inherited correctly.
+        assert_eq!(result.content, "inherited");
+    }
+
+    #[tokio::test]
+    async fn direct_nested_runtime_ignores_the_still_active_parent_executor_catalog() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DirectNestedAdapter));
+        let parent_catalog = Arc::new(registry.clone());
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["direct_nested_adapter".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(
+                Workspace::new(temp_root("outer-direct-catalog")).unwrap(),
+            ))),
+        );
+
+        let result = flux_runtime::scope_runtime_turn(
+            flux_runtime::RuntimeTurnContext::new()
+                .with_spawn_activity_sink(Arc::new(NoopSpawnActivity))
+                .with_tool_registry(parent_catalog),
+            executor.dispatch("direct_nested_adapter", json!({})),
+        )
+        .await;
 
         assert_eq!(result.content, "inherited");
     }

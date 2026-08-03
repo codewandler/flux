@@ -717,7 +717,7 @@ impl Tool for ReleaseCutTool {
         // Predicted before the script runs, from the same rule the script applies — so a mismatch
         // afterwards is detectable rather than merely unlikely.
         let expected = next_version(&current, &args.bump)?;
-        let argv = vec![RELEASE_SCRIPTS[1].to_string(), args.bump.clone()];
+        let mut argv = vec![RELEASE_SCRIPTS[1].to_string(), args.bump.clone()];
 
         if !args.apply.unwrap_or(false) {
             return json_result(
@@ -732,11 +732,35 @@ impl Tool for ReleaseCutTool {
             );
         }
 
-        // The script runs its own gate LAST, after its edits, and restores every file it touched on
-        // any non-zero exit (C-147). We deliberately do not pass `--no-gate`: that gate is the one
-        // that tests exactly what is about to be tagged, and its transactionality is why a red gate
-        // here leaves no phantom version section and no tag.
-        let out = ctx.system().run(&argv, Duration::from_secs(5400)).await?;
+        // Humans and manual workflow rehearsals keep the transactional in-cut gate. Only the
+        // host-owned automatic release-branch push delegates that work to release.yml, where the
+        // exact cut SHA is gated once and earns an immutable receipt before promotion. The model
+        // cannot select this branch: all four values come from the guarded host environment.
+        let automated_candidate_gate = ctx
+            .system()
+            .env("FLUX_RELEASE_CANDIDATE_OWNS_GATE")
+            .as_deref()
+            == Some("true")
+            && ctx.system().env("GITHUB_ACTIONS").as_deref() == Some("true")
+            && ctx.system().env("GITHUB_EVENT_NAME").as_deref() == Some("push")
+            && ctx.system().env("GITHUB_REF").as_deref() == Some("refs/heads/release");
+        let out = if automated_candidate_gate {
+            argv.push("--no-gate".to_string());
+            let gate_owner_env = vec![
+                (
+                    "FLUX_RELEASE_CANDIDATE_OWNS_GATE".to_string(),
+                    "true".to_string(),
+                ),
+                ("GITHUB_ACTIONS".to_string(), "true".to_string()),
+                ("GITHUB_EVENT_NAME".to_string(), "push".to_string()),
+                ("GITHUB_REF".to_string(), "refs/heads/release".to_string()),
+            ];
+            ctx.system()
+                .run_with_env(&argv, &gate_owner_env, Duration::from_secs(5400))
+                .await?
+        } else {
+            ctx.system().run(&argv, Duration::from_secs(5400)).await?
+        };
         let output = format!("{}{}", out.stdout, out.stderr);
         if out.exit_code != 0 {
             let tail: String = output.chars().rev().take(1600).collect::<String>();

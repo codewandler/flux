@@ -76,7 +76,7 @@ declaration, statement, block, and expression nodes; it does not reconstruct log
 | `thing` | A reference to an external thing. |
 | `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min`, `max`, `sum`), comparison (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`, `any`, `all`, `has`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat/join/split`), list helpers (`first`/`last`), string literals (`'…'`/`"…"`), lists, and objects. Dotted names such as `it.author.name` descend object fields leniently (missing/null/non-object hops read as `""`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps formula identifiers to `Lit` or `Var` nodes. No IO, no approval gate. Native source writes an invertible formula directly, for example `doubled = $price * 2`. |
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
-| `jq` | Pure JSON path extraction. `path` is a dot-segment path (for example `".bitcoin.usd"` or `".results.0.value"`) applied to the JSON content of a `Var`, `Lit`, `Obj`, or `List` input. Native `first = response.results[0].value` source lowers its bracket index to the `.0` AST segment and formats back with brackets; an AST path string that itself contains brackets uses `@json` to preserve that exact shape. No IO, no approval gate.  `optional` selects the traversal-through-missing-data policy. When `false` — the default for native `x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `x.field?` sugar, or a legacy JSON AST that omitted the flag — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
+| `jq` | Pure JSON path extraction. `path` is a dot/index path (for example `".bitcoin.usd"` or `".results.0.value"`) applied to the JSON content of a `Var`, `Lit`, `Obj`, or `List` input. Native `first = response.results[0].value` lowers its array index to the `.0` AST segment; a quoted object key such as `response.headers["content-type"]` stays the unambiguous JSON-string segment `.headers["content-type"]`. JSON escaping keeps dots, brackets, quotes, backslashes, empty keys, Unicode, and numeric-looking object keys as data. No IO, no approval gate.  `optional` selects the traversal-through-missing-data policy. When `false` — the default for native `x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `x.field?` sugar, or a legacy JSON AST that omitted the flag — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
 | `parse` | Pure type coercion over a literal, bound symbol, or object/list template. Bind a computed `jq` or `fmt` result before parsing it. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`, or `"form"`. `"json"` also serializes a structured value as canonical JSON; `"form"` serializes a flat record as `application/x-www-form-urlencoded` text. No IO, no approval gate. Example: `number = parse(price_text, as: "f64")`. |
 | `ctx` | Build a bounded, budgeted **context pack** from existing symbols. Resolves `include` (minus `exclude`) to its members, then — when `budget` is set — shrinks the pack *at evaluation* by visibility tier then declared order until within the char budget, recording any dropped members in the run trace. Produces a `Ctx` value bound to `name`. Pure: it selects and labels existing values, performing no IO. |
 | `ctx_append` | Accrete more symbols into an existing context pack (the `+=` marker). Creates a new immutable `Ctx` value, updates `ctx` to resolve to that version, preserves the earlier version in the audit trail, then re-applies the pack's budget. Pure. |
@@ -1131,9 +1131,10 @@ a `Value::String`.
 
 ### `jq`
 
-Pure JSON path extraction. `path` is a dot-path string applied to the JSON
-content of `input`. Supports dot-notation (`.bitcoin.usd`), array indexing
-(`results[0].value`), and nested paths. No shell-out — parsed in-process.
+Pure JSON path extraction. `path` is a field/index path string applied to the JSON content of
+`input`. It supports dot notation (`.bitcoin.usd`), numeric AST index segments
+(`.results.0.value`), and JSON-string object-key segments (`.headers["content-type"]`). No
+shell-out — parsed in-process.
 
 ```json
 {"kind": "jq",
@@ -1145,7 +1146,7 @@ content of `input`. Supports dot-notation (`.bitcoin.usd`), array indexing
 
 | field | type | required | description |
 |---|---|---|---|
-| `path` | string | yes | dot-path (e.g. `.bitcoin.usd`, `results[0].value`) |
+| `path` | string | yes | field/index path (e.g. `.bitcoin.usd`, `.results.0.value`, `.headers["content-type"]`) |
 | `input` | Node | yes | any node producing a JSON string or object (`Var` or `Lit`) |
 
 The extracted value is returned as the natural JSON type (`Number`, `String`,
@@ -1158,7 +1159,11 @@ object that only has `.a`) cascades to `null`. Native `$a.b` field-access sugar 
 instead of silently reading empty — add the `?` opt-out (`$a.b?`, `$list.0?`) to
 read `null` when a field may be absent, and `$list.0` indexes a list. In both modes
 a **present-but-`null`** field returns `null` (never an error), and a **malformed
-path** — an unmatched `[`, or a non-numeric bracket index — always errors loudly.
+path** — an unmatched bracket, invalid quoted JSON key, or non-numeric unquoted bracket index —
+always errors loudly. Quoted keys use JSON string escaping, so `.headers["content-type"]` reaches a
+hyphenated header and `.["a.b"]["br[ack]"]["quote\\\"slash\\\\"]` treats every punctuation mark
+as key data. A numeric `.0` segment indexes a list (and retains the legacy contextual object-key
+behavior); a quoted `["0"]` segment is explicitly an object key and never a list index.
 Field access inside an `expr` computation (`$a.b == x`, `filter`/`map` predicates)
 stays lenient.
 
@@ -1430,9 +1435,9 @@ gates on a shell exit-code wrapper or a boolean tool output work as expected.
   outside any concurrent branch is unaffected.
 - **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
 - **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.
-- **Native `$a.b` field access is STRICT; a model/host `jq` node is lenient** — a
+- **Native `$a.b` / `$a["non-identifier"]` field access is STRICT; a model/host `jq` node is lenient** — a
   bare `$a.b` errors on a missing key / out-of-range index / non-object (add `?` — `$a.b?`,
-  `$list.0?` — to read `null` instead; `$list.0` indexes a list). A model-emitted `jq`
+  `$a["missing"]?`, `$list.0?` — to read `null` instead; `$list.0` indexes a list). A model-emitted `jq`
   propagates `null` for missing data and cascades (`.a.b.c` on an object with only `.a`
   bottoms out at `null`). In both, a present-but-`null` field is `null`, not an error; a
   malformed path (unmatched `[`, a non-numeric index) always errors. Field access inside an

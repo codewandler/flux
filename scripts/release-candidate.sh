@@ -36,10 +36,12 @@ if ! [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 printf -v EXPECTED '%s\n' \
-  'schema=flux-release-candidate-v1' \
+  'schema=flux-release-candidate-v2' \
   "version=$VERSION" \
   "tag=v$VERSION" \
   "commit=$COMMIT" \
+  'gate=mandatory-full-v1' \
+  "gate_commit=$COMMIT" \
   "run_id=$RUN_ID"
 
 case "$COMMAND" in

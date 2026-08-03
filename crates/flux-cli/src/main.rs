@@ -120,7 +120,9 @@ mod tests {
     };
     use flux_flow::AgentSink;
     use flux_provider::{ChunkStream, Provider, Request};
-    use flux_runtime::{active_runtime_turn_context, SpawnActivity, SpawnActivitySink};
+    use flux_runtime::{
+        active_runtime_turn_context, SpawnActivity, SpawnActivitySink, ToolRegistry,
+    };
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -145,12 +147,24 @@ mod tests {
     /// direct/resumable flow runner must put that returned capability in the lexical turn scope.
     #[tokio::test]
     async fn direct_flow_runtime_scope_carries_session_and_child_reporter() {
-        let turn = direct_flow_runtime_turn("s_cli", Arc::new(IgnoredSpawnActivity));
+        let registry = Arc::new(ToolRegistry::new());
+        let registry_base = registry.clone();
+        let turn = direct_flow_runtime_turn(
+            "s_cli",
+            Arc::new(IgnoredSpawnActivity),
+            registry.clone(),
+            registry_base.clone(),
+        );
 
         flux_runtime::scope_runtime_turn(turn, async {
             let active = active_runtime_turn_context().expect("direct flow turn is scoped");
             assert_eq!(active.session_id().as_deref(), Some("s_cli"));
             assert!(active.spawn_activity_sink().is_some());
+            assert!(Arc::ptr_eq(&active.tool_registry().unwrap(), &registry));
+            assert!(Arc::ptr_eq(
+                &active.tool_registry_base().unwrap(),
+                &registry_base
+            ));
         })
         .await;
 

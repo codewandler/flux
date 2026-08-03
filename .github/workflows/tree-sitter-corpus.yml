@@ -19,10 +19,12 @@ name: tree-sitter-corpus
 # shipping flux over a bug flux cannot land the fix for.
 #
 # ⚠ THE CONTRACT THIS LANE ENFORCES, and what a red means when you see one (L-118). Green is the
-# normal state and has been since the pin moved to `2dbec53`: all sixteen canonical `examples/*.flux`
-# parse with zero ERROR and zero MISSING nodes. There is no allowlist, no expected-failure list, and
-# no file exempted — the whole corpus, or red. Keep it that way; the two things that would quietly
-# destroy this lane's value are an allowlist and a second corpus, and it has neither.
+# normal state at the current `7a90ffa` pin: every canonical `examples/*.flux` parses with zero ERROR
+# and zero MISSING nodes, and the grammar additionally covers C-320's JSON-quoted bracket keys such
+# as `headers[ "content-type" ]`, including Flux's accepted internal whitespace. There is no
+# allowlist, no expected-failure list, and no file exempted — the whole corpus, or red. Keep it that
+# way; the two things that would quietly destroy this lane's value are an allowlist and a second
+# corpus, and it has neither.
 #
 # So a red here means exactly one thing: **the revision `.helix/languages.toml` pins cannot parse
 # Flux that flux itself ships as canonical**, and every construct the log names is a red squiggle in

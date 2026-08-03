@@ -100,8 +100,9 @@ carries the other" doctrine, extended by one because this chain crosses a crate 
 1. **The guard** — `guard_open_bind` (`crates/flux-server/src/lib.rs`) now tests
    `ServerAuth::is_effectively_open()` instead of `matches!(auth, ServerAuth::Open)`. The new
    predicate is `Open`, **or** `SharedSecret` with an empty secret. This is the primary fix: it is
-   the single construction-time enforcement point that `router`, `router_multi`, `serve`, `serve_on`,
-   `serve_multi`, `serve_multi_on` and the `a2a` channel's own `axum::serve` mount all share (C-190),
+   the single construction-time enforcement point that `router`, `router_multi`, `serve`,
+   `serve_multi` and the `a2a` channel's own router mount all share (C-190; C-435 later removed the
+   already-bound native-listener helpers),
    so **every** producer of `ServerAuth` inherits the refusal without touching the constructor. It
    also makes the doc comment's "there is deliberately no escape hatch" true, and states the property
    once so a future mode that is open-in-effect is caught without anyone remembering to extend a

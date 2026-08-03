@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use flux_plugin::{load_plugin_tools, LoadedPlugin, PluginDescriptor, SystemHostCaps};
-use flux_runtime::ToolRegistry;
+use flux_runtime::{LiveToolCatalog, ToolRegistry};
 use serde_json::json;
 
 /// A throwaway workspace-rooted `System` — the guarded spawn path needs one; these tests do no
@@ -207,6 +207,46 @@ async fn refresh_reprojects_a_changed_catalog_into_the_registry() {
     fixture.shutdown().await;
 }
 
+/// C-318: the plugin host can publish the same atomic refresh to a long-lived session without
+/// taking `&mut` access to its executor. The published generation is complete, while a snapshot
+/// already held by an active turn remains unchanged.
+#[tokio::test]
+async fn refresh_live_publishes_for_the_next_turn_without_rewriting_an_adopted_snapshot() {
+    let mut fixture = Fixture::load("live-session").await;
+    let catalog = LiveToolCatalog::new(fixture.registry.clone());
+    let active_turn = catalog.snapshot();
+
+    fixture.set_mode("grown");
+    fixture
+        .loaded
+        .refresh_live(&catalog, "plugin:drift")
+        .await
+        .expect("the live refresh is accepted");
+
+    assert_eq!(
+        active_turn.names(),
+        vec!["drift.alpha".to_string(), "drift.beta".to_string()],
+        "an already-adopted turn generation must not move"
+    );
+    assert_eq!(
+        catalog.snapshot().names(),
+        vec!["drift.alpha".to_string(), "drift.gamma".to_string()],
+        "the next turn sees the gain and withdrawal together"
+    );
+    assert_eq!(
+        fixture
+            .loaded
+            .tools
+            .iter()
+            .map(|tool| tool.spec().name)
+            .collect::<Vec<_>>(),
+        vec!["drift.alpha".to_string(), "drift.gamma".to_string()],
+        "the plugin commit and published generation stay aligned"
+    );
+
+    fixture.shutdown().await;
+}
+
 /// A failed registry write must not leave the plugin believing it published a catalog the registry
 /// never took. `refresh_into` writes the registry first precisely so this cannot happen: if the two
 /// diverged, the next refresh would diff against the newer manifest and the stale names could never
@@ -262,31 +302,112 @@ async fn a_refused_registry_write_keeps_the_plugin_and_the_registry_in_step() {
     fixture.shutdown().await;
 }
 
-/// A withdrawn op is *withdrawn*, not shadowed: it is gone from the registry, and re-registering the
-/// name is free. A tool handle already taken out of the registry — an in-flight call — keeps running
-/// against the spec it was projected with; withdrawal governs future dispatch only.
+/// The running-session publication path has the same all-or-nothing collision behavior as the
+/// mutable-registry path: neither the published generation nor LoadedPlugin commits on failure.
+#[tokio::test]
+async fn a_refused_live_publication_keeps_plugin_and_catalog_on_the_old_generation() {
+    let mut fixture = Fixture::load("live-divergence").await;
+    let squatter = fixture.registry.get("drift.alpha").unwrap();
+    let mut colliding = ToolRegistry::new();
+    colliding
+        .try_register_from("some-other-pack", squatter)
+        .unwrap();
+    let catalog = LiveToolCatalog::new(colliding);
+
+    fixture.set_mode("grown");
+    let error = fixture
+        .loaded
+        .refresh_live(&catalog, "plugin:drift")
+        .await
+        .expect_err("the live collision must reject the whole generation")
+        .to_string();
+    assert!(error.contains("duplicate operation"), "{error}");
+    assert_eq!(catalog.snapshot().names(), vec!["drift.alpha".to_string()]);
+    assert_eq!(
+        fixture
+            .loaded
+            .tools
+            .iter()
+            .map(|tool| tool.spec().name)
+            .collect::<Vec<_>>(),
+        vec!["drift.alpha".to_string(), "drift.beta".to_string()],
+        "LoadedPlugin must not commit a generation the live catalog rejected"
+    );
+
+    drop(catalog);
+    fixture.shutdown().await;
+}
+
+/// A withdrawn op is *withdrawn*, not shadowed. A call that actually entered the old subprocess
+/// handler before refresh completes successfully; refresh waits for that host exchange, then
+/// publishes the withdrawal for future dispatch.
 #[tokio::test]
 async fn a_withdrawn_op_is_removed_while_an_in_flight_call_completes_under_its_old_spec() {
     let mut fixture = Fixture::load("withdrawn").await;
-
-    // Take the handle the way a dispatch in progress holds one.
     let in_flight = fixture
         .registry
         .get("drift.beta")
         .expect("beta is registered at load");
     let spec_before = in_flight.spec();
+    let entered = fixture._dir.0.join("entered");
+    let release = fixture._dir.0.join("release");
+    let ctx = flux_runtime::ToolContext::new(Arc::new(test_system()));
+    let entered_arg = entered.to_string_lossy().into_owned();
+    let release_arg = release.to_string_lossy().into_owned();
+    let call = tokio::spawn({
+        let tool = in_flight.clone();
+        async move {
+            tool.execute(
+                &ctx,
+                json!({
+                    "text": "hi",
+                    "entered_path": entered_arg,
+                    "release_path": release_arg,
+                }),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !entered.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the old beta call enters the subprocess handler");
 
+    let catalog = LiveToolCatalog::new(fixture.registry.clone());
     fixture.set_mode("grown");
-    fixture.refresh_into_registry().await;
+    let result = {
+        let refresh = fixture.loaded.refresh_live(&catalog, "plugin:drift");
+        tokio::pin!(refresh);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), refresh.as_mut())
+                .await
+                .is_err(),
+            "refresh must not tear down or replace a host exchange already in flight"
+        );
+        std::fs::write(&release, "release").unwrap();
+
+        let result = call
+            .await
+            .expect("call task joins")
+            .expect("the already-running old call completes");
+        refresh.await.expect("refresh completes after the old call");
+        result
+    };
 
     assert!(
-        fixture.registry.get("drift.beta").is_none(),
+        catalog.snapshot().get("drift.beta").is_none(),
         "a withdrawn op must not be dispatchable"
     );
     // Not merely shadowed by a later entry: nothing named `drift.beta` is in the registry at all,
     // so registering the name again succeeds rather than colliding.
     assert!(
-        !fixture.registry.names().contains(&"drift.beta".to_string()),
+        !catalog
+            .snapshot()
+            .names()
+            .contains(&"drift.beta".to_string()),
         "withdrawn, not shadowed"
     );
 
@@ -296,20 +417,16 @@ async fn a_withdrawn_op_is_removed_while_an_in_flight_call_completes_under_its_o
     assert_eq!(in_flight.spec().effects, spec_before.effects);
     assert_eq!(in_flight.spec().access, spec_before.access);
 
-    // And it completes rather than panicking or hanging: the subprocess is still open (the other
-    // ops share it), the plugin no longer serves `beta`, so the call comes back as a tool error.
-    let ctx = flux_runtime::ToolContext::new(Arc::new(test_system()));
-    let result = in_flight
-        .execute(&ctx, json!({"text": "hi"}))
-        .await
-        .expect("the call completes");
-    assert!(
-        result.is_error && result.content.contains("unknown operation"),
-        "an in-flight call to a withdrawn op resolves as a plugin error: {}",
-        result.content
+    let payload: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert!(!result.is_error, "old call failed: {}", result.content);
+    assert_eq!(
+        payload.get("operation").and_then(serde_json::Value::as_str),
+        Some("beta"),
+        "the call admitted under the old catalog must succeed"
     );
 
     drop(in_flight);
+    drop(catalog);
     fixture.shutdown().await;
 }
 

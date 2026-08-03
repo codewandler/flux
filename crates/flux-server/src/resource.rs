@@ -113,6 +113,38 @@ struct GovernorInner {
 #[derive(Clone)]
 pub(crate) struct ResourceGovernor(Arc<GovernorInner>);
 
+/// Request-rate and live-work admission for one authenticated channel binding. A webhook token or
+/// signature authenticates the deployment realm rather than an end-user principal, so all callers
+/// share one stricter bucket and no credential material is retained or hashed.
+#[derive(Clone)]
+pub struct SharedIngressGovernor(ResourceGovernor);
+
+impl SharedIngressGovernor {
+    pub fn new(limits: ServerLimits) -> Self {
+        Self(ResourceGovernor::new(limits))
+    }
+
+    pub fn admit_request(&self) -> Result<(), Box<Response>> {
+        self.0
+            .admit_request_key(BudgetKey("channel-shared-realm".into()))
+            .map_err(|rejection| Box::new(rejection_response(rejection)))
+    }
+
+    pub fn admit_work(&self) -> Result<IngressPermit, Box<Response>> {
+        self.0
+            .admit_work_key(BudgetKey("channel-shared-realm".into()))
+            .map(|permit| IngressPermit { _permit: permit })
+            .map_err(|rejection| Box::new(rejection_response(rejection)))
+    }
+}
+
+/// RAII ownership of one channel-delivery slot. Provider budgets remain an App/runtime concern:
+/// one delivery may fan out into several journey turns and has no single durable turn id that can
+/// be attributed to this HTTP request without guessing.
+pub struct IngressPermit {
+    _permit: WorkPermit,
+}
+
 impl ResourceGovernor {
     pub(crate) fn new(limits: ServerLimits) -> Self {
         Self(Arc::new(GovernorInner {

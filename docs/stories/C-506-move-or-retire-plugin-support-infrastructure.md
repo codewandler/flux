@@ -1,33 +1,33 @@
 ---
 id: C-506
-title: "Move or retire the official plugin support infrastructure"
+title: "Remove plugin support and distribution from Flux"
 pillar: Core
 status: backlog
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
-note: "decide host-kit and pack-index after adapter migration: protocol SDK may move with connector runtime artifacts; the official signed plugin index must not remain a rival catalogue"
+note: "after the last adapter cutover, delete plugin host/install/index and every archive/sign/upload path; CI rejects their return"
 ---
 
-# Move or retire the official plugin support infrastructure
+# Remove plugin support and distribution from Flux
 
 ## Goal
 
-Give `plugins/host-kit` and `plugins/pack-index` an explicit post-migration home so the generic stdio
-runtime can survive where useful without preserving a second official integration distribution path.
+Finish the migration by removing plugin execution, installation and distribution from Flux, so its
+binary and release pipeline contain only the embedded Exchange client and no additional integration
+artifact path.
 
 ## Acceptance
 
-- [ ] `host-kit` is either moved/published as the connector runtime SDK or replaced by a versioned
-      protocol client with identical capability and credential-boundary guarantees.
-- [ ] `pack-index` ceases to list official vendor integrations once connector artifact distribution
-      is live; compatibility entries have a bounded removal policy.
-- [ ] `flux plugin install` either becomes a connector-runtime compatibility command with explicit
-      deprecation or remains only for third-party extensions; docs cannot present it as the official
-      integration path.
-- [ ] Supply-chain verification is at least as strong as the current minisign/archive-digest path and
-      shares artifact truth with Flux Exchange.
-- [ ] A test distinguishes generic support crates from vendor adapters so C-505's zero count remains
-      meaningful.
+- [ ] Plugin host/runtime crates, `host-kit`, `pack-index`, installer commands, configuration and
+      documentation are deleted rather than renamed into a connector compatibility path.
+- [ ] Flux release workflows build, archive, sign and upload no plugin binary, pack, index or other
+      official integration artifact; obsolete secrets and release inputs are removed.
+- [ ] Connector/runtime artifacts are built and distributed only by the connector/Exchange pipeline,
+      including any temporary framed-stdio implementation used behind Exchange.
+- [ ] CI scans the Flux workspace, release workflows and public docs and rejects reintroduced plugin
+      support, plugin installation, or official integration artifacts.
+- [ ] Core language, agent, SDK and built-in-tool releases remain usable with Exchange absent; the
+      unavailable capability is official external integration execution.
 
 ## Progress
 

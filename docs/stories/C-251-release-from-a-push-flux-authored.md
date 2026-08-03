@@ -181,6 +181,12 @@ workflows and runs the public Release verifier before reporting success. Keeping
 half outside the model-authored program means a bug in the program cannot publish directly.
 
 ## Progress
+- 2026-08-03 — Deduplicated the expensive release gate without weakening promotion. The unattended
+  cut may request `--no-gate` only under the host-owned GitHub Actions push context for
+  `refs/heads/release`; manual cuts and workflow rehearsals retain the transactional default gate.
+  The versioned exact-SHA candidate now runs the shared `release-full-gate.sh` once before artifact
+  construction, and its immutable v2 receipt binds `mandatory-full-v1` to that same SHA. Candidate
+  failure produces no receipt, so the existing promotion helper leaves `main` and the tag untouched.
 - 2026-08-03 — Automatic release run `30840283679` proved the Node/Docusaurus repair, passed the
   live smoke, scribe parser, changelog roll and embedded-doc regeneration, then failed safely in the
   full gate. `secure_defaults::a_supervised_client_is_unchanged` assumed no ambient sandbox policy,

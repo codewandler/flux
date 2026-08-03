@@ -100,10 +100,10 @@ your answer cannot change it. If you disagree, say why in `bump_reason`; the run
 
   # ── 5. Cut ──────────────────────────────────────────────────────────────────
   # `scripts/cut-release.sh` owns the version sweep, the re-lock, the `[Unreleased]` roll, the tested
-  # website mirror, the commit and the annotated tag — and it is transactional (C-147): its gate runs
-  # last, over exactly what is about to be tagged, and any non-zero exit restores every file it
-  # touched. So a red gate here leaves no phantom version section and no tag. It is called, not
-  # wrapped and not reimplemented.
+  # website mirror, the commit and the annotated tag — and it is transactional (C-147). Human and
+  # rehearsal cuts run the shared full gate here; the automatic release-branch context alone
+  # delegates that gate to the exact-SHA candidate, whose receipt is required before promotion. Any
+  # pre-commit failure restores every file touched. It is called, not wrapped and not reimplemented.
   $cut = release_cut({ bump: $bump, apply: $apply })
   $version = $cut.version
   $tag = $cut.tag

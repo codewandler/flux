@@ -93,6 +93,40 @@ pub(super) struct IntegrationAssembly {
     pub(super) tools: Vec<(String, Arc<dyn flux_runtime::Tool>)>,
     pub(super) groups: Vec<flux_evidence::ToolGroup>,
     pub(super) ambient_signals: Vec<String>,
+    pub(super) live_plugins: LivePluginCatalog,
+}
+
+/// Loaded plugin processes retained by a running agent. Refreshing one republishes atomically into
+/// that agent's catalog channel; it does not construct the throwaway registry used by the standalone
+/// inspection command.
+#[derive(Default)]
+pub(super) struct LivePluginCatalog {
+    plugins: std::collections::BTreeMap<String, Arc<tokio::sync::Mutex<flux_plugin::LoadedPlugin>>>,
+}
+
+impl LivePluginCatalog {
+    pub(super) async fn refresh(
+        &self,
+        name: &str,
+        catalog: &flux_runtime::LiveToolCatalog,
+    ) -> Result<flux_plugin::CatalogRefresh> {
+        let plugin =
+            self.plugins.get(name).cloned().ok_or_else(|| {
+                anyhow::anyhow!("no loaded plugin named `{name}` in this session")
+            })?;
+        let refresh = plugin
+            .lock()
+            .await
+            .refresh_live(catalog, &format!("plugin:{name}"))
+            .await
+            .with_context(|| format!("refresh live plugin `{name}`"));
+        refresh
+    }
+
+    fn insert(&mut self, name: String, plugin: flux_plugin::LoadedPlugin) {
+        self.plugins
+            .insert(name, Arc::new(tokio::sync::Mutex::new(plugin)));
+    }
 }
 
 /// Assemble the shared endpoint broker, datasource bridge, plugin host capabilities, audit sinks,
@@ -117,6 +151,7 @@ pub(super) async fn assemble_integrations(
         tools: Vec::new(),
         groups: Vec::new(),
         ambient_signals: Vec::new(),
+        live_plugins: LivePluginCatalog::default(),
     };
     let Some(dir) = plugins_dir() else {
         return Ok(assembly);
@@ -259,9 +294,11 @@ pub(super) async fn assemble_integrations(
                 assembly.tools.extend(
                     loaded
                         .tools
-                        .into_iter()
+                        .iter()
+                        .cloned()
                         .map(|tool| (format!("plugin:{plugin_name}"), tool)),
                 );
+                assembly.live_plugins.insert(plugin_name, loaded);
             }
             Err(error) => eprintln!(
                 "{}",

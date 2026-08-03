@@ -964,14 +964,21 @@ price = raw.bitcoin.usd       # native sugar for the jq node
 @json {"kind": "bind", "name": "first", "value": {"kind": "jq", "path": ".results[0].value", "input": {"kind": "var", "name": "response"}}}
 ```
 
-Path syntax: a leading `.` followed by dot-separated field names with optional `[n]`
-array-index suffixes. This is a strict subset of jq — no filters, pipes, or
-conditionals. Allowed forms:
+Path syntax: a leading `.` followed by dot-separated field names, numeric index segments, or
+JSON-string bracket keys. This is a strict subset of jq — no filters, pipes, or conditionals.
+Allowed AST forms:
 
 - `.field`
 - `.field.nested`
-- `.field[0]`
-- `.field[0].nested`
+- `.field.0`
+- `.headers["content-type"]`
+- `.["a.b"]["br[ack]"]["quote\\\"slash\\\\"]`
+
+JSON string escaping is the only quoted-key escape rule. That makes a dot, bracket, quote,
+backslash, empty key, Unicode scalar, or numeric-looking key unambiguous: `.0` is an array index,
+while `.["0"]` is an object field literally named `0`. The runtime still accepts legacy numeric
+brackets in a hand-built AST path, but the formatter keeps such a node in `@json` form so reparse
+does not silently change its stored path.
 
 **Field/index-access sugar (P6/L-93):** when the input is a plain symbol, write `var.path` or
 `var.items[0]` instead of `jq(".path", var)`:
@@ -980,7 +987,15 @@ conditionals. Allowed forms:
 kind = plan.kind              # sugar for jq(".kind", plan)
 txt = plan.message.text       # nested fields
 first = response.items[0]     # numeric list index
+content_type = response.headers["content-type"] # quoted object key
+request_id = response.headers["x-request-id"]?  # optional quoted key
 ```
+
+Use `.name` for identifier keys and `["..."]` for any other object key. The quoted content is a JSON
+string, so `response["a.b"]` reads one field literally named `a.b`; it is not two path segments.
+Flux deliberately uses JSON-string bracket access instead of widening dot segments or inventing a
+second quoted-dot syntax: dots stay the compact identifier-only form, while the bracket form reuses
+JSON's established escaping and remains distinct from numeric array indexes.
 
 This is a *bind-value* form: the lowered `jq` node, like any computed value, is only valid as a bind
 value — not inline as a `match` subject or call argument (bind it first). Non-symbol inputs keep the

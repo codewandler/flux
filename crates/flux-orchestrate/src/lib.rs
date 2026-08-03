@@ -369,7 +369,40 @@ impl Spawner for LocalSpawner {
                     .collect(),
             ),
         };
-        let mut registry = self.base_registry.subset(effective_tools.as_deref());
+        // Apply only the parent's live-generation DELTA to this explicit child base. SDK children
+        // may own tools their parent never exposes, so wholesale replacement would erase those
+        // child-only operations. Adding every parent operation would conversely widen the audited
+        // child policy. The paired parent baseline identifies true refresh replacements and
+        // withdrawals; role/scope narrowing remains the final ceiling.
+        let mut projected_base = self.base_registry.clone();
+        if let (Some(parent_base), Some(adopted)) = (
+            request.tool_registry_base.as_deref(),
+            request.tool_registry.as_deref(),
+        ) {
+            for name in parent_base.names() {
+                match adopted.get(&name) {
+                    None => {
+                        projected_base.remove(&name);
+                    }
+                    Some(tool) if projected_base.get(&name).is_some() => {
+                        projected_base.replace_from(
+                            adopted.source(&name).unwrap_or("live parent catalog"),
+                            tool,
+                        )?;
+                    }
+                    Some(_) => {}
+                }
+            }
+            for name in adopted.names() {
+                if parent_base.get(&name).is_none() && projected_base.get(&name).is_some() {
+                    projected_base.replace_from(
+                        adopted.source(&name).unwrap_or("live parent catalog"),
+                        adopted.get(&name).expect("name came from adopted registry"),
+                    )?;
+                }
+            }
+        }
+        let mut registry = projected_base.subset(effective_tools.as_deref());
         register_agent_ops(&mut registry)?;
 
         // Recursion bound: a child at the leaf depth must never spawn further sub-agents, so `task` is
@@ -412,7 +445,7 @@ impl Spawner for LocalSpawner {
                 "flux-orchestrate canonical nested task operation",
                 Arc::new(TaskTool),
             )?;
-            let child_base = self.base_registry.subset(effective_tools.as_deref());
+            let child_base = projected_base.subset(effective_tools.as_deref());
             ctx = ctx.with_spawner(Arc::new(self.at_depth(
                 child_depth,
                 child_base,
@@ -1196,6 +1229,8 @@ impl Tool for TaskTool {
             // independent WorkspaceContext — a child transition never affects the parent).
             system: Some(ctx.system()),
             execution_system: Some(ctx.execution_system()),
+            tool_registry: ctx.runtime_turn_context().tool_registry(),
+            tool_registry_base: ctx.runtime_turn_context().tool_registry_base(),
         };
         let spawned = if let Some(supervisor) = supervisor {
             let spawner = spawner.clone();
@@ -3138,6 +3173,85 @@ mod tests {
             system.read_file("PINGED.marker").await.is_ok(),
             "ping is in both the role's tools and the active scope, so it must run"
         );
+    }
+
+    /// C-318: the child starts from the parent's adopted live generation, then intersects the
+    /// child role/scope. It therefore sees additions, honors withdrawals, and cannot use a refreshed
+    /// tool that its inherited scope excluded.
+    #[tokio::test]
+    async fn spawn_uses_adopted_catalog_generation_without_widening_child_scope() {
+        fn spawner(base: ToolRegistry, system: Arc<System>) -> LocalSpawner {
+            let mut roles = RoleRegistry::default();
+            roles.insert(parse_role(
+                "---\ntools: [ping]\n---\nYou are a scout.",
+                "scout",
+            ));
+            LocalSpawner::new(
+                Arc::new(|| {
+                    Ok(Box::new(PingPlanMock {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    }))
+                }),
+                Arc::new(roles),
+                base,
+                system,
+                "mock",
+                1024,
+            )
+        }
+
+        // Addition: ping is inside the explicit child policy, and the parent adopted a generation
+        // that newly makes it available.
+        let added_system = unique_system("adopted-catalog-added");
+        let mut added = ToolRegistry::new();
+        added.register(Arc::new(Ping));
+        let child_base = added.clone();
+        spawner(child_base.clone(), added_system.clone())
+            .spawn(
+                SpawnRequest {
+                    tool_registry: Some(Arc::new(added.clone())),
+                    tool_registry_base: Some(Arc::new(ToolRegistry::new())),
+                    ..SpawnRequest::new("scout", "use the refreshed tool")
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(added_system.read_file("PINGED.marker").await.is_ok());
+
+        // Scope remains a ceiling even though that adopted generation contains ping.
+        let scoped_system = unique_system("adopted-catalog-scoped");
+        spawner(child_base, scoped_system.clone())
+            .spawn(
+                SpawnRequest {
+                    cap_scope: Some(vec!["some.other.tool".into()]),
+                    tool_registry: Some(Arc::new(added)),
+                    tool_registry_base: Some(Arc::new(ToolRegistry::new())),
+                    ..SpawnRequest::new("scout", "do not widen")
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(scoped_system.read_file("PINGED.marker").await.is_err());
+
+        // Withdrawal: assembly had ping, but the adopted generation removed it.
+        let withdrawn_system = unique_system("adopted-catalog-withdrawn");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let parent_base = base.clone();
+        spawner(base, withdrawn_system.clone())
+            .spawn(
+                SpawnRequest {
+                    tool_registry: Some(Arc::new(ToolRegistry::new())),
+                    tool_registry_base: Some(Arc::new(parent_base)),
+                    ..SpawnRequest::new("scout", "honor withdrawal")
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(withdrawn_system.read_file("PINGED.marker").await.is_err());
     }
 
     /// End-to-end through the real seam: `TaskTool::execute` reads the active scope off the live

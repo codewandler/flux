@@ -2,7 +2,7 @@
 id: C-318
 title: "The refreshed catalog reaches a running session — the registry A-95 froze on purpose"
 pillar: Core
-status: ready
+status: active
 priority: 12
 areas: [flux-cli]
 note: "C-310's honest boundary, declared by its own implementor — the refresh mechanism and its operator surface exist, but Executor owns its ToolRegistry by value with no registry_mut, and execution.rs cites A-95 prompt-cache stability as the reason the surfaced set must not churn mid-turn"
@@ -31,23 +31,35 @@ one.
 
 ## Acceptance
 
-- [ ] **The interior-mutability decision is made explicitly and written down**, because that is the
+- [x] **The interior-mutability decision is made explicitly and written down**, because that is the
       whole story. The existing precedent in this tree is a **side-channel**
       (`DynamicComposites`/`EngineLoopHost`), not mutation of the registry — evaluate that against
       making the registry interior-mutable, and say which and why. A story that quietly adds a
       `registry_mut` has skipped the question A-95 asked.
-- [ ] **Turn-boundary semantics are defined and tested.** A refresh must not change the surfaced set
+- [x] **Turn-boundary semantics are defined and tested.** A refresh must not change the surfaced set
       *during* a turn. State where the boundary is, and prove with a test that a refresh landing
       mid-turn is not visible until the boundary — the failure mode is a model that plans against one
       catalog and dispatches against another.
-- [ ] The prompt-cache cost is measured, not assumed. State what a refresh costs the cached prefix
+- [x] The prompt-cache cost is measured, not assumed. State what a refresh costs the cached prefix
       and whether that is acceptable; A-95 exists because it was not.
-- [ ] **Failing-first**: a test showing a running session still dispatching the pre-refresh catalog,
+- [x] **Failing-first**: a test showing a running session still dispatching the pre-refresh catalog,
       red before the wiring and green after.
-- [ ] A withdrawn op is not callable by a running session after the boundary, and the in-flight
+- [x] A withdrawn op is not callable by a running session after the boundary, and the in-flight
       guarantee C-310 established still holds — a call already running completes under the spec it
       was authorized with.
+- [x] The actual running operator path retains the loaded plugin and `/plugin-refresh <name>`
+      publishes into that session's catalog; the standalone scratch-registry command is not counted
+      as live wiring.
+- [x] Nested runtimes cannot replace their deliberately scoped executor registry with a parent turn
+      snapshot, while spawned children explicitly inherit the adopted generation and narrow it by
+      role/`with_tools` policy.
+- [x] Original exact and `family.*` disable intent is re-evaluated for live additions, and a failed
+      live publication leaves both the plugin and published generation unchanged.
 - [ ] Full gate green in both workspaces.
+
+Design, boundary rationale, cache measurement, and focused verification evidence are recorded in
+[live-session-catalog-refresh.md](../designs/live-session-catalog-refresh.md). The repository-wide
+gate remains unchecked until the concurrent epic lanes have converged.
 
 ## Notes
 

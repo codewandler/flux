@@ -4445,27 +4445,19 @@ fn eval_jq_path(
     optional: bool,
 ) -> Result<serde_json::Value> {
     use serde_json::Value as J;
-    let trimmed = path.trim().trim_start_matches('.');
-    if trimmed.is_empty() {
+    let parsed = crate::jq_path::parse_path(path).map_err(Error::Other)?;
+    if parsed.segments.is_empty() {
         return Ok(value.clone());
     }
     let mut cur = value.clone();
-    // Split on `.` and handle `[n]` inside each segment.
-    for raw_seg in trimmed.split('.') {
-        let seg = raw_seg.trim();
-        if seg.is_empty() {
-            continue;
-        }
-        // Segment may be `key[0][1]` — split on `[`.
-        let mut parts = seg.splitn(2, '[');
-        let key = parts.next().unwrap_or("");
-        if !key.is_empty() {
-            cur = match &cur {
+    for segment in parsed.segments {
+        cur = match segment {
+            crate::jq_path::PathSegment::Key(key) => match &cur {
                 // A PRESENT key returns its value (even `null` — that is the load-bearing
                 // present-but-optional idiom, e.g. an execution report's `failure`, and is never an error).
                 // An ABSENT key is missing data: `null` when `optional`, else a loud error (L-53) so
                 // a typo'd field name fails fast instead of silently reading empty.
-                J::Object(map) => match map.get(key) {
+                J::Object(map) => match map.get(&key) {
                     Some(v) => v.clone(),
                     None if optional => J::Null,
                     None => {
@@ -4475,28 +4467,48 @@ fn eval_jq_path(
                         ));
                     }
                 },
-                // Dotted numeric index into a list: `$nums.0` is the first element (L-53). A
-                // non-numeric field name on a list, or an out-of-range index, is missing data.
-                J::Array(arr) => match key.parse::<usize>() {
-                    Ok(idx) => match arr.get(idx) {
-                        Some(v) => v.clone(),
-                        None if optional => J::Null,
-                        None => {
-                            return Err(jq_access_error(
-                                path,
-                                &format!(
-                                    "index {idx} is past the end of a {}-element list",
-                                    arr.len()
-                                ),
-                            ));
-                        }
-                    },
-                    Err(_) if optional => J::Null,
-                    Err(_) => {
+                // A quoted numeric-looking key is still an object field, never a list index.
+                J::Array(_) if optional => J::Null,
+                J::Array(_) => {
+                    return Err(jq_access_error(
+                        path,
+                        &format!("cannot read field `{key}` of a list (use an index like `.0`)"),
+                    ));
+                }
+                _ if optional => J::Null,
+                other => {
+                    return Err(jq_access_error(
+                        path,
+                        &format!("cannot read field `{key}` of {}", json_type_name(other)),
+                    ));
+                }
+            },
+            crate::jq_path::PathSegment::Index {
+                value: idx,
+                spelling,
+            } => match &cur {
+                // Preserve the old contextual `.0` behavior: it indexes a list, but can also read
+                // an object whose literal key is `"0"`. Quoted `["0"]` above is the explicit
+                // object-only spelling and therefore never indexes a list.
+                J::Object(map) => match map.get(&spelling) {
+                    Some(v) => v.clone(),
+                    None if optional => J::Null,
+                    None => {
+                        return Err(jq_access_error(
+                            path,
+                            &format!("has no field `{spelling}`{}", present_keys_hint(map)),
+                        ));
+                    }
+                },
+                J::Array(arr) => match arr.get(idx) {
+                    Some(v) => v.clone(),
+                    None if optional => J::Null,
+                    None => {
                         return Err(jq_access_error(
                             path,
                             &format!(
-                                "cannot read field `{key}` of a list (use an index like `.0`)"
+                                "index [{idx}] is past the end of a {}-element list",
+                                arr.len()
                             ),
                         ));
                     }
@@ -4505,47 +4517,11 @@ fn eval_jq_path(
                 other => {
                     return Err(jq_access_error(
                         path,
-                        &format!("cannot read field `{key}` of {}", json_type_name(other)),
+                        &format!("cannot index [{idx}] into {}", json_type_name(other)),
                     ));
                 }
-            };
-        }
-        if let Some(rest) = parts.next() {
-            // rest is like `0]` or `0][1]`
-            let mut bracket = format!("[{rest}");
-            while bracket.contains('[') {
-                let end = bracket
-                    .find(']')
-                    .ok_or_else(|| Error::Other("`jq` path: unmatched `[`".to_string()))?;
-                let idx_str = bracket[1..end].trim();
-                let idx: usize = idx_str
-                    .parse()
-                    .map_err(|_| Error::Other(format!("`jq` path: invalid index `{idx_str}`")))?;
-                cur = match &cur {
-                    J::Array(arr) => match arr.get(idx) {
-                        Some(v) => v.clone(),
-                        None if optional => J::Null,
-                        None => {
-                            return Err(jq_access_error(
-                                path,
-                                &format!(
-                                    "index [{idx}] is past the end of a {}-element list",
-                                    arr.len()
-                                ),
-                            ));
-                        }
-                    },
-                    _ if optional => J::Null,
-                    other => {
-                        return Err(jq_access_error(
-                            path,
-                            &format!("cannot index [{idx}] into {}", json_type_name(other)),
-                        ));
-                    }
-                };
-                bracket = bracket[end + 1..].to_string();
-            }
-        }
+            },
+        };
     }
     Ok(cur)
 }
@@ -8580,6 +8556,67 @@ mod tests {
         );
     }
 
+    /// C-320 (failing first): JSON-string bracket access has the same strict/optional policy as a
+    /// dotted field, while reserved path characters and a numeric-looking object key remain data.
+    #[tokio::test]
+    async fn quoted_object_keys_preserve_strict_and_optional_access_semantics() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+
+        let present = crate::parse::parse(
+            r#"flow f
+  obj = {"content-type":"json","a.b":{"br[ack]":{"quote\"slash\\":{"0":"found"}}}}
+  found = obj["a.b"]["br[ack]"]["quote\"slash\\"]["0"]
+  return found
+"#,
+        )
+        .unwrap();
+        let out = execute_flow(
+            &store,
+            &host,
+            "quoted-present",
+            &present,
+            &mut BufferSink::default(),
+        )
+        .await
+        .expect("quoted keys are traversed as object fields");
+        assert_eq!(out.result, "found");
+
+        let strict = crate::parse::parse(
+            "flow f\n  obj = {\"content-type\":\"json\"}\n  missing = obj[\"retry-after\"]\n  return missing\n",
+        )
+        .unwrap();
+        let error = execute_flow(
+            &store,
+            &host,
+            "quoted-strict",
+            &strict,
+            &mut BufferSink::default(),
+        )
+        .await
+        .expect_err("a missing quoted key is strict by default");
+        let message = error.to_string();
+        assert!(
+            message.contains("no field `retry-after`") && message.contains('?'),
+            "quoted-key error must retain the ordinary strict-access guidance: {message}"
+        );
+
+        let optional = crate::parse::parse(
+            "flow f\n  obj = {\"content-type\":\"json\"}\n  missing = obj[\"retry-after\"]?\n  return missing\n",
+        )
+        .unwrap();
+        let out = execute_flow(
+            &store,
+            &host,
+            "quoted-optional",
+            &optional,
+            &mut BufferSink::default(),
+        )
+        .await
+        .expect("an optional missing quoted key reads null");
+        assert_eq!(out.result, "");
+    }
+
     /// L-36: a genuinely MALFORMED path — not missing data — must still error loudly (unmatched
     /// `[`, a non-numeric index). Only absent keys/indices become `null`.
     #[tokio::test]
@@ -8637,6 +8674,36 @@ mod tests {
             err2.to_string().contains("invalid index"),
             "non-numeric index still errors: {err2}"
         );
+
+        for (session, path) in [
+            ("suffix-after-index", ".a[0]suffix"),
+            ("whitespace-after-key", r#".["a"] suffix"#),
+        ] {
+            let malformed = DraftAst {
+                body: vec![
+                    flow_bind("obj", flow_lit(json!({"a": [1, 2, 3]}))),
+                    flow_bind(
+                        "bad",
+                        Node::Jq {
+                            path: path.into(),
+                            optional: true,
+                            input: Box::new(flow_var("obj")),
+                        },
+                    ),
+                ],
+                ..Default::default()
+            };
+            let error = execute_flow(
+                &store,
+                &host,
+                session,
+                &malformed,
+                &mut BufferSink::default(),
+            )
+            .await
+            .expect_err("malformed public AST path must be recoverable");
+            assert!(error.to_string().contains("unexpected"), "{path}: {error}");
+        }
     }
 
     /// L-53: dotted numeric access `$nums.0` indexes into a list (previously it read a non-existent

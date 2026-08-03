@@ -727,6 +727,28 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_network_calls_are_substitutable_without_native_sockets() {
+        struct MemoryReadHalf;
+        impl crate::net::DuplexReadHalf for MemoryReadHalf {
+            fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>> {
+                Box::pin(async move { Ok(b"reply"[..max.min(5)].to_vec()) })
+            }
+        }
+
+        struct MemoryWriteHalf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl crate::net::DuplexWriteHalf for MemoryWriteHalf {
+            fn write_all<'a>(&'a mut self, data: &'a [u8]) -> Guarded<'a, ()> {
+                let written = self.0.clone();
+                Box::pin(async move {
+                    written.lock().unwrap().extend_from_slice(data);
+                    Ok(())
+                })
+            }
+
+            fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
         struct MemoryStream(Arc<std::sync::Mutex<Vec<u8>>>);
         impl DuplexStream for MemoryStream {
             fn read<'a>(&'a mut self, max: usize) -> Guarded<'a, Vec<u8>> {
@@ -743,6 +765,15 @@ mod tests {
 
             fn shutdown<'a>(&'a mut self) -> Guarded<'a, ()> {
                 Box::pin(async { Ok(()) })
+            }
+
+            fn split(
+                self: Box<Self>,
+            ) -> (
+                Box<dyn crate::net::DuplexReadHalf>,
+                Box<dyn crate::net::DuplexWriteHalf>,
+            ) {
+                (Box::new(MemoryReadHalf), Box::new(MemoryWriteHalf(self.0)))
             }
         }
 

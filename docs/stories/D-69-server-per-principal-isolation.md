@@ -80,6 +80,7 @@ identity.
   the account-value/principal-realm collision) with a regression test; realm-scoped `/usage` now
   goes through the store's `cost_summary_for_account` (shared canonical fold, no key-split/unpriced
   divergence); shared-secret mode carries `external_url` (card no longer Host-phishable);
-  `serve_multi`/`serve_multi_on` guard the D-63 mount's bind; duplicate-`Authorization` rejection
+  `serve_multi` guards the D-63 mount's bind through its required `ExecutionSystem` (C-435 removed
+  the already-bound native-listener helper); duplicate-`Authorization` rejection
   applied to shared-secret too; secret-without-client-id is now a hard error; account-claim-without-
   require_account warns. Full gate green.

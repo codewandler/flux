@@ -21,8 +21,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
 use flux_system::net::{
-    BindExposure, DatagramEndpoint, DatagramHandle, DialTarget, DuplexStream as GuardedDuplex,
-    InboundLimits, NetworkListener, NetworkStream, PrivateNetAllow, StreamListener,
+    BindExposure, DatagramEndpoint, DatagramHandle, DialTarget, DuplexReadHalf,
+    DuplexStream as GuardedDuplex, DuplexWriteHalf, InboundLimits, NetworkListener, NetworkStream,
+    PrivateNetAllow, StreamListener,
 };
 use flux_system::port::{ExecutionIdentity, GuardedNetwork, SubstrateIdentity};
 use flux_system::remote::{Answer, Answered, Delegate, Delivered, RemoteSystem, Unreachable};
@@ -38,7 +39,7 @@ use tower_http::timeout::TimeoutLayer;
 use crate::{guard_open_bind, require_auth, ServerAuth};
 
 /// Version of the remote execution-system wire contract.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 static CLIENT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -693,6 +694,12 @@ enum NetworkFrame {
         data: String,
         peer: Option<SocketAddr>,
     },
+    ReadError {
+        detail: String,
+    },
+    WriteError {
+        detail: String,
+    },
     Accept,
     Accepted {
         handle: String,
@@ -814,47 +821,91 @@ async fn serve_network_socket(mut socket: WebSocket, state: SystemState) {
     }
 }
 
-async fn serve_stream_socket(mut socket: WebSocket, mut stream: NetworkStream) {
+enum StreamWriteCommand {
+    Write(Vec<u8>),
+    Shutdown,
+}
+
+async fn serve_stream_socket(mut socket: WebSocket, stream: NetworkStream) {
     if send_network_frame(&mut socket, NetworkFrame::Started { local_addr: None })
         .await
         .is_err()
     {
         return;
     }
-    while let Some(Ok(ServerWsMessage::Text(text))) = socket.next().await {
-        let response = match serde_json::from_str::<NetworkFrame>(text.as_str()) {
-            Ok(NetworkFrame::Read { max }) => match stream.read(max).await {
+    let (mut stream_read, mut stream_write) = stream.into_split();
+    let (read_tx, mut read_rx) = tokio::sync::mpsc::channel::<usize>(1);
+    let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<StreamWriteCommand>(1);
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<NetworkFrame>(2);
+    let read_responses = response_tx.clone();
+    let read_worker = tokio::spawn(async move {
+        while let Some(max) = read_rx.recv().await {
+            let response = match stream_read.read(max).await {
                 Ok(data) => NetworkFrame::Data {
                     data: encode_bytes(&data),
                     peer: None,
                 },
-                Err(error) => NetworkFrame::Error {
+                Err(error) => NetworkFrame::ReadError {
                     detail: error.to_string(),
                 },
-            },
-            Ok(NetworkFrame::Write { data }) => match decode_bytes(Some(&Value::String(data))) {
-                Ok(data) => match stream.write_all(&data).await {
-                    Ok(()) => NetworkFrame::Ok,
-                    Err(error) => NetworkFrame::Error {
-                        detail: error.to_string(),
-                    },
-                },
-                Err(detail) => NetworkFrame::Error { detail },
-            },
-            Ok(NetworkFrame::Shutdown) => match stream.shutdown().await {
+            };
+            if read_responses.send(response).await.is_err() {
+                break;
+            }
+        }
+    });
+    let write_worker = tokio::spawn(async move {
+        while let Some(command) = write_rx.recv().await {
+            let result = match command {
+                StreamWriteCommand::Write(data) => stream_write.write_all(&data).await,
+                StreamWriteCommand::Shutdown => stream_write.shutdown().await,
+            };
+            let response = match result {
                 Ok(()) => NetworkFrame::Ok,
-                Err(error) => NetworkFrame::Error {
+                Err(error) => NetworkFrame::WriteError {
                     detail: error.to_string(),
                 },
-            },
-            _ => NetworkFrame::Error {
-                detail: "invalid stream command".into(),
-            },
-        };
-        if send_network_frame(&mut socket, response).await.is_err() {
-            return;
+            };
+            if response_tx.send(response).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (mut socket_tx, mut socket_rx) = socket.split();
+    loop {
+        tokio::select! {
+            command = socket_rx.next() => {
+                let Some(Ok(ServerWsMessage::Text(text))) = command else { break };
+                let routed = match serde_json::from_str::<NetworkFrame>(text.as_str()) {
+                    Ok(NetworkFrame::Read { max }) => read_tx.send(max).await.map_err(|_| ()),
+                    Ok(NetworkFrame::Write { data }) => match decode_bytes(Some(&Value::String(data))) {
+                        Ok(data) => write_tx.send(StreamWriteCommand::Write(data)).await.map_err(|_| ()),
+                        Err(detail) => {
+                            if socket_tx.send(ServerWsMessage::Text(
+                                serde_json::to_string(&NetworkFrame::WriteError { detail }).unwrap().into()
+                            )).await.is_err() { break; }
+                            continue;
+                        }
+                    },
+                    Ok(NetworkFrame::Shutdown) => write_tx.send(StreamWriteCommand::Shutdown).await.map_err(|_| ()),
+                    _ => {
+                        if socket_tx.send(ServerWsMessage::Text(
+                            serde_json::to_string(&NetworkFrame::Error { detail: "invalid stream command".into() }).unwrap().into()
+                        )).await.is_err() { break; }
+                        continue;
+                    }
+                };
+                if routed.is_err() { break; }
+            }
+            response = response_rx.recv() => {
+                let Some(response) = response else { break };
+                let Ok(text) = serde_json::to_string(&response) else { break };
+                if socket_tx.send(ServerWsMessage::Text(text.into())).await.is_err() { break; }
+            }
         }
     }
+    read_worker.abort();
+    write_worker.abort();
 }
 
 async fn serve_listener_socket(
@@ -1651,14 +1702,34 @@ async fn network_rpc(
     }
 }
 
+async fn network_rpc_direct(
+    socket: &mut ProcessSocket,
+    command: NetworkFrame,
+) -> Result<NetworkFrame> {
+    send_client_network_frame(socket, command)
+        .await
+        .map_err(|error| Error::Other(error.to_string()))?;
+    match receive_client_network_frame(socket)
+        .await
+        .map_err(|error| Error::Other(error.to_string()))?
+    {
+        NetworkFrame::Error { detail }
+        | NetworkFrame::ReadError { detail }
+        | NetworkFrame::WriteError { detail } => {
+            Err(GuardedIoError::new(GuardedIoFailure::Refused, detail).into())
+        }
+        response => Ok(response),
+    }
+}
+
 struct RemoteDuplexStream {
-    socket: Arc<tokio::sync::Mutex<ProcessSocket>>,
+    socket: ProcessSocket,
 }
 
 impl GuardedDuplex for RemoteDuplexStream {
     fn read<'a>(&'a mut self, max: usize) -> flux_system::port::Guarded<'a, Vec<u8>> {
         Box::pin(async move {
-            match network_rpc(&self.socket, NetworkFrame::Read { max }).await? {
+            match network_rpc_direct(&mut self.socket, NetworkFrame::Read { max }).await? {
                 NetworkFrame::Data { data, peer: None } => {
                     decode_bytes(Some(&Value::String(data))).map_err(Error::Other)
                 }
@@ -1669,8 +1740,8 @@ impl GuardedDuplex for RemoteDuplexStream {
 
     fn write_all<'a>(&'a mut self, data: &'a [u8]) -> flux_system::port::Guarded<'a, ()> {
         Box::pin(async move {
-            match network_rpc(
-                &self.socket,
+            match network_rpc_direct(
+                &mut self.socket,
                 NetworkFrame::Write {
                     data: encode_bytes(data),
                 },
@@ -1685,13 +1756,239 @@ impl GuardedDuplex for RemoteDuplexStream {
 
     fn shutdown<'a>(&'a mut self) -> flux_system::port::Guarded<'a, ()> {
         Box::pin(async move {
-            match network_rpc(&self.socket, NetworkFrame::Shutdown).await? {
+            match network_rpc_direct(&mut self.socket, NetworkFrame::Shutdown).await? {
                 NetworkFrame::Ok => Ok(()),
                 _ => Err(Error::Other(
                     "invalid remote stream shutdown response".into(),
                 )),
             }
         })
+    }
+
+    fn split(self: Box<Self>) -> (Box<dyn DuplexReadHalf>, Box<dyn DuplexWriteHalf>) {
+        split_remote_stream(self.socket)
+    }
+}
+
+struct RemoteReadRequest {
+    max: usize,
+    response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+}
+
+enum RemoteWriteKind {
+    Write(Vec<u8>),
+    Shutdown,
+}
+
+struct RemoteWriteRequest {
+    kind: RemoteWriteKind,
+    response: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+struct RemoteReadHalf {
+    requests: tokio::sync::mpsc::Sender<RemoteReadRequest>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for RemoteReadHalf {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl DuplexReadHalf for RemoteReadHalf {
+    fn read<'a>(&'a mut self, max: usize) -> flux_system::port::Guarded<'a, Vec<u8>> {
+        Box::pin(async move {
+            let (response, answer) = tokio::sync::oneshot::channel();
+            self.requests
+                .send(RemoteReadRequest { max, response })
+                .await
+                .map_err(|_| Error::Other("remote network stream closed".into()))?;
+            answer
+                .await
+                .map_err(|_| Error::Other("remote network stream closed".into()))?
+        })
+    }
+}
+
+struct RemoteWriteHalf {
+    requests: tokio::sync::mpsc::Sender<RemoteWriteRequest>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for RemoteWriteHalf {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl RemoteWriteHalf {
+    async fn request(&self, kind: RemoteWriteKind) -> Result<()> {
+        let (response, answer) = tokio::sync::oneshot::channel();
+        self.requests
+            .send(RemoteWriteRequest { kind, response })
+            .await
+            .map_err(|_| Error::Other("remote network stream closed".into()))?;
+        answer
+            .await
+            .map_err(|_| Error::Other("remote network stream closed".into()))?
+    }
+}
+
+impl DuplexWriteHalf for RemoteWriteHalf {
+    fn write_all<'a>(&'a mut self, data: &'a [u8]) -> flux_system::port::Guarded<'a, ()> {
+        Box::pin(async move { self.request(RemoteWriteKind::Write(data.to_vec())).await })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> flux_system::port::Guarded<'a, ()> {
+        Box::pin(async move { self.request(RemoteWriteKind::Shutdown).await })
+    }
+}
+
+fn split_remote_stream(
+    socket: ProcessSocket,
+) -> (Box<dyn DuplexReadHalf>, Box<dyn DuplexWriteHalf>) {
+    let (read_tx, read_rx) = tokio::sync::mpsc::channel(1);
+    let (write_tx, write_rx) = tokio::sync::mpsc::channel(1);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(drive_remote_stream(
+        socket,
+        read_rx,
+        write_rx,
+        cancel.clone(),
+    ));
+    (
+        Box::new(RemoteReadHalf {
+            requests: read_tx,
+            cancel: cancel.clone(),
+        }),
+        Box::new(RemoteWriteHalf {
+            requests: write_tx,
+            cancel,
+        }),
+    )
+}
+
+async fn drive_remote_stream(
+    socket: ProcessSocket,
+    mut read_requests: tokio::sync::mpsc::Receiver<RemoteReadRequest>,
+    mut write_requests: tokio::sync::mpsc::Receiver<RemoteWriteRequest>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (mut socket_tx, mut socket_rx) = socket.split();
+    let mut pending_read: Option<tokio::sync::oneshot::Sender<Result<Vec<u8>>>> = None;
+    let mut pending_write: Option<tokio::sync::oneshot::Sender<Result<()>>> = None;
+    let mut read_open = true;
+    let mut write_open = true;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            request = read_requests.recv(), if read_open && pending_read.is_none() => {
+                let Some(request) = request else {
+                    read_open = false;
+                    if !write_open && pending_write.is_none() { break; }
+                    continue;
+                };
+                let frame = NetworkFrame::Read { max: request.max };
+                let sent = serde_json::to_string(&frame)
+                    .map(Message::text)
+                    .map_err(|error| error.to_string());
+                match sent {
+                    Ok(message) => {
+                        if socket_tx.send(message).await.is_ok() {
+                            pending_read = Some(request.response);
+                        } else {
+                            let _ = request.response.send(Err(Error::Other("remote network stream closed".into())));
+                            break;
+                        }
+                    }
+                    Err(detail) => {
+                        let _ = request.response.send(Err(Error::Other(detail)));
+                    }
+                }
+            }
+            request = write_requests.recv(), if write_open && pending_write.is_none() => {
+                let Some(request) = request else {
+                    write_open = false;
+                    if !read_open && pending_read.is_none() { break; }
+                    continue;
+                };
+                let frame = match &request.kind {
+                    RemoteWriteKind::Write(data) => NetworkFrame::Write { data: encode_bytes(data) },
+                    RemoteWriteKind::Shutdown => NetworkFrame::Shutdown,
+                };
+                let sent = serde_json::to_string(&frame)
+                    .map(Message::text)
+                    .map_err(|error| error.to_string());
+                match sent {
+                    Ok(message) => {
+                        if socket_tx.send(message).await.is_ok() {
+                            pending_write = Some(request.response);
+                        } else {
+                            let _ = request.response.send(Err(Error::Other("remote network stream closed".into())));
+                            break;
+                        }
+                    }
+                    Err(detail) => {
+                        let _ = request.response.send(Err(Error::Other(detail)));
+                    }
+                }
+            }
+            response = socket_rx.next() => {
+                let Some(Ok(Message::Text(text))) = response else { break };
+                match serde_json::from_str::<NetworkFrame>(text.as_str()) {
+                    Ok(NetworkFrame::Data { data, peer: None }) => {
+                        if let Some(response) = pending_read.take() {
+                            let result = decode_bytes(Some(&Value::String(data))).map_err(Error::Other);
+                            let _ = response.send(result);
+                        }
+                    }
+                    Ok(NetworkFrame::ReadError { detail }) => {
+                        if let Some(response) = pending_read.take() {
+                            let _ = response.send(Err(
+                                GuardedIoError::new(GuardedIoFailure::Refused, detail).into()
+                            ));
+                        }
+                    }
+                    Ok(NetworkFrame::Ok) => {
+                        if let Some(response) = pending_write.take() {
+                            let _ = response.send(Ok(()));
+                        }
+                    }
+                    Ok(NetworkFrame::WriteError { detail }) => {
+                        if let Some(response) = pending_write.take() {
+                            let _ = response.send(Err(
+                                GuardedIoError::new(GuardedIoFailure::Refused, detail).into()
+                            ));
+                        }
+                    }
+                    Ok(NetworkFrame::Error { detail }) => {
+                        if let Some(response) = pending_read.take() {
+                            let _ = response.send(Err(
+                                GuardedIoError::new(GuardedIoFailure::Refused, detail.clone()).into()
+                            ));
+                        }
+                        if let Some(response) = pending_write.take() {
+                            let _ = response.send(Err(
+                                GuardedIoError::new(GuardedIoFailure::Refused, detail).into()
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        let detail = format!("invalid network frame: {error}");
+                        if let Some(response) = pending_read.take() {
+                            let _ = response.send(Err(Error::Other(detail.clone())));
+                        }
+                        if let Some(response) = pending_write.take() {
+                            let _ = response.send(Err(Error::Other(detail)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -1724,9 +2021,7 @@ impl StreamListener for RemoteStreamListener {
                 .await,
             )?;
             Ok((
-                NetworkStream::from_handle(RemoteDuplexStream {
-                    socket: Arc::new(tokio::sync::Mutex::new(socket)),
-                }),
+                NetworkStream::from_handle(RemoteDuplexStream { socket }),
                 peer,
             ))
         })
@@ -2133,9 +2428,7 @@ impl Delegate for HttpDelegate {
                 Answer::Unknown(detail) => return Ok(Answer::Unknown(detail)),
             };
             Ok(Answer::Served(NetworkStream::from_handle(
-                RemoteDuplexStream {
-                    socket: Arc::new(tokio::sync::Mutex::new(socket)),
-                },
+                RemoteDuplexStream { socket },
             )))
         })
     }
@@ -2561,7 +2854,7 @@ mod tests {
         echo.await.unwrap();
 
         let limits = InboundLimits {
-            max_connections: 2,
+            max_connections: 1,
             max_frame_bytes: 64,
             io_timeout: Duration::from_secs(5),
         };
@@ -2578,13 +2871,35 @@ mod tests {
             let mut stream = tokio::net::TcpStream::connect(listener_address)
                 .await
                 .unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut stream, b"accepted")
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &[b'x'; 256])
                 .await
                 .unwrap();
+            let mut response = [0; 8];
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut response),
+            )
+            .await
+            .expect("remote outbound half must progress while inbound is backpressured")
+            .unwrap();
+            response
         });
-        let (mut accepted, _) = remote_listener.accept().await.unwrap();
-        assert_eq!(accepted.read(8).await.unwrap(), b"accepted");
-        client.await.unwrap();
+        let (accepted, _) = remote_listener.accept().await.unwrap();
+        let mut protocol = accepted.into_async_io(limits.max_frame_bytes);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::io::AsyncWriteExt::write_all(&mut protocol, b"response")
+            .await
+            .unwrap();
+        assert_eq!(&client.await.unwrap(), b"response");
+        drop(protocol);
+        let second_client = tokio::spawn(tokio::net::TcpStream::connect(listener_address));
+        let second_accepted =
+            tokio::time::timeout(Duration::from_secs(1), remote_listener.accept())
+                .await
+                .expect("dropping remote protocol IO must release remote admission")
+                .unwrap();
+        drop(second_accepted);
+        second_client.await.unwrap().unwrap();
 
         let mut remote_udp = remote
             .bind_udp(

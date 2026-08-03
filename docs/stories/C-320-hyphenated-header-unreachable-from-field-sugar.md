@@ -2,7 +2,7 @@
 id: C-320
 title: "A hyphenated header name is unreachable from the `$resp.headers.x` sugar"
 pillar: Language
-status: ready
+status: active
 priority: 15
 areas: [flux-lang]
 note: "found by C-304 — `http.request` now returns a headers map, but `.headers.content-type` and `.headers[\"content-type\"]` both fail: field segments are alphanumeric/underscore and eval_jq_path's bracket index must be numeric, so the commonest header names need a pick() workaround"
@@ -26,22 +26,39 @@ answer — and it is the first thing a caller hits after adopting the new record
 
 ## Acceptance
 
-- [ ] **Decide the surface**, and it is a language decision rather than a web one: a quoted key in
+- [x] **Decide the surface**, and it is a language decision rather than a web one: a quoted key in
       bracket access (`$x["a-b"]`), a quoted field segment, or something else. State what you chose
       and what you rejected. This changes flux-lang's grammar, so the cost is not only the parser.
-- [ ] **Failing-first**: a test showing the chosen spelling failing before the change.
-- [ ] Strict-access semantics are preserved — a missing quoted key must behave exactly like a missing
+- [x] **Failing-first**: a test showing the chosen spelling failing before the change.
+- [x] Strict-access semantics are preserved — a missing quoted key must behave exactly like a missing
       plain field, including the `?` optional-access form and its error text.
-- [ ] ⚠ **The editor-tooling mirrors are manual and only one of four is guarded.** A grammar change
+- [x] ⚠ **The editor-tooling mirrors are manual and only one of four is guarded.** A grammar change
       must be propagated by hand to the website Prism grammar
       (`website/src/theme/prism-include-languages.js`), `codewandler/flux-tree-sitter` (Helix/Neovim/
       Zed, plus `.helix/languages.toml`), and the TextMate/IntelliJ grammars in
       `codewandler/flux-editors`. Only the Prism one has any mechanical check, and only for canonical
       header-option labels. Grep the other three; nothing else will tell you.
-- [ ] The node-kind and reference docs regenerate cleanly
+- [x] The node-kind and reference docs regenerate cleanly
       (`UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` and `--test website_in_sync`),
       and changed semantics get hand-written prose — the generated tables do not cover that.
 - [ ] Full gate green in both workspaces.
+
+## Progress
+
+- Chosen surface: JSON-quoted bracket keys, for example `$resp.headers["content-type"]`. This reuses
+  JSON string escaping, keeps dotted identifier sugar unchanged, and distinguishes quoted numeric
+  object keys from unquoted numeric indexes. A new quoted-dot segment was rejected because it would
+  introduce a second string syntax without improving the familiar map-access spelling.
+- Failing-first parser, formatter, runtime, strict/optional-access, and malformed public-AST tests
+  now cover the core behavior. Malformed bracket suffixes return ordinary diagnostics; they no
+  longer reach an internal panic in formatting or evaluation.
+- Editor mirrors are landed: `flux-editors` commit
+  `e49ba2a332ed8215ec54d440ba537e4746218355`, and `flux-tree-sitter` commits
+  `77e7ba61131a20a8f061e026727b634a7b8a5458` plus whitespace-alignment follow-up
+  `7a90ffa6794972b3aa8dbf8a9b7b0755e3404f8b`. The Helix pin above now selects the follow-up.
+- Focused core, generated-reference, mirror, corpus, query, Rust binding, and isolated Helix checks
+  are green. The full Flux repository gate remains pending while unrelated active lanes share this
+  worktree, so this story remains active.
 
 ## Notes
 

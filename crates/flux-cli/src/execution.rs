@@ -1122,16 +1122,24 @@ pub(super) fn assemble_cli_execution_environment(
 /// Build a tool-enabled agent (provider + safety envelope + session) for agentic mode / the REPL.
 /// Eager provider construction: an agentic turn always calls the model, so a credential problem
 /// should fail fast here. Deterministic execution paths use [`build_agent_lazy`].
+pub(super) type LiveAgentBuild = (
+    FlowEngine,
+    String,
+    String,
+    Arc<dyn flux_runtime::Spawner>,
+    Arc<super::app_cmd::LivePluginCatalog>,
+);
+
 pub(super) async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None, None, None, None).await
+    let (agent, session, spec, spawner, _) =
+        build_agent_with(flags, true, None, None, None, None).await?;
+    Ok((agent, session, spec, spawner))
 }
 
 /// Build for the local line-oriented terminal, with typed questions enabled.
-pub(super) async fn build_agent_interactive(
-    flags: &AgentFlags,
-) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+pub(super) async fn build_agent_interactive(flags: &AgentFlags) -> Result<LiveAgentBuild> {
     build_agent_with(
         flags,
         true,
@@ -1153,7 +1161,9 @@ pub(super) async fn build_agent_with_approver(
     flags: &AgentFlags,
     approver: Arc<dyn Approver>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, true, None, None, Some(approver), None).await
+    let (agent, session, spec, spawner, _) =
+        build_agent_with(flags, true, None, None, Some(approver), None).await?;
+    Ok((agent, session, spec, spawner))
 }
 
 /// [`build_agent`] for a surface that has a human terminal to draw on (C-305).
@@ -1168,7 +1178,7 @@ pub(super) async fn build_agent_with_surface(
     surface_sink: Arc<dyn flux_runtime::SurfaceSink>,
     user_interaction: Arc<dyn flux_runtime::UserInteraction>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(
+    let (agent, session, spec, spawner, _) = build_agent_with(
         flags,
         true,
         None,
@@ -1176,7 +1186,8 @@ pub(super) async fn build_agent_with_surface(
         None,
         Some(user_interaction),
     )
-    .await
+    .await?;
+    Ok((agent, session, spec, spawner))
 }
 
 /// [`build_agent`] with a LAZY provider (C-11): `flux flow run` / `flux preset --run` replay
@@ -1189,7 +1200,9 @@ pub(super) async fn build_agent_lazy(
     flags: &AgentFlags,
     session_override: Option<String>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    build_agent_with(flags, false, session_override, None, None, None).await
+    let (agent, session, spec, spawner, _) =
+        build_agent_with(flags, false, session_override, None, None, None).await?;
+    Ok((agent, session, spec, spawner))
 }
 
 /// Build the workspace view used by every saved-flow consumer. Agent construction creates the two
@@ -1663,7 +1676,7 @@ pub(super) async fn build_agent_with(
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     approver_override: Option<Arc<dyn Approver>>,
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
-) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+) -> Result<LiveAgentBuild> {
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
     let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
@@ -1928,6 +1941,7 @@ pub(super) async fn build_agent_with(
         &redactor,
     )
     .await?;
+    let live_plugins = Arc::new(integrations.live_plugins);
     for (source, tool) in integrations.tools {
         registry.try_register_from(source, tool)?;
     }
@@ -2028,9 +2042,10 @@ pub(super) async fn build_agent_with(
     // C-162: resolve `[tools] disable` against the now-final registry (exact op names or
     // `family.*` globs) and install it on the executor — surface-only + defense-in-depth (the
     // engine narrows the per-turn advertised set by it, and `Executor::gate` separately refuses a
-    // dispatch that names one). Resolved exactly once here, before any turn runs, so the set can
-    // never churn mid-session (A-95). An entry matching no known op is a loud startup warning, not
-    // a silent no-op — it's very likely a typo or a stale entry naming a retired op.
+    // dispatch that names one). Startup names resolve here for diagnostics; the original patterns
+    // are also retained so a matching op added by a later catalog generation is disabled at that
+    // generation's turn boundary (never mid-turn). An entry matching no known startup op is a loud
+    // warning, not a silent no-op — it may be a typo, stale entry, or deliberate future ceiling.
     let disabled_tools = executor.registry().resolve_disabled(&cfg.tools.disable);
     for pattern in &disabled_tools.unmatched {
         eprintln!(
@@ -2042,7 +2057,9 @@ pub(super) async fn build_agent_with(
     }
     let mut disabled = disabled_tools.disabled;
     disabled.extend(remote_unsupported_ops);
-    let executor = executor.with_disabled_ops(disabled);
+    let executor = executor
+        .with_disabled_ops(disabled)
+        .with_disabled_patterns(cfg.tools.disable.clone());
     // Record the available toolchain as a startup observation (audit backbone).
     executor.observe(flux_evidence::Observation::new(
         "toolchain",
@@ -2115,7 +2132,7 @@ pub(super) async fn build_agent_with(
         system.as_ref(),
     )
     .await?;
-    Ok((agent, session_id, canonical_spec, spawner))
+    Ok((agent, session_id, canonical_spec, spawner, live_plugins))
 }
 
 /// D-178/D-179/D-183 resurrect-on-open, plus A-98 wake-up servicing: if this session was killed
@@ -2169,7 +2186,8 @@ pub(super) async fn resurrect_on_open(
 
 /// One-shot agentic turn.
 pub(super) async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()> {
-    let (agent, session_id, model_spec, _spawner) = build_agent_interactive(flags).await?;
+    let (agent, session_id, model_spec, _spawner, _live_plugins) =
+        build_agent_interactive(flags).await?;
     eprintln!(
         "{}",
         style::dim(&format!("{} · session {session_id}", agent.model))

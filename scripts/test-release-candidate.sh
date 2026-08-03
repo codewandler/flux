@@ -8,6 +8,7 @@ FINDER="$ROOT/scripts/find-release-candidate.sh"
 WORKFLOW="$ROOT/.github/workflows/release.yml"
 FLOW_WORKFLOW="$ROOT/.github/workflows/release-flow.yml"
 PROMOTER="$ROOT/scripts/promote-release-flow.sh"
+FULL_GATE="$ROOT/scripts/release-full-gate.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -30,14 +31,56 @@ expect_fail() {
 [ -x "$HELPER" ] || fail "missing executable receipt helper: $HELPER"
 [ -x "$FINDER" ] || fail "missing executable candidate finder: $FINDER"
 [ -x "$PROMOTER" ] || fail "missing executable release-flow promotion helper: $PROMOTER"
+[ -x "$FULL_GATE" ] || fail "missing executable mandatory release gate: $FULL_GATE"
+
+# The gate binds itself to the checked-out SHA and runs the exact command list. A command failure is
+# fatal, and a SHA mismatch is rejected before Cargo starts.
+mkdir -p "$TMP/gate-bin" "$TMP/gate-root"
+cat >"$TMP/gate-bin/git" <<'MOCK_GATE_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  'rev-parse --show-toplevel') echo "$MOCK_GATE_ROOT" ;;
+  'rev-parse HEAD') echo "$MOCK_GATE_SHA" ;;
+  *) exit 2 ;;
+esac
+MOCK_GATE_GIT
+cat >"$TMP/gate-bin/cargo" <<'MOCK_GATE_CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >>"$MOCK_GATE_LOG"
+if [ "${MOCK_GATE_FAIL:-}" = "$*" ]; then
+  exit 1
+fi
+MOCK_GATE_CARGO
+chmod +x "$TMP/gate-bin/git" "$TMP/gate-bin/cargo"
+: >"$TMP/gate.log"
+env PATH="$TMP/gate-bin:$PATH" MOCK_GATE_ROOT="$TMP/gate-root" MOCK_GATE_SHA="$SHA" \
+  MOCK_GATE_LOG="$TMP/gate.log" "$FULL_GATE" "$SHA" >/dev/null
+expected_gate_commands='build --workspace
+test --workspace
+clippy --workspace --all-targets -- -D warnings
+fmt --all --check
+fmt --manifest-path plugins/Cargo.toml --all --check
+test -p flux-codegate'
+[ "$(cat "$TMP/gate.log")" = "$expected_gate_commands" ] \
+  || fail "mandatory release gate command list drifted"
+: >"$TMP/gate.log"
+expect_fail env PATH="$TMP/gate-bin:$PATH" MOCK_GATE_ROOT="$TMP/gate-root" MOCK_GATE_SHA="$SHA" \
+  MOCK_GATE_LOG="$TMP/gate.log" "$FULL_GATE" "a${SHA#?}"
+[ ! -s "$TMP/gate.log" ] || fail "release gate ran Cargo for the wrong checked-out SHA"
+expect_fail env PATH="$TMP/gate-bin:$PATH" MOCK_GATE_ROOT="$TMP/gate-root" MOCK_GATE_SHA="$SHA" \
+  MOCK_GATE_LOG="$TMP/gate.log" MOCK_GATE_FAIL='test --workspace' "$FULL_GATE" "$SHA"
 
 "$HELPER" write "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
 "$HELPER" verify "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
 
-expected='schema=flux-release-candidate-v1
+expected='schema=flux-release-candidate-v2
 version=1.2.3
 tag=v1.2.3
 commit=0123456789abcdef0123456789abcdef01234567
+gate=mandatory-full-v1
+gate_commit=0123456789abcdef0123456789abcdef01234567
 run_id=123456789'
 actual=$(cat "$RECEIPT")
 [ "$actual" = "$expected" ] || fail "receipt is not deterministic"
@@ -46,6 +89,7 @@ expect_fail "$HELPER" write "$RECEIPT" v1.2.3 "$SHA" "$RUN_ID"
 expect_fail "$HELPER" write "$RECEIPT" 1.2 "$SHA" "$RUN_ID"
 expect_fail "$HELPER" write "$RECEIPT" "$VERSION" "${SHA%?}" "$RUN_ID"
 expect_fail "$HELPER" write "$RECEIPT" "$VERSION" "$SHA" run-1
+expect_fail "$ROOT/scripts/cut-release.sh" patch --no-gate
 ln -s "$RECEIPT" "$TMP/receipt-link"
 expect_fail "$HELPER" write "$TMP/receipt-link" "$VERSION" "$SHA" "$RUN_ID"
 
@@ -176,5 +220,14 @@ grep -Fq 'crates/flux-server/assets/public-docs.zip' "$ROOT/scripts/cut-release.
   || fail "cut-release does not transact and commit the embedded docs archive"
 grep -Fq 'promotes those artifacts without recompiling' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
   || fail "publishing runbook does not document build-once promotion"
+
+grep -Fq 'scripts/release-full-gate.sh "$GITHUB_SHA"' "$WORKFLOW" \
+  || fail "candidate workflow does not gate its exact checked-out SHA"
+gate_line=$(grep -nF 'scripts/release-full-gate.sh "$GITHUB_SHA"' "$WORKFLOW" | cut -d: -f1)
+receipt_line=$(grep -nF 'scripts/release-candidate.sh write release-candidate.txt' "$WORKFLOW" | cut -d: -f1)
+[ -n "$gate_line" ] && [ -n "$receipt_line" ] && [ "$gate_line" -lt "$receipt_line" ] \
+  || fail "candidate receipt can be written before the mandatory full gate"
+grep -Fq 'FLUX_RELEASE_CANDIDATE_OWNS_GATE' "$FLOW_WORKFLOW" \
+  || fail "automatic flow does not delegate the one full gate to its exact-SHA candidate"
 
 echo "release-candidate receipt and workflow tests passed"

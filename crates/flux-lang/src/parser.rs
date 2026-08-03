@@ -1399,7 +1399,7 @@ impl<'s> Parser<'s> {
         self.primary();
         while self.at(SyntaxKind::DOT)
             || (self.at(SyntaxKind::L_BRACK)
-                && self.nth(1) == SyntaxKind::NUMBER
+                && matches!(self.nth(1), SyntaxKind::NUMBER | SyntaxKind::STRING)
                 && self.nth(2) == SyntaxKind::R_BRACK)
         {
             if self.eat(SyntaxKind::DOT) {
@@ -1411,8 +1411,15 @@ impl<'s> Parser<'s> {
                 }
             } else {
                 self.bump(); // [
-                self.expect(SyntaxKind::NUMBER, "an integer index after `[` ");
-                self.expect(SyntaxKind::R_BRACK, "`]` to close the index");
+                if self.at(SyntaxKind::STRING) {
+                    self.bump(); // JSON-string object key
+                } else {
+                    self.expect(
+                        SyntaxKind::NUMBER,
+                        "an integer index or quoted key after `[` ",
+                    );
+                }
+                self.expect(SyntaxKind::R_BRACK, "`]` to close the field or index");
             }
             self.eat(SyntaxKind::QUESTION); // optional-access marker
             self.wrap(cp, SyntaxKind::FIELD_EXPR);

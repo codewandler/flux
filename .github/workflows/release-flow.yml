@@ -18,8 +18,9 @@
 # So `apply: false` (the default) is a real, reviewable preview against the real repo: it derives the
 # version, has the scribe draft both changelogs, and posts the rendered sections plus the diff it would
 # apply to the job summary — writing nothing. `apply: true` is a full REHEARSAL: it runs the real
-# `scripts/cut-release.sh`, including its gate, and proves the cut succeeds — then throws the result
-# away with the runner. Neither manually dispatched mode releases anything.
+# `scripts/cut-release.sh`, including its default human gate, and proves the cut succeeds — then
+# throws the result away with the runner. Only the automatic push delegates that gate to the exact
+# candidate workflow. Neither manually dispatched mode releases anything.
 #
 # Secrets: ANTHROPIC_API_KEY for the direct Haiku default; OPENROUTER_API_KEY for an explicit
 # OpenRouter model override. A manual run without the selected provider's key skips; an automatic
@@ -53,6 +54,9 @@ env:
   # branch push always applies; a manual dispatch keeps its selected preview/rehearsal posture.
   RELEASE_APPLY: ${{ github.event_name == 'push' && 'true' || (inputs.apply && 'true' || 'false') }}
   RELEASE_MODEL: ${{ inputs.model || 'anthropic/claude-haiku-4-5' }}
+  # Host-owned signal consumed by release_cut. cut-release.sh also verifies the Actions event/ref,
+  # so a manual flow cannot use it to bypass the human gate.
+  FLUX_RELEASE_CANDIDATE_OWNS_GATE: ${{ github.event_name == 'push' && 'true' || 'false' }}
 
 concurrency:
   group: release-flow

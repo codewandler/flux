@@ -18,8 +18,8 @@ matching version tag should then publish those exact workflow artifacts without 
 ## Acceptance
 
 - [x] A manual candidate run validates the requested version against the workspace manifest, records
-      the exact 40-character commit SHA, and builds the existing cargo-dist local and global artifact
-      set without creating a GitHub Release.
+      the exact 40-character commit SHA, runs the mandatory full gate for that SHA, and builds the
+      existing cargo-dist local and global artifact set without creating a GitHub Release.
 - [x] A tag run locates only a successful candidate at the tag's exact commit, verifies its
       version/SHA/run receipt, and feeds that candidate's immutable artifacts into the existing
       cargo-dist host and GitHub Release verification steps.
@@ -45,6 +45,9 @@ matching version tag should then publish those exact workflow artifacts without 
   inputs, and API failure.
 - Added manual preparation, 14-day artifact retention, tag-time receipt verification, cross-run
   artifact download, audit summaries, and an explicit legacy-build fallback to `release.yml`.
+- Moved automated gate ownership from the transactional cut to the exact candidate: the v2 receipt
+  records `mandatory-full-v1` plus `gate_commit`, and cannot be emitted until the gate and all
+  platform builds succeed. Human cuts retain their default local full gate.
 - Tightened candidate discovery to require the receipt, global artifacts, and all five local target
   artifacts to remain present and unexpired before promotion.
 - Proved cargo-dist can plan the prospective (not-yet-pushed) tag with all five target builds, and

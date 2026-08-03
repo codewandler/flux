@@ -1454,6 +1454,16 @@ fn lower_field(expression: &SyntaxNode) -> DecodeResult<Node> {
                 }
                 segment.push_str(&text);
             }
+            SyntaxKind::STRING if bracket_index => {
+                let key = serde_json::from_str::<String>(&text)
+                    .map_err(|err| error(expression, format!("invalid quoted field key: {err}")))?;
+                segment.push('[');
+                segment.push_str(
+                    &serde_json::to_string(&key)
+                        .expect("serializing a Rust string to JSON cannot fail"),
+                );
+                segment.push(']');
+            }
             SyntaxKind::L_BRACK => bracket_index = true,
             SyntaxKind::R_BRACK => bracket_index = false,
             SyntaxKind::QUESTION => optional = true,
@@ -1475,7 +1485,11 @@ fn lower_field(expression: &SyntaxNode) -> DecodeResult<Node> {
             })
         }
         input => Ok(Node::Jq {
-            path: segment,
+            path: if segment.starts_with('[') {
+                format!(".{segment}")
+            } else {
+                segment
+            },
             input: Box::new(input),
             optional,
         }),

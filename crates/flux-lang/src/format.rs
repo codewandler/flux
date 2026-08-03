@@ -575,24 +575,7 @@ fn fmt_legacy_call_args(args: &[Node], multiline: bool) -> Option<String> {
 /// Convert the AST's jq-compatible dotted path (`.items.0.name`) to readable field/index syntax
 /// (`.items[0].name`). Unsupported jq syntax falls back to the JSON node escape.
 pub(crate) fn fmt_field_path(path: &str) -> Option<String> {
-    let segments = path.strip_prefix('.')?.split('.').collect::<Vec<_>>();
-    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
-        return None;
-    }
-    let mut rendered = String::new();
-    for segment in segments {
-        if segment.chars().all(|ch| ch.is_ascii_digit()) {
-            rendered.push('[');
-            rendered.push_str(segment);
-            rendered.push(']');
-        } else if is_ident_key(segment) {
-            rendered.push('.');
-            rendered.push_str(segment);
-        } else {
-            return None;
-        }
-    }
-    Some(rendered)
+    crate::jq_path::native_field_path(path)
 }
 
 pub(crate) fn fmt_duration(ms: u64) -> String {
@@ -1562,6 +1545,77 @@ mod tests {
             "strict access is bare: {txt2}"
         );
         assert_eq!(crate::parse::parse(&txt2).unwrap(), strict);
+    }
+
+    /// C-320 (failing first): a JSON-string bracket segment reaches object keys that cannot be
+    /// represented by the dotted identifier grammar. The lowered path keeps those segments in
+    /// canonical JSON-string brackets, so dots, brackets, quotes and backslashes inside a key can
+    /// never be mistaken for path syntax. A numeric-looking *quoted* key stays distinct from an
+    /// array index.
+    #[test]
+    fn quoted_field_access_has_an_unambiguous_round_trip() {
+        let source = r#"flow f
+  content_type = response.headers["content-type"]
+  escaped = response["a.b"]["br[ack]"]["quote\"slash\\"]["0"]?
+  return escaped
+"#;
+        let ast = crate::parse::parse(source).expect("quoted object-key access parses");
+
+        let paths = ast
+            .body
+            .iter()
+            .filter_map(|node| match node {
+                Node::Bind { value, .. } => match value.as_ref() {
+                    Node::Jq { path, optional, .. } => Some((path.as_str(), *optional)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                (r#".headers["content-type"]"#, false),
+                (r#".["a.b"]["br[ack]"]["quote\"slash\\"]["0"]"#, true),
+            ]
+        );
+
+        let formatted = format(&ast);
+        assert!(
+            formatted.contains(r#"response.headers["content-type"]"#),
+            "quoted key must stay native: {formatted}"
+        );
+        assert!(
+            formatted.contains(r#"response["a.b"]["br[ack]"]["quote\"slash\\"]["0"]?"#),
+            "escaped keys and optional marker must stay native: {formatted}"
+        );
+        assert_eq!(crate::parse::parse(&formatted).unwrap(), ast);
+    }
+
+    /// C-320 review failing-first: formatting is total over the public AST even when a hand-built
+    /// jq path has junk or whitespace after an otherwise complete bracket segment.
+    #[test]
+    fn malformed_bracket_suffixes_format_through_json_without_panicking() {
+        for path in [r#".a[0]suffix"#, r#".["key"] suffix"#] {
+            let ast = DraftAst {
+                body: vec![Node::Bind {
+                    name: "bad".into(),
+                    value: Box::new(Node::Jq {
+                        path: path.into(),
+                        input: Box::new(Node::Var {
+                            name: "input".into(),
+                        }),
+                        optional: false,
+                    }),
+                    ty: None,
+                    effect: None,
+                }],
+                ..Default::default()
+            };
+            let formatted = format(&ast);
+            assert!(formatted.contains("@json"), "{path}: {formatted}");
+            assert_eq!(crate::parse::parse(&formatted).unwrap(), ast);
+        }
     }
 
     /// Golden nested case named by the story's Acceptance: a multi-line string inside an object

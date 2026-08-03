@@ -15,11 +15,13 @@ and **open one layer out**.
 - **OUTCOME-01** — provider-stage failures are carried to `TurnTerminal` and converted to a hard
   `Err`; the end-to-end test spawns the real binary and asserts a nonzero exit with a typed error line.
 
-But: A/B's Medium is now right about a surface nobody inventoried. The `webhook` and `connector`
-**channel adapters** mount a bare `Router::new()` — no body limit, no timeout, no rate guard, no
-concurrency permit, no provider budget — and `tokio::spawn` the delivery *before* admission, so a
-burst parks unbounded tasks behind a process-global semaphore. And the turn-gate is one mutex per
-engine, so per-principal concurrency does not isolate the actually scarce resource.
+The previously uninventoried `webhook` and `connector` surfaces are now covered by C-409. Both reuse
+the server's body and timeout limits plus its typed request-rate/concurrency governor; admission
+happens before `Deliverer` or `tokio::spawn`, so a burst cannot park an unbounded queue of accepted
+tasks. A channel token/signature identifies one deployment realm rather than an end-user principal,
+so the governor intentionally uses one shared channel key and retains no credential-derived value.
+Provider call/cost budgets remain at App/runtime: one delivery may fan out into several journeys and
+there is no single durable turn id to charge honestly at HTTP admission.
 
 On the outcome side, `turn_end.outcome` is a two-valued `ok|error` projection of a seven-valued
 durable vocabulary: `suspended`, `max_iter`, `cancelled` and a denied approval all reach an
@@ -29,7 +31,7 @@ automation client as `"outcome":"ok"` with exit 0 — the C-226 failure mode, on
 
 | Residual | Story |
 | --- | --- |
-| `webhook`/`connector` adapters have no limit layers and spawn before admission | C-370 |
+| `webhook`/`connector` adapters have no limit layers and spawn before admission | C-409 (implemented; full gate pending) |
 | Queue depth is unbounded everywhere; `FlowEngine::turn_gate` is process-global and head-of-line-blocks across principals | C-371 |
 | SSE turns have no wall-clock ceiling, can park on the gate forever, and `tasks/resubscribe` takes no permit; public card/health routes are unrated | C-372 |
 | `turn_end.outcome` collapses `suspended`/`max_iter`/`cancelled`/denied to `ok` | C-373 |
@@ -51,6 +53,8 @@ automation client as `"outcome":"ok"` with exit 0 — the C-226 failure mode, on
 
 ## Closure proof
 
-Load-test each ingress class with valid credentials and assert a typed limit response; drive a
+Oversized, slow-body, rate-window and blocked-delivery burst tests now assert a typed refusal and
+zero additional delivery before spawn for both channel shapes. Continue to load-test each remaining
+ingress class with valid credentials; drive a
 suspended, a max-iter, a cancelled and a denied turn through the NDJSON stream and assert the
 outcome and exit code differ from success.

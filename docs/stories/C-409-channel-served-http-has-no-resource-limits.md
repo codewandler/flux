@@ -2,7 +2,7 @@
 id: C-409
 title: "Channel-served HTTP has none of flux-server's resource limits"
 pillar: Core
-status: ready
+status: in-progress
 priority: 7
 epic: connector-channels
 areas: [flux-channels]
@@ -35,11 +35,11 @@ inherits none of the hardening its `flux-server` sibling got against the same th
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test that an oversized or slow request against a channel listener is
+- [x] **Failing-first**: a test that an oversized or slow request against a channel listener is
       refused — failing at the merge base.
-- [ ] Both adapters carry body caps, request timeouts and the admission/rate controls C-189
+- [x] Both adapters carry body caps, request timeouts and the admission/rate controls C-189
       established, or state per-control why the server's answer does not transfer.
-- [ ] Prefer **sharing** C-189's implementation over re-deriving it; two hardening stacks for one
+- [x] Prefer **sharing** C-189's implementation over re-deriving it; two hardening stacks for one
       threat is the drift this repo already has stories about.
 - [ ] Full gate green.
 
@@ -50,3 +50,10 @@ inherits none of the hardening its `flux-server` sibling got against the same th
 ## Progress
 
 - Filed 2026-08-01 from the 0.47.1 security-posture review.
+- 2026-08-03: webhook and connector routers now reuse `ServerLimits`, the server timeout layer and
+  `ResourceGovernor`'s typed `429` vocabulary, with body caps before extraction and request/work
+  admission before `Deliverer` or task spawn. Oversized, slow-body, request-rate and burst tests
+  prove refusal before delivery. Channel credentials identify one deployment realm, so the shared
+  ingress governor deliberately stores no bearer-derived key. Provider call/cost budgets remain at
+  App/runtime because one channel delivery may fan out into several durable turns and has no single
+  honest turn id at HTTP admission. The full workspace gate remains pending.
