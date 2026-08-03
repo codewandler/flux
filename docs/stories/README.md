@@ -108,7 +108,7 @@ _flux's central claim is that **the LLM is not the runtime** — authored contro
 
 ### Connector Native Integrations
 - [C-509 — Complete the first-run local Exchange and integration CLI tutorial](C-509-complete-first-run-local-exchange-integration-cli.md) · Core · Milestone 1 product exit: one clean Flux install starts local Exchange, connects named custom-origin GitLab and Jira, grants, diagnoses and invokes without holding vendor credentials
-- [C-510 — Install and supervise a verified local Exchange release](C-510-install-and-supervise-a-verified-local-exchange.md) · Core · Milestone 1 runtime prerequisite: pin, verify, install and own the separate local Exchange process without PATH, source-tree or unsigned fallbacks
+- [C-510 — Install and supervise a verified local Exchange release](C-510-install-and-supervise-a-verified-local-exchange.md) · Core · Milestone 1 runtime prerequisite: a pinned Exchange release, atomic verified cache and same-binary authenticated supervisor — never PATH, PID signalling or an unsigned fallback
 
 ### Connector Platform
 - [C-405 — The plugin pack carries twelve private percent-encoders and one has already drifted](C-405-the-plugin-packs-twelve-encoders-have-started-to-drift.md) · Core · found by C-313's census — drift observed, not predicted. `plugins/gitlab`'s `enc` omits `~` from the unreserved set, so it emits %7E where the other eleven emit `~`. The nested workspace structurally cannot delegate to flux-core, so the fix is a shared encoder in host-kit — a protocol-line change owing a pack release
