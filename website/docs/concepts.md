@@ -334,12 +334,12 @@ its environment.
 
 **Connector** — a *declaration* of what a vendor can do in both directions, compiled into Flux-Lang
 operations plus a capability manifest. Connectors are produced by
-[flux-connectors](./ecosystem.md#flux-connectors--vendor-descriptions-compiled) and are the answer to "integrating this vendor
+[flux-connectors](./ecosystem.md#flux-connectors--integrations-compiled) and are the answer to "integrating this vendor
 should not require writing Rust". A connector is a compiled description; it is not a running thing.
 
 **Service Account** — a non-human API principal holding its own token and receiving grants. It is
-not an Agent: it has no model or loop. Flux Exchange currently exposes this under the legacy
-`/api/agents` name; that compatibility surface does not create a second definition of Agent.
+not an Agent: it has no model or loop. A compatibility route that once used the Agent noun does not
+create a second definition of Agent and cannot mint a different kind of authority.
 
 ---
 

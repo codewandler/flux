@@ -56,7 +56,7 @@ flag breaks the build rather than quietly turning a documented topology into a l
 | [Served agent, thin client](#served-agent-thin-client) | **ships** | the server | the server | the server's | your choice: over the network (`--remote-approval`), or nowhere (`--yes`) |
 | [Embedded in your program](#embedded-in-your-program) | **ships** | your process | your process | your process's working dir | whichever approver you install |
 | [Portable WebAssembly](#portable-webassembly) | **partial** — language core only | the embedder | nothing; there is no host authority | none | none; there is nothing to approve |
-| [Hosted / multi-tenant](#hosted-multi-tenant) | **partial**, and early | flux-exchange | flux-exchange, HTTP only | not applicable | not applicable |
+| [Hosted / multi-tenant](#hosted-multi-tenant) | **partial**, and early | flux-exchange | flux-exchange: HTTP invoke plus generated socket channels | not applicable | not applicable |
 | [`ssh` to the box](#ssh-to-the-box) | **ships** — it is not a flux feature | the remote host | the remote host | the remote's | your terminal, over the `ssh` session |
 
 The rest of this page is one section per row.
@@ -75,13 +75,14 @@ different jobs separate:
 | Target | Manage infrastructure | Place guarded effects | Place agent workers | Provision isolation |
 |---|---|---|---|---|
 | Native host | not a separate integration | **ships** — local is the default | **ships** — guarded process workers; externally managed workers exist as a library runtime | **ships** — Bubblewrap on Linux, Seatbelt on macOS |
-| Docker | **ships** — [Docker plugin](./plugins/docker.md), in local mode | **proposed** — [C-397](https://github.com/codewandler/flux/blob/main/docs/stories/C-397-container-process-backend.md) | **proposed** — [A-124](https://github.com/codewandler/flux/blob/main/docs/stories/A-124-docker-runtime.md) | **BYO remote system** — run the daemon in an operator-supplied container |
-| Kubernetes | **ships** — [Kubernetes plugin](./plugins/kubernetes.md), in local mode | **BYO remote system** — deploy the daemon in a pod; there is no native pod-per-effect backend | **proposed** — [A-125](https://github.com/codewandler/flux/blob/main/docs/stories/A-125-kubernetes-runtime.md) | **BYO** — the cluster/runtime owns pod isolation |
+| Docker | **ships** — [Docker plugin](./plugins/docker.md), in local mode; connector migration is C-500 | **proposed** — [C-397](https://github.com/codewandler/flux/blob/main/docs/stories/C-397-container-process-backend.md) | **proposed** — [A-124](https://github.com/codewandler/flux/blob/main/docs/stories/A-124-docker-runtime.md) | **BYO remote system** — run the daemon in an operator-supplied container |
+| Kubernetes | **ships** — [Kubernetes plugin](./plugins/kubernetes.md), in local mode; connector migration is C-500 | **BYO remote system** — deploy the daemon in a pod; there is no native pod-per-effect backend | **proposed** — [A-125](https://github.com/codewandler/flux/blob/main/docs/stories/A-125-kubernetes-runtime.md) | **BYO** — the cluster/runtime owns pod isolation |
 | microVM | no management integration | **BYO remote system** — run the daemon inside the guest | externally managed workers are possible through the runtime port, but not CLI-configurable | **BYO** — Flux does not provision, pool, snapshot, attest, or destroy microVMs |
 
-The Docker and Kubernetes plugins are **management integrations**, not placement backends. Installing
-one does not make `--remote` send plugin calls to that target, and it does not turn `fleet.start` into
-a container or pod scheduler. Conversely, the generic remote-system daemon can run inside a
+The Docker and Kubernetes plugins are today's **management integrations**, not placement backends.
+C-500 migrates their vendor-specific surfaces to connectors while preserving that distinction.
+Installing one does not make `--remote` send integration calls to that target, and it does not turn
+`fleet.start` into a container or pod scheduler. Conversely, the generic remote-system daemon can run inside a
 container, Kubernetes pod, VM, or microVM without teaching the local runtime how that boundary was
 provisioned.
 
@@ -379,9 +380,10 @@ flux itself never needs it. The charter line the ecosystem design enforces:
 
 > **flux must never *require* flux-exchange.**
 
-What exists today (v0.11.0): a loopback service with OIDC sign-in, a per-tenant connection surface, a
-file-backed credential store, agent-principal minting, and an invoke endpoint that runs one
-catalogue operation. Two facts decide whether you can plan on it:
+What exists today (v0.15.0): a loopback service with OIDC sign-in, per-tenant connections and
+grants, file-backed stores, legacy agent-principal minting, an HTTP invoke endpoint, durable workflow
+drafts/runs, and supervised generated connector WebSocket channels delivered through authenticated
+`/api/subscribe`. Three facts decide whether you can plan on it:
 
 - **A minted agent token authenticates nothing yet.** Nothing binds the agent store to the identity
   port, so a token you hand an agent is refused by every guarded route exactly as an unknown value
@@ -390,9 +392,12 @@ catalogue operation. Two facts decide whether you can plan on it:
   leaves the machine; process spawning, container exec and raw sockets consume the host's own
   identity and filesystem, so a shared deployment serves only HTTP and remote runtimes and refuses
   the rest. "Runs ops per tenant" today means **HTTP connector operations**, not agent execution.
+- **Rich outbound connector dispatch is still planned.** The generated socket channel is a real
+  hosted protocol slice, but Docker, Kubernetes, SQL, process/container execution, arbitrary streamed
+  results, and leases wait on the C-500/X-111 cross-repository program.
 
-Channels, leases, stored workflows and execution records are described in the design and are not
-built.
+General webhooks/polls, leases, rich-runtime streams and isolated worker execution are described in
+the design and are not built.
 
 ## `ssh` to the box {#ssh-to-the-box}
 

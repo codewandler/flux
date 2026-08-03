@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **All official integrations now have one documented connector destination** (C-500, C-501).
+  Protocol-rich adapters move out of Flux's vendor-specific native plugin catalogue after local and
+  Exchange parity; Flux retains generic guarded runtime mechanisms, including the plugin protocol
+  where useful. Cross-repository epics and stories now cover the runtime, migration, isolation,
+  stream, artifact, and cutover work.
+
 - **The shared family vocabulary reserves Agent for the runtime** (C-492). An Agent is consistently
   a model plus a loop plus bounded operations and datasources; Exchange's non-human bearer principal
   is a Service Account, retaining `/api/agents` only as its documented legacy spelling. Concepts now

@@ -14,6 +14,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **Every official integration now has one destination.** Rich integrations such as Docker,
+  Kubernetes, SQL, and Prometheus will become connectors that run locally or through Exchange. The
+  existing plugin pack remains available while parity and migration work is completed.
+
 - **Flux, connectors, and Exchange now use one set of names.** “Agent” always means a model with an
   authored loop and bounded capabilities; an API token belongs to a Service Account. The Concepts
   guide also distinguishes Programs from installed Apps, event types from deliveries, and model

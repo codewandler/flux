@@ -1,6 +1,6 @@
 # Design: the flux ecosystem — three repositories, one vocabulary
 
-**Status:** proposed, owner-directed 2026-08-01 · **Scope:** cross-repository · **Produces:**
+**Status:** accepted, owner-confirmed 2026-08-03 · **Scope:** cross-repository · **Produces:**
 [`docs/ecosystem.md`](../ecosystem.md) (the end-user description), amendments to
 `flux-connectors/docs/vision.md`, and the charter for `codewandler/flux-exchange`
 
@@ -30,7 +30,7 @@ taste is a boundary that erodes.
 | Domain | Test | Owns |
 |---|---|---|
 | **flux** (engine) | *Does it change what happens when an effect executes?* | The envelope, the substrate, Flux-Lang, the agent, the SDK. Knows **kinds**, never vendors. |
-| **flux-connectors** | *Is it true of the vendor regardless of who runs it?* | Vendor facts, compiled. Operations, events, credentials-required, config-required. No runtime, no tenancy, no credential values. |
+| **flux-connectors** | *Is it true of the integration regardless of who runs it?* | Connector facts, compiled: operations, events, credentials-required, config-required, runtime binding, and vendor-specific runtime artifacts. No tenancy or credential values. |
 | **flux-exchange** | *Does it require holding a credential or knowing a tenant?* | Principals, connections, credentials, channels, installed apps, datasource/trigger bindings, event deliveries, model profiles, leases, stored programs, execution records. |
 | **a downstream product** | *Is it true only of one company's customers?* | Its accounts, its channels, its console, its identity provider. |
 
@@ -97,6 +97,22 @@ reviewable:
 
 > **The runtime is declared by the connector, never chosen by the caller.** A caller who can pick the
 > runtime is a caller who can pick an effect. The manifest names; the operator grants.
+
+### The physical ownership consequence
+
+Every official integration moves to flux-connectors, including adapters whose implementation remains
+hand-written Rust. Flux retains generic guarded runtime mechanisms and may retain the stdio plugin
+protocol as one runtime; it does not retain vendor-specific Docker, Kubernetes, SQL, observability,
+secret-store, or collaboration adapters as a second catalogue. Connector-specific binaries and
+images are immutable bundle artifacts owned and attested with their declarations.
+
+Measured on 2026-08-03 with
+`find plugins -mindepth 2 -maxdepth 2 -name Cargo.toml -printf '%h\n' | sort`, the current Flux tree
+contains eighteen integration adapters after excluding `host-kit` and `pack-index`: collaboration
+(`confluence`, `gitlab`, `jira`, `slack`), infrastructure (`docker`, `kubernetes`), observability
+(`alertmanager`, `grafana`, `loki`, `opsgenie`, `prometheus`), data/secrets (`onepassword`, `sql`,
+`vault`), and remaining adapters (`aws`, `homer`, `huggingface`, `websearch`). Connector stories
+C-499…C-503 own those connector migration waves; Flux C-505 owns retirement only after parity.
 
 ### The multi-tenancy rule that falls out of it
 
@@ -165,7 +181,9 @@ not "channels" — it is a **remote connector binding with two verbs**, and the 
   HTTP operations, in flux-exchange v0.13.0.
 - **`subscribe`** — the host terminates the vendor webhook, holds the socket, or runs the poll; it
   verifies the signature **with the credential it owns**; it maps the payload through the binding the
-  manifest declares; and it emits a normalized, typed event to a subscriber. This does not exist.
+  manifest declares; and it emits a normalized, typed event to a subscriber. Exchange v0.16.0 has
+  the generated WebSocket-channel slice for declared socket event sets; webhooks, polls, arbitrary
+  rich-runtime streams, replay, and lease liveness remain program work.
 
 The invariant, which is the whole security argument:
 
@@ -193,7 +211,7 @@ tenant already has.
 **HTTP** for everything one-shot: catalogue reads, credential and connection management, stateless
 `invoke`, the whole management surface.
 
-**One websocket per connected agent** for the three things that do not fit request/response, which
+**One websocket per connected caller** for the three things that do not fit request/response, which
 are all the same shape — a long-lived authenticated bidirectional frame stream:
 
 1. inbound events (`subscribe`),
@@ -202,8 +220,9 @@ are all the same shape — a long-lived authenticated bidirectional frame stream
 
 flux needs no new trigger concept to consume this. `flux-channels` already has a generic `connector`
 channel kind that reads a manifest and drives a deliberately narrow webhook binding locally. A
-future `mode = "remote"` setting could open a stream instead of binding a listener while keeping
-event labels unchanged; neither that mode nor Exchange `subscribe` exists today.
+future `mode = "remote"` setting can open a stream instead of binding a listener while keeping event
+labels unchanged. Exchange's authenticated `/api/subscribe` exists for its generated socket slice;
+Flux's remote channel mode and the general stream protocol do not.
 
 ## Principals and grants
 
@@ -306,6 +325,23 @@ Two patterns generalize from the first adoption and are worth stating for the ne
   of one deployment instead of a published, versioned artifact — which is the distribution tax this
   whole family exists to remove.
 
+## Migration program
+
+The accepted direction is filed as one cross-repository program rather than left as an architectural
+wish:
+
+- Flux C-500 is the epic; C-501 aligns its public contract, C-502 hosts connector runtime artifacts
+  locally, C-503 binds the same addresses to Exchange, C-504 proves placement parity, C-505 retires
+  integration-specific native crates, and C-506 decides the remaining generic plugin infrastructure.
+- flux-connectors C-495 is the declaration/artifact epic with C-497…C-505 covering runtime bindings,
+  artifacts, migration waves, pack projection, and the cutover gate.
+- Exchange X-111 is the hosted-runtime epic with X-113…X-120 covering protocol completion, dispatch,
+  tenant isolation, streams, leases, artifact trust, and conformance journeys.
+
+The plan consumes rather than duplicates work visible in linked worktrees: Flux's remote-approval
+C-453 and generated-channel C-481…C-488 branches, flux-connectors' instance-aware host-port C-494
+branch and active C-155 semantic-effects branch, and Exchange's delivered X-107 Service Account work.
+
 ## Open questions
 
 - **Whether flux-exchange's console reuses flux-connectors' explorer components.** They import no
@@ -326,4 +362,4 @@ Two patterns generalize from the first adoption and are worth stating for the ne
 
 - [`docs/ecosystem.md`](../ecosystem.md) — the description this design produces
 - [`docs/concepts.md`](../concepts.md) — the shared vocabulary
-- [`docs/vision.md`](../vision.md) — flux's own charter, unchanged by this document
+- [`docs/vision.md`](../vision.md) — flux's own charter, aligned with this document

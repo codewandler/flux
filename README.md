@@ -270,8 +270,11 @@ println!("{}", out.text);
 
 ## Plugin packs
 
-Official integrations — GitLab, Slack, Kubernetes, SQL and more — ship as a signed pack. The release
-index is minisign-checked and every archive hash is verified before install.
+Official integrations — GitLab, Slack, Kubernetes, SQL and more — currently ship as a signed native
+plugin pack. The accepted migration makes each one a connector with a declared runtime, runnable
+locally or through Exchange; the stdio plugin protocol may remain as one generic runtime while the
+vendor-specific Flux plugin crates retire after parity. The current release index is
+minisign-checked and every archive hash is verified before install.
 
 ```bash
 flux plugin install gitlab

@@ -83,6 +83,19 @@ request/response) and a **knowledge/datasource layer** (answers grounded in an i
 Both sit **behind the same envelope — no new bypass** — and the personal-coding-agent-first priority above
 is unchanged; these are platform-tier capabilities, hardened as the earlier tiers solidify.
 
+## Integration boundary
+
+Every official external integration is a connector. Protocol richness selects its declared runtime
+— guarded HTTP, socket, process, container, remote execution, or the stdio plugin protocol — rather
+than selecting a second repository. flux-connectors owns the declaration and any vendor-specific
+artifact; Flux owns generic guarded runtime mechanisms and the local host, and knows runtime kinds
+rather than vendors. Exchange may bind the same connector address under remote tenant authority, but
+Flux never requires Exchange: local execution remains a complete path.
+
+Existing integration-specific crates under `plugins/` are compatibility implementations during the
+C-500 migration. They leave only after connector parity, including refusals and streams, is proven;
+the generic plugin protocol may remain as one runtime kind.
+
 ## Principles
 
 1. **The LLM is not the runtime** (the north star, above) governs everything: a model participates in

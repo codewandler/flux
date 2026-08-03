@@ -10,11 +10,11 @@ two exist because two specific problems turned out not to belong in an engine.
 | | What it is | You need it when |
 |---|---|---|
 | **flux** | The engine, the language, the agent. | Always. It is the thing that runs. |
-| **flux-connectors** | Vendor APIs compiled into typed operations, manifests, a catalogue, and a host Tool pack. | You want reusable vendor truth instead of hand-writing every integration. |
-| **flux-exchange** | A shared host for tenant credentials, metadata grants, and connector invocation. | You want integration authority managed outside one person's environment. Hosted channels and run records remain direction, not shipped behavior. |
+| **flux-connectors** | Every official integration as compiled operations, manifests, a catalogue, and any vendor-specific runtime artifact. | You want reusable integration truth instead of hand-writing every vendor or protocol adapter. |
+| **flux-exchange** | A shared host for tenant credentials, metadata grants, connector invocation, and declared event channels. | You want integration authority or runtime placement managed outside one person's environment. Rich outbound runtimes remain planned work. |
 
-> **Dated capability snapshot (checked 2026-08-03).** The connector source reports v0.16.0;
-> Exchange reports v0.13.0. These repositories move independently from flux, so use their linked
+> **Dated capability snapshot (checked 2026-08-03).** The connector source reports v0.17.0;
+> Exchange reports v0.16.0. These repositories move independently from flux, so use their linked
 > READMEs for the live inventory rather than reading this date as a compatibility promise.
 
 ## The boundary test
@@ -22,7 +22,7 @@ two exist because two specific problems turned out not to belong in an engine.
 One question each. If you are wondering where something belongs, this is the answer:
 
 - **Does it change what happens when an effect executes?** → flux
-- **Is it true of the vendor regardless of who runs it?** → flux-connectors
+- **Is it true of the integration regardless of who runs it?** → flux-connectors
 - **Does it require holding a credential or knowing a tenant?** → flux-exchange
 
 ## flux — the engine
@@ -44,7 +44,7 @@ That is a complete, self-contained product. Everything below is optional.
 See [Concepts](./concepts.md) for the vocabulary and [the agent loop](https://codewandler.github.io/flux/docs/agent/agent-loop) for how
 a turn actually works.
 
-## flux-connectors — vendor descriptions, compiled
+## flux-connectors — integrations, compiled
 
 Integrating a vendor usually means re-encoding what the vendor already published: a base URL, an
 auth scheme, endpoints, parameters, response shapes. flux-connectors makes that information
@@ -75,6 +75,12 @@ A connector describes an external capability reached over a declared protocol. A
 optional — a public search API is as valid a connector as a paid SaaS product. What makes something a
 connector is that its surface can be *described*.
 
+Generated HTTP is the complete runtime today, not the permanent boundary. Docker, Kubernetes, SQL,
+Prometheus, secret stores, and other rich protocols are migration targets too. Their connectors may
+carry attested vendor-specific binaries or images and select guarded socket, process, container,
+remote, or plugin runtimes. Flux supplies those generic mechanisms; the connector repository owns
+the integration-specific code and declaration.
+
 The **published** connector crates open no socket. The repository has a non-published loopback API
 host that proves the pack against real guarded HTTP, but deployment remains the consuming host's
 job. See the [live connector inventory](https://github.com/codewandler/flux-connectors#readme).
@@ -86,26 +92,31 @@ moment you want a team to share an integration, an agent to use it unattended, o
 what happened.
 
 flux-exchange is the deployed answer: **a service that holds tenant credentials and settings, applies
-metadata grants, and invokes admitted connector operations.** A human signs in, connects a provider,
-previews and saves a grant, then can invoke from the admin console. Service Account authentication, inbound
-channels, and durable run records are not part of that shipped path yet.
+metadata grants, invokes admitted connector operations, and terminates generated connector socket
+channels.** A human signs in, connects a provider, previews and saves a grant, then can invoke from
+the admin console. Service Accounts can authenticate for unattended calls; rich outbound runtimes
+are not part of that shipped path yet.
 
 Its designed primary caller is **non-human**, not a human. Humans sign in to wire things up and to see
-what happened; Service Accounts and future Managed Agents are intended to call operations all day.
-That inverts the usual assumption and shapes the design even though Service Account authentication
-has not shipped yet.
+what happened; Service Accounts can call admitted operations all day, and future Managed Agents will
+use the same bounded authority. That inverts the usual assumption and shapes the design.
 
-**What v0.13.0 manages today:**
+**What v0.16.0 manages today:**
 
 - **Connections** — a connector plus its credentials and settings, per tenant.
-- **Identity** — complete OIDC sign-in for humans, plus tenant-scoped sessions.
+- **Identity** — complete OIDC sign-in for humans, tenant-scoped sessions, and canonical Service
+  Account lifecycle plus bearer authentication.
 - **Grants** — connector/risk selectors with a preview endpoint; operation-id lists are refused.
 - **Invocation** — admitted HTTP operations whose destination authority comes from the connector.
-- **Service Accounts, partially and under the legacy `/api/agents` name** — a token can be minted and shown once, but presenting it does not
-  authenticate yet and there is no list/revoke surface.
+- **Generated socket channels** — persistent supervised WebSockets with closed declared event sets,
+  delivered through authenticated `/api/subscribe`.
+- **Workflow drafts and runs** — immutable published versions execute through Flux with grant gates
+  and value-free node activity.
+- **Service Accounts** — create, list, revoke, and present a one-time `fxsa_…` bearer token; the
+  durable store keeps only its verifier. `/api/agents` is a bounded compatibility alias for create.
 
-**Still direction:** `subscribe`, hosted channels, installed Apps, custom-operation authoring,
-execution records, and Service Account authentication. The
+**Still direction:** rich outbound runtime dispatch, webhooks and polls, general streamed results,
+leases, isolated per-tenant workers, and installed Apps. The
 [Exchange inventory](https://github.com/codewandler/flux-exchange#what-exists-today) is authoritative.
 
 **The security property that makes it usable by agents:**
@@ -116,14 +127,14 @@ execution records, and Service Account authentication. The
 > it did not already have.
 
 Grants are written over declared metadata (`risk`, `effects`, `idempotency`) rather than operation-id
-lists. The intended Service Account property is that a token grants operations, never credentials; v0.13.0
-does not yet accept the tokens it mints, so that agent path must not be presented as usable.
+lists. A Service Account token grants operations, never credentials, and lifecycle management
+remains human-only.
 
 ### Running it locally
 
 flux-exchange runs as one HTTP process. `cargo run` binds `127.0.0.1:8080`; configure its OIDC
 variables for real sign-in and explicit store paths for durable credentials, settings, grants, and
-agent records. A reachable bind without a real identity provider is refused.
+Service Account records. A reachable bind without a real identity provider is refused.
 
 ```bash
 git clone https://github.com/codewandler/flux-exchange && cd flux-exchange
@@ -133,15 +144,16 @@ cargo run
 It is a **separate repository**, not a member of this workspace — `cargo run -p flux-exchange` from
 a flux checkout will not resolve.
 
-> **Verified against flux-exchange v0.13.0 on 2026-08-03.** The process serves health, catalogue,
-> session/sign-in, tenant connection/settings/grant management, agent minting, and gated `invoke`.
-> It still does **not** serve `subscribe`, hosted channels, installed Apps, execution records, or
-> a Service Account token authenticator.
+> **Verified against flux-exchange v0.16.0 on 2026-08-03.** The process serves health, catalogue,
+> session/sign-in, tenant connection/settings/grant management, legacy agent minting, gated `invoke`,
+> workflow drafts/runs, generated connector WebSocket channels, and authenticated `subscribe`. It
+> still does **not** dispatch rich outbound runtimes or provide the general stream/lease protocol.
 
 ### Runtime model
 
-The host vocabulary can describe several runtimes, but this is a model rather than the v0.13.0
-execution inventory. Current Exchange invocation is the shareable HTTP path.
+The host vocabulary can describe several runtimes, but this is a destination rather than the v0.16.0
+outbound execution inventory. Current Exchange invocation is the shareable HTTP path; generated
+WebSocket channels are the first hosted rich-protocol slice.
 
 | Runtime | For |
 |---|---|
@@ -163,13 +175,14 @@ serves them. Because the runtime is in the manifest, the service can make that c
 
 The three fit together at exactly two seams.
 
-**Locally — flux remains complete without either sibling.** The binary runs built-ins and installed
-plugins through its own safety envelope. It can also read a published connector manifest for the
-`connector` inbound channel, but today that adapter serves only explicitly unsigned webhook
-bindings and does not auto-install the external outbound Tool pack. See
+**Locally — flux remains complete without Exchange.** The binary currently runs built-ins and
+installed native plugins through its own safety envelope. The migration replaces those
+vendor-specific plugins with connector bundles behind the same generic guarded runtimes. Flux can
+also read a published connector manifest for the `connector` inbound channel, but today that adapter
+serves only explicitly unsigned webhook bindings and does not auto-install the external outbound Tool pack. See
 [Connector channels](https://codewandler.github.io/flux/docs/channels/connector) for the exact limits.
 
-**Hosted — Exchange implements one half of the proposed remote binding.** The family vocabulary has
+**Hosted — Exchange implements HTTP invoke and one subscribe slice of the remote binding.** The family vocabulary has
 two verbs:
 
 - **`invoke`** — name an operation, get a result. The exchange resolves the credential and builds the
@@ -178,10 +191,11 @@ two verbs:
   socket, checks the signature with the credential it owns, and emits typed events a `trigger`
   routes to a journey.
 
-> **Current seam:** Exchange `invoke` is built for signed-in humans whose tenant has a connection
-> and an admitting grant. Flux itself has no Exchange client binding, and Exchange-minted agent
-> tokens do not authenticate, so a Flux agent cannot use that route today. `subscribe` does not
-> exist. The shipped local connector channel is separate and deliberately narrower.
+> **Current seam:** Exchange `invoke` is built for signed-in humans and Service Accounts whose tenant
+> has a connection and an admitting grant. Generated socket channels can publish their closed declared event sets to
+> authenticated `/api/subscribe`. Flux itself has no Exchange client binding, the general
+> rich-runtime stream/lease protocol is not built, and a Flux agent cannot mount that route as a
+> connector placement today. The shipped local connector channel is separate and deliberately narrower.
 
 **flux never *requires* the exchange.** The local path is complete and stays complete. Trading
 binary-distribution pain for service lock-in would be a bad trade made twice.
@@ -212,4 +226,4 @@ decoupled from crate names and your `use flux_sdk::…` imports are unaffected.
 
 - [Concepts](./concepts.md) — the vocabulary all three share
 - [Infrastructure](https://codewandler.github.io/flux/docs/infrastructure) — how the engine's pieces fit at runtime
-- [Plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins) — the other extension path, and when it is still the right one
+- [Plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins) — the current compatibility path and the generic stdio runtime

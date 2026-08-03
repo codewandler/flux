@@ -143,13 +143,30 @@ got wrong quietly: `AGENTS.md` says *"Every tool runs through `Executor::dispatc
 capping) and which are `flux-runtime`'s and do not (default-deny authorization, approval, redaction,
 evidence).
 
-**C-397** (container backend) remains `ready` with ownership undecided. **C-399** (remote port
-backend) is done with the opposite decision: flux owns the transport-neutral `Delegate` seam and
+**C-397** (container backend) remains `ready`; the accepted ecosystem design settles ownership:
+Flux owns the generic guarded container mechanism, while connector-specific images and adapters live
+with their declarations. **C-399** (remote port backend) is done with the complementary decision:
+flux owns the transport-neutral `Delegate` seam and
 local `Loopback`, and flux-exchange may implement the far side. The port remains unsealed, while
 every in-repo backend pays an explicit, single-use codegate allowance.
 
 The epic changes no layer, adds no IO path, weakens no default, and does not build flux-exchange.
 Design: [execution-substrate.md](designs/execution-substrate.md).
+
+### Connector-native integrations — one catalogue across every runtime (epic) — 🔄 **IN PROGRESS (C-500)**
+
+The old distinction between generated connectors and native technology plugins is retired. Docker,
+Kubernetes, SQL, observability, secret stores, collaboration tools, and the remaining official
+adapters become connector declarations whose runtime is explicit. Flux supplies a local generic
+runtime host and an Exchange binding; the same address and policy metadata must behave identically in
+both placements. Native integration crates remain until parity and cutover evidence exist.
+
+**C-501** aligns Flux's public contract; **C-502** binds connector runtime artifacts locally;
+**C-503** mounts Exchange as a remote binding; **C-504** proves local/hosted conformance; **C-505**
+retires the eighteen measured integration crates; and **C-506** moves or retires only the remaining
+generic plugin support infrastructure. This program reuses C-394/C-397/C-399/C-435, the pending C-453
+remote-approval worktree, and the C-481…C-488 generated-channel worktree instead of filing them again.
+Design: [ecosystem.md](designs/ecosystem.md).
 
 ### The secret the agent never sees — our redaction against their substitution (epic) — 🔄 **PROPOSED (C-458…C-461 filed, none started)**
 
