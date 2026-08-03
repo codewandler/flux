@@ -664,6 +664,32 @@ fn release_flow_proves_a_sandbox_backend_before_running_flux() {
     );
 }
 
+/// `cut-release.sh` regenerates the embedded documentation snapshot, which invokes the website's
+/// local Docusaurus binary. Hosted runners start without `website/node_modules`, so the automatic
+/// release must install the locked website toolchain before it enters the Flux-authored cut.
+#[test]
+fn release_flow_installs_the_locked_docs_toolchain_before_running_flux() {
+    let code = workflow_code("release-flow.yml");
+    let node = code_line_index(&code, |line| line.contains("actions/setup-node@"));
+    let lockfile = code_line_index(&code, |line| {
+        line.contains("cache-dependency-path: website/package-lock.json")
+    });
+    let install = code_line_index(&code, |line| line.trim() == "- run: npm ci");
+    let install_directory =
+        code_line_index(&code, |line| line.trim() == "working-directory: website");
+    let flow = code_line_index(&code, |line| {
+        line.contains("flux flow run examples/release.flux")
+    });
+    assert!(
+        matches!((node, lockfile, install, install_directory, flow),
+            (Some(node), Some(lockfile), Some(install), Some(directory), Some(flow))
+                if node < lockfile && lockfile < install && install < directory && directory < flow),
+        "release-flow.yml must provision pinned Node and install website/package-lock.json before \
+         the Flux cut can regenerate embedded docs; found node={node:?}, lockfile={lockfile:?}, \
+         install={install:?}, directory={install_directory:?}, flow={flow:?}"
+    );
+}
+
 /// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`. The
 /// release and crates.io workflows are tag-push-triggered, so this workflow needs a separately
 /// configured push credential; otherwise a green auto-cut silently publishes nothing.
