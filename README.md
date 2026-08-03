@@ -271,10 +271,17 @@ println!("{}", out.text);
 ## Plugin packs
 
 Official integrations — GitLab, Slack, Kubernetes, SQL and more — currently ship as a signed native
-plugin pack. The accepted migration makes each one a connector with a declared runtime, runnable
-locally or through Exchange; the stdio plugin protocol may remain as one generic runtime while the
-vendor-specific Flux plugin crates retire after parity. The current release index is
-minisign-checked and every archive hash is verified before install.
+plugin pack. This is temporary compatibility behavior: the current release index is
+minisign-checked and every archive hash is verified before install, so the commands below remain the
+supported way to use those integrations today.
+
+The accepted migration makes Flux's embedded Exchange client the only future official integration
+path. Exchange executes connector-declared runtimes; Flux itself will execute no connector runtime
+and has no plugin fallback. Each adapter retires only after its Exchange replacement passes frozen
+parity evidence, then C-506 removes the plugin protocol, host, installer, signed pack and release
+artifacts. The client and those migrations do not ship yet. Flux remains useful without Exchange for
+its language, agent loop and core tools; official external integrations become unavailable when
+Exchange is unavailable.
 
 ```bash
 flux plugin install gitlab

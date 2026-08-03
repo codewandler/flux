@@ -8,14 +8,16 @@ description: "Installing and running trusted Flux plugins, including source choi
 :::note Current compatibility path
 The signed first-party plugin pack is the supported way to use GitLab, Slack, Docker, Kubernetes,
 SQL, observability, secret-store, and other official integrations **today**. It is not their
-permanent source model.
+permanent execution or distribution model.
 
-The accepted direction moves every official vendor-specific integration to
-**flux-connectors**, with an explicit runtime that Flux can execute locally or Flux Exchange can
-host under tenant authority. Flux keeps generic guarded runtimes—including the stdio plugin
-protocol where it is useful—rather than permanent vendor-specific crates. Existing plugins remain
-available until connector parity, local and hosted conformance, and an explicit cutover have all
-passed. See [Connector-native integrations](../direction/connector-native-integrations.md).
+The accepted direction makes the embedded Exchange client the only future official integration path.
+**flux-connectors** owns each declaration and runtime artifact; Exchange executes it under Service
+Account authority. Flux will have no local connector runtime and no plugin fallback. Existing
+plugins remain available until each Exchange replacement passes frozen legacy-contract evidence and
+the adapter is deleted. After the final cutover, C-506 removes the plugin protocol and host,
+installer, signed pack, index, and release artifacts rather than preserving them for third-party use.
+None of that removal—or the embedded client—ships yet. See
+[Connector-native integrations](../direction/connector-native-integrations.md).
 :::
 
 Plugins are trusted subprocess binaries that extend Flux with new operations. Each declared

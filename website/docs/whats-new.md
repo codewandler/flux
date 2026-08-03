@@ -20,6 +20,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **The integration guides now distinguish today's plugin compatibility path from its replacement.**
+  The signed plugin pack still works today. The future official path is an embedded Exchange client,
+  with Exchange executing connector runtimes and no local plugin fallback. The client, adapter
+  migrations and plugin removal are planned work; core Flux remains useful without Exchange while
+  official external integrations require it after they migrate.
+
 - **A running REPL can now pick up a plugin's changed actions without restarting.** Run
   `/plugin-refresh <name>`; the current turn keeps the actions it started with, and the next turn
   adopts the complete refreshed set. Existing plugin grants and disabled-tool patterns still apply
