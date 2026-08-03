@@ -1964,9 +1964,11 @@ pub(super) async fn build_agent_with(
     let mut ambient_signals = integrations.ambient_signals;
 
     // C-503: one native Service Account client, compiled into the Flux binary. The two values are
-    // host startup configuration and never operation/model input. A partial or unavailable binding
-    // leaves core Flux intact and advertises no Exchange operation; the turn-boundary refresher
-    // retries and publishes only complete effective generations through C-318's live catalogue.
+    // transitional host startup configuration and never operation/model input; C-509 replaces the
+    // environment bearer with an Exchange-owned direct handoff into secure storage. A partial or
+    // unavailable binding leaves core Flux intact and advertises no Exchange operation; the
+    // turn-boundary refresher retries and publishes only complete effective generations through
+    // C-318's live catalogue.
     let catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> = match (
         std::env::var("FLUX_EXCHANGE_URL").ok(),
         std::env::var("FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN").ok(),
