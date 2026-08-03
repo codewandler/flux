@@ -152,9 +152,10 @@ Merging that PR is the whole release action; its resulting push to `release` sta
 
 `.github/workflows/release-flow.yml` runs the live smoke, asks the tool-less release scribe for the
 two changelog sections, has the host derive and cut the version, and creates a local release commit
-plus annotated tag. Before running Flux unattended, the workflow installs and self-tests bubblewrap;
-agentic and served smoke legs remain confined instead of weakening the fail-closed sandbox posture
-for CI. Its host-owned promotion step then:
+plus annotated tag. Before running Flux unattended, the workflow installs bubblewrap, enables the
+user-namespace primitive restricted by the hosted Ubuntu AppArmor default, and self-tests the
+backend; agentic and served smoke legs remain confined instead of weakening the fail-closed sandbox
+posture for CI. Its host-owned promotion step then:
 
 1. stages the cut commit at `refs/heads/release-candidates/vX.Y.Z`;
 2. dispatches `.github/workflows/release.yml` from that exact ref and waits for all five cargo-dist

@@ -206,6 +206,10 @@ half outside the model-authored program means a bug in the program cannot publis
   `30832802801` proved the stock hosted runner has no sandbox backend, so the agentic and served live
   smoke legs correctly refuse to start. The workflow now defaults to direct Anthropic Haiku and
   provisions plus self-tests bubblewrap before running Flux. Structural tests pin both requirements.
+- 2026-08-03 — Run `30833459849` installed bubblewrap but proved Ubuntu 24.04's hosted AppArmor
+  default denies its UID map. The workflow now enables unprivileged user namespaces only on the
+  dedicated ephemeral runner and immediately proves a minimal bwrap namespace before compilation.
+  It does not disable Flux's sandbox.
 - 2026-07-30 — **the foundation is merged and this story stays `ready` for the rest.** Recovered as an
   orphan after a coordinating session crash killed its implementor mid-task; branch preserved verbatim,
   reviewed independently, four blocking findings discharged, then integrated.

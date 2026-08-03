@@ -629,6 +629,9 @@ fn release_flow_proves_a_sandbox_backend_before_running_flux() {
     let backend = code_line_index(&code, |line| {
         line.contains("apt-get install") && line.contains("bubblewrap")
     });
+    let user_namespace = code_line_index(&code, |line| {
+        line.contains("apparmor_restrict_unprivileged_userns=0")
+    });
     let backend_probe = code_line_index(&code, |line| {
         line.contains("bwrap") && line.contains("--ro-bind") && line.contains("/ / ")
     });
@@ -637,11 +640,13 @@ fn release_flow_proves_a_sandbox_backend_before_running_flux() {
         line.contains("flux flow run examples/release.flux")
     });
     assert!(
-        matches!((backend, backend_probe, smoke, flow),
-            (Some(backend), Some(probe), Some(smoke), Some(flow))
-                if backend < probe && probe < smoke && smoke < flow),
-        "release-flow.yml must install and self-test bubblewrap before the live smoke and Flux flow; \
-         found install={backend:?}, probe={backend_probe:?}, smoke={smoke:?}, flow={flow:?}"
+        matches!((backend, user_namespace, backend_probe, smoke, flow),
+            (Some(backend), Some(userns), Some(probe), Some(smoke), Some(flow))
+                if backend < userns && userns < probe && probe < smoke && smoke < flow),
+        "release-flow.yml must install bubblewrap, enable the hosted Ubuntu user-namespace \
+         primitive, and self-test the backend before the live smoke and Flux flow; found \
+         install={backend:?}, userns={user_namespace:?}, probe={backend_probe:?}, smoke={smoke:?}, \
+         flow={flow:?}"
     );
 }
 

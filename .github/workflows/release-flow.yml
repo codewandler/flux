@@ -120,6 +120,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap
+          # Ubuntu 24.04's hosted-runner AppArmor default otherwise denies bwrap's UID map. This
+          # runner is single-job and ephemeral; enable the namespace primitive, then prove the exact
+          # backend Flux will use before continuing.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --ro-bind / / --dev /dev --proc /proc --chdir "$GITHUB_WORKSPACE" true
 
       # The release binary is what both the smoke test and the flow run under, so build it once.
