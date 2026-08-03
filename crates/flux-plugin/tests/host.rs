@@ -220,18 +220,97 @@ async fn plugin_operations_project_as_tools() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Monotonic suffix for target-adjacent writable copies; the two hash-drift tests may run in
+/// parallel inside one integration-test process.
+static NEXT_HASH_DRIFT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug)]
+struct HashDriftFixture {
+    dir: std::path::PathBuf,
+    stored: std::path::PathBuf,
+}
+
+impl Drop for HashDriftFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+fn stage_hash_drift_fixture_with(
+    exe: &std::path::Path,
+    copy: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<u64>,
+) -> Result<HashDriftFixture, String> {
+    use std::sync::atomic::Ordering;
+
+    let target_dir = exe.parent().ok_or_else(|| {
+        format!(
+            "could not stage plugin fixture before hash verification: Cargo binary has no parent: \
+             {}",
+            exe.display()
+        )
+    })?;
+    let sequence = NEXT_HASH_DRIFT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let dir = target_dir.join(format!(
+        "flux-spawn-drift-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "could not stage plugin fixture in target-adjacent scratch directory `{}` before hash \
+             verification: {error}",
+            dir.display()
+        )
+    })?;
+
+    let stored = dir.join("flux-plugin-echo");
+    if let Err(error) = copy(exe, &stored) {
+        std::fs::remove_dir_all(&dir).ok();
+        return Err(format!(
+            "could not stage plugin fixture in target-adjacent scratch directory `{}`: copying \
+             `{}` to `{}` failed before hash verification: {error}",
+            dir.display(),
+            exe.display(),
+            stored.display()
+        ));
+    }
+
+    Ok(HashDriftFixture { dir, stored })
+}
+
+#[test]
+fn hash_drift_fixture_copy_reports_storage_pressure_as_an_environment_failure() {
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_echo_plugin"));
+    let simulated = std::io::Error::other("simulated ENOSPC / quota exceeded");
+    let err = stage_hash_drift_fixture_with(exe, |_, _| Err(simulated))
+        .expect_err("a fixture copy failure must be reported");
+
+    let target_dir = exe.parent().expect("Cargo binary has a target directory");
+    assert!(
+        err.contains(&target_dir.display().to_string()),
+        "the failure must name the target-adjacent scratch location: {err}"
+    );
+    assert!(
+        err.contains("ENOSPC") && err.contains("quota exceeded"),
+        "the failure must preserve the storage cause: {err}"
+    );
+    assert!(
+        err.contains("before hash verification"),
+        "the failure must identify fixture staging, not implicate hash verification: {err}"
+    );
+}
+
 /// D-48 acceptance: a descriptor carrying a `sha256` is re-hashed before spawn — a tampered
 /// binary is a hard refusal naming the plugin and both hashes; the untampered binary loads; a
 /// hashless (dev/local) descriptor spawns exactly as before.
 #[tokio::test]
 async fn spawn_refuses_hash_drift() {
-    let exe = env!("CARGO_BIN_EXE_echo_plugin");
-    let dir = std::env::temp_dir().join(format!("flux-spawn-drift-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let stored = dir.join("flux-plugin-echo");
-    std::fs::copy(exe, &stored).unwrap();
-    let recorded = flux_plugin::pack::sha256_hex(&std::fs::read(&stored).unwrap());
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_echo_plugin"));
+    let fixture = stage_hash_drift_fixture_with(exe, |source, destination| {
+        std::fs::copy(source, destination)
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+    let stored = &fixture.stored;
+    let recorded = flux_plugin::pack::sha256_hex(&std::fs::read(stored).unwrap());
     let system = test_system();
 
     // Untampered: the recorded hash matches → the plugin loads normally.
@@ -251,7 +330,7 @@ async fn spawn_refuses_hash_drift() {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
-            .open(&stored)
+            .open(stored)
             .unwrap();
         f.write_all(b"tampered").unwrap();
     }
@@ -259,7 +338,7 @@ async fn spawn_refuses_hash_drift() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("hash drift must refuse to spawn"),
     };
-    let actual = flux_plugin::pack::sha256_hex(&std::fs::read(&stored).unwrap());
+    let actual = flux_plugin::pack::sha256_hex(&std::fs::read(stored).unwrap());
     assert!(err.contains("echo"), "names the plugin: {err}");
     assert!(err.contains(&recorded), "names the expected hash: {err}");
     assert!(err.contains(&actual), "names the actual hash: {err}");
@@ -273,8 +352,6 @@ async fn spawn_refuses_hash_drift() {
         .await
         .expect("hashless descriptor spawns unverified");
     let _ = host.shutdown().await;
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// C-90 end-to-end: an op's per-operation `process` narrowing governs both what the approval

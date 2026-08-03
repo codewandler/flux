@@ -39,6 +39,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The plugin hash-drift test no longer copies a whole binary into ambient `/tmp`** (C-468).
+  Its writable fixture now lives in a unique, automatically cleaned directory beside Cargo's active
+  target binary. A staging failure names that directory and its storage cause before any hash check,
+  so tmpfs pressure can no longer masquerade as a verification regression.
+
 - **Malformed `FLUX_COMPACT_CHARS` overrides now warn on served agents as well as the CLI**
   (C-507). Both surfaces consume one `flux-agent` parse/outcome contract: missing, valid, and `0`
   values stay quiet, while an explicit invalid value names the rejected input and shared fallback.
