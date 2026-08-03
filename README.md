@@ -271,7 +271,10 @@ println!("{}", out.text);
 ## Exchange integrations
 
 Flux can mount the connected, granted operations of one Exchange Service Account into each agent
-turn. Configure the Exchange origin and its one-time-issued bearer token in the host environment:
+turn. The environment setup below is a transitional C-503 compatibility seam for the embedded
+client, not the Milestone 1 onboarding contract; C-509 replaces it with an Exchange-owned handoff
+directly into secure storage. For that temporary seam, configure the origin and bearer in the host
+environment:
 
 ```bash
 export FLUX_EXCHANGE_URL=https://exchange.example.com
@@ -280,7 +283,8 @@ flux
 ```
 
 Flux refreshes the account's effective catalogue between turns and sends operation inputs to the
-bound Exchange origin. The token is startup configuration, never a tool argument. Exchange retains
+bound Exchange origin. In this transitional seam the token is startup configuration, never a tool
+argument. Exchange retains
 tenant, connection, credential, grant and runtime authority. If Exchange is absent or unavailable,
 its operations disappear while Flux's language, agent loop and core tools remain available.
 Bearer transport requires HTTPS except for an origin that resolves entirely to loopback, which is
