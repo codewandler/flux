@@ -29,6 +29,10 @@ published manifests promise.
   zip, scraper/pdf-extract, ratatui's stability macro, and Slack's serialization helper. Compatible
   registry lines now pass `cargo +1.87 build --workspace --locked`; SQLx 0.8's dynamic-query API is
   used only after the same schema identifier validation as before.
+- 2026-08-03: Carrying the repair onto the unreleased 0.53 line exposed three newer PostgreSQL
+  backend call sites that still used SQLx 0.9's `AssertSqlSafe` wrapper. They now use SQLx 0.8's
+  dynamic-query API after the same const, placeholder-only, or ULID-derived validation as before;
+  the exact feature-gated CI clippy commands pass on Rust 1.97.
 
 ## Notes
 - Flux v0.52.2 was published by the crates.io workflow from the tagged maintenance commit after the

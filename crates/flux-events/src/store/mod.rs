@@ -4485,8 +4485,8 @@ mod tests {
             let drop_sql = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
             admin
                 .block_on(async move {
-                    // SqlSafeStr: the schema identifier is minted from a ULID above, not user input.
-                    sqlx::raw_sql(sqlx::AssertSqlSafe(drop_sql))
+                    // The schema identifier is minted from a ULID above, not user input.
+                    sqlx::raw_sql(&drop_sql)
                         .execute(&pool)
                         .await
                         .map(|_| ())
