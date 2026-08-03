@@ -44,7 +44,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Plain X.Y.Z workspace version to prepare at this exact main commit"
+        description: "Plain X.Y.Z workspace version to prepare from release-candidates/vX.Y.Z"
         required: true
         type: string
   push:
@@ -78,8 +78,9 @@ jobs:
           CANDIDATE_VERSION: ${{ inputs.version }}
           DISPATCH_REF: ${{ github.ref }}
         run: |
-          if [ "$DISPATCH_REF" != "refs/heads/main" ]; then
-            echo "::error::release candidates must be prepared from main, got $DISPATCH_REF"
+          expected_ref="refs/heads/release-candidates/v$CANDIDATE_VERSION"
+          if [ "$DISPATCH_REF" != "$expected_ref" ]; then
+            echo "::error::release candidate v$CANDIDATE_VERSION must be prepared from $expected_ref, got $DISPATCH_REF"
             exit 1
           fi
           workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')

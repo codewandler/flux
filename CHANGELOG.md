@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **A merge from `main` into the dedicated `release` branch is now the complete release action**
+  (C-251). `.github/workflows/release-flow.yml` runs the live smoke and narrow Flux-authored cut,
+  while `scripts/promote-release-flow.sh` keeps the trigger-capable PAT out of the model step, stages
+  the exact cut SHA on a versioned candidate ref, verifies its immutable receipt before advancing
+  `main`, and waits for both tag workflows plus the public Release verifier. Any failure preserves
+  the candidate ref and names the recovery evidence instead of leaving a green partial release.
+
 ## [0.55.0] - 2026-08-03
 
 ### Added

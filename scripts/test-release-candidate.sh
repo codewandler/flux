@@ -6,6 +6,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 HELPER="$ROOT/scripts/release-candidate.sh"
 FINDER="$ROOT/scripts/find-release-candidate.sh"
 WORKFLOW="$ROOT/.github/workflows/release.yml"
+FLOW_WORKFLOW="$ROOT/.github/workflows/release-flow.yml"
+PROMOTER="$ROOT/scripts/promote-release-flow.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -27,6 +29,7 @@ expect_fail() {
 
 [ -x "$HELPER" ] || fail "missing executable receipt helper: $HELPER"
 [ -x "$FINDER" ] || fail "missing executable candidate finder: $FINDER"
+[ -x "$PROMOTER" ] || fail "missing executable release-flow promotion helper: $PROMOTER"
 
 "$HELPER" write "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
 "$HELPER" verify "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
@@ -124,8 +127,49 @@ for required in \
   grep -Fq "$required" "$WORKFLOW" "$FINDER" || fail "release workflow is missing: $required"
 done
 
-grep -Fq 'gh workflow run release.yml --ref main -f version=' "$ROOT/scripts/cut-release.sh" \
-  || fail "cut-release does not print the candidate preparation command"
+# A candidate dispatch is accepted only from the version-derived staging ref. `main` is advanced
+# only after the exact-SHA candidate and receipt have been verified, so a red platform build cannot
+# leave main carrying an unpublishable cut.
+grep -Fq 'expected_ref="refs/heads/release-candidates/v$CANDIDATE_VERSION"' "$WORKFLOW" \
+  || fail "release workflow does not derive the exact versioned candidate ref"
+grep -Fq 'if [ "$DISPATCH_REF" != "$expected_ref" ]' "$WORKFLOW" \
+  || fail "release workflow does not refuse dispatches from other refs"
+if grep -Fq 'DISPATCH_REF" != "refs/heads/main' "$WORKFLOW"; then
+  fail "release workflow still accepts candidate preparation directly from main"
+fi
+
+grep -Fq 'candidate="release-candidates/$tag"' "$ROOT/scripts/cut-release.sh" \
+  || fail "cut-release does not print the versioned candidate ref"
+grep -Fq 'git push origin "HEAD:refs/heads/$candidate"' "$ROOT/scripts/cut-release.sh" \
+  || fail "cut-release does not stage the cut before candidate dispatch"
+grep -Fq 'gh workflow run release.yml --ref' "$ROOT/scripts/cut-release.sh" \
+  || fail "cut-release does not dispatch from the versioned candidate ref"
+grep -Fq 'scripts/release-candidate.sh verify' "$ROOT/scripts/cut-release.sh" \
+  || fail "cut-release does not print the exact receipt verification"
+baseline_line=$(grep -nF 'baseline=$(gh run list --workflow release.yml' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+dispatch_line=$(grep -nF 'gh workflow run release.yml --ref' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+new_run_line=$(grep -nF '.databaseId > $baseline' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+candidate_line=$(grep -nF 'scripts/find-release-candidate.sh "$repo" "$sha"' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+main_line=$(grep -nF 'git push origin HEAD:main' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+tag_line=$(grep -nF 'git push origin "$tag"' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+[ -n "$baseline_line" ] && [ -n "$dispatch_line" ] && [ -n "$new_run_line" ] \
+  && [ "$baseline_line" -lt "$dispatch_line" ] && [ "$dispatch_line" -lt "$new_run_line" ] \
+  || fail "cut-release must baseline runs before dispatch and select only a newer exact-ref/SHA run"
+[ -n "$candidate_line" ] && [ -n "$main_line" ] && [ -n "$tag_line" ] \
+  && [ "$candidate_line" -lt "$main_line" ] && [ "$main_line" -lt "$tag_line" ] \
+  || fail "cut-release must verify the exact candidate before printing main and tag pushes"
+
+grep -Fq 'branches:' "$FLOW_WORKFLOW" && grep -Fq -- '- release' "$FLOW_WORKFLOW" \
+  || fail "release-flow is not triggered by the dedicated release branch"
+grep -Fq 'run: scripts/promote-release-flow.sh' "$FLOW_WORKFLOW" \
+  || fail "release-flow does not hand the irreversible half to the host promotion helper"
+grep -Fq "if: success() && github.event_name == 'push'" "$FLOW_WORKFLOW" \
+  || fail "manual release-flow dispatches are not structurally excluded from promotion"
+grep -Fq 'gh pr create --base release --head main' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
+  || fail "publishing runbook does not make a protected main-to-release PR the normal path"
+if grep -Fq 'git push origin release' "$ROOT/crates/flux-sdk/PUBLISHING.md"; then
+  fail "publishing runbook still presents a direct release-branch push as the normal path"
+fi
 grep -Fq 'scripts/build-embedded-docs.sh --check' "$ROOT/scripts/cut-release.sh" \
   || fail "cut-release does not verify the release-current embedded docs"
 grep -Fq 'crates/flux-server/assets/public-docs.zip' "$ROOT/scripts/cut-release.sh" \

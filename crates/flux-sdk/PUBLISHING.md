@@ -136,47 +136,141 @@ Pushing a `vX.Y.Z` tag triggers **`.github/workflows/crates-io.yml`**, which run
 `scripts/publish-crates-io.sh` (the §2 order, idempotent — an already-published crate@version is
 skipped, so a failed run is re-runnable).
 
-**One-time setup — the required secret:** add **`CARGO_REGISTRY_TOKEN`** under
-*Settings → Secrets and variables → Actions* on the `codewandler/flux` repo. It is a crates.io API token
-(https://crates.io/settings/tokens) from an account that can publish the `codewandler-flux-*` names.
-Without it the job fails fast with a clear message and nothing is published.
+### Normal path: merge `main` into `release`
 
-To release, cut the version (`scripts/cut-release.sh <ver>`), then use the build-once sequence printed
-by the script:
+The deliberate release action is merging a pull request from `main` into the protected `release`
+branch. Direct pushes to `release` are not the normal path; branch protection should require the PR
+and its checks. Open the release PR with:
 
 ```sh
-git push origin main
-gh workflow run release.yml --ref main -f version=X.Y.Z
-# Wait for the candidate run to succeed; its summary SHA must equal `git rev-list -n1 vX.Y.Z^{}`.
-git push origin vX.Y.Z
+gh pr create --base release --head main \
+  --title "release: promote main" \
+  --body "Merge main into the protected release trigger branch."
 ```
 
-The manual run builds all five cargo-dist targets for that exact main SHA and retains the immutable
-workflow artifacts plus a version/SHA/run receipt for 14 days. The matching tag run verifies the
-receipt and promotes those artifacts without recompiling, while retaining the normal public-release
-asset verification. The tag simultaneously starts this crates.io publish workflow.
+Merging that PR is the whole release action; its resulting push to `release` starts the workflow.
+
+`.github/workflows/release-flow.yml` runs the live smoke, asks the tool-less release scribe for the
+two changelog sections, has the host derive and cut the version, and creates a local release commit
+plus annotated tag. Its host-owned promotion step then:
+
+1. stages the cut commit at `refs/heads/release-candidates/vX.Y.Z`;
+2. dispatches `.github/workflows/release.yml` from that exact ref and waits for all five cargo-dist
+   targets;
+3. verifies the candidate's version/SHA/run receipt and exact-SHA lookup;
+4. advances `main`, then pushes the annotated tag; and
+5. waits for both tag workflows, verifies the public GitHub Release, and only then deletes the
+   candidate ref.
+
+The matching tag run verifies the receipt and promotes those artifacts without recompiling, while
+retaining the normal public-release asset verification. The tag simultaneously starts the
+idempotent crates.io publisher.
+
+Three Actions secrets are required:
+
+- **`OPENROUTER_API_KEY`** — used only by the cheap `FLUX_SMOKE_MODEL` live smoke and release-scribe
+  turn. A manual preview without it skips, but a push to `release` fails loudly without cutting or
+  pushing anything.
+- **`RELEASE_TOKEN`** — a fine-grained GitHub PAT scoped to this repository with **Contents: write**.
+  It is exposed only to the host promotion step for the candidate/main/tag refs, and to the binary
+  workflow for creating or refreshing the Release. A separately authenticated token is required
+  because refs pushed with `GITHUB_TOKEN` do not start the tag-triggered workflows.
+- **`CARGO_REGISTRY_TOKEN`** — a crates.io API token from an account that can publish the
+  `codewandler-flux-*` names. It may be a selected organization Actions secret. Without it the
+  crates.io job fails before publishing.
+
+`workflow_dispatch` on `release-flow.yml` is deliberately **not** another publish button. Its
+default `apply: false` is a read-only preview; `apply: true` cuts only inside the ephemeral runner as
+a rehearsal. Neither manual mode calls the promotion helper or moves a remote ref.
+
+### Manual build-once path
+
+If the automation itself is unavailable, run `scripts/cut-release.sh <version|patch|minor>` from a
+clean `main` checkout. It prints this exact sequence; do not advance `main` or push the tag before
+the candidate and receipt checks are green:
+
+```sh
+tag=vX.Y.Z
+sha=$(git rev-list -n1 "$tag^{}")
+candidate="release-candidates/$tag"
+repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+baseline=$(gh run list --workflow release.yml --limit 100 \
+  --json databaseId --jq '([.[].databaseId] | max) // 0')
+
+# Make the exact cut commit addressable without moving main.
+git push origin "HEAD:refs/heads/$candidate"
+gh workflow run release.yml --ref "$candidate" -f version=X.Y.Z
+
+# Wait for the newly dispatched exact-ref/exact-SHA run. The baseline excludes an older run or retry
+# while GitHub is still registering this dispatch.
+run_id=
+until [ -n "$run_id" ]; do
+  run_id=$(gh run list --workflow release.yml --event workflow_dispatch \
+    --branch "$candidate" --commit "$sha" --limit 20 \
+    --json databaseId,event,headBranch,headSha \
+    --jq ".[] | select(.databaseId > $baseline and .event == \"workflow_dispatch\" and .headBranch == \"$candidate\" and .headSha == \"$sha\") | .databaseId" \
+    | sort -n | head -1)
+  [ -n "$run_id" ] || sleep 5
+done
+gh run watch "$run_id" --exit-status
+
+receipt_dir=$(mktemp -d)
+gh run download "$run_id" --name release-candidate-receipt --dir "$receipt_dir"
+scripts/release-candidate.sh verify "$receipt_dir/release-candidate.txt" \
+  X.Y.Z "$sha" "$run_id"
+test "$(scripts/find-release-candidate.sh "$repo" "$sha")" = "$run_id"
+
+# Only the verified commit may now become main and a public version tag.
+git push origin HEAD:main
+git push origin "$tag"
+
+# Wait for release.yml and crates-io.yml to finish, then:
+scripts/verify-github-release.sh --repo "$repo" "$tag"
+git push origin --delete "$candidate"
+```
+
+The credential used for the candidate, main, and tag pushes must be `RELEASE_TOKEN` (or an
+equivalently scoped maintainer credential), not `GITHUB_TOKEN`, so the tag starts both publication
+workflows.
 
 If no successful, unexpired candidate exists at the tag's exact SHA, the binary workflow emits a
 prominent warning and performs the legacy full build. It never searches by version alone. A malformed
 or mismatched receipt fails closed before release creation; re-running promotion remains safe because
 GitHub Release uploads use `--clobber` and the crates publisher skips versions already present.
 
-**Binary Release workflow secret:** add **`RELEASE_TOKEN`** under
-*Settings → Secrets and variables → Actions* on the `codewandler/flux` repo. It must be a fine-grained
-GitHub PAT scoped to this repo with **Contents: write**. This is required even though
-`.github/workflows/release.yml` requests `contents: write`: tag-triggered `GITHUB_TOKEN` release
-creation has produced `HTTP 403: Resource not accessible by integration`, leaving a tag without a
-GitHub Release object. The workflow now fails fast if `RELEASE_TOKEN` is missing, creates or refreshes
-the release idempotently, then runs:
+The automated and manual C-251 paths deliberately do not rely on that compatibility rebuild: they
+require the exact candidate before pushing the tag. The fallback remains for older/direct tag cuts.
+
+### Failure retention and recovery
+
+Once a candidate ref has been staged, any failed candidate build, ref push, tag workflow, or public
+verification leaves `release-candidates/vX.Y.Z` in place at the exact cut SHA. The failure log prints
+the SHA and recovery commands. Do not delete that ref or move/recreate the version tag while
+investigating.
+
+- **Before the tag exists:** inspect or rerun the candidate workflow at the retained ref. Re-download
+  and verify its receipt against the retained SHA. Only after it is green may `main` and then the tag
+  be pushed using the manual sequence above.
+- **After the tag exists:** never delete or retarget the tag. Rerun the failed `Release` or `crates.io`
+  workflow; both paths are idempotent. Verify the public Release, then delete only the matching
+  candidate branch.
+
+Useful evidence and cleanup commands:
 
 ```sh
-scripts/verify-github-release.sh vX.Y.Z
+tag=vX.Y.Z
+candidate="release-candidates/$tag"
+git ls-remote origin "refs/heads/$candidate" "refs/tags/$tag^{}"
+gh run list --repo codewandler/flux --branch "$candidate"
+gh run list --repo codewandler/flux --branch "$tag"
+scripts/verify-github-release.sh --repo codewandler/flux "$tag"
+git push origin --delete "$candidate"  # only after recovery and public verification are green
 ```
 
-That verifier confirms the Release object exists and carries the installer scripts, checksum manifest,
-and platform archives that `/releases/latest` users need.
+The verifier confirms the Release object exists and carries the installer scripts, checksum manifest,
+platform archives, and provenance attestations that `/releases/latest` users need.
 
-**Manual fallback** (from a maintainer machine with a token):
+**Registry-only fallback** (from a maintainer machine with a crates.io token):
 ```sh
 cargo login                      # or: export CARGO_REGISTRY_TOKEN=…
 scripts/publish-crates-io.sh     # same ordered, idempotent loop

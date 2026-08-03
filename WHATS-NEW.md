@@ -15,6 +15,13 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **Maintainers can now cut a release by merging `main` into `release`.** The hosted flow writes the
+  release notes, derives the version mechanically, prepares and verifies the exact build once, then
+  publishes it. A failed build or publication stays visibly failed with its recovery candidate
+  preserved; it cannot silently finish as a partial release.
+
 ## [0.55.0] - 2026-08-03
 
 ### New

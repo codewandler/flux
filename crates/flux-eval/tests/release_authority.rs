@@ -37,6 +37,53 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn release_flow_workflow_code() -> String {
+    format!(
+        "{}\n{}",
+        workflow_code("release-flow.yml"),
+        non_comment_source(repo_root().join("scripts/promote-release-flow.sh"))
+    )
+}
+
+fn release_workflow_code() -> String {
+    workflow_code("release.yml")
+}
+
+fn workflow_code(name: &str) -> String {
+    non_comment_source(repo_root().join(".github/workflows").join(name))
+}
+
+fn non_comment_source(path: PathBuf) -> String {
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn code_line_index<F>(code: &str, predicate: F) -> Option<usize>
+where
+    F: Fn(&str) -> bool,
+{
+    code.lines().position(predicate)
+}
+
+fn code_line_indices<F>(code: &str, predicate: F) -> Vec<usize>
+where
+    F: Fn(&str) -> bool,
+{
+    code.lines()
+        .enumerate()
+        .filter_map(|(index, line)| predicate(line).then_some(index))
+        .collect()
+}
+
+fn is_git_push_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("git push") || line.starts_with("git_with_release_token push")
+}
+
 /// Every operation `examples/release.flux` calls. Collected from the serialized AST rather than a
 /// hand-written match, so a new node kind cannot hide a call from this check.
 fn ops_called_by_release_flux() -> BTreeSet<String> {
@@ -372,5 +419,198 @@ fn the_checked_in_release_policy_grants_exactly_the_three_changelogs_and_two_scr
     assert!(
         wild.is_empty(),
         "every resource matcher in this policy must be literal; found wildcard(s): {wild:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The unattended half
+// ---------------------------------------------------------------------------
+
+/// C-251 is not complete when the safe offline program merely exists: merging `main` into the
+/// dedicated `release` branch must be the deliberate action that runs it in apply mode. Ordinary
+/// pushes to `main` must not cut, and a manual preview may remain as a separate trigger.
+#[test]
+fn the_release_branch_is_the_automatic_apply_trigger() {
+    let code = release_flow_workflow_code();
+    let release_push = code.contains("  push:\n    branches:\n      - release")
+        || code.contains("  push:\n    branches:\n      - \"release\"")
+        || code.contains("  push:\n    branches: [release]")
+        || code.contains("  push:\n    branches: [\"release\"]");
+    assert!(
+        release_push,
+        ".github/workflows/release-flow.yml must run on pushes to the dedicated `release` branch; \
+         workflow_dispatch alone still leaves the release as a human sequence"
+    );
+    assert!(
+        !code.contains("  push:\n    branches:\n      - main")
+            && !code.contains("  push:\n    branches: [main]"),
+        "ordinary pushes to `main` must not cut a release; merging main -> release is the deliberate act"
+    );
+
+    let push_applies = code.contains("--arg apply=true")
+        || (code.contains("--arg apply=")
+            && code.contains("github.event_name")
+            && code.contains("push"));
+    assert!(
+        push_applies,
+        "the release-branch path must run examples/release.flux with apply=true; a push-triggered \
+         preview creates no commit or tag and therefore releases nothing"
+    );
+}
+
+/// The cut commit is first staged on a versioned candidate ref. `main` does not move until that
+/// exact SHA has a successful candidate and a matching receipt; the irreversible tag comes last.
+/// This avoids leaving main in a cut-but-unpublishable state when a platform build fails, and keeps
+/// the build-once ordering documented by `cut-release.sh`.
+#[test]
+fn the_release_workflow_prepares_an_exact_sha_candidate_before_pushing_the_tag() {
+    let code = release_flow_workflow_code();
+
+    let versioned_candidate_ref = code.contains("release-candidates/v")
+        || (code.contains("TAG=\"v$VERSION\"")
+            && code.contains("CANDIDATE_BRANCH=\"release-candidates/$TAG\""));
+    assert!(
+        versioned_candidate_ref,
+        "the cut must be staged at refs/heads/release-candidates/v$version before main moves"
+    );
+    let candidate_ref_push = code_line_index(&code, |line| {
+        is_git_push_line(line)
+            && (line.contains("release-candidates/v")
+                || line.to_ascii_lowercase().contains("candidate_ref"))
+    });
+    let main_push = code_line_index(&code, |line| {
+        is_git_push_line(line)
+            && (line.contains("HEAD:main")
+                || line.contains("refs/heads/main")
+                || line.trim_end().ends_with(" origin main"))
+    });
+    let candidate_dispatch =
+        code_line_index(&code, |line| line.contains("gh workflow run release.yml"));
+    let run_watches = code_line_indices(&code, |line| line.contains("gh run watch"));
+    let candidate_wait = run_watches.first().copied();
+    let release_wait = run_watches
+        .last()
+        .copied()
+        .filter(|_| run_watches.len() >= 2);
+    let exact_candidate = code_line_index(&code, |line| {
+        line.contains("scripts/find-release-candidate.sh")
+            && line.to_ascii_lowercase().contains("sha")
+    });
+    let receipt_verify = code_line_index(&code, |line| {
+        line.contains("scripts/release-candidate.sh verify")
+    });
+    let tag_push = code_line_index(&code, |line| {
+        is_git_push_line(line)
+            && line.to_ascii_lowercase().contains("tag")
+            && !line.contains("HEAD:main")
+            && !line.trim_end().ends_with(" origin main")
+    });
+    let public_verify = code_line_index(&code, |line| {
+        line.contains("scripts/verify-github-release.sh")
+            && !line.contains("--staged")
+            && line.to_ascii_lowercase().contains("tag")
+    });
+
+    let ordered = match (
+        candidate_ref_push,
+        candidate_dispatch,
+        candidate_wait,
+        exact_candidate,
+        receipt_verify,
+        main_push,
+        tag_push,
+        release_wait,
+        public_verify,
+    ) {
+        (
+            Some(candidate_ref),
+            Some(dispatch),
+            Some(candidate_wait),
+            Some(candidate),
+            Some(receipt),
+            Some(main),
+            Some(tag),
+            Some(release_wait),
+            Some(public_verify),
+        ) => {
+            candidate_ref < dispatch
+                && dispatch < candidate_wait
+                && candidate_wait < candidate
+                && candidate < receipt
+                && receipt < main
+                && main < tag
+                && tag < release_wait
+                && release_wait < public_verify
+        }
+        _ => false,
+    };
+    assert!(
+        ordered,
+        "release-flow.yml must perform, in order: stage the cut at the versioned candidate ref; \
+         dispatch and wait for release.yml; select the exact-SHA candidate and verify its receipt; \
+         advance main; push the tag; wait for its Release workflow; verify the public Release. \
+         Found indexes: candidate_ref={candidate_ref_push:?}, dispatch={candidate_dispatch:?}, \
+         candidate_wait={candidate_wait:?}, exact={exact_candidate:?}, receipt={receipt_verify:?}, \
+         main={main_push:?}, tag={tag_push:?}, release_wait={release_wait:?}, \
+         public_verify={public_verify:?}"
+    );
+    assert!(
+        code.contains("git rev-list -n1") && code.contains("^{}"),
+        "the promotion path must resolve the annotated tag to its commit and use that exact SHA as \
+         the candidate identity"
+    );
+}
+
+/// Candidate preparation may run from the one version-derived staging ref and nowhere else. In
+/// particular, accepting arbitrary branches would let a same-version dispatch prepare artifacts
+/// for a ref that the release flow never reviewed.
+#[test]
+fn release_yml_accepts_only_the_exact_versioned_candidate_ref() {
+    let code = release_workflow_code();
+    let exact_ref = code.contains("refs/heads/release-candidates/v$CANDIDATE_VERSION")
+        || code.contains("refs/heads/release-candidates/v${CANDIDATE_VERSION}");
+    assert!(
+        exact_ref,
+        "release.yml must derive the only permitted dispatch ref as \
+         refs/heads/release-candidates/v$CANDIDATE_VERSION"
+    );
+    assert!(
+        code.lines().any(|line| {
+            line.contains("DISPATCH_REF")
+                && line.contains("!=")
+                && (line.contains("release-candidates/")
+                    || line.contains("EXPECTED")
+                    || line.contains("expected"))
+        }),
+        "release.yml must fail when github.ref differs from its version-derived candidate ref"
+    );
+    assert!(
+        !code.lines().any(|line| {
+            line.contains("DISPATCH_REF") && line.contains("!=") && line.contains("refs/heads/main")
+        }),
+        "candidate preparation must no longer accept main directly"
+    );
+}
+
+/// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`. The
+/// release and crates.io workflows are tag-push-triggered, so this workflow needs a separately
+/// configured push credential; otherwise a green auto-cut silently publishes nothing.
+#[test]
+fn the_tag_push_uses_a_credential_that_can_trigger_the_publication_workflows() {
+    let code = release_flow_workflow_code();
+    assert!(
+        code.contains("secrets.RELEASE_TOKEN"),
+        "release-flow.yml must use a non-GITHUB_TOKEN credential for its main/tag pushes; refs \
+         pushed with GITHUB_TOKEN do not trigger release.yml or crates-io.yml"
+    );
+    assert!(
+        code.contains("actions: write") && code.contains("contents: read"),
+        "the workflow token needs Actions write to dispatch/watch the candidate, while repository \
+         contents stay read-only because RELEASE_TOKEN alone moves refs"
+    );
+    assert!(
+        !code.contains("contents: write"),
+        "do not give GITHUB_TOKEN contents write: RELEASE_TOKEN is the narrowly configured, \
+         trigger-capable credential for main and tag pushes"
     );
 }

@@ -16,9 +16,10 @@
 # changelogs. It never calls `bash`, `proc.run`, `write`, or `edit`.
 #
 # Run with: flux flow run examples/release.flux --arg apply=false --yes
-# `apply=false` is the safe default and the only mode CI runs today: it derives the version, renders
-# both changelog sections and the diff it would apply, and mutates nothing — no file, no commit, no
-# tag. `apply=true` is the real cut.
+# `apply=false` is the safe local/manual default: it derives the version, renders both changelog
+# sections and the diff it would apply, and mutates nothing — no file, no commit, no tag. The
+# release-branch workflow supplies `apply=true`; its host-owned step promotes the resulting local cut
+# only after the exact-SHA candidate and receipt are green.
 
 flow release(apply: Bool) -> String
 goal "Cut a flux release: the host derives the version from the commit titles, a scribe drafts both changelogs, the host inserts that prose, and the run stops at a local annotated tag."
