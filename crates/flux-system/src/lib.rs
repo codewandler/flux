@@ -541,7 +541,7 @@ fn expand_home_input(input: &str) -> std::borrow::Cow<'_, str> {
 fn path_to_utf8(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_string)
-        .ok_or_else(|| Error::Config(format!("resolved path {:?} is not valid UTF-8", path)))
+        .ok_or_else(|| Error::Config(format!("resolved path {path:?} is not valid UTF-8")))
 }
 
 /// The base directory worktree parents are allocated under: `$FLUX_WORKTREE_DIR`, else
@@ -634,8 +634,7 @@ impl WorktreeBase {
                 .is_some_and(|n| n.starts_with("flux-worktree-"));
         if !ok {
             return Err(Error::Config(format!(
-                "refusing to remove {:?}: not an allocated flux worktree dir",
-                path
+                "refusing to remove {path:?}: not an allocated flux worktree dir"
             )));
         }
         match std::fs::remove_dir_all(path) {
