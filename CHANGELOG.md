@@ -12,7 +12,8 @@ All notable changes to this project are documented in this file. The format is b
   boundary** (C-318). `/plugin-refresh <name>` publishes one atomic generation shared by prompting,
   validation, authorization and dispatch. Mid-turn and already-running calls retain their original
   catalog; withdrawals, wildcard disables, nested runtimes and newly spawned children all preserve
-  their existing authority ceilings.
+  their existing authority ceilings. A refused refresh leaves both the retained plugin and the
+  published generation unchanged.
 
 - **Flux-Lang supports JSON-quoted object keys in field paths** (C-320). Expressions such as
   `$response.headers["content-type"]` and their optional `?` form preserve the existing strict-field
