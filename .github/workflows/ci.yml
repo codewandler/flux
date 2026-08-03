@@ -51,6 +51,11 @@ jobs:
       - name: Fetch locked dependencies (all targets)
         run: cargo fetch --locked
 
+      # C-450: Cargo.lock pins versions, while this review lock pins the direct edges that selected
+      # them and calls out dependencies that execute build.rs during the build.
+      - name: Direct dependencies are explicitly acknowledged
+        run: ./scripts/check-crate-versions.sh --direct-dependencies root
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -310,6 +315,9 @@ jobs:
       - name: Test
         working-directory: plugins
         run: cargo test --workspace
+
+      - name: Direct dependencies are explicitly acknowledged
+        run: ./scripts/check-crate-versions.sh --direct-dependencies plugins
 
   crate-versions:
     name: independently-versioned crates moved their version

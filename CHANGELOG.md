@@ -22,6 +22,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Direct dependency changes are now explicit review events** (C-450). CI compares each workspace's
+  exact resolved direct edges with a committed review lock, including which selected packages run a
+  Cargo build script. Adding, moving, renaming or upgrading a direct dependency now fails with the
+  exact regeneration command until its lock diff is acknowledged.
+
 - **Canonical and public integration documentation now follows the Exchange-only program** (C-501).
   The signed plugin pack is documented as temporary compatibility behavior; the future path is one
   embedded Service Account client with every official connector runtime executed by Exchange and no
