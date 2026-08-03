@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.54.2] - 2026-08-03
+
 ### Fixed
 
 - **The release cutter now regenerates and commits `flux-server`'s embedded docs after rolling the
