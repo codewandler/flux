@@ -56,6 +56,10 @@
 
 ### Fixed
 
+- **JaaS room joins no longer race each other or re-resolve their signalling host.** Two concurrent
+  joins now create one live room session, and the XMPP WebSocket connects only to the address Flux's
+  network guard already checked.
+
 - **Formatting no longer moves a final top-level comment into the preceding flow.** Format-on-save
   and `fluxlang fmt` now keep a comment written at the left margin after the last declaration at the
   left margin, preserving which part of the program it documents.

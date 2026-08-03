@@ -90,6 +90,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **JaaS rooms now close the two residual races in their otherwise-pinned join path** (C-413).
+  Concurrent initial joins are serialized across check, handshake and install so only one session
+  and pump can be created; a concurrent leave waits for that transition and cannot strand the
+  session. XMPP-over-WebSocket now resolves once through `flux-system` and performs its handshake on
+  the exact vetted TCP address, closing the DNS-rebinding gap for the query-carried guest token.
+
 - **The CST layout formatter preserves a terminal column-zero module comment** (L-125). The LSP's
   format-on-save path and `fluxlang fmt` no longer re-indent a comment after the final declaration
   into that declaration's body; exact-text coverage also pins comments before, between, and trailing

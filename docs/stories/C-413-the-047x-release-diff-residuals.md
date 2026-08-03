@@ -2,7 +2,7 @@
 id: C-413
 title: "Two residuals in the 0.47.x diff: the XMPP socket is guarded but not DNS-pinned, and `JaasRoom::join` has a TOCTOU"
 pillar: Core
-status: ready
+status: in-progress
 priority: 9
 epic: meeting-rooms
 areas: [flux-channels]
@@ -33,12 +33,12 @@ is what makes the asymmetry worth removing.
 
 ## Acceptance
 
-- [ ] **Failing-first for the TOCTOU**: a test driving two concurrent `join` calls and asserting one
+- [x] **Failing-first for the TOCTOU**: a test driving two concurrent `join` calls and asserting one
       session, no leak — failing at the merge base. The `leave`-race test added for the same file is
       the shape to follow, including its "verify the guard fires by deleting it" step.
-- [ ] `join` closes the window the same way `leave`/`rejoin` already do — check and install under one
+- [x] `join` closes the window the same way `leave`/`rejoin` already do — check and install under one
       guard, no bare `await` between them.
-- [ ] The XMPP socket is DNS-pinned like its HTTP siblings, or the asymmetry is documented at
+- [x] The XMPP socket is DNS-pinned like its HTTP siblings, or the asymmetry is documented at
       `session.rs:167` with the reason it cannot be.
 - [ ] Full gate green.
 
@@ -51,3 +51,7 @@ is what makes the asymmetry worth removing.
 ## Progress
 
 - Filed 2026-08-01 from the 0.47.1 security-posture review.
+- 2026-08-04: failing-first concurrent-join proof observed two constructed sessions (`left: 2`,
+  `right: 1`) before the initial-join gate was installed; the same focused test now passes and a
+  fixed-resolver WebSocket handshake proves the RFC 6455/TLS request dials the exact address vetted
+  by `flux-system` without handing the hostname to a second resolver. The wave full gate is pending.
