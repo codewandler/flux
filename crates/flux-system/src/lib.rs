@@ -140,6 +140,7 @@ pub mod port;
 pub mod remote;
 pub mod sandbox;
 pub mod secret_scope;
+pub mod verified_cache;
 pub mod websocket;
 
 use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};
