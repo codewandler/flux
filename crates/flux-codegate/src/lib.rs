@@ -3597,6 +3597,11 @@ fn opens() {
             }
         }
 
+        // Filesystem traversal order differs across runners; the census is exact, but its
+        // comparison and diagnostic must be stable everywhere.
+        found.sort();
+        locations.sort();
+
         assert_eq!(
             found,
             vec![
