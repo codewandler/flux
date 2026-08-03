@@ -21,208 +21,79 @@ owner, never an Exchange runtime, binary distributor or credential holder.
 
 ## Acceptance
 
-### One pinned channel and one trust contract
+### One provider-owned channel and one trust contract
 
-- [ ] The Flux build pins one `ExchangeChannelPolicy`: the stable-channel origin, long-lived offline
-      minisign root public keys/policy by id, accepted delegation/channel/manifest/readiness schema
-      ids, and supported version sets for Exchange API, effective-catalogue, invoke and
-      `exchange.connection-plan`. It embeds no routine online channel/release signer. It deliberately
-      contains no Exchange tag, semver, source commit, build id, manifest digest, executable digest or
-      connector version. Configuration, environment, project files, model input and an unsigned
-      latest lookup cannot replace or widen that policy.
-- [ ] Before reading a channel, Flux fetches the canonical root-signed delegation at the one compiled
-      URL
-      `https://github.com/codewandler/flux-exchange/releases/download/exchange-trust-v1/flux-exchange-trust-delegation.json`.
-      It is at most 64 KiB, rejects unknown/duplicate/non-canonical fields, and has this exact v1 shape:
-
-      ```json
-      {
-        "schema": "exchange.trust-delegation.v1",
-        "origin": "https://github.com/codewandler/flux-exchange",
-        "generation": 1,
-        "issued_at": "<RFC 3339 UTC seconds>",
-        "expires_at": "<RFC 3339 UTC seconds>",
-        "root_key_id": "flux-exchange-root-2026-01",
-        "channel_keys": [
-          {
-            "key_id": "flux-exchange-channel-2026-01",
-            "minisign_public_key": "<base64 public key>",
-            "not_before": "<RFC 3339 UTC seconds>",
-            "not_after": "<RFC 3339 UTC seconds>"
-          }
-        ],
-        "release_keys": [
-          {
-            "key_id": "flux-exchange-release-2026-01",
-            "minisign_public_key": "<base64 public key>",
-            "not_before": "<RFC 3339 UTC seconds>",
-            "not_after": "<RFC 3339 UTC seconds>"
-          }
-        ]
-      }
-      ```
-
-      The arrays contain 1..=4 unique, lexically sorted keys per role and a key cannot cross roles.
-      Delegation generation is `1..=u64::MAX`; issuance may be five minutes in the future at most,
-      expiry is later and at most 366 days after issuance, and every delegated interval lies within
-      it. Exactly `flux-exchange-trust-delegation.json.<root-key-id>.minisig` (at most 4 KiB) must
-      verify under the compiled offline root policy. Owner-only state caches the highest accepted
-      `{generation,delegation_sha256}` and applies the same lower-generation/same-generation-digest
-      rollback refusal as the channel. Unknown roots or expired/not-yet-valid delegation/signer keys
-      refuse; no channel/release signature is considered until this succeeds.
-- [ ] Release selection then reads the canonical RFC 8785 UTF-8 JSON index at the one compiled URL
-      `https://github.com/codewandler/flux-exchange/releases/download/exchange-stable-v1/flux-exchange-stable-index.json`.
-      Unknown/duplicate fields, non-canonical encodings, a response over 256 KiB or a non-byte-identical
-      canonicalization refuses. The exact v1 shape is (pretty-printed here; all fields are required,
-      `signing_key_ids` and `releases` are sorted):
-
-      ```json
-      {
-        "schema": "exchange.stable-channel.v1",
-        "channel": "stable",
-        "origin": "https://github.com/codewandler/flux-exchange",
-        "generation": 1,
-        "issued_at": "<RFC 3339 UTC seconds>",
-        "expires_at": "<RFC 3339 UTC seconds>",
-        "signing_key_ids": ["flux-exchange-channel-2026-01"],
-        "releases": [
-          {
-            "tag": "refs/tags/vX.Y.Z",
-            "version": "X.Y.Z",
-            "source_commit": "<40 lowercase hex>",
-            "build_id": "<1..128 printable ASCII bytes>",
-            "manifest_sha256": "<64 lowercase hex>",
-            "release_key_ids": ["flux-exchange-release-2026-01"],
-            "protocols": {
-              "exchange_api": "<versioned id>",
-              "effective_catalogue": "<versioned id>",
-              "invoke": "<versioned id>",
-              "connection_plan": "exchange.connection-plan.v1"
-            },
-            "readiness_schema": "exchange.supervisor-ready.v1"
-          }
-        ]
-      }
-      ```
-
-      `generation` is `1..=u64::MAX`; there are 1..=64 unique releases in ascending SemVer order
-      with no duplicate tag/version/manifest identity. `issued_at` may be at most five minutes in the
-      future, `expires_at` must be later than it and no more than seven days later, and the index must
-      be unexpired at use. Each key id must be a currently valid delegated `channel_keys` entry and
-      requires exactly
-      `flux-exchange-stable-index.json.<key-id>.minisig` (at most 4 KiB) over the canonical bytes.
-- [ ] After authenticating and time-validating the index, Flux filters releases only by the compiled
-      schema/protocol support sets and chooses the greatest SemVer; an absent compatible entry
-      refuses as `incompatible`. It then derives the immutable tag URL, fetches the exact manifest
-      digest named by that entry and requires every duplicated release/build/protocol field to agree.
-      The manifest's `signing_key_ids` must equal the entry's `release_key_ids` and every id must be a
-      currently valid delegated release key.
-      Neither package-version guessing nor an installed/newest-by-clock/latest-API heuristic selects
-      a binary. A protocol-compatible Exchange release becomes selectable without a Flux rebuild or
-      release.
-- [ ] The owner-only channel state atomically records
-      `{delegation_generation,delegation_sha256,channel,generation,index_sha256}` only after
-      the delegation, signed index and its selected release have passed verification. Either
-      generation has its own monotonic floor: a lower value refuses as rollback, and the same value
-      is accepted only with the same corresponding SHA-256. A higher value advances atomically and
-      never decreases after an interrupted install. There is no
-      production reset/downgrade/ignore-expiry switch. A network-unavailable start may use an already
-      accepted cached index only while it remains unexpired; otherwise a fresh online index or fully
-      verified offline import is required.
-- [ ] C-510 consumes the following canonical UTF-8 JSON contract from Exchange X-126. Unknown or
-      duplicate fields, non-canonical encodings, numbers outside their declared integer domain and a
-      manifest not byte-identical to its RFC 8785 serialization refuse. The manifest is at most
-      256 KiB and has exactly this v1 shape (pretty-printed here for review; every field is required,
-      `signing_key_ids` and `assets` are sorted):
-
-      ```json
-      {
-        "schema": "exchange.release-manifest.v1",
-        "origin": "https://github.com/codewandler/flux-exchange",
-        "tag": "refs/tags/vX.Y.Z",
-        "version": "X.Y.Z",
-        "source_commit": "<40 lowercase hex>",
-        "build_id": "<1..128 printable ASCII bytes>",
-        "protocols": {
-          "exchange_api": "<versioned id>",
-          "effective_catalogue": "<versioned id>",
-          "invoke": "<versioned id>",
-          "connection_plan": "exchange.connection-plan.v1"
-        },
-        "readiness_schema": "exchange.supervisor-ready.v1",
-        "signing_key_ids": ["flux-exchange-release-2026-01"],
-        "assets": [
-          {
-            "target": "<closed supported target>",
-            "archive": "<basename>",
-            "format": "tar.zst|zip",
-            "archive_bytes": 1,
-            "archive_sha256": "<64 lowercase hex>",
-            "executable": {
-              "path": "<single-root relative path ending flux-exchange|flux-exchange.exe>",
-              "bytes": 1,
-              "sha256": "<64 lowercase hex>"
-            },
-            "other_members": [
-              {
-                "path": "<single-root relative path>",
-                "kind": "documentation|license",
-                "bytes": 1,
-                "sha256": "<64 lowercase hex>"
-              }
-            ],
-            "provenance": "<archive basename>.intoto.jsonl"
-          }
-        ]
-      }
-      ```
-
-      There are exactly five target entries in X-126 v1. Integer domains are `1..=268435456` for an
-      archive/member and at most `536870912` summed expanded bytes; `other_members` has zero to 15
-      entries. Every `other_members` entry is an archive member; the executable plus that list is the
-      complete member set. Each provenance name
-      is a release basename, never a URL, and the live verifier proves its repository/workflow,
-      immutable tag and source SHA before Flux admits the archive. Its exact release identity and
-      digests are installed metadata for audit, cache validation and process ownership; they are not
-      compiled Flux selection policy.
-- [ ] Delegated minisign over the canonical manifest is the sole v1 release-authenticity mechanism.
-      For each id in
-      `signing_key_ids`, the release contains exactly
-      `flux-exchange-release-manifest.json.<key-id>.minisig`, at most 4 KiB, and Flux verifies it with
-      currently valid delegated release public key under the same id; provenance complements and never
-      substitutes for that signature. Routine rotation introduces
-      `flux-exchange-channel-2026-02`/`flux-exchange-release-2026-02` in a higher root-signed
-      delegation generation, then a transition channel/manifest declares old+new role keys and carries
-      both signatures, then a still-higher delegation/channel generation may retire the old signers.
-      None of those steps changes Flux. Only rotating/removing the long-lived
-      `flux-exchange-root-2026-01`, changing the root trust policy, or requiring an incompatible
-      schema/protocol/client changes Flux. A missing transition signature, expired/wrong-role/unknown
-      delegated id, id/signature disagreement, signer switch without root-authorized overlap or
-      accepting an unlisted extra signature refuses. Production root/trust enforcement has only an
-      injected test-double seam under `cfg(test)`.
-- [ ] Network installation admits only the two compiled metadata URLs above and immutable release
-      inputs derived under
-      `https://github.com/codewandler/flux-exchange/releases/download/vX.Y.Z/`; signed documents carry
-      the exact compiled repository identity but no download URL. The client permits HTTPS on that
-      exact host, repository and closed paths, ignores proxy environment/config,
-      sends no release credential, accepts no redirect, query or fragment,
-      proxy-selected replacement or mutable release API response, and uses the guarded pinned-address
-      HTTP seam. The manifest basename is exactly `flux-exchange-release-manifest.json`; signature,
-      archive and provenance basenames must be the ones closed over by the manifest contract.
-      Manifest/signature bodies are capped as above; an archive is capped at 256 MiB both
-      by declared and received bytes with a 10-second connect and 120-second total deadline.
-- [ ] The signed asset set is closed and equals Exchange X-126/X-127's released supported-platform
-      set; Flux selects only its exact target. Extraction admits at most 16 regular-file members,
-      240 UTF-8 bytes per relative path, 256 MiB per member and 512 MiB total expanded bytes. It
-      rejects absolute/parent
-      paths, links, devices, FIFOs, duplicate or case-colliding paths, trailing data, an undeclared
-      member, more than one executable, the wrong executable basename, size/digest disagreement and
-      bytes whose side-effect-free `compatibility --json` identity differs from the selected channel
-      entry/manifest or falls outside Flux's compiled protocol policy.
-      A target entry itself is the signed released-platform claim and is accepted only from an X-126
-      release whose native gate includes X-127's fail-closed owner-only restart proof for credentials,
-      settings, grants, labelled connections and Service Accounts; an ad-hoc/cross-compiled asset or
-      `/health` response cannot manufacture platform support.
+- [ ] The Flux build pins one `ExchangeChannelPolicy`: X-126's exact GitHub release request origin,
+      long-lived offline minisign root keys/threshold policy, the provider-owned trust/channel/
+      manifest/compatibility/readiness schema ids, and the protocol versions this client implements.
+      It embeds no routine online signer and no Exchange tag, semver, source commit, build id,
+      manifest/executable digest or connector version. Configuration, environment, project files,
+      model input and an unsigned `latest` lookup cannot replace or widen it.
+- [ ] Exchange X-126/X-128 own the exact canonical v1 schemas and positive/adversarial fixtures:
+      `exchange.release-trust.v1` (at most 64 KiB, 1..=4 keys per delegated role),
+      `exchange.release-channel.v1` (at most 256 KiB and 1..=128 release entries),
+      `exchange.release-manifest.v1` (at most 256 KiB, exactly five target assets and the declared
+      16-member/256 MiB-member/512 MiB-expanded bounds), `exchange.compatibility.v1`, and
+      `exchange.supervisor-ready.v1` (at most 16 KiB). Flux consumes their identifiers, fields,
+      RFC 8785 byte canonicalization, bounds and fixture bytes verbatim. It does not publish local
+      aliases, normalize provider field names or maintain a second independently shaped v1. A
+      provider fixture change without the matching supported schema id makes the cross-repository
+      conformance test fail before implementation.
+- [ ] Fetches begin only from X-126's fixed HTTPS requests: trust at
+      `https://github.com/codewandler/flux-exchange/releases/download/exchange-trust-v1/flux-exchange-release-trust.json`,
+      channel at
+      `https://github.com/codewandler/flux-exchange/releases/download/exchange-stable-v1/flux-exchange-release-channel.json`,
+      and selected immutable release inputs at
+      `https://github.com/codewandler/flux-exchange/releases/download/vX.Y.Z/<signed-basename>`.
+      Metadata signatures use the same directory and exact derived basename. Source URLs have the
+      exact scheme, default port, host, repository/path and no userinfo, fragment or
+      caller-controlled component. Flux ignores proxy environment/config and sends no credential,
+      cookie or proxy authorization.
+- [ ] Because real GitHub Release assets return a redirect, the fetcher permits exactly one response
+      accepted by X-126's transport fixture: `302 Found`, with an absolute HTTPS
+      `Location` with default port, no userinfo/fragment, host exactly
+      `release-assets.githubusercontent.com`, and length at most 8192 bytes. Its ASCII path must match
+      `/github-production-release-asset/[1-9][0-9]{0,19}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`;
+      its query is at most 6144 bytes, has no duplicate or percent-encoded names, and has non-empty,
+      at-most-2048-byte valid percent-encoded values with no decoded control character. The only
+      names admitted are `jwt`, `response-content-disposition`,
+      `response-content-type`, `rscd`, `rsct`, `se`, `sig`, `ske`, `skoid`, `sks`, `skt`, `sktid`,
+      `skv`, `sp`, `spr`, `sr` and `sv`. The follow-up request is newly constructed and forwards no
+      cookie, authorization, proxy authorization or other credential-bearing header. A relative,
+      oversized or malformed location, different host/scheme/port, disallowed source path, missing
+      location, second redirect or final status other than `200` refuses. The transient CDN URL is
+      never logged or persisted. Redirect transport never establishes identity: root/role signatures,
+      signed origin/tag/basename, SHA-256 and response byte bounds still decide acceptance.
+- [ ] Flux first verifies current root-threshold signatures over X-126's trust metadata, then its
+      monotonic version/expiry and delegated channel/release role thresholds, validity intervals and
+      key usage. It refreshes that metadata before rejecting an otherwise unknown online signer.
+      Unknown root/role, role confusion, threshold failure, not-yet-valid/expired metadata or key,
+      lower version, or changed bytes at one version refuses before the channel is read. Production
+      root/trust policy has only an injected `cfg(test)` seam.
+- [ ] From a threshold-signed, canonical, unexpired channel with a generation no lower than the
+      owner-only rollback floor, Flux chooses the greatest stable SemVer whose provider-declared
+      Exchange API, effective-catalogue response, invoke request/response, connection-plan and
+      supervisor protocol identities are all supported. It skips a newer incompatible entry and
+      names refusal when none is compatible; package version, local install time, `latest`, `PATH` and
+      sibling checkouts never substitute for protocol compatibility. The selected immutable manifest
+      must match the channel's signed identity/digest and satisfy the current delegated release role.
+- [ ] Owner-only trust/channel state atomically stores each highest accepted metadata version/
+      generation and SHA-256 after the selected release verifies. A lower value always refuses as
+      rollback; the same value requires the same SHA-256; a higher value advances and never decreases
+      after interruption. There is no production reset/downgrade/ignore-expiry switch. A cached
+      channel is usable without network only while both it and its trust metadata remain current;
+      otherwise a fresh fetch or equally verified offline import is required.
+- [ ] Routine delegated signer rotation follows X-126's root-threshold overlap fixtures and requires
+      no Flux release. Compatible Exchange releases, including releases carrying new connector
+      catalogues, likewise require no Flux release. Only a root/trust-policy change not already
+      admitted by the pinned threshold policy, or an unsupported schema/protocol/client change,
+      requires Flux to change.
+- [ ] The selected manifest's exact release identity/digests become installed audit, cache-validation
+      and process-ownership metadata, never compiled compatibility policy. Flux admits only its exact
+      target from X-126's five-platform closed set, whose publication already requires X-127's native
+      owner-only persistence/restart proof. Extraction and side-effect-free `compatibility --json`
+      use the provider manifest fixtures and refuse every undeclared member, path trick, size/digest/
+      identity mismatch or protocol outside the compiled policy before execution.
 
 ### Atomic cache, offline import and quarantine
 
@@ -238,17 +109,17 @@ owner, never an Exchange runtime, binary distributor or credential holder.
       explicit stopped `reinstall`) selects the then-current newest compatible release. A channel
       update does not silently rewrite the exact identity attached to an already-owned process.
 - [ ] Flux alone owns offline installation through
-      `flux exchange local import --delegation <path> --root-signature <path> --channel-index <path> --channel-signature <path>... --manifest <path> --signature <path>... --archive <path> --provenance <path>`.
-      Channel/release signature options are repeatable and every signature set must supply exactly the
-      ids its signed document declares. Exchange
+      `flux exchange local import --trust <path> --root-signature <path>... --channel <path> --channel-signature <path>... --manifest <path> --release-signature <path>... --archive <path> --provenance <path>`.
+      Signature options are repeatable; each set must use only keys named for that role and satisfy
+      the provider fixture's threshold. Exchange
       has no importer/downloader and `start` has no artifact-path or URL option. Import performs the
-      identical offline-root delegation, role/time validity, channel authenticity, expiry,
+      identical offline-root trust, role/time validity, channel authenticity, expiry,
       monotonic-generation, newest-compatible selection,
       manifest/signature, bounds, platform, archive, executable and compatibility checks as network
       installation. Production has no unsigned, skip-verification, alternate-key or
       allow-incompatible override and never searches `PATH`, a sibling checkout, a Cargo target
-      directory or an operator-selected executable. Offline import requires the root-signed
-      delegation, delegated signed channel, selected signed manifest, archive and provenance as one
+      directory or an operator-selected executable. Offline import requires the root-signed trust
+      metadata, delegated signed channel, selected signed manifest, archive and provenance as one
       closed set; it has no reduced offline asset set or direct-manifest shortcut.
 - [ ] A failed candidate is removed from staging and cannot disturb a currently verified install.
       If a previously visible install fails cache-hit revalidation, Flux atomically moves that whole
@@ -294,33 +165,11 @@ owner, never an Exchange runtime, binary distributor or credential holder.
       start/stop is idempotent and a second Exchange child is never silently created.
 - [ ] Exchange X-128 supplies exactly one readiness record on a dedicated inherited one-shot
       pipe/handle after the listener has bound and before it accepts lifecycle ownership. The record
-      is strict JSON, at most 16 KiB, followed by EOF, with this exact shape:
-
-      ```json
-      {
-        "schema": "exchange.supervisor-ready.v1",
-        "release": {
-          "tag": "refs/tags/vX.Y.Z",
-          "version": "X.Y.Z",
-          "source_commit": "<40 lowercase hex>",
-          "build_id": "<1..128 printable ASCII bytes>",
-          "executable_sha256": "<64 lowercase hex>"
-        },
-        "protocols": {
-          "exchange_api": "<versioned id>",
-          "effective_catalogue": "<versioned id>",
-          "invoke": "<versioned id>",
-          "connection_plan": "exchange.connection-plan.v1"
-        },
-        "bind": { "scheme": "http", "host": "127.0.0.1|::1", "port": 1 },
-        "process": { "pid": 1, "start_identity": "<OS process-start identity>" }
-      }
-      ```
-
-      Flux commits ownership only when the record arrives within ten seconds, is the sole frame, the
-      bind is loopback and matches the actual listener, the process id/start identity matches the
-      child handle the supervisor created, and every release/protocol field matches the verified
-      selected signed channel entry, manifest, compatibility output and compiled protocol policy.
+      is provider-fixture-valid `exchange.supervisor-ready.v1`, at most 16 KiB and followed by EOF.
+      Flux commits ownership only when it arrives within ten seconds, is the sole frame, the provider
+      bind field is loopback and matches the actual listener, the provider process-start identity
+      matches the child handle the supervisor created, and every provider release/protocol field
+      matches the selected signed channel entry, manifest, compatibility output and compiled policy.
       `/health`, a stdout marker, application logs
       or a listener already occupying the port proves none of those facts and cannot substitute.
 
@@ -343,12 +192,12 @@ owner, never an Exchange runtime, binary distributor or credential holder.
       ```
 
       `channel`, when accepted, is exactly
-      `{name,delegation_generation,delegation_sha256,generation,index_sha256,expires_at}` (`name` is
+      `{name,trust_version,trust_sha256,generation,index_sha256,expires_at}` (`name` is
       `stable`, generations are JSON integers and the rest strings). `release`, when installed, is
       exactly `{tag,version,source_commit,build_id,target,manifest_sha256,executable_sha256}` with
       string values and is audit/ownership identity, not Flux policy; `endpoint`, only after verified
       readiness, is exactly `{scheme,host,port}`. The closed v1 status diagnostic codes are
-      `delegation_invalid`, `delegation_expired`, `delegation_rollback`, `channel_invalid`,
+      `trust_invalid`, `trust_expired`, `trust_rollback`, `channel_invalid`,
       `channel_expired`, `channel_rollback`, `manifest_missing`, `signature_invalid`,
       `signing_key_unknown`, `origin_refused`, `archive_invalid`,
       `executable_invalid`, `cache_permissions`, `control_unavailable`, `control_auth_failed`,
@@ -374,15 +223,16 @@ owner, never an Exchange runtime, binary distributor or credential holder.
 
 ### Failing-first proof and release boundary
 
-- [ ] Hermetic fixtures use a test-only offline root plus delegated channel/release keys and cover
-      valid network install, valid offline import and cache reuse, then root/delegation/channel/
-      manifest/signature/key-id/role/dual-signature tampering, expired or overlong validity, future
-      issuance, delegation/channel generation rollback, same-generation digest drift,
-      redirect, mutable/wrong origin,
-      oversized/slow bodies, target/asset-set drift, archive bombs/path tricks, archive/executable
-      digest mismatch, compatibility mismatch, widened cache permissions, concurrent/interrupted
-      installs, quarantine and explicit reinstall. Mutation proves removal of signature, executable or
-      cache-hit revalidation makes a test fail. A release-cadence test adds a greater compatible
+- [ ] Flux runs X-126/X-128's provider-owned positive and adversarial conformance fixtures verbatim,
+      including their test root/delegated keys. A checked fixture inventory/digest fails if a local
+      copy is hand-edited, omitted or locally reinterpreted under another v1 shape. Those fixtures plus
+      Flux lifecycle cases cover valid network install, valid offline import and cache reuse, then
+      root/trust/channel/manifest/signature/key-id/role/threshold tampering, expired or overlong
+      validity, future issuance, trust-version/channel-generation rollback, same-version/generation
+      digest drift, redirect confusion, mutable/wrong origin, oversized/slow bodies, target/asset-set
+      drift, archive bombs/path tricks, archive/executable digest mismatch, compatibility mismatch,
+      widened cache permissions, concurrent/interrupted installs, quarantine and explicit reinstall.
+      Mutation proves removal of signature, executable or cache-hit revalidation makes a test fail. A release-cadence test adds a greater compatible
       Exchange version to a higher signed channel generation and proves an unchanged Flux binary
       selects it; a signer-cadence test rotates both delegated roles through a root-signed overlap and
       proves the unchanged binary accepts the new-only successor; an incompatible greater version is
@@ -409,15 +259,17 @@ owner, never an Exchange runtime, binary distributor or credential holder.
 - 2026-08-04: Architecture correction replaced the exact-Exchange-release pin with a signed,
   expiry-bounded, monotonic stable channel. Flux now pins trust/origin/protocol policy only; installed
   version and digests are audit/ownership facts rather than a release-cadence coupling.
+- 2026-08-04: Cross-repository reconciliation removed Flux-owned wire shapes and made X-126/X-128's
+  canonical schemas, redirect contract and conformance fixtures the single provider-owned source.
 
 ## Notes
 
 - Cross-repository authority:
   `../flux-roadmap/decisions/0004-flux-manages-a-verified-local-exchange.md` at coordinator commit
-  `71fea6c74be93851bd3ad4e095b432026bf8363d`.
-- Direct dependencies are Exchange X-126 (root delegation, signed monotonic stable index and
+  `013a2ab0e1632e67f272e0903cde30dfc1c85db8`.
+- Direct dependencies are Exchange X-126 (root-signed trust metadata, signed monotonic channel and
   immutable release manifests/artifacts) and X-128
-  (compiled compatibility plus the one-shot readiness record). X-127 is required transitively and
+  (the one-shot readiness record/schema/fixtures). X-127 is required transitively and
   observably: X-126 may publish a target only after X-127's native owner-only persistence/restart
   gate, and C-510 accepts only that signed released-platform set. C-509 consumes C-510 only after
   those Exchange contracts and C-510 itself are released.
