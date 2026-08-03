@@ -2,7 +2,7 @@
 id: C-510
 title: "Install and supervise a verified local Exchange release"
 pillar: Core
-status: ready
+status: in-progress
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
