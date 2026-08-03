@@ -194,9 +194,11 @@ current feature rather than an official outbound integration executor. See
 
 > **Current seam:** Flux's embedded client authenticates as one Service Account, projects its
 > effective catalogue at turn boundaries, and calls Exchange's one-shot HTTP `invoke` route.
-> Configure it only through `FLUX_EXCHANGE_URL` and
-> `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN`; tenant, connection, credential, grant and runtime remain
-> Exchange-owned. Generated socket channels can publish their closed declared event sets to
+> Its `FLUX_EXCHANGE_URL` plus `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN` environment setup is
+> transitional C-503 compatibility, not the Milestone 1 bootstrap; C-509 replaces the bearer
+> environment path with an Exchange-owned direct handoff into secure storage. Tenant, connection,
+> credential, grant and runtime remain Exchange-owned. Generated socket channels can publish their
+> closed declared event sets to
 > authenticated `/api/subscribe`, but Flux does not yet consume subscribe, streaming, cancellation,
 > terminal lifecycle or leases. Today's native plugin pack remains a temporary compatibility route
 > for adapters that have not completed migration.

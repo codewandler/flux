@@ -30,6 +30,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The Exchange environment bearer is now documented as transitional compatibility** (C-511).
+  C-503's lower-level embedded-client setup remains available and redacted, but public and
+  contributor guidance no longer presents it as the Milestone 1 bootstrap: C-509 replaces it with
+  an Exchange-owned direct handoff into secure storage.
+
 - **Direct dependency changes are now explicit review events** (C-450). CI compares each workspace's
   exact resolved direct edges with a committed review lock, including which selected packages run a
   Cargo build script. Adding, moving, renaming or upgrading a direct dependency now fails with the

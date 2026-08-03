@@ -35,7 +35,9 @@ second execution placement.
   channels. General rich-runtime dispatch remains planned.
 - Flux now embeds the Exchange client. When `FLUX_EXCHANGE_URL` and
   `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN` are configured, it projects that account's effective
-  catalogue between turns and invokes admitted one-shot HTTP operations. Subscribe, streaming,
+  catalogue between turns and invokes admitted one-shot HTTP operations. That environment bearer is
+  transitional C-503 compatibility, not final onboarding; C-509 replaces it with an Exchange-owned
+  direct handoff into secure storage. Subscribe, streaming,
   cancellation frames, terminal lifecycle and leases remain planned.
 
 This direction changes ownership and the migration target. It does **not** claim that Docker,
