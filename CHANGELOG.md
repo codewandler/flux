@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The public Plugins and Direction sections now state the connector-native destination** (C-501).
+  The signed first-party plugin pack is labelled as today's compatibility path, the Direction
+  sidebar exposes the migration program, and the new page records ownership, current limitations,
+  parity gates and the rule that generic plugin support may remain after vendor crates move.
+
 ## [0.54.3] - 2026-08-03
 
 ### Changed

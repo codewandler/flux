@@ -5,7 +5,7 @@ pillar: Core
 status: done
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
-note: "make the accepted runtime-axis destination explicit: Flux owns generic execution, not official vendor adapters; local and Exchange placements serve the same connector"
+note: "public Plugins and Direction sections now join the canonical docs in naming the signed pack as compatibility and connectors as the gated destination"
 ---
 
 # Align Flux documentation with connector-native integrations
@@ -27,11 +27,20 @@ gap, with a roadmap that points to every implementation and retirement story.
       approval work it consumes.
 - [x] Engineering and customer changelogs record the direction without claiming any new executor or
       migrated connector ships in this change; docs/website gates pass.
+- [x] The public Plugins landing page labels the signed first-party pack as a compatibility path,
+      and Direction has a dedicated page stating the destination, migration gates and honest current
+      boundary.
 
 ## Progress
 
 - 2026-08-03: Done after cross-repository and worktree audit; contributor and public mirrors now
   distinguish the compatibility plugin fleet from the accepted connector destination.
+- 2026-08-03: Reopened after a public-site review found that `plugins/using-plugins.md` still
+  presented the pack without its migration status and the Direction sidebar exposed no page for the
+  program. The broader Ecosystem, Vision, Roadmap, README and topology pages were already aligned.
+- 2026-08-03: Closed the missed public-site gap: Plugins now labels the pack as the current
+  compatibility path, Direction publishes ownership/current-state/cutover gates, the customer
+  changelog mirror is current, and two deterministic embedded-site builds agree.
 
 ## Notes
 

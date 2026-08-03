@@ -5,6 +5,19 @@ description: "Installing and running trusted Flux plugins, including source choi
 
 # Using plugins
 
+:::note Current compatibility path
+The signed first-party plugin pack is the supported way to use GitLab, Slack, Docker, Kubernetes,
+SQL, observability, secret-store, and other official integrations **today**. It is not their
+permanent source model.
+
+The accepted direction moves every official vendor-specific integration to
+**flux-connectors**, with an explicit runtime that Flux can execute locally or Flux Exchange can
+host under tenant authority. Flux keeps generic guarded runtimes—including the stdio plugin
+protocol where it is useful—rather than permanent vendor-specific crates. Existing plugins remain
+available until connector parity, local and hosted conformance, and an explicit cutover have all
+passed. See [Connector-native integrations](../direction/connector-native-integrations.md).
+:::
+
 Plugins are trusted subprocess binaries that extend Flux with new operations. Each declared
 operation is projected as a policy-gated tool, so the same authorization, approval, and guarded-IO
 chain that protects built-ins also protects plugin calls.
@@ -80,7 +93,7 @@ hash-integrity claim. Review the repository and pin `--rev` when you need the re
 itself to be immutable. Reinstalling the same resolved commit is an idempotent no-op unless you pass
 `--force`.
 
-## What's in the pack
+## What's in the compatibility pack
 
 | Category | Plugins |
 |---|---|

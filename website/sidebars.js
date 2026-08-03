@@ -179,7 +179,11 @@ const sidebars = {
     {
       type: 'category',
       label: 'Direction',
-      items: ['direction/portable-wasm-runtime', 'agent/improvement'],
+      items: [
+        'direction/connector-native-integrations',
+        'direction/portable-wasm-runtime',
+        'agent/improvement',
+      ],
     },
   ],
 };

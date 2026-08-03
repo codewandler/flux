@@ -12,6 +12,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Fixed
+
+- **The Plugins and Direction guides now tell the same migration story as the roadmap.** The signed
+  plugin pack remains the supported compatibility path today, while official integrations move to
+  connectors only after local and hosted parity is proven.
+
 ## [0.54.3] - 2026-08-03
 
 ### Improved
