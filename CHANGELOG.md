@@ -72,8 +72,9 @@ All notable changes to this project are documented in this file. The format is b
 ### Fixed
 
 - **Embedded release documentation is independent of its checkout path** (C-495). Docusaurus now
-  receives path-independent sidebar, stylesheet, theme, and local-plugin identifiers, and the
-  archive builder refuses any client bundle that contains the checkout root.
+  receives path-independent sidebar, stylesheet, theme, local-plugin, generated-module, and Babel
+  helper identifiers; the archive builder refuses any client bundle that contains the checkout
+  root and packages the deterministic non-mangled production output.
 
 - **Default web.fetch no longer links the PDF parser affected by RUSTSEC-2026-0187** (C-494).
   Detected PDF bodies stay opaque unless the new pdf feature is enabled; that feature uses the

@@ -26,3 +26,7 @@ not of the absolute directory where that source was checked out.
   installed search-theme paths serialized from `require.resolve`; page content was identical.
 - `scripts/build-embedded-docs.sh` now rejects a generated site containing its checkout root before
   packaging it.
+- Docusaurus also generated absolute client-module and Babel-helper requests, and Webpack's default
+  numeric module IDs and minifier salted output with those physical filenames. The release bundle
+  uses bare helper imports, root-normalized module IDs, and deterministic non-mangled output; zip
+  compression keeps the archive overhead bounded.

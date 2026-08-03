@@ -81,7 +81,7 @@ const config = {
 
   themes: [
     [
-      '@easyops-cn/docusaurus-search-local',
+      './plugins/search-local',
       {
         // Offline, index-based search — no external service (Algolia) needed.
         hashed: true,

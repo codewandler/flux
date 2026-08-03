@@ -15,7 +15,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 (
   cd "$ROOT/website"
-  npm run build
+  # Webpack's production minifier salts mangled identifiers with the absolute input filename. The
+  # archive is already compressed, so retain the deterministic optimized bundle without mangling.
+  npm run build -- --no-minify
 )
 
 mkdir -p "$TMP/site"
@@ -30,7 +32,8 @@ find "$TMP/site" -type f \( -name '*.xml' -o -name '*.html' \) -exec \
 
 # An absolute source/plugin path in a client bundle makes the release archive depend on where its
 # source tree happened to be checked out. Refuse it before the deterministic zip hides the cause.
-if grep -R -F -q -- "$ROOT" "$TMP/site"; then
+ENCODED_ROOT=$(printf '%s' "$ROOT" | sed -E 's/[^A-Za-z0-9_$]+/_/g')
+if grep -R -F -q -- "$ROOT" "$TMP/site" || grep -R -F -q -- "$ENCODED_ROOT" "$TMP/site"; then
   echo "built docs contain the checkout root" >&2
   exit 1
 fi
