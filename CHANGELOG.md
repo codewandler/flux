@@ -23,6 +23,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The release gate's SDK secure-defaults test is now isolated from an outer Flux sandbox**
+  (C-251). The automatic cut intentionally runs with `FLUX_SANDBOX=require`; the test now clears and
+  restores that inherited process policy while asserting the SDK's unset-environment defaults, so a
+  confined release validates the intended subject instead of mistaking its parent posture for an SDK
+  regression.
+
 - **The Flux-authored release flow now validates the scribe's textual JSON before reading fields**
   (C-251). `release_parse_notes` is a pure, strict model-to-host adapter: it normalizes one canonical
   `json` Markdown fence, while surrounding prose, missing or extra fields, and invalid bump opinions
