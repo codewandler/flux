@@ -2,7 +2,7 @@
 id: C-498
 title: "Embedded docs drift under the GitHub Pages environment"
 area: Docs
-status: in-progress
+status: done
 priority: 1
 areas: [docs, release, ci]
 note: "found by the v0.54.0 main workflow: GITHUB_PAGES=true rebuilds a different server archive, while the release candidate gate did not refresh the docs changed in the release"
@@ -17,13 +17,13 @@ source, independent of GitHub Pages runner variables, and ship the refreshed arc
 
 ## Acceptance
 
-- [ ] **Failing first:** `GITHUB_PAGES=true scripts/build-embedded-docs.sh --check` reproduces the
+- [x] **Failing first:** `GITHUB_PAGES=true scripts/build-embedded-docs.sh --check` reproduces the
       stale-archive failure from website workflow run 30780486792.
-- [ ] The embedded-docs builder explicitly excludes the Pages-only environment from its Docusaurus
+- [x] The embedded-docs builder explicitly excludes the Pages-only environment from its Docusaurus
       subprocess; builds with `GITHUB_PAGES` set and unset produce the same archive.
-- [ ] `public-docs.zip` is regenerated from the v0.54 documentation and the website workflow is
+- [x] `public-docs.zip` is regenerated from the v0.54 documentation and the website workflow is
       green on main.
-- [ ] A patch release rebuilds all platform artifacts from the corrected committed archive and its
+- [x] A patch release rebuilds all platform artifacts from the corrected committed archive and its
       release/publish workflows complete successfully.
 
 ## Progress
@@ -37,3 +37,6 @@ source, independent of GitHub Pages runner variables, and ship the refreshed arc
   website changelog after the one-time archive refresh. The cutter now regenerates, verifies,
   snapshots and commits the archive after all release-owned website edits; v0.54.2 will carry the
   corrected invariant.
+- 2026-08-03: exact-SHA candidate run 30784525192 rebuilt and attested every platform archive;
+  release run 30787166399 promoted v0.54.2 and crates run 30787166427 published its complete crate
+  closure. The public release is https://github.com/codewandler/flux/releases/tag/v0.54.2.
