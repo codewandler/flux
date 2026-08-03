@@ -1485,6 +1485,7 @@ dependencies = [
  "codewandler-flux-plugin",
  "codewandler-flux-policy",
  "codewandler-flux-runtime",
+ "codewandler-flux-secret",
  "codewandler-flux-spec",
  "codewandler-flux-system",
  "lopdf 0.44.0",

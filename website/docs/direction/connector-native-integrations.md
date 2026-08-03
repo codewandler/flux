@@ -33,13 +33,15 @@ second execution placement.
   behavior, not the future architecture.
 - Exchange invokes admitted HTTP connector operations and terminates generated connector socket
   channels. General rich-runtime dispatch remains planned.
-- Flux does not yet embed the Exchange client, so it cannot project an effective Service Account
-  catalogue or invoke those operations from an agent turn today.
+- Flux now embeds the Exchange client. When `FLUX_EXCHANGE_URL` and
+  `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN` are configured, it projects that account's effective
+  catalogue between turns and invokes admitted one-shot HTTP operations. Subscribe, streaming,
+  cancellation frames, terminal lifecycle and leases remain planned.
 
 This direction changes ownership and the migration target. It does **not** claim that Docker,
 Kubernetes, SQL, observability, or secret-store connectors already replace their plugins. Core Flux
-remains useful without Exchange; official external integrations are unavailable when Exchange is
-unavailable once they migrate.
+remains useful without Exchange; Exchange-backed official external integrations are unavailable
+when Exchange is unavailable.
 
 ## Cutover gates
 

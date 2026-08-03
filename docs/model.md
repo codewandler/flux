@@ -428,6 +428,14 @@ Run `flux auth status` to see what credentials are currently resolved and from w
 
 ## All supported providers
 
+Flux's text/turn path has **eight production `-m` prefixes over four wire codecs** in the shipped
+registry (`flux_providers::spec::KNOWN_PROVIDERS`): Anthropic Messages, OpenAI Chat, OpenAI Responses,
+and Bedrock's Anthropic event-stream transport. The table also includes `mock`, the CLI's ninth,
+offline-only selection; it is a deterministic test provider rather than a production model service.
+Voice is a separate interface: the optional `realtime` feature supplies one concrete
+`RealtimeProvider`, OpenAI Realtime over WebSocket. These numbers count selectable transports, not
+the models a gateway exposes.
+
 | `-m` prefix | Wire | Env var | Notes |
 |---|---|---|---|
 | `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` | Supported; bare aliases `fable`/`opus`/`sonnet`/`haiku` |
@@ -435,9 +443,38 @@ Run `flux auth status` to see what credentials are currently resolved and from w
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | Full streaming + tool-call support |
 | `codex` | OpenAI Responses | — | ChatGPT/Codex OAuth; opt-in (`flux auth login codex`) |
 | `aws` | Anthropic Messages (Bedrock) | `AWS_*` / SSO / IRSA / EKS Pod Identity | Claude via AWS Bedrock; full credential chain, no `aws` CLI; metered; region-aware model ids |
-| `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | Proxies a large catalog of models; the `provider/model` slug after `openrouter/` is forwarded verbatim; recovers inline-text tool calls |
+| `openrouter` | Anthropic Messages | `OPENROUTER_API_KEY` | Proxies a large catalog of models; the `provider/model` slug after `openrouter/` is forwarded verbatim |
 | `ollama` | OpenAI Chat | — | Local models; no key; `OLLAMA_HOST` overrides `localhost:11434`; needs a tool-capable model |
 | `ollama-anthropic` | Anthropic Messages | — | Local Ollama's Messages endpoint (recent builds) — native `tool_use` |
 | `mock` | — | — | Offline test provider; no key, exercises the full pipeline |
+
+### Provider-breadth strategy
+
+Flux does **not** aim to add a built-in prefix for every model vendor. The maintained in-tree set is
+for a distinct wire protocol, credential lifecycle, or provider behavior that needs Flux's stream,
+tool-call, history, cancellation, and usage invariants tested here. A logo or a different base URL is
+not enough. This keeps each shipped provider supported rather than accumulating a long catalogue of
+nearly identical, partially tested adapters.
+
+To reach a model or vendor Flux does not name:
+
+1. If OpenRouter lists it, use its catalogue id verbatim: `-m openrouter/<vendor>/<model>`. This is
+   the default long-tail path and uses the maintained Anthropic Messages codec. For example,
+   `-m openrouter/z-ai/glm-4.6` does not require a built-in `z-ai` provider.
+2. For a local Ollama-served model, set `OLLAMA_HOST` when needed and use `ollama/<model>` (OpenAI
+   Chat) or `ollama-anthropic/<model>` (Anthropic Messages). Flux does not claim that an arbitrary
+   hosted OpenAI-compatible base URL is configurable through the stock `openai` prefix; it is not.
+3. In an embedded Rust product, pass any implementation of `flux_sdk::Provider`. When the server
+   already speaks one of the supported request/stream shapes, compose
+   `flux_provider::NativeProvider` from a `WireCodec` and `Credential`; implement a codec only for a
+   genuinely different wire. This custom provider is an embedder dependency, not a new Flux CLI
+   prefix or a promise that Flux CI maintains it.
+
+Provider connectors/plugins are not the chosen extension path. Connectors describe effect operations
+executed by Exchange, while a model provider participates inside the model loop and must preserve its
+streaming ledger. The native plugin compatibility path is also scheduled for removal. Treating either
+as a provider loader would blur those boundaries and invent a second provider lifecycle. The strategy
+is therefore a narrow, quality-gated in-tree registry plus gateway coverage for the long tail and the
+existing Rust `Provider` interface for embedders—not catalogue parity one vendor at a time.
 
 See [docs/architecture.md](architecture.md) for the provider layer design and [docs/usage.md](usage.md) for the full CLI reference.

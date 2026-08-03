@@ -31,6 +31,7 @@ pub mod condense;
 pub mod crawl;
 pub mod digest;
 mod egress;
+pub mod exchange;
 pub mod fetch;
 pub mod http;
 

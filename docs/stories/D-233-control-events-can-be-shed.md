@@ -2,7 +2,7 @@
 id: D-233
 title: "A control event *can* be shed, silently and uncounted — three places say it never is"
 pillar: Agent
-status: ready
+status: done
 priority: 3
 design: docs/designs/meeting-rooms.md
 epic: meeting-rooms
@@ -35,14 +35,14 @@ nothing consumes the inbound stream until D-209.
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test flooding 33+ *control* events into an unconsumed stream and asserting
+- [x] **Failing-first**: a test flooding 33+ *control* events into an unconsumed stream and asserting
       either that none is lost, or that a loss is counted and surfaced — failing at the merge base.
-- [ ] Either the guarantee becomes true, or the wording in **all three places** is narrowed to what the
+- [x] Either the guarantee becomes true, or the wording in **all three places** is narrowed to what the
       code delivers (e.g. *"never shed because of audio"*). ⚠ Do not fix the comment in one place and
       leave the other two — a claim that survives in two of three files is how this recurs.
-- [ ] A shed control event is **counted**, whatever the wording ends up being. Silent and uncounted is
+- [x] A shed control event is **counted**, whatever the wording ends up being. Silent and uncounted is
       the part with no defence.
-- [ ] ⚠ Coordinate with [D-209](D-209-room-audio-in.md): it consumes the inbound stream and will lean on
+- [x] ⚠ Coordinate with [D-209](D-209-room-audio-in.md): it consumes the inbound stream and will lean on
       this guarantee. If D-209 lands first, the pressure disappears in practice but the claim is still
       wrong — fix the claim regardless.
 
@@ -56,3 +56,15 @@ nothing consumes the inbound stream until D-209.
 ## Progress
 
 - Filed 2026-08-02 from D-208's review.
+- 2026-08-03 failing first: `cargo test -p codewandler-flux-channels --features room-media
+  rooms::media::tests::a_control_flood_is_shed_visibly_when_the_bounded_queue_is_full -- --exact
+  --nocapture` failed to compile because the control-loss counter did not exist; at the merge-base
+  behavior the 33rd control event was returned as dropped without incrementing any counter.
+- 2026-08-03: audio and control losses now have separate public diagnostics on both channel halves,
+  and every full-queue loss increments the matching counter. The module API, delivery variant and
+  meeting-room design consistently promise that audio cannot consume the control reserve while
+  explicitly documenting that control alone can exhaust it. D-209 remains ready and therefore does
+  not change this bounded-queue contract.
+- 2026-08-03: the focused regression and all five media module tests passed with `room-media` enabled;
+  package clippy with all targets and `-D warnings`, workspace formatting, and `git diff --check`
+  passed.

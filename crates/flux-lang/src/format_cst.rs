@@ -224,8 +224,9 @@ fn print(root: &SyntaxNode) -> String {
     out
 }
 
-/// The indentation depth of a line. A comment-only line aligns with the next real statement, since
-/// a trailing comment block at the end of a body would otherwise cling to its parent's depth.
+/// The indentation depth of a line. A comment-only line aligns with the next real statement. At
+/// end of input there is no following statement to reveal its scope, so an explicitly column-zero
+/// comment remains module-level even when the tolerant CST attached it to the last declaration.
 fn line_depth(lines: &[Vec<Piece>], i: usize) -> usize {
     let line = &lines[i];
     let first = &line[0];
@@ -236,6 +237,9 @@ fn line_depth(lines: &[Vec<Piece>], i: usize) -> usize {
             .find(|p| p.token.kind() != SyntaxKind::COMMENT)
         {
             return block_depth(&next.token);
+        }
+        if !first.spaced_in_source {
+            return 0;
         }
     }
     block_depth(&first.token)
@@ -336,6 +340,17 @@ mod tests {
         assert_eq!(
             formatted,
             "flow f\n  # a leading note\n  $x = 1  # trailing\n  return $x\n"
+        );
+    }
+
+    #[test]
+    fn preserves_comments_at_module_and_statement_boundaries() {
+        let src = "# before the first declaration\nflow first\n    $x   =   1 # trailing on a statement\n    return $x\n# between declarations\nflow second\n    return \"ok\"\n# after the last declaration\n";
+        let formatted = format_source(src).expect("formats");
+        assert_eq!(
+            formatted,
+            "# before the first declaration\nflow first\n  $x = 1  # trailing on a statement\n  return $x\n# between declarations\nflow second\n  return \"ok\"\n# after the last declaration\n",
+            "comment columns and the constructs they document are part of formatting correctness"
         );
     }
 

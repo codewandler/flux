@@ -268,6 +268,26 @@ let out = client.run("Summarize the README").await?;
 println!("{}", out.text);
 ```
 
+## Exchange integrations
+
+Flux can mount the connected, granted operations of one Exchange Service Account into each agent
+turn. Configure the Exchange origin and its one-time-issued bearer token in the host environment:
+
+```bash
+export FLUX_EXCHANGE_URL=https://exchange.example.com
+export FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN=fxsa_...
+flux
+```
+
+Flux refreshes the account's effective catalogue between turns and sends operation inputs to the
+bound Exchange origin. The token is startup configuration, never a tool argument. Exchange retains
+tenant, connection, credential, grant and runtime authority. If Exchange is absent or unavailable,
+its operations disappear while Flux's language, agent loop and core tools remain available.
+Bearer transport requires HTTPS except for an origin that resolves entirely to loopback, which is
+reserved for local development.
+One-shot `invoke` is the shipped slice; subscriptions, streaming, cancellation frames, terminal
+lifecycle and leases remain future lifecycle work.
+
 ## Plugin packs
 
 Official integrations — GitLab, Slack, Kubernetes, SQL and more — currently ship as a signed native
@@ -276,12 +296,11 @@ minisign-checked and every archive hash is verified before install, so the comma
 supported way to use those integrations today.
 
 The accepted migration makes Flux's embedded Exchange client the only future official integration
-path. Exchange executes connector-declared runtimes; Flux itself will execute no connector runtime
-and has no plugin fallback. Each adapter retires only after its Exchange replacement passes frozen
-parity evidence, then C-506 removes the plugin protocol, host, installer, signed pack and release
-artifacts. The client and those migrations do not ship yet. Flux remains useful without Exchange for
-its language, agent loop and core tools; official external integrations become unavailable when
-Exchange is unavailable.
+path. Its Service Account catalogue and one-shot invocation binding now ship. Exchange executes
+connector-declared runtimes; Flux itself executes no connector runtime and has no official fallback.
+Each adapter retires only after its Exchange replacement passes frozen parity evidence, then C-506
+removes the plugin protocol, host, installer, signed pack and release artifacts. Flux remains useful
+without Exchange for its language, agent loop and core tools.
 
 ```bash
 flux plugin install gitlab

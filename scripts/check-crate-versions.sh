@@ -14,7 +14,10 @@
 #
 #   scripts/check-crate-versions.sh              # compare HEAD against the previous v* tag
 #   BASE=v0.28.0 scripts/check-crate-versions.sh # explicit base
-#   scripts/check-crate-versions.sh --self-test  # prove the check catches a stale version
+#   scripts/check-crate-versions.sh --self-test  # prove both checks catch stale state
+#   scripts/check-crate-versions.sh --direct-dependencies root
+#   scripts/check-crate-versions.sh --direct-dependencies plugins
+#   scripts/check-crate-versions.sh --update-direct-dependencies root
 #
 # Exit 0 clean, 1 a stale version (a real failure), 2 the base tag could not be resolved.
 #
@@ -23,6 +26,69 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 fail() { printf '\033[31mFAIL\033[0m %s\n' "$1" >&2; }
+
+# Emit the exact resolved direct, external dependency edges for one workspace. Cargo.lock already
+# pins the resolved package; this review lock makes *which first-party package directly chose it*
+# visible too. The final column calls out Cargo's lifecycle-script analogue: a dependency whose
+# selected package runs a custom build target. Transitive packages are deliberately absent — this
+# is a decision register for dependencies Flux names directly, not a second Cargo.lock.
+direct_dependency_snapshot() {
+  local workspace="$1" manifest
+  case "$workspace" in
+    root) manifest="Cargo.toml" ;;
+    plugins) manifest="plugins/Cargo.toml" ;;
+    *) fail "unknown workspace '$workspace' (expected root or plugins)"; return 2 ;;
+  esac
+  command -v jq >/dev/null 2>&1 || {
+    fail "jq is required to verify the direct-dependency review lock"
+    return 2
+  }
+  printf '# member\tkind\tdependency\tpackage\tresolved\tsource\tbuild-script\n'
+  cargo metadata --manifest-path "$manifest" --locked --offline --format-version 1 \
+    | jq -r '
+        def pkg($id): first(.packages[] | select(.id == $id));
+        def hasbuild($p): (([$p.targets[].kind[]] | index("custom-build")) != null);
+        .resolve.nodes[] as $node
+        | (pkg($node.id)) as $member
+        | select($member.source == null)
+        | $node.deps[] as $dep
+        | (pkg($dep.pkg)) as $target
+        | select($target.source != null)
+        | $dep.dep_kinds[]
+        | [$member.name, (.kind // "normal"), $dep.name, $target.name,
+           $target.version, $target.source,
+           (if hasbuild($target) then "build.rs" else "-" end)]
+        | @tsv
+      ' \
+    | LC_ALL=C sort -u
+}
+
+check_direct_dependencies() {
+  local workspace="$1" expected tmp_dir actual
+  expected="scripts/direct-dependencies-${workspace}.lock"
+  tmp_dir="$(mktemp -d)"
+  actual="$tmp_dir/actual"
+  if ! direct_dependency_snapshot "$workspace" >"$actual"; then
+    rm -rf -- "$tmp_dir"
+    return 2
+  fi
+  if ! diff -u "$expected" "$actual"; then
+    rm -rf -- "$tmp_dir"
+    fail "$workspace direct dependencies changed without review acknowledgement"
+    echo "Review every added/moved edge and every new 'build.rs' marker, then run:" >&2
+    echo "  ./scripts/check-crate-versions.sh --update-direct-dependencies $workspace" >&2
+    return 1
+  fi
+  rm -rf -- "$tmp_dir"
+  printf '\033[32mPASS\033[0m %s direct dependencies match the review lock\n' "$workspace"
+}
+
+update_direct_dependencies() {
+  local workspace="$1" target
+  target="scripts/direct-dependencies-${workspace}.lock"
+  direct_dependency_snapshot "$workspace" >"$target" || return $?
+  echo "updated $target — review its dependency edges and build.rs markers"
+}
 
 # Does this manifest set its own version, rather than inheriting the workspace one? Only
 # independently-versioned crates are in scope: a workspace-inherited crate is bumped for the whole
@@ -79,8 +145,26 @@ version.workspace = true'
   bumped="$(package_version "${explicit/1.0.0/1.1.0}" "$ws")"
   [ "$bumped" != "$before" ] || { fail "self-test: a bumped version compared equal to the old one"; exit 1; }
 
-  printf '\033[32mPASS\033[0m self-test: stale versions are detectable, bumps are recognized\n'
+  # The review lock is intentionally exact: a new edge, moving an edge between members, changing
+  # the selected version/source, or gaining a build script all changes the bytes compared by diff.
+  baseline=$'crate-a\tnormal\tserde\tserde\t1.0.0\tregistry\t-'
+  added="$baseline"$'\ncrate-b\tnormal\tnew-dep\tnew-dep\t1.0.0\tregistry\tbuild.rs'
+  [ "$baseline" != "$added" ] || { fail "self-test: a new build-script dependency was invisible"; exit 1; }
+
+  printf '\033[32mPASS\033[0m self-test: stale versions and direct-dependency drift are detectable\n'
   exit 0
+fi
+
+if [ "${1:-}" = "--direct-dependencies" ]; then
+  [ -n "${2:-}" ] || { fail "--direct-dependencies requires root or plugins"; exit 2; }
+  check_direct_dependencies "$2"
+  exit $?
+fi
+
+if [ "${1:-}" = "--update-direct-dependencies" ]; then
+  [ -n "${2:-}" ] || { fail "--update-direct-dependencies requires root or plugins"; exit 2; }
+  update_direct_dependencies "$2"
+  exit $?
 fi
 
 BASE="${BASE:-}"

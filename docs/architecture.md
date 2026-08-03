@@ -206,9 +206,15 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
   Chat, OpenAI Responses).
 - **`Credential`** — auth/transport profile: tokens, base URL, gating headers, refresh.
 
-`provider/model` routing selects a cell. v1 ships `anthropic`, `claude`, `openai`, `codex`, `aws`
-(Bedrock), `openrouter`, `ollama`, and `ollama-anthropic`. Adding a
-provider is a small composition, never a fork of the loop. Streaming is a
+`provider/model` routing selects a cell. The production text registry has eight prefixes:
+`anthropic`, `claude`, `openai`, `codex`, `aws` (Bedrock), `openrouter`, `ollama`, and
+`ollama-anthropic`, composed over four concrete wire codecs. The separate full-duplex
+`RealtimeProvider` seam has one optional in-tree implementation, OpenAI Realtime. Adding a provider
+is a small composition, never a fork of the loop—but the maintained registry grows only for a
+genuinely distinct wire, credential lifecycle, or provider behavior. The long model-vendor tail goes
+through OpenRouter; Rust embedders can implement `Provider`. Model providers do not load as effect
+connectors or native plugins. See [the provider guide](model.md#provider-breadth-strategy) for the
+decision and the route to a provider Flux does not name. Streaming is a
 `Chunk` stream; usage accounting preserves input/cache tokens across `message_start`/`message_delta`.
 
 ## Agent loop, sessions, context

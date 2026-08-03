@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Flux now embeds the Exchange Service Account client for official integrations** (C-503).
+  Operator-only environment configuration binds one Exchange origin and bearer; its authenticated
+  effective catalogue is adopted between turns and one-shot operations run through Exchange's HTTP
+  `invoke` contract. Exchange retains credential, tenant, connection, grant and runtime authority.
+  An outage withdraws only Exchange operations, leaves core Flux usable, and never selects a local
+  or plugin fallback. Streaming, subscriptions, cancellation frames, terminal lifecycle and leases
+  remain outside this first slice.
+
 - **Running REPL sessions can adopt a plugin's refreshed operation catalog at the next turn
   boundary** (C-318). `/plugin-refresh <name>` publishes one atomic generation shared by prompting,
   validation, authorization and dispatch. Mid-turn and already-running calls retain their original
@@ -21,6 +29,28 @@ All notable changes to this project are documented in this file. The format is b
   and are mirrored in Prism, tree-sitter, TextMate and IntelliJ.
 
 ### Changed
+
+- **Direct dependency changes are now explicit review events** (C-450). CI compares each workspace's
+  exact resolved direct edges with a committed review lock, including which selected packages run a
+  Cargo build script. Adding, moving, renaming or upgrading a direct dependency now fails with the
+  exact regeneration command until its lock diff is acknowledged.
+
+- **The public security guide now distinguishes secret prevention from containment** (C-461). It
+  identifies connector, host-authentication and non-serializable endpoint guarantees; maps local
+  program/provider/plugin credentials to their actual materialization paths; and states the
+  redactor, destination-scope, rotation, audit, and raw prompt/answer durable-log limits without an
+  unqualified "the model never sees secrets" claim.
+
+- **The provider guide now states the supported breadth and the rule for extending it** (C-449).
+  Flux ships eight production text-provider prefixes over four wire codecs plus one optional realtime
+  implementation; the maintained strategy is a narrow in-tree registry, OpenRouter for the catalogue
+  tail, and the Rust `Provider` interface for embedders—not one built-in prefix per vendor or a model
+  provider loader hidden in connectors/plugins.
+
+- **The contributor vision now classifies every decision-bearing finding from the comparative source
+  review exactly once** (C-452). It separates real engineering gaps from deliberate costs of the
+  mandatory effect envelope and from adoption evidence that code cannot manufacture, with an explicit
+  purchase and cost for every defended trade-off.
 
 - **Canonical and public integration documentation now follows the Exchange-only program** (C-501).
   The signed plugin pack is documented as temporary compatibility behavior; the future path is one
@@ -59,6 +89,25 @@ All notable changes to this project are documented in this file. The format is b
   and the immutable receipt binds that gated commit before main or the tag may move.
 
 ### Fixed
+
+- **JaaS rooms now close the two residual races in their otherwise-pinned join path** (C-413).
+  Concurrent initial joins are serialized across check, handshake and install so only one session
+  and pump can be created; a concurrent leave waits for that transition and cannot strand the
+  session. XMPP-over-WebSocket now resolves once through `flux-system` and performs its handshake on
+  the exact vetted TCP address, closing the DNS-rebinding gap for the query-carried guest token.
+
+- **The CST layout formatter preserves a terminal column-zero module comment** (L-125). The LSP's
+  format-on-save path and `fluxlang fmt` no longer re-indent a comment after the final declaration
+  into that declaration's body; exact-text coverage also pins comments before, between, and trailing
+  on declarations and statements.
+
+- **A control-only room-media flood is now counted instead of being shed silently** (D-233). Audio
+  retains its reserved boundary, while the finite control queue exposes a separate loss diagnostic
+  and the media contract no longer claims that control events can never fill it.
+
+- **Room-media settings no longer expose sidecar arguments through `Debug` formatting** (D-234).
+  The executable and non-secret timing/buffer settings remain diagnosable, while every argument
+  after `argv[0]` is represented only by a redacted count in both media and containing room output.
 
 - **Webhook and connector HTTP ingress now shares the server's body, timeout, request-rate and
   concurrency controls** (C-409). Admission happens before `Deliverer` or task spawn, async work

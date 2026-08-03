@@ -2,7 +2,7 @@
 id: C-450
 title: "Mechanically pin direct dependencies and gate new ones — the one place Pi's CI is ahead"
 pillar: Core
-status: ready
+status: done
 priority: 7
 design: docs/designs/pi-comparison-remediation.md
 epic: pi-comparison-remediation
@@ -32,17 +32,17 @@ dependency is a decision" is ecosystem-independent.
 
 ## Acceptance
 
-- [ ] A mechanical check that a **new or moved direct dependency** fails CI until acknowledged. The
+- [x] A mechanical check that a **new or moved direct dependency** fails CI until acknowledged. The
       repo already has the pattern — `scripts/check-feature-gated-tests.sh` fails for any (package,
       feature) pair with no declared disposition, which is exactly this shape for a different axis.
-- [ ] ⚠ **`build.rs` is the cargo analogue of a lifecycle script** — arbitrary code at build time. A new
+- [x] ⚠ **`build.rs` is the cargo analogue of a lifecycle script** — arbitrary code at build time. A new
       dependency that ships one should be visible in review rather than discovered later.
-- [ ] The check names *what changed and what to do*, so it is a prompt rather than an obstacle. A gate
+- [x] The check names *what changed and what to do*, so it is a prompt rather than an obstacle. A gate
       people route around teaches nothing.
-- [ ] ⚠ Do not duplicate what already exists: `scripts/check-crate-versions.sh`, the Actions-pinning
+- [x] ⚠ Do not duplicate what already exists: `scripts/check-crate-versions.sh`, the Actions-pinning
       guard and the security-audit workflow are already here. Extend rather than adding a fourth
       supply-chain script.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -53,4 +53,17 @@ dependency is a decision" is ecosystem-independent.
   whether there is an equivalent worth having or record that there is not.
 
 ## Progress
+- 2026-08-03: Extended `scripts/check-crate-versions.sh` instead of adding another supply-chain
+  checker. `scripts/direct-dependencies-{root,plugins}.lock` records every first-party-to-external
+  direct edge, its exact Cargo.lock resolution/source and whether that selected package has a
+  `custom-build` target. The ordinary and nested workspace CI jobs verify their respective locks.
+- 2026-08-03: Failing evidence: inserting an unacknowledged synthetic direct edge marked `build.rs`
+  made `--direct-dependencies root` exit 1 with a unified diff and the exact update command. After
+  removing it, self-test plus both workspace checks passed. The wave's final full gate supplies the
+  repository-wide evidence for the last checkbox.
+- 2026-08-03: crates.io publishes Cargo.lock checksums but no npm-registry-signature equivalent that
+  this repository can independently verify, so no decorative signature lane was added. Inferring a
+  breaking change in a workspace-versioned crate is likewise not mechanical from a source diff;
+  release review remains the version decision rather than pretending this dependency gate solves it.
+- 2026-08-03: implementation started in the `flux-core-2` wave.
 - Filed 2026-08-02 from the Pi comparison.

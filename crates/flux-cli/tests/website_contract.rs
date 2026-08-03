@@ -1044,7 +1044,7 @@ fn homepage_flux_example_is_canonical_and_analyzes_against_the_live_catalog() {
 /// C-491/C-501: the team presentation is part of the release-matched docs artifact, not an external
 /// deck that can drift from its sources. Its one executable seam must remain L-128's
 /// already-declared scratch fixture, and its integration topology must match the accepted
-/// Exchange-only direction without claiming that client binding already ships.
+/// Exchange-only direction while matching the shipped one-shot client boundary.
 #[test]
 fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixture() {
     let route = read("website/src/pages/presentation.js");
@@ -1067,7 +1067,7 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
         "authorization → approval → guarded IO",
         "every official integration",
         "Exchange is the only official integration executor",
-        "Flux does not yet embed the Exchange client",
+        "Flux embeds the Exchange client",
         "Core Flux remains useful without Exchange",
     ] {
         assert!(
@@ -1094,11 +1094,7 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
             "docs/ecosystem.md retained C-455's stale claim `{stale}`"
         );
     }
-    for absent in [
-        "flux itself has no exchange client binding",
-        "rich outbound runtime dispatch",
-        "general stream/lease protocol",
-    ] {
+    for absent in ["one-shot http", "streaming", "leases"] {
         assert!(
             ecosystem_prose.contains(&normalized_prose(absent)),
             "ecosystem correction must keep the unbuilt boundary explicit: `{absent}`"
@@ -1137,7 +1133,7 @@ fn connector_native_docs_fix_exchange_as_the_only_future_official_execution_path
 
     for claim in [
         "embedded Exchange client",
-        "official external integrations are unavailable",
+        "official external operations are withdrawn",
         "no local connector",
         "no plugin fallback",
     ] {
