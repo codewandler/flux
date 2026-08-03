@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-08-03
+
 ### Added
 
 - **Generated connector WebSocket bindings can run through one guarded channel runtime** (C-483,

@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.54.0] - 2026-08-03
+
 ### New
 
 - **Generated connector event streams can now run through Flux's guarded placement.** A connector's

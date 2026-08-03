@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-08-03
+
 ### New
 
 - **Generated connector event streams can now run through Flux's guarded placement.** A connector's
