@@ -15,6 +15,26 @@
 
 ## [Unreleased]
 
+## [0.55.1] - 2026-08-03
+
+### Added
+- Network isolation and port management for secure agent execution
+- Listener census tracking for multi-principal server isolation
+- JSONPath expression support in flow language for data extraction
+- Exchange-only integration roadmap adoption for simplified connector deployment
+- Exact-SHA release promotion automation for reproducible builds
+
+### Changed
+- Connector framework now supports native integrations with direct provider bindings
+- Live runtime hardening complete with comprehensive provider contract validation
+- Publishing guide updated with current best practices for SDK distribution
+- Language syntax documentation reflects new expression evaluation capabilities
+
+### Fixed
+- Listener census ordering is now deterministic and stable
+- Release promotion workflow ensures all hosted infrastructure prerequisites are met before automation
+- Sandboxed execution properly isolated for safety-critical release gates
+
 ### New
 
 - **Flux programs can read headers and other map keys that contain punctuation directly.** Use

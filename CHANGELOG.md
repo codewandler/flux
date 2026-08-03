@@ -6,6 +6,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.55.1] - 2026-08-03
+
+### Added
+- **flux-codegate**: New listener module (`src/lib.rs`, 332 LL) for runtime listener management and health probing
+- **flux-runtime**: Expanded provider architecture (331 LL delta) with network integration and system-level capabilities
+- **flux-system**: New `net.rs` (369 LL) and `port.rs` (31 LL) modules for network abstraction and port allocation
+- **flux-server**: New `listener.rs` (136 LL) for HTTP listener lifecycle and `resource.rs` (32 LL) for resource governance
+- **flux-lang**: New `jq_path.rs` (251 LL) for JSONPath expression support in language runtime
+- **Release automation**: New `promote-release-flow.sh` (191 LL), `release-full-gate.sh` (38 LL), and `test-promote-release-flow.sh` (332 LL) for exact-SHA promotion and validation
+- **flux-eval**: New `release_authority.rs` test suite (380 LL) for release promotion authority validation
+- **Documentation**: Design document for live-session-catalog-refresh and new C-507 story for Exchange-only integration roadmap adoption
+
+### Changed
+- **Release pipeline** (`release-flow.yml`: 178 LL delta, `release.yml`: 21 LL delta): Restructured for exact-SHA promotion (C-251), hosted sandbox backend, user namespace provisioning, and sandboxed gate test isolation
+- **flux-channels**: Substantially expanded connector (`connector.rs`: 260 LL delta) and webhook (`webhook.rs`: 206 LL delta) adapters; refined a2a adapter (66 LL delta) for Exchange-only integration roadmap
+- **flux-flow**: Enhanced engine (`engine.rs`: 190 LL delta), loop_host, runtime, and staged modules for live runtime hardening and improved provider contract handling
+- **flux-lang**: Format module expanded (90 LL delta), CST decode refined (16 LL delta), runtime substantially rewritten (211 LL delta) for expression evaluation and path support
+- **flux-orchestrate**: Expanded service binding (118 LL delta) with connector native integration support
+- **flux-server**: System module doubled in size (401 LL delta) for listener census, resource limits, and authentication by construction (C-190); public docs asset updated
+- **flux-cli**: Updated app_cmd (39 LL delta), execution (48 LL delta), session (52 LL delta), and flow_cmd (17 LL delta) for live runtime integration
+- **Documentation**: Updated syntax and reference guides for new language features; refresh of embedded publishing guide in `flux-sdk/PUBLISHING.md` (159 LL)
+
+### Fixed
+- **flux-codegate**: Stabilize listener census order deterministically (fix commit)
+- **Release toolchain**: Sandboxed gate test isolation, hosted docs provisioning, canonical scribe JSON fence normalization, scribe output validation before promotion, hosted user namespace enablement, hosted sandbox backend provisioning
+- **Provider integration**: Direct provider for live gate execution
+- **Build artifacts**: Tree-sitter corpus and Helix language configuration updates
+
 ### Added
 
 - **Running REPL sessions can adopt a plugin's refreshed operation catalog at the next turn
