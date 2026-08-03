@@ -2,12 +2,11 @@
 id: D-232
 title: "The browser harness itself — a lib-jitsi-meet peer that joins, publishes audible audio, and proves it"
 pillar: Agent
-status: in-progress
-priority: 1
+status: blocked
 design: docs/designs/meeting-rooms.md
 epic: meeting-rooms
 areas: [flux-channels]
-note: "⚠ THE Thursday-critical piece. D-208 shipped the seam, the protocol and the runbook but NOT the browser side, so D-209/D-210/D-211 are unblocked on the flux side only — there is still no audio in a call. Two risks D-208 documented and could never exercise decide whether this works at all: a cleared environment and Chrome inside bubblewrap"
+note: "blocked on a human in an operator-owned live room confirming the tone is audible; the isolated impl/D-232 worktree proves Chrome confinement, Pulse routing and genuine in-page RMS but has not crossed the live Jitsi boundary"
 ---
 
 # The half that has to meet a real browser
@@ -79,3 +78,8 @@ real harness**, because if either risk bites, the harness's shape changes.
 ## Progress
 
 - Filed 2026-08-01 from D-208's PARTIAL report, which delivered the seam and named this half explicitly.
+- 2026-08-03: The isolated `impl/D-232` worktree contains the browser harness and measured Chrome
+  under bubblewrap, the required Pulse socket bind, per-stream routing, and a genuine in-page RMS
+  probe. It remains deliberately unmerged: no human has yet joined an operator-owned live room and
+  confirmed the published tone is audible, which is an explicit acceptance criterion that CI cannot
+  substitute for. Resume from that preserved branch and its live-test runbook.
