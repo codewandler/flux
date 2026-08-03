@@ -74,6 +74,10 @@ All notable changes to this project are documented in this file. The format is b
   retains its reserved boundary, while the finite control queue exposes a separate loss diagnostic
   and the media contract no longer claims that control events can never fill it.
 
+- **Room-media settings no longer expose sidecar arguments through `Debug` formatting** (D-234).
+  The executable and non-secret timing/buffer settings remain diagnosable, while every argument
+  after `argv[0]` is represented only by a redacted count in both media and containing room output.
+
 - **Webhook and connector HTTP ingress now shares the server's body, timeout, request-rate and
   concurrency controls** (C-409). Admission happens before `Deliverer` or task spawn, async work
   holds its permit for the full delivery, and refusals reuse the typed `429`, `Retry-After` and

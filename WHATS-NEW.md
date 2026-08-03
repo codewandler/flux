@@ -46,6 +46,9 @@
   and `fluxlang fmt` now keep a comment written at the left margin after the last declaration at the
   left margin, preserving which part of the program it documents.
 
+- **Room-media diagnostics no longer include sidecar command arguments.** The sidecar executable
+  remains visible for troubleshooting, while tokens and other host-specific arguments are redacted.
+
 - **Webhook and connector listeners now refuse overload consistently with the main server.** Body
   size, timeout, request-rate and concurrent-work limits apply before a delivery can start, and
   long-lived streaming responses remain full-duplex under backpressure.

@@ -2,7 +2,7 @@
 id: D-234
 title: "`MediaSettings` derives `Debug` and prints the full sidecar argv — where a resolved secret can live"
 pillar: Agent
-status: ready
+status: done
 priority: 4
 design: docs/designs/meeting-rooms.md
 epic: meeting-rooms
@@ -36,11 +36,11 @@ config layer above them.
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test asserting `MediaSettings`' (and `RoomSettings`') `Debug` prints neither a
+- [x] **Failing-first**: a test asserting `MediaSettings`' (and `RoomSettings`') `Debug` prints neither a
       resolved secret nor argv past `argv[0]` — failing at the merge base.
-- [ ] Follow `WebhookSettings`' hand-written `Debug` precedent exactly rather than inventing a second
+- [x] Follow `WebhookSettings`' hand-written `Debug` precedent exactly rather than inventing a second
       convention.
-- [ ] ⚠ Check the neighbours while here: `ChannelDecl` (`crates/flux-lang/src/program.rs:75`) already
+- [x] ⚠ Check the neighbours while here: `ChannelDecl` (`crates/flux-lang/src/program.rs:75`) already
       derives `Debug` over the same resolved `Value`, so the exposure class **pre-exists at the decl
       layer**. Either fix it too or record explicitly why it is out of scope — it is the reason this was
       judged non-blocking, not a reason it is fine.
@@ -57,3 +57,15 @@ config layer above them.
 ## Progress
 
 - Filed 2026-08-02 from D-208's review.
+- 2026-08-03 failing first: `cargo test -p codewandler-flux-channels
+  config::tests::media_and_room_settings_debug_never_print_sidecar_arguments -- --exact
+  --nocapture` failed because the derived formatter printed both `--token` and the resolved token.
+- 2026-08-03: `MediaSettings` now follows `WebhookSettings` with a hand-written `Debug`: `argv[0]`,
+  the redacted argument count, and non-secret settings stay diagnosable. `RoomSettings`' derived
+  formatter inherits that safe boundary. The neighbouring L0 `ChannelDecl` remains explicitly out
+  of scope: it is the generic declaration carrier and cannot distinguish a literal from a
+  host-resolved secret after `flux-app` mutates its arbitrary JSON settings. Fixing that class needs
+  a resolution-boundary or blanket-settings-redaction decision across every channel kind, not a
+  media-specific formatter in this L6 crate.
+- 2026-08-03: the focused regression and config module tests passed; package clippy with all targets
+  and `-D warnings`, workspace formatting, and `git diff --check` passed.
