@@ -31,3 +31,5 @@ source, independent of GitHub Pages runner variables, and ship the refreshed arc
 - 2026-08-03: the exact CI failure was reproduced locally. A normal rebuild also differs from the
   committed archive, proving the release docs themselves were stale rather than the runner variable
   being the only cause.
+- 2026-08-03: v0.54.0 is recorded as intentionally unshippable rather than bypassing the verifier
+  to publish known-stale binaries; v0.54.1 is the release-current rebuild.

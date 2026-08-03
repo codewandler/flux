@@ -31,3 +31,5 @@ names cargo-dist emits after the crate became a publishable `codewandler-flux-ls
 - 2026-08-03: downloaded candidate run 30780489647 and measured the complete set: five
   `codewandler-flux-lsp` archives, two installers, matching sidecars, the five ordinary `flux-cli`
   archives/installers, source, checksum index and manifest.
+- 2026-08-03: the immutable v0.54.0 tag cannot gain the corrected verifier, so the release-fleet
+  audit records it as intentionally unshippable and v0.54.1 will be promoted from corrected main.

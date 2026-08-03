@@ -92,13 +92,19 @@ TAB="$(printf '\t')"
 #            assetless Release fleet-wide. What
 #            an entry cannot undo is history: v0.47.0's binaries were never built and its tag is
 #            permanently undownloadable, which is precisely what this list is for.
+#   v0.54.0  the candidate built all platforms, but its embedded documentation archive was stale
+#            and the tag's closed verifier rejected cargo-dist's renamed `codewandler-flux-lsp-*`
+#            assets before publishing anything. Re-running the immutable tag would repeat that
+#            refusal, while bypassing it would publish known-stale binaries. -> superseded by
+#            v0.54.1, rebuilt from the corrected archive with the corrected closed verifier
 #
 # An entry here is a claim that the version is unshippable, not a way to silence a tag you have not
 # investigated. Adding one means the version is permanently undownloadable.
 ALLOWED_WITHOUT_RELEASE='v0.11.1
 v0.12.0
 v0.17.0
-v0.47.0'
+v0.47.0
+v0.54.0'
 
 # Rule 3's floor (C-412). A published Release is only useful if the install commands in its own body
 # resolve, so the audit checks for the assets those commands name rather than for a count: a count
