@@ -20,7 +20,7 @@ ever receiving vendor credentials.
 
 ## Acceptance
 
-- [ ] `flux exchange local start`, `status` and `stop` consume C-510's pinned, verified and
+- [ ] `flux exchange local start`, `status` and `stop` consume C-510's channel-selected, verified and
       process-owned local Exchange lifecycle. This story adds no second downloader, verifier,
       executable discovery rule or lifecycle state machine.
 - [ ] Human/operator bootstrap is a separate ceremony from the Service Account Flux uses at runtime.
