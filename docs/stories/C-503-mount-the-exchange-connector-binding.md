@@ -2,7 +2,8 @@
 id: C-503
 title: "Embed the Exchange connector client"
 pillar: Core
-status: backlog
+status: ready
+priority: 0
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
 note: "Milestone 1 only: embed Service Account auth, effective-catalogue refresh and one-shot HTTP invoke; lifecycle frames follow later"
