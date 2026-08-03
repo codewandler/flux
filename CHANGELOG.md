@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **The shared family vocabulary reserves Agent for the runtime** (C-492). An Agent is consistently
+  a model plus a loop plus bounded operations and datasources; Exchange's non-human bearer principal
+  is a Service Account, retaining `/api/agents` only as its documented legacy spelling. Concepts now
+  define App, Managed Agent, Event Type, Event Delivery, Datasource Definition, Model Provider and
+  Identity Provider, and the public Concepts/Ecosystem mirrors carry the same definitions.
+
 ## [0.54.2] - 2026-08-03
 
 ### Fixed

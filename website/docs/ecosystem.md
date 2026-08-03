@@ -94,12 +94,13 @@ what happened.
 
 flux-exchange is the deployed answer: **a service that holds tenant credentials and settings, applies
 metadata grants, and invokes admitted connector operations.** A human signs in, connects a provider,
-previews and saves a grant, then can invoke from the admin console. Agent authentication, inbound
+previews and saves a grant, then can invoke from the admin console. Service Account authentication, inbound
 channels, and durable run records are not part of that shipped path yet.
 
-Its designed primary caller is an **agent**, not a human. Humans sign in to wire things up and to see
-what happened; agents are intended to call operations all day. That inverts the usual assumption and
-shapes the design even though agent-token authentication has not shipped yet.
+Its designed primary caller is **non-human**, not a human. Humans sign in to wire things up and to see
+what happened; Service Accounts and future Managed Agents are intended to call operations all day.
+That inverts the usual assumption and shapes the design even though Service Account authentication
+has not shipped yet.
 
 **What v0.13.0 manages today:**
 
@@ -107,11 +108,11 @@ shapes the design even though agent-token authentication has not shipped yet.
 - **Identity** — complete OIDC sign-in for humans, plus tenant-scoped sessions.
 - **Grants** — connector/risk selectors with a preview endpoint; operation-id lists are refused.
 - **Invocation** — admitted HTTP operations whose destination authority comes from the connector.
-- **Agent principals, partially** — a token can be minted and shown once, but presenting it does not
+- **Service Accounts, partially and under the legacy `/api/agents` name** — a token can be minted and shown once, but presenting it does not
   authenticate yet and there is no list/revoke surface.
 
-**Still direction:** `subscribe`, hosted channels, stored workflows, custom-operation authoring,
-execution records, and agent-token authentication. The
+**Still direction:** `subscribe`, hosted channels, installed Apps, custom-operation authoring,
+execution records, and Service Account authentication. The
 [Exchange inventory](https://github.com/codewandler/flux-exchange#what-exists-today) is authoritative.
 
 **The security property that makes it usable by agents:**
@@ -122,7 +123,7 @@ execution records, and agent-token authentication. The
 > it did not already have.
 
 Grants are written over declared metadata (`risk`, `effects`, `idempotency`) rather than operation-id
-lists. The intended agent property is that a token grants operations, never credentials; v0.13.0
+lists. The intended Service Account property is that a token grants operations, never credentials; v0.13.0
 does not yet accept the tokens it mints, so that agent path must not be presented as usable.
 
 ### Running it locally
@@ -141,8 +142,8 @@ a flux checkout will not resolve.
 
 > **Verified against flux-exchange v0.13.0 on 2026-08-03.** The process serves health, catalogue,
 > session/sign-in, tenant connection/settings/grant management, agent minting, and gated `invoke`.
-> It still does **not** serve `subscribe`, hosted channels, stored workflows, execution records, or
-> an agent-token authenticator.
+> It still does **not** serve `subscribe`, hosted channels, installed Apps, execution records, or
+> a Service Account token authenticator.
 
 ### Runtime model
 

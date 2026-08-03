@@ -31,7 +31,7 @@ taste is a boundary that erodes.
 |---|---|---|
 | **flux** (engine) | *Does it change what happens when an effect executes?* | The envelope, the substrate, Flux-Lang, the agent, the SDK. Knows **kinds**, never vendors. |
 | **flux-connectors** | *Is it true of the vendor regardless of who runs it?* | Vendor facts, compiled. Operations, events, credentials-required, config-required. No runtime, no tenancy, no credential values. |
-| **flux-exchange** | *Does it require holding a credential or knowing a tenant?* | Principals, connections, credentials, channels, leases, stored programs, execution records. |
+| **flux-exchange** | *Does it require holding a credential or knowing a tenant?* | Principals, connections, credentials, channels, installed apps, datasource/trigger bindings, event deliveries, model profiles, leases, stored programs, execution records. |
 | **a downstream product** | *Is it true only of one company's customers?* | Its accounts, its channels, its console, its identity provider. |
 
 Three consequences worth stating because they are the ones people get wrong:
@@ -207,13 +207,14 @@ event labels unchanged; neither that mode nor Exchange `subscribe` exists today.
 
 ## Principals and grants
 
-flux-exchange's primary caller is an **agent**, not a human. Humans sign in to manage and to observe.
+flux-exchange's primary caller is **non-human**, not a human. Humans sign in to manage and to observe.
 That inverts the usual assumption and it has to be in the model from the start rather than bolted on.
 
 **Three principal kinds, one grant model:**
 
 - **User** — a human. Manages connections, credentials, groups; may run operations interactively.
-- **Agent** — a non-human principal holding its own minted token, belonging to roles.
+- **Service Account** — a non-human API principal holding its own minted token, belonging to roles.
+  Flux Exchange's current `/api/agents` route is the legacy spelling to migrate.
 - **Service** — another backend acting on behalf of `(account, actor)`. Products that already front
   a connector service tend to have invented this header set independently, so adopting the model is
   usually a rename rather than a change.
@@ -225,22 +226,27 @@ is what stops it drifting: the catalogue already publishes `risk`, `effects` and
 every operation, so "this role may only call non-writing operations" is checkable rather than
 maintained.
 
-The property that makes agent principals safe:
+The property that makes Service Accounts safe:
 
-> **An agent's token grants access to an operation, never to a credential.** The credential is
-> resolved by the host from the connection the grant names. A stolen agent token yields a bounded
+> **A Service Account token grants access to an operation, never to a credential.** The credential is
+> resolved by the host from the connection the grant names. A stolen token yields a bounded
 > operation set against one tenant's connections — never a vendor token.
 
-## Workflows are stored programs, not a second model
+A Flux **Agent** keeps its core meaning: model + loop + bounded operations/datasources. When
+flux-exchange hosts one inside an installed App it is a **Managed Agent**, receiving reviewed App
+authority without becoming the Service Account that calls the public API.
+
+## Apps are installed Programs, not a second workflow model
 
 flux-exchange needs to persist "workflows": triggers, conditions, schedules, and flows of operations
 that may or may not involve an agent. `flux-app` already is this — a `.flux` program declaring
 `agent`, `channel`, `datasource`, `trigger` and `journey`, where an agent is one node kind and
 nothing requires one.
 
-**Decision: a workflow is a stored, versioned, per-tenant `flux-app` Program.** A visual editor emits
-the IR; the IR lowers to Flux. The simplified schema an editor wants is a *projection*, never a
-second execution model.
+**Decision: an App is a stored, versioned, per-tenant Program plus its installed bindings.** A visual
+editor emits the IR; the IR lowers to Flux. “Workflow” remains ordinary descriptive prose, not a
+second domain type or execution model. The simplified schema an editor wants is a *projection*,
+never a second model.
 
 What that buys, and why any other choice is worse: determinism, replay, fork/diff, approval gates,
 typing, and risk derivation all come free, and a composed operation becomes **indistinguishable from

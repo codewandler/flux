@@ -12,6 +12,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **Flux, connectors, and Exchange now use one set of names.** “Agent” always means a model with an
+  authored loop and bounded capabilities; an API token belongs to a Service Account. The Concepts
+  guide also distinguishes Programs from installed Apps, event types from deliveries, and model
+  providers from identity providers and connectors.
+
 ## [0.54.2] - 2026-08-03
 
 ## [0.54.1] - 2026-08-03

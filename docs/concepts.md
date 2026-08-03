@@ -50,12 +50,13 @@ when the subject is building on flux. They name the same thing from two directio
 *same* safety pipeline the CLI uses. The CLI is the reference application built on the SDK, not a
 privileged sibling: there is no capability the CLI has that an SDK embedder cannot obtain.
 
-**Agent** — a model plus a loop plus a bounded catalog of operations. Note that in flux an agent is
+**Agent** — a model plus a loop plus a bounded catalog of operations and datasources. Note that in flux an agent is
 **not** the unit of execution and not the thing that holds authority: a journey with no agent in it
 is an ordinary flux program, and an agent that calls an operation faces exactly the checks a CLI turn
-faces. An agent is one node kind, not the runtime.
+faces. An agent is one node kind, not the runtime and not an API bearer principal. When Flux Exchange
+hosts one inside an installed App, it is a **Managed Agent**.
 
-**Flux-Lang** — the authored workflow language. Small, typed, analyzer-validated, with first-class
+**Flux-Lang** — the authored flow language. Small, typed, analyzer-validated, with first-class
 `retry`, `throttle`, `saga` and approval gates. It places deterministic control flow *around*
 explicit model stages. It is not model output and not a general-purpose language.
 
@@ -210,8 +211,10 @@ rather than consume it — is answered once in the `port` module and not repeate
 
 ## What knows: datasources and evidence
 
-**Datasource** — the knowledge layer: an indexed store of records (workspace documents, integration
-data) the agent looks things up in. Operations *do*; datasources *know*.
+**Datasource** — a governed readable surface of records the agent looks things up in. It may be an
+indexed snapshot (workspace documents, synchronized integration data) or a live system-of-record
+adapter. Operations *do*; datasources *know*. A **Datasource Definition** declares the schema and
+retrieval surface; a host binds it to an installed datasource and its authority.
 
 The two meet cleanly, and this is deliberate: **a datasource is read through operations.** Retrieval
 (`search`, `get`, `list`, …) is just more read-only operations in the same catalog, so knowledge
@@ -277,6 +280,10 @@ database transaction. Leases *pull*, and a lease dies with its holder.
 > owners. `lease` is used deliberately so that a sentence about one can never be misread as a
 > sentence about the other.
 
+**Event Type** — a declared event name and schema. **Event Delivery** — one occurrence, including
+its source identity, payload lifecycle and delivery outcome. A channel emits deliveries of declared
+types; a type is not a queue and a delivery is not a type.
+
 **Trigger** — the binding from a channel event to a journey. A declaration is a bareword name
 followed by indented attributes, never a brace-and-equals record:
 
@@ -292,13 +299,22 @@ restart. An agent may appear in a journey as one node; nothing requires it to.
 **Program** — a `.flux` file declaring an application: its agents, channels, datasources, triggers
 and journeys together. `flux app run support-bot.flux` serves the whole declaration.
 
+**App** — a Program assembled with concrete host bindings and run as one supervised system. Flux
+owns what execution means; an Exchange-hosted App additionally has a tenant, an immutable package
+revision, reviewed connection/operation/datasource access, a model profile and runtime quotas. An App
+is not a Connector and a Program is not yet an installation.
+
 ---
 
 ## What extends it
 
-**Provider** — a *wire codec × credential* pair, selected as `provider/model`. Adding one is a small
+**Model Provider** — the inference-provider role, implemented by Flux's compatibility `Provider`
+trait as a *wire codec × credential* pair and selected as `provider/model`. Adding one is a small
 composition. flux is provider-neutral by principle, not by accident: no single vendor may become
 load-bearing in the core.
+
+**Identity Provider** — the authority that authenticates a human or service to a host. It is not a
+Model Provider and it does not describe a vendor integration.
 
 **Plugin** — a subprocess extension speaking the flux plugin protocol over stdio. Its operations are
 manifest-scoped with enforced privileges: a plugin may only run programs, read secret keys, reach
@@ -313,6 +329,10 @@ its environment.
 operations plus a capability manifest. Connectors are produced by
 [flux-connectors](./ecosystem.md#flux-connectors--vendor-descriptions-compiled) and are the answer to "integrating this vendor
 should not require writing Rust". A connector is a compiled description; it is not a running thing.
+
+**Service Account** — a non-human API principal holding its own token and receiving grants. It is
+not an Agent: it has no model or loop. Flux Exchange currently exposes this under the legacy
+`/api/agents` name; that compatibility surface does not create a second definition of Agent.
 
 ---
 
