@@ -14,10 +14,10 @@
 # pack is NOT part of a flux cut: its crates sit on the independent 1.x protocol line (C-143), so
 # nothing under plugins/ is edited, re-locked, or staged here.
 #
-# It does NOT push. It prints the build-once sequence: push the commit, prepare its exact-SHA
-# binary artifacts, then push the already-created local tag to promote those artifacts and start
-# crates.io publication. Run from the repo root, and commit your actual code/content changes first:
-# this cuts the release on top of them.
+# It does NOT push. It prints the build-once sequence: stage HEAD on the versioned candidate ref,
+# prepare and verify its exact-SHA binary artifacts and receipt, then advance main and push the
+# already-created local tag to promote those artifacts and start crates.io publication. Run from the
+# repo root, and commit your actual code/content changes first: this cuts the release on top of them.
 #
 # A failed gate is now SAFE to re-run from (C-147): every file the script touches is snapshotted up
 # front and restored on any non-zero exit before the commit, so a red gate no longer leaves the
@@ -216,10 +216,26 @@ git tag -a "v$NEW" -m "flux $NEW"
 
 echo
 echo "== cut v$NEW. Review 'git show', then prepare + promote the exact commit: =="
-echo "   git push origin main"
-echo "   gh workflow run release.yml --ref main -f version=$NEW"
-echo "   # wait for that candidate run to succeed and confirm its SHA equals:"
-echo "   git rev-list -n1 \"v$NEW^{}\""
-echo "   git push origin \"v$NEW\"   # promotes candidate binaries + starts crates.io"
-echo "   (verify tag: git ls-remote origin \"refs/tags/v$NEW\")"
-echo "   (no candidate? the tag workflow logs a warning and performs the legacy full build)"
+echo "   tag=v$NEW"
+echo '   sha=$(git rev-list -n1 "$tag^{}")'
+echo '   candidate="release-candidates/$tag"'
+echo '   repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)'
+echo '   baseline=$(gh run list --workflow release.yml --limit 100 --json databaseId --jq '\''([.[].databaseId] | max) // 0'\'')'
+echo '   git push origin "HEAD:refs/heads/$candidate"'
+echo "   gh workflow run release.yml --ref \"\$candidate\" -f version=$NEW"
+echo '   # Wait for a NEW run with the exact event, ref, and SHA (an older retry is not this dispatch).'
+echo '   run_id='
+echo '   until [ -n "$run_id" ]; do'
+echo '     run_id=$(gh run list --workflow release.yml --event workflow_dispatch --branch "$candidate" --commit "$sha" --limit 20 --json databaseId,event,headBranch,headSha --jq ".[] | select(.databaseId > $baseline and .event == \"workflow_dispatch\" and .headBranch == \"$candidate\" and .headSha == \"$sha\") | .databaseId" | sort -n | head -1)'
+echo '     [ -n "$run_id" ] || sleep 5'
+echo '   done'
+echo '   gh run watch "$run_id" --exit-status'
+echo '   receipt_dir=$(mktemp -d)'
+echo '   gh run download "$run_id" --name release-candidate-receipt --dir "$receipt_dir"'
+echo "   scripts/release-candidate.sh verify \"\$receipt_dir/release-candidate.txt\" $NEW \"\$sha\" \"\$run_id\""
+echo '   test "$(scripts/find-release-candidate.sh "$repo" "$sha")" = "$run_id"'
+echo '   git push origin HEAD:main'
+echo '   git push origin "$tag"   # promotes candidate binaries + starts crates.io'
+echo '   # Wait for both tag workflows, verify the public Release, then remove only this candidate ref.'
+echo '   scripts/verify-github-release.sh --repo "$repo" "$tag"'
+echo '   git push origin --delete "$candidate"'

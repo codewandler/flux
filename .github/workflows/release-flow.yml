@@ -1,22 +1,16 @@
 # The Flux-Lang release cut (C-251, `examples/release.flux`) — flux cutting its own release.
 #
-# ⚠ DELIBERATELY `workflow_dispatch` ONLY, AND DELIBERATELY DRY BY DEFAULT.
+# A push to the dedicated `release` branch is the deliberate release action. The Flux program cuts
+# locally; the host-owned promotion helper stages that exact commit on a versioned candidate ref,
+# waits for immutable release artifacts, then advances main and pushes the annotated tag. Manual
+# dispatch remains dry by default and never promotes, even when `apply: true` is selected.
 #
-# The story this implements describes merging `main` → `release` as the whole release action. That
-# automatic `push: release` trigger is **not wired here on purpose**. An unattended agent with commit
-# and tag authority in a release pipeline is the highest-risk shape in this repo, crates.io is
-# yank-only, and a wrong publish is permanent across 30 crate names. So the trigger flip is a separate,
-# deliberate change, to be made only once this workflow has run green by hand a few times. Until then
-# a release is still cut by a human running `scripts/cut-release.sh`, exactly as
-# `crates/flux-sdk/PUBLISHING.md` documents.
-#
-# WHAT THIS WORKFLOW CANNOT DO, structurally:
-#   * It cannot push. `permissions: contents: read` — there is no write token in the job, so even
-#     `apply: true` cannot move a ref on the remote. The commit and annotated tag `apply: true` creates
-#     live and die inside the ephemeral runner.
-#   * It cannot publish. Publication is `release.yml` + `crates-io.yml`, both triggered by a **tag
-#     push**, which this workflow cannot perform.
-#   * The program it runs cannot reach source. `examples/release.flux` calls no `bash`, no `proc.run`,
+# AUTHORITY SPLIT:
+#   * GITHUB_TOKEN has repository contents read + Actions write. It can dispatch and observe the
+#     candidate workflow, but cannot move a ref.
+#   * RELEASE_TOKEN is exposed only to the final host-owned promotion step. Its ref pushes can trigger
+#     the existing tag workflows; GitHub deliberately suppresses those triggers for GITHUB_TOKEN.
+#   * The Flux program cannot reach source. `examples/release.flux` calls no `bash`, no `proc.run`,
 #     no `write`/`edit`; its only writing op addresses exactly the three release changelogs and its
 #     only process-capable ops have fixed argv for `scripts/check-crate-versions.sh` and
 #     `scripts/cut-release.sh`. Pinned by `crates/flux-eval/tests/release_authority.rs`.
@@ -25,19 +19,22 @@
 # version, has the scribe draft both changelogs, and posts the rendered sections plus the diff it would
 # apply to the job summary — writing nothing. `apply: true` is a full REHEARSAL: it runs the real
 # `scripts/cut-release.sh`, including its gate, and proves the cut succeeds — then throws the result
-# away with the runner. Neither mode releases anything.
+# away with the runner. Neither manually dispatched mode releases anything.
 #
-# Secrets: OPENROUTER_API_KEY — a cheap model is enough for prose curation and a smoke turn. Absent,
-# the smoke leg and the flow are SKIPPED with a notice rather than failing: a missing credential is
-# not a broken release pipeline.
+# Secrets: ANTHROPIC_API_KEY for the direct Haiku default; OPENROUTER_API_KEY for an explicit
+# OpenRouter model override. A manual run without the selected provider's key skips; an automatic
+# release fails loudly after the smoke and flow are skipped.
 
 name: release-flow
 
 on:
+  push:
+    branches:
+      - release
   workflow_dispatch:
     inputs:
       apply:
-        description: "Cut for real in this runner (still cannot push or publish). false = preview only."
+        description: "Cut in this runner as a rehearsal. false = preview only; manual runs never promote."
         required: true
         type: boolean
         default: false
@@ -45,10 +42,17 @@ on:
         description: "Model for the release-scribe sub-agent."
         required: false
         type: string
-        default: "openrouter/anthropic/claude-haiku-4.5"
+        default: "anthropic/claude-haiku-4-5"
 
 permissions:
   contents: read
+  actions: write
+
+env:
+  # `inputs` is empty on a push event, so both values need explicit host-owned defaults. A release
+  # branch push always applies; a manual dispatch keeps its selected preview/rehearsal posture.
+  RELEASE_APPLY: ${{ github.event_name == 'push' && 'true' || (inputs.apply && 'true' || 'false') }}
+  RELEASE_MODEL: ${{ inputs.model || 'anthropic/claude-haiku-4-5' }}
 
 concurrency:
   group: release-flow
@@ -56,7 +60,7 @@ concurrency:
 
 jobs:
   cut:
-    name: "smoke · scribe · ${{ inputs.apply && 'cut (rehearsal)' || 'preview' }}"
+    name: "smoke · scribe · ${{ github.event_name == 'push' && 'cut + promote' || (inputs.apply && 'cut (rehearsal)' || 'preview') }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -64,31 +68,68 @@ jobs:
           # `release_plan` runs `git describe --tags` and `check-crate-versions.sh` compares against
           # the previous `v*` tag — both need the full history, not a shallow clone.
           fetch-depth: 0
+          # No ambient checkout credential may be able to move a ref. The promotion helper receives
+          # the trigger-capable PAT explicitly, and only in its own step.
+          persist-credentials: false
+
+      - name: Does a model credential exist?
+        id: creds
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          case "$RELEASE_MODEL" in
+            anthropic/*)
+              credential_name=ANTHROPIC_API_KEY
+              selected_key=${ANTHROPIC_API_KEY:-}
+              ;;
+            openrouter/*)
+              credential_name=OPENROUTER_API_KEY
+              selected_key=${OPENROUTER_API_KEY:-}
+              ;;
+            *)
+              echo "::error::Unsupported release model provider in '$RELEASE_MODEL'. Use an anthropic/* or openrouter/* model."
+              exit 1
+              ;;
+          esac
+          echo "credential_name=$credential_name" >> "$GITHUB_OUTPUT"
+          if [ -n "$selected_key" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$credential_name is not set for $RELEASE_MODEL — the live smoke leg and the release flow will be skipped."
+          fi
 
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        if: steps.creds.outputs.have_key == 'true'
         with:
           toolchain: "1.97.0"
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.creds.outputs.have_key == 'true'
 
-      - run: cargo fetch --locked
+      - if: steps.creds.outputs.have_key == 'true'
+        run: cargo fetch --locked
+
+      # Unattended agentic and served surfaces deliberately fail closed without an OS sandbox
+      # backend. GitHub's hosted Ubuntu image does not ship bubblewrap, so install it and prove the
+      # kernel permits a minimal namespace before spending the cold release-build time.
+      - name: Install and prove the sandbox backend
+        if: steps.creds.outputs.have_key == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          # Ubuntu 24.04's hosted-runner AppArmor default otherwise denies bwrap's UID map. This
+          # runner is single-job and ephemeral; enable the namespace primitive, then prove the exact
+          # backend Flux will use before continuing.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --dev /dev --proc /proc --chdir "$GITHUB_WORKSPACE" true
 
       # The release binary is what both the smoke test and the flow run under, so build it once.
       - name: Build the flux binary
+        if: steps.creds.outputs.have_key == 'true'
         run: cargo build --release --bin flux
-
-      - name: Does a model credential exist?
-        id: creds
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-            echo "have_key=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_key=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::OPENROUTER_API_KEY is not set — the live smoke leg and the release flow will be skipped."
-          fi
 
       # A live provider turn against a cheap model. Its failure blocks the cut by ordering: a broken
       # provider path is exactly the class the offline gate cannot see. Legs whose own credential is
@@ -96,8 +137,9 @@ jobs:
       - name: Live smoke against a cheap model
         if: steps.creds.outputs.have_key == 'true'
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          FLUX_SMOKE_MODEL: ${{ inputs.model }}
+          FLUX_SMOKE_MODEL: ${{ env.RELEASE_MODEL }}
           FLUX_BIN: ${{ github.workspace }}/target/release/flux
         run: ./scripts/smoke-live.sh
 
@@ -108,6 +150,7 @@ jobs:
         if: steps.creds.outputs.have_key == 'true'
         id: flow
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -o pipefail
@@ -115,9 +158,9 @@ jobs:
           git config user.name "flux release flow"
           git config user.email "release@codewandler.invalid"
           ./target/release/flux flow run examples/release.flux \
-            --arg apply=${{ inputs.apply }} \
-            -m '${{ inputs.model }}' \
-            --yes 2>&1 | tee release-flow.out
+            --arg apply="$RELEASE_APPLY" \
+            -m "$RELEASE_MODEL" \
+            --yes 2>&1 | tee "$RUNNER_TEMP/release-flow.out"
 
       # The prose is the part a human must actually read before a release goes out, so it goes on the
       # run's summary page rather than only into the log.
@@ -125,21 +168,42 @@ jobs:
         if: always() && steps.creds.outputs.have_key == 'true'
         run: |
           {
-            echo "## Release flow — ${{ inputs.apply && 'cut (rehearsal)' || 'preview' }}"
+            echo "## Release flow — ${{ github.event_name == 'push' && 'automatic cut' || (inputs.apply && 'cut (rehearsal)' || 'preview') }}"
             echo
-            echo "Model: \`${{ inputs.model }}\`"
+            echo "Model: \`$RELEASE_MODEL\`"
             echo
             echo '```'
-            cat release-flow.out 2>/dev/null || echo "(no output captured)"
+            cat "$RUNNER_TEMP/release-flow.out" 2>/dev/null || echo "(no output captured)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Says out loud that nothing was released, so a green run is never mistaken for one.
-      - name: What actually happened
-        if: success()
+      # Manual runs remain review/rehearsal surfaces. Only the release-branch push enters the
+      # separately authenticated promotion path below.
+      - name: What happened in this manual run
+        if: success() && github.event_name == 'workflow_dispatch'
         run: |
-          if [ "${{ inputs.apply }}" = "true" ]; then
+          if [ "$RELEASE_APPLY" = "true" ]; then
             echo "::notice::Rehearsal only. A commit and an annotated tag were created IN THIS RUNNER and are now gone — this job has no write token and cannot push. To release for real, follow crates/flux-sdk/PUBLISHING.md."
           else
             echo "::notice::Preview only. Nothing was written, committed, or tagged."
           fi
+
+      # Host-owned irreversible half. The helper stages the exact cut commit on
+      # release-candidates/vX.Y.Z, dispatches and verifies its candidate build, then uses the
+      # trigger-capable PAT to advance main and push the tag. It waits for both tag workflows and
+      # verifies the public GitHub Release before returning success.
+      - name: Prepare exact-SHA candidate and promote
+        if: success() && github.event_name == 'push' && steps.creds.outputs.have_key == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: scripts/promote-release-flow.sh
+
+      # A missing optional credential may skip a manual preview, but a release-branch push is a
+      # declared release action. It must never finish green after silently doing nothing.
+      - name: Refuse to skip an automatic release
+        if: github.event_name == 'push' && steps.creds.outputs.have_key != 'true'
+        run: |
+          echo "::error::${{ steps.creds.outputs.credential_name || 'The selected provider credential' }} is required for an automatic release. Smoke and flow were skipped; no commit or tag was pushed."
+          exit 1

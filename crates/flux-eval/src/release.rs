@@ -38,8 +38,8 @@ use serde_json::{json, Value};
 use flux_core::{Error, Result};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{
-    tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
-    IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
+    tool_input_schema, tool_output_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior,
+    IntentCertainty, IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use flux_system::PathAccess;
 
@@ -343,6 +343,116 @@ impl Tool for ReleaseVerifyVersionsTool {
         json_result(
             &json!({ "ok": true, "output": output }),
             "protocol-line crate versions are clean",
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// release_parse_notes
+// ---------------------------------------------------------------------------
+
+/// The exact model-to-host contract for release prose.
+///
+/// `task()` intentionally returns text, even when its prompt requests JSON. The host parses that
+/// text at one explicit boundary before Flux-Lang reads fields from it. Unknown and missing fields
+/// fail closed, as does explanatory prose around the JSON object. One canonical `json` Markdown
+/// fence is normalized because the hosted scribe produced that exact transport wrapper despite the
+/// no-fence instruction; the object inside still crosses the same strict schema.
+#[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReleaseNotes {
+    changelog: String,
+    whats_new: String,
+    bump_opinion: BumpOpinion,
+    bump_reason: String,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum BumpOpinion {
+    Patch,
+    Minor,
+}
+
+/// Parse and validate the release scribe's textual result.
+fn parse_release_notes(text: &str) -> Result<ReleaseNotes> {
+    let text = text.trim();
+    let json = text
+        .strip_prefix("```json\n")
+        .and_then(|body| body.strip_suffix("\n```"))
+        .or_else(|| {
+            text.strip_prefix("```json\r\n")
+                .and_then(|body| body.strip_suffix("\r\n```"))
+        })
+        .unwrap_or(text);
+    let notes: ReleaseNotes = serde_json::from_str(json)
+        .map_err(|e| Error::Other(format!("release_parse_notes: invalid scribe JSON: {e}")))?;
+    validate_release_notes(notes)
+}
+
+fn validate_release_notes(notes: ReleaseNotes) -> Result<ReleaseNotes> {
+    if notes.changelog.trim().is_empty() {
+        return Err(Error::Other(
+            "release_parse_notes: `changelog` must not be empty".into(),
+        ));
+    }
+    Ok(notes)
+}
+
+/// `release_parse_notes(text)` — pure, strict adaptation of the scribe's text into typed fields.
+pub struct ReleaseParseNotesTool;
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReleaseParseNotesInput {
+    /// Exact JSON returned by the release-scribe task, either as raw text or runtime-decoded JSON.
+    text: ReleaseNotesPayload,
+}
+
+/// Flux-Lang preserves ordinary task output as text, but decodes JSON-looking values while mapping
+/// them into an operation argument. Both paths cross the same exact `ReleaseNotes` schema here.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum ReleaseNotesPayload {
+    Text(String),
+    Decoded(ReleaseNotes),
+}
+
+#[async_trait]
+impl Tool for ReleaseParseNotesTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "release_parse_notes".into(),
+            description: "Validate the release-scribe task's output as one exact JSON object. \
+                          Accepts raw text, one canonical json Markdown fence, or Flux-Lang's \
+                          decoded JSON value; rejects surrounding prose, missing/extra fields, \
+                          empty engineering notes, and bump opinions outside patch|minor. Returns \
+                          {changelog, whats_new, bump_opinion, bump_reason}. Pure: grants no \
+                          filesystem, process, or network authority."
+                .into(),
+            input_schema: tool_input_schema::<ReleaseParseNotesInput>(),
+            output_schema: Some(tool_output_schema::<ReleaseNotes>()),
+            effects: vec![],
+            risk: Risk::Low,
+            idempotency: Idempotency::Idempotent,
+            access: vec![],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![]
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: ReleaseParseNotesInput = parse_params(&params, "release_parse_notes")?;
+        let notes = match args.text {
+            ReleaseNotesPayload::Text(text) => parse_release_notes(&text)?,
+            ReleaseNotesPayload::Decoded(notes) => validate_release_notes(notes)?,
+        };
+        json_result(
+            &serde_json::to_value(&notes).map_err(|e| Error::Other(e.to_string()))?,
+            "release-scribe JSON validated",
         )
     }
 }
@@ -730,6 +840,52 @@ mod tests {
                         [workspace.dependencies]\nserde = \"1.0.0\"\n";
         assert_eq!(manifest_version(manifest).as_deref(), Some("0.37.0"));
         assert_eq!(manifest_version("name = \"x\"\n"), None);
+    }
+
+    #[test]
+    fn release_notes_parse_from_one_exact_json_object() {
+        let notes = parse_release_notes(
+            r####"{"changelog":"### Fixed\n- safe","whats_new":"### Fixed\n- safer","bump_opinion":"patch","bump_reason":"fix-only release"}"####,
+        )
+        .unwrap();
+        assert_eq!(notes.changelog, "### Fixed\n- safe");
+        assert_eq!(notes.whats_new, "### Fixed\n- safer");
+        assert_eq!(notes.bump_opinion, BumpOpinion::Patch);
+        assert_eq!(notes.bump_reason, "fix-only release");
+
+        let internal_only = parse_release_notes(
+            r####"{"changelog":"### Changed\n- internal","whats_new":"","bump_opinion":"patch","bump_reason":""}"####,
+        )
+        .unwrap();
+        assert!(internal_only.whats_new.is_empty());
+        assert!(internal_only.bump_reason.is_empty());
+
+        let fenced = parse_release_notes(&format!(
+            "```json\n{}\n```",
+            r#"{"changelog":"c","whats_new":"w","bump_opinion":"minor","bump_reason":"breaking"}"#
+        ))
+        .unwrap();
+        assert_eq!(fenced.bump_opinion, BumpOpinion::Minor);
+    }
+
+    #[test]
+    fn release_notes_reject_prose_wrappers_or_schema_drift() {
+        let valid =
+            r#"{"changelog":"c","whats_new":"w","bump_opinion":"minor","bump_reason":"breaking"}"#;
+        for invalid in [
+            format!("Here are the notes: {valid}"),
+            format!("{valid}\nHope this helps."),
+            r#"{"changelog":"c","whats_new":"w","bump_opinion":"major","bump_reason":"breaking"}"#.into(),
+            r#"{"changelog":"c","whats_new":"w","bump_opinion":"patch"}"#.into(),
+            r#"{"changelog":"c","whats_new":"w","bump_opinion":"patch","bump_reason":"fix","extra":true}"#.into(),
+            r#"{"changelog":"","whats_new":"w","bump_opinion":"patch","bump_reason":"fix"}"#.into(),
+            "not json".into(),
+        ] {
+            assert!(
+                parse_release_notes(&invalid).is_err(),
+                "accepted malformed release notes: {invalid}"
+            );
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 id: C-251
 title: "Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version"
 pillar: Core
-status: ready
+status: in-progress
 priority: 10
 areas: [flux-cli, flux-tools, ci]
 note: "flux automating its own release is the most honest dogfood there is; the load-bearing decision is that the MODEL writes prose and the HOST does version math, because a wrong version on crates.io is irreversible"
@@ -63,12 +63,19 @@ run loudly rather than silently changing the number.
 - [x] The model's prose is inserted under `[Unreleased]` deterministically by the host, and
       `website/docs/whats-new.md` is regenerated in the **same commit** — the mirror is a tested input
       (`website_customer_changelog_is_in_sync`), so a bare `WHATS-NEW.md` edit is a red gate.
-- [ ] The program runs under a **narrow, explicit authorization**: write authority path-scoped to
-      exactly `CHANGELOG.md`, `WHATS-NEW.md`, `website/docs/whats-new.md`, and process authority to
-      the named scripts. Any attempt to write elsewhere is refused **structurally** by policy, not by
-      prompt. Pinned by a test that has the model try.
-- [ ] The smoke test runs in CI against a cheap OpenRouter model (`FLUX_SMOKE_MODEL`), and its
-      failure blocks the cut. Legs whose credential is absent SKIP rather than fail.
+- [x] The program runs under a **narrow, runtime-enforced authority ceiling by construction**: its
+      op set exposes no general write or process tool; `changelog_insert` canonicalizes and permits
+      exactly `CHANGELOG.md`, `WHATS-NEW.md`, and `website/docs/whats-new.md`; the two process-capable
+      release ops use fixed argv for the named scripts; and the scribe has `tools: []`. Attempts to
+      write elsewhere are refused by the operation implementation, not by prompt or by the decorative
+      `.flux/policies/release.toml`. Pinned by `release_authority.rs` against the shipped AST, path
+      boundary, permission subjects, and role.
+- [x] The smoke test is wired in CI against the configured cheap direct Anthropic model
+      (`FLUX_SMOKE_MODEL`), and its failure blocks the cut. An explicit `openrouter/*` override
+      selects its own credential. Optional legs whose credential is absent SKIP; an automatic
+      release with no selected-provider credential fails loudly rather than finishing green after
+      doing nothing. The source wiring is complete; live hosted proof remains pending and is tracked
+      below.
 - [x] The flow is idempotent and re-runnable: a second run on an already-released SHA is a no-op, and
       a failed run leaves **no** partially-rolled changelog (the C-147 transactionality property that
       `cut-release.sh` already has must not be lost by wrapping it).
@@ -166,13 +173,52 @@ flow release -> string
 ```
 
 **What the program deliberately does not do:** push, create the GitHub release, or publish to
-crates.io. Those stay with the existing tag-triggered workflows, which already implement the
-BUILD-ONCE candidate→promote flow. The program's job ends at a local annotated tag; the workflow step
-after it does `git push origin main`, runs the candidate build, verifies
-`candidate headSha == tag SHA`, and only then pushes the tag. Keeping the irreversible half in CI
-means a bug in the program cannot publish.
+crates.io. Those stay in the host-owned CI half and the existing tag-triggered workflows. The
+program's job ends at a local annotated tag. The workflow then stages the cut commit on the exact
+`release-candidates/vX.Y.Z` ref, dispatches and watches the candidate build, verifies its
+version/SHA/run receipt, and only then advances `main` and pushes the tag. It watches both tag
+workflows and runs the public Release verifier before reporting success. Keeping that irreversible
+half outside the model-authored program means a bug in the program cannot publish directly.
 
 ## Progress
+- 2026-08-03 — Hosted preview `30833603707` passed the complete live smoke under bubblewrap, then
+  failed closed before writing or promotion because `task()` returned JSON as text and the flow read
+  it as an object. `release_parse_notes` now makes that boundary explicit and strict. Unit tests
+  reject prose, missing/extra fields, empty engineering notes and invalid bump opinions; the
+  shipped-flow journey proves malformed scribe text leaves both changelogs and every ref untouched.
+  Preview `30834939427` then passed the complete live smoke and proved Haiku wraps an otherwise exact
+  object in a canonical `json` fence despite the no-fence instruction. The host now normalizes only
+  that exact transport wrapper before applying the same schema. Internal-only releases retain their
+  documented ability to omit customer-facing prose.
+- 2026-08-03 — **the unattended path is implemented in source and the story is now `in-progress`,
+  but Acceptance item 1 remains deliberately unchecked until a hosted run dogfoods it.**
+  `.github/workflows/release-flow.yml` now runs automatically only for pushes to `release`, forces
+  apply mode for that event, runs the cheap-model smoke before the flow, scopes `RELEASE_TOKEN` to
+  the promotion step, and fails rather than silently skipping an automatic release when the selected
+  provider credential is absent. Manual dispatch remains the preview/rehearsal surface.
+  `scripts/promote-release-flow.sh` owns the irreversible host sequence: validate the local annotated
+  tag; stage its exact SHA at `refs/heads/release-candidates/vX.Y.Z`; dispatch and watch
+  `release.yml`; verify the immutable candidate receipt; advance `main`; push the tag; watch the
+  binary and crates.io workflows; verify the public GitHub Release; then delete only the exact
+  candidate ref. Failures before main retain the candidate ref and leave main/tag untouched; failures
+  after the tag retain recovery evidence.
+  `scripts/test-promote-release-flow.sh` exercises the happy path, ref ordering, receipt mismatch or
+  absence, candidate/build/publication failures, stale-ref refusal, merge ancestry, idempotent no-op,
+  and token non-disclosure with hermetic `git`/`gh` fixtures. `release_authority.rs` composes the
+  workflow and helper source to pin the same ordering, the trigger-capable credential boundary, and
+  `release.yml`'s exact versioned candidate-ref admission rule. **Operational activation is still
+  pending:** these paths have not yet completed a real `main` → `release` hosted cut with configured
+  secrets and a publicly verified Release. That dogfood run is the evidence required to tick item 1
+  and move this story to done.
+- 2026-08-03 — Two fail-closed hosted previews improved the activation boundary before any ref could
+  move. Run `30831706707` proved the original OpenRouter default depended on account credits; run
+  `30832802801` proved the stock hosted runner has no sandbox backend, so the agentic and served live
+  smoke legs correctly refuse to start. The workflow now defaults to direct Anthropic Haiku and
+  provisions plus self-tests bubblewrap before running Flux. Structural tests pin both requirements.
+- 2026-08-03 — Run `30833459849` installed bubblewrap but proved Ubuntu 24.04's hosted AppArmor
+  default denies its UID map. The workflow now enables unprivileged user namespaces only on the
+  dedicated ephemeral runner and immediately proves a minimal bwrap namespace before compilation.
+  It does not disable Flux's sandbox.
 - 2026-07-30 — **the foundation is merged and this story stays `ready` for the rest.** Recovered as an
   orphan after a coordinating session crash killed its implementor mid-task; branch preserved verbatim,
   reviewed independently, four blocking findings discharged, then integrated.
@@ -252,23 +298,25 @@ means a bug in the program cannot publish.
 ## Notes
 - **Trigger:** a push to `release`, not to `main`. Merging main → release is the deliberate act; an
   ordinary main push must not cut. This was the user's own framing and it is the safer one.
-- **Model + key:** `OPENROUTER_API_KEY` as a repo secret, with a cheap or free model. Prose curation
-  and a smoke turn are both small; see the OpenRouter model spec already used for eval and loop work.
-  The smoke test takes `FLUX_SMOKE_MODEL`, so no code change is needed to point it at OpenRouter.
+- **Model + key:** direct `anthropic/claude-haiku-4-5` with `ANTHROPIC_API_KEY` is the default. A
+  manual `openrouter/*` override selects `OPENROUTER_API_KEY`. The first hosted rehearsal proved the
+  distinction matters: OpenRouter returned 402 with no account credits, while its zero-cost models
+  were unavailable under the account's privacy policy. The direct provider avoids coupling release
+  availability to either condition without weakening that policy.
 - **Why this is a good flux story rather than a shell script:** every hard part is something flux
-  already claims to do — a narrow path-scoped write authority so a model-driven run *structurally*
-  cannot touch source (`crates/flux-policy`), a guarded process seam so every command is argv-only
-  (`flux_system`), and an auditable action batch. If flux cannot safely automate its own release, the
-  claim that it can safely automate someone else's work is weaker.
+  already claims to do — a narrow runtime op set whose canonical path boundary means a model-driven
+  run structurally cannot touch source, fixed-argv process seams through `flux_system`, and an
+  auditable action batch. If flux cannot safely automate its own release, the claim that it can
+  safely automate someone else's work is weaker.
 - **Ops this needs that now exist:** C-238 landed `git_branch`/`git_merge`/`git_revert`, so the
   merge-and-revert half is expressible; `gate_check`, `git_snapshot` and `git_tag` already exist in
   the eval pack. The gap is the changelog-insertion seam (⚠ above) — a deterministic anchored insert
   is probably a small op or a script, and should **not** be the model writing the file, because then
   the model's output becomes the file content rather than its input.
-- **No approval prompt exists in CI.** The run needs an explicit non-interactive authorization with
-  the narrow policy above. That is the honest hard part of this story and where its design review
-  should concentrate: an unattended agent with write authority in a release pipeline is exactly the
-  shape that must fail closed.
+- **No approval prompt exists in CI.** `--yes` makes the run non-interactive, but it does not define
+  the ceiling: the model-facing program has only the fixed release op set above, while the separately
+  authenticated promotion helper is host-owned and receives `RELEASE_TOKEN` only for its guarded ref
+  operations. An unattended agent in a release pipeline is exactly the shape that must fail closed.
 - **Failure archive worth reading first** (all real, all in this repo's history): a gate flake *after*
   the changelog roll minted a phantom version section; `cut-release.sh`'s global `sed` bumped an
   external crate that happened to share flux's version string; a backfilled tag hijacked

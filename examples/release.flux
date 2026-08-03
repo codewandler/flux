@@ -16,9 +16,10 @@
 # changelogs. It never calls `bash`, `proc.run`, `write`, or `edit`.
 #
 # Run with: flux flow run examples/release.flux --arg apply=false --yes
-# `apply=false` is the safe default and the only mode CI runs today: it derives the version, renders
-# both changelog sections and the diff it would apply, and mutates nothing — no file, no commit, no
-# tag. `apply=true` is the real cut.
+# `apply=false` is the safe local/manual default: it derives the version, renders both changelog
+# sections and the diff it would apply, and mutates nothing — no file, no commit, no tag. The
+# release-branch workflow supplies `apply=true`; its host-owned step promotes the resulting local cut
+# only after the exact-SHA candidate and receipt are green.
 
 flow release(apply: Bool) -> String
 goal "Cut a flux release: the host derives the version from the commit titles, a scribe drafts both changelogs, the host inserts that prose, and the run stops at a local annotated tag."
@@ -48,7 +49,7 @@ goal "Cut a flux release: the host derives the version from the commit titles, a
   # ── 3. The scribe curates prose. It holds no tools; it returns text. ────────
   # Two audiences, two voices: `CHANGELOG.md` is for engineers (mechanism, files, why),
   # `WHATS-NEW.md` is for users (plain language, no story IDs, no crate names).
-  $notes = task({ role: "release-scribe", task: fmt("""
+  $notes_text = task({ role: "release-scribe", task: fmt("""
 Write the release notes for flux — a Rust agent SDK, harness, and coding agent — for the release
 after {last_tag}.
 
@@ -71,6 +72,10 @@ anything breaking, phrased as the action to take.
 `bump_opinion` is ADVISORY ONLY — the host has already derived the version from the commit titles and
 your answer cannot change it. If you disagree, say why in `bump_reason`; the run will surface it.
 """) })
+  # `task` returns text even when the prompt requests JSON. Parse it through a pure, strict host op
+  # so prose/schema drift halt here instead of becoming a confusing field-access failure. The host
+  # normalizes one canonical `json` fence before applying the same exact schema.
+  $notes = release_parse_notes({ text: $notes_text })
   $changelog = $notes.changelog
   $whats_new = $notes.whats_new
   $opinion = $notes.bump_opinion

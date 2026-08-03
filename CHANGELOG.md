@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **A merge from `main` into the dedicated `release` branch is now the complete release action**
+  (C-251). `.github/workflows/release-flow.yml` runs the live smoke and narrow Flux-authored cut,
+  while `scripts/promote-release-flow.sh` keeps the trigger-capable PAT out of the model step, stages
+  the exact cut SHA on a versioned candidate ref, verifies its immutable receipt before advancing
+  `main`, and waits for both tag workflows plus the public Release verifier. Any failure preserves
+  the candidate ref and names the recovery evidence instead of leaving a green partial release. The
+  live gate defaults to direct Anthropic Haiku, with an explicit OpenRouter override, so the normal
+  release does not also depend on an OpenRouter credit balance. Hosted runners install and self-test
+  bubblewrap before the agentic smoke and Flux cut, including enabling the user-namespace primitive
+  restricted by Ubuntu 24.04's hosted AppArmor default, preserving the fail-closed sandbox posture.
+
+### Fixed
+
+- **The Flux-authored release flow now validates the scribe's textual JSON before reading fields**
+  (C-251). `release_parse_notes` is a pure, strict model-to-host adapter: it normalizes one canonical
+  `json` Markdown fence, while surrounding prose, missing or extra fields, and invalid bump opinions
+  halt before either changelog or the cut script can run. Internal-only releases may still leave the
+  customer note empty.
+
 ## [0.55.0] - 2026-08-03
 
 ### Added

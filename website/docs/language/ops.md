@@ -460,7 +460,7 @@ outside it.
 
 ## Cutting a release
 
-These four drive [`examples/release.flux`](https://github.com/codewandler/flux/blob/main/examples/release.flux),
+These five drive [`examples/release.flux`](https://github.com/codewandler/flux/blob/main/examples/release.flux),
 which cuts a flux release as a Flux-Lang program. They exist as separate, narrow ops rather than as
 `proc.run` calls because a release flow needs exactly two programs and three writable files: fixed
 argv and a fixed path set are authority you cannot mistype.
@@ -469,6 +469,7 @@ argv and a fixed path set are authority you cannot mistype.
 |---|---|---|
 | `release_plan` | | The last `v*` tag, the commit subjects and diffstat since it, and the **host's** bump decision + next version |
 | `release_verify_versions` | | Run `scripts/check-crate-versions.sh` (fixed argv); errors with the offending protocol-line crate named |
+| `release_parse_notes` | `text` | Strictly parse the scribe's textual JSON contract into typed release-note fields; normalizes one canonical `json` fence, rejects surrounding prose and schema drift; pure, with no external authority |
 | `changelog_insert` | `file, body, [section], [apply]` | Insert markdown under a changelog's `## [<section>]` heading, deterministically and idempotently. `apply` defaults to false (preview) |
 | `release_cut` | `bump, [apply]` | Cut with `scripts/cut-release.sh <bump>` (fixed argv), stopping at the **local** annotated tag. `apply` defaults to false |
 
@@ -477,6 +478,9 @@ The division of labour is the point: **the model writes prose, the host decides 
 means a minor bump while flux is `0.y` — so no version is ever read back out of a model reply.
 crates.io is yank-only, and a wrong version cannot be withdrawn. A model may return a `bump_opinion`
 and disagree in writing; the run surfaces the disagreement and cuts the host's number anyway.
+
+`task()` returns text, even when the prompt requests JSON. `release_parse_notes` is the explicit host
+boundary that accepts only the exact release-note object before the flow reads any of its fields.
 
 `changelog_insert` addresses only `CHANGELOG.md`, `WHATS-NEW.md`, and `website/docs/whats-new.md`,
 resolving its target through the canonicalizing IO boundary first — so the model's prose is an *input*

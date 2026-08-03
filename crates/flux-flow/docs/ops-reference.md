@@ -396,7 +396,7 @@ used to reset the anti-cheat baseline to an unrelated line of history without a 
 ## Release ops (`examples/release.flux`)
 
 Registered by `flux_eval::register_eval_ops` alongside the self-improvement pack above — top-level-only,
-repo-mutating orchestration ops, never a sub-agent's. They exist as four narrow ops rather than as
+repo-mutating orchestration ops, never a sub-agent's. They exist as five narrow ops rather than as
 `proc.run` calls because a release flow needs exactly two programs and three writable files, and fixed
 argv plus a fixed path set is authority that cannot be mistyped.
 
@@ -404,6 +404,7 @@ argv plus a fixed path set is authority that cannot be mistyped.
 |---|---|---|
 | `release_plan` | | The last `v*` tag, the commit subjects + diffstat since it, and the **host's** bump and next version |
 | `release_verify_versions` | | `scripts/check-crate-versions.sh` (fixed argv); errors with the offending protocol-line crate named |
+| `release_parse_notes` | `text` | Strictly parse the scribe's textual JSON contract into typed release-note fields; normalizes one canonical `json` fence, rejects surrounding prose and schema drift; pure, with no external authority |
 | `changelog_insert` | `file, body[, section][, apply]` | Insert markdown under a changelog's `## [<section>]` heading, deterministically and idempotently; `apply` defaults to false (preview) |
 | `release_cut` | `bump[, apply]` | `scripts/cut-release.sh <bump>` (fixed argv), stopping at the **local** annotated tag; never pushes, never publishes; `apply` defaults to false |
 
@@ -411,7 +412,8 @@ argv plus a fixed path set is authority that cannot be mistyped.
 conventional-commit titles (`!` ⇒ breaking ⇒ minor while `0.y`), so no version is ever read back out
 of a model reply — crates.io is yank-only and a wrong version cannot be withdrawn. A model may return
 a `bump_opinion`; a disagreement is surfaced as a `release.bump_disagreement` observation and changes
-nothing. `changelog_insert` addresses only `CHANGELOG.md`, `WHATS-NEW.md` and
+nothing. `task()` returns text, so `release_parse_notes` validates the exact object shape before the
+flow reads fields. `changelog_insert` addresses only `CHANGELOG.md`, `WHATS-NEW.md` and
 `website/docs/whats-new.md`, resolved through the canonicalizing IO boundary first, so model text is an
 *input* to the file rather than its contents.
 
