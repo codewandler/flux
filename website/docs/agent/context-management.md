@@ -147,12 +147,14 @@ unparseable value is ignored without a warning.
 If you arrive from another harness, these are the things it is reasonable to assume exist and which
 **flux does not do**. None of them is a hidden feature to be found; they are absent.
 
-- **The threshold does not consult the model's context window.** It is a flat character count,
-  applied identically to a 200k-token model and a 1M-token one. 48,000 characters is roughly 12k
-  tokens — a small fraction of a large window, and a substantial one of a small local model's. flux
-  does not count tokens or measure headroom against the target model at all. Whether this should
-  scale with the window is an open question, tracked as a known limitation rather than settled
-  behaviour.
+- **The threshold deliberately does not consult the model's context window.** The fixed history budget
+  is applied identically to every model. The transcript is only one part of a request: harness
+  instructions, project context, skills, tool schemas and stage prompts consume headroom too, and
+  their size is not implied by a model's nominal window. flux also cannot maintain trustworthy
+  window metadata for every unknown, local or custom model id. A fixed 48,000-character cap (roughly
+  12k tokens) bounds the growing transcript's repeated cost and latency on every provider. If a known
+  model and workload can retain more safely, raise `FLUX_COMPACT_CHARS` or the per-agent override;
+  small-window deployments can lower it.
 - **Compaction rarely fires in practice.** A sweep of a 112,114-event local store found *zero*
   compactions: most sessions are one-shot runs, and the average multi-turn session was under 10% of
   the threshold. Expect it only in a genuinely sustained session — roughly 35-40 substantive

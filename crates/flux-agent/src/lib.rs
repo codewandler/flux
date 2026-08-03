@@ -138,6 +138,15 @@ pub const DEFAULT_CONTEXT_BUDGET: usize = 8192;
 /// argument to lower it — a threshold low enough to fire on those sessions would compact almost
 /// every real one, spending a provider call and discarding fidelity under no memory pressure.
 /// Raising it weakens the unbounded-growth guard this constant exists for.
+///
+/// **This remains a fixed history budget, not a fraction of a model window** (C-462). Conversation
+/// history is only the growing part of a request; harness instructions, skills, tool schemas, and
+/// stage prompts consume model-dependent headroom independently. A 5,095-call usage sweep found
+/// whole prompts ranging from tiny to hundreds of thousands of tokens, so a model's nominal window
+/// does not determine how much transcript is safe or economical to retain. Flux also has no
+/// trustworthy context-window metadata for unknown, local, or custom model ids. The fixed cap keeps
+/// transcript resend cost and compaction behavior bounded across every provider; deployments that
+/// know their workload can tune it with [`AgentSpec::with_compaction`] / `FLUX_COMPACT_CHARS`.
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 48_000;
 
 /// Optional behavior layered after Flux's mandatory harness protocol.

@@ -21,7 +21,7 @@ use flux_core::Result;
 use flux_provider::{ChunkStream, Provider, Request};
 use flux_sdk::approval::{ApprovalChoice, Approver, IntentSet};
 use flux_sdk::sandbox::SandboxMode;
-use flux_sdk::{Client, Sandbox, SandboxSettings};
+use flux_sdk::{Client, ResourceLimits, Sandbox, SandboxSettings};
 use std::sync::Arc;
 
 struct StubProvider;
@@ -183,6 +183,29 @@ fn an_explicit_sandbox_decision_still_wins() {
         SandboxMode::Off,
         "an explicitly pinned sandbox must win over the auto-approval raise — otherwise an embedder \
          who has provided isolation another way cannot say so"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C-471: an explicit SDK ceiling is host policy, so it wins over the autonomous preset just as an
+/// explicit sandbox decision does. File config reaches this same builder input through
+/// `ResourceLimits::from_config`; only silence selects the posture preset.
+#[test]
+fn explicit_resource_limits_win_over_the_autonomous_preset() {
+    let dir = temp_root("explicit-resource-limits");
+    let client = Client::builder()
+        .model("mock")
+        .auto_approve(true)
+        .resource_limits(ResourceLimits::new().with_max_live_agents(3))
+        .build(Box::new(StubProvider), &dir)
+        .expect("build Client");
+
+    assert_eq!(client.resource_limits().max_live_agents(), Some(3));
+    assert_eq!(
+        client.resource_limits().max_concurrent_tool_calls(),
+        None,
+        "an explicit host value must not be silently combined with the autonomous preset"
     );
 
     std::fs::remove_dir_all(&dir).ok();

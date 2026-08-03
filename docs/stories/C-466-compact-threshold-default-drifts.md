@@ -2,10 +2,10 @@
 id: C-466
 title: "The CLI hard-codes the compaction default twice instead of reading the constant it already depends on"
 pillar: Core
-status: ready
+status: done
 priority: 7
 areas: [flux-cli, flux-agent]
-note: "spun out of C-441: execution.rs writes 48_000 twice (and \"48000\" in a warning string) while flux-app reads DEFAULT_COMPACT_THRESHOLD_CHARS; the new website pin reads the constant, so the CLI can drift away from documentation that still looks verified"
+note: "the CLI resolver now reads DEFAULT_COMPACT_THRESHOLD_CHARS for missing and malformed env values, interpolates warnings, and has no literal copy; served-path diagnostic divergence is tracked as C-507"
 ---
 
 # Two surfaces, one number, no link
@@ -46,25 +46,44 @@ guard now covers two of the three surfaces and reads as if it covered all three.
 
 ## Acceptance
 
-- [ ] A failing-first test: changing `DEFAULT_COMPACT_THRESHOLD_CHARS` changes the CLI's effective
+- [x] A failing-first test: changing `DEFAULT_COMPACT_THRESHOLD_CHARS` changes the CLI's effective
       default. It must fail at the merge base.
-- [ ] `crates/flux-cli/src/execution.rs` has no literal copy of the default left — including the one
+- [x] `crates/flux-cli/src/execution.rs` has no literal copy of the default left — including the one
       inside the warning message, which should interpolate.
-- [ ] The precedence is unchanged: `FLUX_COMPACT_CHARS` > default, `0` disables, and a malformed value
+- [x] The precedence is unchanged: `FLUX_COMPACT_CHARS` > default, `0` disables, and a malformed value
       still warns rather than silently reverting (the C-4xx reasoning at `:345-347` stays).
-- [ ] ⚠ Grep the tree for any other copy of the number before closing — this story is only worth doing
+- [x] ⚠ Grep the tree for any other copy of the number before closing — this story is only worth doing
       once, and a fourth surface holding a literal defeats it.
+
+## Progress
+
+- 2026-08-03: added the failing-first
+  `cli_compaction_resolution_tracks_the_agent_default_and_preserves_env_precedence` test before its
+  pure resolver existed; it failed to compile on the missing seam. The finished test pins the
+  agent-owned fallback, explicit values, `0`, malformed fallback, and the absence of numeric/prose
+  copies in the resolver body.
+- 2026-08-03: `compact_threshold_from_env` now returns
+  `DEFAULT_COMPACT_THRESHOLD_CHARS` for missing or malformed values, and the warning interpolates
+  that same constant. The environment-reading wrapper remains the production entry point, so
+  precedence and behavior are unchanged.
+- 2026-08-03: a scoped Rust sweep found no other compaction-default copy. Other `48_000` literals are
+  48 kHz audio sample rates; website prose remains intentionally numeric and is already checked
+  against the owner constant by C-441's website contract.
+- 2026-08-03: filed the served-path silent malformed-value behavior as
+  [C-507](C-507-served-compaction-env-typo-is-silent.md), keeping diagnostic behavior out of this
+  no-behavior-change consolidation.
 
 ## Notes
 
-- Not the same bug as [C-462](C-462-compaction-threshold-is-context-window-blind.md), which asks
-  whether 48,000 is the *right* number. This story asks that there be **one** of it. C-462 gets
-  materially easier once this lands, because there will be a single place to change.
+- Not the same bug as [C-462](C-462-compaction-threshold-is-context-window-blind.md), which has now
+  decided 48,000 is the right fixed default. This story asks that there be **one** source of that
+  intentional value, so the CLI cannot drift from the decision and its documentation.
 - ⚠ There is a third divergence in the same area, and it is a behaviour difference rather than
   duplication: a malformed `FLUX_COMPACT_CHARS` **warns** on the CLI path (`execution.rs:344`) but is
   **silently ignored** on the served path — `app.rs:1819-1822` does `.ok().and_then(|s| s.parse().ok())`,
   so `FLUX_COMPACT_CHARS=48k` falls through to the default with no trace at all. An operator typos the
-  env var on a served agent and gets no signal. Fix it here or file it; do not leave it unmentioned.
+  env var on a served agent and gets no signal. Filed as
+  [C-507](C-507-served-compaction-env-typo-is-silent.md).
 - Related: [C-441](C-441-context-management-doc.md) (the documentation and the pin),
   [C-465](C-465-compact-claims-success-on-five-no-ops.md) (the other defect from the same review).
 - Filed 2026-08-02 out of C-441's review.

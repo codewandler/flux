@@ -245,15 +245,23 @@ Malformed scoped entries refuse every use under that name rather than falling ba
 |---|---:|---|
 | `turn_token_budget` | off | Stop consulting models after cumulative turn usage crosses this ceiling. `--turn-budget`, then `FLUX_TURN_TOKEN_BUDGET`, override it. |
 | `max_concurrent_tool_calls` | off | How many tool calls one agent may have executing at once. `0` is read as `1`. A call arriving at a saturated agent queues, then is refused with a message naming the limit — never truncated, never silently dropped. |
+| `max_live_agents` | off | How many agents may be live across the whole delegated tree, **including the root**. `1` means no delegation; `0` is read as `1`. A spawn over the ceiling is refused immediately, never queued. |
 | `tool_call_queue_timeout_ms` | `30000` | How long a queued tool call waits for a slot before that refusal. Meaningful only alongside `max_concurrent_tool_calls`. **Not clamped:** there is no "wait forever" sentinel, but an absurd value is honoured as written — `u64::MAX` ms is a ~585-million-year wait, i.e. a hang you chose. |
 | `max_retained_result_bytes` | off | How many bytes of tool results one agent keeps in its deterministic op cache. Reaching it evicts; a miss just re-runs the op, so this never truncates a result the model sees. |
 | `max_evidence_payload_bytes` | off | How many bytes of observation payload one agent's in-memory evidence log retains. Reaching it elides the *oldest* payloads behind a marker — no observation is ever dropped, and counts, order, kind and phase are preserved. Payloads from completed turns remain in full in the session event store. |
 
-**These are per-agent ceilings, and sub-agents get their own.** A `task`-delegated sub-agent inherits
-the same numbers with its own separate budget, so with *k* sub-agents alive the process may be
-running up to `max_concurrent_tool_calls × (k + 1)` tool calls and retaining that many multiples of
-the byte ceilings. Size them with your delegation fan-out (`[agent] max_depth`, and how many `task`
-calls a turn makes) in mind rather than as a whole-process cap.
+The execution and retention ceilings are per agent: a `task`-delegated child inherits the same
+numbers with separate budgets. `max_live_agents` is different: its census is shared across the root
+and every transitive child. Setting both concurrency and census ceilings therefore bounds the whole
+tree at `max_concurrent_tool_calls × max_live_agents` simultaneous tool calls; without the census,
+an unbounded number of agents can each consume the per-agent ceiling. Retained-result and evidence
+byte ceilings remain per agent, so their process-wide upper bound is likewise the configured byte
+ceiling times `max_live_agents` when both are set.
+
+Project config overrides user config for each `[limits]` scalar. For SDK embeddings, an explicit
+`ClientBuilder::resource_limits` value wins exactly as supplied (including a value built from file
+config); only an omitted value selects the autonomous preset for an autonomous client or the
+unbounded default for a supervised client.
 
 ## Skills and workspace access
 

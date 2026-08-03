@@ -12,6 +12,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Config files can now bound delegated agent fan-out.** Set `[limits] max_live_agents` to cap the
+  root plus all live descendants in one tree. `1` (and `0`, which is normalized to `1`) disables
+  delegation; combine it with `max_concurrent_tool_calls` to bound total simultaneous tool work.
+
+### Improved
+
+- **The context-management guide now explains why compaction uses a fixed history budget.** A model's
+  nominal context window does not reveal how much room remains after instructions, skills and tool
+  schemas. The 48,000-character default therefore stays consistent across providers; use
+  `FLUX_COMPACT_CHARS` or a per-agent setting when a known workload needs a different cap.
+
 ### Fixed
 
 - **`/compact` now tells you what happened.** It reports a successful compaction only after the
@@ -19,6 +32,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   unchanged, an explicitly disabled setting, and a cancelled check now say so directly.
 
 ### Action needed
+
+- **Rust integrations using either `TokenCounter` trait must remove that integration.** Flux never
+  wired either extension point into production. Context slicing now exposes its actual policy
+  directly: a deterministic estimate of roughly four characters per token. Calls to
+  `slice_context` must also omit the former counter argument.
 
 - **Rust integrations that call `FlowEngine::maybe_compact` must handle its typed outcome.** The
   method now distinguishes disabled, unchanged, cancelled, and compacted results instead of

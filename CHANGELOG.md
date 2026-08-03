@@ -6,6 +6,37 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **File-configured hosts can now bound delegated fan-out with `[limits] max_live_agents`**
+  (C-471). The ceiling counts the root and every transitive child in one shared census, so `0` and
+  `1` both disable delegation and a spawn over the limit is refused immediately. Combined with
+  `max_concurrent_tool_calls`, it bounds simultaneous tool execution across the tree at the product
+  of the two values. Project config overrides user config; an explicit host limit wins over the
+  autonomous posture preset.
+
+### Changed
+
+- **The CLI now reads its compaction fallback from the agent-owned default instead of carrying
+  three copies of 48,000** (C-466). `FLUX_COMPACT_CHARS` precedence, `0` disabling, and malformed
+  value warnings are unchanged; changing the shared default now moves CLI, served, SDK, and checked
+  documentation surfaces together.
+
+- **The 48,000-character compaction default is now an explicit fixed history budget, not an
+  unresolved model-window approximation** (C-462). Recorded usage shows whole-request prompt size is
+  dominated by more than conversation history, and Flux has no trustworthy context-window metadata
+  for arbitrary local, custom, or evolving model ids. The runtime value and override precedence are
+  unchanged; code and docs now state that operators should tune the existing per-agent / environment
+  override when their known workload needs a different retained-history cap.
+
+- **Flux-Lang context slicing now has one honest, deterministic token-budget policy instead of two
+  unused extension points** (C-469). It always uses its documented four-characters-per-token
+  estimate; the host counter argument and both unrelated `TokenCounter` traits have been removed.
+  Removing the public traits and the `slice_context` argument is a breaking change for direct
+  `flux-provider` / `flux-lang` callers and therefore a next-minor release change. Production Flux
+  behavior is unchanged because no provider implemented the capability and the only runtime caller
+  never supplied a counter.
+
 ### Fixed
 
 - **`/compact` now reports whether it actually rewrote the conversation** (C-465). The REPL no

@@ -11,9 +11,9 @@
 //! - [`required_symbols_from_diagnostics`] adds the symbols a planner repair diagnostic named —
 //!   the model needs to see the thing its previous plan got wrong.
 //! - [`slice_context`] combines those required-reads with each candidate symbol's visibility/
-//!   secret/policy gating and a token budget (exact, when a host [`TokenCounter`] is supplied, or
-//!   the deterministic [`estimate_tokens`] fallback) to decide the final kept set, and returns a
-//!   full [`SliceRecord`] auditing why every candidate was in or out.
+//!   secret/policy gating and a token budget (using the deterministic [`estimate_tokens`] policy)
+//!   to decide the final kept set, and returns a full [`SliceRecord`] auditing why every candidate
+//!   was in or out.
 //!
 //! Pure and IO-free like the rest of `flux-lang`: this module never touches a store, a secret, or a
 //! policy engine — callers (the interpreter's `ctx`/`ctx_append` evaluation, the planner's repair
@@ -344,23 +344,16 @@ pub struct SliceRecord {
 // Token budgeting (KF4 bullet 3)
 // ---------------------------------------------------------------------------
 
-/// A host-provided exact token counter (e.g. a provider's tokenizer). When [`slice_context`] is
-/// given one, budgets are enforced against its exact counts; otherwise [`estimate_tokens`] is used.
-pub trait TokenCounter {
-    fn count(&self, text: &str) -> u64;
-}
-
-/// The deterministic fallback estimate used when no host-provided counter is available: ~4
-/// chars/token, rounded up so a non-empty string never estimates to zero.
+/// The deliberate token-budget policy for context slicing: approximately four characters per
+/// token, rounded up so a non-empty string never estimates to zero.
+///
+/// Flux does not expose an exact-token-counter extension point here. Exact tokenization is
+/// model-specific, while `flux-lang` is a provider-independent, IO-free L0 contract. Keeping this
+/// deterministic estimate makes slicing reproducible for every host; a future exact path must own
+/// its provider/model boundary and production wiring rather than presenting an unused capability.
 pub fn estimate_tokens(text: &str) -> u64 {
     let chars = text.chars().count() as u64;
     chars.div_ceil(4)
-}
-
-fn size_of(text: &str, counter: Option<&dyn TokenCounter>) -> u64 {
-    counter
-        .map(|c| c.count(text))
-        .unwrap_or_else(|| estimate_tokens(text))
 }
 
 // ---------------------------------------------------------------------------
@@ -398,9 +391,8 @@ fn reason_rank(r: &IncludeReason) -> u8 {
 ///    — "explicitly referenced" is necessary but never sufficient on its own.
 /// 3. **Budget** (bullet 3): the survivors are ranked (visibility tier, then reason specificity,
 ///    then declared `candidates` order) and packed **drop-and-continue** into `budget` — sized by
-///    `counter` when given (exact host-provided counts) or [`estimate_tokens`] otherwise (the
-///    deterministic fallback) — so one oversized early candidate never starves the smaller ones
-///    after it. `budget: None` keeps every gate-surviving candidate.
+///    [`estimate_tokens`] — so one oversized early candidate never starves the smaller ones after
+///    it. `budget: None` keeps every gate-surviving candidate.
 ///
 /// Returns the kept names in `candidates`' original declared order, plus the full [`SliceRecord`]
 /// naming every inclusion/exclusion and why.
@@ -410,7 +402,6 @@ pub fn slice_context(
     candidates: &[Candidate],
     boundary: &Boundary,
     budget: Option<u64>,
-    counter: Option<&dyn TokenCounter>,
 ) -> (Vec<String>, SliceRecord) {
     struct Ranked<'a> {
         idx: usize,
@@ -471,7 +462,7 @@ pub fn slice_context(
         keep = vec![false; ranked.len()];
         let mut running = 0u64;
         for &k in &order {
-            let t = size_of(ranked[k].text, counter);
+            let t = estimate_tokens(ranked[k].text);
             if running + t <= b {
                 running += t;
                 keep[k] = true;
@@ -482,7 +473,7 @@ pub fn slice_context(
         used = running;
     } else {
         for r in &ranked {
-            used += size_of(r.text, counter);
+            used += estimate_tokens(r.text);
         }
     }
 
@@ -689,7 +680,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             None,
-            None,
         );
         assert_eq!(kept, vec!["used".to_string()]);
         assert_eq!(
@@ -711,7 +701,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             None,
-            None,
         );
         assert_eq!(kept, vec!["pin".to_string()]);
         assert_eq!(record.included[0].1, IncludeReason::Pinned);
@@ -726,7 +715,6 @@ mod tests {
             &diag_symbols,
             &candidates,
             &Boundary::none(),
-            None,
             None,
         );
         assert_eq!(kept, vec!["typo".to_string()]);
@@ -769,7 +757,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             None,
-            None,
         );
         assert!(
             kept.is_empty(),
@@ -799,7 +786,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             None,
-            None,
         );
         assert!(kept.is_empty());
 
@@ -809,7 +795,6 @@ mod tests {
             &BTreeSet::new(),
             &candidates,
             &Boundary::allowing(["priv".to_string()]),
-            None,
             None,
         );
         assert!(kept.is_empty());
@@ -822,48 +807,15 @@ mod tests {
             &candidates,
             &Boundary::allowing(["priv".to_string()]),
             None,
-            None,
         );
         assert_eq!(kept, vec!["priv".to_string()]);
     }
 
     // -- slice_context: budget (bullet 3) -------------------------------------------------------
 
-    struct FixedCounter(u64);
-    impl TokenCounter for FixedCounter {
-        fn count(&self, _text: &str) -> u64 {
-            self.0
-        }
-    }
-
     #[test]
-    fn budget_uses_the_exact_host_provided_counter_when_given() {
-        let mut required = RequiredSymbols::default();
-        required.require_whole("a");
-        let candidates = vec![candidate(
-            "a",
-            Visibility::Visible,
-            "anything, any length at all",
-        )];
-        let counter = FixedCounter(5);
-        let (kept, record) = slice_context(
-            &required,
-            &BTreeSet::new(),
-            &candidates,
-            &Boundary::none(),
-            Some(5),
-            Some(&counter),
-        );
-        assert_eq!(kept, vec!["a".to_string()]);
-        assert_eq!(
-            record.used, 5,
-            "exact count from the host counter, not the char estimate"
-        );
-    }
-
-    #[test]
-    fn budget_falls_back_to_the_deterministic_estimator_without_a_counter() {
-        let text = "x".repeat(40); // ~10 tokens at the 4-chars/token fallback
+    fn budget_deliberately_uses_the_deterministic_estimator() {
+        let text = "x".repeat(40); // 10 tokens under the deliberate 4-chars/token policy
         assert_eq!(estimate_tokens(&text), 10);
         let mut required = RequiredSymbols::default();
         required.require_whole("a");
@@ -874,7 +826,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             Some(10),
-            None,
         );
         assert_eq!(kept, vec!["a".to_string()]);
         assert_eq!(record.used, 10);
@@ -886,7 +837,7 @@ mod tests {
         for n in ["a", "b", "c"] {
             required.require_whole(n);
         }
-        let text40 = "x".repeat(40); // 10 tokens (fallback estimator)
+        let text40 = "x".repeat(40); // 10 tokens under the deterministic estimator
         let candidates = vec![
             candidate("a", Visibility::Visible, &text40),
             candidate("b", Visibility::Visible, &text40),
@@ -898,7 +849,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             Some(25), // fits exactly two of three ~10-token members
-            None,
         );
         assert_eq!(kept.len(), 2, "budget kept exactly two of three: {kept:?}");
         assert!(
@@ -931,7 +881,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             Some(2),
-            None,
         );
         assert_eq!(
             kept,
@@ -958,7 +907,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             Some(3),
-            None,
         );
         for _ in 0..5 {
             let again = slice_context(
@@ -967,7 +915,6 @@ mod tests {
                 &candidates,
                 &Boundary::none(),
                 Some(3),
-                None,
             );
             assert_eq!(
                 first, again,
@@ -1010,7 +957,7 @@ mod tests {
         assert!(required.contains("s1"));
         assert!(required.contains("s2"));
 
-        let big = "x".repeat(400); // 100 tokens (fallback estimator) each
+        let big = "x".repeat(400); // 100 tokens under the deterministic estimator each
         let candidates = vec![
             candidate("s1", Visibility::Visible, &big),
             candidate("s2", Visibility::Visible, &big),
@@ -1022,7 +969,6 @@ mod tests {
             &BTreeSet::new(),
             &candidates,
             &Boundary::none(),
-            None,
             None,
         );
         assert_eq!(
@@ -1037,7 +983,6 @@ mod tests {
             &candidates,
             &Boundary::none(),
             Some(105),
-            None,
         );
         assert!(
             record.used <= 105,

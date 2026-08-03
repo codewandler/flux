@@ -2,10 +2,10 @@
 id: C-471
 title: "A file-configured host cannot set the delegated-tree agent ceiling"
 pillar: Core
-status: ready
+status: done
 priority: 6
 areas: [flux-config, flux-runtime]
-note: "spun out of C-444: max_live_agents bounds the whole delegated tree, but flux_config::Limits has no such field — only an SDK embedder or the autonomous preset can set it, so an operator running flux from a config file cannot bound fan-out at all"
+note: "[limits] max_live_agents now reaches the shared runtime census; project config overrides user config, explicit host limits override posture presets, and 0/1 both mean no delegation"
 ---
 
 # A ceiling only one kind of host can reach
@@ -37,17 +37,30 @@ failure with no configuration knob to turn.
 
 ## Acceptance
 
-- [ ] `max_live_agents` is settable in the config file, wired through `flux_config::Limits` to
+- [x] `max_live_agents` is settable in the config file, wired through `flux_config::Limits` to
       `ResourceLimits`, with a failing-first test proving a file-configured value reaches the census and
       is enforced.
-- [ ] Precedence is explicit and tested: an SDK-injected value, the config file, the `autonomous()`
+- [x] Precedence is explicit and tested: an SDK-injected value, the config file, the `autonomous()`
       preset, and the default cannot silently disagree about which wins.
-- [ ] ⚠ The `0` / `1` semantics are documented at the config key, because they are surprising: the census
+- [x] ⚠ The `0` / `1` semantics are documented at the config key, because they are surprising: the census
       counts the **root** agent, so `max_live_agents = 1` means *no delegation at all*, not "one child".
       C-444 has a test naming this; the config surface needs the same warning where an operator will read
       it.
-- [ ] A config-schema change means the website config reference gains the key, with the fan-out reasoning
+- [x] A config-schema change means the website config reference gains the key, with the fan-out reasoning
       (`N × k`) stated once so an operator can pick a number rather than guess.
+
+## Progress
+
+- 2026-08-03: added `Limits::max_live_agents`, its project-over-user scalar merge, and
+  `ResourceLimits::from_config` wiring. A file-source parsing test plus a runtime census test prove
+  the configured value admits `limit - 1` children beside the root, refuses the next spawn
+  immediately, and releases a place when a child ends.
+- 2026-08-03: pinned the remaining precedence boundary at the SDK builder: an explicit host value
+  wins unchanged over the autonomous preset rather than being merged with it. Existing C-444 tests
+  continue to pin the autonomous preset when limits are omitted and the unbounded supervised
+  default.
+- 2026-08-03: documented the shared-tree semantics, `0`/`1` behavior, and the composed
+  `max_concurrent_tool_calls × max_live_agents` bound in the config reference and release notes.
 
 ## Notes
 
@@ -55,8 +68,10 @@ failure with no configuration knob to turn.
   its own surface and its own test obligations.
 - ⚠ Consider whether the refusal should be a **typed** backpressure signal rather than
   `Error::Other(...)` before adding a knob that makes people hit it more often. C-444's RISKS flags this
-  as "fine at 8, worth a type if anyone lowers it" — this story is exactly the thing that lets someone
-  lower it. Doing the type here may be the cheaper order.
+  as "fine at 8, worth a type if anyone lowers it". The census API already returns the typed
+  `AgentCensusRefusal`, and the new enforcement test pins it there; translating that through the
+  general `flux_core::Error` boundary remains separate error-taxonomy work rather than a prerequisite
+  for making the safety ceiling configurable.
 - ⚠ The preset's numbers are unmeasured (C-444 ADJACENT 3: 16 calls / 8 agents / 64 MiB / 32 MiB, a
   deliberate first cut). Making the ceiling configurable does not require tuning the default, but do not
   present the default as measured.

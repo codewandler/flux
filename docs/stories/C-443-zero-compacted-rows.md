@@ -45,7 +45,7 @@ reached it on its *last* message, after which no turn remained to compact.
 
 `DEFAULT_COMPACT_THRESHOLD_CHARS = 48_000` (`crates/flux-agent/src/lib.rs:161`) — used by the SDK and
 by served/agentic agents via `compact_threshold_for_decl` (`crates/flux-app/src/app.rs:1813`). The CLI
-resolves the same 48,000 independently in `compact_threshold()` (`crates/flux-cli/src/execution.rs:342`),
+now reads that same constant in `compact_threshold()` (`crates/flux-cli/src/execution.rs:342`),
 honouring `FLUX_COMPACT_CHARS`. Possibility 2 is out: nothing defaults to `0`.
 
 ### The call path is automatic, not just the `/compact` command
@@ -181,6 +181,6 @@ than unreachable. Settling it needs a store from sustained interactive use, whic
   the store to render. What C-443 adds is that **both** views are reconstructible: the `Compacted` event
   carries the replacement, and the superseded `Message` events are never removed.
 - Spun the one finding this story declined to act on out into
-  [C-462](C-462-compaction-threshold-is-context-window-blind.md) (`ready`): the threshold is a flat
-  character count that never consults the model's context window.
+  [C-462](C-462-compaction-threshold-is-context-window-blind.md) (subsequently done): it kept the
+  threshold as an intentional fixed history budget rather than a model-window fraction.
 - Next: C-441 lifts the wording block above; nothing else blocks it.

@@ -1,4 +1,5 @@
 use super::*;
+use flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS;
 
 // Codex/Anthropic model resolution is backend knowledge owned by each provider crate
 // (`flux_providers::codex::resolve_model`, `flux_providers::anthropic::resolve_model`) so every
@@ -339,19 +340,71 @@ pub(super) fn datasource_backend(
 
 /// Session size (serialized chars) past which the agent summarizes old turns. Override with
 /// `FLUX_COMPACT_CHARS` (`0` disables compaction).
-pub(super) fn compact_threshold() -> usize {
-    match std::env::var("FLUX_COMPACT_CHARS") {
+fn compact_threshold_from_env(value: Result<String, std::env::VarError>) -> usize {
+    match value {
         Ok(s) => s.parse().unwrap_or_else(|_| {
             // Warn instead of silently reverting: the user set the knob, so a typo'd value
             // (`48k`) falling back to the default would contradict the documented 0-disables
             // contract without a trace.
             eprintln!(
-                "{} FLUX_COMPACT_CHARS is not a number ({s:?}); using the default 48000",
-                style::yellow("warning:")
+                "{} FLUX_COMPACT_CHARS is not a number ({s:?}); using the default {}",
+                style::yellow("warning:"),
+                DEFAULT_COMPACT_THRESHOLD_CHARS
             );
-            48_000
+            DEFAULT_COMPACT_THRESHOLD_CHARS
         }),
-        Err(_) => 48_000,
+        Err(_) => DEFAULT_COMPACT_THRESHOLD_CHARS,
+    }
+}
+
+pub(super) fn compact_threshold() -> usize {
+    compact_threshold_from_env(std::env::var("FLUX_COMPACT_CHARS"))
+}
+
+#[cfg(test)]
+mod compact_threshold_tests {
+    use super::*;
+    use std::env::VarError;
+
+    /// C-466: the CLI's effective fallback must be the value owned by `flux-agent`, not a literal
+    /// that merely happens to equal it today. Keeping the resolver input explicit also pins the
+    /// unchanged env precedence without racing other tests through process-global environment.
+    #[test]
+    fn cli_compaction_resolution_tracks_the_agent_default_and_preserves_env_precedence() {
+        assert_eq!(
+            compact_threshold_from_env(Err(VarError::NotPresent)),
+            flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS
+        );
+        assert_eq!(compact_threshold_from_env(Ok("1234".into())), 1234);
+        assert_eq!(
+            compact_threshold_from_env(Ok("0".into())),
+            0,
+            "an explicit zero must continue to disable compaction"
+        );
+        assert_eq!(
+            compact_threshold_from_env(Ok("48k".into())),
+            flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS,
+            "a malformed explicit value must fall back after warning"
+        );
+
+        let source = include_str!("execution.rs");
+        let resolver = source
+            .split_once("fn compact_threshold_from_env(")
+            .expect("compact_threshold resolver exists")
+            .1
+            .split_once("#[cfg(test)]\nmod compact_threshold_tests")
+            .expect("resolver tests follow the implementation")
+            .0;
+        assert!(
+            resolver.contains("DEFAULT_COMPACT_THRESHOLD_CHARS"),
+            "the CLI resolver must name the flux-agent-owned default"
+        );
+        let numeric_copy = ["48", "_000"].concat();
+        let prose_copy = ["48", "000"].concat();
+        assert!(
+            !resolver.contains(&numeric_copy) && !resolver.contains(&prose_copy),
+            "the CLI resolver must contain no numeric or prose copy of the default"
+        );
     }
 }
 

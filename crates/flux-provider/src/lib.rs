@@ -205,12 +205,6 @@ pub trait ModelResolver: Send + Sync {
     fn resolve(&self, alias: &str) -> String;
 }
 
-/// Optional capability: count the prompt tokens of a request before sending it.
-#[async_trait]
-pub trait TokenCounter: Send + Sync {
-    async fn count_tokens(&self, req: &Request) -> Result<u64>;
-}
-
 /// Axis (a): the **wire protocol** — how a [`Request`] is serialized to a JSON body and
 /// how the response byte stream is parsed into [`Chunk`]s. Independent of auth/transport.
 /// (Anthropic Messages, OpenAI Chat Completions, OpenAI Responses.)

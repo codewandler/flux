@@ -1878,7 +1878,7 @@ const CONTEXT_PAGE: &str = "website/docs/agent/context-management.md";
 /// keeping if this test is ever trimmed:
 ///
 /// - the threshold is a **character** count, not a fraction of the model's context window
-///   (C-462 is filed against exactly that), so the page must not imply the latter; and
+///   (C-462 deliberately kept that fixed budget), so the page must not imply the latter; and
 /// - the summary **replaces** the live history, which changes what a later reader of the session
 ///   sees — the page must say so rather than leave a user to discover it.
 #[test]
@@ -1982,14 +1982,31 @@ fn context_management_page_matches_the_compaction_the_code_implements() {
     }
 
     // C-462: the threshold counts characters of serialized history. It does NOT consult the
-    // model's context window — nothing in the tree does, since `TokenCounter` has no
-    // implementation. A page that implies a window fraction would be documenting a feature that
-    // does not exist, and would paper over the defect C-462 is filed for.
+    // model's context window — nothing in the tree exposes that metadata, and C-469 deliberately
+    // retired the unrelated unused exact-token seams. C-462 kept a fixed history budget because a
+    // nominal model window does not reveal whole-request headroom. A page that implies a dynamic
+    // fraction would be documenting a feature that does not exist.
     assert!(
         page.contains("does not")
             && (page.contains("context window") || page.contains("context-window")),
         "{CONTEXT_PAGE} must say plainly that the threshold does not consult the model's context \
          window (C-462), not imply it scales with the model"
+    );
+    assert!(
+        page.contains("fixed history budget") && !page.contains("an open question"),
+        "{CONTEXT_PAGE} must record C-462's decision: the flat threshold is an intentional fixed \
+         history budget, not an unresolved model-window limitation"
+    );
+    let threshold_docs = agent_src
+        .split_once("pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = ")
+        .expect("DEFAULT_COMPACT_THRESHOLD_CHARS is declared in flux-agent")
+        .0
+        .rsplit_once("/// Default session size")
+        .expect("the default threshold keeps its rationale next to the constant")
+        .1;
+    assert!(
+        threshold_docs.contains("C-462") && threshold_docs.contains("fixed history budget"),
+        "C-462's fixed-threshold reasoning must live beside DEFAULT_COMPACT_THRESHOLD_CHARS"
     );
 
     // The claim a user is most surprised by, so the page carries it explicitly: compaction

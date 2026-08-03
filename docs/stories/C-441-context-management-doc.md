@@ -108,9 +108,10 @@ the knob is the fix; a second copy of the knob is not.
   history-replacement path, and `projection::conversation` only `clear()`s the fold.
 - ⚠ **C-462 is documented as a limitation, not papered over and not fixed.** The page says outright that
   the threshold is a flat character count that does not consult the model's context window, gives the
-  ~12k-token equivalence, and calls it an open question. Two assertions in the pin guard that framing:
-  one requires the page to say the threshold *does not* consult the context window, the other pins the
-  `messages.len() < 4` floor and `keep = 2` so a reworded page cannot drift from the gates.
+  ~12k-token equivalence, and originally called it an open question. C-462 subsequently kept it as an
+  intentional fixed history budget and updated the page; the pin still requires the page to say the
+  threshold *does not* consult the context window, and separately pins the `messages.len() < 4` floor
+  and `keep = 2` so rewording cannot drift from the gates.
 - Deliberately **not** written into the page: the summarizer's hard-coded `max_tokens: 1024` and the
   cancellation/empty-summary silent no-ops. Both are real (`engine.rs:1671`, `1686`, `1699`) but are
   internals a user cannot act on; the one user-visible consequence — `/compact` reporting success after
@@ -122,7 +123,7 @@ the knob is the fix; a second copy of the knob is not.
   [C-466](C-466-compact-threshold-default-drifts.md) (the CLI hard-codes the default twice more, so this
   story's new pin verifies the constant against the page while the CLI can drift from both — plus the
   served path silently ignores a malformed `FLUX_COMPACT_CHARS` where the CLI warns),
-  [C-469](C-469-tokencounter-has-no-production-implementor.md) (`TokenCounter` has no production
-  implementor, which is *why* C-462 lacks the evidence it asks for), and
+  [C-469](C-469-tokencounter-has-no-production-implementor.md) (the unused `TokenCounter` seams were
+  subsequently retired, making the deterministic estimate explicit), and
   [C-468](C-468-plugin-host-test-hard-fails-under-tmpfs-pressure.md) (unrelated area, found in the same
   gate run).

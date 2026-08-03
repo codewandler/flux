@@ -867,6 +867,17 @@ pub struct Limits {
     /// `ClientBuilder::resource_limits`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_tool_calls: Option<usize>,
+    /// C-471: how many agents may be live at once across one delegated tree, including the root.
+    /// Absent means no tree-wide ceiling. `1` disables delegation; `0` is read as `1` because the
+    /// root itself already occupies one census place.
+    ///
+    /// Unlike `max_concurrent_tool_calls`, this budget is shared by the root and every transitive
+    /// child. A spawn over the ceiling is refused immediately rather than queued, avoiding a child
+    /// waiting on an ancestor that is itself waiting for that child. Set both ceilings to bound
+    /// simultaneous tool execution across the tree at
+    /// `max_concurrent_tool_calls × max_live_agents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_live_agents: Option<usize>,
     /// C-290: how long a tool call waits for a concurrency slot before it is refused with an
     /// actionable message. Absent means the runtime default (30s). Meaningful only alongside
     /// `max_concurrent_tool_calls`.
@@ -1296,6 +1307,10 @@ fn merge(user: Config, project: Config) -> Config {
                 .limits
                 .max_concurrent_tool_calls
                 .or(user.limits.max_concurrent_tool_calls),
+            max_live_agents: project
+                .limits
+                .max_live_agents
+                .or(user.limits.max_live_agents),
             tool_call_queue_timeout_ms: project
                 .limits
                 .tool_call_queue_timeout_ms
@@ -1805,6 +1820,7 @@ allowed_secrets = ["ISSUE_TOKEN;to=issues.example;by=alice"]
 [limits]
 turn_token_budget = 100000
 max_concurrent_tool_calls = 4
+max_live_agents = 6
 tool_call_queue_timeout_ms = 2500
 max_retained_result_bytes = 1048576
 max_evidence_payload_bytes = 262144
@@ -1813,6 +1829,7 @@ max_evidence_payload_bytes = 262144
         .unwrap();
         assert_eq!(config.limits.turn_token_budget, Some(100_000));
         assert_eq!(config.limits.max_concurrent_tool_calls, Some(4));
+        assert_eq!(config.limits.max_live_agents, Some(6));
         assert_eq!(config.limits.tool_call_queue_timeout_ms, Some(2500));
         assert_eq!(config.limits.max_retained_result_bytes, Some(1_048_576));
         assert_eq!(
@@ -1828,16 +1845,19 @@ max_evidence_payload_bytes = 262144
     fn runtime_resource_ceilings_merge_as_scalars() {
         let mut user = Config::default();
         user.limits.max_concurrent_tool_calls = Some(2);
+        user.limits.max_live_agents = Some(3);
         user.limits.max_retained_result_bytes = Some(1024);
         user.limits.tool_call_queue_timeout_ms = Some(9_000);
         user.limits.max_evidence_payload_bytes = Some(4_096);
 
         let mut project = Config::default();
         project.limits.max_concurrent_tool_calls = Some(8);
+        project.limits.max_live_agents = Some(12);
         project.limits.max_evidence_payload_bytes = Some(65_536);
 
         let merged = merge(user, project);
         assert_eq!(merged.limits.max_concurrent_tool_calls, Some(8));
+        assert_eq!(merged.limits.max_live_agents, Some(12));
         assert_eq!(merged.limits.max_evidence_payload_bytes, Some(65_536));
         assert_eq!(
             merged.limits.max_retained_result_bytes,

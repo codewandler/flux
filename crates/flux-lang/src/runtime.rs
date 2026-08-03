@@ -4770,7 +4770,6 @@ fn build_ctx(
             &candidates,
             &crate::context_slice::Boundary::none(),
             None,
-            None,
         );
         if !gate_record.excluded.is_empty() {
             let excluded_names: Vec<String> = gate_record

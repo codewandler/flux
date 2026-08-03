@@ -234,6 +234,9 @@ impl ResourceLimits {
         if let Some(n) = limits.max_concurrent_tool_calls {
             resolved = resolved.with_max_concurrent_tool_calls(n);
         }
+        if let Some(n) = limits.max_live_agents {
+            resolved = resolved.with_max_live_agents(n);
+        }
         if let Some(ms) = limits.tool_call_queue_timeout_ms {
             resolved = resolved.with_tool_call_queue_timeout(Duration::from_millis(ms));
         }
@@ -657,12 +660,14 @@ mod tests {
     fn the_config_table_maps_onto_the_runtime_ceilings() {
         let limits = ResourceLimits::from_config(&flux_config::Limits {
             max_concurrent_tool_calls: Some(4),
+            max_live_agents: Some(6),
             tool_call_queue_timeout_ms: Some(2_500),
             max_retained_result_bytes: Some(1_048_576),
             max_evidence_payload_bytes: Some(262_144),
             ..Default::default()
         });
         assert_eq!(limits.max_concurrent_tool_calls(), Some(4));
+        assert_eq!(limits.max_live_agents(), Some(6));
         assert_eq!(
             limits.tool_call_queue_timeout(),
             Duration::from_millis(2_500)
@@ -675,6 +680,37 @@ mod tests {
         assert_eq!(
             empty.tool_call_queue_timeout(),
             DEFAULT_TOOL_CALL_QUEUE_TIMEOUT
+        );
+    }
+
+    /// C-471: the file-configured delegated-tree ceiling reaches the shared census, including its
+    /// immediate typed refusal rather than merely surviving deserialization as an inert number.
+    #[test]
+    fn a_file_configured_agent_ceiling_reaches_and_enforces_the_census() {
+        let config = flux_config::parse_source(
+            "project/.flux/config.toml",
+            "[limits]\nmax_live_agents = 2\n",
+        )
+        .expect("parse file config");
+        let limits = ResourceLimits::from_config(&config.limits);
+
+        assert_eq!(limits.max_live_agents(), Some(2));
+        let child = limits
+            .admit_agent()
+            .expect("configured census exists")
+            .expect("one child fits beside the root");
+        let refusal = limits
+            .admit_agent()
+            .expect_err("a second child exceeds root + one child");
+        assert_eq!(refusal.limit, 2);
+
+        drop(child);
+        assert!(
+            limits
+                .admit_agent()
+                .expect("a freed census place is reusable")
+                .is_some(),
+            "dropping a child must return its place to the shared census"
         );
     }
 
