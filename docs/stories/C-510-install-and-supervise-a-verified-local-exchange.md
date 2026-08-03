@@ -23,12 +23,15 @@ owner, never an Exchange runtime, binary distributor or credential holder.
 
 ### One provider-owned channel and one trust contract
 
-- [ ] The Flux build pins one `ExchangeChannelPolicy`: X-126's exact GitHub release request origin,
-      long-lived offline minisign root keys/threshold policy, the provider-owned trust/channel/
-      manifest/compatibility/readiness schema ids, and the protocol versions this client implements.
-      It embeds no routine online signer and no Exchange tag, semver, source commit, build id,
-      manifest/executable digest or connector version. Configuration, environment, project files,
-      model input and an unsigned `latest` lookup cannot replace or widen it.
+- [ ] Flux begins from exactly one authenticated `ExchangeChannelPolicy` bootstrap contract, either
+      embedded in the shipped Flux build or supplied through explicitly user-administered trust
+      configuration. It contains only the initial minisign trust anchors/threshold, X-126's exact
+      stable-channel request origin and redirect/transport policy, the provider-owned trust/channel/
+      manifest/compatibility/readiness schema ids, and the provider protocol ids/versions this client
+      supports. It embeds no routine online signer and never pins or selects an Exchange tag, semver,
+      source commit, build id, manifest/executable digest or connector version. Ordinary runtime
+      configuration, environment, project files, model input and an unsigned `latest` lookup cannot
+      replace or widen this bootstrap policy.
 - [ ] The compiled protocol set consumes X-126's exact six provider values:
       `exchange_api=exchange.api.v1`,
       `effective_catalogue_response=exchange.effective-catalogue-response.v1`,
@@ -118,7 +121,7 @@ owner, never an Exchange runtime, binary distributor or credential holder.
 - [ ] Routine delegated signer rotation follows X-126's root-threshold overlap fixtures and requires
       no Flux release. Compatible Exchange releases, including releases carrying new connector
       catalogues, likewise require no Flux release. Only a root/trust-policy change not already
-      admitted by the pinned threshold policy, or an unsupported schema/protocol/client change,
+      admitted by the authenticated bootstrap policy, or an unsupported schema/protocol/client change,
       requires Flux to change.
 - [ ] The selected manifest's exact release identity/digests become installed audit, cache-validation
       and process-ownership metadata, never compiled compatibility policy. Flux admits only its exact
@@ -324,8 +327,10 @@ owner, never an Exchange runtime, binary distributor or credential holder.
   boundary and the upcoming Exchange X-127/X-128 platform/readiness contracts; no implementation has
   started.
 - 2026-08-04: Architecture correction replaced the exact-Exchange-release pin with a signed,
-  expiry-bounded, monotonic stable channel. Flux now pins trust/origin/protocol policy only; installed
-  version and digests are audit/ownership facts rather than a release-cadence coupling.
+  expiry-bounded, monotonic stable channel. Flux now uses only an authenticated bootstrap policy—
+  embedded or explicitly administrator-supplied—for initial trust anchors, stable-channel origin/
+  transport and supported schema/protocol identities; installed version and digests are audit/
+  ownership facts rather than a release-cadence coupling.
 - 2026-08-04: Cross-repository reconciliation removed Flux-owned wire shapes and made X-126/X-128's
   canonical schemas, redirect contract and conformance fixtures the single provider-owned source.
 - 2026-08-04: Implementation audit aligned the consumer to Exchange provider commit
