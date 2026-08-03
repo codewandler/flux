@@ -24,6 +24,7 @@ mod auth_cmd;
 mod dispatch;
 mod docs_cmd;
 mod doctor;
+mod exchange_local;
 mod execution;
 mod export_cmd;
 mod flow_cmd;

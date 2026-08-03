@@ -563,6 +563,11 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: Option<AuthAction>,
     },
+    /// Install and operate the verified local Flux Exchange service.
+    Exchange {
+        #[command(subcommand)]
+        action: ExchangeAction,
+    },
     /// The plugin CLI — manage subprocess plugins (any-language ops).
     ///
     /// Lifecycle over the signed plugin pack (`plugins-v*` releases): `install` (verified remote;
@@ -677,6 +682,53 @@ pub(super) enum ContextAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `flux exchange ...` — lifecycle operations for provider-owned local services.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum ExchangeAction {
+    /// Install and operate the verified local Exchange release.
+    Local {
+        #[command(subcommand)]
+        action: ExchangeLocalAction,
+    },
+}
+
+/// `flux exchange local ...` — the closed local Exchange lifecycle surface.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum ExchangeLocalAction {
+    /// Install the newest compatible release and start it, or report the already-running instance.
+    Start,
+    /// Report the installed and running state.
+    Status {
+        /// Emit the stable `flux.exchange-local-status.v1` JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the authenticated instance, or succeed when it is already stopped.
+    Stop,
+    /// Import one complete offline signed release set. Every artifact is required and no reduced
+    /// direct-manifest import exists.
+    Import {
+        #[arg(long, value_name = "PATH", required = true)]
+        trust: std::path::PathBuf,
+        #[arg(long, value_name = "PATH", required = true)]
+        root_signature: Vec<std::path::PathBuf>,
+        #[arg(long, value_name = "PATH", required = true)]
+        channel: std::path::PathBuf,
+        #[arg(long, value_name = "PATH", required = true)]
+        channel_signature: Vec<std::path::PathBuf>,
+        #[arg(long, value_name = "PATH", required = true)]
+        manifest: std::path::PathBuf,
+        #[arg(long, value_name = "PATH", required = true)]
+        release_signature: Vec<std::path::PathBuf>,
+        #[arg(long, value_name = "PATH", required = true)]
+        archive: std::path::PathBuf,
+        #[arg(long, value_name = "PATH", required = true)]
+        provenance: std::path::PathBuf,
+    },
+    /// Replace a refused or obsolete cached release while no local instance is running.
+    Reinstall,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]

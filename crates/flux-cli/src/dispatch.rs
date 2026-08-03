@@ -172,6 +172,7 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Export { .. }
         | Commands::Auth { .. }
         | Commands::Endpoint { .. }
+        | Commands::Exchange { .. }
         | Commands::Policy { .. }
         | Commands::Catalog { .. }
         | Commands::Skill { .. }
@@ -590,7 +591,15 @@ pub(super) fn run() -> Result<()> {
     // One clap parse handles every subcommand + `--help`/`-h`/`--version`/`help`. The top level carries
     // only `--color` (global) + the command list; the agent (turn) flags live on the agent-path
     // subcommands (`run`/`plan`/`tui`/`fork`/`app run`). With no subcommand, `flux` opens the REPL.
-    let cli = Cli::parse();
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(argv.clone()) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = exchange_usage_exit_code(&argv, error.exit_code());
+            error.print().context("print command-line error")?;
+            std::process::exit(exit_code);
+        }
+    };
     style::init(cli.color);
     // C-21: export the filesystem-access policy (extra read-only roots + the unconfined hatch) to the
     // environment so every workspace — including `app run` and subprocess paths — inherits it via
@@ -792,6 +801,15 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Diff { a, b, json }) => run_diff_cmd(&a, &b, json),
             Some(Commands::Export { run, out }) => run_export(&run, out.as_deref()),
             Some(Commands::Auth { action }) => run_auth(action).await,
+            Some(Commands::Exchange {
+                action: ExchangeAction::Local { action },
+            }) => {
+                let exit_code = exchange_local::command::run(action).await;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
             Some(Commands::Policy { action }) => run_policy(action),
@@ -821,6 +839,52 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Clap uses exit 2 for the established Flux CLI. C-510 reserves sysexits-style 64 specifically
+/// for malformed `exchange local` invocations, without silently changing every older subcommand.
+pub(super) fn exchange_usage_exit_code(argv: &[std::ffi::OsString], clap_exit_code: i32) -> i32 {
+    if clap_exit_code != 0 && is_exchange_local_command_path(argv) {
+        exchange_local::status::USAGE_EXIT
+    } else {
+        clap_exit_code
+    }
+}
+
+fn is_exchange_local_command_path(argv: &[std::ffi::OsString]) -> bool {
+    fn next_path_token(
+        argv: &[std::ffi::OsString],
+        mut index: usize,
+    ) -> Option<(&std::ffi::OsStr, usize)> {
+        while let Some(argument) = argv.get(index).map(std::ffi::OsString::as_os_str) {
+            if matches!(argument.to_str(), Some("--color" | "--store" | "--add-dir")) {
+                index += 2;
+                continue;
+            }
+            if argument.to_str().is_some_and(|argument| {
+                argument.starts_with("--color=")
+                    || argument.starts_with("--store=")
+                    || argument.starts_with("--add-dir=")
+            }) || matches!(
+                argument.to_str(),
+                Some("--allow-all-paths" | "--allow-private-net" | "--sandbox" | "--no-sandbox")
+            ) {
+                index += 1;
+                continue;
+            }
+            return Some((argument, index + 1));
+        }
+        None
+    }
+
+    let Some((command, after_command)) = next_path_token(argv, 1) else {
+        return false;
+    };
+    if command != std::ffi::OsStr::new("exchange") {
+        return false;
+    }
+    next_path_token(argv, after_command)
+        .is_some_and(|(action, _)| action == std::ffi::OsStr::new("local"))
 }
 
 /// Export the per-turn env signals (`FLUX_VERBOSE`, `FLUX_SHOW_LOOP`, `FLUX_TRACE_LOOP`) the
