@@ -17,7 +17,10 @@ trap 'rm -rf "$TMP"' EXIT
   cd "$ROOT/website"
   # Webpack's production minifier salts mangled identifiers with the absolute input filename. The
   # archive is already compressed, so retain the deterministic optimized bundle without mangling.
-  npm run build -- --no-minify
+  # GitHub's Pages runner injects GITHUB_PAGES=true. That variable belongs to deployment, not to the
+  # same website embedded in flux-server, and letting it reach Docusaurus makes CI compare a
+  # Pages-flavoured archive with the server archive contributors build locally.
+  env -u GITHUB_PAGES npm run build -- --no-minify
 )
 
 mkdir -p "$TMP/site"

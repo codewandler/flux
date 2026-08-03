@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The documentation archive embedded in `flux-server` is release-current and independent of the
+  GitHub Pages runner environment** (C-498). The v0.54.0 main workflow exposed two coupled gaps: the
+  archive had not been refreshed after the release documentation changed, and `GITHUB_PAGES=true`
+  made the check build deployment-flavoured bytes that no local server build produced. The builder
+  now excludes that deployment-only variable, the archive is regenerated, and set/unset checks are
+  byte-identical.
+
+- **The closed GitHub Release verifier admits and attests the LSP assets cargo-dist actually emits
+  for the published package name** (C-499). v0.54.0 promotion refused safely on
+  `codewandler-flux-lsp-aarch64-apple-darwin.tar.xz`: the binary remains `flux-lsp`, but archives
+  switched from the former crate name when its package became `codewandler-flux-lsp`. The real
+  candidate inventory now drives the self-test, all seven LSP executables remain inside the exact
+  download/attestation set, and historical `flux-lsp-*` releases are still accepted.
+
 ## [0.54.0] - 2026-08-03
 
 ### Added
