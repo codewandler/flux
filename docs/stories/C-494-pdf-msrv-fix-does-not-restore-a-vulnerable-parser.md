@@ -2,7 +2,7 @@
 id: C-494
 title: The MSRV repair does not restore a vulnerable PDF parser
 pillar: Core
-status: in-progress
+status: done
 priority: 0
 note: "the 1.87-compatible pdf-extract downgrade pulled lopdf 0.38, vulnerable to untrusted recursive PDF objects; make safe extraction opt-in and keep default fetches opaque"
 ---
@@ -18,7 +18,7 @@ line affected by RUSTSEC-2026-0187.
 - [x] The default flux-web graph contains no vulnerable PDF parser and still builds on Rust 1.87.
 - [x] A default-build test proves detected PDF bytes remain opaque rather than falling through to a
       lossy raw response, while the opt-in pdf feature extracts through the fixed parser line.
-- [ ] Workspace tests, clippy, formatting, codegate and audit pass, and a corrective 0.52 patch is
+- [x] Workspace tests, clippy, formatting, codegate and audit pass, and a corrective 0.52 patch is
       published by CI.
 
 ## Notes
@@ -27,3 +27,4 @@ line affected by RUSTSEC-2026-0187.
 - The fixed lopdf line uses language syntax stabilized in Rust 1.88. PDF extraction is therefore an
   explicit feature with a feature-specific 1.88 floor; the default web and HTTP surface keeps 1.87.
 - Ignoring the advisory is not an option: web.fetch parses remote, attacker-controlled bytes.
+- Flux 0.52.3's complete 29-crate closure was published by the tag-triggered crates.io workflow.
