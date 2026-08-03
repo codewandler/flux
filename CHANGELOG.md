@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release cutter now regenerates and commits `flux-server`'s embedded docs after rolling the
+  website changelog** (C-498). v0.54.1 proved the earlier one-time refresh was insufficient: the cut
+  changed `website/docs/whats-new.md` after the archive had been built, so its tag-only website
+  workflow correctly found stale bytes. The archive is now a snapshotted, restored, verified and
+  path-limited release output, making that ordering part of every cut instead of release-day memory.
+
 ## [0.54.1] - 2026-08-03
 
 ### Fixed

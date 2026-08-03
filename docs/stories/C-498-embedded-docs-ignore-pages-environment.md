@@ -33,3 +33,7 @@ source, independent of GitHub Pages runner variables, and ship the refreshed arc
   being the only cause.
 - 2026-08-03: v0.54.0 is recorded as intentionally unshippable rather than bypassing the verifier
   to publish known-stale binaries; v0.54.1 is the release-current rebuild.
+- 2026-08-03: v0.54.1's tag workflow exposed the remaining ordering bug: the cutter rolled the
+  website changelog after the one-time archive refresh. The cutter now regenerates, verifies,
+  snapshots and commits the archive after all release-owned website edits; v0.54.2 will carry the
+  corrected invariant.

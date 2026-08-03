@@ -126,6 +126,10 @@ done
 
 grep -Fq 'gh workflow run release.yml --ref main -f version=' "$ROOT/scripts/cut-release.sh" \
   || fail "cut-release does not print the candidate preparation command"
+grep -Fq 'scripts/build-embedded-docs.sh --check' "$ROOT/scripts/cut-release.sh" \
+  || fail "cut-release does not verify the release-current embedded docs"
+grep -Fq 'crates/flux-server/assets/public-docs.zip' "$ROOT/scripts/cut-release.sh" \
+  || fail "cut-release does not transact and commit the embedded docs archive"
 grep -Fq 'promotes those artifacts without recompiling' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
   || fail "publishing runbook does not document build-once promotion"
 

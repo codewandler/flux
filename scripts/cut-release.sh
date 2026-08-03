@@ -9,10 +9,10 @@
 #   scripts/cut-release.sh <ver> --no-gate   # skip the build/test/clippy/fmt gate (not recommended)
 #
 # It stages ONLY the release files (the root manifest + lock, both changelogs, the generated
-# website customer-changelog mirror, and the roadmap status stamp) so concurrent uncommitted work
-# from other sessions is never swept in. The plugin pack is NOT part of a flux cut: its crates sit
-# on the independent 1.x protocol line (C-143), so nothing under plugins/ is edited, re-locked, or
-# staged here.
+# website customer-changelog mirror, the docs archive embedded in flux-server, and the roadmap
+# status stamp) so concurrent uncommitted work from other sessions is never swept in. The plugin
+# pack is NOT part of a flux cut: its crates sit on the independent 1.x protocol line (C-143), so
+# nothing under plugins/ is edited, re-locked, or staged here.
 #
 # It does NOT push. It prints the build-once sequence: push the commit, prepare its exact-SHA
 # binary artifacts, then push the already-created local tag to promote those artifacts and start
@@ -58,7 +58,7 @@ echo "== cutting $OLD -> $NEW =="
 # is left behind: re-running the script would roll [Unreleased] a SECOND time and mint a phantom
 # version section (this is the documented 0.14.3 gap; it recurred cutting 0.28.0). So snapshot every
 # file this script may touch and restore it on ANY non-zero exit before the commit.
-RELEASE_FILES=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md docs/roadmap.md)
+RELEASE_FILES=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip docs/roadmap.md)
 SNAPSHOT="$(mktemp -d)"
 for f in "${RELEASE_FILES[@]}"; do
   [ -f "$f" ] || continue
@@ -156,6 +156,14 @@ else
   echo "   !! docs/roadmap.md has no 'Status as of **X.Y.Z (DATE)**' line — stamp it by hand" >&2
 fi
 
+# 3e) The release roll changes the website mirror above, and flux-server embeds that website as a
+#      zip at compile time. Regenerate after every release-owned website edit, inside the same
+#      transaction, so the exact tagged commit cannot contain the previous release's docs (C-498).
+scripts/build-embedded-docs.sh >/dev/null
+scripts/build-embedded-docs.sh --check >/dev/null \
+  || { echo "!! embedded docs did not regenerate deterministically" >&2; exit 1; }
+echo "   regenerated embedded documentation"
+
 # 4) the gate (skippable). Mirrors AGENTS.md's dev-loop gate + both-workspace fmt + codegate.
 if [ "$NO_GATE" -eq 0 ]; then
   echo "== gate =="
@@ -184,7 +192,7 @@ fi
 # So: commit by pathspec (`--only`, which commits exactly these paths from the working tree and
 # leaves any other staged work alone), and include the roadmap only when its sole change is the
 # stamp this script just made.
-COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md)
+COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip)
 if git diff --quiet HEAD -- docs/roadmap.md; then
   : # unchanged (no stamp needed, or the file has no status line) — nothing to commit
 elif diff -q <(git show "HEAD:docs/roadmap.md" 2>/dev/null) "$SNAPSHOT/docs/roadmap.md" >/dev/null 2>&1; then
