@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.54.4] - 2026-08-03
+
 ### Fixed
 
 - **The Plugins and Direction guides now tell the same migration story as the roadmap.** The signed

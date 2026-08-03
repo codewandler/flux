@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.54.4] - 2026-08-03
+
 ### Fixed
 
 - **The public Plugins and Direction sections now state the connector-native destination** (C-501).

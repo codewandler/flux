@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.54.4] - 2026-08-03
+
 ### Fixed
 
 - **The Plugins and Direction guides now tell the same migration story as the roadmap.** The signed
