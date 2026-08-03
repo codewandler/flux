@@ -27,6 +27,14 @@ find "$TMP/site" -type f \( -name '*.xml' -o -name '*.html' \) -exec \
   sed -i -E \
     -e 's#<lastBuildDate>[^<]+</lastBuildDate>#<lastBuildDate>Thu, 01 Jan 1970 00:00:00 GMT</lastBuildDate>#g' \
     -e 's#<updated>[^<]+</updated>#<updated>1970-01-01T00:00:00.000Z</updated>#g' {} +
+
+# An absolute source/plugin path in a client bundle makes the release archive depend on where its
+# source tree happened to be checked out. Refuse it before the deterministic zip hides the cause.
+if grep -R -F -q -- "$ROOT" "$TMP/site"; then
+  echo "built docs contain the checkout root" >&2
+  exit 1
+fi
+
 find "$TMP/site" -type f -exec touch -t 198001010000 {} +
 
 BUNDLE="$TMP/public-docs.zip"

@@ -47,7 +47,7 @@ const config = {
       'classic',
       {
         docs: {
-          sidebarPath: require.resolve('./sidebars.js'),
+          sidebarPath: './sidebars.js',
           routeBasePath: 'docs',
           editUrl: 'https://github.com/codewandler/flux/edit/main/website/',
         },
@@ -73,7 +73,7 @@ const config = {
           },
         },
         theme: {
-          customCss: require.resolve('./src/css/custom.css'),
+          customCss: './src/css/custom.css',
         },
       },
     ],
@@ -81,7 +81,7 @@ const config = {
 
   themes: [
     [
-      require.resolve('@easyops-cn/docusaurus-search-local'),
+      '@easyops-cn/docusaurus-search-local',
       {
         // Offline, index-based search — no external service (Algolia) needed.
         hashed: true,
@@ -92,7 +92,7 @@ const config = {
     ],
   ],
 
-  plugins: [require.resolve('./plugins/llms-txt')],
+  plugins: ['./plugins/llms-txt'],
 
   themeConfig: {
     image: 'img/social-card.png',
