@@ -109,6 +109,20 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: steps.creds.outputs.have_key == 'true'
 
+      # `cut-release.sh` regenerates the embedded documentation snapshot. Hosted runners have Node
+      # but not the lockfile's local Docusaurus binary, so provision the same pinned toolchain used
+      # by website.yml before the Flux-authored transaction starts.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.creds.outputs.have_key == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - run: npm ci
+        if: steps.creds.outputs.have_key == 'true'
+        working-directory: website
+
       - if: steps.creds.outputs.have_key == 'true'
         run: cargo fetch --locked
 

@@ -181,6 +181,11 @@ workflows and runs the public Release verifier before reporting success. Keeping
 half outside the model-authored program means a bug in the program cannot publish directly.
 
 ## Progress
+- 2026-08-03 — Automatic release run `30837261195` passed the hosted sandbox proof, release build,
+  nine-leg live smoke, strict scribe parser, and changelog insertion, then failed safely inside the
+  transactional cut because the fresh runner had no local Docusaurus binary. `cut-release.sh`
+  restored the worktree and no candidate, tag, or release ref moved. The release workflow now installs
+  pinned Node 22 and the website lockfile before entering Flux; an authority test pins that ordering.
 - 2026-08-03 — Hosted preview `30833603707` passed the complete live smoke under bubblewrap, then
   failed closed before writing or promotion because `task()` returned JSON as text and the flow read
   it as an object. `release_parse_notes` now makes that boundary explicit and strict. Unit tests

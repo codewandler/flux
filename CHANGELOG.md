@@ -18,6 +18,8 @@ All notable changes to this project are documented in this file. The format is b
   release does not also depend on an OpenRouter credit balance. Hosted runners install and self-test
   bubblewrap before the agentic smoke and Flux cut, including enabling the user-namespace primitive
   restricted by Ubuntu 24.04's hosted AppArmor default, preserving the fail-closed sandbox posture.
+  They also install the website's locked Node dependencies before the transactional cut, so embedded
+  documentation regeneration uses the same pinned Docusaurus toolchain as the website gate.
 
 ### Fixed
 
