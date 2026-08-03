@@ -2,7 +2,7 @@
 id: C-461
 title: "Say what flux's secret model is — including that the connector path already prevents while the local path only contains"
 pillar: Core
-status: ready
+status: done
 priority: 6
 design: docs/designs/secrets-the-agent-never-sees.md
 epic: secrets-the-agent-never-sees
@@ -24,9 +24,10 @@ what the `Redactor` can and cannot do.
 1. **The connector boundary** ([C-312](C-312-connector-credential-boundary.md)) — *"flux holds exactly
    ONE secret on this path… a response carrying credential-shaped material is refused, not merely
    redacted."* The vendor credential never enters the process.
-2. **`conn.authenticate` (D-31)** — for Postgres, **the host speaks the SCRAM handshake itself so the
-   plugin never receives the password at all** (`crates/flux-plugin/src/host.rs:986+`). That is
-   prevention by protocol, and it is a better story than any redaction claim.
+2. **[`conn.authenticate` (D-31)](D-31-host-terminated-rawsocket-auth.md)** — for Postgres, **the host
+   speaks the SCRAM handshake itself so the plugin never receives the password at all**
+   (`crates/flux-plugin/src/host.rs:986+`). That is prevention by protocol, and it is a better story
+   than any redaction claim.
 3. **`ResolvedEndpoint` has no `Serialize` impl at all** (`crates/flux-secret/src/endpoint.rs:145`) — a
    **compile-time** guarantee that a materialized credential cannot be serialized toward the model,
    while `EndpointRef` carries only a *location*.
@@ -48,24 +49,27 @@ and it is the single most important sentence for a user to read.
 
 ## Acceptance
 
-- [ ] A page stating the two models and which secrets fall under each. ⚠ **A reader must be able to
+- [x] A page stating the two models and which secrets fall under each. ⚠ **A reader must be able to
       determine, for their own secret, which one they have** — that is the entire point.
-- [ ] ⚠ **The `Redactor`'s limit is stated plainly: it redacts values it has been told about.** A
+- [x] ⚠ **The `Redactor`'s limit is stated plainly: it redacts values it has been told about.** A
       credential pasted into a prompt, or read from a file flux did not resolve, is not redacted. This is
-      C-432's finding and it is the single most useful sentence on the page.
-- [ ] The connector-path guarantee is stated where a user evaluating flux will meet it, not only in a
+      [C-432](C-432-browser-credentials-never-come-from-the-prompt.md)'s finding and it is the single
+      most useful sentence on the page.
+- [x] The connector-path guarantee is stated where a user evaluating flux will meet it, not only in a
       story.
-- [ ] ⚠ **No overclaiming.** *"Secrets are redacted from model-visible output"* is true and incomplete;
+- [x] ⚠ **No overclaiming.** *"Secrets are redacted from model-visible output"* is true and incomplete;
       unqualified, it invites the belief that pasting a key into a prompt is safe. The repo's register is
       `vision.md`'s — it calls a pillar *"currently aspirational, and this document says so honestly."*
-- [ ] Where flux is genuinely behind, say so and link the story — no **destination** scoping (C-459;
-      ⚠ note flux *does* scope which secret may be *named*, via `http.request`'s `allowed_secrets` and
-      plugin `grants.secrets`), no rotation-without-restart, and audit of use covering exactly one hop
-      (C-460).
-- [ ] ⚠ The **documented, structural** exception is stated: raw prompt text and turn summaries reach the
+- [x] Where flux is genuinely behind, say so and link the story — destination scoping reaches only
+      `http.request` ([C-459](C-459-scope-a-secret.md); local program/channel secrets remain unscoped;
+      flux also scopes which secret may be *named* via `allowed_secrets` and plugin `grants.secrets`),
+      no local-program-secret rotation without restart, and audit of use covering exactly one hop
+      ([C-460](C-460-rotation-revocation-audit.md)).
+- [x] ⚠ The **documented, structural** exception is stated: raw prompt text and turn summaries reach the
       durable log with no redactor in the path. A page that lists the guarantees without this one is the
       overclaim it exists to prevent.
-- [ ] Full gate green including website checks.
+- [ ] Full gate green including website checks. (Website checks are green; the wave integration parent
+      owns the single full repository gate.)
 
 ## Notes
 
@@ -78,3 +82,15 @@ and it is the single most important sentence for a user to read.
 
 ## Progress
 - Filed 2026-08-02 from the Vaults comparison.
+- 2026-08-03 — rewrote the public credentials guide around a user-classifiable prevention versus
+  containment table. It distinguishes process prevention for platform-sourced connector vendor
+  credentials, plugin prevention for PostgreSQL `conn.authenticate`, and the non-serializable
+  `ResolvedEndpoint` boundary from local plaintext program/provider/plugin paths. The guide states
+  the `Redactor`'s registration limit, heuristic gaps, prompt/answer durable-log exception,
+  `http.request`-only destination/principal scope, restart requirement for program-secret rotation,
+  and the single cross-plugin audit hop. Corrected the security overview/plain-language page and
+  added maintainer/customer changelog entries. Verification: `git diff --check`;
+  `cargo test -p codewandler-flux-secret` (23 passed); the plugin credential-boundary unit filter (9
+  passed); and `npm run build` in `website/` (production build green after `npm ci`). `npm ci` reported
+  the lockfile's existing 27 audit findings (1 low, 20 moderate, 6 high); dependencies were not changed.
+  The wave parent owns the single full repository gate.

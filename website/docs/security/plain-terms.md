@@ -30,9 +30,11 @@ prompt.
   authorize anything excluded by policy or by an app/agent ceiling.
 - **You approve before anything big runs in interactive mode.** You can say yes once, always allow a
   routine action, or say no. No is always the safe default.
-- **The AI does not receive your passwords and API keys.** The default login store does contain token
-  values, as a plaintext owner-only file. The model receives references such as a key name instead;
-  flux resolves values at the IO boundary and scrubs known secrets from captured output.
+- **Use secret references; never paste a password or API key into a prompt.** On supported paths the
+  model receives a name or location while the host or external connector handles the value. Locally
+  materialized values are scrubbed from captured output only after Flux has registered them. A value
+  pasted into a prompt is unknown to that redactor, is sent to the model, and is written into the
+  durable session log.
 - **Plugin access through flux is narrow.** Host callbacks are limited to the programs, files,
   secrets, connections, and network hosts declared by the plugin. A plugin is still a trusted native
   program and is not OS-sandboxed by default in interactive use; malicious code could make its own
@@ -59,6 +61,10 @@ No tool removes all risk, and flux won't pretend to. A few things stay in your h
 - **Keep your login file private.** On your own computer, flux stores your sign-in tokens in a file
   that only your account can read. Don't share it or loosen its permissions. (An embedding host can
   inject a Vault-backed store for a team deployment.)
+- **Treat session history as sensitive.** Raw prompts and answers are saved without redaction at the
+  moment they are written. Export catches recognizable credential shapes, but it cannot reconstruct
+  every secret a past run knew. Keep credentials out of prompts and use the supported references in
+  [Credentials & secrets](./credentials.md).
 
 ## Where to go next
 

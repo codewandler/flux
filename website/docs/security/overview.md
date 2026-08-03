@@ -31,7 +31,7 @@ There are three directions of trust to keep separate in your head:
 | Pillar | What it protects | Page |
 |---|---|---|
 | The envelope | The agent can't touch fs/process/network except through one gated chain | [Safety & approvals](../agent/safety.md) |
-| Credentials & secrets | Provider and plugin tokens; secret values never reach the model | [Credentials & secrets](./credentials.md) |
+| Credentials & secrets | Which paths prevent disclosure, which materialize plaintext, and where redaction stops | [Credentials & secrets](./credentials.md) |
 | Plugin capability sandbox | What a plugin's code can reach *through host callbacks* | [Plugin capability sandbox](./plugin-sandbox.md) |
 | OS process sandbox | What a spawned process's raw syscalls can reach (interactive opt-in; selected unattended CLI forms fail closed) | [OS process sandboxing](./os-sandbox.md) |
 | Plugin trust & signing | *Which* plugin code runs — supply-chain integrity | [Plugin trust & signing](./plugin-trust.md) |
@@ -62,7 +62,7 @@ by convention. Each is covered by a test:
 
 ## An honest posture
 
-Three things are easy to assume and worth stating plainly up front, because the deep pages depend on
+Four things are easy to assume and worth stating plainly up front, because the deep pages depend on
 you knowing them:
 
 - **Stored credentials are plaintext on disk, protected by file permissions — not encrypted.** The
@@ -71,6 +71,12 @@ you knowing them:
   host applications through the credential-store API; setting Vault environment variables does not
   switch the stock CLI or server away from the file store. See
   [Credentials & secrets](./credentials.md).
+- **Redaction covers known values, not arbitrary prompt text, and prompts/answers have a durable-log
+  exception.** A credential Flux resolved and registered is scrubbed on the surfaces wired to the
+  shared redactor. A credential pasted into a prompt or read from an unrelated file is not thereby
+  registered. Raw prompt and answer fields are written to the durable event log without a redactor in
+  that write path; a later export can apply only fresh shape-based matching. See
+  [Credentials & secrets](./credentials.md#the-durable-log-exception).
 - **Plugin host callbacks are capability-confined; native code remains trusted.** A plugin process
   starts with a cleared environment and can reach only what its manifest declared *through flux*.
   The binary is not OS-sandboxed by default in interactive use, so direct syscalls can bypass the

@@ -28,6 +28,11 @@
 
 ### Improved
 
+- **The security guide now tells you which secret guarantee you actually have.** It separates
+  credentials kept outside Flux or a plugin from values materialized locally and protected by
+  scopes and redaction. It also states plainly that unknown credentials pasted into prompts are not
+  redacted and that raw prompts and answers are written to session history.
+
 - **The model guide now explains how to use a provider Flux does not name.** Use an OpenRouter
   catalogue id for hosted models, either Ollama wire for local models, or implement the Rust provider
   interface in an embedded product. Flux keeps a small, fully maintained built-in set instead of

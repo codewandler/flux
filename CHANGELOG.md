@@ -35,6 +35,12 @@ All notable changes to this project are documented in this file. The format is b
   Cargo build script. Adding, moving, renaming or upgrading a direct dependency now fails with the
   exact regeneration command until its lock diff is acknowledged.
 
+- **The public security guide now distinguishes secret prevention from containment** (C-461). It
+  identifies connector, host-authentication and non-serializable endpoint guarantees; maps local
+  program/provider/plugin credentials to their actual materialization paths; and states the
+  redactor, destination-scope, rotation, audit, and raw prompt/answer durable-log limits without an
+  unqualified "the model never sees secrets" claim.
+
 - **The provider guide now states the supported breadth and the rule for extending it** (C-449).
   Flux ships eight production text-provider prefixes over four wire codecs plus one optional realtime
   implementation; the maintained strategy is a narrow in-tree registry, OpenRouter for the catalogue
