@@ -65,6 +65,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The CST layout formatter preserves a terminal column-zero module comment** (L-125). The LSP's
+  format-on-save path and `fluxlang fmt` no longer re-indent a comment after the final declaration
+  into that declaration's body; exact-text coverage also pins comments before, between, and trailing
+  on declarations and statements.
+
 - **Webhook and connector HTTP ingress now shares the server's body, timeout, request-rate and
   concurrency controls** (C-409). Admission happens before `Deliverer` or task spawn, async work
   holds its permit for the full delivery, and refusals reuse the typed `429`, `Retry-After` and

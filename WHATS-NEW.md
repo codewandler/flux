@@ -42,6 +42,10 @@
 
 ### Fixed
 
+- **Formatting no longer moves a final top-level comment into the preceding flow.** Format-on-save
+  and `fluxlang fmt` now keep a comment written at the left margin after the last declaration at the
+  left margin, preserving which part of the program it documents.
+
 - **Webhook and connector listeners now refuse overload consistently with the main server.** Body
   size, timeout, request-rate and concurrent-work limits apply before a delivery can start, and
   long-lived streaming responses remain full-duplex under backpressure.

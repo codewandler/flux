@@ -2,7 +2,7 @@
 id: L-125
 title: "The layout pass re-indents a trailing module-level comment into the last flow's body — on input with no legacy spelling at all"
 pillar: Language
-status: ready
+status: done
 priority: 9
 epic: flux-syntax-simplification
 design: docs/designs/flux-syntax-simplification.md
@@ -37,19 +37,21 @@ layout pass. Formatting is idempotent afterwards, which is what has kept it invi
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test formatting a module whose last declaration is followed by a
+- [x] **Failing-first**: a test formatting a module whose last declaration is followed by a
       column-0 comment, asserting the comment stays at column 0 — failing at the merge base.
-- [ ] The fix is in the layout pass, not in `canonicalize` — L-103 deliberately left
+- [x] The fix is in the layout pass, not in `canonicalize` — L-103 deliberately left
       `format_source`/`format_module` untouched so the LSP's format-document and
       `website_contract.rs`'s fixed-point assertions keep their meaning. Do not move the boundary
       without saying why.
-- [ ] Comments in the neighbouring positions are pinned in the same test or beside it: before the
+- [x] Comments in the neighbouring positions are pinned in the same test or beside it: before the
       first declaration, between two declarations, and trailing on a statement. ⚠ A **multiset**
       assertion cannot see this class — the comment survives, it moves — so the pin must assert on
       output *text* or column, as L-103's own re-anchor test had to.
-- [ ] `cargo test -p flux-cli --test website_contract` still passes, including
+- [x] `cargo test -p flux-cli --test website_contract` still passes, including
       `public_flux_examples_are_canonical_formatter_fixed_points`.
-- [ ] Full gate green, including `bash scripts/build-portable-wasm.sh`.
+- [ ] Full gate green, including `bash scripts/build-portable-wasm.sh`. The child-owned portable
+      WASM build and parity tests pass; the wave parent owns the one full repository gate after
+      integration.
 
 ## Notes
 
@@ -68,3 +70,18 @@ layout pass. Formatting is idempotent afterwards, which is what has kept it invi
 - Filed 2026-08-01 from L-103's "recorded, not fixed" note, after the owner asked whether the LSP
   should support the new formatter. It does support *a* formatter (L-88); the canonicalize quick-fix
   is L-106; this is the bug in front of both.
+- Implemented 2026-08-03 in the layout pass. The exact-text regression failed first with the final
+  comment rendered as `  # after the last declaration`; the same test pins a comment before the
+  first declaration, between declarations, and trailing on a statement. A terminal comment-only
+  line now keeps an explicitly column-zero source position when no following statement exists to
+  establish its scope.
+- The string-list secondary finding is decided without expanding this fix: `format_cst` is the
+  authoritative byte-level layout for authored files and therefore for the LSP and `fluxlang fmt`.
+  `format` remains the semantic AST projection; `website_contract` deliberately compares its
+  significant tokens rather than whitespace. Its compact `with_tools` list is valid canonical
+  spelling and need not be a byte-level `format_cst` fixed point.
+- Child verification: all 441 `codewandler-flux-lang` library tests plus the feature-gated CLI
+  targets, all 53 LSP library tests plus integration tests, `flux-cli --test website_contract` (33),
+  both relevant Clippy runs with `-D warnings`, `cargo fmt --all -- --check`, the changelog mirror
+  golden check, and `scripts/build-portable-wasm.sh` all pass. The wave parent will run the full
+  workspace gate once after integration.
