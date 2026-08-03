@@ -1,31 +1,37 @@
 ---
 id: C-503
-title: "Mount Exchange as a remote connector binding"
+title: "Embed the Exchange connector client"
 pillar: Core
 status: backlog
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
-note: "Flux authenticates as a Service Account, sends operation ids/arguments, consumes subscribe/streams/leases, and never receives the Exchange-held credential"
+note: "Milestone 1 only: embed Service Account auth, effective-catalogue refresh and one-shot HTTP invoke; lifecycle frames follow later"
 ---
 
-# Mount Exchange as a remote connector binding
+# Embed the Exchange connector client
 
 ## Goal
 
-Let an operator select Exchange as the placement for a connector while keeping the Flux program and
-connector vocabulary identical to local execution.
+Make Exchange the compiled-in official integration path: Flux authenticates as one Service Account,
+projects its effective catalogue into the existing tool registry at turn boundaries, and invokes the
+existing one-shot HTTP operation path without learning vendor authority.
 
 ## Acceptance
 
-- [ ] A Flux connector client authenticates with Exchange's canonical Service Account API and derives
-      no tenant, credential, endpoint or runtime from model-controlled input.
-- [ ] One-shot operations use `invoke`; inbound events, streamed results and lease liveness share the
-      authenticated connector WebSocket and remain cancellable and bounded.
-- [ ] Refused authority, unreachable Exchange, runtime failure and stream loss stay distinct errors.
-- [ ] A remote connector appears under the same operation/channel ids as its local placement; Flux
-      source does not branch on locality.
+- [ ] One native Rust client is compiled into the core Flux binary; there is no helper executable,
+      plugin, installed pack dependency, caller-selected placement, or local official fallback.
+- [ ] The client authenticates with Exchange's canonical Service Account API and derives no tenant,
+      credential, endpoint, connection, grant, or runtime from model-controlled input.
+- [ ] An authenticated effective catalogue exposes only connected and granted operations for that
+      Service Account, carries a stable generation identity, and refreshes the model-facing registry
+      only between turns through C-318's delivered seam.
+- [ ] One-shot operations use the existing HTTP `invoke` contract and preserve distinct authentication,
+      grant refusal, unavailable Exchange, and Exchange runtime failure outcomes.
 - [ ] Failing-first integration tests prove an Exchange-held credential never enters Flux output,
-      logs, events or persisted session state.
+      logs, events or persisted session state, and that an unavailable Exchange removes only official
+      external tools rather than core Flux capabilities.
+- [ ] Subscribe, streamed output, cancellation frames, terminal lifecycle and leases are explicitly
+      outside this Milestone 1 story and receive their own contract in the lifecycle milestone.
 
 ## Progress
 
@@ -33,6 +39,6 @@ connector vocabulary identical to local execution.
 
 ## Notes
 
-- Depends on Exchange X-107 and X-111/X-113…X-120.
+- Depends on C-318 plus Exchange X-107 and the Milestone 1 effective-catalogue/one-shot HTTP slice.
 - X-107 already delivers canonical Service Account authentication; this story consumes it and does
   not duplicate lifecycle or bearer verification.

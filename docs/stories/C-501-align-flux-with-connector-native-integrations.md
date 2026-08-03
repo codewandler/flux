@@ -2,34 +2,35 @@
 id: C-501
 title: "Align Flux documentation with connector-native integrations"
 pillar: Core
-status: done
+status: ready
+priority: 1
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
-note: "public Plugins and Direction sections now join the canonical docs in naming the signed pack as compatibility and connectors as the gated destination"
+note: "reopened by C-508: remove the superseded local/hosted placement story and document Exchange as the only official integration executor"
 ---
 
 # Align Flux documentation with connector-native integrations
 
 ## Goal
 
-Make Flux's canonical and public documentation state the accepted destination and the honest current
-gap, with a roadmap that points to every implementation and retirement story.
+Make Flux's canonical and public documentation state the Exchange-only official-integration path and
+the honest current compatibility gap, with a roadmap that points to every implementation and
+retirement story.
 
 ## Acceptance
 
-- [x] `docs/vision.md`, `docs/designs/ecosystem.md`, `docs/ecosystem.md`, `docs/roadmap.md`, the root
-      README and their website mirrors agree on repository ownership and local/hosted placement.
-- [x] Current plugin commands remain documented as compatibility behavior, while the future official
-      integration source is unambiguously flux-connectors.
-- [x] The docs distinguish generic plugin protocol support—which may remain—from vendor-specific
-      official plugin crates—which migrate and are removed.
-- [x] The roadmap names C-500 and C-502…C-506 plus the existing/pending substrate, channel and
-      approval work it consumes.
-- [x] Engineering and customer changelogs record the direction without claiming any new executor or
-      migrated connector ships in this change; docs/website gates pass.
-- [x] The public Plugins landing page labels the signed first-party pack as a compatibility path,
-      and Direction has a dedicated page stating the destination, migration gates and honest current
-      boundary.
+- [ ] `docs/vision.md`, `docs/ecosystem.md`, `docs/roadmap.md`, the root README and their website
+      mirrors agree that Flux's embedded Exchange client is the only future official integration
+      path; Flux itself executes no connector runtime and has no plugin fallback.
+- [ ] Current plugin commands remain documented as temporary compatibility behavior without implying
+      that their protocol, installer, signed pack, or release artifacts survive C-506.
+- [ ] The roadmap links the cross-repository source of truth and names the corrected C-500…C-506
+      sequence: embedded HTTP path, lifecycle later, per-adapter proof/deletion, then unconditional
+      plugin-infrastructure removal.
+- [ ] The docs distinguish Flux remaining usable without Exchange for core capabilities from official
+      external integrations becoming unavailable when Exchange is unavailable.
+- [ ] Engineering and customer changelogs record the correction without claiming the embedded client,
+      an adapter migration, or zero-plugin release already ships; docs/website gates pass.
 
 ## Progress
 
@@ -41,6 +42,8 @@ gap, with a roadmap that points to every implementation and retirement story.
 - 2026-08-03: Closed the missed public-site gap: Plugins now labels the pack as the current
   compatibility path, Direction publishes ownership/current-state/cutover gates, the customer
   changelog mirror is current, and two deterministic embedded-site builds agree.
+- 2026-08-03: Reopened by C-508 because flux-roadmap Decision 0001 superseded the local/hosted
+  placement architecture this story previously documented.
 
 ## Notes
 

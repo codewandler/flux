@@ -1,31 +1,31 @@
 ---
 id: C-504
-title: "Prove connector parity across local and Exchange placements"
+title: "Prove each legacy adapter through Exchange before deletion"
 pillar: Core
 status: backlog
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
-note: "the same Flux program and connector contract run against local and hosted backends; observable results/errors/streams agree and unsupported placement is explicit"
+note: "a reusable frozen-fixture harness compares each legacy plugin with its Exchange connector replacement before that plugin is deleted"
 ---
 
-# Prove connector parity across local and Exchange placements
+# Prove each legacy adapter through Exchange before deletion
 
 ## Goal
 
-Make locality a deployment choice rather than a second integration implementation by running one
-connector conformance contract against Flux's local host and Exchange's remote binding.
+Make adapter retirement evidence mechanical by freezing each legacy plugin's observable contract and
+requiring its connector replacement to pass that contract through Exchange before deletion.
 
 ## Acceptance
 
-- [ ] The conformance corpus from flux-connectors C-505 drives both placements without backend-only
-      expected schemas or operation names.
-- [ ] Results, declared errors, effects, cancellation, stream termination and lease cleanup agree;
-      transport diagnostics may differ only where the contract says they must.
-- [ ] Representative HTTP, plugin/process, socket and container connectors are covered, including one
-      inbound channel and one long-lived operation.
-- [ ] A runtime that a shared Exchange deployment cannot isolate is a tested explicit refusal while
-      the same connector remains available locally.
-- [ ] The suite is a release prerequisite for removing an official Flux adapter.
+- [ ] The conformance inventory from flux-connectors C-505 maps every legacy adapter to frozen
+      fixtures and its Exchange connector replacement without omitted or duplicate adapters.
+- [ ] Observable results, declared errors, effects, approval consequences and refusal behavior agree;
+      transport diagnostics may differ only where the replacement contract says they must.
+- [ ] The reusable harness starts before the first migration wave and accumulates HTTP, process/plugin,
+      socket and container cases as their Exchange runtimes and lifecycle surfaces become available.
+- [ ] Each adapter's evidence is an independent release prerequisite, so C-505 can delete it in the
+      same release train without waiting for a global big-bang cutover.
+- [ ] No fixture invokes an official connector locally or treats a local fallback as expected behavior.
 
 ## Progress
 
@@ -33,4 +33,5 @@ connector conformance contract against Flux's local host and Exchange's remote b
 
 ## Notes
 
-- D-225's SIP two-locality conformance is prior art; the connector suite generalizes that shape.
+- This is legacy-versus-replacement conformance, not placement parity. Exchange is the replacement's
+  only official execution path.

@@ -1,38 +1,36 @@
 ---
 id: C-502
-title: "Bind connector runtime artifacts through Flux's guarded system"
+title: "Supersede local official connector execution"
 pillar: Core
-status: backlog
+status: done
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
-note: "one local connector host dispatches http/socket/process/container/plugin plans through flux-system; no vendor-specific match and no bypass around Executor::dispatch"
+note: "closed without implementation: Decision 0001 assigns every official integration runtime to Exchange and forbids a local Flux fallback"
 ---
 
-# Bind connector runtime artifacts locally
+# Supersede local official connector execution
 
 ## Goal
 
-Load a connector bundle and execute its declared runtime locally through Flux's existing safety
-envelope and guarded IO, so rich connectors remain fully usable without Exchange.
+Close the proposed local official-connector host without implementing it, because the accepted
+cross-repository topology assigns every official external integration runtime to Exchange.
 
 ## Acceptance
 
-- [ ] The host consumes the closed zero-IO plan published by flux-connectors C-504 and exhaustively
-      binds `http`, `socket`, `process`, `container`, `plugin` and `remote` to generic mechanisms.
-- [ ] Every model-facing operation still enters `Executor::dispatch`; process and network effects use
-      the single guarded `flux-system` paths and declared effects/capabilities.
-- [ ] Runtime, artifact, endpoint authority and credential reference come from the connector/operator
-      binding and cannot be selected by an operation caller.
-- [ ] Signed runtime artifacts are verified before execution; an absent or incompatible artifact is a
-      named refusal, never an ambient `PATH` fallback.
-- [ ] Failing-first tests run representative HTTP, plugin, socket and container plans and prove a
-      vendor-specific dispatcher is unnecessary.
+- [x] No local connector host, runtime-plan dispatcher, artifact installer, or official integration
+      fallback is added to Flux.
+- [x] C-500 and C-503 assign Flux only the embedded Exchange client, Service Account authentication,
+      effective-catalogue projection, approval, and invocation request.
+- [x] Connector-declared runtimes and artifacts remain connector-owned and execute only behind
+      Exchange; the caller cannot choose runtime, credential, tenant, or endpoint authority.
+- [x] Flux remains useful without Exchange for the language, agent loop and core tools, without
+      pretending official external integrations remain available.
 
 ## Progress
 
-- (not started)
+- 2026-08-03: Superseded without implementation by C-508 and flux-roadmap Decision 0001.
 
 ## Notes
 
-- Depends on C-394/C-397/C-435 and flux-connectors C-497/C-498/C-504.
-- C-399's remote guarded-IO backend is already delivered.
+- Historical proposal only. Do not restore this as an implementation story; amend the
+  cross-repository decision first if the execution topology ever changes.

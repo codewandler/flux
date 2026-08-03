@@ -5,40 +5,44 @@ pillar: Core
 status: in-progress
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
-note: "EPIC — Flux keeps guarded runtime kinds and local-first execution, while all 18 vendor-specific plugin adapters move to flux-connectors and become remotely usable through Exchange"
+note: "EPIC — Flux embeds one Exchange client while all official integrations execute in Exchange; the Flux release ends with no plugin artifacts or fallback"
 ---
 
 # Connector-native integrations replace the official plugin fleet
 
 ## Goal
 
-Make connectors the single official integration model: Flux locally executes connector bundles
-through generic guarded runtimes, can call the same bundles through Exchange, and ultimately carries
-no vendor-specific integration crate under `plugins/`.
+Make connectors the single official integration model: Flux embeds one native Exchange client and
+projects the operations Exchange grants to it, while every official external integration executes in
+Exchange and the Flux release ultimately carries no plugin artifact or fallback path.
 
 ## Acceptance
 
 - [ ] The vision, ecosystem description, roadmap, public docs and plugin-pack documentation agree
-      that plugins are a connector runtime/compatibility format rather than the permanent home of
-      Docker, Kubernetes, SQL, observability or vendor adapters (C-501).
-- [ ] Flux can execute every connector runtime locally without a vendor switch or a second path
-      around authorization → approval → guarded IO (C-502).
-- [ ] Flux can authenticate as a Service Account and consume Exchange `invoke`, `subscribe`, streamed
-      output and lease lifecycle without receiving a tenant credential (C-503).
-- [ ] One conformance suite proves connector behavior across local and hosted placements before a
-      native adapter is removed (C-504).
+      that every official external integration executes through Exchange and that Flux has no local
+      connector/plugin fallback (C-501).
+- [x] The proposed local official-connector runtime host is explicitly superseded and must not be
+      implemented (C-502, closed by C-508).
+- [ ] Flux's core binary authenticates as a Service Account, consumes the effective catalogue, and
+      invokes the existing one-shot HTTP path without receiving a tenant credential (C-503).
+- [ ] A reusable cutover suite proves each legacy plugin's observable contract through Exchange
+      before that adapter is removed (C-504).
 - [ ] All eighteen current integration crates are retired only after their connector migration waves
-      complete, and the support/distribution crates receive an explicit disposition (C-505, C-506).
-- [ ] `flux must never require flux-exchange`: the local connector path remains complete after the
-      last official native adapter is gone.
+      complete, then all plugin support and distribution infrastructure is removed from the Flux
+      release pipeline (C-505, C-506).
+- [ ] Flux remains complete without Exchange for its language, agent loop and core tools; official
+      external integrations are unavailable when Exchange is unavailable.
 
 ## Progress
 
 - 2026-08-03: Filed after auditing the active tree and linked worktrees. The connector WebSocket
   program and remote approval exist in pending Flux worktrees and are dependencies, not duplicate
   backlog; C-493/C-494 are reserved by the pending 0.52 maintenance worktree.
+- 2026-08-03: C-508 adopted flux-roadmap Decision 0001 and removed the contradicted local execution
+  placement before any C-502…C-506 implementation began.
 
 ## Notes
 
 - Connector counterpart: flux-connectors C-495. Exchange counterpart: X-111.
-- Reuses C-394/C-397/C-399/C-435, D-215/D-220 and the pending generated-channel program C-481…C-488.
+- C-503 consumes C-318 and Exchange's effective catalogue/one-shot invoke contract. General
+  subscriptions, streams, cancellation and leases belong to the later lifecycle milestone.
