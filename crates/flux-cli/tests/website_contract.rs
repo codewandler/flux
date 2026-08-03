@@ -702,6 +702,9 @@ const NON_PUBLIC_ENV: &[&str] = &[
     "FLUX_WEB_TEST_NUMERIC_TOKEN",
     // CI-only deterministic corpus size for the adversarial assurance tests; not shipped behavior.
     "FLUX_ADVERSARIAL_CASES",
+    // CI-only release authority marker. The release workflow sets this on its guarded push path so
+    // the exact candidate workflow, rather than the cut step, owns the one mandatory full gate.
+    "FLUX_RELEASE_CANDIDATE_OWNS_GATE",
     // A `format!` prefix, not a variable: the D-116 endpoint e2e mints a per-process credential
     // key (`FLUX_D116_PGPASS_<pid>`) to prove a credential *location* is never part of the URL.
     "FLUX_D116_PGPASS_",

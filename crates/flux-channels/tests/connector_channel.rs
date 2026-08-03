@@ -1268,16 +1268,18 @@ async fn the_handler_does_not_block_on_a_slow_delivery() {
     );
 }
 
-/// …and they are concurrent with **each other**, not merely with the response.
+/// …and they are concurrent with **each other** up to the shared ingress ceiling, not merely with
+/// the response.
 ///
 /// The distinction is the whole acceptance criterion and one test cannot cover both: an adapter that
 /// answered immediately and then drained one queue of its own would pass the test above and fail this
-/// one. Here every delivery is held open at once, and the assertion is that all of them arrive before
-/// any of them is released — which only holds if the adapter adds no serialization. Bounding is the
-/// App's admission limit's job (`flux_app::DeliveryLoad`), deliberately not a second queue here.
+/// one. Here every admitted delivery is held open at once, and the assertion is that all of them
+/// arrive before any is released — which only holds if the adapter adds no serialization. The next
+/// request is refused before spawn; admission at the HTTP boundary bounds accepted tasks rather than
+/// relying on App admission after the queue already exists.
 #[tokio::test]
-async fn deliveries_run_concurrently_with_each_other() {
-    const N: usize = 8;
+async fn deliveries_run_concurrently_up_to_the_ingress_ceiling() {
+    let admitted = flux_server::ServerLimits::default().max_inflight_per_key;
 
     struct Gated {
         started: Mutex<usize>,
@@ -1299,7 +1301,7 @@ async fn deliveries_run_concurrently_with_each_other() {
     });
     let app = channel(json!({ "manifest": fixture("acme.connector.toml") })).router(gate.clone());
 
-    for i in 0..N {
+    for i in 0..admitted {
         // Bounded: an adapter that *awaited* `deliver` would never answer, and a hanging test is a
         // worse failure report than a failing one.
         let resp = tokio::time::timeout(
@@ -1319,14 +1321,29 @@ async fn deliveries_run_concurrently_with_each_other() {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::post("/acme")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "event": { "type": "mention" } }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused.headers()["x-flux-limit"], "concurrency");
+
     for _ in 0..200 {
-        if *gate.started.lock().await == N {
+        if *gate.started.lock().await == admitted {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!(
-        "only {} of {N} deliveries were in flight at once — the adapter serialized them",
+        "only {} of {admitted} admitted deliveries were in flight at once — the adapter serialized them",
         *gate.started.lock().await
     );
 }

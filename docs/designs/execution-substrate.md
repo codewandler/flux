@@ -47,6 +47,39 @@ consequence.
 
 So the substrate is real and shipped. What is missing is narrower than it looks.
 
+### Guarded inbound is now the production serving path
+
+`GuardedNetwork::bind_tcp` is the constructor for long-lived agent and channel listeners. The
+standalone single-agent server derives that system from the `FlowEngine` executor; the multi-agent
+server requires its host to pass the selected system explicitly. A2A, webhook and connector adapters
+receive the same handle from their channel host. A remote-selected surface therefore cannot silently
+open a local socket. `flux-server::GuardedHttpListener` adapts the opaque `NetworkListener` to axum
+by pumping bytes through a bounded in-process duplex stream. The native or remote port still owns
+every physical accept, read and write, including connection, frame and IO-time ceilings.
+
+The bridge drives independently owned guarded read/write halves. This is part of the port contract,
+not a native-socket shortcut: unread request bytes may backpressure their bounded half without
+head-of-line blocking an SSE/streaming response. The authenticated remote-system wire multiplexes
+one outstanding read and write and carries typed per-direction failures; dropping either protocol
+end cancels the coordinator, closes the wire, and releases remote admission. That wire change is
+remote-system protocol version 2.
+
+The syntax-aware codegate census makes additions reviewable through ordinary aliases, fully-qualified
+paths, and obvious macro bodies. It also refuses production APIs that name a native `TcpListener`
+outside the native port, and treats direct `socket2`, libc and nix socket constructors as reviewed
+network IO. Three direct-bind classes remain explicit rather than being mislabeled as guarded:
+
+- two finite loopback OAuth callback handshakes, which accept one authorization code and close;
+- the public-docs static server, which may intentionally be unauthenticated off-loopback and mounts
+  no execution routes. `BindExposure` permits only loopback-open or authenticated public exposure,
+  so claiming this listener is authenticated would weaken the contract;
+- the one native constructor that implements `GuardedNetwork::bind_tcp` itself.
+
+Tests may still bind native ephemeral listeners as fixtures; the census excludes `cfg(test)` code.
+Like any source census, it does not expand procedural/build-script macros or inspect downstream
+crates; those callers receive only the guarded public serving APIs and take responsibility for any
+`ExecutionSystem` implementation they supply.
+
 ## What is missing
 
 ### 1. The workspace-confined file surface is a port

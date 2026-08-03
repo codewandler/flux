@@ -21,6 +21,7 @@
 //! Before C-453 only the first was reachable here — see [`ApprovalGate`].
 
 mod a2a;
+mod listener;
 pub mod public_docs;
 mod resource;
 pub mod system;
@@ -51,7 +52,10 @@ use flux_runtime::TurnIdentity;
 /// (C-297/C-332), re-exported so a caller of [`router_in`]/[`router_multi_in`] can name the
 /// parameter without depending on `flux-runtime` directly.
 pub use flux_runtime::metadata::DiscoveryEnv;
+pub use flux_system::net::BindExposure;
 
+pub use listener::{bind_http_listener, http_inbound_limits, GuardedHttpListener};
+pub use resource::{IngressPermit, SharedIngressGovernor};
 use resource::{ResourceGovernor, WorkPermit};
 
 type Shared = Arc<FlowEngine>;
@@ -564,7 +568,19 @@ impl FromRef<ServerState> for ApprovalGate {
 /// spelled here: `flux-orchestrate`'s `fleet.start` matches it to decide a fleet worker is live,
 /// and being three layers below this crate it cannot import it to check the wording agrees (C-277).
 pub async fn serve(addr: &str, agent: FlowEngine, auth: ServerAuth) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let requested: SocketAddr = addr
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid server bind address `{addr}`: {error}"))?;
+    guard_open_bind(&auth, requested)?;
+    let limits = ServerLimits::from_env();
+    let execution_system = agent.executor.execution_system();
+    let listener = bind_http_listener(
+        execution_system.as_ref(),
+        requested,
+        bind_exposure(&auth),
+        limits,
+    )
+    .await?;
     let addr = listener.local_addr()?;
     eprintln!(
         "{}",
@@ -572,7 +588,17 @@ pub async fn serve(addr: &str, agent: FlowEngine, auth: ServerAuth) -> anyhow::R
     );
     eprintln!("  A2A agent card:  http://{addr}/.well-known/agent-card.json");
     eprintln!("  A2A endpoint:    http://{addr}/a2a  (message/send, message/stream)");
-    serve_on(listener, agent, auth).await
+    let router = router_with_approvals(
+        Arc::new(agent),
+        auth,
+        CardInfo::flux_coding(),
+        addr,
+        ApprovalGate::none(),
+    )?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
 }
 
 /// [`serve`] for an agent running the **remote-approval** posture (C-453): `approvals` is the queue
@@ -585,7 +611,19 @@ pub async fn serve_with_approvals(
     auth: ServerAuth,
     approvals: ApprovalGate,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let requested: SocketAddr = addr
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid server bind address `{addr}`: {error}"))?;
+    guard_open_bind(&auth, requested)?;
+    let limits = ServerLimits::from_env();
+    let execution_system = agent.executor.execution_system();
+    let listener = bind_http_listener(
+        execution_system.as_ref(),
+        requested,
+        bind_exposure(&auth),
+        limits,
+    )
+    .await?;
     let addr = listener.local_addr()?;
     eprintln!(
         "{}",
@@ -596,29 +634,6 @@ pub async fn serve_with_approvals(
     if approvals.0.is_some() {
         eprintln!("  Approvals:       http://{addr}/approvals  (GET to list, POST /approvals/{{id}} to decide)");
     }
-    serve_on_with_approvals(listener, agent, auth, approvals).await
-}
-
-/// Serve on an already-bound listener (lets callers pick an ephemeral port).
-pub async fn serve_on(
-    listener: tokio::net::TcpListener,
-    agent: FlowEngine,
-    auth: ServerAuth,
-) -> anyhow::Result<()> {
-    serve_on_with_approvals(listener, agent, auth, ApprovalGate::none()).await
-}
-
-/// [`serve_on`] carrying an [`ApprovalGate`] — the one place both forms converge, so the
-/// non-loopback refusal and the route set cannot differ between postures.
-pub async fn serve_on_with_approvals(
-    listener: tokio::net::TcpListener,
-    agent: FlowEngine,
-    auth: ServerAuth,
-    approvals: ApprovalGate,
-) -> anyhow::Result<()> {
-    let addr = listener.local_addr()?;
-    // The non-loopback refusal now lives in `router` (construction-time, C-190); `serve_on` simply
-    // propagates it, so there is one enforcement point every caller shares.
     let router = router_with_approvals(
         Arc::new(agent),
         auth,
@@ -642,9 +657,20 @@ fn unauthenticated_bind_allowed(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+/// Translate server authentication into the guarded network port's exposure vocabulary. The
+/// router independently repeats the open/non-loopback refusal, so neither the physical bind nor
+/// route construction depends on the other being correct.
+pub fn bind_exposure(auth: &ServerAuth) -> BindExposure {
+    if auth.is_effectively_open() {
+        BindExposure::LoopbackOnly
+    } else {
+        BindExposure::Authenticated
+    }
+}
+
 /// The construction-time guard behind the safety invariant *"an unauthenticated server is never
 /// exposed off loopback"* (`AGENTS.md`: *there are no bypass paths — don't add one*). Enforced HERE,
-/// at router build, rather than only inside [`serve_on`]: a lower-level caller that mounts the router
+/// at router build, rather than only inside [`serve`]: a lower-level caller that mounts the router
 /// into its own `axum::serve` (the `a2a` channel does exactly this) inherits the refusal by
 /// construction instead of being silently responsible for re-deriving it. An unauthenticated
 /// non-loopback bind is remote code execution against the auto-approving daemon, so it is refused
@@ -687,27 +713,28 @@ fn guard_open_bind(auth: &ServerAuth, addr: SocketAddr) -> anyhow::Result<()> {
 /// Serve a resolver-keyed multi-agent mount (D-63) until shutdown — the guarded entry point for
 /// [`router_multi`]. Refuses an unauthenticated ([`ServerAuth::Open`]) non-loopback bind, exactly
 /// as [`serve`] does for the single-agent surface: an open, auto-approving `/:agent_id/a2a` is
-/// remote code execution.
+/// remote code execution. The host must pass the same immutable execution substrate selected for
+/// the mounted engines; there is no native-listener compatibility fallback.
 pub async fn serve_multi(
     addr: &str,
     resolver: Arc<dyn AgentResolver>,
     auth: ServerAuth,
+    execution_system: Arc<dyn flux_system::port::ExecutionSystem>,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_multi_on(listener, resolver, auth).await
-}
-
-/// [`serve_multi`] on an already-bound listener (ephemeral-port callers). Enforces the same
-/// Open-on-non-loopback refusal as [`serve_on`].
-pub async fn serve_multi_on(
-    listener: tokio::net::TcpListener,
-    resolver: Arc<dyn AgentResolver>,
-    auth: ServerAuth,
-) -> anyhow::Result<()> {
-    let addr = listener.local_addr()?;
-    // Same construction-time refusal as the single-agent mount (C-190): `router_multi` enforces it,
-    // `serve_multi_on` propagates it.
-    let router = router_multi(resolver, auth, addr)?;
+    let requested: SocketAddr = addr
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid server bind address `{addr}`: {error}"))?;
+    guard_open_bind(&auth, requested)?;
+    let limits = ServerLimits::from_env();
+    let listener = bind_http_listener(
+        execution_system.as_ref(),
+        requested,
+        bind_exposure(&auth),
+        limits,
+    )
+    .await?;
+    let bound = listener.local_addr()?;
+    let router = router_multi(resolver, auth, bound)?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -825,6 +852,11 @@ impl Default for ServerLimits {
 }
 
 impl ServerLimits {
+    /// Resolve production limits from the process discovery environment once.
+    pub fn from_env() -> Self {
+        Self::from_env_in(&DiscoveryEnv::from_process())
+    }
+
     /// The limits in force, reading env overrides once (mirrors [`max_inflight_per_realm`]):
     /// `FLUX_SERVER_MAX_BODY_BYTES` (positive integer bytes) and `FLUX_SERVER_REQUEST_TIMEOUT_SECS`
     /// (positive integer seconds; `0`/missing/unparseable falls back to the documented default —
@@ -911,7 +943,7 @@ fn positive_env(name: &str) -> Option<u64> {
 
 /// The request `TimeoutLayer` in force. `TimeoutLayer::with_status_code` (not the deprecated
 /// `::new`) so the timeout answers a real `408 Request Timeout`.
-fn request_timeout_layer(limits: ServerLimits) -> TimeoutLayer {
+pub fn request_timeout_layer(limits: ServerLimits) -> TimeoutLayer {
     TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, limits.request_timeout)
 }
 
@@ -1535,7 +1567,7 @@ fn router_multi_with_ttl_and_limits(
 /// The auth gate, per [`ServerAuth`] mode. Exempt routes (`/health`, the agent card) are
 /// registered outside this middleware's scope in [`router`] — no path-string bypass is possible.
 ///
-/// - `Open` — pass-through (loopback-only bind enforced in [`serve_on`]).
+/// - `Open` — pass-through (loopback-only bind enforced in [`serve`]).
 /// - `SharedSecret` — constant-time compare of `Authorization: Bearer <secret>` (pre-D-69, plus
 ///   the RFC 7235-required `WWW-Authenticate` challenge on 401). An **empty** expected secret
 ///   authenticates nothing at all rather than everything (C-321 — see the inline note).
@@ -1988,11 +2020,101 @@ impl AgentSink for Collect {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use axum::routing::get;
+    use flux_system::net::{BindExposure, InboundLimits, NetworkListener};
+    use flux_system::port::{
+        ExecutionIdentity, ExecutionSystem, Guarded, GuardedEnv, GuardedHostFiles, GuardedNetwork,
+        GuardedProcess, GuardedWorkspaceFiles, SubstrateIdentity,
+    };
     use tower::ServiceExt; // for `oneshot`
+
+    struct RefusingBindSystem {
+        binds: AtomicUsize,
+    }
+
+    impl RefusingBindSystem {
+        fn new() -> Self {
+            Self {
+                binds: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    fn refused<'a, T>(operation: &'static str) -> Guarded<'a, T> {
+        Box::pin(async move { Err(flux_core::Error::Other(operation.into())) })
+    }
+
+    impl GuardedEnv for RefusingBindSystem {
+        fn env(&self, _key: &str) -> Option<String> {
+            None
+        }
+    }
+
+    impl GuardedProcess for RefusingBindSystem {
+        fn run_with_env<'a>(
+            &'a self,
+            _argv: &'a [String],
+            _env: &'a [(String, String)],
+            _timeout: Duration,
+        ) -> Guarded<'a, flux_system::ProcessOutput> {
+            refused("probe process is unserved")
+        }
+    }
+
+    impl GuardedHostFiles for RefusingBindSystem {
+        fn host_path_identity(&self, _path: &str) -> flux_core::Result<String> {
+            Err(flux_core::Error::Other(
+                "probe host files are unserved".into(),
+            ))
+        }
+
+        fn read_file_scoped<'a>(
+            &'a self,
+            _path: &'a str,
+            _scope: &'a str,
+            _max_bytes: usize,
+        ) -> Guarded<'a, flux_system::ScopedFileRead> {
+            refused("probe host files are unserved")
+        }
+    }
+
+    impl GuardedWorkspaceFiles for RefusingBindSystem {
+        fn read_file_bytes<'a>(&'a self, _path: &'a str) -> Guarded<'a, Vec<u8>> {
+            refused("probe workspace reads are unserved")
+        }
+
+        fn write_file_bytes<'a>(&'a self, _path: &'a str, _contents: &'a [u8]) -> Guarded<'a, ()> {
+            refused("probe workspace writes are unserved")
+        }
+    }
+
+    impl GuardedNetwork for RefusingBindSystem {
+        fn bind_tcp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+            _exposure: BindExposure,
+            _limits: InboundLimits,
+        ) -> Guarded<'a, NetworkListener> {
+            self.binds.fetch_add(1, Ordering::SeqCst);
+            refused("substituted bind reached")
+        }
+    }
+
+    impl ExecutionIdentity for RefusingBindSystem {
+        fn substrate_identity(&self) -> SubstrateIdentity {
+            SubstrateIdentity {
+                kind: "bind-probe".into(),
+                workspace: "memory".into(),
+                confinement: "test".into(),
+                remotely_reported: true,
+            }
+        }
+    }
 
     /// [`router_with_ttl_limits_and_approvals`] with no remote-approval posture — the shape every
     /// pre-C-453 test in this module was written against.
@@ -2317,6 +2439,13 @@ mod tests {
     fn test_engine(
         provider: Arc<dyn flux_provider::Provider>,
     ) -> (Arc<FlowEngine>, Arc<flux_events::EventStore>) {
+        test_engine_with_execution_system(provider, None)
+    }
+
+    fn test_engine_with_execution_system(
+        provider: Arc<dyn flux_provider::Provider>,
+        execution_system: Option<Arc<dyn ExecutionSystem>>,
+    ) -> (Arc<FlowEngine>, Arc<flux_events::EventStore>) {
         let dir =
             std::env::temp_dir().join(format!("flux-server-usage-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2326,11 +2455,15 @@ mod tests {
         let mut registry = flux_runtime::ToolRegistry::new();
         flux_tools::register_reflect(&mut registry);
         flux_tools::register_evidence(&mut registry);
+        let mut context = flux_runtime::ToolContext::new(system);
+        if let Some(execution_system) = execution_system {
+            context = context.with_execution_system(execution_system);
+        }
         let executor = flux_runtime::Executor::new(
             registry,
             flux_runtime::PermissionManager::from_rules(&[], &[]),
             Arc::new(flux_runtime::AllowApprover),
-            flux_runtime::ToolContext::new(system),
+            context,
         );
         let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
         let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone()).unwrap();
@@ -2350,6 +2483,45 @@ mod tests {
         )
         .unwrap();
         (Arc::new(engine), events)
+    }
+
+    #[tokio::test]
+    async fn standalone_serve_binds_through_the_engine_execution_system() {
+        let probe = Arc::new(RefusingBindSystem::new());
+        let (engine, _) = test_engine_with_execution_system(
+            Arc::new(UnusedProvider),
+            Some(probe.clone() as Arc<dyn ExecutionSystem>),
+        );
+        let engine = Arc::try_unwrap(engine)
+            .ok()
+            .expect("test owns the only engine reference");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            serve("127.0.0.1:0", engine, ServerAuth::Open),
+        )
+        .await
+        .expect("a substituted refusing bind must return instead of opening a native listener")
+        .unwrap_err();
+
+        assert!(error.to_string().contains("substituted bind reached"));
+        assert_eq!(probe.binds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_serve_binds_through_the_explicit_execution_system() {
+        let probe = Arc::new(RefusingBindSystem::new());
+        let error = serve_multi(
+            "127.0.0.1:0",
+            Arc::new(StaticResolver::new()),
+            ServerAuth::Open,
+            probe.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("substituted bind reached"));
+        assert_eq!(probe.binds.load(Ordering::SeqCst), 1);
     }
 
     async fn get_json(app: Router, path: &str) -> (StatusCode, Value) {
@@ -3240,7 +3412,7 @@ mod tests {
     // ── Non-loopback auth by construction (C-190) ────────────────────────────
 
     /// C-190 failing-first: the invariant that an unauthenticated (`Open`) server may not be exposed
-    /// on a non-loopback address must hold at ROUTER CONSTRUCTION — not only inside `serve_on`. A
+    /// on a non-loopback address must hold at ROUTER CONSTRUCTION — not only inside `serve`. A
     /// caller that mounts the real router and serves it itself (the `a2a` channel does exactly this,
     /// via `flux_server::router` + `axum::serve`) must not be able to stand up an open router bound
     /// to a routable address. This test drives the REAL construction path, not a hand-built
@@ -3264,7 +3436,7 @@ mod tests {
         );
         assert!(
             refused.is_err(),
-            "Open + non-loopback must be refused at router construction, not only in serve_on"
+            "Open + non-loopback must be refused at router construction, not only in serve"
         );
 
         // Authenticated + non-loopback is fine — the refusal is specifically the UNAUTHENTICATED

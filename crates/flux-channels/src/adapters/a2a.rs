@@ -16,9 +16,10 @@ use flux_app::App;
 use flux_flow::engine::FlowEngine;
 use flux_lang::program::ChannelDecl;
 use flux_server::CardInfo;
+use flux_system::System;
 
 use crate::config::A2aSettings;
-use crate::{Channel, Deliverer};
+use crate::{Channel, ChannelContext, Deliverer};
 
 pub struct A2aChannel {
     name: String,
@@ -82,6 +83,35 @@ impl A2aChannel {
             engine,
             card,
         })
+    }
+
+    async fn serve_on(&self, context: ChannelContext) -> anyhow::Result<()> {
+        let limits = flux_server::ServerLimits::from_env();
+        let listener = flux_server::bind_http_listener(
+            context.execution_system.as_ref(),
+            self.addr,
+            flux_server::bind_exposure(&self.auth),
+            limits,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("channel `{}`: bind {}: {error}", self.name, self.addr))?;
+        let bound = listener.local_addr().unwrap_or(self.addr);
+        eprintln!(
+            "channel `{}`: serving agent API on http://{bound}  (card: /.well-known/agent-card.json, \
+             a2a: /a2a)",
+            self.name
+        );
+        let router = flux_server::router(
+            self.engine.clone(),
+            self.auth.clone(),
+            self.card.clone(),
+            bound,
+        )
+        .map_err(|error| anyhow::anyhow!("channel `{}`: {error}", self.name))?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move { context.cancel.cancelled().await })
+            .await
+            .map_err(|error| anyhow::anyhow!("channel `{}`: serve: {error}", self.name))
     }
 }
 
@@ -168,29 +198,17 @@ impl Channel for A2aChannel {
     }
 
     async fn start(&self, _d: Arc<dyn Deliverer>, cancel: CancellationToken) -> anyhow::Result<()> {
-        let listener = tokio::net::TcpListener::bind(self.addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("channel `{}`: bind {}: {e}", self.name, self.addr))?;
-        let bound = listener.local_addr().unwrap_or(self.addr);
-        eprintln!(
-            "channel `{}`: serving agent API on http://{bound}  (card: /.well-known/agent-card.json, \
-             a2a: /a2a)",
-            self.name
-        );
-        // `router` enforces the unauthenticated-non-loopback refusal by construction (C-190), so the
-        // fail-fast check in `from_decl_and_app` is now a backstopped early error, not the only
-        // guard — both use the identical `addr.ip().is_loopback()` predicate.
-        let router = flux_server::router(
-            self.engine.clone(),
-            self.auth.clone(),
-            self.card.clone(),
-            self.addr,
-        )
-        .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", self.name))?;
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move { cancel.cancelled().await })
-            .await
-            .map_err(|e| anyhow::anyhow!("channel `{}`: serve: {e}", self.name))
+        let system = Arc::new(System::from_env(std::env::current_dir()?)?);
+        self.serve_on(ChannelContext {
+            deliverer: _d,
+            cancel,
+            execution_system: system,
+        })
+        .await
+    }
+
+    async fn start_with_context(&self, context: ChannelContext) -> anyhow::Result<()> {
+        self.serve_on(context).await
     }
 }
 

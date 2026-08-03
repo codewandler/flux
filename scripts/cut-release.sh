@@ -6,7 +6,7 @@
 #   scripts/cut-release.sh <version>    # explicit, e.g. 0.9.4
 #   scripts/cut-release.sh patch        # bump the patch component of the current version
 #   scripts/cut-release.sh minor        # bump minor, reset patch  (flux uses minor as the breaking signal)
-#   scripts/cut-release.sh <ver> --no-gate   # skip the build/test/clippy/fmt gate (not recommended)
+#   scripts/cut-release.sh <ver> --no-gate   # automated release-branch flow only; candidate gates
 #
 # It stages ONLY the release files (the root manifest + lock, both changelogs, the generated
 # website customer-changelog mirror, the docs archive embedded in flux-server, and the roadmap
@@ -36,6 +36,16 @@ for a in "$@"; do
   esac
 done
 [ "${#ARGS[@]}" -ge 1 ] || { echo "usage: scripts/cut-release.sh <version|patch|minor|major> [--no-gate]" >&2; exit 2; }
+[ "${#ARGS[@]}" -eq 1 ] || { echo "usage: scripts/cut-release.sh <version|patch|minor|major> [--no-gate]" >&2; exit 2; }
+if [ "$NO_GATE" -eq 1 ]; then
+  if [ "${FLUX_RELEASE_CANDIDATE_OWNS_GATE:-}" != "true" ] \
+    || [ "${GITHUB_ACTIONS:-}" != "true" ] \
+    || [ "${GITHUB_EVENT_NAME:-}" != "push" ] \
+    || [ "${GITHUB_REF:-}" != "refs/heads/release" ]; then
+    echo "--no-gate is reserved for the automated release-branch push; its exact-SHA candidate owns the mandatory gate" >&2
+    exit 2
+  fi
+fi
 
 OLD=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 [ -n "$OLD" ] || { echo "could not read current [workspace.package].version" >&2; exit 1; }
@@ -53,8 +63,9 @@ echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad target version:
 echo "== cutting $OLD -> $NEW =="
 
 # TRANSACTIONAL (C-147). Everything below mutates tracked files — manifests, lockfile, both
-# changelogs, the website mirror, the roadmap stamp — and the gate runs at the END, after those
-# edits, because it must test what is about to be tagged. When the gate then fails, a half-cut tree
+# changelogs, the website mirror, the roadmap stamp — and the human/rehearsal gate runs at the END,
+# after those edits, because it must test what is about to be tagged. When the gate then fails, a
+# half-cut tree
 # is left behind: re-running the script would roll [Unreleased] a SECOND time and mint a phantom
 # version section (this is the documented 0.14.3 gap; it recurred cutting 0.28.0). So snapshot every
 # file this script may touch and restore it on ANY non-zero exit before the commit.
@@ -164,22 +175,12 @@ scripts/build-embedded-docs.sh --check >/dev/null \
   || { echo "!! embedded docs did not regenerate deterministically" >&2; exit 1; }
 echo "   regenerated embedded documentation"
 
-# 4) the gate (skippable). Mirrors AGENTS.md's dev-loop gate + both-workspace fmt + codegate.
+# 4) the gate. Humans always run it here. Only the authenticated automatic release-branch flow may
+#    defer it to release.yml, where the exact candidate SHA earns the immutable receipt.
 if [ "$NO_GATE" -eq 0 ]; then
-  echo "== gate =="
-  # `set -e` already aborts here, but name the failing step explicitly: a bare non-zero exit from
-  # `cargo test --workspace` scrolled off screen reads as "the script died", not "the gate is red",
-  # and the EXIT trap's restore message is easier to trust when it says which step caused it.
-  gate() { "$@" || { echo "!! gate step failed: $*" >&2; exit 1; }; }
-  gate cargo build --workspace
-  gate cargo test --workspace
-  gate cargo clippy --workspace --all-targets -- -D warnings
-  gate cargo fmt --all --check
-  gate cargo fmt --manifest-path plugins/Cargo.toml --all --check
-  gate cargo test -p flux-codegate
-  echo "   gate green"
+  scripts/release-full-gate.sh
 else
-  echo "== gate SKIPPED (--no-gate) =="
+  echo "== cut gate delegated to the exact-SHA release candidate =="
 fi
 
 # 5) commit ONLY the release files, then tag.

@@ -295,9 +295,10 @@ branch and return after the join instead.
 
 Every AST node kind has a native text spelling. The one-line `@json` escape — carrying a node's
 compact JSON form — remains for the rare *shapes* the text grammar cannot express: a symbol name
-that is not an identifier, a non-invertible `expr` formula, or a `jq` AST whose path string itself
-uses brackets (native `items[0]` lowers to the canonical `.items.0` AST path) or whose input cannot
-use field-access sugar:
+that is not an identifier, a non-invertible `expr` formula, or a `jq` AST whose input cannot use
+field-access sugar. Canonical quoted-key brackets such as `.headers["content-type"]` are native;
+legacy numeric brackets in a hand-built AST path are not (native `items[0]` lowers to the canonical
+`.items.0` AST path):
 
 ```flux
 @json { "kind": "bind", "name": "report.v2", "value": { "kind": "var", "name": "draft" } }

@@ -62,18 +62,22 @@ struct ExecutorHost<'a> {
 }
 
 impl<'a> ExecutorHost<'a> {
-    fn new(executor: &'a Executor) -> Self {
+    fn new(executor: &'a Executor, registry: &'a ToolRegistry) -> Self {
         Self {
-            catalog: OpRegistry::new(executor.registry()),
+            catalog: OpRegistry::new(registry),
             executor,
             cap_scope_guards: std::sync::Mutex::new(Vec::new()),
             cassette: None,
         }
     }
 
-    fn new_with_composites(executor: &'a Executor, composites: &'a [CompositeOpDecl]) -> Self {
+    fn new_with_composites(
+        executor: &'a Executor,
+        registry: &'a ToolRegistry,
+        composites: &'a [CompositeOpDecl],
+    ) -> Self {
         Self {
-            catalog: OpRegistry::new(executor.registry()).with_composites(composites),
+            catalog: OpRegistry::new(registry).with_composites(composites),
             executor,
             cap_scope_guards: std::sync::Mutex::new(Vec::new()),
             cassette: None,
@@ -346,7 +350,8 @@ pub async fn execute_call(
     input: serde_json::Value,
     bind: Option<BindSpec<'_>>,
 ) -> Result<CallOutcome> {
-    let host = ExecutorHost::new(executor);
+    let registry = executor.active_registry_snapshot();
+    let host = ExecutorHost::new(executor, &registry);
     flux_lang::runtime::execute_call(store, &host, session_id, op, input, bind).await
 }
 
@@ -377,7 +382,8 @@ pub async fn execute_flow_traced(
     sink: &mut dyn AgentSink,
     trace_structural: bool,
 ) -> Result<FlowOutcome> {
-    let host = ExecutorHost::new(executor);
+    let registry = executor.active_registry_snapshot();
+    let host = ExecutorHost::new(executor, &registry);
     let mut bridge = SinkBridge {
         inner: sink,
         trace: trace_structural,
@@ -403,7 +409,8 @@ pub async fn execute_flow_with_composites(
     } else {
         runtime_turn.with_session(session_id)
     };
-    let mut host = ExecutorHost::new_with_composites(executor, composites);
+    let registry = executor.active_registry_snapshot();
+    let mut host = ExecutorHost::new_with_composites(executor, &registry, composites);
     // C-43: plan execution self-wires the store's active cassette scope (record or replay).
     host.cassette = store.cassette();
     let mut bridge = SinkBridge {
@@ -441,7 +448,8 @@ pub async fn execute_flow_resumable_with_composites(
     } else {
         runtime_turn.with_session(session_id)
     };
-    let mut host = ExecutorHost::new_with_composites(executor, composites);
+    let registry = executor.active_registry_snapshot();
+    let mut host = ExecutorHost::new_with_composites(executor, &registry, composites);
     // C-43: authored execution self-wires the store's active cassette scope (record or replay).
     // The outer agent-loop path (`execute_flow_traced`) stays unwired because replay drives its
     // recorded host-derived action flows directly.
@@ -533,7 +541,8 @@ pub async fn resume_flow(
     input: flux_lang::ast::Value,
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    let host = ExecutorHost::new(executor);
+    let registry = executor.active_registry_snapshot();
+    let host = ExecutorHost::new(executor, &registry);
     let mut bridge = SinkBridge {
         inner: sink,
         trace: false,
@@ -558,7 +567,8 @@ pub async fn resume_flow_with_composites(
     composites: &[CompositeOpDecl],
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    let host = ExecutorHost::new_with_composites(executor, composites);
+    let registry = executor.active_registry_snapshot();
+    let host = ExecutorHost::new_with_composites(executor, &registry, composites);
     let mut bridge = SinkBridge {
         inner: sink,
         trace: false,
@@ -587,7 +597,8 @@ pub async fn execute_plan(
     plan: &flux_lang::ast::PhysicalPlan,
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    let host = ExecutorHost::new(executor);
+    let registry = executor.active_registry_snapshot();
+    let host = ExecutorHost::new(executor, &registry);
     let mut bridge = SinkBridge {
         inner: sink,
         trace: false,
@@ -605,7 +616,8 @@ pub async fn execute_plan_with_composites(
     composites: &[CompositeOpDecl],
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    let host = ExecutorHost::new_with_composites(executor, composites);
+    let registry = executor.active_registry_snapshot();
+    let host = ExecutorHost::new_with_composites(executor, &registry, composites);
     let mut bridge = SinkBridge {
         inner: sink,
         trace: false,

@@ -13,19 +13,23 @@ release workflow for the tag's exact source commit and workspace version.
 
 ### 1. Cut the release commit
 
-`scripts/cut-release.sh` continues to create the version commit and a local annotated tag. Push the
-release commit to `main`, but hold the tag locally.
+`scripts/cut-release.sh` continues to create the version commit and a local annotated tag. Human
+invocations run `scripts/release-full-gate.sh` before that commit. The unattended release-branch
+flow is the sole exception: it creates the transactionally exact cut with `--no-gate`, stages it on
+`release-candidates/vX.Y.Z`, and delegates the one mandatory gate to that candidate.
 
 ### 2. Prepare the exact commit
 
-Dispatch `release.yml` on `main` with the manifest version as its `version` input. GitHub freezes the
-run's `head_sha`; the workflow validates that the input equals `[workspace.package].version`, plans
-the prospective `v<version>` announcement, and runs the unchanged cargo-dist local/global builds.
-It does not create or modify a GitHub Release.
+Dispatch `release.yml` on `release-candidates/vX.Y.Z` with the manifest version as its `version`
+input. GitHub freezes the run's `head_sha`; the workflow validates both the version-derived ref and
+`[workspace.package].version`, then runs `scripts/release-full-gate.sh "$GITHUB_SHA"` before planning
+or building the unchanged cargo-dist local/global artifacts. It does not create or modify a GitHub
+Release.
 
-After every build succeeds, the run uploads a small `release-candidate-receipt` containing a schema
-marker, version, tag, full commit SHA, and workflow run ID. GitHub Actions v4+ artifacts are immutable
-within a run. The receipt therefore names the immutable run that owns the cargo-dist outputs.
+After the full gate and every build succeed, the run uploads a small `release-candidate-receipt`
+containing a schema marker, version, tag, full commit SHA, `mandatory-full-v1` gate marker, gated SHA,
+and workflow run ID. GitHub Actions v4+ artifacts are immutable within a run. The receipt therefore
+names both the exact gated source and the immutable run that owns the cargo-dist outputs.
 
 ### 3. Promote with the tag
 
@@ -41,7 +45,8 @@ mismatch.
 
 ## Failure behavior
 
-- A malformed candidate input or workspace-version mismatch fails before any build.
+- A malformed candidate input, workspace-version mismatch, checked-out SHA mismatch, or red full
+  gate fails before any artifact build or receipt.
 - Receipt tampering, a SHA/version/run mismatch, or a missing candidate artifact fails before host or
   release creation.
 - If no successful candidate exists at the tag SHA, the workflow logs a prominent warning and uses
@@ -56,7 +61,7 @@ mismatch.
 
 Candidate lookup is repository-local, restricted to successful `workflow_dispatch` runs of
 `release.yml`, and filtered by the tag's full SHA. The downloaded receipt repeats and verifies the
-version, tag, SHA, and run ID. Both preparation and promotion check out the workflow-owned source
+version, tag, SHA, mandatory-gate identity, gated SHA, and run ID. Both preparation and promotion check out the workflow-owned source
 revision with persisted Git credentials disabled.
 
 No third-party upload path or mutable release cache is introduced. Cargo-dist still produces the
@@ -65,10 +70,11 @@ the public asset shape.
 
 ## Operator flow
 
-For `vX.Y.Z`, after the cut commit is on `main` and while its annotated tag remains local:
+For `vX.Y.Z`, while its annotated tag remains local:
 
 ```sh
-gh workflow run release.yml --ref main -f version=X.Y.Z
+git push origin HEAD:refs/heads/release-candidates/vX.Y.Z
+gh workflow run release.yml --ref release-candidates/vX.Y.Z -f version=X.Y.Z
 sha=$(git rev-list -n1 'vX.Y.Z^{}')
 run_id=$(gh run list --workflow release.yml --event workflow_dispatch --commit "$sha" \
   --limit 1 --json databaseId --jq '.[0].databaseId')
@@ -85,5 +91,5 @@ available as the dispatch ref.
 
 - Reusing ordinary CI binaries, whose profiles and target closure differ from cargo-dist.
 - Moving crates.io publication into the binary promotion workflow.
-- Skipping the pre-release live-provider/plugin smokes or the release commit's local gate.
+- Skipping the pre-release live-provider/plugin smokes or the exact release commit's mandatory gate.
 - Replacing cargo-dist's generated artifact or announcement formats.

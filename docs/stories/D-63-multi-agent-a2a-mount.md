@@ -50,6 +50,7 @@ auth) — and in doing so **forgoes** the TTL/SSE machinery entirely, running st
   machinery is engine-based; the story's `impl A2aTurn` sketch didn't match the actual surface.
   6 integration tests (`tests/multi_agent_mount.rs`); full workspace gate green. Per-agent REST
   `/sessions` surface and per-agent turn gate are noted non-goals/follow-ups in the design.
-- 2026-07-07 pre-release review: added `serve_multi`/`serve_multi_on` (guarded bind, the single-
-  agent `serve_on` had the only Open-non-loopback refusal); documented the public-card existence-
+- 2026-07-07 pre-release review: added `serve_multi` and the then-existing native-listener helper;
+  C-435 later removed every already-bound listener helper and made `serve_multi` require an explicit
+  `ExecutionSystem`. The router still owns the shared Open-non-loopback refusal. Documented the public-card existence-
   oracle caveat and the per-engine sub-agent identity-cell contract on `AgentResolver`/`ResolvedAgent`.

@@ -10,7 +10,7 @@ type coercion, and value assembly. They perform no IO, dispatch no operation, an
 approval. Use them anywhere you would otherwise shell out just to reshape data.
 
 In the text form, `fmt(…)`, `parse(…)`, `peek x`, field access including array indexes
-(`value.items[0].name`), value templates, and invertible native expressions have first-class
+(`value.items[0].name`) and quoted object keys (`response.headers["content-type"]`), value templates, and invertible native expressions have first-class
 spellings. The `@json` escape remains only for pathological shapes: non-invertible `expr` formulas
 and `jq` over a non-symbol input. All of them are ordinary nodes in the JSON wire form.
 
@@ -60,6 +60,7 @@ with the access sugar:
 raw = web.fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
 price = raw.bitcoin.usd
 kind = plan.kind
+content_type = response.headers ["content-type"]
 ```
 
 This lowers to a `jq` node. Notes:
@@ -68,7 +69,13 @@ This lowers to a `jq` node. Notes:
   leaf. It is not valid inline as a call argument, condition, or `match` subject. Bind first, then
   pass or test the symbol. In particular, branch on `status`, not `response.status`, after binding
   `status = response.status`.
-- `obj.field` reads an object field; `list[0]` indexes into a list (`list[0]` is the first element).
+- `obj.field` reads an identifier-named object field; `obj["content-type"]` reads a key that needs
+  punctuation or other JSON-string escaping. `obj["a.b"]` is one key literally named `a.b`, not
+  two segments. `list[0]` indexes into a list (`list[0]` is the first element), while
+  `obj["0"]` is an object field literally named `0`.
+- Flux chose JSON-string brackets instead of widening dot segments or adding a separate quoted-dot
+  syntax. Dot access stays identifier-only; brackets reuse JSON escaping and remain visibly distinct
+  from numeric list indexes.
 - Access is **strict**: a missing field, an out-of-range index, or a field access on a non-object
   is a loud error — a typo fails fast instead of silently reading empty. A field that is *present
   but `null`* is never an error.
@@ -82,18 +89,23 @@ This lowers to a `jq` node. Notes:
 
 ## `jq` — JSON path extraction
 
-The full `jq` node supports dot paths with numeric array indexes, applied to the JSON content of its
-input. Native source uses brackets — `first = response.results[0].value` — while the lowered AST
-stores that index as the dot segment `.results.0.value`. The formatter restores brackets. A
-non-symbol input, or a hand-built AST whose path string itself uses brackets, needs `@json` to
-preserve that exact AST shape:
+The full `jq` node supports dot paths with numeric array indexes and JSON-string object keys,
+applied to the JSON content of its input. Native source uses numeric brackets —
+`first = response.results[0].value` — while the lowered AST stores that index as the dot segment
+`.results.0.value`. Quoted object keys remain brackets in both forms:
+`response.headers["content-type"]` lowers to `.headers["content-type"]`. JSON escaping makes dots,
+brackets, quotes, backslashes, empty keys, Unicode, and numeric-looking object keys unambiguous. A
+non-symbol input, or a hand-built AST using the legacy numeric-bracket path spelling, needs `@json`
+to preserve that exact AST shape:
 
 ```flux
 first = @json { "kind": "jq", "path": ".results[0].value", "input": { "kind": "var", "name": "response" }, "optional": true }
 ```
 
-The path grammar is a strict subset of jq — dot-separated field names and numeric index segments
-(`.field`, `.field.nested`, `.field.0.nested`). No filters, pipes, or conditionals.
+The path grammar is a strict subset of jq — dot-separated field names, numeric index segments, and
+JSON-string keys (`.field`, `.field.nested`, `.field.0.nested`,
+`.headers["content-type"]`). No filters, pipes, or conditionals. A numeric `.0` indexes a list;
+quoted `["0"]` names an object field and never indexes a list.
 The extracted value keeps its natural JSON type. A model- or host-emitted `jq` node traverses
 missing data leniently (an absent key or out-of-range index yields `null`); the native
 `x.field` sugar above is strict on missing data unless you add the `?` opt-out.

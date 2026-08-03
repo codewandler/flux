@@ -15,7 +15,8 @@ use flux_core::{Error, Message, Result, Usage};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
     CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, SkillLoadOutcome,
-    SkillLoader, SpawnActivity, SpawnActivitySink, ToolProgress, ToolProgressSink, ToolResult,
+    SkillLoader, SpawnActivity, SpawnActivitySink, ToolProgress, ToolProgressSink, ToolRegistry,
+    ToolResult,
 };
 
 use crate::composites::{prepare_registration, CompositeScope, DynamicComposites};
@@ -30,6 +31,7 @@ struct TurnContext {
     base_system: Option<String>,
     sink: Arc<Mutex<dyn AgentSink>>,
     advertised: Option<HashSet<String>>,
+    registry: Arc<ToolRegistry>,
     audit: Option<(Arc<flux_events::EventStore>, i64)>,
 }
 
@@ -125,6 +127,7 @@ impl EngineLoopHost {
                     base_system,
                     sink,
                     advertised: None,
+                    registry: Arc::new(executor.registry().clone()),
                     audit: None,
                 }),
                 usage: Mutex::new(Usage::default()),
@@ -221,6 +224,7 @@ impl EngineLoopHost {
         base_system: Option<String>,
         sink: Arc<Mutex<dyn AgentSink>>,
         advertised: Option<HashSet<String>>,
+        registry: Arc<ToolRegistry>,
         audit: Option<(Arc<flux_events::EventStore>, i64)>,
     ) -> Arc<dyn SpawnActivitySink> {
         // The caller carries this reporter in its lexical RuntimeTurnContext. Never store it on the
@@ -237,6 +241,7 @@ impl EngineLoopHost {
             base_system,
             sink,
             advertised,
+            registry,
             audit,
         };
         *self.usage.lock().unwrap() = Usage::default();
@@ -331,16 +336,16 @@ impl EngineLoopHost {
         let options = self.options.lock().unwrap().clone();
         let groups = self.groups.lock().unwrap().clone();
         let adaptive_policy = self.adaptive_policy.lock().unwrap().clone();
-        let (session_id, base_system, sink, audit, mut advertised) = {
+        let (session_id, base_system, sink, audit, registry, mut advertised) = {
             let turn = self.turn.lock().unwrap();
             (
                 turn.session_id.clone(),
                 turn.base_system.clone(),
                 turn.sink.clone(),
                 turn.audit.clone(),
+                turn.registry.clone(),
                 turn.advertised.clone().unwrap_or_else(|| {
-                    executor
-                        .registry()
+                    turn.registry
                         .specs()
                         .into_iter()
                         .map(|spec| spec.name)
@@ -360,6 +365,7 @@ impl EngineLoopHost {
                 provider,
                 model: model.clone(),
                 executor,
+                registry,
                 store: self.store.clone(),
                 session_id,
                 conversation,
@@ -656,19 +662,19 @@ impl LoopHost for EngineLoopHost {
         let ast: crate::ast::DraftAst = serde_json::from_value(ast)
             .map_err(|error| Error::Other(format!("run_authored_flow: invalid AST: {error}")))?;
         let executor = self.executor()?;
-        let (session_id, sink, audit) = {
+        let (session_id, sink, audit, turn_registry) = {
             let turn = self.turn.lock().unwrap();
             (
                 turn.session_id.clone(),
                 turn.sink.clone(),
                 turn.audit.clone(),
+                turn.registry.clone(),
             )
         };
         self.composites
             .ensure_session_loaded(&self.store, &session_id)?;
         let composites = self.composites.active_for_session(&session_id);
-        let registry =
-            OpRegistry::new(executor.registry()).with_owned_composites(composites.clone());
+        let registry = OpRegistry::new(&turn_registry).with_owned_composites(composites.clone());
         let defined = self
             .store
             .view(&session_id)?
@@ -726,19 +732,23 @@ impl LoopHost for EngineLoopHost {
             serde_json::from_value(decode_host_json(batch_value, "approve_batch.batch")?).map_err(
                 |error| Error::Other(format!("approve_batch: invalid ActionBatch: {error}")),
             )?;
-        let (session_id, sink) = {
+        let (session_id, sink, turn_registry) = {
             let turn = self.turn.lock().unwrap();
-            (turn.session_id.clone(), turn.sink.clone())
+            (
+                turn.session_id.clone(),
+                turn.sink.clone(),
+                turn.registry.clone(),
+            )
         };
         if batch.session_id != session_id || batch.actions.is_empty() {
             return Err(Error::Other(
                 "approve_batch: batch is empty or belongs to a different session".into(),
             ));
         }
-        validate_live_batch(&batch, executor.registry())?;
+        validate_live_batch(&batch, &turn_registry)?;
 
         let ast = crate::staged::action_batch_ast(&batch);
-        let risk = crate::runtime::plan_risk(&ast, executor.registry());
+        let risk = crate::runtime::plan_risk(&ast, &turn_registry);
         let redacted = executor
             .context()
             .redactor
@@ -836,15 +846,16 @@ impl LoopHost for EngineLoopHost {
         .map_err(|error| {
             Error::Other(format!("execute_batch: invalid ApprovalReceipt: {error}"))
         })?;
-        let (session_id, sink, audit) = {
+        let (session_id, sink, audit, turn_registry) = {
             let turn = self.turn.lock().unwrap();
             (
                 turn.session_id.clone(),
                 turn.sink.clone(),
                 turn.audit.clone(),
+                turn.registry.clone(),
             )
         };
-        validate_live_batch(&batch, executor.registry())?;
+        validate_live_batch(&batch, &turn_registry)?;
         let destructive =
             self.receipts
                 .consume(&batch, &receipt, &session_id, &executor.approval_context())?;
@@ -992,6 +1003,7 @@ impl CompositeRegistrar for EngineLoopHost {
         let (scope, declaration, source, replace) = prepare_registration(request)?;
         let session_id = self.turn.lock().unwrap().session_id.clone();
         let executor = self.executor()?;
+        let turn_registry = self.turn.lock().unwrap().registry.clone();
         self.composites
             .ensure_session_loaded(&self.store, &session_id)?;
         self.composites.validate_registration(
@@ -999,7 +1011,7 @@ impl CompositeRegistrar for EngineLoopHost {
             &session_id,
             &declaration,
             replace,
-            executor.registry(),
+            &turn_registry,
         )?;
 
         let path = match scope {

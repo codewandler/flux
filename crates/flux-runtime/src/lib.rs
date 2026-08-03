@@ -710,6 +710,12 @@ pub struct RuntimeTurnContext {
     tool_progress: Option<Arc<dyn ToolProgressSink>>,
     surface: Option<Arc<dyn SurfaceSink>>,
     user_interaction: Option<Arc<dyn UserInteraction>>,
+    /// Immutable operation catalog adopted at this turn's boundary. Catalog refreshes publish a
+    /// later generation through [`LiveToolCatalog`]; this snapshot deliberately does not move.
+    tool_registry: Option<Arc<ToolRegistry>>,
+    /// Stable assembly catalog paired with `tool_registry` so delegation can project only the
+    /// parent's live generation delta onto an explicitly separate child tool base.
+    tool_registry_base: Option<Arc<ToolRegistry>>,
 }
 
 /// The caller and trust assertion frozen for one runtime turn.
@@ -842,6 +848,29 @@ impl RuntimeTurnContext {
         self
     }
 
+    /// Freeze the operation catalog used for both advertisement and dispatch in this turn.
+    pub fn with_tool_registry(mut self, registry: Arc<ToolRegistry>) -> Self {
+        self.tool_registry = Some(registry);
+        self
+    }
+
+    /// Carry the parent executor's stable assembly catalog for live-delta projection by spawners.
+    pub fn with_tool_registry_base(mut self, registry: Arc<ToolRegistry>) -> Self {
+        self.tool_registry_base = Some(registry);
+        self
+    }
+
+    /// Remove the executor-affine catalog snapshot while preserving the rest of the live turn.
+    ///
+    /// Cancellation, identity, reporting, and session lineage may deliberately cross into a
+    /// nested runtime. A catalog may not: the nested runtime assembled its own registry and must
+    /// not have that policy decision replaced by its parent's snapshot.
+    pub fn without_tool_registry(mut self) -> Self {
+        self.tool_registry = None;
+        self.tool_registry_base = None;
+        self
+    }
+
     /// The turn's cancellation token, when driven by a cancellable surface.
     pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancel.clone()
@@ -889,6 +918,16 @@ impl RuntimeTurnContext {
         self.identity.clone()
     }
 
+    /// The immutable operation catalog adopted by this turn, when a live driver installed one.
+    pub fn tool_registry(&self) -> Option<Arc<ToolRegistry>> {
+        self.tool_registry.clone()
+    }
+
+    /// The stable parent catalog paired with this turn's adopted generation.
+    pub fn tool_registry_base(&self) -> Option<Arc<ToolRegistry>> {
+        self.tool_registry_base.clone()
+    }
+
     /// Whether this snapshot carries no live turn capabilities.
     pub fn is_empty(&self) -> bool {
         self.cancel.is_none()
@@ -899,6 +938,8 @@ impl RuntimeTurnContext {
             && self.tool_progress.is_none()
             && self.surface.is_none()
             && self.user_interaction.is_none()
+            && self.tool_registry.is_none()
+            && self.tool_registry_base.is_none()
     }
 }
 
@@ -910,6 +951,8 @@ impl std::fmt::Debug for RuntimeTurnContext {
             .field("spawn_activity", &self.spawn_activity.is_some())
             .field("spawn_supervisor", &self.spawn_supervisor.is_some())
             .field("user_interaction", &self.user_interaction.is_some())
+            .field("tool_registry", &self.tool_registry.is_some())
+            .field("tool_registry_base", &self.tool_registry_base.is_some())
             .field(
                 "identity",
                 &self
@@ -965,6 +1008,13 @@ pub struct SpawnRequest {
     /// native `system`; a remote-aware parent carries the selected target explicitly so delegation
     /// cannot switch effects back to the coordinator's machine.
     pub execution_system: Option<Arc<dyn ExecutionSystem>>,
+    /// Catalog generation adopted by the parent turn. Paired with `tool_registry_base`, a local
+    /// spawner projects only the parent's generation delta onto its explicit child base before
+    /// applying the child role and active capability scope.
+    pub tool_registry: Option<Arc<ToolRegistry>>,
+    /// Stable parent catalog paired with `tool_registry`. The spawner applies only their delta to
+    /// its explicit child base, preserving child-only tools and its independent policy ceiling.
+    pub tool_registry_base: Option<Arc<ToolRegistry>>,
 }
 
 impl std::fmt::Debug for SpawnRequest {
@@ -980,6 +1030,8 @@ impl std::fmt::Debug for SpawnRequest {
                 &self.system.as_ref().map(|s| s.workspace().root()),
             )
             .field("execution_system", &self.execution_system.is_some())
+            .field("tool_registry", &self.tool_registry.is_some())
+            .field("tool_registry_base", &self.tool_registry_base.is_some())
             .finish()
     }
 }
@@ -995,6 +1047,8 @@ impl SpawnRequest {
             activity: None,
             system: None,
             execution_system: None,
+            tool_registry: None,
+            tool_registry_base: None,
         }
     }
 }
@@ -1350,6 +1404,11 @@ pub struct ToolContext {
     surface: Arc<Mutex<Option<Arc<dyn SurfaceSink>>>>,
     /// Stored user-interaction fallback; live engines carry this lexically per turn.
     user_interaction: Arc<Mutex<Option<Arc<dyn UserInteraction>>>>,
+    /// Stored live-catalog fallback for a fresh nested runtime that deliberately pins a turn
+    /// snapshot before crossing a spawned-task boundary.
+    tool_registry: Arc<Mutex<Option<Arc<ToolRegistry>>>>,
+    /// Stored stable parent-catalog fallback paired with `tool_registry`.
+    tool_registry_base: Arc<Mutex<Option<Arc<ToolRegistry>>>>,
     /// Stored sub-agent supervisor fallback for deliberately pinned spawned runtimes. Ordinary
     /// conversational turns carry it lexically with the rest of [`RuntimeTurnContext`].
     spawn_supervisor: Arc<Mutex<Option<Arc<SpawnTaskSupervisor>>>>,
@@ -1394,6 +1453,8 @@ impl ToolContext {
             tool_progress: Arc::new(Mutex::new(None)),
             surface: Arc::new(Mutex::new(None)),
             user_interaction: Arc::new(Mutex::new(None)),
+            tool_registry: Arc::new(Mutex::new(None)),
+            tool_registry_base: Arc::new(Mutex::new(None)),
             identity: None,
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
@@ -1551,6 +1612,8 @@ impl ToolContext {
             tool_progress: self.tool_progress.lock().unwrap().clone(),
             surface: self.surface.lock().unwrap().clone(),
             user_interaction: self.user_interaction.lock().unwrap().clone(),
+            tool_registry: self.tool_registry.lock().unwrap().clone(),
+            tool_registry_base: self.tool_registry_base.lock().unwrap().clone(),
         })
     }
 
@@ -1565,6 +1628,8 @@ impl ToolContext {
         *self.tool_progress.lock().unwrap() = turn.tool_progress;
         *self.surface.lock().unwrap() = turn.surface;
         *self.user_interaction.lock().unwrap() = turn.user_interaction;
+        *self.tool_registry.lock().unwrap() = turn.tool_registry;
+        *self.tool_registry_base.lock().unwrap() = turn.tool_registry_base;
         self.identity = turn.identity;
     }
 
@@ -2115,6 +2180,48 @@ impl ToolRegistry {
     }
 }
 
+/// Host-owned publication channel for operation-catalog generations.
+///
+/// Publishers clone and update the latest complete registry, then swap it atomically. A live turn
+/// takes one [`snapshot`](Self::snapshot) at its boundary and carries that `Arc` lexically, so a
+/// later publication cannot change either its advertised schemas or its dispatch targets. This is
+/// deliberately a side channel rather than interior mutability on [`Executor::registry`]: the
+/// assembly registry stays a stable validation input, while running sessions opt into generations
+/// explicitly at their turn boundary.
+#[derive(Clone)]
+pub struct LiveToolCatalog {
+    latest: Arc<Mutex<Arc<ToolRegistry>>>,
+}
+
+impl LiveToolCatalog {
+    pub fn new(initial: ToolRegistry) -> Self {
+        Self {
+            latest: Arc::new(Mutex::new(Arc::new(initial))),
+        }
+    }
+
+    /// The complete catalog generation currently published for the next turn.
+    pub fn snapshot(&self) -> Arc<ToolRegistry> {
+        self.latest.lock().unwrap().clone()
+    }
+
+    /// Publish an already-assembled complete generation in one pointer swap.
+    pub fn publish(&self, registry: ToolRegistry) {
+        *self.latest.lock().unwrap() = Arc::new(registry);
+    }
+
+    /// Clone and update the latest generation under the publication lock. The generation moves
+    /// only when `update` succeeds, preventing both partial application and lost concurrent
+    /// refreshes.
+    pub fn try_update<T>(&self, update: impl FnOnce(&mut ToolRegistry) -> Result<T>) -> Result<T> {
+        let mut latest = self.latest.lock().unwrap();
+        let mut next = latest.as_ref().clone();
+        let output = update(&mut next)?;
+        *latest = Arc::new(next);
+        Ok(output)
+    }
+}
+
 /// `FLUX_SURFACE_ALL=1` (or `true`) disables evidence gating — every op is advertised, as before
 /// surfacing existed. An escape hatch for debugging and parity.
 pub fn surface_all_override() -> bool {
@@ -2578,6 +2685,9 @@ pub struct ExecutionEnvironment {
     redactor: Redactor,
     spawner: Option<Arc<dyn Spawner>>,
     runtime_turn: Option<RuntimeTurnContext>,
+    /// Whether this executor should consult an enclosing runtime's executor-affine catalog.
+    /// Deliberately nested runtimes turn this off while inheriting the other turn capabilities.
+    use_lexical_tool_registry: bool,
     hooks: Vec<Arc<dyn PreToolHook>>,
     /// A pre-created workspace handle (C-122): when set, the derived context is built over this
     /// exact handle instead of minting a fresh one, so a surface that also bound the same handle
@@ -2594,6 +2704,9 @@ pub struct ExecutionEnvironment {
     /// per-agent-target executors, both derived from one template) install the same resolved set
     /// without a second matching implementation.
     disabled_ops: HashSet<String>,
+    /// Original exact and `family.*` disable expressions. These remain authoritative when a live
+    /// catalog publishes operations that did not exist during assembly.
+    disabled_patterns: Vec<String>,
     /// The host's resource ceilings (C-290), installed on every executor this environment derives.
     /// The concurrency ceiling is a shared handle, so a surface that mints a fresh executor per run
     /// (`FlowClient::build_executor`) still counts against one runtime-wide budget.
@@ -2619,10 +2732,12 @@ impl ExecutionEnvironment {
             redactor: Redactor::new(),
             spawner: None,
             runtime_turn: None,
+            use_lexical_tool_registry: true,
             hooks: Vec::new(),
             workspace: None,
             exact_context: None,
             disabled_ops: HashSet::new(),
+            disabled_patterns: Vec::new(),
             resource_limits: ResourceLimits::new(),
         }
     }
@@ -2650,10 +2765,12 @@ impl ExecutionEnvironment {
             redactor: context.redactor.clone(),
             spawner: context.spawner.clone(),
             runtime_turn: None,
+            use_lexical_tool_registry: true,
             hooks: Vec::new(),
             workspace: None,
             exact_context: Some(context),
             disabled_ops: HashSet::new(),
+            disabled_patterns: Vec::new(),
             resource_limits: ResourceLimits::new(),
         }
     }
@@ -2743,8 +2860,13 @@ impl ExecutionEnvironment {
 
     /// Snapshot the currently effective lexical turn for a one-shot runtime that may cross a task
     /// boundary. Outside a turn this pins an explicitly empty context.
-    pub fn inherit_runtime_turn(self) -> Self {
-        self.with_runtime_turn(active_runtime_turn_context().unwrap_or_default())
+    pub fn inherit_runtime_turn(mut self) -> Self {
+        self.use_lexical_tool_registry = false;
+        self.with_runtime_turn(
+            active_runtime_turn_context()
+                .unwrap_or_default()
+                .without_tool_registry(),
+        )
     }
 
     /// Attach ordered pre-tool hooks.
@@ -2768,6 +2890,12 @@ impl ExecutionEnvironment {
     /// through [`Self::into_executor`].
     pub fn with_disabled_ops(mut self, disabled: HashSet<String>) -> Self {
         self.disabled_ops = disabled;
+        self
+    }
+
+    /// Preserve the operator-authored disable intent for catalogs published after assembly.
+    pub fn with_disabled_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.disabled_patterns = patterns;
         self
     }
 
@@ -2824,7 +2952,9 @@ impl ExecutionEnvironment {
             self.authorization,
         )
         .with_hooks(self.hooks)
+        .with_lexical_tool_registry(self.use_lexical_tool_registry)
         .with_disabled_ops(self.disabled_ops)
+        .with_disabled_patterns(self.disabled_patterns)
         .with_resource_limits(limits)
     }
 }
@@ -3206,6 +3336,9 @@ pub fn authority_requirements_from_declaration(
 /// approval, then executes through the guarded system.
 pub struct Executor {
     registry: ToolRegistry,
+    /// Latest complete catalog published by plugin/control-plane owners. Real conversational turns
+    /// adopt one immutable generation through `RuntimeTurnContext`; direct calls use the latest.
+    live_catalog: LiveToolCatalog,
     perms: Mutex<PermissionManager>,
     /// Interior-mutable so a surface can swap the approver (e.g. the TUI's modal) even when the executor
     /// is shared as an `Arc<Executor>` — which it is once the authored loop host is installed.
@@ -3254,15 +3387,22 @@ pub struct Executor {
     dispatch_seq: AtomicU64,
     /// `FLUX_OP_CACHE=off|0` kill switch (resolved at construction); `with_op_cache` overrides.
     cache_enabled: bool,
-    /// `[tools] disable` (C-162), resolved to concrete op names once at construction time via
-    /// [`ToolRegistry::resolve_disabled`] — never recomputed mid-session, so it can't churn the
-    /// prompt prefix (the A-95 cache-stability lesson). Consulted twice: the engine layer narrows
-    /// the per-turn advertised set by it via [`Executor::disabled_ops`] (surface-only), and
+    /// `[tools] disable` (C-162): startup-known names are resolved once through
+    /// [`ToolRegistry::resolve_disabled`], while the original expressions are retained so a later
+    /// catalog generation cannot add an exempt matching name. Matching is stable within a turn
+    /// because the engine evaluates it against that turn's adopted immutable registry. Consulted
+    /// twice: the engine layer narrows the per-turn advertised set via
+    /// [`Executor::disabled_ops_for`] (surface-only), and
     /// [`Executor::gate`] refuses a dispatch that names one directly, so a cached plan or a resumed
     /// session can't call it either. Surface-only and defense-in-depth — the authorization policy is
     /// still the actual security control and wins if the two ever disagree; this never widens what a
     /// call may do, only what is offered.
     disabled_ops: HashSet<String>,
+    /// Original disable expressions, re-evaluated against each adopted catalog generation.
+    disabled_patterns: Vec<String>,
+    /// False for a deliberately scoped nested executor that inherits its parent's other lexical
+    /// turn capabilities but owns a different operation catalog.
+    use_lexical_tool_registry: bool,
     /// The host's resource ceilings (C-290): simultaneously executing tool calls, and retained
     /// result bytes. Unbounded by default. Shared — not copied — with every other executor derived
     /// from the same [`ExecutionEnvironment`], so the concurrency ceiling is a property of the
@@ -3483,8 +3623,10 @@ impl Executor {
         ctx: ToolContext,
         authorization: ExecutionAuthorization,
     ) -> Self {
+        let live_catalog = LiveToolCatalog::new(registry.clone());
         Self {
             registry,
+            live_catalog,
             perms: Mutex::new(perms),
             approver: Mutex::new(approver),
             ctx,
@@ -3501,6 +3643,8 @@ impl Executor {
                 .map(|v| v != "off" && v != "0")
                 .unwrap_or(true),
             disabled_ops: HashSet::new(),
+            disabled_patterns: Vec::new(),
+            use_lexical_tool_registry: true,
             limits: ResourceLimits::new(),
         }
     }
@@ -3561,11 +3705,43 @@ impl Executor {
         self
     }
 
+    /// Install the original exact and `family.*` disable expressions. Unlike the resolved set,
+    /// these also apply to operations introduced by a later live-catalog generation.
+    pub fn with_disabled_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.disabled_patterns = patterns;
+        self
+    }
+
+    fn with_lexical_tool_registry(mut self, enabled: bool) -> Self {
+        self.use_lexical_tool_registry = enabled;
+        self
+    }
+
     /// The resolved `[tools] disable` set this executor was built with (C-162) — the concrete op
     /// names to exclude from the advertised set and refuse at dispatch. Empty when nothing is
     /// disabled.
     pub fn disabled_ops(&self) -> &HashSet<String> {
         &self.disabled_ops
+    }
+
+    /// Concrete disabled names for `registry`, including names newly matched by the original
+    /// operator expressions.
+    pub fn disabled_ops_for(&self, registry: &ToolRegistry) -> HashSet<String> {
+        let mut disabled = self.disabled_ops.clone();
+        disabled.extend(registry.names().into_iter().filter(|name| {
+            self.disabled_patterns
+                .iter()
+                .any(|pattern| flux_config::tool_disable_matches(pattern, name))
+        }));
+        disabled
+    }
+
+    fn operation_disabled(&self, name: &str) -> bool {
+        self.disabled_ops.contains(name)
+            || self
+                .disabled_patterns
+                .iter()
+                .any(|pattern| flux_config::tool_disable_matches(pattern, name))
     }
 
     /// Turn boundary for the op cache (L-54): the engine calls this at the start of every user
@@ -3672,6 +3848,9 @@ impl Executor {
     /// approval. A bare deny or an active `with_tools` miss is knowable before arguments exist and
     /// therefore removes the operation from model context entirely.
     pub fn operation_visible(&self, name: &str) -> bool {
+        if self.operation_disabled(name) {
+            return false;
+        }
         if self
             .active_cap_scope()
             .is_some_and(|scope| !scope.iter().any(|allowed| allowed == name))
@@ -3820,6 +3999,24 @@ impl Executor {
         &self.registry
     }
 
+    /// Publication handle for complete live catalog generations.
+    pub fn live_catalog(&self) -> LiveToolCatalog {
+        self.live_catalog.clone()
+    }
+
+    /// Registry generation effective for this lexical turn. Outside a turn, direct/one-shot
+    /// dispatch observes the latest published generation.
+    pub fn active_registry_snapshot(&self) -> Arc<ToolRegistry> {
+        if self.use_lexical_tool_registry {
+            self.ctx
+                .runtime_turn_context()
+                .tool_registry()
+                .unwrap_or_else(|| self.live_catalog.snapshot())
+        } else {
+            self.live_catalog.snapshot()
+        }
+    }
+
     /// The execution context (guarded system, redactor, spawner). Lets a caller derive a sibling
     /// executor over the *same* guarded surface — e.g. a read-only research executor scoped to a
     /// subset of tools for the planner.
@@ -3868,7 +4065,8 @@ impl Executor {
     /// hooks for a hypothetical call would be a real side effect) and the approval gate. `Allow` from
     /// this function means "the deterministic gates admit it", never "it may now run unchecked".
     pub fn authorize(&self, name: &str, params: &Value) -> AuthorizeVerdict {
-        let Some(tool) = self.registry.get(name) else {
+        let registry = self.active_registry_snapshot();
+        let Some(tool) = registry.get(name) else {
             return AuthorizeVerdict::Deny(format!("unknown tool: {name}"));
         };
         match self.gate(name, params, tool.as_ref(), GateAudit::DecisionOnly) {
@@ -3921,7 +4119,7 @@ impl Executor {
         // policy below still governs everything that isn't disabled); it exists so a cached plan or
         // a resumed session can't call an op this workspace configured off, even where the policy
         // would otherwise allow it. Surface-only + defense-in-depth, never a second permission system.
-        if self.disabled_ops.contains(name) {
+        if self.operation_disabled(name) {
             return Err(format!("`{name}` disabled by config ([tools] disable)"));
         }
         self.cap_scope_gate(name, audit)?;
@@ -4033,7 +4231,8 @@ impl Executor {
         let started = Instant::now();
         let dispatch = self.dispatch_seq.fetch_add(1, Ordering::Relaxed);
         let mut approval_wait = None;
-        let Some(tool) = self.registry.get(name) else {
+        let registry = self.active_registry_snapshot();
+        let Some(tool) = registry.get(name) else {
             // D-184: an unknown tool is a structural refusal — the same bucket `authorize` already
             // puts it in (`Deny`, below), and the one `ast::Node::Retry`'s own doc comment names as
             // fatal ("policy denial, unknown op") — never a transient failure worth retrying. Before
@@ -5187,6 +5386,77 @@ mod tests {
                 params["text"].as_str().unwrap_or("").to_string(),
             ))
         }
+    }
+
+    struct CatalogTool(&'static str);
+
+    #[async_trait]
+    impl Tool for CatalogTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                self.0,
+                format!("{} catalog generation", self.0),
+                json!({"type": "object", "additionalProperties": false}),
+            )
+        }
+
+        async fn execute(&self, _ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok(self.0))
+        }
+    }
+
+    /// C-318 failing-first: publication may happen while a turn is live, but both lookup and
+    /// dispatch stay on that turn's immutable catalog generation. The next lexical turn adopts the
+    /// new generation, including both the gained and withdrawn operation.
+    #[tokio::test]
+    async fn live_catalog_refresh_is_adopted_only_at_the_next_turn_boundary() {
+        let mut initial = ToolRegistry::new();
+        initial.register(Arc::new(CatalogTool("old_op")));
+        let executor = Arc::new(Executor::new(
+            initial,
+            PermissionManager::from_rules(&["old_op".into(), "new_op".into()], &[]),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        ));
+        let catalog = executor.live_catalog();
+        let first_turn = catalog.snapshot();
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_tool_registry(first_turn),
+            async {
+                let mut refreshed = executor.registry().clone();
+                refreshed.remove("old_op");
+                refreshed.register(Arc::new(CatalogTool("new_op")));
+                catalog.publish(refreshed);
+
+                assert_eq!(
+                    executor.dispatch("old_op", json!({})).await.content,
+                    "old_op",
+                    "the live turn must keep dispatching under its adopted generation"
+                );
+                assert!(
+                    executor.dispatch("new_op", json!({})).await.is_error,
+                    "a gain published mid-turn must remain invisible in that turn"
+                );
+            },
+        )
+        .await;
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_tool_registry(catalog.snapshot()),
+            async {
+                assert!(
+                    executor.dispatch("old_op", json!({})).await.is_error,
+                    "a withdrawal must take effect at the next turn boundary"
+                );
+                assert_eq!(
+                    executor.dispatch("new_op", json!({})).await.content,
+                    "new_op",
+                    "a gain must take effect at the next turn boundary"
+                );
+            },
+        )
+        .await;
     }
 
     struct NoopSpawnActivitySink;
@@ -7294,6 +7564,49 @@ mod tests {
             HashSet::from(["browser.navigate".to_string(), "browser.click".to_string()])
         );
         assert!(resolved.unmatched.is_empty());
+    }
+
+    /// C-318: disable intent is policy, not a one-time expansion. An exact name that was absent at
+    /// assembly and a family member added by a live refresh must both remain hidden and refused.
+    #[tokio::test]
+    async fn live_catalog_additions_re_evaluate_exact_and_family_disable_patterns() {
+        struct NamedTool(&'static str);
+        #[async_trait]
+        impl Tool for NamedTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only(self.0, "fixture", json!({"type": "object"}))
+            }
+            fn permission_subjects(&self, _p: &Value) -> Vec<String> {
+                Vec::new()
+            }
+            async fn execute(&self, _ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                Ok(ToolResult::ok("unexpected execution"))
+            }
+        }
+
+        let executor = Executor::new(
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        )
+        .with_disabled_patterns(vec!["future.exact".into(), "plugin.*".into()]);
+        let mut refreshed = ToolRegistry::new();
+        refreshed.register(Arc::new(NamedTool("future.exact")));
+        refreshed.register(Arc::new(NamedTool("plugin.new")));
+        executor.live_catalog().publish(refreshed);
+
+        for name in ["future.exact", "plugin.new"] {
+            assert!(!executor.operation_visible(name), "{name} must stay hidden");
+            let result = executor.dispatch(name, json!({})).await;
+            assert!(result.is_error, "{name} must be refused at dispatch");
+            assert!(result.content.contains("disabled by config"), "{result:?}");
+        }
+        let disabled = executor.disabled_ops_for(&executor.active_registry_snapshot());
+        assert_eq!(
+            disabled,
+            HashSet::from(["future.exact".to_string(), "plugin.new".to_string()])
+        );
     }
 
     #[test]

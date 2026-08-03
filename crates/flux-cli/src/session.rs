@@ -655,8 +655,24 @@ impl TurnCost {
 /// Built-in REPL slash commands (D-186): a file command sharing one of these names is dropped at
 /// load (with a warning) rather than shadowing it — see [`load_command_files`].
 const REPL_BUILTIN_COMMANDS: &[&str] = &[
-    "exit", "quit", "help", "shell", "model", "effort", "pd", "goal", "loop", "tools", "evidence",
-    "session", "sessions", "resume", "compact", "insights", "clear",
+    "exit",
+    "quit",
+    "help",
+    "shell",
+    "plugin-refresh",
+    "model",
+    "effort",
+    "pd",
+    "goal",
+    "loop",
+    "tools",
+    "evidence",
+    "session",
+    "sessions",
+    "resume",
+    "compact",
+    "insights",
+    "clear",
 ];
 
 /// The terminal line `/compact` prints after the engine has made an outcome observable. Only the
@@ -679,7 +695,8 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
     // Decorative boot splash, before any other output. Blocks the runtime thread for a
     // few seconds at most — nothing else is in flight this early in the REPL.
     crate::splash::maybe_splash();
-    let (mut agent, mut session_id, _spec, spawner) = build_agent_interactive(&flags).await?;
+    let (mut agent, mut session_id, _spec, spawner, live_plugins) =
+        build_agent_interactive(&flags).await?;
     let cost = TurnCost::load();
     let initial_rules = agent.executor.allow_rules();
     // Command files (D-186): discovered once at REPL start, not gated behind a flag like skills —
@@ -733,6 +750,10 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                     const CMDS: &[(&str, &str)] = &[
                         ("/help", "show this help"),
                         ("/shell", "toggle the generic bash op (off by default)"),
+                        (
+                            "/plugin-refresh <name>",
+                            "refresh a loaded plugin for the next turn",
+                        ),
                         ("/tools", "list available tools"),
                         (
                             "/evidence",
@@ -799,6 +820,26 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                             if currently_on { "hidden from" } else { "in" }
                         ))
                     );
+                }
+                "plugin-refresh" => {
+                    let name = rest.strip_prefix("plugin-refresh").unwrap_or("").trim();
+                    if name.is_empty() {
+                        eprintln!("usage: /plugin-refresh <name>");
+                    } else {
+                        let catalog = agent.executor.live_catalog();
+                        match live_plugins.refresh(name, &catalog).await {
+                            Ok(refresh) => eprintln!(
+                                "{}",
+                                style::dim(&format!(
+                                    "plugin `{name}` refreshed for the next turn · added [{}] · removed [{}] · retained {}",
+                                    refresh.added.join(", "),
+                                    refresh.removed.join(", "),
+                                    refresh.retained.len(),
+                                ))
+                            ),
+                            Err(error) => eprintln!("{} {error:#}", style::red("error:")),
+                        }
+                    }
                 }
                 "model" => {
                     let spec = rest.strip_prefix("model").unwrap_or("").trim();
@@ -906,12 +947,13 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                     }
                 }
                 "tools" => {
-                    let mut names = agent.executor.registry().names();
+                    let registry = agent.executor.active_registry_snapshot();
+                    let mut names = registry.names();
                     names.sort();
                     // C-162: `[tools] disable` ops stay registered (dispatch still refuses them),
                     // so mark them here rather than hiding them — a mysteriously-missing op is one
                     // command from an explanation instead of a silent gap in this listing.
-                    let disabled = agent.executor.disabled_ops();
+                    let disabled = agent.executor.disabled_ops_for(&registry);
                     let rendered: Vec<String> = names
                         .into_iter()
                         .map(|name| {

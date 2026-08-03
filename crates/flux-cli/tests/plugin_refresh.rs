@@ -70,3 +70,24 @@ fn plugin_refresh_is_a_reachable_subcommand() {
         "refreshing an uninstalled plugin must not exit 0:\n{combined}"
     );
 }
+
+/// C-318: the running-session operator path must retain LoadedPlugin ownership and call the live
+/// publisher. The standalone `flux plugin refresh` command intentionally uses a scratch registry;
+/// it is not evidence that an active agent can adopt a new generation.
+#[test]
+fn repl_refresh_reaches_the_running_agents_live_catalog() {
+    let assembly = include_str!("../src/app_cmd.rs");
+    let session = include_str!("../src/session.rs");
+    assert!(
+        assembly.contains(".refresh_live(catalog,"),
+        "running plugin ownership must call LoadedPlugin::refresh_live"
+    );
+    assert!(
+        session.contains("live_plugins.refresh(name, &catalog).await"),
+        "the REPL operator action must target its running agent's catalog"
+    );
+    assert!(
+        session.contains("/plugin-refresh <name>"),
+        "the running refresh action must be documented and reachable"
+    );
+}

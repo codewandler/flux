@@ -44,6 +44,7 @@ pub mod format_cst;
 pub mod glyph;
 pub mod highlight;
 pub mod host;
+mod jq_path;
 pub mod lexer;
 pub mod lower_cst;
 pub mod opspec;

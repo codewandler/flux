@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -448,6 +448,14 @@ struct SocketRuntime {
 
 impl ConnectorChannel {
     fn binding_state(&self, deliverer: Arc<dyn Deliverer>) -> Arc<BindingState> {
+        self.binding_state_with_limits(deliverer, flux_server::ServerLimits::default())
+    }
+
+    fn binding_state_with_limits(
+        &self,
+        deliverer: Arc<dyn Deliverer>,
+        limits: flux_server::ServerLimits,
+    ) -> Arc<BindingState> {
         Arc::new(BindingState {
             name: self.name.clone(),
             deliverer,
@@ -458,6 +466,7 @@ impl ConnectorChannel {
             payload: self.payload.clone(),
             payload_root: self.payload_root,
             dropped: Arc::clone(&self.dropped),
+            resources: flux_server::SharedIngressGovernor::new(limits),
         })
     }
 
@@ -882,10 +891,44 @@ impl ConnectorChannel {
 
     /// Build the axum router for this channel over `d` (exposed for hermetic tests).
     pub fn router(&self, d: Arc<dyn Deliverer>) -> Router {
-        let state = self.binding_state(d);
+        self.router_with_limits(d, flux_server::ServerLimits::default())
+    }
+
+    fn router_with_limits(
+        &self,
+        d: Arc<dyn Deliverer>,
+        limits: flux_server::ServerLimits,
+    ) -> Router {
+        let state = self.binding_state_with_limits(d, limits);
         Router::new()
             .route(&self.path, post(handle))
+            .layer(flux_server::request_timeout_layer(limits))
+            .layer(DefaultBodyLimit::max(limits.max_body_bytes))
             .with_state(state)
+    }
+
+    async fn serve_webhook_on(&self, context: ChannelContext) -> anyhow::Result<()> {
+        let addr = self
+            .addr
+            .ok_or_else(|| anyhow::anyhow!("channel `{}`: no bind address", self.name))?;
+        let limits = flux_server::ServerLimits::from_env();
+        let exposure = if self.token.is_some() {
+            flux_server::BindExposure::Authenticated
+        } else {
+            flux_server::BindExposure::LoopbackOnly
+        };
+        let listener = flux_server::bind_http_listener(
+            context.execution_system.as_ref(),
+            addr,
+            exposure,
+            limits,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("channel `{}`: bind {addr}: {error}", self.name))?;
+        axum::serve(listener, self.router_with_limits(context.deliverer, limits))
+            .with_graceful_shutdown(async move { context.cancel.cancelled().await })
+            .await
+            .map_err(|error| anyhow::anyhow!("channel `{}`: serve: {error}", self.name))
     }
 }
 
@@ -1383,6 +1426,7 @@ struct BindingState {
     payload: BTreeMap<String, String>,
     payload_root: bool,
     dropped: Arc<AtomicU64>,
+    resources: flux_server::SharedIngressGovernor,
 }
 
 impl BindingState {
@@ -1447,6 +1491,9 @@ async fn handle(
     if !authorized(state.token.as_deref(), &headers) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
+    if let Err(response) = state.resources.admit_request() {
+        return *response;
+    }
 
     let label = match state.label(&headers, &body) {
         Ok(label) => label,
@@ -1461,13 +1508,18 @@ async fn handle(
         }
     };
     let payload = state.payload(&headers, &body);
+    let permit = match state.resources.admit_work() {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
 
     // Spawn rather than await: the reply is an operation call (D-217), never this HTTP response, so
     // holding the vendor's connection open buys nothing — and a channel adapter must not block its
-    // own protocol loop on a delivery. Deliveries run concurrently and are bounded by the App's
-    // admission limit, so this adds no queue of its own.
+    // own protocol loop on a delivery. The permit was acquired before this task was created, so
+    // deliveries are bounded without building a queue of already-accepted tasks.
     let deliverer = state.deliverer.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(e) = deliverer.deliver(&label, payload).await {
             eprintln!("connector channel `{label}`: delivery failed: {e}");
         }
@@ -1618,16 +1670,13 @@ impl Channel for ConnectorChannel {
                 self.name
             );
         }
-        let addr = self
-            .addr
-            .ok_or_else(|| anyhow::anyhow!("channel `{}`: no bind address", self.name))?;
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("channel `{}`: bind {addr}: {e}", self.name))?;
-        axum::serve(listener, self.router(d))
-            .with_graceful_shutdown(async move { cancel.cancelled().await })
-            .await
-            .map_err(|e| anyhow::anyhow!("channel `{}`: serve: {e}", self.name))
+        let system = Arc::new(System::from_env(std::env::current_dir()?)?);
+        self.serve_webhook_on(ChannelContext {
+            deliverer: d,
+            cancel,
+            execution_system: system,
+        })
+        .await
     }
 
     async fn start_with_context(&self, context: ChannelContext) -> anyhow::Result<()> {
@@ -1640,7 +1689,7 @@ impl Channel for ConnectorChannel {
             )
             .await;
         }
-        self.start(context.deliverer, context.cancel).await
+        self.serve_webhook_on(context).await
     }
 }
 
@@ -1659,6 +1708,184 @@ mod tests {
         ) -> anyhow::Result<Vec<flux_app::JourneyRun>> {
             Ok(Vec::new())
         }
+    }
+
+    #[derive(Default)]
+    struct CountingDeliverer(AtomicU64);
+
+    #[async_trait]
+    impl Deliverer for CountingDeliverer {
+        async fn deliver(
+            &self,
+            _label: &str,
+            _payload: Value,
+        ) -> anyhow::Result<Vec<flux_app::JourneyRun>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    struct BlockedDeliverer {
+        calls: AtomicU64,
+        release: tokio::sync::Notify,
+    }
+
+    impl Default for BlockedDeliverer {
+        fn default() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Deliverer for BlockedDeliverer {
+        async fn deliver(
+            &self,
+            _label: &str,
+            _payload: Value,
+        ) -> anyhow::Result<Vec<flux_app::JourneyRun>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(Vec::new())
+        }
+    }
+
+    fn test_webhook_channel() -> ConnectorChannel {
+        ConnectorChannel {
+            name: "events".into(),
+            addr: Some("127.0.0.1:0".parse().unwrap()),
+            path: "/events".into(),
+            token: None,
+            socket: None,
+            wire_events: BTreeMap::new(),
+            discriminator: None,
+            delivery_id: None,
+            payload: BTreeMap::new(),
+            payload_root: true,
+            dropped: Arc::new(AtomicU64::new(0)),
+            reply_operation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_connector_webhook_is_refused_before_delivery() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let limits = flux_server::ServerLimits {
+            max_body_bytes: 16,
+            ..flux_server::ServerLimits::default()
+        };
+        let delivered = Arc::new(CountingDeliverer::default());
+        let response = test_webhook_channel()
+            .router_with_limits(delivered.clone(), limits)
+            .oneshot(
+                Request::post("/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"payload":"too large"}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(delivered.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn slow_connector_body_is_timed_out_before_delivery() {
+        use axum::body::{Body, Bytes};
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let limits = flux_server::ServerLimits {
+            request_timeout: std::time::Duration::from_millis(10),
+            ..flux_server::ServerLimits::default()
+        };
+        let delivered = Arc::new(CountingDeliverer::default());
+        let body = Body::from_stream(futures_util::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"{}"))
+        }));
+        let response = test_webhook_channel()
+            .router_with_limits(delivered.clone(), limits)
+            .oneshot(
+                Request::post("/events")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(delivered.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connector_burst_is_refused_before_a_second_delivery_is_spawned() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let limits = flux_server::ServerLimits {
+            max_inflight_per_key: 1,
+            requests_per_window: 8,
+            ..flux_server::ServerLimits::default()
+        };
+        let blocked = Arc::new(BlockedDeliverer::default());
+        let router = test_webhook_channel().router_with_limits(blocked.clone(), limits);
+        let request = || {
+            Request::post("/events")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+
+        assert_eq!(
+            router.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+        tokio::task::yield_now().await;
+        let second = router.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers()["x-flux-limit"], "concurrency");
+        assert_eq!(blocked.calls.load(Ordering::SeqCst), 1);
+        blocked.release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn connector_request_rate_is_refused_before_delivery_spawn() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let limits = flux_server::ServerLimits {
+            max_inflight_per_key: 8,
+            requests_per_window: 1,
+            request_rate_window: std::time::Duration::from_secs(60),
+            ..flux_server::ServerLimits::default()
+        };
+        let delivered = Arc::new(CountingDeliverer::default());
+        let router = test_webhook_channel().router_with_limits(delivered.clone(), limits);
+        let request = || {
+            Request::post("/events")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        assert_eq!(
+            router.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+        tokio::task::yield_now().await;
+        let second = router.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers()["x-flux-limit"], "request_rate");
+        assert_eq!(delivered.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1759,6 +1986,7 @@ name = "type"
             payload: BTreeMap::new(),
             payload_root: true,
             dropped: Arc::new(AtomicU64::new(0)),
+            resources: flux_server::SharedIngressGovernor::new(flux_server::ServerLimits::default()),
         };
         let body = serde_json::json!({"type": "ChannelCreated", "channel": {"id": "42"}});
         assert_eq!(
@@ -1942,6 +2170,7 @@ name = "type"
             payload: BTreeMap::new(),
             payload_root: true,
             dropped: Arc::new(AtomicU64::new(0)),
+            resources: flux_server::SharedIngressGovernor::new(flux_server::ServerLimits::default()),
         });
         let workspace =
             Workspace::new(std::env::current_dir().expect("current directory")).expect("workspace");
@@ -2002,6 +2231,7 @@ name = "type"
             payload: BTreeMap::new(),
             payload_root: true,
             dropped: Arc::new(AtomicU64::new(0)),
+            resources: flux_server::SharedIngressGovernor::new(flux_server::ServerLimits::default()),
         });
         let workspace =
             Workspace::new(std::env::current_dir().expect("current directory")).expect("workspace");

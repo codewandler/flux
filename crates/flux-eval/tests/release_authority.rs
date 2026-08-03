@@ -606,6 +606,48 @@ fn release_yml_accepts_only_the_exact_versioned_candidate_ref() {
     );
 }
 
+/// The unattended cut creates the exact candidate commit, but the candidate workflow owns the one
+/// mandatory full gate for that commit. A receipt may be written only after that gate succeeds;
+/// promotion already verifies the receipt before either public ref moves.
+#[test]
+fn automated_release_gates_the_exact_candidate_once_before_promotion() {
+    let flow = workflow_code("release-flow.yml");
+    let release = release_workflow_code();
+    let cut = non_comment_source(repo_root().join("scripts/cut-release.sh"));
+    let receipt_helper = non_comment_source(repo_root().join("scripts/release-candidate.sh"));
+
+    assert!(
+        flow.contains("FLUX_RELEASE_CANDIDATE_OWNS_GATE"),
+        "the automatic release must explicitly delegate its gate to the exact-SHA candidate"
+    );
+    assert!(
+        cut.contains("--no-gate")
+            && cut.contains("GITHUB_ACTIONS")
+            && cut.contains("GITHUB_EVENT_NAME")
+            && cut.contains("refs/heads/release"),
+        "cut-release must reject --no-gate outside the automated release-branch push"
+    );
+
+    let validate = code_line_index(&release, |line| {
+        line.contains("Validate release-candidate request")
+    });
+    let gate = code_line_index(&release, |line| {
+        line.contains("scripts/release-full-gate.sh")
+    });
+    let receipt = code_line_index(&release, |line| {
+        line.contains("scripts/release-candidate.sh write release-candidate.txt")
+    });
+    assert!(
+        matches!((validate, gate, receipt), (Some(v), Some(g), Some(r)) if v < g && g < r),
+        "release.yml must validate the candidate ref, run the full gate, and only then write its receipt; indexes: validate={validate:?}, gate={gate:?}, receipt={receipt:?}"
+    );
+    assert!(
+        receipt_helper.contains("gate=mandatory-full-v1")
+            && receipt_helper.contains("gate_commit=$COMMIT"),
+        "the immutable candidate receipt must say which exact SHA earned the mandatory full gate"
+    );
+}
+
 /// The release gate must not depend on an OpenRouter account balance. The direct Anthropic key is
 /// the stable default, while an explicit OpenRouter model remains supported and must select its own
 /// credential rather than silently borrowing the default provider's key.

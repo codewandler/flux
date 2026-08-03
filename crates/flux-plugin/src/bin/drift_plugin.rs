@@ -226,13 +226,30 @@ impl PluginHandler for Drift {
         input: Value,
         _host: &mut dyn GuestHost,
     ) -> Result<Value, String> {
-        // Answer whatever the *current* manifest advertises, so a call to a withdrawn op is a
-        // plugin-side "unknown operation" rather than a host-side one.
-        if manifest_for(&mode())
+        // Decide against the manifest in force when the call begins. A live catalog refresh can
+        // withdraw this operation for future dispatch while an already-running invocation still
+        // completes under the old projection.
+        let admitted = manifest_for(&mode())
             .operations
             .iter()
-            .any(|op| op.name == operation)
-        {
+            .any(|op| op.name == operation);
+        if admitted {
+            // Test-only deterministic rendezvous for the in-flight-vs-refresh contract. The
+            // subprocess writes `entered_path` after admitting the old call, then waits until the
+            // test creates `release_path`. Both live under the fixture's /tmp workspace.
+            if let (Some(entered), Some(release)) = (
+                input.get("entered_path").and_then(Value::as_str),
+                input.get("release_path").and_then(Value::as_str),
+            ) {
+                std::fs::write(entered, "entered").map_err(|error| error.to_string())?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !std::path::Path::new(release).exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("timed out waiting for fixture release".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
             let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("");
             return Ok(json!({ "operation": operation, "text": text }));
         }

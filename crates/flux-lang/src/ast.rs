@@ -662,11 +662,13 @@ pub enum Node {
     /// No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`.
     Fmt { template: String },
 
-    /// Pure JSON path extraction. `path` is a dot-segment path (for example `".bitcoin.usd"` or
+    /// Pure JSON path extraction. `path` is a dot/index path (for example `".bitcoin.usd"` or
     /// `".results.0.value"`) applied to the JSON content of a `Var`, `Lit`, `Obj`, or `List` input.
-    /// Native `first = response.results[0].value` source lowers its bracket index to the `.0` AST
-    /// segment and formats back with brackets; an AST path string that itself contains brackets uses
-    /// `@json` to preserve that exact shape. No IO, no approval gate.
+    /// Native `first = response.results[0].value` lowers its array index to the `.0` AST segment;
+    /// a quoted object key such as `response.headers["content-type"]` stays the unambiguous
+    /// JSON-string segment `.headers["content-type"]`. JSON escaping keeps dots, brackets, quotes,
+    /// backslashes, empty keys, Unicode, and numeric-looking object keys as data. No IO, no approval
+    /// gate.
     ///
     /// `optional` selects the traversal-through-missing-data policy. When `false` — the
     /// default for native `x.field` sugar — an absent object key, an out-of-range index, or a field

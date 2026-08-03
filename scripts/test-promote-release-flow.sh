@@ -150,7 +150,7 @@ case "${1:-} ${2:-}" in
     ;;
   "run watch")
     run_id=${3:-}
-    if [ "${MOCK_SCENARIO:-success}" = candidate-fail ] && [ "$run_id" = 11 ]; then
+    if [ "${MOCK_SCENARIO:-success}" = candidate-gate-fail ] && [ "$run_id" = 11 ]; then
       exit 1
     fi
     if [ "${MOCK_SCENARIO:-success}" = release-fail ] && [ "$run_id" = 31 ]; then
@@ -171,8 +171,8 @@ case "${1:-} ${2:-}" in
     if [ "${MOCK_SCENARIO:-success}" != receipt-missing ]; then
       receipt_run=11
       [ "${MOCK_SCENARIO:-success}" = receipt-wrong ] && receipt_run=12
-      printf 'schema=flux-release-candidate-v1\nversion=%s\ntag=v%s\ncommit=%s\nrun_id=%s' \
-        "$MOCK_VERSION" "$MOCK_VERSION" "$MOCK_SHA" "$receipt_run" \
+      printf 'schema=flux-release-candidate-v2\nversion=%s\ntag=v%s\ncommit=%s\ngate=mandatory-full-v1\ngate_commit=%s\nrun_id=%s' \
+        "$MOCK_VERSION" "$MOCK_VERSION" "$MOCK_SHA" "$MOCK_SHA" "$receipt_run" \
         >"$dir/release-candidate.txt"
     fi
     ;;
@@ -202,8 +202,8 @@ cat >"$TMP/work/scripts/release-candidate.sh" <<'MOCK_RECEIPT'
 set -euo pipefail
 [ "$#" -eq 5 ] && [ "$1" = verify ] || exit 2
 receipt=$2 version=$3 sha=$4 run_id=$5
-expected=$(printf 'schema=flux-release-candidate-v1\nversion=%s\ntag=v%s\ncommit=%s\nrun_id=%s' \
-  "$version" "$version" "$sha" "$run_id")
+expected=$(printf 'schema=flux-release-candidate-v2\nversion=%s\ntag=v%s\ncommit=%s\ngate=mandatory-full-v1\ngate_commit=%s\nrun_id=%s' \
+  "$version" "$version" "$sha" "$sha" "$run_id")
 [ -f "$receipt" ] || exit 1
 [ "$(cat "$receipt")" = "$expected" ] || exit 1
 echo "receipt $version $sha $run_id" >>"$PROMOTION_MOCK_LOG"
@@ -269,14 +269,14 @@ if grep -Fq 'release-token' "$TMP/git.log" "$TMP/gh.log" "$TMP/stdout" "$TMP/std
   fail "RELEASE_TOKEN leaked into command arguments or output"
 fi
 
-if run_promoter candidate-fail >"$TMP/stdout" 2>"$TMP/stderr"; then
-  fail "a failed candidate run unexpectedly promoted"
+if run_promoter candidate-gate-fail >"$TMP/stdout" 2>"$TMP/stderr"; then
+  fail "a candidate full-gate failure unexpectedly promoted"
 fi
 # shellcheck disable=SC1090
 . "$TMP/git.state"
 [ "$candidate" = "$SHA" ] || fail "failed promotion did not retain the exact candidate ref"
-[ "$main" = "$SOURCE_SHA" ] || fail "failed candidate advanced main"
-[ -z "$tag" ] || fail "failed candidate pushed the tag"
+[ "$main" = "$SOURCE_SHA" ] || fail "failed candidate gate advanced main"
+[ -z "$tag" ] || fail "failed candidate gate pushed the tag"
 grep -Fq 'remains at' "$TMP/stderr" || fail "failure did not print candidate recovery evidence"
 
 for receipt_scenario in receipt-missing receipt-wrong; do

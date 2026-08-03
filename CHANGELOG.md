@@ -6,7 +6,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Running REPL sessions can adopt a plugin's refreshed operation catalog at the next turn
+  boundary** (C-318). `/plugin-refresh <name>` publishes one atomic generation shared by prompting,
+  validation, authorization and dispatch. Mid-turn and already-running calls retain their original
+  catalog; withdrawals, wildcard disables, nested runtimes and newly spawned children all preserve
+  their existing authority ceilings.
+
+- **Flux-Lang supports JSON-quoted object keys in field paths** (C-320). Expressions such as
+  `$response.headers["content-type"]` and their optional `?` form preserve the existing strict-field
+  diagnostics, distinguish quoted numeric keys from array indexes, round-trip through the formatter,
+  and are mirrored in Prism, tree-sitter, TextMate and IntelliJ.
+
 ### Changed
+
+- **Every long-lived production server and channel listener now binds through the selected guarded
+  execution system** (C-435). Guarded streams split into independent bounded read/write halves so
+  full-duplex HTTP and SSE remain live under inbound backpressure, including remote HTTPS protocol
+  v2. The public helpers accepting an already-bound native `TcpListener` were removed; single-agent
+  serving uses its engine's execution system and multi-agent serving now requires one explicitly.
 
 - **A merge from `main` into the dedicated `release` branch is now the complete release action**
   (C-251). `.github/workflows/release-flow.yml` runs the live smoke and narrow Flux-authored cut,
@@ -19,9 +38,16 @@ All notable changes to this project are documented in this file. The format is b
   bubblewrap before the agentic smoke and Flux cut, including enabling the user-namespace primitive
   restricted by Ubuntu 24.04's hosted AppArmor default, preserving the fail-closed sandbox posture.
   They also install the website's locked Node dependencies before the transactional cut, so embedded
-  documentation regeneration uses the same pinned Docusaurus toolchain as the website gate.
+  documentation regeneration uses the same pinned Docusaurus toolchain as the website gate. The
+  automated cut no longer repeats the full six-command gate: the exact candidate SHA runs it once,
+  and the immutable receipt binds that gated commit before main or the tag may move.
 
 ### Fixed
+
+- **Webhook and connector HTTP ingress now shares the server's body, timeout, request-rate and
+  concurrency controls** (C-409). Admission happens before `Deliverer` or task spawn, async work
+  holds its permit for the full delivery, and refusals reuse the typed `429`, `Retry-After` and
+  `x-flux-limit` vocabulary without retaining credential-derived rate keys.
 
 - **The release gate's SDK secure-defaults test is now isolated from an outer Flux sandbox**
   (C-251). The automatic cut intentionally runs with `FLUX_SANDBOX=require`; the test now clears and

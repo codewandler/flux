@@ -519,6 +519,10 @@ impl FlowEngine {
         scope_override: Option<Arc<crate::cassette::CassetteScope>>,
     ) -> Result<TurnLifecycle> {
         let skill_input = user_message.unwrap_or_default();
+        // C-318: this is the catalog adoption boundary. `begin_turn_lifecycle` is reached only
+        // after the engine's single-active-turn gate is held; take the generation before any turn
+        // bookkeeping so every later surface, schema, validation, and dispatch shares it.
+        let registry = self.executor.live_catalog().snapshot();
         // The cache boundary precedes every execution flavor, including a persisted continuation.
         self.executor.begin_cache_turn();
         // A-101: the turn's opening write, through the typed handle. `open_turn` refuses from
@@ -585,7 +589,7 @@ impl FlowEngine {
         let iteration_base = self.evidence_kind_count("turn.iteration");
         let subagent_base = self.evidence_kind_count("subagent.usage");
         let base_system = self.base_system_with_skills(session_id, skill_input, sink);
-        let advertised = self.surfaced_for_turn(session_id, skill_input, sink);
+        let advertised = self.surfaced_for_turn(&registry, session_id, skill_input, sink);
         let (sender, receiver) =
             tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
@@ -596,6 +600,7 @@ impl FlowEngine {
             Some(base_system),
             channel.clone(),
             Some(advertised),
+            registry.clone(),
             Some((self.events.clone(), turn_id)),
         );
         let spawn_supervisor = Arc::new(SpawnTaskSupervisor::with_cancel(cancel.child_token()));
@@ -609,7 +614,9 @@ impl FlowEngine {
             .with_spawn_activity_sink(activity)
             .with_tool_progress_sink(tool_progress)
             .with_spawn_supervisor(spawn_supervisor.clone())
-            .with_identity(identity.clone());
+            .with_identity(identity.clone())
+            .with_tool_registry(registry)
+            .with_tool_registry_base(Arc::new(self.executor.registry().clone()));
         // C-305: the surface's pane channel is engine-owned rather than turn-owned — the host
         // installed it once, at assembly — but it must be re-attached to every turn's context, since
         // this scope is authoritative including the fields it omits.
@@ -1194,6 +1201,7 @@ impl FlowEngine {
 
     fn surfaced_for_turn(
         &self,
+        registry: &flux_runtime::ToolRegistry,
         session_id: &str,
         user_input: &str,
         sink: &mut dyn AgentSink,
@@ -1225,15 +1233,16 @@ impl FlowEngine {
         // config/skills/roles loading deliberately stays fixed to `self.cwd` (entering a worktree
         // changes the working directory, not the agent's authority).
         let active_system = self.executor.context().system();
+        let disabled = self.executor.disabled_ops_for(registry);
         let (advertised, surfaced) = surfaced_op_names(
-            self.executor.registry(),
+            registry,
             &self.groups,
             active_system.workspace().root(),
             &self.sticky_groups,
             session_id,
             &self.ambient_signals,
             user_input,
-            self.executor.disabled_ops(),
+            &disabled,
             &self.discovery_env,
         );
         if let Some(surfaced) = surfaced.as_ref() {
@@ -2470,6 +2479,24 @@ mod tests {
         }
     }
 
+    struct GainedCatalogTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for GainedCatalogTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "catalog_gain",
+                "Operation gained by a live catalog refresh.",
+                json!({"type": "object", "additionalProperties": false}),
+            )
+        }
+
+        async fn execute(&self, _ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::ok("gained operation ran"))
+        }
+    }
+
     struct CountingWriteTool(Arc<AtomicU64>);
 
     #[async_trait]
@@ -3408,6 +3435,155 @@ mod tests {
         assert_eq!(events.conversation(&session).unwrap().len(), 2);
     }
 
+    /// C-318: one already-running session adopts a published catalog exactly at its next turn
+    /// boundary. The gained op is advertised and dispatchable, the withdrawn op disappears, and
+    /// the provider-facing catalog prefix changes once then becomes byte-stable again.
+    #[tokio::test]
+    async fn running_session_adopts_refresh_once_and_restabilizes_its_provider_catalog_prefix() {
+        let gained_calls = Arc::new(AtomicUsize::new(0));
+        let (engine, events, requests) = scripted_engine(
+            vec![
+                native_call(
+                    "intent-1",
+                    "declare_intent",
+                    json!({"intent": "inspect", "capability_families": ["core"]}),
+                ),
+                prose("before refresh"),
+                native_call(
+                    "intent-2",
+                    "declare_intent",
+                    json!({"intent": "use gained op", "capability_families": ["core"]}),
+                ),
+                native_call("gain-1", "catalog_gain", json!({})),
+                prose("after refresh"),
+                native_call(
+                    "intent-3",
+                    "declare_intent",
+                    json!({"intent": "inspect again", "capability_families": ["core"]}),
+                ),
+                prose("stable after refresh"),
+            ],
+            AgentLoopSpec::default(),
+        );
+        let session = events.create_session("scripted/test-model").unwrap();
+
+        engine
+            .run_turn(&session, "before", &mut CollectSink::default())
+            .await
+            .unwrap();
+
+        let catalog = engine.executor.live_catalog();
+        let mut refreshed = catalog.snapshot().as_ref().clone();
+        refreshed.remove("echo");
+        refreshed.register(Arc::new(GainedCatalogTool(gained_calls.clone())));
+        catalog.publish(refreshed);
+        engine.executor.allow(&["catalog_gain"]);
+
+        let mut gained_sink = CollectSink::default();
+        engine
+            .run_turn(&session, "after", &mut gained_sink)
+            .await
+            .unwrap();
+        engine
+            .run_turn(&session, "stable", &mut CollectSink::default())
+            .await
+            .unwrap();
+
+        assert_eq!(gained_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gained_sink.tools, vec!["catalog_gain"]);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 7, "two, three, then two model calls");
+        let provider_prefix = |request: &Request| {
+            serde_json::to_vec(&json!({
+                "system": request.system,
+                "tools": request.tools,
+            }))
+            .unwrap()
+        };
+        let before = provider_prefix(&requests[1]);
+        let after = provider_prefix(&requests[3]);
+        let stable = provider_prefix(&requests[6]);
+        assert_ne!(
+            before, after,
+            "the refresh must invalidate the catalog prefix"
+        );
+        assert_eq!(
+            after, stable,
+            "without another refresh the provider catalog prefix must be byte-stable"
+        );
+        assert!(requests[1].tools.iter().any(|tool| tool.name == "echo"));
+        assert!(!requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "catalog_gain"));
+        assert!(!requests[3].tools.iter().any(|tool| tool.name == "echo"));
+        assert!(requests[3]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "catalog_gain"));
+        println!(
+            "C-318 provider catalog-prefix measurement: pre={} bytes, refreshed={} bytes, \
+             invalidations=1 across 3 turns; the third turn reused the refreshed bytes",
+            before.len(),
+            after.len(),
+        );
+    }
+
+    /// C-318 turn-boundary proof through the real engine gate: publication happens only after the
+    /// old handler has entered `execute`. That in-flight call completes from the turn's adopted
+    /// generation; a gained op dispatches on the next turn, and the withdrawn op is rejected there.
+    #[tokio::test]
+    async fn mid_turn_refresh_preserves_in_flight_dispatch_then_switches_at_the_next_turn() {
+        let barrier = Arc::new(TurnBarrier::default());
+        let gained_calls = Arc::new(AtomicUsize::new(0));
+        let (mut engine, events, root) = tool_engine(
+            Arc::new(BlockingTurnTool(barrier.clone())),
+            blocking_agent_loop(),
+        );
+        let session = events.create_session("null/test-model").unwrap();
+        let mut first_sink = CollectSink::default();
+        let catalog = engine.executor.live_catalog();
+
+        let (first, ()) = tokio::join!(
+            engine.run_turn(&session, "hold old op", &mut first_sink),
+            async {
+                barrier.wait_for_entered(1).await;
+                let mut refreshed = catalog.snapshot().as_ref().clone();
+                refreshed.remove("blocking_turn");
+                refreshed.register(Arc::new(GainedCatalogTool(gained_calls.clone())));
+                catalog.publish(refreshed);
+                barrier.release(1);
+            }
+        );
+        first.expect("the old in-flight handler completes under its adopted generation");
+
+        engine.executor.allow(&["catalog_gain"]);
+        engine.agent_loop = DraftAst {
+            body: vec![Node::Return {
+                value: Box::new(call_node("catalog_gain")),
+            }],
+            ..Default::default()
+        };
+        engine
+            .run_turn(&session, "use gained op", &mut CollectSink::default())
+            .await
+            .expect("the next turn adopts and dispatches the gained op");
+        assert_eq!(gained_calls.load(Ordering::SeqCst), 1);
+
+        engine.agent_loop = blocking_agent_loop();
+        let error = engine
+            .run_turn(&session, "retry withdrawn op", &mut CollectSink::default())
+            .await
+            .expect_err("the withdrawn op is unavailable after the boundary")
+            .to_string();
+        assert!(
+            error.contains("unknown operation") || error.contains("unknown op"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn authored_decision_suspends_and_resumes_the_same_native_ledger() {
         let (engine, events, requests) = scripted_engine(
@@ -4119,7 +4295,8 @@ mod tests {
         .with_discovery_env(pinned_env());
 
         let mut sink = CollectSink::default();
-        let before = engine.surfaced_for_turn("session-wt", "hello", &mut sink);
+        let before =
+            engine.surfaced_for_turn(engine.executor.registry(), "session-wt", "hello", &mut sink);
         assert!(
             !before.contains("echo"),
             "the rust-gated group must not surface from the origin root (no Cargo.toml)"
@@ -4145,7 +4322,8 @@ mod tests {
             )
             .unwrap();
 
-        let after = engine.surfaced_for_turn("session-wt", "hello", &mut sink);
+        let after =
+            engine.surfaced_for_turn(engine.executor.registry(), "session-wt", "hello", &mut sink);
         assert!(
             after.contains("echo"),
             "after the worktree transition the per-turn probe must detect the worktree-local Cargo.toml"

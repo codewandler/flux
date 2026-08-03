@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -47,10 +47,11 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use flux_lang::program::ChannelDecl;
+use flux_system::System;
 
 use crate::adapters::connector::parse_tolerance;
 use crate::config::{VerifyDecl, VerifySpec, WebhookSettings};
-use crate::{Channel, Deliverer};
+use crate::{Channel, ChannelContext, Deliverer};
 
 /// The **one** body every authentication failure answers with.
 ///
@@ -453,6 +454,14 @@ impl WebhookChannel {
 
     /// Build the axum router for this channel over `d` (exposed for hermetic tests).
     pub fn router(&self, d: Arc<dyn Deliverer>) -> Router {
+        self.router_with_limits(d, flux_server::ServerLimits::default())
+    }
+
+    fn router_with_limits(
+        &self,
+        d: Arc<dyn Deliverer>,
+        limits: flux_server::ServerLimits,
+    ) -> Router {
         let state = Arc::new(HookState {
             name: self.name.clone(),
             deliverer: d,
@@ -460,10 +469,34 @@ impl WebhookChannel {
             token: self.token.clone(),
             verify: self.verify.clone(),
             unauthenticated_allowed: unauthenticated_bind_allowed(self.addr),
+            resources: flux_server::SharedIngressGovernor::new(limits),
         });
         Router::new()
             .route(&self.path, post(handle))
+            .layer(flux_server::request_timeout_layer(limits))
+            .layer(DefaultBodyLimit::max(limits.max_body_bytes))
             .with_state(state)
+    }
+
+    async fn serve_on(&self, context: ChannelContext) -> anyhow::Result<()> {
+        let limits = flux_server::ServerLimits::from_env();
+        let exposure = if is_effectively_open(self.token.as_deref(), &self.verify) {
+            flux_server::BindExposure::LoopbackOnly
+        } else {
+            flux_server::BindExposure::Authenticated
+        };
+        let listener = flux_server::bind_http_listener(
+            context.execution_system.as_ref(),
+            self.addr,
+            exposure,
+            limits,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("channel `{}`: bind {}: {error}", self.name, self.addr))?;
+        axum::serve(listener, self.router_with_limits(context.deliverer, limits))
+            .with_graceful_shutdown(async move { context.cancel.cancelled().await })
+            .await
+            .map_err(|error| anyhow::anyhow!("channel `{}`: serve: {error}", self.name))
     }
 }
 
@@ -477,6 +510,7 @@ struct HookState {
     /// Carried rather than re-derived so [`handle`] can restate the bind rule at the point a request
     /// is answered; see the guard at the top of it.
     unauthenticated_allowed: bool,
+    resources: flux_server::SharedIngressGovernor,
 }
 
 /// The one answer every authentication failure gets.
@@ -530,6 +564,9 @@ async fn handle(State(state): State<Arc<HookState>>, headers: HeaderMap, body: B
     if !state.verify.admits(&headers, &body) {
         return unauthorized();
     }
+    if let Err(response) = state.resources.admit_request() {
+        return *response;
+    }
 
     // 4 ─ Only now does anything look at what the body *is*. A content-type rejection emitted before
     //     the signature check is a probe oracle — a caller that can tell `415` from `401` learns its
@@ -543,10 +580,18 @@ async fn handle(State(state): State<Arc<HookState>>, headers: HeaderMap, body: B
         return (StatusCode::BAD_REQUEST, "bad request").into_response();
     };
 
+    // Acquire before either awaiting or spawning the delivery. A permit acquired inside the task
+    // bounds execution but leaves an unbounded queue of already-accepted tasks.
+    let permit = match state.resources.admit_work() {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
+
     if state.is_async {
         let d = state.deliverer.clone();
         let label = state.name.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = d.deliver(&label, body).await {
                 eprintln!("webhook `{label}`: async delivery failed: {e}");
             }
@@ -554,6 +599,7 @@ async fn handle(State(state): State<Arc<HookState>>, headers: HeaderMap, body: B
         return StatusCode::ACCEPTED.into_response();
     }
 
+    let _permit = permit;
     match state.deliverer.deliver(&state.name, body).await {
         Ok(runs) => {
             let out: Vec<Value> = runs
@@ -616,13 +662,17 @@ impl Channel for WebhookChannel {
     }
 
     async fn start(&self, d: Arc<dyn Deliverer>, cancel: CancellationToken) -> anyhow::Result<()> {
-        let listener = tokio::net::TcpListener::bind(self.addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("channel `{}`: bind {}: {e}", self.name, self.addr))?;
-        axum::serve(listener, self.router(d))
-            .with_graceful_shutdown(async move { cancel.cancelled().await })
-            .await
-            .map_err(|e| anyhow::anyhow!("channel `{}`: serve: {e}", self.name))
+        let system = Arc::new(System::from_env(std::env::current_dir()?)?);
+        self.serve_on(ChannelContext {
+            deliverer: d,
+            cancel,
+            execution_system: system,
+        })
+        .await
+    }
+
+    async fn start_with_context(&self, context: ChannelContext) -> anyhow::Result<()> {
+        self.serve_on(context).await
     }
 }
 
@@ -632,6 +682,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use axum::body::Body;
     use axum::http::Request;
@@ -656,6 +707,29 @@ mod tests {
     impl Deliverer for Counting {
         async fn deliver(&self, _label: &str, _payload: Value) -> anyhow::Result<Vec<JourneyRun>> {
             self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    struct Blocked {
+        calls: AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    impl Default for Blocked {
+        fn default() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Deliverer for Blocked {
+        async fn deliver(&self, _label: &str, _payload: Value) -> anyhow::Result<Vec<JourneyRun>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
             Ok(Vec::new())
         }
     }
@@ -741,6 +815,120 @@ mod tests {
             .await
             .expect("a bounded body");
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn tiny_limits() -> flux_server::ServerLimits {
+        flux_server::ServerLimits {
+            max_body_bytes: 16,
+            request_timeout: Duration::from_millis(25),
+            requests_per_window: 8,
+            request_rate_window: Duration::from_secs(60),
+            max_inflight_per_key: 1,
+            ..flux_server::ServerLimits::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_webhook_is_refused_before_delivery() {
+        let delivered = Arc::new(Counting::default());
+        let response = channel(None)
+            .router_with_limits(delivered.clone(), tiny_limits())
+            .oneshot(
+                Request::post("/hook")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"payload":"too large"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(delivered.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn slow_webhook_is_timed_out_and_releases_admission() {
+        let blocked = Arc::new(Blocked::default());
+        let response = channel(None)
+            .router_with_limits(blocked.clone(), tiny_limits())
+            .oneshot(
+                Request::post("/hook")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(blocked.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn async_webhook_burst_is_refused_before_a_second_delivery_is_spawned() {
+        let blocked = Arc::new(Blocked::default());
+        let mut hook = channel(None);
+        hook.is_async = true;
+        let router = hook.router_with_limits(blocked.clone(), tiny_limits());
+        let request = || {
+            Request::post("/hook")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("request")
+        };
+
+        let first = router.clone().oneshot(request()).await.expect("first");
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        tokio::task::yield_now().await;
+        let second = router.oneshot(request()).await.expect("second");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            second.headers()["x-flux-limit"],
+            "concurrency",
+            "reuse the server's typed limit vocabulary"
+        );
+        assert_eq!(
+            blocked.calls.load(Ordering::SeqCst),
+            1,
+            "refusal must happen before tokio::spawn reaches Deliverer"
+        );
+        blocked.release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn production_listener_uses_the_selected_guarded_network_port() {
+        use flux_system::net::{BindExposure, InboundLimits, NetworkListener};
+        use flux_system::remote::{Answer, Answered, Delegate, RemoteSystem};
+
+        struct RefusingNetwork(AtomicUsize);
+
+        impl Delegate for RefusingNetwork {
+            fn bind_tcp<'a>(
+                &'a self,
+                _addr: SocketAddr,
+                _exposure: BindExposure,
+                _limits: InboundLimits,
+            ) -> Answered<'a, NetworkListener> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(Answer::Refused("substituted bind refusal".into())) })
+            }
+        }
+
+        let delegate = Arc::new(RefusingNetwork(AtomicUsize::new(0)));
+        let context = crate::ChannelContext {
+            deliverer: Arc::new(Nothing),
+            cancel: CancellationToken::new(),
+            execution_system: Arc::new(RemoteSystem::new(delegate.clone())),
+        };
+        let error = channel(None)
+            .start_with_context(context)
+            .await
+            .expect_err("the substituted guarded port refuses the bind");
+        assert!(
+            error.to_string().contains("substituted bind refusal"),
+            "{error}"
+        );
+        assert_eq!(delegate.0.load(Ordering::SeqCst), 1);
     }
 
     /// **A request carrying no `Authorization` header is rejected by a channel whose token is empty.**

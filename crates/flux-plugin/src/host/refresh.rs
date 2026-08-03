@@ -70,7 +70,7 @@
 use super::loading::{op_coherence_warnings, plugin_tool_spec};
 use super::*;
 use flux_plugin_protocol::validate_manifest_operations;
-use flux_runtime::ToolRegistry;
+use flux_runtime::{LiveToolCatalog, ToolRegistry};
 
 /// The result of a re-projection: the tools to install, and what changed relative to the catalog
 /// that was in force before. Produced by [`LoadedPlugin::refresh`]; installed by
@@ -143,6 +143,22 @@ impl CatalogRefresh {
 }
 
 impl LoadedPlugin {
+    /// Re-fetch and atomically publish this plugin's refreshed operations to a running session's
+    /// catalog channel. Active turns retain their already-adopted generation; the next turn takes
+    /// the generation installed here.
+    ///
+    /// Like [`Self::refresh_into`], the fallible catalog write happens before this plugin commits
+    /// its manifest, so a collision cannot diverge the publisher and plugin state.
+    pub async fn refresh_live(
+        &mut self,
+        catalog: &LiveToolCatalog,
+        source: &str,
+    ) -> Result<CatalogRefresh> {
+        let prepared = self.prepare_refresh().await?;
+        catalog.try_update(|registry| prepared.apply(registry, source))?;
+        Ok(self.commit(prepared))
+    }
+
     /// Re-fetch this plugin's manifest over the open subprocess connection, re-project its
     /// operations, and install them into `registry` — without restarting flux or respawning the
     /// plugin. **The entry point to prefer**: the registry and the plugin move together or not at

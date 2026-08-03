@@ -37,7 +37,7 @@ no bypass paths; this is one that already exists. Make the invariant structural.
       is likewise rewritten now that construction enforces it).
 - [x] Any intentional escape hatch is explicit, named, and logged loudly at startup. → **no escape
       hatch was added** (the safe default): `Open` off-loopback is refused outright, matching the
-      pre-existing `serve_on` behavior, so there is nothing to name or log. A network-facing
+      pre-existing serving behavior, so there is nothing to name or log. A network-facing
       deployment fronts the loopback daemon with an authenticating proxy or configures
       shared-secret/principal auth.
 
@@ -46,9 +46,10 @@ no bypass paths; this is one that already exists. Make the invariant structural.
   the marker (`UnauthenticatedLoopbackOnly`) only witnesses "a caller named this type", not "this
   listener is loopback" — the address and the auth mode must be checked *together*, and the only
   place both are known is where the bind address is in hand. `router(engine, auth, card, bind)`
-  makes that check unavoidable and keeps ONE enforcement point (`guard_open_bind`) that both
-  `serve_on`/`serve_multi_on` and every direct mounter (the `a2a` channel) share. Public API break
-  is sanctioned by the story (commit uses `!`).
+  makes that check unavoidable and keeps ONE enforcement point (`guard_open_bind`) that `serve`,
+  `serve_multi`, and every direct router mounter (the `a2a` channel) share. C-435 subsequently
+  removed the already-bound native-listener serving helpers. Public API break is sanctioned by the
+  story (commit uses `!`).
 - The real bypass caller was `flux-channels`' a2a adapter (`crates/flux-channels/src/adapters/a2a.rs`):
   it built `flux_server::router(...)` and served it with raw `axum::serve`, re-deriving the loopback
   refusal itself in `from_decl_and_app`. That early check stays (nice config-time error, same

@@ -78,6 +78,8 @@ pub(crate) struct StagedContext {
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub executor: Arc<Executor>,
+    /// The immutable live-catalog generation adopted at this turn boundary.
+    pub registry: Arc<flux_runtime::ToolRegistry>,
     pub store: Arc<FlowStore>,
     pub session_id: String,
     pub conversation: Vec<Message>,
@@ -486,7 +488,7 @@ pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Va
 /// would collide with the control tool in the provider request and be misrouted, so reserve them.
 fn ensure_control_names_free(ctx: &StagedContext) -> Result<()> {
     for reserved in [FINALIZE_PLAN, REQUEST_DECISION, SIGNAL_CAPABILITIES] {
-        if ctx.executor.registry().get(reserved).is_some() {
+        if ctx.registry.get(reserved).is_some() {
             return Err(Error::Other(format!(
                 "adaptive planning cannot reserve `{reserved}` because an operation already uses that name"
             )));
@@ -666,7 +668,7 @@ async fn run_model_stage_inner(
                 "model stage `{name}` tool `{operation}` is outside the live capability ceiling"
             )));
         }
-        let tool = ctx.executor.registry().get(operation).ok_or_else(|| {
+        let tool = ctx.registry.get(operation).ok_or_else(|| {
             Error::Other(format!(
                 "model stage `{name}` names unregistered tool `{operation}`"
             ))
@@ -813,7 +815,7 @@ async fn run_model_stage_inner(
                 continue;
             };
             let operation = spec.name.clone();
-            let Some(tool) = ctx.executor.registry().get(&operation) else {
+            let Some(tool) = ctx.registry.get(&operation) else {
                 last_error = format!("model stage `{name}` tool `{operation}` disappeared");
                 results.push(ContentBlock::tool_result_text(id, last_error.clone(), true));
                 continue;
@@ -1372,7 +1374,7 @@ async fn adaptive_explore(
                 continue;
             }
 
-            let tool = ctx.executor.registry().get(&operation).ok_or_else(|| {
+            let tool = ctx.registry.get(&operation).ok_or_else(|| {
                 Error::Other(format!(
                     "selected operation `{operation}` disappeared from the registry"
                 ))
@@ -2019,8 +2021,7 @@ fn selected_specs_for_state(
 /// the agent's configured tool subset; `operation_visible` adds bare-deny and active `with_tools`
 /// enforcement. Semantic signals may expand turn-local visibility only inside this set.
 fn live_visible_specs(ctx: &StagedContext) -> Vec<ToolSpec> {
-    ctx.executor
-        .registry()
+    ctx.registry
         .specs()
         .into_iter()
         .filter(|spec| {
@@ -2073,7 +2074,7 @@ fn stale_capability_state_error(
 }
 
 fn operation_unavailable_reason(ctx: &StagedContext, name: &str) -> &'static str {
-    if ctx.executor.registry().get(name).is_none() {
+    if ctx.registry.get(name).is_none() {
         return "not registered";
     }
     if ctx
@@ -2348,8 +2349,7 @@ fn validate_action_batch(
             )));
         }
         let spec = ctx
-            .executor
-            .registry()
+            .registry
             .get(&action.op)
             .ok_or_else(|| Error::Other(format!("unknown action operation `{}`", action.op)))?
             .spec();
@@ -2833,7 +2833,7 @@ fn validate_plan_inner(
     ctx: &StagedContext,
     selected: &HashSet<String>,
 ) -> std::result::Result<(), Vec<flux_lang::analyze::Diagnostic>> {
-    let registry = OpRegistry::new(ctx.executor.registry()).with_advertised(selected.clone());
+    let registry = OpRegistry::new(&ctx.registry).with_advertised(selected.clone());
     flux_lang::analyze::lower(ast, &registry, &HashSet::new()).map(|_| ())
 }
 
@@ -3213,10 +3213,12 @@ mod tests {
             responses: Mutex::new(responses.into()),
             requests: requests.clone(),
         });
+        let registry = executor.active_registry_snapshot();
         let context = StagedContext {
             provider,
             model: "test-model".into(),
             executor,
+            registry,
             store: Arc::new(FlowStore::in_memory().unwrap()),
             session_id: "staged-test".into(),
             conversation: vec![Message::user_text("Inspect the fixture")],
@@ -4950,10 +4952,12 @@ mod tests {
             ),
             requests: requests.clone(),
         });
+        let registry = executor.active_registry_snapshot();
         let ctx = StagedContext {
             provider,
             model: "test-model".into(),
             executor,
+            registry,
             store: Arc::new(FlowStore::in_memory().unwrap()),
             session_id: "staged-alias-test".into(),
             conversation: vec![Message::user_text("Read plugin record-1")],

@@ -15,18 +15,41 @@
 
 ## [Unreleased]
 
+### New
+
+- **Flux programs can read headers and other map keys that contain punctuation directly.** Use
+  familiar quoted access such as `$response.headers["content-type"]`; append `?` for optional access.
+  Quoted numeric keys remain object keys, while unquoted numeric brackets remain list indexes.
+
 ### Improved
+
+- **A running REPL can now pick up a plugin's changed actions without restarting.** Run
+  `/plugin-refresh <name>`; the current turn keeps the actions it started with, and the next turn
+  adopts the complete refreshed set. Existing plugin grants and disabled-tool patterns still apply
+  to newly advertised actions, and a rejected refresh changes nothing.
 
 - **Maintainers can now cut a release by merging `main` into `release`.** The hosted flow writes the
   release notes, derives the version mechanically, prepares and verifies the exact build once, then
   publishes it. A failed build or publication stays visibly failed with its recovery candidate
-  preserved; it cannot silently finish as a partial release.
+  preserved; it cannot silently finish as a partial release. The expensive release gate now runs
+  once on that exact candidate instead of being repeated during the cut.
 
 ### Fixed
+
+- **Webhook and connector listeners now refuse overload consistently with the main server.** Body
+  size, timeout, request-rate and concurrent-work limits apply before a delivery can start, and
+  long-lived streaming responses remain full-duplex under backpressure.
 
 - **Release automation now stops clearly when generated notes have the wrong shape.** Unexpected
   prose or missing fields are rejected before a changelog, commit, or tag can be changed; a standard
   JSON code block is normalized safely.
+
+### Action needed
+
+- **Rust server integrations must use the guarded address-based serving APIs.** The helpers that
+  accepted an already-bound native TCP listener have been removed. Single-agent serving now uses the
+  execution system selected on its engine; multi-agent serving requires that execution system as a
+  new argument. Use an address ending in port `0` when the operating system should choose the port.
 
 ## [0.55.0] - 2026-08-03
 
