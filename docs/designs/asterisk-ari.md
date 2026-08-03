@@ -4,7 +4,9 @@
 
 > This records the implementation that shipped in v0.51.1; it is not current ownership guidance.
 > The owner correction is that ARI's spec-described REST surface belongs in `flux-connectors`, while
-> Flux retains neither ARI nor the AMI plugin. Connector event/channel design is deferred.
+> Flux retains neither ARI nor the AMI plugin. The deferred event/channel decision is now recorded
+> by [generated connector WebSocket channels](generated-connector-websocket-channels.md); it does not
+> revive either removed plugin surface.
 
 ## Superseded decision
 

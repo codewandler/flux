@@ -11,13 +11,15 @@ note: "a WebSocket handshake is a vendor protocol and no manifest can describe o
 
 ## Goal
 
-Port Slack Socket Mode to a **transport** that feeds the generic binding driver, so the Slack adapter
-stops being a channel kind and becomes a connection loop with no knowledge of payloads, replies or
-policy.
+Port **Slack's vendor-specific Socket Mode** to a transport that feeds the generic binding driver, so
+the Slack adapter stops being a channel kind and becomes a connection/acknowledgement loop with no
+knowledge of payloads, replies or policy. Generic declarative RFC 6455 handshakes are C-481's program,
+not this story.
 
 ## Context — verified against this tree
 
-- Socket Mode is a vendor WebSocket protocol. `crates/flux-channels/src/adapters/slack.rs:56-82`
+- Socket Mode is a vendor WebSocket protocol: an app-level token obtains a temporary URL and each
+  envelope has acknowledgement semantics beyond the WebSocket handshake. `crates/flux-channels/src/adapters/slack.rs:56-82`
   constructs a `SlackClient`, a listener environment and a push callback via `slack-morphism`
   (`crates/flux-channels/Cargo.toml`, optional, default feature `slack`). **No manifest can describe
   that handshake**, so this dependency is not deletable.
@@ -30,7 +32,8 @@ policy.
   connection we opened and authenticated.
 - The upstream `Transport` enum names all three (`webhook`, `socket`, `poll`) precisely so that
   "inbound" is an abstraction over transports rather than a synonym for "webhook"
-  (`../flux-connectors/crates/connector-spec/src/inbound.rs:54-66`).
+  (`../flux-connectors/crates/connector-spec/src/inbound.rs:54-66`). C-481 adds a declarative connect
+  block for generic RFC 6455 bindings; that does not describe Slack's URL-ticket/ack protocol.
 
 ## Acceptance
 
@@ -53,6 +56,9 @@ policy.
       --no-default-features` builds, and a `connector` channel with a `webhook` binding works without it.
 - [ ] Roughly 40 of the original 217 lines survive. State the real number in Progress; it is the story's
       own evidence.
+- [ ] Nothing in this story treats Slack Socket Mode as a generic `SocketConnectSpec`; an Asterisk-like
+      declarative RFC 6455 binding runs without the Slack SDK, and Slack still exercises its explicit
+      vendor transport.
 
 ## Progress
 
@@ -63,6 +69,8 @@ policy.
 - Parent: **D-215**. Depends on **D-218** (which does the deleting). Design:
   `../flux-connectors/docs/designs/connector-channel-seam.md`, section "So: yes, but only via the socket
   transport".
+- Generic RFC 6455 design: `docs/designs/generated-connector-websocket-channels.md`. The shared
+  binding driver and guarded WebSocket session are reusable; the Slack connection protocol is not.
 - **Why this is a child of the epic and not an optional extra.** The webhook transport cannot replace
   Socket Mode yet: Slack's Events API registration requires answering a `url_verification` handshake, and
   while flux's `C-293` implements the hook, the **upstream binding has no `challenge` declaration** to

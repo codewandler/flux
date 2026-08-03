@@ -64,6 +64,13 @@ CRATES=(
   codewandler-flux-providers
   codewandler-flux-sdk
   codewandler-flux-web
+  # The reusable channel host closure. Keep these last: LSP consumes web/capabilities, app consumes
+  # the agent/runtime stack, server consumes all three, and channels consumes server + app.
+  codewandler-flux-auth
+  codewandler-flux-lsp
+  codewandler-flux-app
+  codewandler-flux-server
+  codewandler-flux-channels
 )
 
 # Versions cargo would publish, resolved once from the workspace. One `cargo metadata` call instead

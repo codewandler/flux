@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use flux_app::{App, JourneyRun};
 use flux_lang::program::ChannelDecl;
 
-use crate::{A2aChannel, AppDeliverer, Channel, Deliverer};
+use crate::{A2aChannel, AppDeliverer, Channel, ChannelContext, Deliverer};
 
 /// Run `channels` against `app` until Ctrl-C (or `cancel`). Fires the one-shot `startup` event first,
 /// then spawns each channel; when `run_stdin` is set, also serves the interactive `cli` stdin loop
@@ -23,6 +23,20 @@ pub async fn serve(
     channels: Vec<Box<dyn Channel>>,
     run_stdin: bool,
     cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let workspace = flux_system::Workspace::new(std::env::current_dir()?)?;
+    let system: Arc<dyn flux_system::port::ExecutionSystem> =
+        Arc::new(flux_system::System::new(workspace));
+    serve_on(app, channels, run_stdin, cancel, system).await
+}
+
+/// [`serve`] with an explicitly selected execution substrate for outbound channels.
+pub async fn serve_on(
+    app: Arc<App>,
+    channels: Vec<Box<dyn Channel>>,
+    run_stdin: bool,
+    cancel: CancellationToken,
+    execution_system: Arc<dyn flux_system::port::ExecutionSystem>,
 ) -> anyhow::Result<()> {
     // `a2a` channels serve an agent over HTTP/A2A and need the live `App` to resolve the target agent's
     // engine, so they are built here rather than in the decl-only `build_channels`. Collect the decls
@@ -63,9 +77,12 @@ pub async fn serve(
 
     let mut set: JoinSet<anyhow::Result<()>> = JoinSet::new();
     for ch in channels.into_iter().chain(a2a_channels) {
-        let d = deliverer.clone();
-        let c = cancel.clone();
-        set.spawn(async move { ch.start(d, c).await });
+        let context = ChannelContext {
+            deliverer: deliverer.clone(),
+            cancel: cancel.clone(),
+            execution_system: execution_system.clone(),
+        };
+        set.spawn(async move { ch.start_with_context(context).await });
     }
     if run_stdin {
         let d = deliverer.clone();

@@ -25,8 +25,10 @@
 //!
 //! # What this arm can serve today, and what it refuses
 //!
-//! `transport = "webhook"` only. `poll` needs a `schedule` channel plus a trigger, and `socket` is
-//! D-220's — both are load errors here rather than a channel that silently never fires.
+//! Declarative `webhook` and RFC 6455 `socket` bindings are served here. `poll` needs a `schedule`
+//! channel plus a trigger. A vendor-specific socket with no declarative handshake remains owned by
+//! its dedicated adapter (Slack Socket Mode is D-220); both shapes are load errors here rather than
+//! channels that silently never fire.
 //!
 //! **A binding whose verification is `hmac` is refused at load**, because flux has no HMAC verifier
 //! yet: C-291 (raw-body capture) and C-292 (the parameterized verifier this arm would feed) are both
@@ -40,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -48,16 +51,19 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use flux_lang::program::ChannelDecl;
+use flux_system::net::PrivateNetAllow;
+use flux_system::websocket::{WebSocketConnect, WebSocketEvent};
 use flux_system::{System, Workspace};
 
 use crate::adapters::webhook::constant_time_eq;
 use crate::config::ConnectorSettings;
-use crate::{Channel, Deliverer};
+use crate::{Channel, ChannelContext, Deliverer};
 
 /// The manifest filename suffix. Not an extension — `slack.connector.toml` has stem
 /// `slack.connector`, which is why this is joined as a suffix rather than set with `set_extension`.
@@ -85,6 +91,8 @@ const MAX_NAME_LEN: usize = 64;
 /// because leaving a rule-carrying field unread is how an edited manifest loads without comment.
 #[derive(Debug, Deserialize)]
 struct Manifest {
+    #[serde(default)]
+    base_url: String,
     /// The connector id, checked against the `connector` setting — the file you opened must be the
     /// connector you asked for.
     connector: String,
@@ -100,12 +108,18 @@ struct Manifest {
     #[serde(default)]
     events: Vec<ManifestEvent>,
     #[serde(default)]
+    auth: Vec<ManifestAuth>,
+    #[serde(default)]
+    config: Vec<ManifestConfig>,
+    #[serde(default)]
     channels: Vec<ManifestChannel>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ManifestEvent {
     name: String,
+    #[serde(default)]
+    wire_value: Option<String>,
     /// Field equalities that narrow one coarse vendor event into this one — GitHub's single `issues`
     /// event with an `action` field becoming `issues.opened`.
     ///
@@ -131,6 +145,10 @@ struct ManifestChannel {
     transport: String,
     #[serde(default)]
     events: Vec<String>,
+    #[serde(default)]
+    payload_root: bool,
+    #[serde(default)]
+    connect: Option<ManifestSocketConnect>,
     /// **Tri-state, and the absent arm is the dangerous one.** Absent means the binding states
     /// nothing; on a `webhook` that is a load error, because silence is never a verification answer.
     #[serde(default)]
@@ -143,6 +161,44 @@ struct ManifestChannel {
     payload: BTreeMap<String, String>,
     #[serde(default)]
     reply: Option<ManifestReply>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestSocketConnect {
+    path: String,
+    #[serde(default)]
+    query: BTreeMap<String, String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    auth: Vec<ManifestAuthChoice>,
+    #[serde(default)]
+    subprotocols: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestAuthChoice {
+    credentials: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestAuth {
+    name: String,
+    scheme: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestConfig {
+    name: String,
+    binds: String,
+    #[serde(default = "required_by_default")]
+    required: bool,
+    #[serde(default)]
+    default: Option<String>,
+}
+
+fn required_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +352,41 @@ enum Source {
     Body,
 }
 
+/// Where a prepared connector plan reads one routing value from a received event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorValueSource {
+    /// An HTTP header on an inbound delivery.
+    Header,
+    /// A dotted path in the decoded JSON event body.
+    Body,
+}
+
+/// One discriminator or delivery-id selector supplied by a zero-I/O connector plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorValueSelector {
+    pub source: ConnectorValueSource,
+    pub name: String,
+}
+
+/// An owned, transport-neutral socket binding ready for the selected execution system.
+///
+/// A connector package composes this only after a host has admitted placement and resolved its
+/// tenant-bound configuration/credential ports. This type owns no resolver, client, socket, task,
+/// tenant, or persistence. [`ConnectorChannel::from_socket_plan`] validates the routing facts once
+/// more and the channel then delegates the physical connection to [`ChannelContext`].
+#[derive(Debug, Clone)]
+pub struct ConnectorSocketPlan {
+    pub connect: WebSocketConnect,
+    pub private_network: PrivateNetAllow,
+    /// Exact vendor discriminator -> declared local event name.
+    pub wire_events: BTreeMap<String, String>,
+    pub discriminator: Option<ConnectorValueSelector>,
+    pub delivery_id: Option<ConnectorValueSelector>,
+    /// Delivered symbol -> dotted JSON path.
+    pub payload: BTreeMap<String, String>,
+    pub payload_root: bool,
+}
+
 /// One named value read off an inbound request: the event discriminator, or the delivery id.
 #[derive(Debug, Clone)]
 struct Selector {
@@ -329,24 +420,110 @@ fn dotted<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     Some(here)
 }
 
-/// A channel binding, loaded and fully validated, over the `webhook` transport.
+/// A connector binding over an inbound webhook or a prepared generic WebSocket plan.
 pub struct ConnectorChannel {
     name: String,
-    addr: SocketAddr,
+    addr: Option<SocketAddr>,
     path: String,
     token: Option<String>,
+    socket: Option<SocketRuntime>,
     /// The **closed** set of event names the binding declares. A discriminator value outside it is a
     /// logged no-op — never a label of its own, and never a fallback to the bare channel name.
-    events: BTreeSet<String>,
+    wire_events: BTreeMap<String, String>,
     discriminator: Option<Selector>,
     delivery_id: Option<Selector>,
     payload: BTreeMap<String, String>,
+    payload_root: bool,
+    dropped: Arc<AtomicU64>,
     /// The operation that answers on this binding. Its *tool* is asserted to exist by
     /// [`crate::serve`], which has the registry the decl-only builder does not.
     reply_operation: Option<String>,
 }
 
+#[derive(Clone)]
+struct SocketRuntime {
+    connect: WebSocketConnect,
+    allow: PrivateNetAllow,
+}
+
 impl ConnectorChannel {
+    fn binding_state(&self, deliverer: Arc<dyn Deliverer>) -> Arc<BindingState> {
+        Arc::new(BindingState {
+            name: self.name.clone(),
+            deliverer,
+            token: self.token.clone(),
+            wire_events: self.wire_events.clone(),
+            discriminator: self.discriminator.clone(),
+            delivery_id: self.delivery_id.clone(),
+            payload: self.payload.clone(),
+            payload_root: self.payload_root,
+            dropped: Arc::clone(&self.dropped),
+        })
+    }
+
+    /// Construct a generic socket binding from a connector package's zero-I/O plan.
+    ///
+    /// The plan is already credential/configuration-resolved, so this constructor performs no file
+    /// read and no value lookup. It validates only the transport-neutral closed-set and projection
+    /// contract; opening the socket remains the selected execution system's operation.
+    pub fn from_socket_plan(
+        name: impl Into<String>,
+        plan: ConnectorSocketPlan,
+    ) -> anyhow::Result<Self> {
+        let name = name.into();
+        validate_name(&name, "channel", &name)?;
+        if plan.discriminator.is_some() && plan.wire_events.is_empty() {
+            anyhow::bail!("channel `{name}`: a prepared discriminator has no declared event set");
+        }
+        for (wire, local) in &plan.wire_events {
+            if wire.is_empty() {
+                anyhow::bail!("channel `{name}`: a prepared event has an empty wire value");
+            }
+            validate_name(&name, "event", local)?;
+        }
+        if plan.payload_root && !plan.payload.is_empty() {
+            anyhow::bail!(
+                "channel `{name}`: a prepared binding cannot deliver both the complete payload and \
+                 a field projection"
+            );
+        }
+        for (symbol, path) in &plan.payload {
+            validate_symbol(&name, "prepared", symbol)?;
+            validate_path(&name, "prepared", symbol, path)?;
+        }
+        let discriminator = prepared_selector(&name, "discriminator", plan.discriminator)?;
+        let delivery_id = prepared_selector(&name, "delivery_id", plan.delivery_id)?;
+        if delivery_id.is_some() && plan.payload.contains_key(DELIVERY_ID_SYMBOL) {
+            anyhow::bail!(
+                "channel `{name}`: a prepared delivery id collides with payload symbol \
+                 `{DELIVERY_ID_SYMBOL}`"
+            );
+        }
+
+        Ok(Self {
+            name,
+            addr: None,
+            path: String::new(),
+            token: None,
+            socket: Some(SocketRuntime {
+                connect: plan.connect,
+                allow: plan.private_network,
+            }),
+            wire_events: plan.wire_events,
+            discriminator,
+            delivery_id,
+            payload: plan.payload,
+            payload_root: plan.payload_root,
+            dropped: Arc::new(AtomicU64::new(0)),
+            reply_operation: None,
+        })
+    }
+
+    /// Malformed or undeclared events dropped by this channel instance.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     /// Load the named binding out of the named connector's manifest, refusing everything refusable.
     ///
     /// The order of the cascade is load-bearing and not incidental: the name grammar runs before any
@@ -444,24 +621,25 @@ impl ConnectorChannel {
             })?;
 
         // 5 ─ A transport this arm can serve.
-        match binding.transport.as_str() {
-            "webhook" => {}
+        let socket_transport = match binding.transport.as_str() {
+            "webhook" => false,
             "poll" => anyhow::bail!(
                 "channel `{name}`: binding `{}` is `transport = \"poll\"`, which this kind cannot \
                  serve — a poll is a `schedule` channel plus a trigger that calls the binding's \
                  cursor operation, not an inbound listener",
                 s.binding
             ),
+            "socket" if binding.connect.is_some() => true,
             "socket" => anyhow::bail!(
-                "channel `{name}`: binding `{}` is `transport = \"socket\"`, which this kind cannot \
-                 serve yet (D-220 ports the outbound socket loop)",
+                "channel `{name}`: binding `{}` is a vendor-specific socket with no declarative \
+                 handshake; it remains owned by its dedicated adapter",
                 s.binding
             ),
             other => anyhow::bail!(
                 "channel `{name}`: binding `{}` declares unknown transport `{other}`",
                 s.binding
             ),
-        }
+        };
 
         // 6 ─ Verification. The tri-state, reproduced against the file.
         let verification = binding.verification.as_ref().ok_or_else(|| {
@@ -492,10 +670,16 @@ impl ConnectorChannel {
                 );
             }
         }
-        match verification.kind.as_str() {
+        match (socket_transport, verification.kind.as_str()) {
+            (true, "connection") => {}
+            (true, other) => anyhow::bail!(
+                "channel `{name}`: socket binding `{}` must use connection verification, not \
+                 `{other}`",
+                s.binding
+            ),
             // Explicitly unverifiable: the vendor publishes no signature. Servable, and said loudly.
-            "none" => {}
-            "hmac" => {
+            (false, "none") => {}
+            (false, "hmac") => {
                 let hmac = verification.hmac.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "channel `{name}`: binding `{}` states `verification.kind = \"hmac\"` with \
@@ -516,13 +700,13 @@ impl ConnectorChannel {
                     s.binding
                 );
             }
-            "connection" => anyhow::bail!(
+            (false, "connection") => anyhow::bail!(
                 "channel `{name}`: binding `{}` states `verification.kind = \"connection\"` on a \
                  webhook — a connection-authenticated verification belongs to a socket or a poll, \
                  so nothing proves who called this endpoint",
                 s.binding
             ),
-            other => anyhow::bail!(
+            (false, other) => anyhow::bail!(
                 "channel `{name}`: binding `{}` states unknown `verification.kind = {other:?}`",
                 s.binding
             ),
@@ -567,7 +751,8 @@ impl ConnectorChannel {
         //     label this host could fire for an event that does not exist.
         let declared: BTreeMap<String, ManifestEvent> = manifest
             .events
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|e| (e.name.clone(), e))
             .collect();
         for event in &binding.events {
@@ -593,6 +778,18 @@ impl ConnectorChannel {
             }
         }
         let events: BTreeSet<String> = binding.events.iter().cloned().collect();
+        let wire_events: BTreeMap<String, String> = binding
+            .events
+            .iter()
+            .filter_map(|name| {
+                declared.get(name).map(|event| {
+                    (
+                        event.wire_value.clone().unwrap_or_else(|| name.clone()),
+                        name.clone(),
+                    )
+                })
+            })
+            .collect();
         if binding.discriminator.is_some() && events.is_empty() {
             anyhow::bail!(
                 "channel `{name}`: binding `{}` selects a discriminator but declares no events, so \
@@ -622,51 +819,49 @@ impl ConnectorChannel {
 
         // 11 ─ The transport's own settings, last: nothing about *where* flux listens can excuse a
         //      defect in *what* it would serve.
-        let addr = s.addr.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "channel `{name}`: binding `{}` is a webhook, so this channel needs an `addr` to \
-                 listen on",
-                s.binding
+        let (addr, path, token, socket) = if socket_transport {
+            let connect = compose_socket(name, &s, &manifest, binding)?;
+            (
+                None,
+                String::new(),
+                None,
+                Some(SocketRuntime {
+                    connect,
+                    allow: PrivateNetAllow::from_hosts(s.private_hosts.clone()),
+                }),
             )
-        })?;
-        let addr = SocketAddr::from_str(addr)
-            .map_err(|e| anyhow::anyhow!("channel `{name}`: bad addr `{addr}`: {e}"))?;
-        // **An empty token is not a token, and it is worse than none.**
-        //
-        // `token ""` — or `token secret "K"` where `K` is exported empty, because
-        // `flux_app::resolve_secrets` resolves through `std::env::var`, which does not filter an
-        // empty value — would otherwise arrive here as `Some("")`. The bearer check compares the
-        // *presented* token, which is `""` when the request carries no `Authorization` header at
-        // all, against the expected one; two empty byte strings are equal, so every anonymous
-        // request would authenticate. On a host that auto-approves tools that is an open
-        // remote-trigger surface presented as an authenticated one.
-        //
-        // [`authorized`] refuses an empty expected token as well, so neither half depends on the
-        // other being right. This one is the half that runs **before a port is bound**, which is
-        // the only half that can prevent the exposure rather than survive it.
-        let token = match s.token.as_deref() {
-            Some(token) if token.trim().is_empty() => anyhow::bail!(
-                "channel `{name}`: `token` is set but empty, which would authenticate every \
-                 request — including one carrying no `Authorization` header at all. Give it a \
-                 value, or remove it (a loopback bind needs none). A `secret \"KEY\"` reference \
-                 resolves to an empty string when `KEY` is exported empty."
-            ),
-            other => other.map(str::to_string),
-        };
-        // The host auto-approves tools, so an open non-loopback listener is a remote-trigger
-        // surface. The binding states it cannot be verified, so a bearer token is the only thing
-        // left that can attribute a delivery — mirroring `WebhookChannel`'s rule exactly.
-        if !addr.ip().is_loopback() && token.is_none() {
-            anyhow::bail!(
-                "channel `{name}`: refusing to bind non-loopback {addr} for binding `{}`, whose \
-                 verification is `none`, without a `token` (set `token secret \"KEY\"`)",
-                s.binding
-            );
-        }
-        let path = if s.path.starts_with('/') {
-            s.path.clone()
         } else {
-            format!("/{}", s.path)
+            let addr = s.addr.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "channel `{name}`: binding `{}` is a webhook, so this channel needs an `addr` \
+                     to listen on",
+                    s.binding
+                )
+            })?;
+            let addr = SocketAddr::from_str(addr)
+                .map_err(|e| anyhow::anyhow!("channel `{name}`: bad addr `{addr}`: {e}"))?;
+            let token = match s.token.as_deref() {
+                Some(token) if token.trim().is_empty() => anyhow::bail!(
+                    "channel `{name}`: `token` is set but empty, which would authenticate every \
+                     request — including one carrying no `Authorization` header at all. Give it a \
+                     value, or remove it (a loopback bind needs none). A `secret \"KEY\"` reference \
+                     resolves to an empty string when `KEY` is exported empty."
+                ),
+                other => other.map(str::to_string),
+            };
+            if !addr.ip().is_loopback() && token.is_none() {
+                anyhow::bail!(
+                    "channel `{name}`: refusing to bind non-loopback {addr} for binding `{}`, whose \
+                     verification is `none`, without a `token` (set `token secret \"KEY\"`)",
+                    s.binding
+                );
+            }
+            let path = if s.path.starts_with('/') {
+                s.path.clone()
+            } else {
+                format!("/{}", s.path)
+            };
+            (Some(addr), path, token, None)
         };
 
         Ok(Self {
@@ -674,29 +869,199 @@ impl ConnectorChannel {
             addr,
             path,
             token,
-            events,
+            socket,
+            wire_events,
             discriminator,
             delivery_id,
             payload: binding.payload.clone(),
+            payload_root: binding.payload_root,
+            dropped: Arc::new(AtomicU64::new(0)),
             reply_operation,
         })
     }
 
     /// Build the axum router for this channel over `d` (exposed for hermetic tests).
     pub fn router(&self, d: Arc<dyn Deliverer>) -> Router {
-        let state = Arc::new(BindingState {
-            name: self.name.clone(),
-            deliverer: d,
-            token: self.token.clone(),
-            events: self.events.clone(),
-            discriminator: self.discriminator.clone(),
-            delivery_id: self.delivery_id.clone(),
-            payload: self.payload.clone(),
-        });
+        let state = self.binding_state(d);
         Router::new()
             .route(&self.path, post(handle))
             .with_state(state)
     }
+}
+
+fn prepared_selector(
+    channel: &str,
+    what: &str,
+    selector: Option<ConnectorValueSelector>,
+) -> anyhow::Result<Option<Selector>> {
+    selector
+        .map(|selector| {
+            if selector.name.is_empty() {
+                anyhow::bail!("channel `{channel}`: prepared {what} names nothing");
+            }
+            let source = match selector.source {
+                ConnectorValueSource::Header => {
+                    validate_header(channel, "prepared", what, &selector.name)?;
+                    Source::Header
+                }
+                ConnectorValueSource::Body => {
+                    validate_path(channel, "prepared", what, &selector.name)?;
+                    Source::Body
+                }
+            };
+            Ok(Selector {
+                source,
+                name: selector.name,
+            })
+        })
+        .transpose()
+}
+
+fn compose_socket(
+    channel: &str,
+    settings: &ConnectorSettings,
+    manifest: &Manifest,
+    binding: &ManifestChannel,
+) -> anyhow::Result<WebSocketConnect> {
+    let declaration = binding.connect.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("channel `{channel}`: socket binding has no declarative connect spec")
+    })?;
+    let mut base = manifest.base_url.clone();
+    for field in manifest
+        .config
+        .iter()
+        .filter(|field| field.binds.starts_with("endpoint."))
+    {
+        let value = config_value(channel, settings, field)?;
+        let slot = format!("{{{}}}", field.binds.trim_start_matches("endpoint."));
+        base = base.replace(&slot, &value);
+    }
+    if base.contains('{') || base.contains('}') {
+        anyhow::bail!("channel `{channel}`: socket endpoint has an unbound configuration slot");
+    }
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    let mut url = url::Url::parse(&base)
+        .and_then(|base| base.join(declaration.path.trim_start_matches('/')))
+        .map_err(|_| anyhow::anyhow!("channel `{channel}`: socket endpoint is invalid"))?;
+    let scheme = match url.scheme() {
+        "https" | "wss" => "wss",
+        "http" | "ws" => "ws",
+        _ => anyhow::bail!(
+            "channel `{channel}`: socket endpoint scheme must be http, https, ws or wss"
+        ),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("channel `{channel}`: socket endpoint scheme is invalid"))?;
+
+    for (parameter, template) in &declaration.query {
+        let config_name = template
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "channel `{channel}`: socket query `{parameter}` is not a configuration slot"
+                )
+            })?;
+        let target = format!("channel.{}.query.{parameter}", settings.binding);
+        let field = manifest
+            .config
+            .iter()
+            .find(|field| field.name == config_name && field.binds == target)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "channel `{channel}`: socket query `{parameter}` has no matching declared \
+                     configuration"
+                )
+            })?;
+        let value = config_value(channel, settings, field)?;
+        url.query_pairs_mut().append_pair(parameter, &value);
+    }
+
+    let mut connect = WebSocketConnect::new(url.to_string());
+    connect.headers.extend(
+        declaration
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    connect.subprotocols = declaration.subprotocols.clone();
+
+    let choice = declaration.auth.first().ok_or_else(|| {
+        anyhow::anyhow!("channel `{channel}`: socket binding declares no authentication")
+    })?;
+    if choice.credentials.len() != 1 {
+        anyhow::bail!("channel `{channel}`: socket authentication must select one credential");
+    }
+    let credential_name = &choice.credentials[0];
+    let auth = manifest
+        .auth
+        .iter()
+        .find(|auth| &auth.name == credential_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("channel `{channel}`: socket authentication is undeclared")
+        })?;
+    let secret = settings
+        .credentials
+        .get(credential_name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "channel `{channel}`: required credential `{credential_name}` is missing"
+            )
+        })?;
+    match auth.scheme.as_str() {
+        "basic" => {
+            let target = format!("username.{credential_name}");
+            let field = manifest
+                .config
+                .iter()
+                .find(|field| field.binds == target)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("channel `{channel}`: Basic username is undeclared")
+                })?;
+            let username = config_value(channel, settings, field)?;
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"));
+            connect
+                .headers
+                .push(("Authorization".into(), format!("Basic {encoded}")));
+        }
+        "bearer" => connect
+            .headers
+            .push(("Authorization".into(), format!("Bearer {secret}"))),
+        other => anyhow::bail!(
+            "channel `{channel}`: socket authentication scheme `{other}` is unsupported"
+        ),
+    }
+    Ok(connect)
+}
+
+fn config_value(
+    channel: &str,
+    settings: &ConnectorSettings,
+    field: &ManifestConfig,
+) -> anyhow::Result<String> {
+    if let Some(value) = settings.config.get(&field.name) {
+        if value.is_empty() && field.required {
+            anyhow::bail!(
+                "channel `{channel}`: required configuration `{}` is empty",
+                field.name
+            );
+        }
+        return Ok(value.clone());
+    }
+    if let Some(value) = &field.default {
+        return Ok(value.clone());
+    }
+    if field.required {
+        anyhow::bail!(
+            "channel `{channel}`: required configuration `{}` is missing",
+            field.name
+        );
+    }
+    Ok(String::new())
 }
 
 /// The reserved payload symbol carrying the vendor's redelivery id, when the binding selects one.
@@ -1012,10 +1377,12 @@ struct BindingState {
     name: String,
     deliverer: Arc<dyn Deliverer>,
     token: Option<String>,
-    events: BTreeSet<String>,
+    wire_events: BTreeMap<String, String>,
     discriminator: Option<Selector>,
     delivery_id: Option<Selector>,
     payload: BTreeMap<String, String>,
+    payload_root: bool,
+    dropped: Arc<AtomicU64>,
 }
 
 impl BindingState {
@@ -1037,8 +1404,8 @@ impl BindingState {
         let Some(value) = discriminator.read(headers, body) else {
             return Err(drop_note(&self.name, None));
         };
-        if self.events.contains(&value) {
-            Ok(format!("{}.{value}", self.name))
+        if let Some(local) = self.wire_events.get(&value) {
+            Ok(format!("{}.{local}", self.name))
         } else {
             Err(drop_note(&self.name, Some(&value)))
         }
@@ -1048,6 +1415,9 @@ impl BindingState {
     /// A path that does not resolve contributes no symbol rather than an empty string, so a journey
     /// can tell "absent" from "empty".
     fn payload(&self, headers: &HeaderMap, body: &Value) -> Value {
+        if self.payload_root {
+            return body.clone();
+        }
         let mut out = Map::new();
         for (symbol, path) in &self.payload {
             if let Some(value) = dotted(body, path) {
@@ -1063,6 +1433,10 @@ impl BindingState {
         }
         Value::Object(out)
     }
+
+    fn count_drop(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 async fn handle(
@@ -1077,6 +1451,7 @@ async fn handle(
     let label = match state.label(&headers, &body) {
         Ok(label) => label,
         Err(note) => {
+            state.count_drop();
             // An event nobody declared, or one nobody subscribed to. Vendors send event types nobody
             // asked for, and a 500 teaches them to retry forever — so it is a 204. It is still
             // *logged*, because from the outside a dropped delivery and a delivery nobody sent look
@@ -1100,6 +1475,132 @@ async fn handle(
     StatusCode::ACCEPTED.into_response()
 }
 
+async fn run_socket(
+    name: &str,
+    socket: SocketRuntime,
+    state: Arc<BindingState>,
+    context: ChannelContext,
+) -> anyhow::Result<()> {
+    let mut backoff = 1u64;
+    let mut attempt = 0u64;
+    loop {
+        let opened = tokio::select! {
+            _ = context.cancel.cancelled() => return Ok(()),
+            opened = context.execution_system.open_websocket_scoped(&socket.connect, &socket.allow) => opened,
+        };
+        let mut session = match opened {
+            Ok(session) => session,
+            Err(error) if terminal_socket_error(&error) => {
+                anyhow::bail!("channel `{name}`: terminal WebSocket connection failure: {error}")
+            }
+            Err(error) => {
+                eprintln!("connector channel `{name}`: WebSocket connection failed; reconnecting: {error}");
+                wait_reconnect(&context.cancel, name, backoff, attempt).await?;
+                (backoff, attempt) = advance_reconnect(backoff, attempt);
+                continue;
+            }
+        };
+        let connected_at = tokio::time::Instant::now();
+        let disconnected = loop {
+            let next = tokio::select! {
+                _ = context.cancel.cancelled() => {
+                    let _ = session.close().await;
+                    return Ok(());
+                }
+                next = session.read() => next,
+            };
+            match next {
+                Ok(Some(WebSocketEvent::Text(text))) => {
+                    let body: Value = match serde_json::from_str(&text) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            state.count_drop();
+                            eprintln!("connector channel `{name}`: dropped malformed JSON event");
+                            continue;
+                        }
+                    };
+                    let label = match state.label(&HeaderMap::new(), &body) {
+                        Ok(label) => label,
+                        Err(note) => {
+                            state.count_drop();
+                            eprintln!("{note}");
+                            continue;
+                        }
+                    };
+                    let payload = state.payload(&HeaderMap::new(), &body);
+                    let deliverer = Arc::clone(&state.deliverer);
+                    tokio::spawn(async move {
+                        if let Err(error) = deliverer.deliver(&label, payload).await {
+                            eprintln!("connector channel `{label}`: delivery failed: {error}");
+                        }
+                    });
+                }
+                Ok(Some(WebSocketEvent::Binary(_))) => {
+                    let _ = session.close().await;
+                    anyhow::bail!(
+                        "channel `{name}`: vendor sent a binary WebSocket frame; JSON text is required"
+                    );
+                }
+                Ok(Some(WebSocketEvent::Close { .. })) | Ok(None) => break None,
+                Err(error) => break Some(error),
+            }
+        };
+        (backoff, attempt) = after_connection(connected_at.elapsed(), backoff, attempt);
+        if let Some(error) = disconnected {
+            eprintln!("connector channel `{name}`: WebSocket ended; reconnecting: {error}");
+        }
+        wait_reconnect(&context.cancel, name, backoff, attempt).await?;
+        (backoff, attempt) = advance_reconnect(backoff, attempt);
+    }
+}
+
+fn terminal_socket_error(error: &flux_core::Error) -> bool {
+    match error {
+        flux_core::Error::Api { status, .. } => matches!(status, 400 | 401 | 403 | 404),
+        flux_core::Error::Auth(_) | flux_core::Error::Config(_) => true,
+        flux_core::Error::GuardedIo(guarded) => matches!(
+            guarded.kind(),
+            flux_core::GuardedIoFailure::Refused | flux_core::GuardedIoFailure::Unserved
+        ),
+        _ => false,
+    }
+}
+
+async fn wait_reconnect(
+    cancel: &CancellationToken,
+    name: &str,
+    seconds: u64,
+    attempt: u64,
+) -> anyhow::Result<()> {
+    let jitter = name
+        .bytes()
+        .fold(attempt.wrapping_mul(1_099_511_628_211), |hash, byte| {
+            hash.wrapping_mul(16_777_619) ^ u64::from(byte)
+        });
+    let delay = reconnect_delay(seconds, jitter);
+    tokio::select! {
+        _ = cancel.cancelled() => Ok(()),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
+}
+
+fn reconnect_delay(seconds: u64, jitter: u64) -> std::time::Duration {
+    let jitter_ms = jitter % (seconds.saturating_mul(250).max(1));
+    std::time::Duration::from_millis(seconds.saturating_mul(1_000).saturating_add(jitter_ms))
+}
+
+fn advance_reconnect(backoff: u64, attempt: u64) -> (u64, u64) {
+    ((backoff * 2).min(30), attempt.saturating_add(1))
+}
+
+fn after_connection(connected_for: std::time::Duration, backoff: u64, attempt: u64) -> (u64, u64) {
+    if connected_for >= std::time::Duration::from_secs(60) {
+        (1, 0)
+    } else {
+        (backoff, attempt)
+    }
+}
+
 #[async_trait]
 impl Channel for ConnectorChannel {
     fn name(&self) -> &str {
@@ -1111,19 +1612,460 @@ impl Channel for ConnectorChannel {
     }
 
     async fn start(&self, d: Arc<dyn Deliverer>, cancel: CancellationToken) -> anyhow::Result<()> {
-        let listener = tokio::net::TcpListener::bind(self.addr)
+        if self.socket.is_some() {
+            anyhow::bail!(
+                "channel `{}`: an outbound socket requires a selected execution system",
+                self.name
+            );
+        }
+        let addr = self
+            .addr
+            .ok_or_else(|| anyhow::anyhow!("channel `{}`: no bind address", self.name))?;
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|e| anyhow::anyhow!("channel `{}`: bind {}: {e}", self.name, self.addr))?;
+            .map_err(|e| anyhow::anyhow!("channel `{}`: bind {addr}: {e}", self.name))?;
         axum::serve(listener, self.router(d))
             .with_graceful_shutdown(async move { cancel.cancelled().await })
             .await
             .map_err(|e| anyhow::anyhow!("channel `{}`: serve: {e}", self.name))
+    }
+
+    async fn start_with_context(&self, context: ChannelContext) -> anyhow::Result<()> {
+        if let Some(socket) = &self.socket {
+            return run_socket(
+                &self.name,
+                socket.clone(),
+                self.binding_state(context.deliverer.clone()),
+                context,
+            )
+            .await;
+        }
+        self.start(context.deliverer, context.cancel).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoopDeliverer;
+
+    #[async_trait]
+    impl Deliverer for NoopDeliverer {
+        async fn deliver(
+            &self,
+            _label: &str,
+            _payload: Value,
+        ) -> anyhow::Result<Vec<flux_app::JourneyRun>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn ari_channel_composes_exact_handshake_and_routes_the_raw_wire_event() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+connector = "asterisk"
+base_url = "https://{host}:8089/ari"
+
+[[auth]]
+name = "asterisk.password"
+scheme = "basic"
+
+[[config]]
+name = "host"
+binds = "endpoint.host"
+
+[[config]]
+name = "username"
+binds = "username.asterisk.password"
+
+[[config]]
+name = "app"
+binds = "channel.ari-events.query.app"
+
+[[config]]
+name = "subscribe_all"
+binds = "channel.ari-events.query.subscribeAll"
+required = false
+default = "false"
+
+[[events]]
+name = "channel-created"
+wire_value = "ChannelCreated"
+
+[[channels]]
+name = "ari-events"
+transport = "socket"
+events = ["channel-created"]
+payload_root = true
+
+[channels.connect]
+path = "/events"
+
+[channels.connect.query]
+app = "{app}"
+subscribeAll = "{subscribe_all}"
+
+[[channels.connect.auth]]
+credentials = ["asterisk.password"]
+
+[channels.verification]
+kind = "connection"
+verified = true
+
+[channels.discriminator]
+source = "body"
+name = "type"
+"#,
+        )
+        .expect("ARI manifest");
+        let settings: ConnectorSettings = serde_json::from_value(serde_json::json!({
+            "connector": "asterisk",
+            "binding": "ari-events",
+            "credentials": {"asterisk.password": "secret"},
+            "config": {"host": "pbx.example.com", "username": "flux", "app": "voice-app"}
+        }))
+        .expect("channel settings");
+        let binding = &manifest.channels[0];
+        let plan = compose_socket("events", &settings, &manifest, binding).expect("socket plan");
+        assert_eq!(
+            plan.url,
+            "wss://pbx.example.com:8089/ari/events?app=voice-app&subscribeAll=false"
+        );
+        assert_eq!(
+            plan.headers,
+            vec![(
+                "Authorization".into(),
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode("flux:secret")
+                )
+            )]
+        );
+
+        let state = BindingState {
+            name: "events".into(),
+            deliverer: Arc::new(NoopDeliverer),
+            token: None,
+            wire_events: [("ChannelCreated".into(), "channel-created".into())]
+                .into_iter()
+                .collect(),
+            discriminator: Some(Selector {
+                source: Source::Body,
+                name: "type".into(),
+            }),
+            delivery_id: None,
+            payload: BTreeMap::new(),
+            payload_root: true,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        let body = serde_json::json!({"type": "ChannelCreated", "channel": {"id": "42"}});
+        assert_eq!(
+            state
+                .label(&HeaderMap::new(), &body)
+                .expect("declared event"),
+            "events.channel-created"
+        );
+        assert_eq!(state.payload(&HeaderMap::new(), &body), body);
+
+        let mut missing_auth = settings.clone();
+        missing_auth.credentials.clear();
+        let refusal = compose_socket("events", &missing_auth, &manifest, binding)
+            .expect_err("missing socket authentication is a planning refusal");
+        assert!(
+            refusal.to_string().contains("required credential"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_zero_io_plan_becomes_a_closed_socket_binding_without_provider_toml() {
+        let channel = ConnectorChannel::from_socket_plan(
+            "tenant-channel",
+            ConnectorSocketPlan {
+                connect: WebSocketConnect::new("wss://pbx.example.com/ari/events?app=voice"),
+                private_network: PrivateNetAllow::from_hosts(["pbx.example.com".into()]),
+                wire_events: [("ChannelCreated".into(), "channel-created".into())]
+                    .into_iter()
+                    .collect(),
+                discriminator: Some(ConnectorValueSelector {
+                    source: ConnectorValueSource::Body,
+                    name: "type".into(),
+                }),
+                delivery_id: None,
+                payload: BTreeMap::new(),
+                payload_root: true,
+            },
+        )
+        .expect("prepared connector plan");
+        let state = channel.binding_state(Arc::new(NoopDeliverer));
+        let body = serde_json::json!({"type": "ChannelCreated", "channel": {"id": "42"}});
+
+        assert_eq!(
+            state
+                .label(&HeaderMap::new(), &body)
+                .expect("declared event"),
+            "tenant-channel.channel-created"
+        );
+        assert_eq!(state.payload(&HeaderMap::new(), &body), body);
+        assert_eq!(channel.dropped_events(), 0);
+        state.count_drop();
+        assert_eq!(channel.dropped_events(), 1);
+
+        let contradiction = ConnectorChannel::from_socket_plan(
+            "tenant-channel",
+            ConnectorSocketPlan {
+                connect: WebSocketConnect::new("wss://pbx.example.com/events"),
+                private_network: PrivateNetAllow::from_hosts(Vec::<String>::new()),
+                wire_events: BTreeMap::new(),
+                discriminator: None,
+                delivery_id: None,
+                payload: [("channel".into(), "channel".into())].into_iter().collect(),
+                payload_root: true,
+            },
+        )
+        .err()
+        .expect("root and projection are mutually exclusive");
+        assert!(
+            contradiction
+                .to_string()
+                .contains("both the complete payload"),
+            "{contradiction}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tungstenite's server callback fixes this result shape.
+    async fn a_mock_ari_socket_routes_channel_created_with_the_complete_payload() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        struct Capture {
+            delivered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<(String, Value)>>>,
+            cancel: CancellationToken,
+        }
+
+        #[async_trait]
+        impl Deliverer for Capture {
+            async fn deliver(
+                &self,
+                label: &str,
+                payload: Value,
+            ) -> anyhow::Result<Vec<flux_app::JourneyRun>> {
+                if let Some(delivered) = self
+                    .delivered
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                {
+                    let _ = delivered.send((label.to_owned(), payload));
+                }
+                self.cancel.cancel();
+                Ok(Vec::new())
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock ARI listener");
+        let address = listener.local_addr().expect("mock ARI address");
+        let vendor = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept channel");
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request.uri().path_and_query().map(ToString::to_string),
+                        Some("/ari/events?app=voice-app&subscribeAll=false".into())
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Basic Zmx1eDpzZWNyZXQ=")
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("ARI handshake");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    "not json".into(),
+                ))
+                .await
+                .expect("send malformed event");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    r#"{"type":"VendorAddedThisLater"}"#.into(),
+                ))
+                .await
+                .expect("send undeclared event");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    r#"{"type":"ChannelCreated","channel":{"id":"42"}}"#.into(),
+                ))
+                .await
+                .expect("send ARI event");
+            let _ = socket.next().await;
+        });
+
+        let mut connect = WebSocketConnect::new(format!(
+            "ws://{address}/ari/events?app=voice-app&subscribeAll=false"
+        ));
+        connect
+            .headers
+            .push(("Authorization".into(), "Basic Zmx1eDpzZWNyZXQ=".into()));
+        let socket = SocketRuntime {
+            connect,
+            allow: PrivateNetAllow::from_hosts(["127.0.0.1".to_owned()]),
+        };
+        let cancel = CancellationToken::new();
+        let (sent, delivered) = tokio::sync::oneshot::channel();
+        let state = Arc::new(BindingState {
+            name: "events".into(),
+            deliverer: Arc::new(Capture {
+                delivered: std::sync::Mutex::new(Some(sent)),
+                cancel: cancel.clone(),
+            }),
+            token: None,
+            wire_events: [("ChannelCreated".into(), "channel-created".into())]
+                .into_iter()
+                .collect(),
+            discriminator: Some(Selector {
+                source: Source::Body,
+                name: "type".into(),
+            }),
+            delivery_id: None,
+            payload: BTreeMap::new(),
+            payload_root: true,
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+        let workspace =
+            Workspace::new(std::env::current_dir().expect("current directory")).expect("workspace");
+        let context = ChannelContext {
+            deliverer: Arc::clone(&state.deliverer),
+            cancel,
+            execution_system: Arc::new(System::new(workspace)),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_socket("events", socket, Arc::clone(&state), context),
+        )
+        .await
+        .expect("channel stops on cancellation")
+        .expect("channel succeeds");
+        let (label, payload) = delivered.await.expect("captured event");
+        assert_eq!(label, "events.channel-created");
+        assert_eq!(
+            payload,
+            serde_json::json!({"type": "ChannelCreated", "channel": {"id": "42"}})
+        );
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 2);
+        vendor.await.expect("mock ARI task");
+    }
+
+    #[tokio::test]
+    async fn a_binary_socket_event_is_a_terminal_protocol_violation() {
+        use futures_util::SinkExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binary event listener");
+        let address = listener.local_addr().expect("binary event address");
+        let vendor = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept channel");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    vec![0, 1, 2].into(),
+                ))
+                .await
+                .expect("send binary event");
+        });
+        let socket = SocketRuntime {
+            connect: WebSocketConnect::new(format!("ws://{address}/events")),
+            allow: PrivateNetAllow::from_hosts(["127.0.0.1".into()]),
+        };
+        let state = Arc::new(BindingState {
+            name: "events".into(),
+            deliverer: Arc::new(NoopDeliverer),
+            token: None,
+            wire_events: BTreeMap::new(),
+            discriminator: None,
+            delivery_id: None,
+            payload: BTreeMap::new(),
+            payload_root: true,
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+        let workspace =
+            Workspace::new(std::env::current_dir().expect("current directory")).expect("workspace");
+        let context = ChannelContext {
+            deliverer: Arc::new(NoopDeliverer),
+            cancel: CancellationToken::new(),
+            execution_system: Arc::new(System::new(workspace)),
+        };
+
+        let refusal = run_socket("events", socket, state, context)
+            .await
+            .expect_err("binary JSON-channel frames are terminal");
+        assert!(refusal.to_string().contains("binary"), "{refusal}");
+        vendor.await.expect("binary vendor task");
+    }
+
+    #[test]
+    fn handshake_and_placement_failures_have_deterministic_reconnect_classification() {
+        for status in [400, 401, 403, 404] {
+            assert!(terminal_socket_error(&flux_core::Error::Api {
+                status,
+                message: "refused".into(),
+            }));
+        }
+        for status in [408, 429, 500, 502, 503] {
+            assert!(!terminal_socket_error(&flux_core::Error::Api {
+                status,
+                message: "retry".into(),
+            }));
+        }
+        assert!(terminal_socket_error(&flux_core::Error::GuardedIo(
+            flux_core::GuardedIoError::new(
+                flux_core::GuardedIoFailure::Unserved,
+                "open a guarded WebSocket",
+            ),
+        )));
+        assert!(!terminal_socket_error(&flux_core::Error::GuardedIo(
+            flux_core::GuardedIoError::new(
+                flux_core::GuardedIoFailure::Unreachable,
+                "selected remote",
+            ),
+        )));
+
+        // The clock and jitter inputs stay pure at this boundary, so the release gate does not
+        // sleep for a minute merely to prove the stable reset or depend on process randomness.
+        assert_eq!(reconnect_delay(1, 0), std::time::Duration::from_secs(1));
+        assert_eq!(
+            reconnect_delay(1, 249),
+            std::time::Duration::from_millis(1_249)
+        );
+        assert_eq!(
+            after_connection(std::time::Duration::from_secs(59), 30, 8),
+            (30, 8)
+        );
+        assert_eq!(
+            after_connection(std::time::Duration::from_secs(60), 30, 8),
+            (1, 0)
+        );
+        let mut state = (1, 0);
+        for _ in 0..10 {
+            state = advance_reconnect(state.0, state.1);
+        }
+        assert_eq!(state, (30, 10));
+    }
 
     /// **An empty expected token authenticates nothing — least of all a request with no header.**
     ///

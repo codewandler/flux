@@ -6,6 +6,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Generated connector WebSocket bindings can run through one guarded channel runtime** (C-483,
+  C-484). `flux-system` owns bounded native and selected-remote WebSocket sessions with destination
+  policy, pinned resolution, TLS/SNI, auth-safe handshakes, cancellation and typed protocol
+  failures. `flux-channels` consumes prepared connector bindings through the selected execution
+  system, shares closed event discrimination/projection across transports, and applies bounded
+  reconnect or terminal refusal without logging credentials or payloads. Its public owned plan
+  constructor lets an independent host bind connector-pack's zero-I/O result without rereading
+  provider TOML or owning a second handshake composer.
+
+- **The reusable app and connector-channel host closure is published for independent embedders**
+  (C-497). Auth, LSP, app, server and channel packages retain their existing Rust import and binary
+  names under the repository's `codewandler-flux-*` crates.io namespace, allowing Exchange to bind
+  the generic channel runtime without a path or git dependency.
+
+### Changed
+
+- **A channel context now carries the selected execution system** (C-484). Existing inbound
+  listeners keep their behavior; outbound connector sockets use the explicit placement selected by
+  the host. This is a source-breaking struct change for direct `flux-channels` embedders and is why
+  the release advances the pre-1.0 minor line.
+
+### Fixed
+
+- **The generated-channel work does not restore removed Asterisk plugin surfaces** (C-485). The
+  reusable socket guard contains no connector policy, while the already-published v0.52.0 removal
+  of both ARI and AMI plugin registration remains intact.
+
 ## [0.53.0] - 2026-08-03
 
 ### Added

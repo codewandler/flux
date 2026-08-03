@@ -13,6 +13,8 @@ name = "flux_system"
 [dependencies]
 flux-core.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 url.workspace = true
 # The guarded CDP-pipe spawn (`spawn_debug_pipe`) maps a socket onto the child's fd 3/4 in a
 # `pre_exec` hook — dup2/fcntl only, async-signal-safe.
@@ -21,3 +23,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio.workspace = true
+rcgen = "0.14"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+tokio-rustls = "0.26"

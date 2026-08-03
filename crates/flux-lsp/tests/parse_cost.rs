@@ -3,7 +3,7 @@
 //! Not a correctness test — `document::tests::one_edit_costs_one_parse` owns that. This exists to
 //! produce the before/after number the L-90 acceptance asks to be recorded, on a large buffer, and
 //! is `#[ignore]`d so it never slows the normal suite. Run with:
-//!   cargo test -p flux-lsp --test parse_cost -- --ignored --nocapture
+//!   cargo test -p codewandler-flux-lsp --test parse_cost -- --ignored --nocapture
 use std::time::Instant;
 
 const LARGE: &str = include_str!("fixtures/large.flux");

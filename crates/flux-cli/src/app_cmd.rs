@@ -333,7 +333,7 @@ pub(super) fn assemble_app_execution_environment(
     resource_limits: flux_runtime::ResourceLimits,
 ) -> ExecutionEnvironment {
     assemble_cli_execution_environment(
-        system,
+        system.clone(),
         registry,
         PermissionManager::new(),
         approver,
@@ -749,7 +749,7 @@ pub(super) async fn run_app(
     };
     try_register_fleet(&mut integration_registry, ledger)?;
     let environment = assemble_app_execution_environment(
-        system,
+        system.clone(),
         integration_registry,
         app_run_approver(auto_approve),
         app_workspace,
@@ -779,7 +779,8 @@ pub(super) async fn run_app(
     // channels at all (preserving the plain read-eval-print behavior).
     let run_stdin = channel_decls.is_empty() || channel_decls.iter().any(|c| c.kind == "cli");
     let cancel = tokio_util::sync::CancellationToken::new();
-    flux_channels::serve(app, channels, run_stdin, cancel).await
+    let channel_system: Arc<dyn flux_system::port::ExecutionSystem> = system;
+    flux_channels::serve_on(app, channels, run_stdin, cancel, channel_system).await
 }
 
 /// Resolve the server's auth mode (D-69). `[server] introspect_url` in the layered config turns

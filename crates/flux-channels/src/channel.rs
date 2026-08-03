@@ -3,9 +3,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flux_system::port::ExecutionSystem;
 use tokio_util::sync::CancellationToken;
 
 use crate::Deliverer;
+
+/// Host-owned services supplied to a running channel.
+///
+/// Outbound channels must use `execution_system` for their physical connection. Keeping it in the
+/// context prevents a remote-selected run from silently opening the socket on the local host.
+#[derive(Clone)]
+pub struct ChannelContext {
+    pub deliverer: Arc<dyn Deliverer>,
+    pub cancel: CancellationToken,
+    pub execution_system: Arc<dyn ExecutionSystem>,
+}
 
 /// A long-running event source: a cron schedule, a webhook server, a Slack socket. Each implementation
 /// owns its protocol loop and, per external event, calls `d.deliver(self.name(), payload)` to wake the
@@ -33,4 +45,10 @@ pub trait Channel: Send + Sync {
     /// Run the protocol loop until `cancel` fires. Returning `Ok(())` ends the channel normally; an
     /// `Err` is a fatal channel error that brings the host down.
     async fn start(&self, d: Arc<dyn Deliverer>, cancel: CancellationToken) -> anyhow::Result<()>;
+
+    /// Run with the execution substrate selected by the operator. Existing inbound adapters keep
+    /// their established behavior; outbound adapters override this method and use the substrate.
+    async fn start_with_context(&self, context: ChannelContext) -> anyhow::Result<()> {
+        self.start(context.deliverer, context.cancel).await
+    }
 }

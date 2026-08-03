@@ -894,8 +894,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-flux-app"
+version = "0.53.0"
+dependencies = [
+ "async-trait",
+ "codewandler-flux-agent",
+ "codewandler-flux-cognition",
+ "codewandler-flux-core",
+ "codewandler-flux-events",
+ "codewandler-flux-evidence",
+ "codewandler-flux-flow",
+ "codewandler-flux-lang",
+ "codewandler-flux-orchestrate",
+ "codewandler-flux-policy",
+ "codewandler-flux-provider",
+ "codewandler-flux-runtime",
+ "codewandler-flux-sdk",
+ "codewandler-flux-secret",
+ "codewandler-flux-spec",
+ "codewandler-flux-system",
+ "codewandler-flux-tools",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "codewandler-flux-audio"
 version = "0.53.0"
+
+[[package]]
+name = "codewandler-flux-auth"
+version = "0.53.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "codewandler-flux-policy",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
 
 [[package]]
 name = "codewandler-flux-capabilities"
@@ -920,6 +962,39 @@ dependencies = [
  "toml",
  "ulid",
  "ureq",
+ "url",
+]
+
+[[package]]
+name = "codewandler-flux-channels"
+version = "0.53.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.0",
+ "chrono",
+ "codewandler-flux-app",
+ "codewandler-flux-core",
+ "codewandler-flux-credentials",
+ "codewandler-flux-flow",
+ "codewandler-flux-lang",
+ "codewandler-flux-runtime",
+ "codewandler-flux-server",
+ "codewandler-flux-spec",
+ "codewandler-flux-system",
+ "cron",
+ "futures-util",
+ "quick-xml",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "slack-morphism",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "toml",
+ "tower 0.5.3",
  "url",
 ]
 
@@ -1060,6 +1135,27 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "wasmi",
+]
+
+[[package]]
+name = "codewandler-flux-lsp"
+version = "0.53.0"
+dependencies = [
+ "codewandler-flux-capabilities",
+ "codewandler-flux-cognition",
+ "codewandler-flux-core",
+ "codewandler-flux-flow",
+ "codewandler-flux-lang",
+ "codewandler-flux-provider",
+ "codewandler-flux-runtime",
+ "codewandler-flux-system",
+ "codewandler-flux-tools",
+ "codewandler-flux-web",
+ "serde_json",
+ "tempfile",
+ "text-size",
+ "tokio",
+ "tower-lsp",
 ]
 
 [[package]]
@@ -1272,6 +1368,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-flux-server"
+version = "0.53.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64 0.23.0",
+ "codewandler-flux-a2a",
+ "codewandler-flux-app",
+ "codewandler-flux-auth",
+ "codewandler-flux-capabilities",
+ "codewandler-flux-config",
+ "codewandler-flux-core",
+ "codewandler-flux-credentials",
+ "codewandler-flux-events",
+ "codewandler-flux-flow",
+ "codewandler-flux-lang",
+ "codewandler-flux-lsp",
+ "codewandler-flux-policy",
+ "codewandler-flux-provider",
+ "codewandler-flux-runtime",
+ "codewandler-flux-sdk",
+ "codewandler-flux-system",
+ "codewandler-flux-tools",
+ "codewandler-flux-web",
+ "futures",
+ "rand 0.10.2",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "tower 0.5.3",
+ "tower-http",
+ "webpki-roots 1.0.9",
+ "zip",
+]
+
+[[package]]
 name = "codewandler-flux-skill"
 version = "0.53.0"
 dependencies = [
@@ -1295,8 +1436,13 @@ name = "codewandler-flux-system"
 version = "0.53.0"
 dependencies = [
  "codewandler-flux-core",
+ "futures-util",
  "libc",
+ "rcgen",
+ "rustls",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.30.0",
  "url",
 ]
 
@@ -2291,81 +2437,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flux-app"
-version = "0.53.0"
-dependencies = [
- "async-trait",
- "codewandler-flux-agent",
- "codewandler-flux-cognition",
- "codewandler-flux-core",
- "codewandler-flux-events",
- "codewandler-flux-evidence",
- "codewandler-flux-flow",
- "codewandler-flux-lang",
- "codewandler-flux-orchestrate",
- "codewandler-flux-policy",
- "codewandler-flux-provider",
- "codewandler-flux-runtime",
- "codewandler-flux-sdk",
- "codewandler-flux-secret",
- "codewandler-flux-spec",
- "codewandler-flux-system",
- "codewandler-flux-tools",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "flux-auth"
-version = "0.53.0"
-dependencies = [
- "async-trait",
- "axum",
- "codewandler-flux-policy",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
-]
-
-[[package]]
-name = "flux-channels"
-version = "0.53.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.23.0",
- "chrono",
- "codewandler-flux-core",
- "codewandler-flux-credentials",
- "codewandler-flux-flow",
- "codewandler-flux-lang",
- "codewandler-flux-runtime",
- "codewandler-flux-spec",
- "codewandler-flux-system",
- "cron",
- "flux-app",
- "flux-server",
- "futures-util",
- "quick-xml",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "slack-morphism",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tokio-util",
- "toml",
- "tower 0.5.3",
- "url",
-]
-
-[[package]]
 name = "flux-cli"
 version = "0.53.0"
 dependencies = [
@@ -2376,7 +2447,10 @@ dependencies = [
  "clap_complete",
  "codewandler-flux-a2a",
  "codewandler-flux-agent",
+ "codewandler-flux-app",
+ "codewandler-flux-auth",
  "codewandler-flux-capabilities",
+ "codewandler-flux-channels",
  "codewandler-flux-cognition",
  "codewandler-flux-config",
  "codewandler-flux-core",
@@ -2395,17 +2469,14 @@ dependencies = [
  "codewandler-flux-runtime",
  "codewandler-flux-sdk",
  "codewandler-flux-secret",
+ "codewandler-flux-server",
  "codewandler-flux-skill",
  "codewandler-flux-spec",
  "codewandler-flux-system",
  "codewandler-flux-tools",
  "codewandler-flux-web",
  "crossterm 0.28.1",
- "flux-app",
- "flux-auth",
- "flux-channels",
  "flux-eval",
- "flux-server",
  "flux-tui",
  "futures",
  "jsonschema",
@@ -2459,72 +2530,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
-]
-
-[[package]]
-name = "flux-lsp"
-version = "0.53.0"
-dependencies = [
- "codewandler-flux-capabilities",
- "codewandler-flux-cognition",
- "codewandler-flux-core",
- "codewandler-flux-flow",
- "codewandler-flux-lang",
- "codewandler-flux-provider",
- "codewandler-flux-runtime",
- "codewandler-flux-system",
- "codewandler-flux-tools",
- "codewandler-flux-web",
- "serde_json",
- "tempfile",
- "text-size",
- "tokio",
- "tower-lsp",
-]
-
-[[package]]
-name = "flux-server"
-version = "0.53.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "axum-server",
- "base64 0.23.0",
- "codewandler-flux-a2a",
- "codewandler-flux-capabilities",
- "codewandler-flux-config",
- "codewandler-flux-core",
- "codewandler-flux-credentials",
- "codewandler-flux-events",
- "codewandler-flux-flow",
- "codewandler-flux-lang",
- "codewandler-flux-policy",
- "codewandler-flux-provider",
- "codewandler-flux-runtime",
- "codewandler-flux-sdk",
- "codewandler-flux-system",
- "codewandler-flux-tools",
- "codewandler-flux-web",
- "flux-app",
- "flux-auth",
- "flux-lsp",
- "futures",
- "rand 0.10.2",
- "rcgen",
- "reqwest 0.13.4",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tokio-util",
- "tower 0.5.3",
- "tower-http",
- "webpki-roots 1.0.9",
- "zip",
 ]
 
 [[package]]

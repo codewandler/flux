@@ -1,5 +1,5 @@
 [package]
-name = "flux-lsp"
+name = "codewandler-flux-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

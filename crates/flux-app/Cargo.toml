@@ -1,9 +1,13 @@
 [package]
-name = "flux-app"
+name = "codewandler-flux-app"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "flux-app: the L6 runtime host that runs a multi-agent flux Program (event bus + triggers + journeys)"
+repository.workspace = true
+
+[lib]
+name = "flux_app"
 
 [dependencies]
 flux-core.workspace = true

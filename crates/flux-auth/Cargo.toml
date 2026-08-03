@@ -1,9 +1,13 @@
 [package]
-name = "flux-auth"
+name = "codewandler-flux-auth"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "flux caller identity: IdentityProvider trait, local single-user default, OIDC plugin seam, per-request RequestAuthenticator seam"
+repository.workspace = true
+
+[lib]
+name = "flux_auth"
 
 [features]
 # RFC 7662 token introspection (`Introspector`) + the caching decorator. Off by default so the

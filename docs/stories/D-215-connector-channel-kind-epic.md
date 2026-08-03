@@ -47,6 +47,8 @@ makes its **events** deliverable — and makes the reply to an event an ordinary
 - **D-218** — the reply wired to the connector Tool pack; `adapters/slack.rs` reduced to a transport
 - **D-219** — operator allow-lists keyed on the binding's declared payload symbols
 - **D-220** — Socket Mode as a transport under the binding driver
+- **C-481…C-488** — generic declarative RFC 6455 bindings, guarded selected-system execution and
+  durable Exchange subscriptions, with Asterisk ARI as the first proof
 
 ## Acceptance
 
@@ -82,8 +84,12 @@ makes its **events** deliverable — and makes the reply to an event an ordinary
   `webhook`/`http`, `schedule`/`cron`, `startup`, `cli`, `a2a`. A connector describes a vendor; it never
   describes a loop. The consumer repository's vision forbids it shipping a runtime, and this seam is what
   keeps that true while still deleting the vendor code from here.
-- **Two things the connector side cannot describe yet**, both filed as findings in the design and both
-  bounding this epic's first release: `EventDecl::when` cannot express *absence*, so Slack's
+- **Generic RFC 6455 and Slack Socket Mode are different transports.** C-481's design adds a
+  declarative socket connect block for ordinary service-relative handshakes such as Asterisk ARI.
+  D-220 remains the vendor-specific Slack URL-ticket/envelope-ack loop that feeds raw JSON into this
+  binding driver; it is not the generic handshake implementation.
+- **Two Slack-specific things the connector side cannot describe yet**, both filed as findings in the
+  design and both bounding this epic's first release: `EventDecl::when` cannot express *absence*, so Slack's
   `bot_id`/`subtype` loop guard is not reproducible and the `message` event stays unusable
   (`app_mention` works); and `ChannelBinding` has no `challenge` declaration, so `C-293`'s handshake
   hook has no manifest parameters to read — which is why D-220 (Socket Mode) is a child of this epic

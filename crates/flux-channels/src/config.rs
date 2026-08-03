@@ -190,6 +190,12 @@ pub struct ConnectorSettings {
     /// record separates key from value with `:`, the same grammar `{ "a": 1 }` takes anywhere else.
     #[serde(default)]
     pub credentials: BTreeMap<String, String>,
+    /// Non-secret connection settings used by endpoint and socket-query bindings.
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
+    /// Operator-admitted private hosts for this channel. An empty list keeps the public-only guard.
+    #[serde(default)]
+    pub private_hosts: Vec<String>,
 
     // ── the `webhook` transport's own settings ──
     /// Address to bind, e.g. `"0.0.0.0:8790"`. Required for a `webhook`-transport binding.

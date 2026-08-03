@@ -15,6 +15,14 @@
 
 ## [Unreleased]
 
+### New
+
+- **Generated connector event streams can now run through Flux's guarded placement.** A connector's
+  declared WebSocket binding uses the same destination controls whether it runs locally or on a
+  selected remote system, keeps event names to the connector's declared closed set, closes cleanly
+  on cancellation, and reconnects only for failures that may recover. Credentials and raw event
+  payloads stay out of logs.
+
 ## [0.53.0] - 2026-08-03
 
 ### New

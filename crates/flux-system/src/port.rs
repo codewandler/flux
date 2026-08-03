@@ -92,6 +92,7 @@ use crate::net::{
     BindExposure, DatagramEndpoint, DialTarget, InboundLimits, NetworkListener, NetworkStream,
     PrivateNetAllow,
 };
+use crate::websocket::{GuardedWebSocketSession, WebSocketConnect};
 use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead, System};
 use std::net::SocketAddr;
 
@@ -214,6 +215,19 @@ pub trait GuardedProcess: Send + Sync {
 /// private-range checks and address pinning. Implementations must not derive a second hostname or
 /// range policy; a non-native substrate enforces the same contract at its own physical boundary.
 pub trait GuardedNetwork: Send + Sync {
+    /// Resolve, guard, pin, and handshake a WebSocket on this execution substrate.
+    ///
+    /// The default is a refusal: a substrate must opt in explicitly, and may not silently fall
+    /// back to a socket opened by the caller's local process.
+    fn open_websocket_scoped<'a>(
+        &'a self,
+        connect: &'a WebSocketConnect,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, GuardedWebSocketSession> {
+        let _ = (connect, allow);
+        Box::pin(async { Err(deny("open a guarded WebSocket")) })
+    }
+
     /// Guard and open `target`, returning an opaque connection rather than a native socket.
     fn dial_scoped<'a>(
         &'a self,
@@ -522,6 +536,15 @@ impl GuardedProcess for System {
 }
 
 impl GuardedNetwork for System {
+    fn open_websocket_scoped<'a>(
+        &'a self,
+        connect: &'a WebSocketConnect,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, GuardedWebSocketSession> {
+        let _ = self;
+        Box::pin(crate::websocket::open_native(connect, allow))
+    }
+
     fn dial_scoped<'a>(
         &'a self,
         target: &'a DialTarget,

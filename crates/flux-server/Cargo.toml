@@ -1,9 +1,13 @@
 [package]
-name = "flux-server"
+name = "codewandler-flux-server"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "flux HTTP API daemon: create/drive/inspect agent sessions over REST (axum)"
+repository.workspace = true
+
+[lib]
+name = "flux_server"
 
 [features]
 # Pull in flux-auth's RFC 7662 introspection so `PrincipalAuth::from_introspection` (the one

@@ -52,9 +52,10 @@ pub mod rooms;
 #[cfg(feature = "slack")]
 pub use adapters::SlackChannel;
 pub use adapters::{
-    build_channels, A2aChannel, ConnectorChannel, RoomChannel, ScheduleChannel, WebhookChannel,
+    build_channels, A2aChannel, ConnectorChannel, ConnectorSocketPlan, ConnectorValueSelector,
+    ConnectorValueSource, RoomChannel, ScheduleChannel, WebhookChannel,
 };
-pub use channel::Channel;
+pub use channel::{Channel, ChannelContext};
 pub use config::{MediaSettings, RoomSettings, DEFAULT_ROOM_NICK};
 pub use deliver::{AppDeliverer, Deliverer};
-pub use host::serve;
+pub use host::{serve, serve_on};

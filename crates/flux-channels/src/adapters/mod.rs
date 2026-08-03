@@ -9,7 +9,9 @@ mod slack;
 mod webhook;
 
 pub use a2a::A2aChannel;
-pub use connector::ConnectorChannel;
+pub use connector::{
+    ConnectorChannel, ConnectorSocketPlan, ConnectorValueSelector, ConnectorValueSource,
+};
 pub use room::RoomChannel;
 pub use schedule::ScheduleChannel;
 #[cfg(feature = "slack")]

@@ -266,6 +266,17 @@ pub trait Delegate: Send + Sync {
 
     // -- network ----------------------------------------------------------------------------------
 
+    /// Open and host a guarded WebSocket on the far side. The returned handle remains remote-owned;
+    /// reads and close operations must travel through that handle rather than falling back locally.
+    fn open_websocket_scoped<'a>(
+        &'a self,
+        connect: &'a crate::websocket::WebSocketConnect,
+        allow: &'a PrivateNetAllow,
+    ) -> Answered<'a, crate::websocket::GuardedWebSocketSession> {
+        let _ = (connect, allow);
+        unserved("open a guarded WebSocket")
+    }
+
     /// Open an egress-guarded connection on the far side.
     fn dial_scoped<'a>(
         &'a self,
@@ -583,6 +594,14 @@ impl GuardedProcess for RemoteSystem {
 }
 
 impl GuardedNetwork for RemoteSystem {
+    fn open_websocket_scoped<'a>(
+        &'a self,
+        connect: &'a crate::websocket::WebSocketConnect,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, crate::websocket::GuardedWebSocketSession> {
+        Box::pin(async move { settle(self.delegate.open_websocket_scoped(connect, allow).await) })
+    }
+
     fn dial_scoped<'a>(
         &'a self,
         target: &'a DialTarget,
@@ -725,6 +744,14 @@ fn relay<T>(result: Result<T>) -> Delivered<T> {
 }
 
 impl<T: GuardedSubstrate + ?Sized> Delegate for Loopback<T> {
+    fn open_websocket_scoped<'a>(
+        &'a self,
+        connect: &'a crate::websocket::WebSocketConnect,
+        allow: &'a PrivateNetAllow,
+    ) -> Answered<'a, crate::websocket::GuardedWebSocketSession> {
+        Box::pin(async move { relay(self.substrate.open_websocket_scoped(connect, allow).await) })
+    }
+
     fn run_with_env<'a>(
         &'a self,
         argv: &'a [String],

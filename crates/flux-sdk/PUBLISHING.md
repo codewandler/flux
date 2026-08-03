@@ -1,11 +1,12 @@
 # Publishing to crates.io — runbook
 
-The publish closure is **29 crates**: the `flux-sdk` + `flux-providers` SDK surface, the plugin
+The publish closure is **34 crates**: the `flux-sdk` + `flux-providers` SDK surface, the plugin
 authoring surface (`flux-datasource`, `flux-credentials`, `flux-plugin`, `flux-plugin-protocol`), and the
 standalone contracts and capabilities that external consumers depend on directly — `flux-a2a`,
 `flux-audio`, `flux-config`, `flux-capabilities`, and `flux-web` (the web pack: `http.request`,
-`web.fetch`, `web.crawl`, `browser.*`). Publishing in dependency order means every dependent resolves
-its deps from the index.
+`web.fetch`, `web.crawl`, `browser.*`) — plus the reusable app/channel host closure (`flux-auth`,
+`flux-lsp`, `flux-app`, `flux-server`, `flux-channels`). Publishing in dependency order means every
+dependent resolves its deps from the index.
 The authoritative list is the `CRATES` array in `scripts/publish-crates-io.sh` — this doc mirrors it.
 
 > Status: **live.** The SDK closure (20 crates) shipped in v0.9.3. The plugin authoring surface (4
@@ -37,12 +38,11 @@ flux-core = { package = "codewandler-flux-core", version = "0.9.3", path = "crat
 
 The nested `plugins/` workspace carries the same `package =` key for the closure crates it references by
 path. `flux-codegate` strips the `codewandler-` prefix before layer classification. Non-closure crates
-(`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-auth`, `flux-channels`, `flux-eval`,
-`flux-codegate`, `flux-lsp`) stay **bare and path-only** — not published.
+(`flux-cli`, `flux-tui`, `flux-eval`, `flux-codegate`) stay **bare and path-only** — not published.
 
 ## 2. The closure & topological publish order
 
-**29 crates.** Each crate's dependencies precede it (machine-verified — see the guard noted
+**34 crates.** Each crate's dependencies precede it (machine-verified — see the guard noted
 below). This list mirrors the `CRATES` array in `scripts/publish-crates-io.sh` in order — keep the two in sync. Publish the
 `codewandler-*` package for each:
 
@@ -78,6 +78,12 @@ below). This list mirrors the `CRATES` array in `scripts/publish-crates-io.sh` i
     flux-sdk because the SDK's optional `providers` feature (D-153) depends on it
 28. flux-sdk            (→ orchestrate, agent, flow, cognition, …; optional: providers, credentials)
 29. flux-web            (→ core, runtime, spec, system, plugin, markdown, datasource, evidence)  — the web pack
+30. flux-auth           (→ policy)
+31. flux-lsp            (→ flow, capabilities, web, runtime, system, …) — library import remains
+    `flux_lsp`; its distributed executable remains `flux-lsp`
+32. flux-app            (→ agent, orchestrate, flow, cognition, runtime, …)
+33. flux-server         (→ app, auth, lsp, sdk, web, …)
+34. flux-channels       (→ app, server, system, credentials, flow, …) — reusable inbound channel host
 ```
 
 **Not in this list: `host-kit`.** Since C-146 it ships with the plugin pack from
@@ -236,6 +242,5 @@ silently forgiven.
 
 ## 7. Follow-on (out of scope here)
 
-The rest of the platform (`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-auth`,
-`flux-channels`, `flux-eval`, `flux-codegate`, `flux-lsp`) stays path-only and unpublished — a
-separate, later decision.
+The remaining product binaries and internal tooling (`flux-cli`, `flux-tui`, `flux-eval`,
+`flux-codegate`) stay path-only and unpublished — a separate, later decision.
