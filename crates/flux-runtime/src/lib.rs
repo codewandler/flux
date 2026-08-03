@@ -2193,6 +2193,16 @@ pub struct LiveToolCatalog {
     latest: Arc<Mutex<Arc<ToolRegistry>>>,
 }
 
+/// A host-owned source that updates the live operation catalogue at a turn boundary.
+///
+/// Implementations may perform IO, but they may only publish through [`LiveToolCatalog`]. The flow
+/// engine awaits this hook after acquiring its single-turn gate and before taking C-318's immutable
+/// generation snapshot, so a refresh can never change the schemas or handlers inside a live turn.
+#[async_trait]
+pub trait CatalogRefresher: Send + Sync {
+    async fn refresh(&self, catalog: &LiveToolCatalog) -> Result<()>;
+}
+
 impl LiveToolCatalog {
     pub fn new(initial: ToolRegistry) -> Self {
         Self {

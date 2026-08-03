@@ -790,7 +790,7 @@ impl flux_web::RecordSink for BackendRecordSink {
 pub(super) fn seed_provider_env_secrets(redactor: &flux_secret::Redactor) {
     let secret_refs: Vec<flux_secret::Ref> = flux_credentials::provider_env_keys()
         .iter()
-        .chain(["FLUX_SECRET"].iter())
+        .chain(["FLUX_SECRET", "FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN"].iter())
         .map(|k| flux_secret::Ref::env(*k))
         .collect();
     let declined =
@@ -1543,6 +1543,9 @@ struct EngineParts {
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     /// Host-owned responder installed on interactive surfaces only.
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
+    /// C-503's Exchange effective-catalogue source, absent unless the operator configured both
+    /// origin and Service Account token.
+    catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>>,
 }
 
 /// Capture the session-stable project layers shared by ordinary CLI assembly and `context show`.
@@ -1604,6 +1607,7 @@ async fn assemble_engine(
         model_invoked_skills,
         surface_sink,
         user_interaction,
+        catalog_refresher,
     } = parts;
     let flow = open_flow_store(events.clone())?;
     let spec = AgentSpec {
@@ -1653,6 +1657,9 @@ async fn assemble_engine(
     }
     if let Some(interaction) = user_interaction {
         agent = agent.with_user_interaction(interaction);
+    }
+    if let Some(refresher) = catalog_refresher {
+        agent = agent.with_catalog_refresher(refresher);
     }
     agent.loop_host.set_model_stages(model_stages);
     let env_budget = match std::env::var("FLUX_TURN_TOKEN_BUDGET") {
@@ -1955,6 +1962,56 @@ pub(super) async fn build_agent_with(
     }
     let plugin_groups = integrations.groups;
     let mut ambient_signals = integrations.ambient_signals;
+
+    // C-503: one native Service Account client, compiled into the Flux binary. The two values are
+    // host startup configuration and never operation/model input. A partial or unavailable binding
+    // leaves core Flux intact and advertises no Exchange operation; the turn-boundary refresher
+    // retries and publishes only complete effective generations through C-318's live catalogue.
+    let catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> = match (
+        std::env::var("FLUX_EXCHANGE_URL").ok(),
+        std::env::var("FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN").ok(),
+    ) {
+        (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
+            match flux_web::exchange::ExchangeClient::new(&url, &token, redactor.clone()) {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    if let Err(error) = client.refresh_registry(&mut registry).await {
+                        eprintln!(
+                            "{}",
+                            style::dim(&format!(
+                                "(Exchange catalogue unavailable at startup: {})",
+                                redactor.redact(&error.to_string())
+                            ))
+                        );
+                    }
+                    Some(Arc::new(flux_web::exchange::ExchangeCatalogRefresher::new(
+                        client,
+                    )))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!(
+                            "(Exchange binding refused: {})",
+                            redactor.redact(&error.to_string())
+                        ))
+                    );
+                    None
+                }
+            }
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!(
+                "{}",
+                style::dim(
+                    "(Exchange disabled: set both FLUX_EXCHANGE_URL and \
+                     FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN)"
+                )
+            );
+            None
+        }
+    };
     // A-96: the `consult` op's group surfaces only when a target is configured, exactly like the
     // `endpoint` ambient signal above — computed once here from config, never re-probed per turn,
     // so surfacing can't churn the prompt prefix mid-session (A-95).
@@ -2125,6 +2182,7 @@ pub(super) async fn build_agent_with(
             model_invoked_skills,
             surface_sink,
             user_interaction,
+            catalog_refresher,
         },
         &cwd,
         &cfg,

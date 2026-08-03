@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Flux now embeds the Exchange Service Account client for official integrations** (C-503).
+  Operator-only environment configuration binds one Exchange origin and bearer; its authenticated
+  effective catalogue is adopted between turns and one-shot operations run through Exchange's HTTP
+  `invoke` contract. Exchange retains credential, tenant, connection, grant and runtime authority.
+  An outage withdraws only Exchange operations, leaves core Flux usable, and never selects a local
+  or plugin fallback. Streaming, subscriptions, cancellation frames, terminal lifecycle and leases
+  remain outside this first slice.
+
 - **Running REPL sessions can adopt a plugin's refreshed operation catalog at the next turn
   boundary** (C-318). `/plugin-refresh <name>` publishes one atomic generation shared by prompting,
   validation, authorization and dispatch. Mid-turn and already-running calls retain their original

@@ -257,7 +257,7 @@ function TopologySlide({topology, setTopology}) {
         {shared ? (
           <>
             <p><strong>Today:</strong> Exchange can invoke granted HTTP connector operations for a signed-in tenant.</p>
-            <p><strong>Gap:</strong> Flux does not yet embed the Exchange client or project its effective catalogue.</p>
+            <p><strong>Ships:</strong> Flux embeds the Exchange client and projects one Service Account&apos;s effective catalogue between turns.</p>
           </>
         ) : (
           <>

@@ -17,6 +17,7 @@ pdf = ["dep:pdf-extract"]
 [dependencies]
 flux-core.workspace = true
 flux-runtime.workspace = true
+flux-secret.workspace = true
 flux-spec.workspace = true
 flux-system.workspace = true
 # For the shared `EgressAudit` seam (a `PrivateNetAdmit` is emitted when a request is admitted to a

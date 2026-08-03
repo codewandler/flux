@@ -386,9 +386,9 @@ canonical Service Account authentication, an HTTP invoke endpoint, durable workf
 supervised generated connector WebSocket channels delivered through authenticated `/api/subscribe`.
 Three facts decide whether you can plan on it:
 
-- **Flux does not yet embed the Exchange client.** The authenticated effective-catalogue contract and
-  turn-boundary projection are the next useful HTTP slice; current Flux releases cannot mount the
-  Exchange operations into an agent turn.
+- **Flux embeds the one-shot Exchange client.** With an operator-configured origin and Service
+  Account token, authenticated effective-catalogue operations are mounted at turn boundaries and
+  invoked through Exchange. Subscribe and lifecycle consumption remain later slices.
 - **A multi-tenant deployment refuses to execute on the host.** HTTP is shareable because the effect
   leaves the machine; process spawning, container exec and raw sockets consume the host's own
   identity and filesystem, so a shared deployment serves only HTTP and remote runtimes and refuses
