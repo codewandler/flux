@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.55.0] - 2026-08-03
+
 ### New
 
 - **Config files can now bound delegated agent fan-out.** Set `[limits] max_live_agents` to cap the

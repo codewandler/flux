@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-08-03
+
 ### Added
 
 - **File-configured hosts can now bound delegated fan-out with `[limits] max_live_agents`**

@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-08-03
+
 ### New
 
 - **Config files can now bound delegated agent fan-out.** Set `[limits] max_live_agents` to cap the
