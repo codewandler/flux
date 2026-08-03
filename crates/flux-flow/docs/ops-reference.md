@@ -404,7 +404,7 @@ argv plus a fixed path set is authority that cannot be mistyped.
 |---|---|---|
 | `release_plan` | | The last `v*` tag, the commit subjects + diffstat since it, and the **host's** bump and next version |
 | `release_verify_versions` | | `scripts/check-crate-versions.sh` (fixed argv); errors with the offending protocol-line crate named |
-| `release_parse_notes` | `text` | Strictly parse the scribe's textual JSON contract into typed release-note fields; rejects wrappers and schema drift; pure, with no external authority |
+| `release_parse_notes` | `text` | Strictly parse the scribe's textual JSON contract into typed release-note fields; normalizes one canonical `json` fence, rejects surrounding prose and schema drift; pure, with no external authority |
 | `changelog_insert` | `file, body[, section][, apply]` | Insert markdown under a changelog's `## [<section>]` heading, deterministically and idempotently; `apply` defaults to false (preview) |
 | `release_cut` | `bump[, apply]` | `scripts/cut-release.sh <bump>` (fixed argv), stopping at the **local** annotated tag; never pushes, never publishes; `apply` defaults to false |
 

@@ -505,7 +505,6 @@ async fn an_unbumped_protocol_line_crate_halts_before_anything_is_written() {
 async fn malformed_scribe_text_halts_before_any_changelog_or_tag() {
     let valid = scribe_reply("patch");
     let replies = [
-        format!("```json\n{valid}\n```"),
         format!("Here are the notes: {valid}"),
         format!("{valid}\nHope this helps."),
         r#"{"changelog":"c","whats_new":"w","bump_opinion":"major","bump_reason":"r"}"#.into(),
@@ -540,6 +539,26 @@ async fn malformed_scribe_text_halts_before_any_changelog_or_tag() {
         assert_eq!(fixture.head_subject(), before_head);
         assert_eq!(fixture.tags(), vec!["v0.37.0"]);
     }
+}
+
+/// The hosted Haiku scribe wrapped an otherwise exact object in the canonical JSON Markdown fence.
+/// The host may normalize that one transport wrapper, but the exact inner schema still applies.
+#[tokio::test]
+async fn a_canonical_json_fence_is_normalized_before_the_exact_schema_check() {
+    let fixture = Fixture::new(
+        "fenced-json",
+        &["fix(widget): restore cache invalidation"],
+        true,
+        CutStub::Succeeds,
+    );
+    let before_changelog = fixture.read("CHANGELOG.md");
+    let reply = format!("```json\n{}\n```", scribe_reply("patch"));
+
+    let outcome = run_release_flow_with_reply(&fixture, false, reply).await;
+    let summary = outcome.expect_ok();
+    assert!(summary.contains("0.37.1"), "got: {summary}");
+    assert_eq!(fixture.read("CHANGELOG.md"), before_changelog);
+    assert_eq!(fixture.tags(), vec!["v0.37.0"]);
 }
 
 /// A red gate inside `cut-release.sh` leaves **no tag** and no phantom version section — the C-147

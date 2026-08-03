@@ -469,7 +469,7 @@ argv and a fixed path set are authority you cannot mistype.
 |---|---|---|
 | `release_plan` | | The last `v*` tag, the commit subjects and diffstat since it, and the **host's** bump decision + next version |
 | `release_verify_versions` | | Run `scripts/check-crate-versions.sh` (fixed argv); errors with the offending protocol-line crate named |
-| `release_parse_notes` | `text` | Strictly parse the scribe's textual JSON contract into typed release-note fields; rejects wrappers and schema drift; pure, with no external authority |
+| `release_parse_notes` | `text` | Strictly parse the scribe's textual JSON contract into typed release-note fields; normalizes one canonical `json` fence, rejects surrounding prose and schema drift; pure, with no external authority |
 | `changelog_insert` | `file, body, [section], [apply]` | Insert markdown under a changelog's `## [<section>]` heading, deterministically and idempotently. `apply` defaults to false (preview) |
 | `release_cut` | `bump, [apply]` | Cut with `scripts/cut-release.sh <bump>` (fixed argv), stopping at the **local** annotated tag. `apply` defaults to false |
 

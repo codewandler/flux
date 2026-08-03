@@ -184,9 +184,12 @@ half outside the model-authored program means a bug in the program cannot publis
 - 2026-08-03 — Hosted preview `30833603707` passed the complete live smoke under bubblewrap, then
   failed closed before writing or promotion because `task()` returned JSON as text and the flow read
   it as an object. `release_parse_notes` now makes that boundary explicit and strict. Unit tests
-  reject fences, prose, missing/extra fields, empty engineering notes and invalid bump opinions; the
+  reject prose, missing/extra fields, empty engineering notes and invalid bump opinions; the
   shipped-flow journey proves malformed scribe text leaves both changelogs and every ref untouched.
-  Internal-only releases retain their documented ability to omit customer-facing prose.
+  Preview `30834939427` then passed the complete live smoke and proved Haiku wraps an otherwise exact
+  object in a canonical `json` fence despite the no-fence instruction. The host now normalizes only
+  that exact transport wrapper before applying the same schema. Internal-only releases retain their
+  documented ability to omit customer-facing prose.
 - 2026-08-03 — **the unattended path is implemented in source and the story is now `in-progress`,
   but Acceptance item 1 remains deliberately unchecked until a hosted run dogfoods it.**
   `.github/workflows/release-flow.yml` now runs automatically only for pushes to `release`, forces

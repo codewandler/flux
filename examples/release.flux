@@ -73,7 +73,8 @@ anything breaking, phrased as the action to take.
 your answer cannot change it. If you disagree, say why in `bump_reason`; the run will surface it.
 """) })
   # `task` returns text even when the prompt requests JSON. Parse it through a pure, strict host op
-  # so prose/fences/schema drift halt here instead of becoming a confusing field-access failure.
+  # so prose/schema drift halt here instead of becoming a confusing field-access failure. The host
+  # normalizes one canonical `json` fence before applying the same exact schema.
   $notes = release_parse_notes({ text: $notes_text })
   $changelog = $notes.changelog
   $whats_new = $notes.whats_new

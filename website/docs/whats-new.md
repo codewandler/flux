@@ -22,7 +22,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 ### Fixed
 
 - **Release automation now stops clearly when generated notes have the wrong shape.** Unexpected
-  wrappers or missing fields are rejected before a changelog, commit, or tag can be changed.
+  prose or missing fields are rejected before a changelog, commit, or tag can be changed; a standard
+  JSON code block is normalized safely.
 
 ## [0.55.0] - 2026-08-03
 

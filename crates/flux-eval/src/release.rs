@@ -355,7 +355,9 @@ impl Tool for ReleaseVerifyVersionsTool {
 ///
 /// `task()` intentionally returns text, even when its prompt requests JSON. The host parses that
 /// text at one explicit boundary before Flux-Lang reads fields from it. Unknown and missing fields
-/// fail closed, as do Markdown fences and explanatory prose around the JSON object.
+/// fail closed, as does explanatory prose around the JSON object. One canonical `json` Markdown
+/// fence is normalized because the hosted scribe produced that exact transport wrapper despite the
+/// no-fence instruction; the object inside still crosses the same strict schema.
 #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReleaseNotes {
@@ -374,7 +376,16 @@ enum BumpOpinion {
 
 /// Parse and validate the release scribe's textual result.
 fn parse_release_notes(text: &str) -> Result<ReleaseNotes> {
-    let notes: ReleaseNotes = serde_json::from_str(text)
+    let text = text.trim();
+    let json = text
+        .strip_prefix("```json\n")
+        .and_then(|body| body.strip_suffix("\n```"))
+        .or_else(|| {
+            text.strip_prefix("```json\r\n")
+                .and_then(|body| body.strip_suffix("\r\n```"))
+        })
+        .unwrap_or(text);
+    let notes: ReleaseNotes = serde_json::from_str(json)
         .map_err(|e| Error::Other(format!("release_parse_notes: invalid scribe JSON: {e}")))?;
     validate_release_notes(notes)
 }
@@ -413,10 +424,11 @@ impl Tool for ReleaseParseNotesTool {
         ToolSpec {
             name: "release_parse_notes".into(),
             description: "Validate the release-scribe task's output as one exact JSON object. \
-                          Accepts raw text or Flux-Lang's decoded JSON value; rejects prose, code \
-                          fences, missing/extra fields, empty engineering notes, and bump opinions \
-                          outside patch|minor. Returns {changelog, whats_new, bump_opinion, \
-                          bump_reason}. Pure: grants no filesystem, process, or network authority."
+                          Accepts raw text, one canonical json Markdown fence, or Flux-Lang's \
+                          decoded JSON value; rejects surrounding prose, missing/extra fields, \
+                          empty engineering notes, and bump opinions outside patch|minor. Returns \
+                          {changelog, whats_new, bump_opinion, bump_reason}. Pure: grants no \
+                          filesystem, process, or network authority."
                 .into(),
             input_schema: tool_input_schema::<ReleaseParseNotesInput>(),
             output_schema: Some(tool_output_schema::<ReleaseNotes>()),
@@ -847,14 +859,20 @@ mod tests {
         .unwrap();
         assert!(internal_only.whats_new.is_empty());
         assert!(internal_only.bump_reason.is_empty());
+
+        let fenced = parse_release_notes(&format!(
+            "```json\n{}\n```",
+            r#"{"changelog":"c","whats_new":"w","bump_opinion":"minor","bump_reason":"breaking"}"#
+        ))
+        .unwrap();
+        assert_eq!(fenced.bump_opinion, BumpOpinion::Minor);
     }
 
     #[test]
-    fn release_notes_reject_any_model_wrapper_or_schema_drift() {
+    fn release_notes_reject_prose_wrappers_or_schema_drift() {
         let valid =
             r#"{"changelog":"c","whats_new":"w","bump_opinion":"minor","bump_reason":"breaking"}"#;
         for invalid in [
-            format!("```json\n{valid}\n```"),
             format!("Here are the notes: {valid}"),
             format!("{valid}\nHope this helps."),
             r#"{"changelog":"c","whats_new":"w","bump_opinion":"major","bump_reason":"breaking"}"#.into(),
