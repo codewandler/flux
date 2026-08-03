@@ -181,6 +181,12 @@ workflows and runs the public Release verifier before reporting success. Keeping
 half outside the model-authored program means a bug in the program cannot publish directly.
 
 ## Progress
+- 2026-08-03 — Automatic release run `30840283679` proved the Node/Docusaurus repair, passed the
+  live smoke, scribe parser, changelog roll and embedded-doc regeneration, then failed safely in the
+  full gate. `secure_defaults::a_supervised_client_is_unchanged` assumed no ambient sandbox policy,
+  while the cut correctly inherited `FLUX_SANDBOX=require` from the outer Flux confinement. The SDK
+  test binary now serializes, clears and restores all sandbox environment keys. Both an ordinary run
+  and an explicit outer-confined reproduction pass; no candidate, tag, or release ref moved.
 - 2026-08-03 — Automatic release run `30837261195` passed the hosted sandbox proof, release build,
   nine-leg live smoke, strict scribe parser, and changelog insertion, then failed safely inside the
   transactional cut because the fresh runner had no local Docusaurus binary. `cut-release.sh`

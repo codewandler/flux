@@ -24,6 +24,51 @@ use flux_sdk::sandbox::SandboxMode;
 use flux_sdk::{Client, ResourceLimits, Sandbox, SandboxSettings};
 use std::sync::Arc;
 
+/// Keep this integration binary deterministic when its parent is itself a confined Flux process.
+///
+/// The automatic release gate runs under `FLUX_SANDBOX=require` and `FLUX_SANDBOXED=1`. These tests
+/// exercise the SDK's *unset ambient posture* defaults, so inheriting that outer process policy
+/// changes the subject under test. The mutex also keeps the six parallel tests from racing while
+/// the process-wide environment is cleared and restored.
+struct CleanSandboxEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl CleanSandboxEnv {
+    fn enter() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        const KEYS: &[&str] = &[
+            "FLUX_SANDBOX",
+            "FLUX_SANDBOX_NET",
+            "FLUX_SANDBOX_WRITABLE",
+            "FLUX_SANDBOXED",
+            "FLUX_BWRAP_BIN",
+            "FLUX_SANDBOX_EXEC_BIN",
+        ];
+        let lock = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let saved = KEYS
+            .iter()
+            .map(|&key| (key, std::env::var_os(key)))
+            .collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+impl Drop for CleanSandboxEnv {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 struct StubProvider;
 
 /// The smallest custom policy that proves an opaque approver can remove every human decision.
@@ -89,6 +134,7 @@ fn client_posture(client: &Client) -> Sandbox {
 /// `resource_limits` started at `ResourceLimits::new()` — unbounded.
 #[test]
 fn an_auto_approved_client_is_confined_and_bounded() {
+    let _env = CleanSandboxEnv::enter();
     let dir = temp_root("confined-and-bounded");
     // The exact chain the crate-root doc example shows, plus a model: no `with_sandbox`, no
     // `resource_limits`. This is the "documented happy path" the story names.
@@ -121,6 +167,7 @@ fn an_auto_approved_client_is_confined_and_bounded() {
 /// profile — when the prompt is gone, destination scope is part of what is left constraining the run.
 #[test]
 fn the_autonomous_posture_closes_the_sandbox_network() {
+    let _env = CleanSandboxEnv::enter();
     let dir = temp_root("network-closed");
     let client = Client::builder()
         .model("mock")
@@ -142,6 +189,7 @@ fn the_autonomous_posture_closes_the_sandbox_network() {
 /// conservatively. An embedder that really has an outer boundary can still state both overrides.
 #[test]
 fn an_opaque_approver_cannot_claim_supervision_by_default() {
+    let _env = CleanSandboxEnv::enter();
     let dir = temp_root("opaque-approver");
     let client = Client::builder()
         .model("mock")
@@ -168,6 +216,7 @@ fn an_opaque_approver_cannot_claim_supervision_by_default() {
 /// wins over the implied raise — a pinned posture is a decision, not an omission.
 #[test]
 fn an_explicit_sandbox_decision_still_wins() {
+    let _env = CleanSandboxEnv::enter();
     let dir = temp_root("explicit-off");
     let client = Client::builder()
         .model("mock")
@@ -193,6 +242,7 @@ fn an_explicit_sandbox_decision_still_wins() {
 /// `ResourceLimits::from_config`; only silence selects the posture preset.
 #[test]
 fn explicit_resource_limits_win_over_the_autonomous_preset() {
+    let _env = CleanSandboxEnv::enter();
     let dir = temp_root("explicit-resource-limits");
     let client = Client::builder()
         .model("mock")
@@ -216,6 +266,7 @@ fn explicit_resource_limits_win_over_the_autonomous_preset() {
 /// approval boundary to fall back on.
 #[test]
 fn a_supervised_client_is_unchanged() {
+    let _env = CleanSandboxEnv::enter();
     let dir = temp_root("supervised");
     let client = Client::builder()
         .model("mock")
