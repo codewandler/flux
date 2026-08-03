@@ -71,6 +71,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The opt-in PDF parser's tests now run in the exhaustive feature gate** (C-496). The `pdf`
+  feature is explicitly classified and exercised even though the default workspace deliberately
+  keeps the parser out of its dependency graph.
+
 - **Embedded release documentation is independent of its checkout path** (C-495). Docusaurus now
   receives path-independent sidebar, stylesheet, theme, local-plugin, generated-module, and Babel
   helper identifiers; the archive builder refuses any client bundle that contains the checkout
