@@ -199,17 +199,17 @@ current feature rather than an official outbound integration executor. See
   socket, checks the signature with the credential it owns, and emits typed events a `trigger`
   routes to a journey.
 
-> **Current seam:** Exchange `invoke` is built for signed-in humans and Service Accounts whose tenant
-> has a connection and an admitting grant. Generated socket channels can publish their closed
-> declared event sets to authenticated `/api/subscribe`. General subscribe does not exist beyond
-> that socket slice. Flux itself has no Exchange client binding, rich outbound runtime dispatch and
-> the general stream/lease protocol are not built, and today's native plugin pack remains the
-> compatibility route.
+> **Current seam:** Flux's embedded client authenticates as one Service Account, projects its
+> effective catalogue at turn boundaries, and calls Exchange's one-shot HTTP `invoke` route.
+> Configure it only through `FLUX_EXCHANGE_URL` and
+> `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN`; tenant, connection, credential, grant and runtime remain
+> Exchange-owned. Generated socket channels can publish their closed declared event sets to
+> authenticated `/api/subscribe`, but Flux does not yet consume subscribe, streaming, cancellation,
+> terminal lifecycle or leases. Today's native plugin pack remains a temporary compatibility route
+> for adapters that have not completed migration.
 
-C-503 will add the embedded Exchange client for an authenticated effective catalogue and one-shot
-HTTP invocation. Lifecycle follows later. If Exchange is absent or unavailable, official external
-integrations are unavailable; Flux does not change placement or fall back. Core Flux remains useful
-without Exchange.
+If Exchange is absent or unavailable, official external operations are withdrawn; Flux does not
+change placement or fall back. Core Flux remains useful without Exchange.
 
 ## Embedding the exchange in your own product
 

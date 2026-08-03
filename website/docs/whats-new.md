@@ -14,17 +14,31 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Flux can now use operations granted to an Exchange Service Account.** Set the Exchange URL and
+  Service Account token in the host environment. Flux refreshes the available operations between
+  turns and sends one-shot calls to Exchange, while Exchange keeps credentials and deployment
+  choices. If Exchange goes offline, core Flux tools keep working and external operations disappear.
+
 - **Flux programs can read headers and other map keys that contain punctuation directly.** Use
   familiar quoted access such as `$response.headers["content-type"]`; append `?` for optional access.
   Quoted numeric keys remain object keys, while unquoted numeric brackets remain list indexes.
 
 ### Improved
 
+- **The security guide now tells you which secret guarantee you actually have.** It separates
+  credentials kept outside Flux or a plugin from values materialized locally and protected by
+  scopes and redaction. It also states plainly that unknown credentials pasted into prompts are not
+  redacted and that raw prompts and answers are written to session history.
+
+- **The model guide now explains how to use a provider Flux does not name.** Use an OpenRouter
+  catalogue id for hosted models, either Ollama wire for local models, or implement the Rust provider
+  interface in an embedded product. Flux keeps a small, fully maintained built-in set instead of
+  promising a separate adapter for every vendor.
+
 - **The integration guides now distinguish today's plugin compatibility path from its replacement.**
-  The signed plugin pack still works today. The future official path is an embedded Exchange client,
-  with Exchange executing connector runtimes and no local plugin fallback. The client, adapter
-  migrations and plugin removal are planned work; core Flux remains useful without Exchange while
-  official external integrations require it after they migrate.
+  The signed plugin pack still works today while adapters migrate. The embedded Exchange client is
+  now the official path, with Exchange executing connector runtimes and no local fallback; adapter
+  migrations and final plugin removal remain planned work.
 
 - **A running REPL can now pick up a plugin's changed actions without restarting.** Run
   `/plugin-refresh <name>`; the current turn keeps the actions it started with, and the next turn
@@ -39,9 +53,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **JaaS room joins no longer race each other or re-resolve their signalling host.** Two concurrent
+  joins now create one live room session, and the XMPP WebSocket connects only to the address Flux's
+  network guard already checked.
+
 - **Formatting no longer moves a final top-level comment into the preceding flow.** Format-on-save
   and `fluxlang fmt` now keep a comment written at the left margin after the last declaration at the
   left margin, preserving which part of the program it documents.
+
+- **Room-media diagnostics no longer include sidecar command arguments.** The sidecar executable
+  remains visible for troubleshooting, while tokens and other host-specific arguments are redacted.
 
 - **Webhook and connector listeners now refuse overload consistently with the main server.** Body
   size, timeout, request-rate and concurrent-work limits apply before a delivery can start, and
