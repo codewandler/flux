@@ -201,6 +201,11 @@ half outside the model-authored program means a bug in the program cannot publis
   pending:** these paths have not yet completed a real `main` → `release` hosted cut with configured
   secrets and a publicly verified Release. That dogfood run is the evidence required to tick item 1
   and move this story to done.
+- 2026-08-03 — Two fail-closed hosted previews improved the activation boundary before any ref could
+  move. Run `30831706707` proved the original OpenRouter default depended on account credits; run
+  `30832802801` proved the stock hosted runner has no sandbox backend, so the agentic and served live
+  smoke legs correctly refuse to start. The workflow now defaults to direct Anthropic Haiku and
+  provisions plus self-tests bubblewrap before running Flux. Structural tests pin both requirements.
 - 2026-07-30 — **the foundation is merged and this story stays `ready` for the rest.** Recovered as an
   orphan after a coordinating session crash killed its implementor mid-task; branch preserved verbatim,
   reviewed independently, four blocking findings discharged, then integrated.

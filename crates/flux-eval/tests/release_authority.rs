@@ -620,6 +620,31 @@ fn release_flow_defaults_to_direct_anthropic_and_selects_the_model_credential() 
     }
 }
 
+/// Unattended agentic and served surfaces fail closed when no OS sandbox backend exists. Hosted
+/// Ubuntu runners do not provide bubblewrap by default, so the release workflow must provision and
+/// prove it before either the live smoke or the Flux-authored cut runs.
+#[test]
+fn release_flow_proves_a_sandbox_backend_before_running_flux() {
+    let code = workflow_code("release-flow.yml");
+    let backend = code_line_index(&code, |line| {
+        line.contains("apt-get install") && line.contains("bubblewrap")
+    });
+    let backend_probe = code_line_index(&code, |line| {
+        line.contains("bwrap") && line.contains("--ro-bind") && line.contains("/ / ")
+    });
+    let smoke = code_line_index(&code, |line| line.contains("./scripts/smoke-live.sh"));
+    let flow = code_line_index(&code, |line| {
+        line.contains("flux flow run examples/release.flux")
+    });
+    assert!(
+        matches!((backend, backend_probe, smoke, flow),
+            (Some(backend), Some(probe), Some(smoke), Some(flow))
+                if backend < probe && probe < smoke && smoke < flow),
+        "release-flow.yml must install and self-test bubblewrap before the live smoke and Flux flow; \
+         found install={backend:?}, probe={backend_probe:?}, smoke={smoke:?}, flow={flow:?}"
+    );
+}
+
 /// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`. The
 /// release and crates.io workflows are tag-push-triggered, so this workflow needs a separately
 /// configured push credential; otherwise a green auto-cut silently publishes nothing.

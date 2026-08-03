@@ -112,6 +112,16 @@ jobs:
       - if: steps.creds.outputs.have_key == 'true'
         run: cargo fetch --locked
 
+      # Unattended agentic and served surfaces deliberately fail closed without an OS sandbox
+      # backend. GitHub's hosted Ubuntu image does not ship bubblewrap, so install it and prove the
+      # kernel permits a minimal namespace before spending the cold release-build time.
+      - name: Install and prove the sandbox backend
+        if: steps.creds.outputs.have_key == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          bwrap --ro-bind / / --dev /dev --proc /proc --chdir "$GITHUB_WORKSPACE" true
+
       # The release binary is what both the smoke test and the flow run under, so build it once.
       - name: Build the flux binary
         if: steps.creds.outputs.have_key == 'true'
