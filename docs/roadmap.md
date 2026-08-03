@@ -157,16 +157,22 @@ Design: [execution-substrate.md](designs/execution-substrate.md).
 
 The old distinction between generated connectors and native technology plugins is retired. Docker,
 Kubernetes, SQL, observability, secret stores, collaboration tools, and the remaining official
-adapters become connector declarations whose runtime is explicit. Flux supplies a local generic
-runtime host and an Exchange binding; the same address and policy metadata must behave identically in
-both placements. Native integration crates remain until parity and cutover evidence exist.
+adapters become connector declarations whose runtime is explicit. Exchange is the only official
+integration executor. Flux will embed one native Service Account client for that API, with no local
+connector runtime and no plugin fallback. Until the migration reaches each adapter, the signed
+plugin pack remains temporary compatibility behavior rather than the destination architecture.
 
-**C-501** aligns Flux's public contract; **C-502** binds connector runtime artifacts locally;
-**C-503** mounts Exchange as a remote binding; **C-504** proves local/hosted conformance; **C-505**
-retires the eighteen measured integration crates; and **C-506** moves or retires only the remaining
-generic plugin support infrastructure. This program reuses C-394/C-397/C-399/C-435, the pending C-453
-remote-approval worktree, and the C-481…C-488 generated-channel worktree instead of filing them again.
-Design: [ecosystem.md](designs/ecosystem.md).
+The cross-repository source of truth is
+[`flux-roadmap`](https://github.com/codewandler/flux-roadmap), whose accepted Decision 0001 owns the
+dependency order and milestone boundaries. **C-500** is the umbrella epic. **C-501** aligns the
+public contract; **C-502** closes the rejected local runtime-host proposal without implementation;
+**C-503** embeds the effective-catalogue and one-shot HTTP client. Streams, cancellation,
+subscriptions and leases follow in the later lifecycle milestone. **C-504** freezes and runs
+legacy-plugin-versus-Exchange evidence per adapter; **C-505** deletes each adapter after its proof;
+and **C-506** unconditionally removes the plugin host, protocol, installer, signed pack and Flux
+release-artifact pipeline. The client, migrations and zero-plugin release remain planned, not
+shipped. Flux remains useful without Exchange for core capabilities; official external integrations
+are unavailable when Exchange is unavailable. Design: [ecosystem.md](designs/ecosystem.md).
 
 ### The secret the agent never sees — our redaction against their substitution (epic) — 🔄 **PROPOSED (C-458…C-461 filed, none started)**
 
@@ -332,24 +338,13 @@ DTMF; TLS/WSS; SRTP with SDES). And flux was built partway toward it: `flux-audi
 target — *"telephony's 8 kHz, WebRTC's 48 kHz… versus whatever a model speaks natively"* — with PCM16
 both endiannesses, a phase-carrying `Resampler` and a `Framer`. G.711 is 8 kHz.
 
-**One channel, two localities, neither required.** A call is terminated either by a **local sipx
-process** flux drives ([D-230](stories/D-230-the-native-sip-backend.md)) or by a hosted
-**[flux-exchange](designs/ecosystem.md)** ([D-231](stories/D-231-the-remote-sip-backend.md)) — the
-`kubectl` shape: one vocabulary, whether the thing serving it is across a socket on your laptop or
-across the network behind a cert. flux links nothing either way.
-[D-225](stories/D-225-one-sip-channel-two-localities.md) owns the locality-independent vocabulary and,
-crucially, makes **parity testable rather than aspirational** — two backends drift, and the one that
-drifts silently is the one nobody demos.
-
-⚠ **Neither locality may become mandatory, and both directions are already doctrine.** `ecosystem.md`:
-*"**flux must never require flux-exchange.** … Trading plugin-binary distribution pain for service
-lock-in would be a bad trade made twice."* And C-399's ownership decision: *"flux owns it,
-flux-exchange reuses it. **flux must be able to do this locally as dev without depending on a service —
-that is the local-first principle, not a convenience.**"* By the ecosystem's mechanical test the
-exchange owns the hosted case — it *"terminates channels"* and owns whatever *"requires holding a
-credential or knowing a tenant"*, and a SIP trunk is both — while flux's side stays a **kind** ("a voice
-call channel"), never a named provider. Rooms already prove the pattern in-repo: one `room` channel with
-`mock`, `xmpp` and `jaas` side by side.
+⚠ **Placement superseded by C-508 and flux-roadmap Decision 0001.** A future official SIP integration
+must execute through Exchange, whether Exchange itself runs on the operator's machine or in an
+isolated hosted deployment. Flux may consume generic voice-call events, but it does not drive a local
+sipx connector runtime or fall back when Exchange is unavailable. D-225's two-locality parity
+contract and D-230's native backend therefore require amendment or supersession before implementation;
+D-231 is the surviving placement direction. The protocol and media reasoning below remains useful,
+but its old local-host conclusion is not an active contract.
 
 ⚠ **Natively, sipx takes its IO from flux** — and this corrects the epic's first draft, which made it a
 sidecar on the D-205 precedent. That was wrong twice. D-205's reason was that `tokio-xmpp` *"opens its

@@ -12,7 +12,7 @@ const SLIDES = [
   {eyebrow: '05 · one substrate', title: 'Use it at the surface you need'},
   {eyebrow: '06 · vendor vocabulary', title: 'Connectors describe. Hosts execute.'},
   {eyebrow: '07 · shared authority', title: 'Exchange holds credentials, not the agent'},
-  {eyebrow: '08 · topology', title: 'Local-first stays complete'},
+  {eyebrow: '08 · topology', title: 'Core Flux stays useful without Exchange'},
   {eyebrow: '09 · SRE truth', title: 'Know the boundary—and the gaps'},
   {eyebrow: '10 · next step', title: 'Evaluate it from your own machine'},
 ];
@@ -173,7 +173,7 @@ function SurfacesSlide() {
       <Card title="Flux-Lang"><p>Authored flows, programs, channels, triggers, budgets, and concurrency.</p></Card>
       <Card title="Rust SDK"><p>Embed the same parser, engine, dispatcher, and typed host contracts.</p></Card>
       <Card title="HTTP + A2A"><p>Serve authenticated agents or connect to another agent over a standard protocol.</p></Card>
-      <Card title="Plugins"><p>Protocol-rich capabilities projected as policy-gated operations.</p></Card>
+      <Card title="Plugins"><p>Temporary compatibility integrations, removed after their Exchange replacements prove parity.</p></Card>
       <Card title="Remote system"><p>Keep identity and approval local while guarded effects land in a remote workspace.</p></Card>
       <p className={styles.wideCallout}>Different entry points; one execution substrate and one safety envelope.</p>
     </div>
@@ -185,7 +185,7 @@ function ConnectorsSlide() {
     <div className={styles.ecosystemLayout}>
       <div className={styles.snapshot}>
         <span>Source snapshot · 2026-08-03</span>
-        <strong>flux-connectors main · v0.16.0</strong>
+        <strong>flux-connectors main · v0.17.0</strong>
       </div>
       <div className={styles.flowRow}>
         <div><small>author once</small><strong>provider TOML</strong></div>
@@ -203,8 +203,8 @@ function ConnectorsSlide() {
         </Card>
       </div>
       <p className={styles.truthLine}>
-        Published connector crates open no socket. Flux currently consumes manifests for a narrow
-        inbound webhook channel; it does not auto-install the external outbound Tool pack.
+        Every official integration is connector-owned. Exchange is the only official integration
+        executor; Flux will embed one client rather than host connector runtimes.
       </p>
     </div>
   );
@@ -215,7 +215,7 @@ function ExchangeSlide() {
     <div className={styles.exchangeLayout}>
       <div className={styles.snapshot}>
         <span>Source snapshot · 2026-08-03</span>
-        <strong>flux-exchange main · v0.13.0</strong>
+        <strong>flux-exchange main · v0.16.0</strong>
       </div>
       <blockquote className={styles.exchangeThesis}>
         The credential never crosses the boundary; the authority does.
@@ -225,8 +225,8 @@ function ExchangeSlide() {
         <Card title="Connections"><Status state="ships">ships</Status><p>Create, rotate, and delete tenant credentials and settings.</p></Card>
         <Card title="Metadata grants"><Status state="ships">ships</Status><p>Admit operations by connector, risk, effects, and idempotency—not maintained ID lists.</p></Card>
         <Card title="Invoke"><Status state="ships">ships</Status><p>Build and execute an admitted HTTP operation from its compiled connector definition.</p></Card>
-        <Card title="Agent access"><Status state="partial">partial</Status><p>A token can be minted once, but presenting it authenticates nothing yet.</p></Card>
-        <Card title="Inbound + history"><Status state="direction">direction</Status><p><code>subscribe</code>, hosted channels, workflows, and execution records are not built.</p></Card>
+        <Card title="Service Accounts"><Status state="ships">ships</Status><p>Canonical bearer authentication keeps the vendor credential behind Exchange.</p></Card>
+        <Card title="Inbound + history"><Status state="partial">partial</Status><p>Generated socket subscriptions and workflow activity ship; general lifecycle and execution records remain direction.</p></Card>
       </div>
     </div>
   );
@@ -257,12 +257,12 @@ function TopologySlide({topology, setTopology}) {
         {shared ? (
           <>
             <p><strong>Today:</strong> Exchange can invoke granted HTTP connector operations for a signed-in tenant.</p>
-            <p><strong>Gap:</strong> Flux does not yet carry a client binding that authenticates to Exchange.</p>
+            <p><strong>Gap:</strong> Flux does not yet embed the Exchange client or project its effective catalogue.</p>
           </>
         ) : (
           <>
             <p><strong>Today:</strong> Flux is complete as a local agent, workflow engine, SDK, and guarded effect host.</p>
-            <p><strong>Rule:</strong> Adopting Flux never requires adopting Exchange.</p>
+            <p><strong>Rule:</strong> Core Flux remains useful without Exchange; official external integrations do not.</p>
           </>
         )}
       </div>
@@ -286,9 +286,9 @@ function OperationsSlide() {
       <div className={styles.opsColumn}>
         <h2>Plan around these gaps</h2>
         <ul className={styles.gapList}>
-          <li>Flux ↔ Exchange invocation is not wired.</li>
-          <li>Exchange agent tokens are not accepted yet.</li>
-          <li>Exchange inbound subscriptions and run records are direction, not product.</li>
+          <li>Flux ↔ Exchange effective-catalogue and invocation wiring is not built.</li>
+          <li>Rich outbound runtime dispatch remains planned.</li>
+          <li>The general stream/lease protocol is not built.</li>
           <li>Flux connector webhook support is deliberately narrow and unsigned-only today.</li>
           <li>OS process sandboxing is defense in depth and platform-dependent.</li>
         </ul>

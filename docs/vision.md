@@ -85,16 +85,17 @@ is unchanged; these are platform-tier capabilities, hardened as the earlier tier
 
 ## Integration boundary
 
-Every official external integration is a connector. Protocol richness selects its declared runtime
-— guarded HTTP, socket, process, container, remote execution, or the stdio plugin protocol — rather
-than selecting a second repository. flux-connectors owns the declaration and any vendor-specific
-artifact; Flux owns generic guarded runtime mechanisms and the local host, and knows runtime kinds
-rather than vendors. Exchange may bind the same connector address under remote tenant authority, but
-Flux never requires Exchange: local execution remains a complete path.
+Every official external integration is a connector, and Exchange is the only official integration
+executor. flux-connectors owns the declaration, schema, effects, runtime plan and any
+vendor-specific artifact. Exchange owns credentials, grants, installation, execution and lifecycle.
+Flux embeds one native Exchange client and retains the model loop, authorization, approval and tool
+projection; it owns no connector runtime host and has no plugin fallback.
 
-Existing integration-specific crates under `plugins/` are compatibility implementations during the
-C-500 migration. They leave only after connector parity, including refusals and streams, is proven;
-the generic plugin protocol may remain as one runtime kind.
+That embedded client is accepted direction, not shipped behavior. Existing integration-specific
+crates under `plugins/` remain a temporary compatibility path while each Exchange replacement proves
+the legacy contract. C-506 then removes the protocol, host, installer, signed pack and release
+artifacts unconditionally. Flux remains useful without Exchange for its language, agent loop, SDK
+and core tools; official external integrations are unavailable when Exchange is unavailable.
 
 ## Principles
 

@@ -2,7 +2,7 @@
 id: C-501
 title: "Align Flux documentation with connector-native integrations"
 pillar: Core
-status: ready
+status: done
 priority: 1
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
@@ -19,21 +19,28 @@ retirement story.
 
 ## Acceptance
 
-- [ ] `docs/vision.md`, `docs/ecosystem.md`, `docs/roadmap.md`, the root README and their website
+- [x] `docs/vision.md`, `docs/ecosystem.md`, `docs/roadmap.md`, the root README and their website
       mirrors agree that Flux's embedded Exchange client is the only future official integration
       path; Flux itself executes no connector runtime and has no plugin fallback.
-- [ ] Current plugin commands remain documented as temporary compatibility behavior without implying
+- [x] Current plugin commands remain documented as temporary compatibility behavior without implying
       that their protocol, installer, signed pack, or release artifacts survive C-506.
-- [ ] The roadmap links the cross-repository source of truth and names the corrected C-500…C-506
+- [x] The roadmap links the cross-repository source of truth and names the corrected C-500…C-506
       sequence: embedded HTTP path, lifecycle later, per-adapter proof/deletion, then unconditional
       plugin-infrastructure removal.
-- [ ] The docs distinguish Flux remaining usable without Exchange for core capabilities from official
+- [x] The docs distinguish Flux remaining usable without Exchange for core capabilities from official
       external integrations becoming unavailable when Exchange is unavailable.
-- [ ] Engineering and customer changelogs record the correction without claiming the embedded client,
+- [x] Engineering and customer changelogs record the correction without claiming the embedded client,
       an adapter migration, or zero-plugin release already ships; docs/website gates pass.
 
 ## Progress
 
+- 2026-08-03: Closed against flux-roadmap Decision 0001. A failing-first public-doc contract caught
+  the superseded local-host wording; canonical docs, website direction/plugins/topologies, the
+  presentation, both changelogs and the embedded site now agree on Exchange-only execution while
+  preserving today's plugin compatibility commands. The website build, deterministic embedded-docs
+  check and full repository gate passed.
+- 2026-08-03: Resumed against flux-roadmap Decision 0001 to remove the superseded local/hosted
+  placement story from canonical and public documentation.
 - 2026-08-03: Done after cross-repository and worktree audit; contributor and public mirrors now
   distinguish the compatibility plugin fleet from the accepted connector destination.
 - 2026-08-03: Reopened after a public-site review found that `plugins/using-plugins.md` still

@@ -1041,9 +1041,10 @@ fn homepage_flux_example_is_canonical_and_analyzes_against_the_live_catalog() {
     );
 }
 
-/// C-491: the team presentation is part of the release-matched docs artifact, not an external deck
-/// that can drift from its sources. Its one executable seam must remain L-128's already-declared
-/// scratch fixture, and the mutable ecosystem status must stay visibly dated.
+/// C-491/C-501: the team presentation is part of the release-matched docs artifact, not an external
+/// deck that can drift from its sources. Its one executable seam must remain L-128's
+/// already-declared scratch fixture, and its integration topology must match the accepted
+/// Exchange-only direction without claiming that client binding already ships.
 #[test]
 fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixture() {
     let route = read("website/src/pages/presentation.js");
@@ -1064,11 +1065,15 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
     for claim in [
         "The LLM is not the runtime.",
         "authorization → approval → guarded IO",
-        "flux-connectors main · v0.16.0",
-        "flux-exchange main · v0.13.0",
-        "Flux does not yet carry a client binding",
+        "every official integration",
+        "Exchange is the only official integration executor",
+        "Flux does not yet embed the Exchange client",
+        "Core Flux remains useful without Exchange",
     ] {
-        assert!(deck.contains(claim), "presentation omits `{claim}`");
+        assert!(
+            normalized_prose(&deck).contains(&normalized_prose(claim)),
+            "presentation omits `{claim}`"
+        );
     }
     assert!(
         deck.contains("fixture=\"rust-files\"") && deck.contains("<FluxWorkbench"),
@@ -1091,14 +1096,92 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
     }
     for absent in [
         "flux itself has no exchange client binding",
-        "subscribe does not exist",
-        "hosted channels",
-        "execution records",
+        "rich outbound runtime dispatch",
+        "general stream/lease protocol",
     ] {
         assert!(
-            ecosystem_prose.contains(absent),
+            ecosystem_prose.contains(&normalized_prose(absent)),
             "ecosystem correction must keep the unbuilt boundary explicit: `{absent}`"
         );
+    }
+}
+
+/// C-501: the contributor and customer-facing direction pages are a release contract. The current
+/// plugin commands remain documented while they ship, but no page may turn that compatibility path
+/// into a permanent local connector runtime or imply that plugin infrastructure survives C-506.
+#[test]
+fn connector_native_docs_fix_exchange_as_the_only_future_official_execution_path() {
+    let vision = read("docs/vision.md");
+    let ecosystem = read("docs/ecosystem.md");
+    let roadmap = read("docs/roadmap.md");
+    let readme = read("README.md");
+    let direction = read("website/docs/direction/connector-native-integrations.md");
+    let plugins = read("website/docs/plugins/using-plugins.md");
+    let topologies = read("website/docs/topologies.md");
+
+    for (name, page) in [
+        ("vision", vision.as_str()),
+        ("ecosystem", ecosystem.as_str()),
+        ("roadmap", roadmap.as_str()),
+        ("README", readme.as_str()),
+        ("direction", direction.as_str()),
+        ("plugins", plugins.as_str()),
+    ] {
+        let prose = normalized_prose(page);
+        assert!(
+            prose.contains("only official integration")
+                || prose.contains("only future official integration"),
+            "{name} must state the Exchange-only official integration path"
+        );
+    }
+
+    for claim in [
+        "embedded Exchange client",
+        "official external integrations are unavailable",
+        "no local connector",
+        "no plugin fallback",
+    ] {
+        assert!(
+            normalized_prose(&ecosystem).contains(&normalized_prose(claim)),
+            "ecosystem must state `{claim}`"
+        );
+    }
+
+    for claim in [
+        "flux-roadmap",
+        "C-500",
+        "C-501",
+        "C-502",
+        "C-503",
+        "C-504",
+        "C-505",
+        "C-506",
+        "lifecycle",
+    ] {
+        assert!(roadmap.contains(claim), "roadmap must name `{claim}`");
+    }
+
+    for forbidden in [
+        "Flux supplies a local generic runtime host",
+        "local/hosted conformance",
+        "Flux never requires Exchange: local execution remains a complete path",
+        "the generic plugin protocol may remain",
+        "Third-party plugins and the generic stdio protocol may remain",
+        "flux must never *require* flux-exchange",
+    ] {
+        for (name, page) in [
+            ("vision", vision.as_str()),
+            ("ecosystem", ecosystem.as_str()),
+            ("roadmap", roadmap.as_str()),
+            ("direction", direction.as_str()),
+            ("plugins", plugins.as_str()),
+            ("topologies", topologies.as_str()),
+        ] {
+            assert!(
+                !normalized_prose(page).contains(&normalized_prose(forbidden)),
+                "{name} retains superseded placement claim `{forbidden}`"
+            );
+        }
     }
 }
 

@@ -22,6 +22,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Canonical and public integration documentation now follows the Exchange-only program** (C-501).
+  The signed plugin pack is documented as temporary compatibility behavior; the future path is one
+  embedded Service Account client with every official connector runtime executed by Exchange and no
+  local or plugin fallback. The roadmap now links the cross-repository authority and stages the
+  one-shot HTTP client before lifecycle, per-adapter proof/deletion, and unconditional plugin
+  infrastructure removal. This documentation correction does not claim that the client, an adapter
+  migration, or the zero-plugin release already ships.
+
 - **Every long-lived production server and channel listener now binds through the selected guarded
   execution system** (C-435). Guarded streams split into independent bounded read/write halves so
   full-duplex HTTP and SSE remain live under inbound backpressure, including remote HTTPS protocol
