@@ -27,6 +27,13 @@ All notable changes to this project are documented in this file. The format is b
   v2. The public helpers accepting an already-bound native `TcpListener` were removed; single-agent
   serving uses its engine's execution system and multi-agent serving now requires one explicitly.
 
+- **The cross-repository roadmap now schedules Flux's official-integration migration** (C-508).
+  Decision 0001 makes Exchange the only official execution placement: Flux embeds one Service
+  Account client, starts with effective-catalogue projection plus one-shot HTTP invocation, and has
+  no local connector or plugin fallback. The rejected local-host story is closed without
+  implementation, lifecycle is staged after the useful HTTP slice, adapter deletion remains
+  evidence-ratcheted, and the final migration removes every plugin artifact and release path.
+
 - **A merge from `main` into the dedicated `release` branch is now the complete release action**
   (C-251). `.github/workflows/release-flow.yml` runs the live smoke and narrow Flux-authored cut,
   while `scripts/promote-release-flow.sh` keeps the trigger-capable PAT out of the model step, stages

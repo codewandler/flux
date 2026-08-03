@@ -141,11 +141,13 @@ confinement, env clearing, output capping), and which are `flux-runtime`'s and *
 authorization, approval, redaction of tool output, evidence). A consumer taking only the first set is
 supported; a consumer that assumes it got the second is the failure this contract prevents.
 
-### 4. Container and remote backends — ownership settled
+### 4. Core container and remote execution backends — ownership settled
 
-A `container` runtime (spawn inside docker/k8s) and a `remote` runtime (delegate to another
-substrate) are both named in [ecosystem.md](ecosystem.md)'s runtime table. The original design left
-ownership open because the port is unsealed. That decision is now settled:
+A `container` backend (spawn core agent work inside docker/k8s) and a `remote` backend (delegate core
+agent work to another substrate) implement Flux's execution substrate. They are deliberately not
+the official connector runtimes in [ecosystem.md](ecosystem.md): Exchange exclusively executes
+those integrations. The original design left ownership of these core backends open because the port
+is unsealed. That decision is now settled:
 
 - **Flux owns both backends.** Local-first use must not depend on an out-of-repo service, while the
   unsealed port still lets other consumers provide their own implementations.
@@ -153,10 +155,10 @@ ownership open because the port is unsealed. That decision is now settled:
   be visible to the repository's no-bypass checks.
 - The CLI now uses the remote backend directly through explicit `--remote` selection.
 
-**Resolved for the remote backend (C-399): flux owns it.** The alternative — leaving it to the first
-consumer that needed it — would have put a locally-executing runtime behind a service, and flux must
-be able to do this on a developer's own machine with nothing running. That is
-[vision.md](../vision.md)'s local-first principle on the runtime axis, not a convenience.
+**Resolved for the remote backend (C-399): flux owns it.** Flux's core agent and language remain
+usable on a developer's own machine with nothing else running, as required by
+[vision.md](../vision.md)'s local-first principle. This does not provide a local integration host or
+an Exchange fallback: official external integrations are simply unavailable without Exchange.
 
 `crates/flux-system/src/remote.rs` is the implementation: `RemoteSystem` serves all five port
 families by handing each operation to a `Delegate`, and `Loopback` serves `Delegate` from any
