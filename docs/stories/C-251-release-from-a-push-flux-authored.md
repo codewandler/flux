@@ -70,11 +70,12 @@ run loudly rather than silently changing the number.
       write elsewhere are refused by the operation implementation, not by prompt or by the decorative
       `.flux/policies/release.toml`. Pinned by `release_authority.rs` against the shipped AST, path
       boundary, permission subjects, and role.
-- [x] The smoke test is wired in CI against the configured cheap OpenRouter model
-      (`FLUX_SMOKE_MODEL`), and its failure blocks the cut. Optional legs whose credential is absent
-      SKIP; an automatic release with no required OpenRouter credential fails loudly rather than
-      finishing green after doing nothing. The source wiring is complete; live hosted proof remains
-      pending and is tracked below.
+- [x] The smoke test is wired in CI against the configured cheap direct Anthropic model
+      (`FLUX_SMOKE_MODEL`), and its failure blocks the cut. An explicit `openrouter/*` override
+      selects its own credential. Optional legs whose credential is absent SKIP; an automatic
+      release with no selected-provider credential fails loudly rather than finishing green after
+      doing nothing. The source wiring is complete; live hosted proof remains pending and is tracked
+      below.
 - [x] The flow is idempotent and re-runnable: a second run on an already-released SHA is a no-op, and
       a failed run leaves **no** partially-rolled changelog (the C-147 transactionality property that
       `cut-release.sh` already has must not be lost by wrapping it).
@@ -184,8 +185,8 @@ half outside the model-authored program means a bug in the program cannot publis
   but Acceptance item 1 remains deliberately unchecked until a hosted run dogfoods it.**
   `.github/workflows/release-flow.yml` now runs automatically only for pushes to `release`, forces
   apply mode for that event, runs the cheap-model smoke before the flow, scopes `RELEASE_TOKEN` to
-  the promotion step, and fails rather than silently skipping an automatic release when the required
-  OpenRouter credential is absent. Manual dispatch remains the preview/rehearsal surface.
+  the promotion step, and fails rather than silently skipping an automatic release when the selected
+  provider credential is absent. Manual dispatch remains the preview/rehearsal surface.
   `scripts/promote-release-flow.sh` owns the irreversible host sequence: validate the local annotated
   tag; stage its exact SHA at `refs/heads/release-candidates/vX.Y.Z`; dispatch and watch
   `release.yml`; verify the immutable candidate receipt; advance `main`; push the tag; watch the
@@ -279,9 +280,11 @@ half outside the model-authored program means a bug in the program cannot publis
 ## Notes
 - **Trigger:** a push to `release`, not to `main`. Merging main → release is the deliberate act; an
   ordinary main push must not cut. This was the user's own framing and it is the safer one.
-- **Model + key:** `OPENROUTER_API_KEY` as a repo secret, with a cheap or free model. Prose curation
-  and a smoke turn are both small; see the OpenRouter model spec already used for eval and loop work.
-  The smoke test takes `FLUX_SMOKE_MODEL`, so no code change is needed to point it at OpenRouter.
+- **Model + key:** direct `anthropic/claude-haiku-4-5` with `ANTHROPIC_API_KEY` is the default. A
+  manual `openrouter/*` override selects `OPENROUTER_API_KEY`. The first hosted rehearsal proved the
+  distinction matters: OpenRouter returned 402 with no account credits, while its zero-cost models
+  were unavailable under the account's privacy policy. The direct provider avoids coupling release
+  availability to either condition without weakening that policy.
 - **Why this is a good flux story rather than a shell script:** every hard part is something flux
   already claims to do — a narrow runtime op set whose canonical path boundary means a model-driven
   run structurally cannot touch source, fixed-argv process seams through `flux_system`, and an

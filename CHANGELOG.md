@@ -13,7 +13,9 @@ All notable changes to this project are documented in this file. The format is b
   while `scripts/promote-release-flow.sh` keeps the trigger-capable PAT out of the model step, stages
   the exact cut SHA on a versioned candidate ref, verifies its immutable receipt before advancing
   `main`, and waits for both tag workflows plus the public Release verifier. Any failure preserves
-  the candidate ref and names the recovery evidence instead of leaving a green partial release.
+  the candidate ref and names the recovery evidence instead of leaving a green partial release. The
+  live gate defaults to direct Anthropic Haiku, with an explicit OpenRouter override, so the normal
+  release does not also depend on an OpenRouter credit balance.
 
 ## [0.55.0] - 2026-08-03
 

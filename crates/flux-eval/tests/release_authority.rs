@@ -592,6 +592,34 @@ fn release_yml_accepts_only_the_exact_versioned_candidate_ref() {
     );
 }
 
+/// The release gate must not depend on an OpenRouter account balance. The direct Anthropic key is
+/// the stable default, while an explicit OpenRouter model remains supported and must select its own
+/// credential rather than silently borrowing the default provider's key.
+#[test]
+fn release_flow_defaults_to_direct_anthropic_and_selects_the_model_credential() {
+    let code = workflow_code("release-flow.yml");
+    assert!(
+        code.contains("anthropic/claude-haiku-4-5"),
+        "release-flow.yml must default to the direct Anthropic Haiku model"
+    );
+    assert!(
+        !code.contains("default: \"openrouter/anthropic/claude-haiku-4.5\"")
+            && !code.contains("inputs.model || 'openrouter/anthropic/claude-haiku-4.5'"),
+        "the automatic release must not depend on OpenRouter account credits by default"
+    );
+    for required in [
+        "secrets.ANTHROPIC_API_KEY",
+        "secrets.OPENROUTER_API_KEY",
+        "anthropic/*",
+        "openrouter/*",
+    ] {
+        assert!(
+            code.contains(required),
+            "release-flow.yml must select provider credentials explicitly; missing `{required}`"
+        );
+    }
+}
+
 /// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`. The
 /// release and crates.io workflows are tag-push-triggered, so this workflow needs a separately
 /// configured push credential; otherwise a green auto-cut silently publishes nothing.

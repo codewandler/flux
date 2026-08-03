@@ -21,8 +21,9 @@
 # `scripts/cut-release.sh`, including its gate, and proves the cut succeeds — then throws the result
 # away with the runner. Neither manually dispatched mode releases anything.
 #
-# Secrets: OPENROUTER_API_KEY — a cheap model is enough for prose curation and a smoke turn. A manual
-# run without it skips; an automatic release fails loudly after the smoke and flow are skipped.
+# Secrets: ANTHROPIC_API_KEY for the direct Haiku default; OPENROUTER_API_KEY for an explicit
+# OpenRouter model override. A manual run without the selected provider's key skips; an automatic
+# release fails loudly after the smoke and flow are skipped.
 
 name: release-flow
 
@@ -41,7 +42,7 @@ on:
         description: "Model for the release-scribe sub-agent."
         required: false
         type: string
-        default: "openrouter/anthropic/claude-haiku-4.5"
+        default: "anthropic/claude-haiku-4-5"
 
 permissions:
   contents: read
@@ -51,7 +52,7 @@ env:
   # `inputs` is empty on a push event, so both values need explicit host-owned defaults. A release
   # branch push always applies; a manual dispatch keeps its selected preview/rehearsal posture.
   RELEASE_APPLY: ${{ github.event_name == 'push' && 'true' || (inputs.apply && 'true' || 'false') }}
-  RELEASE_MODEL: ${{ inputs.model || 'openrouter/anthropic/claude-haiku-4.5' }}
+  RELEASE_MODEL: ${{ inputs.model || 'anthropic/claude-haiku-4-5' }}
 
 concurrency:
   group: release-flow
@@ -74,13 +75,29 @@ jobs:
       - name: Does a model credential exist?
         id: creds
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+          case "$RELEASE_MODEL" in
+            anthropic/*)
+              credential_name=ANTHROPIC_API_KEY
+              selected_key=${ANTHROPIC_API_KEY:-}
+              ;;
+            openrouter/*)
+              credential_name=OPENROUTER_API_KEY
+              selected_key=${OPENROUTER_API_KEY:-}
+              ;;
+            *)
+              echo "::error::Unsupported release model provider in '$RELEASE_MODEL'. Use an anthropic/* or openrouter/* model."
+              exit 1
+              ;;
+          esac
+          echo "credential_name=$credential_name" >> "$GITHUB_OUTPUT"
+          if [ -n "$selected_key" ]; then
             echo "have_key=true" >> "$GITHUB_OUTPUT"
           else
             echo "have_key=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::OPENROUTER_API_KEY is not set — the live smoke leg and the release flow will be skipped."
+            echo "::notice::$credential_name is not set for $RELEASE_MODEL — the live smoke leg and the release flow will be skipped."
           fi
 
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -106,6 +123,7 @@ jobs:
       - name: Live smoke against a cheap model
         if: steps.creds.outputs.have_key == 'true'
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           FLUX_SMOKE_MODEL: ${{ env.RELEASE_MODEL }}
           FLUX_BIN: ${{ github.workspace }}/target/release/flux
@@ -118,6 +136,7 @@ jobs:
         if: steps.creds.outputs.have_key == 'true'
         id: flow
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -o pipefail
@@ -172,5 +191,5 @@ jobs:
       - name: Refuse to skip an automatic release
         if: github.event_name == 'push' && steps.creds.outputs.have_key != 'true'
         run: |
-          echo "::error::OPENROUTER_API_KEY is required for an automatic release. Smoke and flow were skipped; no commit or tag was pushed."
+          echo "::error::${{ steps.creds.outputs.credential_name || 'The selected provider credential' }} is required for an automatic release. Smoke and flow were skipped; no commit or tag was pushed."
           exit 1

@@ -166,11 +166,15 @@ The matching tag run verifies the receipt and promotes those artifacts without r
 retaining the normal public-release asset verification. The tag simultaneously starts the
 idempotent crates.io publisher.
 
-Three Actions secrets are required:
+Three Actions secrets are required for the default path, with one optional provider override:
 
-- **`OPENROUTER_API_KEY`** — used only by the cheap `FLUX_SMOKE_MODEL` live smoke and release-scribe
-  turn. A manual preview without it skips, but a push to `release` fails loudly without cutting or
-  pushing anything.
+- **`ANTHROPIC_API_KEY`** — used only by the default direct-Haiku `FLUX_SMOKE_MODEL` live smoke and
+  release-scribe turn. A manual preview without the selected provider key skips, but a push to
+  `release` fails loudly without cutting or pushing anything. The direct provider is the default so
+  release availability does not also depend on an OpenRouter account balance.
+- **`OPENROUTER_API_KEY`** *(optional)* — selected only when a manual dispatch explicitly overrides
+  the model with an `openrouter/*` model. The workflow passes provider credentials only to the
+  credential probe, live smoke, and Flux flow steps.
 - **`RELEASE_TOKEN`** — a fine-grained GitHub PAT scoped to this repository with **Contents: write**.
   It is exposed only to the host promotion step for the candidate/main/tag refs, and to the binary
   workflow for creating or refreshing the Release. A separately authenticated token is required
