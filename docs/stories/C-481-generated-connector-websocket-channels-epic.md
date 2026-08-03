@@ -2,7 +2,7 @@
 id: C-481
 title: "Generated connector WebSocket channels (epic)"
 pillar: Core
-status: in-progress
+status: done
 epic: generated-connector-websocket-channels
 design: docs/designs/generated-connector-websocket-channels.md
 areas: [flux-system, flux-channels]
@@ -18,19 +18,19 @@ Exchange subscription, with Asterisk ARI as the first complete proof and no conn
 
 ## Acceptance
 
-- [ ] C-482 makes `flux-connectors` authoritative for declarative RFC 6455 channel handshakes and
+- [x] C-482 makes `flux-connectors` authoritative for declarative RFC 6455 channel handshakes and
       publishes a complete generated Asterisk ARI event binding.
-- [ ] C-483 moves the reusable guarded WebSocket session into `flux-system` and gives native and
+- [x] C-483 moves the reusable guarded WebSocket session into `flux-system` and gives native and
       selected remote execution systems equivalent bounded operations.
-- [ ] C-484 drives webhook and generic WebSocket bindings through one connector-channel runtime,
+- [x] C-484 drives webhook and generic WebSocket bindings through one connector-channel runtime,
       preserving closed event sets, wire discriminators, payload projection and placement rules.
-- [ ] C-485 records the already-shipped v0.52.0 Asterisk plugin removal and proves this program does
+- [x] C-485 records the already-shipped v0.52.0 Asterisk plugin removal and proves this program does
       not resurrect either ARI or AMI while extracting the reusable generic guard.
-- [ ] C-486 gives Exchange durable tenant-owned channel records, placement resolution and independent
+- [x] C-486 gives Exchange durable tenant-owned channel records, placement resolution and independent
       supervisors that restore and reconnect.
-- [ ] C-487 ships operator management plus one authenticated multiplexed agent WebSocket with
+- [x] C-487 ships operator management plus one authenticated multiplexed agent WebSocket with
       default-deny inbound grants, bounded fan-out and live at-most-once semantics.
-- [ ] C-488 supplies cross-repository conformance, live smoke, public capability truth and ordered
+- [x] C-488 supplies cross-repository conformance, live smoke, public capability truth and ordered
       release evidence without inventing a plugin compatibility release after removal.
 
 ## Progress
@@ -40,6 +40,8 @@ Exchange subscription, with Asterisk ARI as the first complete proof and no conn
   Asterisk plugin surfaces in v0.52.0; the generic connector-channel runtime remains absent.
 - 2026-08-02: the program was filed from the master design after the original dirty Flux worktree was
   preserved unchanged in a separate worktree.
+- 2026-08-03: the complete program shipped in order as Flux v0.54.2, flux-connectors v0.17.0 and
+  flux-exchange v0.15.0. All three publication workflows and their consumer gates passed.
 
 ## Notes
 

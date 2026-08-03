@@ -2,7 +2,7 @@
 id: C-497
 title: "Publish the reusable connector-channel host closure"
 pillar: Core
-status: in-progress
+status: done
 epic: generated-connector-websocket-channels
 design: docs/designs/generated-connector-websocket-channels.md
 areas: [flux-app, flux-auth, flux-lsp, flux-server, flux-channels, supply-chain]
@@ -26,7 +26,7 @@ adding a path/git dependency or turning the Exchange into a Flux checkout compos
 - [x] The CI-only publisher and runbook carry all five in machine-checked topological order, and the
       feature-gate ledger follows their published package names.
 - [x] Packaging checks, the root gate and both sandbox postures pass before the release is cut.
-- [ ] The tag-triggered publisher confirms every new crate/version on crates.io before a dependent
+- [x] The tag-triggered publisher confirms every new crate/version on crates.io before a dependent
       repository moves to the new Flux line.
 
 ## Progress
@@ -44,6 +44,9 @@ adding a path/git dependency or turning the Exchange into a Flux checkout compos
 - 2026-08-03: server and channels package-file censuses pass; their complete local dry-runs correctly
   stop at the not-yet-published preceding crate, which is why the CI publisher is topological. The
   workspace gate, codegate, missing-bubblewrap posture and real confined backend suite all pass.
+- 2026-08-03: crates workflow 30787166427 published and confirmed the complete v0.54.2 closure,
+  including app, auth, LSP, server and channels. Only afterward did Exchange resolve Flux 0.54.2 and
+  publish v0.15.0.
 
 ## Notes
 

@@ -2,7 +2,7 @@
 id: C-487
 title: "Manage channels and multiplex live Exchange subscriptions"
 pillar: Agent
-status: in-progress
+status: done
 epic: generated-connector-websocket-channels
 design: docs/designs/generated-connector-websocket-channels.md
 areas: [flux-exchange]
@@ -18,17 +18,17 @@ agents whose tenant grants explicitly admit the connector, binding and declared 
 
 ## Acceptance
 
-- [ ] Operator-only `GET/POST /api/channels`, `PUT/DELETE /api/channels/{id}` derive tenant and accept
+- [x] Operator-only `GET/POST /api/channels`, `PUT/DELETE /api/channels/{id}` derive tenant and accept
       only connector/binding/event selection against existing connections.
-- [ ] Grants gain explicit inbound `{connector, binding, events}` entries; old grants deserialize to
+- [x] Grants gain explicit inbound `{connector, binding, events}` entries; old grants deserialize to
       no inbound access and every selected event must belong to the binding.
-- [ ] `GET /api/subscribe` authenticates agents and multiplexes subscribe/unsubscribe by opaque
+- [x] `GET /api/subscribe` authenticates agents and multiplexes subscribe/unsubscribe by opaque
       channel id, with request-correlated acknowledgements and structured refusals.
-- [ ] Emitted envelopes carry connector, binding, declared event name, receive time and raw typed
+- [x] Emitted envelopes carry connector, binding, declared event name, receive time and raw typed
       payload; no replay/cursor/acknowledgement persistence is implied.
-- [ ] One vendor socket fans out through bounded 32-event subscriber queues; overflow closes and
+- [x] One vendor socket fans out through bounded 32-event subscriber queues; overflow closes and
       counts only the slow subscriber without blocking the vendor loop or peers.
-- [ ] Tests cover operator access, tenant derivation, default deny, event subsets, cross-tenant ids,
+- [x] Tests cover operator access, tenant derivation, default deny, event subsets, cross-tenant ids,
       fan-out, disconnect loss, slow-subscriber isolation and anonymous/log redaction.
 
 ## Progress
@@ -36,5 +36,5 @@ agents whose tenant grants explicitly admit the connector, binding and declared 
 - 2026-08-02: Exchange has default-deny inbound grants, operator CRUD, authenticated multiplexing,
   bounded slow-subscriber isolation and tenant-opaque ids behind an optional supervisor. The public
   capability remains deliberately non-live until compatible released dependencies bind the runner.
-
-- (blocked on C-486)
+- 2026-08-03: Exchange v0.15.0 ships the live authenticated route, operator CRUD and console inbound
+  grant editor; its real-socket end-to-end test and complete tag publication gate passed.

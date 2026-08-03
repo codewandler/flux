@@ -2,7 +2,7 @@
 id: C-482
 title: "Declare and generate connector WebSocket channels"
 pillar: Core
-status: in-progress
+status: done
 priority: 1
 epic: generated-connector-websocket-channels
 design: docs/designs/generated-connector-websocket-channels.md
@@ -19,24 +19,24 @@ complete event surface, while keeping all network I/O in consuming hosts.
 
 ## Acceptance
 
-- [ ] Failing-first loader tests cover socket-only connect declarations, relative paths, fixed
+- [x] Failing-first loader tests cover socket-only connect declarations, relative paths, fixed
       headers, query parameters, subprotocols, payload-root rules and channel-scoped config binds.
-- [ ] Manifest and `connector-catalog` projections carry complete auth, config, event, binding and
+- [x] Manifest and `connector-catalog` projections carry complete auth, config, event, binding and
       socket-connect facts; field-census tests fail when either projection drops an IR field.
-- [ ] `connector_pack::channel_plan` composes and redacts an exact WebSocket URL, query, headers,
+- [x] `connector_pack::channel_plan` composes and redacts an exact WebSocket URL, query, headers,
       subprotocols and credential placements without holding a client or opening a socket.
-- [ ] Asterisk declares `ari-events` at `/events`, Basic auth, `app`, optional default-false
+- [x] Asterisk declares `ari-events` at `/events`, Basic auth, `app`, optional default-false
       `subscribe_all` rendered as `subscribeAll`, discriminator `type`, raw payload delivery, and one
       lowercase-kebab event per exact PascalCase ARI `Event` subtype with full schemas.
-- [ ] Two-way source-operation and event-subtype census tests leave no unaccounted or silently emptied
+- [x] Two-way source-operation and event-subtype census tests leave no unaccounted or silently emptied
       upstream route; scoped generation is green apart from documented coordinator-owned staleness.
 
 ## Progress
 
 - 2026-08-02: implemented in `flux-connectors` C-489–C-492. The complete workspace gate is running
   from an isolated Cargo target after the ordinary target directory was removed by storage cleanup.
-
-- (not started)
+- 2026-08-03: flux-connectors v0.17.0 published the declaration, catalogue and zero-I/O plan closure;
+  Exchange's released consumer resolved and exercised that exact registry line.
 
 ## Notes
 

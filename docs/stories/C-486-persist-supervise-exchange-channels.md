@@ -2,7 +2,7 @@
 id: C-486
 title: "Persist and supervise tenant connector channels in Exchange"
 pillar: Core
-status: in-progress
+status: done
 epic: generated-connector-websocket-channels
 design: docs/designs/generated-connector-websocket-channels.md
 areas: [flux-exchange]
@@ -18,13 +18,13 @@ tenant connection and keep its vendor stream alive independently of agent subscr
 
 ## Acceptance
 
-- [ ] A persistent `ChannelStore` records authenticated tenant, connection, binding and selected
+- [x] A persistent `ChannelStore` records authenticated tenant, connection, binding and selected
       declared events; no caller-supplied tenant, endpoint, credential or placement field exists.
-- [ ] An operator-owned endpoint/placement resolver selects direct-local, protected endpoint ref or
+- [x] An operator-owned endpoint/placement resolver selects direct-local, protected endpoint ref or
       trusted selected remote according to deployment profile before credentials are read.
-- [ ] Supervisors restore after restart, reconnect transient failures, stay stopped on terminal
+- [x] Supervisors restore after restart, reconnect transient failures, stay stopped on terminal
       configuration failures and restart immediately after credential or connection-setting rotation.
-- [ ] Tests cover restoration, one vendor connection, no replay, rotation, all admitted placements,
+- [x] Tests cover restoration, one vendor connection, no replay, rotation, all admitted placements,
       refused shared caller-host placement and secret/payload-free logs.
 
 ## Progress
@@ -32,8 +32,8 @@ tenant connection and keep its vendor stream alive independently of agent subscr
 - 2026-08-02: Exchange has tenant-scoped memory/persistent stores, independent restoration,
   reconnect supervision, rotation restart hooks and an operator-owned placement port. Binding that
   port to Flux's released typed placement remains blocked on the ordered dependency releases.
-
-- (blocked on C-482 through C-484)
+- 2026-08-03: Exchange v0.15.0 binds the released Flux 0.54.2 and connector 0.17.0 contracts; its
+  restoration, reconnect, rotation, placement and redaction suites passed on main and the tag gate.
 
 ## Notes
 

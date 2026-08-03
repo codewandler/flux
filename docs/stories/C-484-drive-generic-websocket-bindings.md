@@ -2,7 +2,7 @@
 id: C-484
 title: "Drive webhook and generic WebSocket connector bindings"
 pillar: Agent
-status: in-progress
+status: done
 epic: generated-connector-websocket-channels
 design: docs/designs/generated-connector-websocket-channels.md
 areas: [flux-channels, flux-app]
@@ -29,7 +29,7 @@ inputs share every event-routing rule and whose outbound socket runs on the sele
       terminal until configuration changes.
 - [x] Binary ARI frames close as protocol violations; malformed and undeclared event types are
       dropped and counted without producing vendor-controlled trigger labels.
-- [ ] Placement matrix proves local/single-tenant scoped private dialing, shared endpoint-reference or
+- [x] Placement matrix proves local/single-tenant scoped private dialing, shared endpoint-reference or
       trusted-selected-remote dialing, whole-authority refusal and pre-credential placement failure.
 - [x] Full gate is green in both sandbox postures.
 
@@ -47,8 +47,9 @@ inputs share every event-routing rule and whose outbound socket runs on the sele
 - 2026-08-03: the complete workspace gate and both sandbox postures are green. The remaining
   placement matrix is cross-repository by design: it needs connector-pack's prepared plan and
   Exchange's deployment-owned placement resolver.
-
-- (blocked on C-482 and C-483)
+- 2026-08-03: Exchange bound the released prepared plan to its operator-owned placement resolver.
+  Its matrix admits scoped single-tenant local and trusted selected-remote execution, refuses shared
+  local placement and fails before reading credentials. Flux v0.54.2 and Exchange v0.15.0 gates pass.
 
 ## Notes
 
