@@ -125,9 +125,10 @@ FLUX_COMPACT_CHARS=0 flux run "…"     # never compact (may hit the provider's 
 FLUX_COMPACT_CHARS=120000 flux run "…" # compact later, at a larger transcript
 ```
 
-In the REPL, **`/compact`** compacts now instead of waiting for the threshold. It reports success
-even when nothing was compacted — for instance when the session is under the threshold or has fewer
-than four messages.
+In the REPL, **`/compact`** runs the same compaction check immediately instead of waiting for the
+next turn; it does not force a session below the threshold to compact. The result distinguishes a
+real rewrite (`context compacted (N → M messages)`) from an unchanged context, disabled compaction,
+and cancellation.
 
 The threshold can also be set per agent, for served and SDK agents, which is the case where it
 matters most: those bind a conversation to one long-lived session. The precedence is **per-agent

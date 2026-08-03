@@ -659,6 +659,22 @@ const REPL_BUILTIN_COMMANDS: &[&str] = &[
     "session", "sessions", "resume", "compact", "insights", "clear",
 ];
 
+/// The terminal line `/compact` prints after the engine has made an outcome observable. Only the
+/// variant that carries real before/after counts is allowed to claim that compaction happened.
+pub(super) fn compact_repl_message(outcome: flux_flow::engine::CompactionOutcome) -> String {
+    use flux_flow::engine::CompactionOutcome;
+
+    match outcome {
+        CompactionOutcome::Disabled => "context compaction is disabled".into(),
+        CompactionOutcome::Unchanged => "context unchanged".into(),
+        CompactionOutcome::Cancelled => "compaction cancelled".into(),
+        CompactionOutcome::Compacted {
+            from_messages,
+            to_messages,
+        } => format!("context compacted ({from_messages} → {to_messages} messages)"),
+    }
+}
+
 pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
     // Decorative boot splash, before any other output. Blocks the runtime thread for a
     // few seconds at most — nothing else is in flight this early in the REPL.
@@ -984,11 +1000,13 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                     }
                 }
                 "compact" => {
-                    eprintln!("{}", style::dim("compacting context…"));
+                    eprintln!("{}", style::dim("checking context for compaction…"));
                     let cancel = tokio_util::sync::CancellationToken::new();
                     let mut sink = cost.sink(&agent, 0);
                     match agent.maybe_compact(&session_id, &mut sink, &cancel).await {
-                        Ok(()) => eprintln!("{}", style::dim("context compacted")),
+                        Ok(outcome) => {
+                            eprintln!("{}", style::dim(&compact_repl_message(outcome)))
+                        }
                         Err(e) => eprintln!("{} {e}", style::red("compact error:")),
                     }
                 }

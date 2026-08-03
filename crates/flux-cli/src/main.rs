@@ -3602,6 +3602,32 @@ mod tests {
         );
     }
 
+    /// C-465 failing-first: `/compact` may use the success word only for a rewrite carrying real
+    /// before/after counts. The former `Ok(())` arm claimed success for every other outcome.
+    #[test]
+    fn repl_compaction_reports_only_a_real_rewrite_as_compacted() {
+        use flux_flow::engine::CompactionOutcome;
+
+        for outcome in [
+            CompactionOutcome::Disabled,
+            CompactionOutcome::Unchanged,
+            CompactionOutcome::Cancelled,
+        ] {
+            let message = super::compact_repl_message(outcome);
+            assert!(
+                !message.contains("context compacted"),
+                "a no-rewrite outcome claimed compaction: {message}"
+            );
+        }
+        assert_eq!(
+            super::compact_repl_message(CompactionOutcome::Compacted {
+                from_messages: 8,
+                to_messages: 3,
+            }),
+            "context compacted (8 → 3 messages)"
+        );
+    }
+
     /// A-15 named acceptance (`phase_observations_emitted_per_pass`'s surface half): each
     /// `loop.phase` observation updates the phase-labeled spinner. Historical phase names remain
     /// supported, and a phase-less turn uses a neutral fallback.

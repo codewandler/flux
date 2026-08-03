@@ -105,6 +105,26 @@ fn flow_trigger_label(label: &str) -> &str {
     }
 }
 
+/// What an explicit context-compaction check changed.
+///
+/// Compaction being disabled or leaving the conversation untouched is a successful check, not an
+/// engine error. Returning the outcome keeps callers from turning every `Ok` into a false success
+/// report. A cancellation likewise remains a clean stop while staying distinct from a rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionOutcome {
+    /// The host configured a zero threshold, which disables compaction.
+    Disabled,
+    /// The conversation was not rewritten (for example because it was short or under threshold).
+    Unchanged,
+    /// The caller cancelled an in-flight summary request before any rewrite.
+    Cancelled,
+    /// Earlier messages were replaced by a summary and the recent tail.
+    Compacted {
+        from_messages: usize,
+        to_messages: usize,
+    },
+}
+
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
 /// (conversation + run trace + turn telemetry), and flux-flow's own value/symbol/suspension store.
 pub struct FlowEngine {
@@ -1628,7 +1648,7 @@ impl FlowEngine {
         session_id: &str,
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<CompactionOutcome> {
         self.compaction_attempt(session_id, sink, cancel).await.0
     }
 
@@ -1641,23 +1661,23 @@ impl FlowEngine {
         session_id: &str,
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
-    ) -> (Result<()>, Option<Usage>) {
+    ) -> (Result<CompactionOutcome>, Option<Usage>) {
         if self.compact_threshold_chars == 0 {
-            return (Ok(()), None);
+            return (Ok(CompactionOutcome::Disabled), None);
         }
         let messages = match self.events.conversation(session_id) {
             Ok(messages) => messages,
             Err(error) => return (Err(error), None),
         };
         if messages.len() < 4 {
-            return (Ok(()), None);
+            return (Ok(CompactionOutcome::Unchanged), None);
         }
         let total: usize = messages
             .iter()
             .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
             .sum();
         if total <= self.compact_threshold_chars {
-            return (Ok(()), None);
+            return (Ok(CompactionOutcome::Unchanged), None);
         }
 
         // A-101: the boundary rule lives in `ValidHistory::snap`, not here. The inline walk-back it
@@ -1666,7 +1686,8 @@ impl FlowEngine {
         // prepending the synthetic `user` summary in front of it wrote `user`-after-`user`.
         let keep = 2.min(messages.len());
         let Some(split) = ValidHistory::snap(&messages, keep) else {
-            return (Ok(()), None); // nothing can be summarized without breaking the shape
+            // Nothing can be summarized without breaking the provider-history shape.
+            return (Ok(CompactionOutcome::Unchanged), None);
         };
         let (old, recent) = messages.split_at(split);
 
@@ -1698,7 +1719,9 @@ impl FlowEngine {
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return (Ok(()), Some(usage)),
+                _ = cancel.cancelled() => {
+                    return (Ok(CompactionOutcome::Cancelled), Some(usage));
+                }
                 chunk = stream.next() => {
                     let Some(chunk) = chunk else { break };
                     match chunk {
@@ -1712,7 +1735,7 @@ impl FlowEngine {
             }
         }
         if summary.trim().is_empty() {
-            return (Ok(()), Some(usage));
+            return (Ok(CompactionOutcome::Unchanged), Some(usage));
         }
 
         let mut new_msgs = vec![Message::user_text(format!(
@@ -1745,7 +1768,13 @@ impl FlowEngine {
         );
         self.executor.observe(obs.clone());
         sink.observation(&obs);
-        (Ok(()), Some(usage))
+        (
+            Ok(CompactionOutcome::Compacted {
+                from_messages: messages.len(),
+                to_messages: to,
+            }),
+            Some(usage),
+        )
     }
 }
 
@@ -4732,6 +4761,119 @@ mod tests {
         assert!(error.to_string().contains("missing_operation"));
     }
 
+    /// C-465 failing-first: an ordinary session below the threshold used to return `Ok(())`,
+    /// which made the REPL print "context compacted" even though the event log was untouched.
+    #[tokio::test]
+    async fn compaction_outcome_says_when_an_under_threshold_session_is_unchanged() {
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (engine, events) =
+            assemble_test_engine_with_compaction(provider, AgentLoopSpec::default(), usize::MAX);
+        let engine = engine.unwrap();
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut log = SessionLog::open(&events, &session).unwrap();
+        for i in 0..2 {
+            log.open_turn(Message::user_text(format!("u{i}"))).unwrap();
+            log.close_turn(AssistantMessage::text(format!("a{i}")).unwrap())
+                .unwrap();
+        }
+        drop(log);
+
+        let before = events.conversation(&session).unwrap();
+        let mut sink = CollectSink::default();
+        let outcome = engine
+            .maybe_compact(&session, &mut sink, &CancellationToken::new())
+            .await
+            .expect("the compaction check succeeds");
+
+        assert_eq!(outcome, CompactionOutcome::Unchanged);
+        assert_eq!(events.conversation(&session).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn compaction_outcome_distinguishes_an_explicitly_disabled_engine() {
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (engine, events) = assemble_test_engine(provider, AgentLoopSpec::default());
+        let engine = engine.unwrap();
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        let outcome = engine
+            .maybe_compact(&session, &mut sink, &CancellationToken::new())
+            .await
+            .expect("the disabled check is not an error");
+
+        assert_eq!(outcome, CompactionOutcome::Disabled);
+    }
+
+    #[tokio::test]
+    async fn an_empty_provider_summary_reports_unchanged_instead_of_compacted() {
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::from(vec![Vec::new()])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (engine, events) =
+            assemble_test_engine_with_compaction(provider, AgentLoopSpec::default(), 1);
+        let engine = engine.unwrap();
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut log = SessionLog::open(&events, &session).unwrap();
+        for i in 0..2 {
+            log.open_turn(Message::user_text(format!("u{i}"))).unwrap();
+            log.close_turn(AssistantMessage::text(format!("a{i}")).unwrap())
+                .unwrap();
+        }
+        drop(log);
+
+        let before = events.conversation(&session).unwrap();
+        let mut sink = CollectSink::default();
+        let outcome = engine
+            .maybe_compact(&session, &mut sink, &CancellationToken::new())
+            .await
+            .expect("an empty summary is not a transport error");
+
+        assert_eq!(outcome, CompactionOutcome::Unchanged);
+        assert_eq!(events.conversation(&session).unwrap(), before);
+    }
+
+    /// C-465: cancellation is a successful stop request, but it is not a successful compaction.
+    #[tokio::test]
+    async fn compaction_outcome_reports_cancellation_without_rewriting_history() {
+        let (engine, events) = assemble_test_engine_with_compaction(
+            Arc::new(PendingProvider),
+            AgentLoopSpec::default(),
+            1,
+        );
+        let engine = engine.unwrap();
+        let session = events.create_session("pending/test-model").unwrap();
+        let mut log = SessionLog::open(&events, &session).unwrap();
+        for i in 0..2 {
+            log.open_turn(Message::user_text(format!("u{i}"))).unwrap();
+            log.close_turn(AssistantMessage::text(format!("a{i}")).unwrap())
+                .unwrap();
+        }
+        drop(log);
+
+        let before = events.conversation(&session).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut sink = CollectSink::default();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            engine.maybe_compact(&session, &mut sink, &cancel),
+        )
+        .await
+        .expect("a cancelled compaction returns promptly")
+        .expect("cancellation is not a provider error");
+
+        assert_eq!(outcome, CompactionOutcome::Cancelled);
+        assert_eq!(events.conversation(&session).unwrap(), before);
+    }
+
     /// A-101 (failing-first): compaction wrote `user`-after-`user` on any ordinary conversation.
     ///
     /// The persisted log is a strict `user, assistant, …` alternation, so `len - keep` (keep = 2)
@@ -4761,10 +4903,18 @@ mod tests {
         }
 
         let mut sink = CollectSink::default();
-        engine
+        let outcome = engine
             .maybe_compact(&session, &mut sink, &CancellationToken::new())
             .await
             .expect("compaction succeeds");
+
+        assert_eq!(
+            outcome,
+            CompactionOutcome::Compacted {
+                from_messages: 4,
+                to_messages: 4,
+            }
+        );
 
         let after = events.conversation(&session).unwrap();
         assert!(

@@ -4966,6 +4966,18 @@ fn command_is_read_only(name: &str, args: &str) -> bool {
         || (name == "effort" && args.is_empty())
 }
 
+fn compaction_notice(outcome: flux_flow::engine::CompactionOutcome) -> (String, Sev) {
+    use flux_flow::engine::CompactionOutcome;
+
+    match outcome {
+        // The observed `context.compacted` event owns the success marker and its real counts.
+        CompactionOutcome::Compacted { .. } => ("compaction check complete".into(), Sev::Info),
+        CompactionOutcome::Unchanged => ("context unchanged".into(), Sev::Info),
+        CompactionOutcome::Disabled => ("context compaction is disabled".into(), Sev::Info),
+        CompactionOutcome::Cancelled => ("compaction cancelled".into(), Sev::Warn),
+    }
+}
+
 fn start_compaction(
     agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
     tx: &mpsc::UnboundedSender<UiEvent>,
@@ -4993,7 +5005,7 @@ fn start_compaction(
                 .await
         });
         let notice = match run.await {
-            Ok(Ok(())) => ("compaction check complete".to_string(), Sev::Info),
+            Ok(Ok(outcome)) => compaction_notice(outcome),
             Ok(Err(error)) => (format!("compact: {error}"), Sev::Err),
             Err(join) => (format!("compaction crashed: {join}"), Sev::Err),
         };
@@ -8456,6 +8468,37 @@ mod tests {
         state.begin_turn_usage();
         assert!(state.turn_rounds.is_empty());
         assert!(state.turn_cache.is_empty());
+    }
+
+    #[test]
+    fn compact_completion_notice_never_calls_a_no_rewrite_success() {
+        use flux_flow::engine::CompactionOutcome;
+
+        for (outcome, expected, severity) in [
+            (
+                CompactionOutcome::Disabled,
+                "context compaction is disabled",
+                Sev::Info,
+            ),
+            (CompactionOutcome::Unchanged, "context unchanged", Sev::Info),
+            (
+                CompactionOutcome::Cancelled,
+                "compaction cancelled",
+                Sev::Warn,
+            ),
+        ] {
+            let (message, actual_severity) = compaction_notice(outcome);
+            assert_eq!(message, expected);
+            assert_eq!(actual_severity, severity);
+            assert!(!message.contains("context compacted"));
+        }
+
+        let (message, severity) = compaction_notice(CompactionOutcome::Compacted {
+            from_messages: 8,
+            to_messages: 3,
+        });
+        assert_eq!(message, "compaction check complete");
+        assert_eq!(severity, Sev::Info);
     }
 
     /// C-140: `/usage` is a registered built-in and the command path opens the overlay — the wiring

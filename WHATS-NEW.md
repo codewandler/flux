@@ -15,6 +15,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/compact` now tells you what happened.** It reports a successful compaction only after the
+  conversation was actually rewritten, with the before/after message counts. A context that stayed
+  unchanged, an explicitly disabled setting, and a cancelled check now say so directly.
+
+### Action needed
+
+- **Rust integrations that call `FlowEngine::maybe_compact` must handle its typed outcome.** The
+  method now distinguishes disabled, unchanged, cancelled, and compacted results instead of
+  returning only `()` on success.
+
 ## [0.54.4] - 2026-08-03
 
 ### Fixed

@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/compact` now reports whether it actually rewrote the conversation** (C-465). The REPL no
+  longer prints `context compacted` for an under-threshold, disabled, unsplittable, empty-summary,
+  or cancelled check; successful rewrites carry their before/after message counts. The published
+  `FlowEngine::maybe_compact` API now returns `CompactionOutcome` instead of `()`, a breaking change
+  for direct `flux-flow` callers and therefore a next-minor release change.
+
 ## [0.54.4] - 2026-08-03
 
 ### Fixed

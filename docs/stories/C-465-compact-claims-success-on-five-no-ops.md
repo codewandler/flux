@@ -2,7 +2,7 @@
 id: C-465
 title: "`/compact` reports \"context compacted\" on five distinct no-ops"
 pillar: Core
-status: ready
+status: done
 priority: 5
 areas: [flux-cli, flux-flow]
 note: "spun out of C-441: maybe_compact returns Ok(()) for five paths that compact nothing; the CLI prints success for all of them. The TUI already hedges correctly, so the fix has a model in-tree"
@@ -49,15 +49,22 @@ honest; the REPL command is the one that guesses.
 
 ## Acceptance
 
-- [ ] A failing-first test: `/compact` on a session under the threshold does **not** claim the context
+- [x] A failing-first test: `/compact` on a session under the threshold does **not** claim the context
       was compacted.
-- [ ] `maybe_compact`'s result distinguishes "compacted" from "nothing to do" — the caller cannot tell
+- [x] `maybe_compact`'s result distinguishes "compacted" from "nothing to do" — the caller cannot tell
       today, and no amount of CLI-side wording fixes that without a signal to read.
-- [ ] The disabled case (`compact_threshold_chars == 0`) says so distinctly: an operator who turned
+- [x] The disabled case (`compact_threshold_chars == 0`) says so distinctly: an operator who turned
       compaction off should be told it is off, not told it ran.
-- [ ] The cancelled case does not read as success.
-- [ ] ⚠ The existing `Err` branch and the `0`-disables *behaviour* are unchanged — this story changes
+- [x] The cancelled case does not read as success.
+- [x] ⚠ The existing `Err` branch and the `0`-disables *behaviour* are unchanged — this story changes
       what is **reported**, never whether compaction fires.
+
+## Progress
+
+- 2026-08-03: `CompactionOutcome` now distinguishes disabled, unchanged, cancelled and rewritten
+  checks; successful rewrites carry their real message counts. REPL and TUI reporting consume that
+  result, and focused tests cover under-threshold, disabled, empty-summary, cancellation and rewrite
+  paths without changing the existing error or trigger behaviour.
 
 ## Notes
 
