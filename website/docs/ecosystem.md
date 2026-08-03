@@ -122,8 +122,9 @@ use the same bounded authority. That inverts the usual assumption and shapes the
 - **Service Accounts** — create, list, revoke, and present a one-time `fxsa_…` bearer token; the
   durable store keeps only its verifier. `/api/agents` is a bounded compatibility alias for create.
 
-**Still direction:** rich outbound runtime dispatch, webhooks and polls, general streamed results,
-leases, isolated per-tenant workers, and installed Apps. The
+**Still direction:** rich outbound runtime dispatch, webhooks and polls, general hosted channels
+beyond the generated socket slice, general execution records beyond value-free workflow node
+activity, streamed results, leases, isolated per-tenant workers, and installed Apps. The
 [Exchange inventory](https://github.com/codewandler/flux-exchange#what-exists-today) is authoritative.
 
 **The security property that makes it usable by agents:**
@@ -200,7 +201,8 @@ two verbs:
 
 > **Current seam:** Exchange `invoke` is built for signed-in humans and Service Accounts whose tenant
 > has a connection and an admitting grant. Generated socket channels can publish their closed declared event sets to
-> authenticated `/api/subscribe`. Flux itself has no Exchange client binding, the general
+> authenticated `/api/subscribe`. General subscribe does not exist beyond that socket slice. Flux
+> itself has no Exchange client binding, the general
 > rich-runtime stream/lease protocol is not built, and a Flux agent cannot mount that route as a
 > connector placement today. The shipped local connector channel is separate and deliberately narrower.
 
