@@ -35,6 +35,11 @@ All notable changes to this project are documented in this file. The format is b
   Cargo build script. Adding, moving, renaming or upgrading a direct dependency now fails with the
   exact regeneration command until its lock diff is acknowledged.
 
+- **The contributor vision now classifies every decision-bearing finding from the comparative source
+  review exactly once** (C-452). It separates real engineering gaps from deliberate costs of the
+  mandatory effect envelope and from adoption evidence that code cannot manufacture, with an explicit
+  purchase and cost for every defended trade-off.
+
 - **Canonical and public integration documentation now follows the Exchange-only program** (C-501).
   The signed plugin pack is documented as temporary compatibility behavior; the future path is one
   embedded Service Account client with every official connector runtime executed by Exchange and no
