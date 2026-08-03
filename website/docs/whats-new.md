@@ -27,6 +27,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **A broken intent or exploration response now names the stage that produced it.** Flux stops the
+  turn safely and shows a bounded, redacted excerpt of the unusable response instead of reporting a
+  misleading Flux-Lang field-access error.
+
 - **A typo in `FLUX_COMPACT_CHARS` is no longer silent on served agents.** An invalid value now
   prints the same warning-and-fallback outcome as the CLI. Valid values and `0` remain quiet, and a
   per-agent compaction setting still takes precedence without reading the environment override.

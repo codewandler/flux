@@ -192,6 +192,54 @@ fn adaptive_spec(
     }
 }
 
+/// Preserve the declared object contract of the adaptive loop's structured host stages before
+/// their values reach authored Flux-Lang control flow. The executor redacts every surfaced tool
+/// error; this local cap additionally prevents an invalid provider value from becoming an
+/// unbounded diagnostic.
+fn structured_stage_result(
+    stage: &str,
+    value: Value,
+    redact: impl FnOnce(&str) -> String,
+) -> Result<ToolResult> {
+    const DIAGNOSTIC_CAP_CHARS: usize = 512;
+
+    if value
+        .as_object()
+        .and_then(|object| object.get("kind"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Ok(ToolResult::ok(value.to_string()));
+    }
+
+    let value_type = match &value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object without a string `kind` field",
+    };
+    let rendered = redact(&value.to_string());
+    let total = rendered.chars().count();
+    let returned = if total <= DIAGNOSTIC_CAP_CHARS {
+        rendered
+    } else {
+        let prefix = rendered
+            .chars()
+            .take(DIAGNOSTIC_CAP_CHARS)
+            .collect::<String>();
+        format!(
+            "{prefix}…[stage result truncated: {} of {total} chars omitted]",
+            total - DIAGNOSTIC_CAP_CHARS
+        )
+    };
+    Err(Error::Other(format!(
+        "{stage} returned an unusable stage result: expected a JSON object with a string `kind` \
+         field, got {value_type}: {returned}"
+    )))
+}
+
 struct DetectIntentOp;
 
 #[async_trait]
@@ -220,7 +268,9 @@ impl Tool for DetectIntentOp {
             ));
         }
         let out = loop_host(ctx)?.detect_intent().await?;
-        Ok(ToolResult::ok(out.to_string()))
+        structured_stage_result("detect_intent", out, |rendered| {
+            ctx.redactor.redact(rendered)
+        })
     }
 }
 
@@ -247,7 +297,7 @@ impl Tool for ExploreOp {
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let _input: ExploreInput = crate::parse_params(params.clone(), "explore")?;
         let out = loop_host(ctx)?.explore(params).await?;
-        Ok(ToolResult::ok(out.to_string()))
+        structured_stage_result("explore", out, |rendered| ctx.redactor.redact(rendered))
     }
 }
 
@@ -500,5 +550,56 @@ impl Tool for RegisterCompositeOp {
         Ok(ToolResult::ok(
             serde_json::to_string(&out).unwrap_or_default(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_stage_result_requires_a_tagged_object_and_bounds_diagnostics() {
+        let valid = structured_stage_result(
+            "detect_intent",
+            serde_json::json!({"kind": "intent", "state": {}}),
+            str::to_owned,
+        )
+        .expect("a tagged object satisfies the stage contract");
+        assert!(valid.content.contains("\"kind\":\"intent\""));
+
+        let untagged = structured_stage_result(
+            "detect_intent",
+            serde_json::json!({"state": {}}),
+            str::to_owned,
+        )
+        .expect_err("an untagged object must fail closed")
+        .to_string();
+        assert!(untagged.contains("detect_intent"));
+        assert!(untagged.contains("object without a string `kind` field"));
+
+        let oversized =
+            structured_stage_result("explore", Value::String("x".repeat(2_000)), str::to_owned)
+                .expect_err("a scalar stage result must fail closed")
+                .to_string();
+        assert!(oversized.contains("explore"));
+        assert!(oversized.contains("got string"));
+        assert!(oversized.contains("stage result truncated"));
+        assert!(
+            oversized.chars().count() < 800,
+            "the diagnostic itself must stay bounded: {} chars",
+            oversized.chars().count()
+        );
+
+        let redacted_before_cap =
+            structured_stage_result("explore", Value::String("secret".repeat(400)), |_| {
+                "\"[redacted]\"".to_string()
+            })
+            .expect_err("redaction does not make a scalar result valid")
+            .to_string();
+        assert!(redacted_before_cap.contains("[redacted]"));
+        assert!(
+            !redacted_before_cap.contains("stage result truncated"),
+            "redaction must happen before truncation so a secret crossing the cap cannot leak"
+        );
     }
 }

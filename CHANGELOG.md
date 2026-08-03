@@ -39,6 +39,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Malformed adaptive-stage results now identify their producer instead of blaming Flux-Lang**
+  (C-327). The `detect_intent` and `explore` reflect boundaries require a tagged JSON object before
+  the authored loop reads `.kind`. Scalar or untagged results halt with the stage name, returned
+  type, and a bounded executor-redacted excerpt retained in the step trace.
+
 - **The plugin hash-drift test no longer copies a whole binary into ambient `/tmp`** (C-468).
   Its writable fixture now lives in a unique, automatically cleaned directory beside Cargo's active
   target binary. A staging failure names that directory and its storage cause before any hash check,

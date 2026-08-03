@@ -106,6 +106,11 @@ the L0-purity of the language is enforced by a **crate wall**, not just module d
   every consumer (zero churn). `plan_risk` / `PlanApprover` stay here — they need `ToolRegistry` and
   `Tool::intents` (literal-arg destructive detection), which the language-level `OpCatalog` doesn't carry.
 
+The same layer boundary owns adaptive-stage shape validation. Host adapters for structured control
+stages reject scalar or untagged results before an authored loop performs strict field access. This
+keeps Flux-Lang's L0 semantics generic, makes the producing stage—not the language—the diagnostic
+owner, and fails closed rather than manufacturing a fallback intent from malformed state.
+
 Classify `"flux-lang" => 0` and `"flux-flow" => 3` in `flux-codegate`'s `layer()` map. `flux-flow` deps
 (own layer or lower): `flux-lang`, `flux-core`, `flux-spec` (L0); `flux-provider` (L1); `flux-runtime`,
 `flux-events` (L2); `flux-agent`, `flux-evidence`, `flux-skill`.

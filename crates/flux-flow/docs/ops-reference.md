@@ -442,6 +442,11 @@ output schemas. Config stages live under `[agent.stages.<name>]`; SDK callers ca
 `stage_fn::<I, O, _, _, _>(...)`. A model stage may call only explicitly declared, statically
 gather-safe tools.
 
+`detect_intent` and `explore` enforce their tagged-object output contract at the host adapter before
+authored control flow reads `.kind`. A scalar or object without a string `kind` fails the stage,
+names the producer and returned type, and retains only a bounded executor-redacted excerpt. The loop
+does not guess a default intent or continue from malformed state.
+
 **Visibility:** the loop machinery is tagged to a never-surfaced host group. A model cannot invoke
 `detect_intent`, batch approval/execution, or `present_results`; only an analyzed authored flow may do
 so when a `LoopHost` is installed. `op.register`, `flow_list`, and `flow_run` remain model-facing root

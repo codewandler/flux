@@ -2282,6 +2282,7 @@ pub(crate) fn suspension_prompt(outcome: &FlowOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::RunEvent;
     use flux_core::ContentBlock;
 
     use std::collections::VecDeque;
@@ -2409,6 +2410,36 @@ mod tests {
 
         async fn stream(&self, _request: Request) -> Result<ChunkStream> {
             Err(Error::Provider("deterministic stage failure".into()))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MalformedStage {
+        DetectIntent,
+        Explore,
+    }
+
+    struct MalformedStageHost {
+        stage: MalformedStage,
+    }
+
+    const MALFORMED_STAGE_SECRET: &str = "stage-secret-327327327327";
+
+    #[async_trait]
+    impl flux_runtime::LoopHost for MalformedStageHost {
+        async fn detect_intent(&self) -> Result<Value> {
+            Ok(match self.stage {
+                MalformedStage::DetectIntent => {
+                    json!(format!("plain-text intent result {MALFORMED_STAGE_SECRET}"))
+                }
+                MalformedStage::Explore => json!({"kind": "intent", "state": {}}),
+            })
+        }
+
+        async fn explore(&self, _input: Value) -> Result<Value> {
+            Ok(json!(format!(
+                "plain-text exploration result {MALFORMED_STAGE_SECRET}"
+            )))
         }
     }
 
@@ -2785,6 +2816,96 @@ mod tests {
             calls, 2,
             "failed zero-usage provider attempts remain durable call facts"
         );
+    }
+
+    /// C-327 failing-first: malformed structured stage output must be attributed at the reflect
+    /// boundary, before the shipped loop's strict `.kind` access can misreport it as a Flux-Lang
+    /// failure. Both producers are driven through the real embedded loop and real reflect tools.
+    #[tokio::test]
+    async fn malformed_stage_results_stop_with_stage_attribution() {
+        for (stage, expected_stage, returned) in [
+            (
+                MalformedStage::DetectIntent,
+                "detect_intent",
+                "plain-text intent result",
+            ),
+            (
+                MalformedStage::Explore,
+                "explore",
+                "plain-text exploration result",
+            ),
+        ] {
+            let mut registry = ToolRegistry::new();
+            flux_tools::register_reflect(&mut registry);
+            let root = std::env::current_dir().expect("the test process has a working directory");
+            let context = ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap())))
+                .with_loop_host(Arc::new(MalformedStageHost { stage }));
+            context.redactor.add_secret(MALFORMED_STAGE_SECRET);
+            let executor = Executor::new(
+                registry,
+                PermissionManager::from_rules(
+                    &[
+                        "detect_intent".into(),
+                        "explore".into(),
+                        "present_results".into(),
+                    ],
+                    &[],
+                ),
+                Arc::new(AllowApprover),
+                context,
+            );
+            executor.allow(&["detect_intent", "explore", "present_results"]);
+            let store = FlowStore::in_memory().unwrap();
+            let loop_ast = load_agent_loop(&root).unwrap();
+
+            let error = crate::runtime::execute_flow(
+                &store,
+                &executor,
+                "malformed-stage",
+                &loop_ast,
+                &mut CollectSink::default(),
+            )
+            .await
+            .expect_err("a malformed control-stage result must halt the adaptive loop");
+            let error = error.to_string();
+            assert!(
+                error.contains(expected_stage),
+                "the failure must name its producing stage `{expected_stage}`: {error}"
+            );
+            assert!(
+                error.contains(returned),
+                "the failure must include the unusable returned value: {error}"
+            );
+            assert!(
+                !error.contains("field access") && !error.contains("Flux-Lang"),
+                "the stage contract failure must not blame the language: {error}"
+            );
+            assert!(
+                !error.contains(MALFORMED_STAGE_SECRET),
+                "stage diagnostics must cross the executor redactor: {error}"
+            );
+            let durable_errors = store
+                .events("malformed-stage")
+                .unwrap()
+                .into_iter()
+                .filter_map(|event| match event {
+                    RunEvent::StepFailed { error, .. } => Some(error),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                durable_errors
+                    .iter()
+                    .any(|error| { error.contains(expected_stage) && error.contains(returned) }),
+                "the replayable trace must retain stage-owned diagnostics: {durable_errors:?}"
+            );
+            assert!(
+                durable_errors
+                    .iter()
+                    .all(|error| !error.contains(MALFORMED_STAGE_SECRET)),
+                "the replayable trace must not retain a registered secret: {durable_errors:?}"
+            );
+        }
     }
 
     /// [`assemble_test_engine`] with compaction armed (`0` disables it, which is the default).

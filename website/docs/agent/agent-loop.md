@@ -54,6 +54,11 @@ The host validates every input against the exact registered schema and construct
 The model cannot label a write as a read or mint an approval receipt. Idempotency controls reuse;
 effects, risk, concrete intents, and staging policy control whether a call may gather.
 
+Structured intent and exploration results also fail closed. They must be tagged JSON objects before
+the authored loop reads them. A scalar or untagged response stops the turn and names the stage and
+returned type, with a bounded redacted excerpt retained in the trace, instead of surfacing as a
+misleading Flux-Lang field-access error or being treated as a default intent.
+
 ## Why not generate one Flux plan?
 
 A one-shot generated graph asked a model to choose operations, reproduce their argument schemas in a

@@ -50,6 +50,13 @@ The model cannot mark a write as a read. Effects, risk, concrete intents, and st
 decide whether a call may gather; idempotency decides whether a result may be reused. These are
 host-owned contracts.
 
+The structured stage boundary is fail-closed too. `detect_intent` and `explore` must return a JSON
+object with a string `kind` before their result reaches the authored loop. A scalar or untagged
+object stops the turn instead of being treated as a default intent: the error names the producing
+stage and value type, includes a bounded redacted excerpt of what it returned, and is retained in
+the replayable step trace. This validation belongs to the host adapter rather than Flux-Lang, whose
+strict field access continues to catch ordinary authored-flow mistakes.
+
 ## Why this replaced model-generated plans
 
 A one-shot model-generated graph asked the least reliable component to choose operations, reproduce

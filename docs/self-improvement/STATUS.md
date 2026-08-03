@@ -1,6 +1,6 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-08-03 (targeted layered-context hardening). Substantive autonomous-loop state is
+_Last updated: 2026-08-03 (targeted adaptive-stage diagnostics). Substantive autonomous-loop state is
 frozen at round 3, 2026-07-06 — the initiative remains ON HOLD._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
@@ -14,6 +14,13 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   headline gain — a statistically clean, grader-confirmed improvement at **trials ≥ 3** — is **not
   yet achieved**. Resume at I-05's two queued chain fixes, then fund round 4. See the
   [2026-07-06 journey entry](#journey-the-runs-and-what-each-one-taught-us) and stories I-01 / I-05.
+
+- **2026-08-03 adaptive-stage diagnostic hardening (C-327, outside the paused autonomous loop):**
+  the shipped loop's `detect_intent` and `explore` adapters now reject scalar or untagged results
+  before strict Flux-Lang field access. The failure names the stage and returned type, retains a
+  bounded executor-redacted excerpt in the replayable trace, and halts rather than guessing a
+  fallback intent. A deterministic injected-host test covers both control-stage sites. No benchmark
+  score is claimed; the autonomous initiative remains on hold.
 
 - **2026-08-03 layered-context hardening (A-147, outside the paused autonomous loop):** the universal
   harness protocol is now a 1,398-byte embedded prefix, distinct from the 1,134-byte coding profile,
