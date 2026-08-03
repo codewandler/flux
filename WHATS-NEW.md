@@ -22,6 +22,11 @@
   publishes it. A failed build or publication stays visibly failed with its recovery candidate
   preserved; it cannot silently finish as a partial release.
 
+### Fixed
+
+- **Release automation now stops clearly when generated notes have the wrong shape.** Unexpected
+  wrappers or missing fields are rejected before a changelog, commit, or tag can be changed.
+
 ## [0.55.0] - 2026-08-03
 
 ### New

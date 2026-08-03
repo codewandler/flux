@@ -126,6 +126,10 @@ const PERMITTED_OPS: &[(&str, &str)] = &[
         "release_verify_versions",
         "fixed argv: scripts/check-crate-versions.sh",
     ),
+    (
+        "release_parse_notes",
+        "pure strict JSON adaptation; grants no external authority",
+    ),
     ("release_cut", "fixed argv: scripts/cut-release.sh"),
     (
         "changelog_insert",
@@ -157,6 +161,16 @@ fn the_release_program_calls_only_its_permitted_ops() {
         "examples/release.flux calls op(s) outside its authority ceiling: {extra:?}\n\
          Adding an op to a release flow widens what an unattended run with commit and tag authority \
          can do. If the addition is intended, add it to PERMITTED_OPS with the reason it is safe."
+    );
+}
+
+#[test]
+fn the_release_program_validates_scribe_text_before_field_access() {
+    let called = ops_called_by_release_flux();
+    assert!(
+        called.contains("release_parse_notes"),
+        "the task op returns text; release.flux must pass it through the strict host parser before \
+         reading changelog fields"
     );
 }
 

@@ -278,8 +278,12 @@ impl RunOutcome {
 }
 
 /// Lower and run the shipped `examples/release.flux` against `fixture`, with `apply` bound as the
-/// flow input and `scribe_opinion` as the stub model's advisory bump.
-async fn run_release_flow(fixture: &Fixture, apply: bool, scribe_opinion: &str) -> RunOutcome {
+/// flow input and `scribe_reply` as the stub model's textual response.
+async fn run_release_flow_with_reply(
+    fixture: &Fixture,
+    apply: bool,
+    scribe_reply: String,
+) -> RunOutcome {
     let src = std::fs::read_to_string(release_flux_path()).expect("read examples/release.flux");
     let mut ast = match flux_flow::program::Module::parse_str(&src)
         .expect("examples/release.flux parses as native flux-lang text")
@@ -296,7 +300,7 @@ async fn run_release_flow(fixture: &Fixture, apply: bool, scribe_opinion: &str) 
     flux_tools::register_builtins(&mut registry);
     flux_eval::register_eval_ops(&mut registry);
     registry.register(Arc::new(StubScribe {
-        reply: scribe_reply(scribe_opinion),
+        reply: scribe_reply,
     }));
 
     // The same gate `flux flow run` applies — unknown ops, missing required params, type conflicts.
@@ -329,6 +333,11 @@ async fn run_release_flow(fixture: &Fixture, apply: bool, scribe_opinion: &str) 
             failure: Some(e.to_string()),
         },
     }
+}
+
+/// Normal journey helper: vary only the scribe's advisory opinion while keeping its JSON valid.
+async fn run_release_flow(fixture: &Fixture, apply: bool, scribe_opinion: &str) -> RunOutcome {
+    run_release_flow_with_reply(fixture, apply, scribe_reply(scribe_opinion)).await
 }
 
 fn release_flux_path() -> PathBuf {
@@ -488,6 +497,49 @@ async fn an_unbumped_protocol_line_crate_halts_before_anything_is_written() {
         vec!["v0.37.0"],
         "the halt must leave no tag"
     );
+}
+
+/// `task()` returns text. Every model wrapper or schema drift must halt at the explicit host parser,
+/// before that text can reach either changelog or the cut script.
+#[tokio::test]
+async fn malformed_scribe_text_halts_before_any_changelog_or_tag() {
+    let valid = scribe_reply("patch");
+    let replies = [
+        format!("```json\n{valid}\n```"),
+        format!("Here are the notes: {valid}"),
+        format!("{valid}\nHope this helps."),
+        r#"{"changelog":"c","whats_new":"w","bump_opinion":"major","bump_reason":"r"}"#.into(),
+        r#"{"changelog":"c","whats_new":"w","bump_opinion":"patch"}"#.into(),
+    ];
+
+    for (index, reply) in replies.into_iter().enumerate() {
+        let fixture = Fixture::new(
+            &format!("malformed-{index}"),
+            &["fix(widget): restore cache invalidation"],
+            true,
+            CutStub::Succeeds,
+        );
+        let before_changelog = fixture.read("CHANGELOG.md");
+        let before_whats_new = fixture.read("WHATS-NEW.md");
+        let before_manifest = fixture.read("Cargo.toml");
+        let before_website = fixture.read("website/docs/whats-new.md");
+        let before_head = fixture.head_subject();
+
+        let failure = run_release_flow_with_reply(&fixture, true, reply)
+            .await
+            .expect_halt()
+            .to_string();
+        assert!(
+            failure.contains("release_parse_notes"),
+            "halt must name the model boundary, got: {failure}"
+        );
+        assert_eq!(fixture.read("CHANGELOG.md"), before_changelog);
+        assert_eq!(fixture.read("WHATS-NEW.md"), before_whats_new);
+        assert_eq!(fixture.read("Cargo.toml"), before_manifest);
+        assert_eq!(fixture.read("website/docs/whats-new.md"), before_website);
+        assert_eq!(fixture.head_subject(), before_head);
+        assert_eq!(fixture.tags(), vec!["v0.37.0"]);
+    }
 }
 
 /// A red gate inside `cut-release.sh` leaves **no tag** and no phantom version section — the C-147

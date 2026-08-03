@@ -84,6 +84,7 @@ pub fn try_register_eval_ops(registry: &mut ToolRegistry) -> Result<()> {
             // general process or write authority.
             Arc::new(release::ReleasePlanTool),
             Arc::new(release::ReleaseVerifyVersionsTool),
+            Arc::new(release::ReleaseParseNotesTool),
             Arc::new(release::ChangelogInsertTool),
             Arc::new(release::ReleaseCutTool),
         ],

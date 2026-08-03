@@ -19,6 +19,13 @@ All notable changes to this project are documented in this file. The format is b
   bubblewrap before the agentic smoke and Flux cut, including enabling the user-namespace primitive
   restricted by Ubuntu 24.04's hosted AppArmor default, preserving the fail-closed sandbox posture.
 
+### Fixed
+
+- **The Flux-authored release flow now validates the scribe's textual JSON before reading fields**
+  (C-251). `release_parse_notes` is a pure, strict model-to-host adapter: Markdown fences, leading
+  prose, missing or extra fields, and invalid bump opinions halt before either changelog or the cut
+  script can run. Internal-only releases may still leave the customer note empty.
+
 ## [0.55.0] - 2026-08-03
 
 ### Added
