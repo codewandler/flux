@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.54.1] - 2026-08-03
+
 ### Fixed
 
 - **The documentation archive embedded in `flux-server` is release-current and independent of the

@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.54.1] - 2026-08-03
+
 ### Fixed
 
 - **`flux docs` now contains the documentation that belongs to this release.** Its embedded site is
