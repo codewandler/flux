@@ -404,10 +404,11 @@ Four decisions in it are load-bearing, and each one is a measured finding rather
   surfaced, and even that only counts.
 
 **Backpressure.** Inbound audio arrives ~50×/s and never stops. `MediaStream` is bounded and sheds *audio*
-past capacity rather than growing, keeping `MEDIA_CONTROL_RESERVE` (32) slots back so `speech_started` and
-`participant` are never shed — a barge-in that arrives late is a bot talking over a person. Blocking
-instead would push backpressure onto the sidecar's pipe and stall the *outbound* half of the same
-protocol, so a flux that is slow at hearing would stop being able to speak.
+past capacity rather than growing, keeping `MEDIA_CONTROL_RESERVE` (32) slots back so audio cannot shed
+`speech_started` or `participant`. A control-only flood can still exhaust that finite queue; such loss is
+counted separately rather than hidden. A barge-in that arrives late is a bot talking over a person.
+Blocking instead would push backpressure onto the sidecar's pipe and stall the *outbound* half of the
+same protocol, so a flux that is slow at hearing would stop being able to speak.
 
 **Failure posture.** Every media failure is an **operation** failure. A sidecar that would not start, died,
 or wedged fails the `MediaPeer` call and nothing else: the room stays joined, text and presence keep

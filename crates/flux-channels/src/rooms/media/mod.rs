@@ -54,9 +54,10 @@
 //!
 //! Inbound audio arrives roughly fifty times a second and never stops. [`MediaStream`] is bounded
 //! and **sheds audio** past its capacity rather than growing: a queue of stale speech is worth less
-//! than the memory it costs. Control events — `speech_started`, `participant` — are never shed;
-//! [`MEDIA_CONTROL_RESERVE`] slots are kept back for them, because a barge-in that arrives late is a
-//! bot talking over a person.
+//! than the memory it costs. [`MEDIA_CONTROL_RESERVE`] slots are kept back so audio cannot shed
+//! control events — `speech_started`, `participant`. A control-only flood can still fill the bounded
+//! queue; that loss is counted separately because a barge-in that arrives late is a bot talking over
+//! a person.
 
 mod mock;
 mod protocol;
@@ -170,7 +171,8 @@ pub trait MediaPeer: Send + Sync {
 /// reading a pipe and the consumer is a `select!` that also watches a cancellation token.
 pub struct MediaStream {
     rx: mpsc::Receiver<MediaEvent>,
-    dropped: Arc<AtomicU64>,
+    dropped_audio: Arc<AtomicU64>,
+    dropped_control: Arc<AtomicU64>,
 }
 
 /// The producing half of a [`MediaStream`].
@@ -178,7 +180,8 @@ pub struct MediaStream {
 pub struct MediaEventSender {
     tx: mpsc::Sender<MediaEvent>,
     reserve: usize,
-    dropped: Arc<AtomicU64>,
+    dropped_audio: Arc<AtomicU64>,
+    dropped_control: Arc<AtomicU64>,
 }
 
 /// What became of one [`MediaEventSender::send`].
@@ -186,7 +189,7 @@ pub struct MediaEventSender {
 pub enum Delivery {
     /// Queued for the consumer.
     Sent,
-    /// Shed to keep the queue bounded. Only ever an audio frame.
+    /// Shed to keep the queue bounded. Normally audio; control can exhaust its finite reserve too.
     Dropped,
     /// The consumer is gone; the producer should stop reading its transport.
     Closed,
@@ -204,14 +207,20 @@ pub fn media_event_channel_with_capacity(capacity: usize) -> (MediaEventSender, 
     let capacity = capacity.max(2);
     let reserve = MEDIA_CONTROL_RESERVE.min(capacity - 1);
     let (tx, rx) = mpsc::channel(capacity);
-    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped_audio = Arc::new(AtomicU64::new(0));
+    let dropped_control = Arc::new(AtomicU64::new(0));
     (
         MediaEventSender {
             tx,
             reserve,
-            dropped: dropped.clone(),
+            dropped_audio: dropped_audio.clone(),
+            dropped_control: dropped_control.clone(),
         },
-        MediaStream { rx, dropped },
+        MediaStream {
+            rx,
+            dropped_audio,
+            dropped_control,
+        },
     )
 }
 
@@ -224,7 +233,12 @@ impl MediaStream {
     /// How many inbound audio frames have been shed to keep this queue bounded, since the stream was
     /// created. Non-zero means flux is not keeping up — which is a diagnostic, not a failure.
     pub fn dropped_audio_frames(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped_audio.load(Ordering::Relaxed)
+    }
+
+    /// How many control events were shed after filling the finite control reserve.
+    pub fn dropped_control_events(&self) -> u64 {
+        self.dropped_control.load(Ordering::Relaxed)
     }
 }
 
@@ -237,15 +251,18 @@ impl MediaEventSender {
     /// at reading audio would stop being able to speak, which is precisely backwards.
     pub fn send(&self, event: MediaEvent) -> Delivery {
         if event.is_droppable() && self.tx.capacity() <= self.reserve {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.dropped_audio.fetch_add(1, Ordering::Relaxed);
             return Delivery::Dropped;
         }
         match self.tx.try_send(event) {
             Ok(()) => Delivery::Sent,
             Err(mpsc::error::TrySendError::Full(event)) => {
-                if event.is_droppable() {
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
-                }
+                let dropped = if event.is_droppable() {
+                    &self.dropped_audio
+                } else {
+                    &self.dropped_control
+                };
+                dropped.fetch_add(1, Ordering::Relaxed);
                 Delivery::Dropped
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Delivery::Closed,
@@ -254,7 +271,12 @@ impl MediaEventSender {
 
     /// How many audio frames this channel has shed. Same counter [`MediaStream`] reports.
     pub fn dropped_audio_frames(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped_audio.load(Ordering::Relaxed)
+    }
+
+    /// How many control events this channel has shed. Same counter [`MediaStream`] reports.
+    pub fn dropped_control_events(&self) -> u64 {
+        self.dropped_control.load(Ordering::Relaxed)
     }
 }
 
@@ -311,6 +333,24 @@ mod tests {
             drained.last(),
             Some(&barge_in),
             "the barge-in is still in the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_flood_is_shed_visibly_when_the_bounded_queue_is_full() {
+        let (tx, _stream) = media_event_channel_with_capacity(MEDIA_CONTROL_RESERVE);
+        let control = MediaEvent::SpeechStarted {
+            from: OccupantId::new("standup@x/ada"),
+        };
+
+        for _ in 0..MEDIA_CONTROL_RESERVE {
+            assert_eq!(tx.send(control.clone()), Delivery::Sent);
+        }
+        assert_eq!(tx.send(control), Delivery::Dropped);
+        assert_eq!(
+            tx.dropped_control_events(),
+            1,
+            "a full control reserve must never lose an event silently"
         );
     }
 

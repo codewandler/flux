@@ -70,6 +70,10 @@ All notable changes to this project are documented in this file. The format is b
   into that declaration's body; exact-text coverage also pins comments before, between, and trailing
   on declarations and statements.
 
+- **A control-only room-media flood is now counted instead of being shed silently** (D-233). Audio
+  retains its reserved boundary, while the finite control queue exposes a separate loss diagnostic
+  and the media contract no longer claims that control events can never fill it.
+
 - **Webhook and connector HTTP ingress now shares the server's body, timeout, request-rate and
   concurrency controls** (C-409). Admission happens before `Deliverer` or task spawn, async work
   holds its permit for the full delivery, and refusals reuse the typed `429`, `Retry-After` and
