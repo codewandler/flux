@@ -49,7 +49,7 @@ layout pass. Formatting is idempotent afterwards, which is what has kept it invi
       output *text* or column, as L-103's own re-anchor test had to.
 - [x] `cargo test -p flux-cli --test website_contract` still passes, including
       `public_flux_examples_are_canonical_formatter_fixed_points`.
-- [ ] Full gate green, including `bash scripts/build-portable-wasm.sh`. The child-owned portable
+- [x] Full gate green, including `bash scripts/build-portable-wasm.sh`. The child-owned portable
       WASM build and parity tests pass; the wave parent owns the one full repository gate after
       integration.
 
@@ -85,3 +85,4 @@ layout pass. Formatting is idempotent afterwards, which is what has kept it invi
   both relevant Clippy runs with `-D warnings`, `cargo fmt --all -- --check`, the changelog mirror
   golden check, and `scripts/build-portable-wasm.sh` all pass. The wave parent will run the full
   workspace gate once after integration.
+- 2026-08-04: the final integrated wave passed the complete repository gate.

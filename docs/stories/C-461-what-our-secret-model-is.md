@@ -68,8 +68,7 @@ and it is the single most important sentence for a user to read.
 - [x] ⚠ The **documented, structural** exception is stated: raw prompt text and turn summaries reach the
       durable log with no redactor in the path. A page that lists the guarantees without this one is the
       overclaim it exists to prevent.
-- [ ] Full gate green including website checks. (Website checks are green; the wave integration parent
-      owns the single full repository gate.)
+- [x] Full gate green including website checks.
 
 ## Notes
 
@@ -94,3 +93,5 @@ and it is the single most important sentence for a user to read.
   passed); and `npm run build` in `website/` (production build green after `npm ci`). `npm ci` reported
   the lockfile's existing 27 audit findings (1 low, 20 moderate, 6 high); dependencies were not changed.
   The wave parent owns the single full repository gate.
+- 2026-08-04: the final integrated wave passed the complete repository gate and regenerated the
+  customer changelog, ecosystem mirror and embedded public-doc archive.

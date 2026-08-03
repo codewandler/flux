@@ -2,7 +2,7 @@
 id: C-413
 title: "Two residuals in the 0.47.x diff: the XMPP socket is guarded but not DNS-pinned, and `JaasRoom::join` has a TOCTOU"
 pillar: Core
-status: in-progress
+status: done
 priority: 9
 epic: meeting-rooms
 areas: [flux-channels]
@@ -40,7 +40,7 @@ is what makes the asymmetry worth removing.
       guard, no bare `await` between them.
 - [x] The XMPP socket is DNS-pinned like its HTTP siblings, or the asymmetry is documented at
       `session.rs:167` with the reason it cannot be.
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -55,3 +55,4 @@ is what makes the asymmetry worth removing.
   `right: 1`) before the initial-join gate was installed; the same focused test now passes and a
   fixed-resolver WebSocket handshake proves the RFC 6455/TLS request dials the exact address vetted
   by `flux-system` without handing the hostname to a second resolver. The wave full gate is pending.
+- 2026-08-04: the final integrated wave passed the complete repository gate.

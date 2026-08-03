@@ -2,7 +2,7 @@
 id: C-503
 title: "Embed the Exchange connector client"
 pillar: Core
-status: in-progress
+status: done
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
@@ -49,6 +49,7 @@ existing one-shot HTTP operation path without learning vendor authority.
   consumes the held sentinel on the vendor wire, then excludes it from Flux output/logs, Exchange
   logs, Flux/Exchange wire, events, evidence, conversation, run trace and store bytes. Focused tests,
   focused all-target clippy, formatting and website contracts pass; the wave gate remains pending.
+- 2026-08-04: the final integrated wave passed the complete repository gate.
 
 ## Notes
 

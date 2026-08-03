@@ -45,7 +45,7 @@ that was a feature. That is a real failure mode and it is cheap to prevent.
       (cancellation) are **real gaps**, and this page should say so and point at them.
 - [x] The register matches `vision.md`'s own — it states the improvement-loop pillar is *"currently
       aspirational, and this document says so honestly."*
-- [ ] Full gate green. (The wave integration parent owns the single full gate.)
+- [x] Full gate green.
 
 ## Notes
 
@@ -66,3 +66,4 @@ that was a feature. That is a real failure mode and it is cheap to prevent.
   both the purchase and cost for every defended choice. Added the maintainer-facing changelog entry.
   Targeted verification: `git diff --check` and `cargo test -p flux-codegate` (51 passed). The wave
   parent owns the single full repository gate.
+- 2026-08-04: the final integrated wave passed the complete repository gate.

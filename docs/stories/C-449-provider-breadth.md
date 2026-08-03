@@ -38,7 +38,7 @@ adoption lever: the provider someone already uses being absent is a first-five-m
       question a bouncing evaluator actually has.
 - [x] ⚠ Do not add providers one at a time without the decision. Nine half-maintained providers is worse
       than three good ones plus a documented compatible path.
-- [ ] Full gate green. (The wave integration parent owns the single full gate.)
+- [x] Full gate green.
 
 ## Notes
 
@@ -59,3 +59,4 @@ adoption lever: the provider someone already uses being absent is a first-five-m
   architecture, and added maintainer/customer changelog entries. Targeted verification:
   `git diff --check`; `cargo test -p codewandler-flux-providers --features realtime` (202 passed, one
   credentialed live test ignored). The wave parent owns the single full repository gate.
+- 2026-08-04: the final integrated wave passed the complete repository gate.
