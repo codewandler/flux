@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use flux_agent::{AgentProfile, AgentSpec, Permissions, DEFAULT_COMPACT_THRESHOLD_CHARS};
+use flux_agent::{resolve_compact_threshold_env, AgentProfile, AgentSpec, Permissions};
 use flux_core::{Error, Result, Usage};
 use flux_events::EventStore;
 use flux_evidence::{Observation, Phase};
@@ -1809,18 +1809,34 @@ fn build_executor(
 /// re-sends the whole growing transcript every turn — linear cost, then a hard provider
 /// context-window error. Precedence: per-agent (`settings.compact_threshold_chars`) > env
 /// (`FLUX_COMPACT_CHARS`, the same knob the CLI honours) > the sane non-zero
-/// [`DEFAULT_COMPACT_THRESHOLD_CHARS`]. A per-agent `0` disables compaction explicitly.
-fn compact_threshold_for_decl(decl: &AgentDecl) -> usize {
-    decl.settings
+/// [`flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS`]. A per-agent `0` disables compaction explicitly.
+fn compact_threshold_for_decl_from_env(
+    decl: &AgentDecl,
+    env: impl FnOnce() -> std::result::Result<String, std::env::VarError>,
+    mut warn: impl FnMut(&str),
+) -> usize {
+    if let Some(threshold_chars) = decl
+        .settings
         .get("compact_threshold_chars")
         .and_then(serde_json::Value::as_u64)
         .map(|n| n as usize)
-        .or_else(|| {
-            std::env::var("FLUX_COMPACT_CHARS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(DEFAULT_COMPACT_THRESHOLD_CHARS)
+    {
+        return threshold_chars;
+    }
+
+    let resolution = resolve_compact_threshold_env(env());
+    if let Some(warning) = resolution.warning.as_deref() {
+        warn(warning);
+    }
+    resolution.threshold_chars
+}
+
+fn compact_threshold_for_decl(decl: &AgentDecl) -> usize {
+    compact_threshold_for_decl_from_env(
+        decl,
+        || std::env::var("FLUX_COMPACT_CHARS"),
+        |warning| eprintln!("(warning: {warning})"),
+    )
 }
 
 async fn agent_spec_from_decl(
@@ -2602,6 +2618,7 @@ impl AgentSink for UsageCapture<'_> {
 mod agent_target_tests {
     use super::*;
     use async_trait::async_trait;
+    use flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS;
     use flux_core::{Chunk, ContentBlock, Role, StopReason};
     use flux_lang::program::Module;
     use flux_provider::{ChunkStream, Request};
@@ -3298,6 +3315,76 @@ journey pong
             .await
             .unwrap();
         assert_eq!(spec.compact_threshold_chars, 0);
+    }
+
+    /// C-507: the served resolver must distinguish an absent environment override from an explicit
+    /// malformed one, while a per-agent setting remains authoritative enough that the environment
+    /// is never consulted. The injected environment result and diagnostic sink keep this test
+    /// hermetic: no process-global variable or stderr capture can race another test thread.
+    #[test]
+    fn served_compaction_resolution_reports_malformed_env_and_preserves_precedence() {
+        fn resolve(
+            decl: &AgentDecl,
+            env: std::result::Result<String, std::env::VarError>,
+        ) -> (usize, Vec<String>) {
+            let mut warnings = Vec::new();
+            let threshold = compact_threshold_for_decl_from_env(
+                decl,
+                || env,
+                |warning| {
+                    warnings.push(warning.to_string());
+                },
+            );
+            (threshold, warnings)
+        }
+
+        let base = AgentDecl {
+            name: "served".into(),
+            settings: Value::Null,
+            ..AgentDecl::default()
+        };
+
+        let (threshold, warnings) = resolve(&base, Err(std::env::VarError::NotPresent));
+        assert_eq!(threshold, DEFAULT_COMPACT_THRESHOLD_CHARS);
+        assert!(warnings.is_empty(), "a missing override must stay quiet");
+
+        for (value, expected) in [("1234", 1234), ("0", 0)] {
+            let (threshold, warnings) = resolve(&base, Ok(value.into()));
+            assert_eq!(threshold, expected);
+            assert!(
+                warnings.is_empty(),
+                "a valid override {value:?} must stay quiet"
+            );
+        }
+
+        let (threshold, warnings) = resolve(&base, Ok("48k".into()));
+        assert_eq!(threshold, DEFAULT_COMPACT_THRESHOLD_CHARS);
+        assert_eq!(warnings.len(), 1, "one bad value emits one warning");
+        let warning = &warnings[0];
+        assert!(warning.contains("FLUX_COMPACT_CHARS"), "{warning}");
+        assert!(warning.contains("48k"), "{warning}");
+        assert!(
+            warning.contains(&DEFAULT_COMPACT_THRESHOLD_CHARS.to_string()),
+            "{warning}"
+        );
+
+        for setting in [9999, 0] {
+            let decl = AgentDecl {
+                settings: json!({ "compact_threshold_chars": setting }),
+                ..base.clone()
+            };
+            let mut warnings = Vec::new();
+            let threshold = compact_threshold_for_decl_from_env(
+                &decl,
+                || panic!("a per-agent setting must not consult FLUX_COMPACT_CHARS"),
+                |warning| warnings.push(warning.to_string()),
+            );
+            assert_eq!(threshold, setting);
+            assert!(
+                warnings.is_empty(),
+                "a per-agent setting must bypass the environment entirely"
+            );
+        }
     }
 
     #[tokio::test]

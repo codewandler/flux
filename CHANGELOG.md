@@ -39,6 +39,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Malformed `FLUX_COMPACT_CHARS` overrides now warn on served agents as well as the CLI**
+  (C-507). Both surfaces consume one `flux-agent` parse/outcome contract: missing, valid, and `0`
+  values stay quiet, while an explicit invalid value names the rejected input and shared fallback.
+  A per-agent `compact_threshold_chars` setting still wins without consulting the environment.
+
 - **`/compact` now reports whether it actually rewrote the conversation** (C-465). The REPL no
   longer prints `context compacted` for an under-threshold, disabled, unsplittable, empty-summary,
   or cancelled check; successful rewrites carry their before/after message counts. The published

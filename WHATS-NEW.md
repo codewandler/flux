@@ -30,6 +30,10 @@
 
 ### Fixed
 
+- **A typo in `FLUX_COMPACT_CHARS` is no longer silent on served agents.** An invalid value now
+  prints the same warning-and-fallback outcome as the CLI. Valid values and `0` remain quiet, and a
+  per-agent compaction setting still takes precedence without reading the environment override.
+
 - **`/compact` now tells you what happened.** It reports a successful compaction only after the
   conversation was actually rewritten, with the before/after message counts. A context that stayed
   unchanged, an explicitly disabled setting, and a cancelled check now say so directly.

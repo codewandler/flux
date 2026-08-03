@@ -149,6 +149,54 @@ pub const DEFAULT_CONTEXT_BUDGET: usize = 8192;
 /// know their workload can tune it with [`AgentSpec::with_compaction`] / `FLUX_COMPACT_CHARS`.
 pub const DEFAULT_COMPACT_THRESHOLD_CHARS: usize = 48_000;
 
+/// Effective compaction threshold plus an optional surface-neutral operator diagnostic.
+///
+/// CLI and served-agent hosts render the diagnostic in their own style, but share this outcome so
+/// an explicit malformed `FLUX_COMPACT_CHARS` value cannot be silently treated as an absent one on
+/// one surface and warned about on another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct CompactThresholdResolution {
+    pub threshold_chars: usize,
+    pub warning: Option<String>,
+}
+
+/// Resolve `FLUX_COMPACT_CHARS` without reading the environment or writing a diagnostic.
+///
+/// Missing values use [`DEFAULT_COMPACT_THRESHOLD_CHARS`] quietly. Valid numbers, including `0`,
+/// are returned quietly. An explicit malformed or non-Unicode value falls back to the default and
+/// returns one diagnostic for the host surface to render.
+pub fn resolve_compact_threshold_env(
+    value: std::result::Result<String, std::env::VarError>,
+) -> CompactThresholdResolution {
+    let rejected = match value {
+        Ok(value) => match value.parse() {
+            Ok(threshold_chars) => {
+                return CompactThresholdResolution {
+                    threshold_chars,
+                    warning: None,
+                };
+            }
+            Err(_) => format!("{value:?}"),
+        },
+        Err(std::env::VarError::NotPresent) => {
+            return CompactThresholdResolution {
+                threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
+                warning: None,
+            };
+        }
+        Err(std::env::VarError::NotUnicode(value)) => format!("{value:?}"),
+    };
+
+    CompactThresholdResolution {
+        threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
+        warning: Some(format!(
+            "FLUX_COMPACT_CHARS is not a number ({rejected}); using the default \
+             {DEFAULT_COMPACT_THRESHOLD_CHARS}"
+        )),
+    }
+}
+
 /// Optional behavior layered after Flux's mandatory harness protocol.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1054,6 +1102,33 @@ mod tests {
                 .with_compaction(0)
                 .compact_threshold_chars,
             0
+        );
+    }
+
+    /// C-507: every host surface consumes one parse/outcome contract. Diagnostics stay as data so
+    /// callers can style them without reimplementing the missing/valid/malformed distinction.
+    #[test]
+    fn compaction_environment_resolution_has_one_shared_outcome_contract() {
+        let missing = resolve_compact_threshold_env(Err(std::env::VarError::NotPresent));
+        assert_eq!(missing.threshold_chars, DEFAULT_COMPACT_THRESHOLD_CHARS);
+        assert_eq!(missing.warning, None);
+
+        for (value, expected) in [("1234", 1234), ("0", 0)] {
+            let resolved = resolve_compact_threshold_env(Ok(value.into()));
+            assert_eq!(resolved.threshold_chars, expected);
+            assert_eq!(resolved.warning, None);
+        }
+
+        let malformed = resolve_compact_threshold_env(Ok("48k".into()));
+        assert_eq!(
+            malformed,
+            CompactThresholdResolution {
+                threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
+                warning: Some(format!(
+                    "FLUX_COMPACT_CHARS is not a number (\"48k\"); using the default \
+                     {DEFAULT_COMPACT_THRESHOLD_CHARS}"
+                )),
+            }
         );
     }
 

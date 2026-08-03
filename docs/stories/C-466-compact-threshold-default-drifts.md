@@ -5,7 +5,7 @@ pillar: Core
 status: done
 priority: 7
 areas: [flux-cli, flux-agent]
-note: "the CLI resolver now reads DEFAULT_COMPACT_THRESHOLD_CHARS for missing and malformed env values, interpolates warnings, and has no literal copy; served-path diagnostic divergence is tracked as C-507"
+note: "the CLI resolver has no literal default copy and now delegates malformed/missing handling to the shared flux-agent contract; C-507 closed the served-path diagnostic divergence"
 ---
 
 # Two surfaces, one number, no link
@@ -71,19 +71,18 @@ guard now covers two of the three surfaces and reads as if it covered all three.
   against the owner constant by C-441's website contract.
 - 2026-08-03: filed the served-path silent malformed-value behavior as
   [C-507](C-507-served-compaction-env-typo-is-silent.md), keeping diagnostic behavior out of this
-  no-behavior-change consolidation.
+  no-behavior-change consolidation. C-507 subsequently closed it with one shared parse/outcome
+  contract for the CLI and served paths.
 
 ## Notes
 
 - Not the same bug as [C-462](C-462-compaction-threshold-is-context-window-blind.md), which has now
   decided 48,000 is the right fixed default. This story asks that there be **one** source of that
   intentional value, so the CLI cannot drift from the decision and its documentation.
-- ⚠ There is a third divergence in the same area, and it is a behaviour difference rather than
-  duplication: a malformed `FLUX_COMPACT_CHARS` **warns** on the CLI path (`execution.rs:344`) but is
-  **silently ignored** on the served path — `app.rs:1819-1822` does `.ok().and_then(|s| s.parse().ok())`,
-  so `FLUX_COMPACT_CHARS=48k` falls through to the default with no trace at all. An operator typos the
-  env var on a served agent and gets no signal. Filed as
-  [C-507](C-507-served-compaction-env-typo-is-silent.md).
+- The third divergence in the same area was a behaviour difference rather than duplication: a
+  malformed `FLUX_COMPACT_CHARS` warned on the CLI path but was silently ignored on the served path.
+  [C-507](C-507-served-compaction-env-typo-is-silent.md) subsequently closed it by moving parsing and
+  the surface-neutral diagnostic into `flux-agent` and making both surfaces render that outcome.
 - Related: [C-441](C-441-context-management-doc.md) (the documentation and the pin),
   [C-465](C-465-compact-claims-success-on-five-no-ops.md) (the other defect from the same review).
 - Filed 2026-08-02 out of C-441's review.

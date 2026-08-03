@@ -122,7 +122,8 @@ the knob is the fix; a second copy of the knob is not.
   distinct no-ops, including compaction-disabled and user-cancelled),
   [C-466](C-466-compact-threshold-default-drifts.md) (the CLI hard-codes the default twice more, so this
   story's new pin verifies the constant against the page while the CLI can drift from both — plus the
-  served path silently ignores a malformed `FLUX_COMPACT_CHARS` where the CLI warns),
+  served path silently ignored a malformed `FLUX_COMPACT_CHARS` where the CLI warned; both parts were
+  subsequently closed by C-466 and [C-507](C-507-served-compaction-env-typo-is-silent.md)),
   [C-469](C-469-tokencounter-has-no-production-implementor.md) (the unused `TokenCounter` seams were
   subsequently retired, making the deterministic estimate explicit), and
   [C-468](C-468-plugin-host-test-hard-fails-under-tmpfs-pressure.md) (unrelated area, found in the same

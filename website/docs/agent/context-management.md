@@ -136,10 +136,11 @@ setting → `FLUX_COMPACT_CHARS` → the default**. On the SDK, that per-agent s
 `ClientBuilder::with_compaction`; on the served path it is `compact_threshold_chars` in the agent's
 settings. A per-agent `0` disables compaction for that agent explicitly.
 
-:::info A typo'd value behaves differently per surface
-The CLI prints a warning and falls back to the default if `FLUX_COMPACT_CHARS` is not a number,
-because silently reverting would contradict the `0`-disables contract. On the served path the same
-unparseable value is ignored without a warning.
+:::info A typo'd value warns and falls back
+The CLI and served-agent paths both print a warning and fall back to the default if
+`FLUX_COMPACT_CHARS` is not a number, because silently reverting would contradict the `0`-disables
+contract. A per-agent setting wins before the environment is consulted, so it remains quiet even if
+the ambient value is malformed.
 :::
 
 ## What flux does not manage

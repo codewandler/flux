@@ -2,10 +2,10 @@
 id: C-507
 title: "A malformed compaction environment override is silent on served agents"
 pillar: Core
-status: ready
+status: done
 priority: 8
-areas: [flux-app, flux-agent]
-note: "spun out of C-466: the CLI warns when FLUX_COMPACT_CHARS is malformed, but compact_threshold_for_decl silently drops the same typo on served/agentic agents and uses the default"
+areas: [flux-app, flux-agent, flux-cli]
+note: "CLI and served agents now consume one flux-agent parse/outcome contract; malformed explicit values warn and fall back, while per-agent settings bypass the environment"
 ---
 
 # One typo, two operator experiences
@@ -25,22 +25,31 @@ on a served agent, even though both surfaces document the same knob and preceden
 
 ## Acceptance
 
-- [ ] A failing-first test captures diagnostics from the served resolver and proves that a malformed
+- [x] A failing-first test captures diagnostics from the served resolver and proves that a malformed
       explicit environment value emits one warning naming `FLUX_COMPACT_CHARS`, the rejected value,
       and the fallback default.
-- [ ] Missing, valid, and `0` values remain quiet; `0` continues to disable compaction.
-- [ ] Per-agent `settings.compact_threshold_chars` still wins over the environment, including `0`,
+- [x] Missing, valid, and `0` values remain quiet; `0` continues to disable compaction.
+- [x] Per-agent `settings.compact_threshold_chars` still wins over the environment, including `0`,
       and does not warn about an environment value it never consults.
-- [ ] CLI and served paths share one parse/outcome contract or carry a test that makes any remaining
+- [x] CLI and served paths share one parse/outcome contract or carry a test that makes any remaining
       diagnostic difference deliberate rather than accidental.
 
 ## Progress
 
-- Filed 2026-08-03 from C-466's required adjacent-divergence disposition. No implementation yet.
+- 2026-08-03: added a failing-first served resolver test. It initially failed to compile because the
+  injected environment/diagnostic seam did not exist.
+- 2026-08-03: `flux-agent::resolve_compact_threshold_env` now owns the parse, fallback, and
+  surface-neutral warning outcome. CLI and app render it in their own style.
+- 2026-08-03: the served resolver takes a lazy environment callback internally, proving per-agent
+  values (including `0`) return before the environment is read or a warning can be emitted.
+- 2026-08-03: focused resolver/CLI/app tests and the full repository build, test, clippy, fmt, and
+  codegate checks pass.
 
 ## Notes
 
 - The fallback value itself no longer drifts: C-466 made the CLI read
   `flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS`, while this served path already did.
+- The warning is one diagnostic per resolution. Agent engines are cached after construction; this
+  story does not introduce process-global warning deduplication.
 - Related: [C-441](C-441-context-management-doc.md),
   [C-466](C-466-compact-threshold-default-drifts.md).

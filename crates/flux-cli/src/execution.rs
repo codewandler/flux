@@ -1,5 +1,5 @@
 use super::*;
-use flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS;
+use flux_agent::resolve_compact_threshold_env;
 
 // Codex/Anthropic model resolution is backend knowledge owned by each provider crate
 // (`flux_providers::codex::resolve_model`, `flux_providers::anthropic::resolve_model`) so every
@@ -341,20 +341,11 @@ pub(super) fn datasource_backend(
 /// Session size (serialized chars) past which the agent summarizes old turns. Override with
 /// `FLUX_COMPACT_CHARS` (`0` disables compaction).
 fn compact_threshold_from_env(value: Result<String, std::env::VarError>) -> usize {
-    match value {
-        Ok(s) => s.parse().unwrap_or_else(|_| {
-            // Warn instead of silently reverting: the user set the knob, so a typo'd value
-            // (`48k`) falling back to the default would contradict the documented 0-disables
-            // contract without a trace.
-            eprintln!(
-                "{} FLUX_COMPACT_CHARS is not a number ({s:?}); using the default {}",
-                style::yellow("warning:"),
-                DEFAULT_COMPACT_THRESHOLD_CHARS
-            );
-            DEFAULT_COMPACT_THRESHOLD_CHARS
-        }),
-        Err(_) => DEFAULT_COMPACT_THRESHOLD_CHARS,
+    let resolution = resolve_compact_threshold_env(value);
+    if let Some(warning) = resolution.warning {
+        eprintln!("{} {warning}", style::yellow("warning:"));
     }
+    resolution.threshold_chars
 }
 
 pub(super) fn compact_threshold() -> usize {
@@ -396,8 +387,8 @@ mod compact_threshold_tests {
             .expect("resolver tests follow the implementation")
             .0;
         assert!(
-            resolver.contains("DEFAULT_COMPACT_THRESHOLD_CHARS"),
-            "the CLI resolver must name the flux-agent-owned default"
+            resolver.contains("resolve_compact_threshold_env"),
+            "the CLI resolver must delegate to the flux-agent-owned parse/outcome contract"
         );
         let numeric_copy = ["48", "_000"].concat();
         let prose_copy = ["48", "000"].concat();
