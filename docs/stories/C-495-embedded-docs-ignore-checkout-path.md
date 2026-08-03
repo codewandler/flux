@@ -30,3 +30,5 @@ not of the absolute directory where that source was checked out.
   numeric module IDs and minifier salted output with those physical filenames. The release bundle
   uses bare helper imports, root-normalized module IDs, and deterministic non-mangled output; zip
   compression keeps the archive overhead bounded.
+- At `01ef0d97`, a fresh detached worktree with a fresh `npm ci` reproduced the committed archive
+  byte-for-byte (`sha256:3ae672f3d568e43340a25c9ca5747b98ce9d8f44dc4081a333a94cda10d1a8dc`).
