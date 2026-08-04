@@ -25,6 +25,7 @@ set -euo pipefail
 
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
+source scripts/build-ownership.sh
 ts="$(date +%Y%m%d-%H%M%S)"
 
 baseline_ref="${FLUX_TTFF_BASELINE:-b528772}"
@@ -77,11 +78,16 @@ for line in open("bench/ttff/corpus.jsonl"):
 }
 
 # --- build the two binaries (release: startup noise out of the measurement) ---------------
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+mkdir -p "$out/bin"
 declare -A bin
 if [[ " ${legs[*]} " == *" post "* ]]; then
   echo "→ building post binary (current tree)"
-  cargo build --release -p flux-cli
-  bin[post]="$repo/target/release/flux"
+  bin[post]="$out/bin/post-flux"
+  with_build_ownership_at "$repo" sh -c \
+    'cargo build --release -p flux-cli && cp "$CARGO_TARGET_DIR/release/flux" "$1"' \
+    sh "${bin[post]}"
 fi
 if [[ " ${legs[*]} " == *" baseline "* ]]; then
   wt="$(dirname "$repo")/flux-ttff-baseline"
@@ -93,11 +99,12 @@ if [[ " ${legs[*]} " == *" baseline "* ]]; then
     git -C "$wt" checkout --detach "$baseline_ref"
   fi
   echo "→ building baseline binary ($baseline_ref)"
-  (cd "$wt" && cargo build --release -p flux-cli)
-  bin[baseline]="$wt/target/release/flux"
+  bin[baseline]="$out/bin/baseline-flux"
+  with_build_ownership_at "$wt" sh -c \
+    'cargo build --release -p flux-cli && cp "$CARGO_TARGET_DIR/release/flux" "$1"' \
+    sh "${bin[baseline]}"
 fi
 
-mkdir -p "$out"
 python3 - "$out" "$baseline_ref" "$model" "$trials" <<'EOF'
 import hashlib, json, subprocess, sys
 out, ref, model, trials = sys.argv[1:5]

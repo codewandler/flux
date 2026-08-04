@@ -27,6 +27,8 @@ check_workflow_semantics() {
 path = ARGV.fetch(0)
 doc = YAML.safe_load(File.read(path), aliases: true)
 abort "release workflow is not a mapping" unless doc.is_a?(Hash)
+abort "release workflow must fix hard-coded target consumers to target" unless
+  doc.fetch("env", {})["CARGO_TARGET_DIR"] == "target"
 permissions = doc.fetch("permissions")
 abort "release workflow default contents permission is not read" unless permissions["contents"] == "read"
 jobs = doc.fetch("jobs")
@@ -88,6 +90,18 @@ install_jobs.each do |name|
   abort "#{name} does not have exactly one release-tooling install" unless install_steps.length == 1
   step = install_steps.fetch(0)
   abort "#{name} bypasses the verified release-tooling installer" unless step["run"] == "scripts/install-release-tooling.sh"
+end
+
+# release.yml is cargo-dist-generated. Every `dist build` is a Cargo-output frontend and must remain
+# inside the checked-in pre-Cargo ownership wrapper after regeneration.
+dist_builds = jobs.values.flat_map { |job| job.fetch("steps", []) }.select do |step|
+  step.fetch("run", "").match?(/(?:^|\s)dist\s+build\b/)
+end
+abort "release workflow changed its expected Unix/Windows/global dist-build inventory" unless dist_builds.length == 3
+dist_builds.each do |step|
+  run = step.fetch("run", "")
+  abort "cargo-dist build bypasses build ownership" unless
+    run.include?("build_ownership.py shared") && run.include?("-- dist build")
 end
 
 # C-412 — the asset set is verified BEFORE it is published, not only after.
@@ -163,6 +177,15 @@ if [ "${1:-}" = "--self-test" ]; then
   check_workflow_semantics "$semantic_good"
   if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
     echo "self-test accepted an attestation that existed only as a decoy comment" >&2
+    exit 1
+  fi
+
+  # Generated cargo-dist workflows restore bare `dist build` unless the local ownership override is
+  # re-applied. The semantic guard must reject that otherwise-valid regeneration.
+  sed '0,/scripts\/run-python3.sh scripts\/build_ownership.py shared --workspace-root "\$PWD" -- dist build/s//dist build/' \
+    "$semantic_good" >"$semantic_bad"
+  if check_workflow_semantics "$semantic_bad" >/dev/null 2>&1; then
+    echo "self-test accepted a generated bare cargo-dist build" >&2
     exit 1
   fi
 

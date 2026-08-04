@@ -123,6 +123,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Repository builds now own their Cargo target while compiler output is live** (C-517).
+  `task install` acquires one cross-process shared lease before the resolved target is first touched
+  and retains it across workspace library tests plus both supported binary installs. Every
+  repository build entry point uses the same persistent sibling lock; `task clean` requires
+  exclusive ownership and refuses with an actionable diagnostic while builders are active.
+  Absolute, workspace-relative and fleet-provided `CARGO_TARGET_DIR` values remain reusable, and
+  Python 3.10+ supplies the pre-Cargo portable bootstrap through native Linux/macOS `flock` and
+  Windows `LockFileEx` branches. The regression gate reproduces the old deterministic compiler
+  output disappearance class and separately observes a real bundled-SQLite object under
+  `release/build/libsqlite3-sys-*/out` without claiming an unobserved incident participant.
+
 - **JaaS rooms now close the two residual races in their otherwise-pinned join path** (C-413).
   Concurrent initial joins are serialized across check, handshake and install so only one session
   and pump can be created; a concurrent leave waits for that transition and cannot strand the

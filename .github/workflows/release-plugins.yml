@@ -34,6 +34,10 @@ concurrency:
   group: release-plugins
   cancel-in-progress: false
 
+env:
+  # Packaging consumes plugins/target/... explicitly; fix the otherwise overridable workflow root.
+  CARGO_TARGET_DIR: target
+
 jobs:
   build:
     name: build (${{ matrix.target }})
@@ -85,9 +89,17 @@ jobs:
         with:
           workspaces: plugins
 
-      - name: Build the pack (release)
+      - name: Build the pack (release, Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         working-directory: plugins
-        run: cargo build --release --workspace
+        run: ../scripts/run-python3.sh ../scripts/build_ownership.py shared --workspace-root "$PWD" -- cargo build --release --workspace
+
+      - name: Build the pack (release, Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        working-directory: plugins
+        run: ..\scripts\run-python3.cmd ..\scripts\build_ownership.py shared --workspace-root "%CD%" -- cargo build --release --workspace
 
       # One archive per plugin per target, containing just the binary:
       # flux-plugin-<name>-<version>-<target>.tar.xz (.zip on windows, binary keeps its .exe).
@@ -164,7 +176,7 @@ jobs:
         run: |
           expected_plugins="$(grep -rl '^name = "flux-plugin-' ./*/Cargo.toml | wc -l)"
           echo "expecting ${expected_plugins} plugins x 5 targets"
-          cargo run --release -p pack-index -- \
+          ../scripts/run-python3.sh ../scripts/build_ownership.py shared --workspace-root "$PWD" -- cargo run --release -p pack-index -- \
             --version "${{ inputs.version }}" \
             --dir ../dist \
             --out ../dist/plugins-index.json \
@@ -269,7 +281,8 @@ jobs:
             exit 1
           fi
 
-          if ! cargo publish --manifest-path plugins/host-kit/Cargo.toml; then
+          if ! scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD/plugins" -- \
+            cargo publish --manifest-path host-kit/Cargo.toml; then
             echo "::error::host-kit publish failed"
             exit 1
           fi

@@ -8,7 +8,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ARTIFACT_DIR="${FLUX_ADVERSARIAL_ARTIFACT_DIR:-$ROOT/target/adversarial-artifacts}"
+source "$ROOT/scripts/build-ownership.sh"
+ROOT_TARGET=$(owned_target_at "$ROOT")
+ARTIFACT_DIR="${FLUX_ADVERSARIAL_ARTIFACT_DIR:-$ROOT_TARGET/adversarial-artifacts}"
 
 fail() {
   echo "adversarial-assurance: $*" >&2
@@ -95,7 +97,7 @@ miri = exact_job(jobs, "miri", "${{ github.event_name == 'schedule' || github.ev
 toolchains = miri.fetch("steps").filter_map { |step| step.fetch("with", {})["toolchain"] }
 abort "Miri lost its date-pinned nightly" unless toolchains.one? { |value| value.match?(/\Anightly-[0-9]{4}-[0-9]{2}-[0-9]{2}\z/) }
 miri_run = run_step(miri, "./scripts/run-adversarial-assurance.sh --miri-preflight", "Miri selector preflight").fetch("run")
-abort "Miri plugin protocol target disappeared" unless miri_run.include?("cargo miri test --locked --offline \\") && miri_run.include?("codewandler-flux-plugin-protocol")
+abort "Miri plugin protocol target disappeared" unless miri_run.include?("scripts/owned-cargo miri test --locked --offline \\") && miri_run.include?("codewandler-flux-plugin-protocol")
 abort "Miri Flux-Lang target disappeared" unless miri_run.include?("codewandler-flux-lang --lib lexer::tests::")
 unsupported = miri.fetch("env", {}).fetch("FLUX_MIRI_UNSUPPORTED", "").split(",").sort
 expected_unsupported = %w[pack-extraction provider-streams url-dialing]
@@ -164,11 +166,11 @@ run_target() {
 
 miri_preflight() {
   local plugin_listing lang_listing
-  plugin_listing="$(cargo test --locked --offline \
+  plugin_listing="$(owned_cargo test --locked --offline \
     -p codewandler-flux-plugin-protocol --test adversarial_frames -- --list)"
   listing_has "$plugin_listing" \
     'generated_plugin_frames_are_total_and_protocol_checked: test' 1
-  lang_listing="$(cargo test --locked --offline \
+  lang_listing="$(owned_cargo test --locked --offline \
     -p codewandler-flux-lang --lib lexer::tests:: -- --list)"
   listing_has "$lang_listing" 'lexer::tests::lexer_is_lossless: test' 4
   echo "PASS Miri selectors enumerate their sentinel tests"
@@ -189,19 +191,19 @@ run_suite() {
 
   run_target provider-envelopes \
     'envelope_corpus::responses_stream_survives_single_frame_corruption: test' "$provider_min" \
-    cargo test --locked --offline -p codewandler-flux-providers "$provider_filter"
+    owned_cargo test --locked --offline -p codewandler-flux-providers "$provider_filter"
   run_target flux-lang \
     'random_draft_asts_round_trip_exactly: test' 1 \
-    cargo test --locked --offline -p codewandler-flux-lang --test roundtrip_property
+    owned_cargo test --locked --offline -p codewandler-flux-lang --test roundtrip_property
   run_target plugin-ndjson \
     'generated_plugin_frames_are_total_and_protocol_checked: test' 1 \
-    cargo test --locked --offline -p codewandler-flux-plugin-protocol --test adversarial_frames
+    owned_cargo test --locked --offline -p codewandler-flux-plugin-protocol --test adversarial_frames
   run_target url-redirect \
     'generated_redirect_targets_never_normalize_around_private_net_policy: test' 1 \
-    cargo test --locked --offline -p codewandler-flux-system --test adversarial_urls
+    owned_cargo test --locked --offline -p codewandler-flux-system --test adversarial_urls
   run_target pack-extraction \
     'pack::tests::generated_pack_archives_are_total_and_write_only_after_complete_extraction: test' 1 \
-    cargo test --locked --offline -p codewandler-flux-plugin \
+    owned_cargo test --locked --offline -p codewandler-flux-plugin \
       pack::tests::generated_pack_archives_are_total_and_write_only_after_complete_extraction
 }
 

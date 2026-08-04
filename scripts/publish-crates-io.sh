@@ -21,6 +21,9 @@
 #
 set -uo pipefail
 
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+source "$ROOT/scripts/build-ownership.sh"
+
 DRY_RUN=""
 [ "${1:-}" = "--dry-run" ] && DRY_RUN="--dry-run"
 
@@ -114,7 +117,7 @@ for c in "${CRATES[@]}"; do
   while true; do
     publish_args="-p $c $DRY_RUN"
     echo "==> cargo publish $publish_args"
-    if out=$(cargo publish $publish_args 2>&1); then
+    if out=$(owned_cargo publish $publish_args 2>&1); then
       echo "    ok: $c"
       [ -z "$DRY_RUN" ] && sleep 15
       break

@@ -19,6 +19,8 @@
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+source scripts/build-ownership.sh
+TARGET_ROOT=$(owned_target)
 
 TARGET=wasm32-unknown-unknown
 PKG=codewandler-flux-lang
@@ -31,9 +33,9 @@ if ! rustup target list --installed | grep -qx "$TARGET"; then
 fi
 
 echo "== building the portable core for $TARGET =="
-cargo build -p "$PKG" --example "$EXAMPLE" --target "$TARGET" --release
+owned_cargo build -p "$PKG" --example "$EXAMPLE" --target "$TARGET" --release
 
-ARTIFACT="${CARGO_TARGET_DIR:-target}/$TARGET/release/examples/$EXAMPLE.wasm"
+ARTIFACT="$TARGET_ROOT/$TARGET/release/examples/$EXAMPLE.wasm"
 [ -f "$ARTIFACT" ] || { echo "FAIL: expected $ARTIFACT to exist" >&2; exit 1; }
 echo "   $ARTIFACT ($(wc -c <"$ARTIFACT") bytes)"
 
@@ -44,8 +46,8 @@ fi
 # FLUX_PORTABLE_WASM_REQUIRED turns "the module is not built" from a skip into a failure, so this
 # command cannot report success without actually having executed the module.
 echo "== parity: the same .flux through the native engine and the wasm module =="
-FLUX_PORTABLE_WASM="$PWD/$ARTIFACT" \
+FLUX_PORTABLE_WASM="$ARTIFACT" \
 FLUX_PORTABLE_WASM_REQUIRED=1 \
-  cargo test -p "$PKG" --test wasm_parity
+  owned_cargo test -p "$PKG" --test wasm_parity
 
 printf '\033[32mPASS\033[0m the wasm32 portable core matches the native engine\n'

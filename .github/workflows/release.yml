@@ -18,6 +18,11 @@ permissions:
   contents: read
   actions: read
 
+# release.yml is dist-generated. Re-apply this ownership override after `dist generate`; the
+# structural release/inventory checks reject regeneration that restores an unowned `dist build`.
+env:
+  CARGO_TARGET_DIR: target
+
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
 # Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
@@ -288,11 +293,20 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      - name: Build artifacts
+      - name: Build artifacts (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Build artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          rem release.yml is generated; keep cargo-dist under the same pre-Cargo target lease.
+          scripts\run-python3.cmd scripts\build_ownership.py shared --workspace-root "%CD%" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo dist ran successfully
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -341,7 +355,8 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
+          # release.yml is generated; keep cargo-dist under the same pre-Cargo target lease.
+          scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage

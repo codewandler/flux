@@ -66,6 +66,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **Building and installing Flux from one checkout no longer loses live compiler output to
+  repository cleanup.** `task install` keeps its Cargo target reusable while it verifies and
+  installs both `flux` and `flux-lsp`; `task clean` now refuses until active repository builds have
+  finished. Existing absolute or relative `CARGO_TARGET_DIR` choices continue to work.
+
 - **JaaS room joins no longer race each other or re-resolve their signalling host.** Two concurrent
   joins now create one live room session, and the XMPP WebSocket connects only to the address Flux's
   network guard already checked.

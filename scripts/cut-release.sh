@@ -26,6 +26,7 @@
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+source scripts/build-ownership.sh
 
 NO_GATE=0
 ARGS=()
@@ -151,9 +152,9 @@ fi
 #     not allowed to report `ok`. Its exit status therefore carries no information and is discarded —
 #     the unarmed re-run on the next line is what actually says whether the mirror is now in sync,
 #     and it is a hard error because a silently-unwritten mirror used to reach the release commit.
-FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync \
+FLUX_UPDATE_GOLDEN=1 owned_cargo test -p codewandler-flux-lang --test website_in_sync \
   website_customer_changelog_is_in_sync >/dev/null 2>&1 || true
-cargo test -p codewandler-flux-lang --test website_in_sync \
+owned_cargo test -p codewandler-flux-lang --test website_in_sync \
   website_customer_changelog_is_in_sync >/dev/null 2>&1 \
   || { echo "!! website customer changelog did not regenerate — see website_in_sync" >&2; exit 1; }
 echo "   regenerated website customer changelog"
