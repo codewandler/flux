@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Independent native gather calls from one model response now execute concurrently** (C-528).
+  Model stages and adaptive exploration share one batch scheduler that admits only idempotent,
+  low-risk, non-mutating calls with explicit read-only effects and an approval-free authorization
+  verdict. Pre-tool hooks, active cassettes, approval-sensitive calls, incomplete connector
+  `Network`-without-`Read` metadata, and every captured action remain ordered. Results retain the
+  provider's call order and ids across completion, refusal, failure and queue timeout; execution
+  still crosses the existing authorization, approval, cancellation, redaction, guarded-IO and
+  `max_concurrent_tool_calls` envelope.
+
 - **A tracked Flux-Lang writer role now authors checked `.flux` sources** (C-513).
   `.flux/agents/flux-lang-writer.md` uses the coding profile and an explicit tool allow-list, reads
   the repository language contract before editing, and separates parse/analyze checks from an
