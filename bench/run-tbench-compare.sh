@@ -30,6 +30,7 @@ set -euo pipefail
 
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
+source scripts/build-ownership.sh
 ts="$(date +%Y%m%d-%H%M%S)"
 
 baseline_ref="${FLUX_TBC_BASELINE:-b528772}"
@@ -74,18 +75,26 @@ elif [[ "$(git -C "$wt" rev-parse HEAD)" != "$(git rev-parse "$baseline_ref^{com
 fi
 
 # --- build: the driver (post CLI) and BOTH legs' static musl container binaries -----------
-echo "→ building post driver + post musl binary (current tree)"
-cargo build --release -p flux-cli
-cargo build --release -p flux-cli --target x86_64-unknown-linux-musl
-echo "→ building baseline musl binary ($baseline_ref)"
-(cd "$wt" && cargo build --release -p flux-cli --target x86_64-unknown-linux-musl)
-
-driver="$repo/target/release/flux"
-declare -A musl
-musl[post]="$repo/target/x86_64-unknown-linux-musl/release/flux"
-musl[baseline]="$wt/target/x86_64-unknown-linux-musl/release/flux"
-
 mkdir -p "$out"
+out=$(cd "$out" && pwd)
+mkdir -p "$out/bin"
+echo "→ building post driver + post musl binary (current tree)"
+with_build_ownership_at "$repo" sh -c \
+  'cargo build --release -p flux-cli && cp "$CARGO_TARGET_DIR/release/flux" "$1"' \
+  sh "$out/bin/post-driver"
+with_build_ownership_at "$repo" sh -c \
+  'cargo build --release -p flux-cli --target x86_64-unknown-linux-musl && cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/flux" "$1"' \
+  sh "$out/bin/post-musl"
+echo "→ building baseline musl binary ($baseline_ref)"
+with_build_ownership_at "$wt" sh -c \
+  'cargo build --release -p flux-cli --target x86_64-unknown-linux-musl && cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/flux" "$1"' \
+  sh "$out/bin/baseline-musl"
+
+driver="$out/bin/post-driver"
+declare -A musl
+musl[post]="$out/bin/post-musl"
+musl[baseline]="$out/bin/baseline-musl"
+
 git rev-parse HEAD >"$out/post-head.txt"
 git rev-parse "$baseline_ref^{commit}" >"$out/baseline-commit.txt"
 

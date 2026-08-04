@@ -34,6 +34,14 @@ The order matters: the final freshness check is against the committed checkout. 
 with an uncommitted regenerated archive; a change outside `website/**` can still affect generated
 public documentation, so CI runs this check on every pull request without a path filter.
 
+Repository build scripts use `scripts/owned-cargo` to hold shared OS ownership of the resolved
+Cargo target; `task clean` is the only repository cleanup entry point and requires exclusive
+ownership. This keeps `CARGO_TARGET_DIR` reusable across compatible builds while preventing cleanup
+from unlinking live compiler output. Python 3.10+ is the pre-Cargo prerequisite: Task selects
+`python3`/`python` on Linux and macOS and `python`/`py -3` on Windows, or accepts an explicit
+`PYTHON=<executable>`. If a direct operator `cargo` command shares the target, finish it before
+running `task clean`.
+
 Every behavioral change ships with a test that fails before it. A safety-invariant change (anything
 touching the authorization → approval → guarded-IO chain) must keep the no-bypass tests passing and
 add to them.

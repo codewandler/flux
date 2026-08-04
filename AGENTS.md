@@ -79,7 +79,10 @@ runtime UI into this file.
 ## Verification
 
 Run the narrowest useful checks while iterating, then the repository gate before declaring a code
-change complete:
+change complete. Repository scripts and workflows route target-touching Cargo commands through
+`scripts/owned-cargo`, whose shared OS lease prevents `task clean` from removing live compiler
+output. Direct operator Cargo commands remain valid, but do not overlap them with cleanup of the
+same `CARGO_TARGET_DIR`:
 
 ```bash
 cargo build --workspace

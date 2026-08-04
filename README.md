@@ -110,7 +110,12 @@ reviewed tag instead.
 </details>
 
 From a clone: `cargo build --release` → `target/release/flux`, or `task install` for `flux` and
-`flux-lsp` together. Plugin packs ship separately as `plugins-v*`.
+`flux-lsp` together. `task install` requires Python 3.10+ before Cargo starts (`python3`, then
+`python` on Linux/macOS; `python`, then `py -3` on Windows). It preserves an absolute or
+workspace-relative `CARGO_TARGET_DIR`, holds shared ownership of that reusable target for the whole
+verification/install sequence, and refuses concurrent `task clean` rather than risking live
+compiler output. Set `PYTHON=<executable>` only when the platform's standard launcher is not the
+desired interpreter. Plugin packs ship separately as `plugins-v*`.
 
 ## Quickstart
 

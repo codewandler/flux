@@ -7,6 +7,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Prebuilt-consumer only: this measurement never builds Flux. FLUX_BIN is the explicit artifact
+# contract; the target/debug fallback is only for an operator who built at Cargo's default root.
 FLUX_BIN="${FLUX_BIN:-$ROOT_DIR/target/debug/flux}"
 MODELS="${MODELS:-codex/gpt-5.5 openrouter/google/gemini-3.5-flash openrouter/deepseek/deepseek-v4-flash:nitro openai/gpt-5-mini}"
 SCREEN_TRIALS="${SCREEN_TRIALS:-3}"

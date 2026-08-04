@@ -33,9 +33,12 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/build-ownership.sh"
 PLUGINS="$ROOT/plugins"
-FLUX="${FLUX_BIN:-$ROOT/target/release/flux}"
-BIN="$PLUGINS/target/release"
+ROOT_TARGET=$(owned_target_at "$ROOT") || exit
+PLUGIN_TARGET=$(owned_target_at "$PLUGINS") || exit
+FLUX="${FLUX_BIN:-$ROOT_TARGET/release/flux}"
+BIN="$PLUGIN_TARGET/release"
 
 pass=0
 fail=0
@@ -48,10 +51,10 @@ step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 step "pre-flight"
 if [ ! -x "$FLUX" ]; then
   echo "  building flux (release)…"
-  ( cd "$ROOT" && cargo build --release -p flux-cli ) || { echo "flux build failed"; exit 1; }
+  ( cd "$ROOT" && owned_cargo build --release -p flux-cli ) || { echo "flux build failed"; exit 1; }
 fi
 echo "  building plugins (release)…"
-( cd "$PLUGINS" && cargo build --release ) || { echo "plugins build failed"; exit 1; }
+( cd "$PLUGINS" && owned_cargo_at "$PLUGINS" build --release ) || { echo "plugins build failed"; exit 1; }
 
 # Isolated registry — do NOT touch the user's ~/.flux/plugins.
 SMOKE_HOME="$(mktemp -d)"

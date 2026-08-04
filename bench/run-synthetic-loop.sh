@@ -24,6 +24,7 @@ set -euo pipefail
 
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
+source scripts/build-ownership.sh
 ts="$(date +%Y%m%d-%H%M%S)"
 branch="improve-synthetic/$ts"
 wt="../flux-improve-syn-$ts"
@@ -48,11 +49,12 @@ improve_home="$(dirname "$repo")/flux-improve-syn-$ts-home"
 mkdir -p "$improve_home"
 
 cd "$wt"
+WORKTREE_TARGET=$(owned_target_at "$wt")
 echo "→ building flux (native debug) in the worktree"
-cargo build --workspace
+owned_cargo build --workspace
 
 echo "→ running improve-synthetic.flux (sub-agent model=$model)"
-HOME="$improve_home" ./target/debug/flux flow run examples/improve-synthetic.flux --yes -m "$model"
+HOME="$improve_home" "$WORKTREE_TARGET/debug/flux" flow run examples/improve-synthetic.flux --yes -m "$model"
 
 echo
 echo "→ done on branch '$branch' ($wt)."

@@ -13,6 +13,7 @@ set -euo pipefail
 
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
+source scripts/build-ownership.sh
 ts="$(date +%Y%m%d-%H%M%S)"
 branch="improve-tbench/$ts"
 wt="../flux-improve-$ts"
@@ -50,15 +51,16 @@ improve_home="$(dirname "$repo")/flux-improve-$ts-home"
 mkdir -p "$improve_home"
 
 cd "$wt"
+WORKTREE_TARGET=$(owned_target_at "$wt")
 echo "→ building flux (native) in the worktree"
-cargo build --workspace
+owned_cargo build --workspace
 
 echo "→ running improve-tbench.flux (model=$model)"
 HOME="$improve_home" \
-FLUX_EVAL_BINARY="$wt/target/x86_64-unknown-linux-musl/release/flux" \
+FLUX_EVAL_BINARY="$WORKTREE_TARGET/x86_64-unknown-linux-musl/release/flux" \
 FLUX_TERMINAL_BENCH_DATASET="terminal-bench-core==0.1.1" \
 FLUX_TERMINAL_BENCH_REBUILD=1 \
-  ./target/debug/flux flow run examples/improve-tbench.flux --yes -m "$model"
+  "$WORKTREE_TARGET/debug/flux" flow run examples/improve-tbench.flux --yes -m "$model"
 
 echo
 echo "→ done on branch '$branch' ($wt)."
