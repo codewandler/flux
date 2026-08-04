@@ -578,6 +578,16 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: EndpointAction,
     },
+    /// Install and operate the separately released local Exchange authority.
+    Exchange {
+        #[command(subcommand)]
+        action: ExchangeAction,
+    },
+    /// Create, grant and inspect labelled Exchange connections without receiving vendor secrets.
+    Integration {
+        #[command(subcommand)]
+        action: IntegrationAction,
+    },
     /// Work with the authorization policy — currently `simulate`, which replays a proposed policy
     /// against the recorded op history before you adopt it.
     Policy {
@@ -656,6 +666,143 @@ pub(super) enum Commands {
     System {
         #[command(subcommand)]
         action: SystemAction,
+    },
+}
+
+/// `flux exchange …` — host-owned entry points for the separately released Exchange process.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum ExchangeAction {
+    /// Operate the verified local Exchange installation and its owned process.
+    Local {
+        #[command(subcommand)]
+        action: ExchangeLocalAction,
+    },
+}
+
+/// `flux exchange local …` — the closed lifecycle grammar owned by C-510.
+///
+/// These arguments deliberately contain no executable, URL, token, credential, port or process-id
+/// override. The lifecycle implementation consumes only C-510's verified channel and authenticated
+/// supervisor boundary once that provider contract is available.
+#[derive(clap::Subcommand, Debug, PartialEq, Eq)]
+pub(super) enum ExchangeLocalAction {
+    /// Start the verified compatible local Exchange, or report its already-running state.
+    Start {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse any ceremony that would require an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+    /// Report the verified install and owned-process state without changing it.
+    Status {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop only the local Exchange instance owned by Flux's authenticated supervisor.
+    Stop {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse any ceremony that would require an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+}
+
+/// One syntactically valid metadata-selector `KEY=VALUE` assignment.
+///
+/// Only Exchange may interpret this as a grant selector. Connection fields deliberately do not use
+/// this parser until the provider-owned plan can prove that an identity or alias is non-secret.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SelectorAssignment {
+    pub(super) key: String,
+    pub(super) value: String,
+    valid: bool,
+}
+
+impl std::fmt::Debug for SelectorAssignment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectorAssignment")
+            .field("key", &self.key)
+            .field("value", &"[redacted]")
+            .finish()
+    }
+}
+
+impl std::str::FromStr for SelectorAssignment {
+    type Err = String;
+
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        let (key, value, valid) = match input.split_once('=') {
+            Some((key, value)) if !key.is_empty() => (key, value, true),
+            _ => ("", input, false),
+        };
+        Ok(Self {
+            key: key.into(),
+            value: value.into(),
+            valid,
+        })
+    }
+}
+
+impl SelectorAssignment {
+    pub(super) fn is_valid(&self) -> bool {
+        self.valid
+    }
+}
+
+/// `flux integration …` — labelled connection management over Exchange's published contracts.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum IntegrationAction {
+    /// Connect one labelled connector from its provider-published connection plan.
+    Connect {
+        /// Connector identity understood by Exchange.
+        connector: String,
+        /// Tenant-scoped connection label (for example, `company` or `sandbox`).
+        #[arg(long)]
+        name: String,
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse if any required non-secret setting needs an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+    /// Preview or apply a metadata-selector grant for one labelled connection.
+    Grant {
+        /// Connector identity understood by Exchange.
+        connector: String,
+        /// Tenant-scoped connection label.
+        #[arg(long)]
+        name: String,
+        /// Opaque metadata selector `KEY=VALUE` interpreted by Exchange (repeatable).
+        #[arg(long = "selector", value_name = "KEY=VALUE", required = true)]
+        selectors: Vec<SelectorAssignment>,
+        /// Apply the previewed grant. Without this flag the command is preview-only.
+        #[arg(long)]
+        apply: bool,
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse if applying the grant would require an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+    /// List labelled connections and their effective-operation state.
+    List {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose local process, bootstrap, authentication, connection and grant state.
+    Doctor {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1348,5 +1495,185 @@ impl ReviewSeverity {
             "high" => Self::High,
             _ => Self::Critical,
         }
+    }
+}
+
+#[cfg(test)]
+mod c509_cli_grammar_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn local_exchange_lifecycle_has_a_closed_json_capable_grammar() {
+        for (verb, expected) in [
+            (
+                "start",
+                ExchangeLocalAction::Start {
+                    json: true,
+                    no_prompt: false,
+                },
+            ),
+            ("status", ExchangeLocalAction::Status { json: true }),
+            (
+                "stop",
+                ExchangeLocalAction::Stop {
+                    json: true,
+                    no_prompt: false,
+                },
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["flux", "exchange", "local", verb, "--json"])
+                .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
+            let Some(Commands::Exchange {
+                action: ExchangeAction::Local { action },
+            }) = cli.command
+            else {
+                panic!("expected exchange local {verb}");
+            };
+            assert_eq!(action, expected);
+        }
+
+        assert!(Cli::try_parse_from(["flux", "exchange", "local", "run"]).is_err());
+        assert!(Cli::try_parse_from([
+            "flux",
+            "exchange",
+            "local",
+            "start",
+            "--executable",
+            "/tmp/flux-exchange",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn integration_connect_withholds_fields_until_a_plan_can_classify_them() {
+        let cli = Cli::try_parse_from([
+            "flux",
+            "integration",
+            "connect",
+            "custom-connector",
+            "--name",
+            "company",
+            "--json",
+            "--no-prompt",
+        ])
+        .expect("generic labelled connection grammar must parse");
+
+        let Some(Commands::Integration {
+            action:
+                IntegrationAction::Connect {
+                    connector,
+                    name,
+                    json,
+                    no_prompt,
+                },
+        }) = cli.command
+        else {
+            panic!("expected integration connect");
+        };
+        assert_eq!(connector, "custom-connector");
+        assert_eq!(name, "company");
+        assert!(json);
+        assert!(no_prompt);
+
+        for credential_flag in ["--token", "--password", "--secret", "--credential"] {
+            assert!(
+                Cli::try_parse_from([
+                    "flux",
+                    "integration",
+                    "connect",
+                    "custom-connector",
+                    "--name",
+                    "company",
+                    credential_flag,
+                    "not-accepted",
+                ])
+                .is_err(),
+                "{credential_flag} must never enter Flux's CLI grammar"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "flux",
+            "integration",
+            "connect",
+            "custom-connector",
+            "--name",
+            "company",
+            "--endpoint",
+            "https://code.example.test",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "flux",
+            "integration",
+            "connect",
+            "custom-connector",
+            "--name",
+            "company",
+            "--field",
+            "origin=https://code.example.test",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn integration_management_grammar_is_metadata_selector_based() {
+        let grant = Cli::try_parse_from([
+            "flux",
+            "integration",
+            "grant",
+            "custom-connector",
+            "--name",
+            "company",
+            "--selector",
+            "custom-key=custom-value",
+            "--selector",
+            "another-key=another-value",
+            "--apply",
+            "--json",
+            "--no-prompt",
+        ])
+        .expect("metadata grant grammar must parse");
+        let Some(Commands::Integration {
+            action:
+                IntegrationAction::Grant {
+                    connector,
+                    name,
+                    selectors,
+                    apply,
+                    json,
+                    no_prompt,
+                },
+        }) = grant.command
+        else {
+            panic!("expected integration grant");
+        };
+        assert_eq!(connector, "custom-connector");
+        assert_eq!(name, "company");
+        assert_eq!(selectors.len(), 2);
+        let debug = format!("{selectors:?}");
+        assert!(!debug.contains("custom-value"));
+        assert!(!debug.contains("another-value"));
+        assert!(apply);
+        assert!(json);
+        assert!(no_prompt);
+
+        for verb in ["list", "doctor"] {
+            let cli = Cli::try_parse_from(["flux", "integration", verb, "--json"])
+                .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
+            assert!(matches!(cli.command, Some(Commands::Integration { .. })));
+        }
+
+        assert!(Cli::try_parse_from([
+            "flux",
+            "integration",
+            "grant",
+            "custom-connector",
+            "--name",
+            "company",
+            "--operation",
+            "tickets.delete",
+        ])
+        .is_err());
     }
 }
