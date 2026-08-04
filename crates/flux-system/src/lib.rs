@@ -135,6 +135,7 @@ use std::time::Duration;
 
 use flux_core::{Error, Result};
 
+pub mod exchange_release_transport;
 pub mod net;
 pub mod port;
 pub mod remote;
