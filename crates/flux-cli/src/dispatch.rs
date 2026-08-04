@@ -172,6 +172,8 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Export { .. }
         | Commands::Auth { .. }
         | Commands::Endpoint { .. }
+        | Commands::Exchange { .. }
+        | Commands::Integration { .. }
         | Commands::Policy { .. }
         | Commands::Catalog { .. }
         | Commands::Skill { .. }
@@ -794,6 +796,14 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
+            Some(Commands::Exchange { .. }) => bail!(
+                "local Exchange lifecycle is unavailable until the provider-owned release and \
+                 supervision contracts are published"
+            ),
+            Some(Commands::Integration { .. }) => bail!(
+                "integration management is unavailable until the provider-owned connection-plan \
+                 contract is published"
+            ),
             Some(Commands::Policy { action }) => run_policy(action),
             Some(Commands::Catalog { action }) => run_catalog(action),
             Some(Commands::Skill {
