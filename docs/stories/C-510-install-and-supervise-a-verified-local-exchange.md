@@ -5,7 +5,7 @@ pillar: Core
 status: in-progress
 priority: 0
 epic: connector-native-integrations
-design: docs/designs/ecosystem.md
+design: docs/designs/managed-exchange-lifecycle.md
 note: "Milestone 1 runtime prerequisite: a signed monotonic Exchange channel, atomic verified cache and same-binary authenticated supervisor — never PATH, PID signalling or an unsigned fallback"
 ---
 
@@ -323,6 +323,12 @@ owner, never an Exchange runtime, binary distributor or credential holder.
 
 ## Progress
 
+- 2026-08-04: The fresh `flux-exchange-lifecycle-2` safe-slice wave established the closed CLI
+  grammar and bounded status/diagnostic types, the fixed-origin one-hop bounded transport that hands
+  opaque bytes to the future verifier, and the immutable install/process identity and retained-handle
+  security design. Provider conformance remains blocked on X-126/X-127/X-128/X-129: no local schema,
+  archive, readiness, platform or signed-release fixture was invented, and the full gate, changelog,
+  pull request and done transition remain intentionally deferred.
 - 2026-08-04: Contract repaired against flux-roadmap Decision 0004's accepted supervision/readiness
   boundary and the upcoming Exchange X-127/X-128 platform/readiness contracts; no implementation has
   started.
