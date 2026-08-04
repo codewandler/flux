@@ -2,7 +2,7 @@
 id: C-509
 title: "Complete the first-run local Exchange and integration CLI tutorial"
 pillar: Core
-status: ready
+status: in-progress
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
@@ -73,7 +73,10 @@ ever receiving vendor credentials.
 
 ## Progress
 
-- (not started)
+- 2026-08-04: Started the independently deliverable CLI command/output skeleton from canonical
+  Flux `be76b1105926a1f01d81d95c63c79bbbca204400`. Provider-owned connection-plan, release,
+  lifecycle, secure-handoff and end-to-end seams remain gated on Exchange X-125 through X-129 and
+  Flux C-510.
 
 ## Notes
 
