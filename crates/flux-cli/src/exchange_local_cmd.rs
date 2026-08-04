@@ -353,104 +353,46 @@ impl ExchangeLocalState {
     }
 }
 
-/// C-510's closed diagnostic component vocabulary. The story does not assign its codes to a
-/// component matrix, so this slice preserves component and code as two closed provider/lifecycle
-/// outcomes instead of inventing a narrower association.
+/// A closed component/code pair. Each variant accepts only that component's code enum; there is no
+/// constructor taking an independently selected component and code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DiagnosticComponent {
-    Install,
-    Supervisor,
-    Control,
-    Exchange,
-}
-
-impl DiagnosticComponent {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Install => "install",
-            Self::Supervisor => "supervisor",
-            Self::Control => "control",
-            Self::Exchange => "exchange",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DiagnosticCode {
-    TrustInvalid,
-    TrustExpired,
-    TrustRollback,
-    ChannelInvalid,
-    ChannelExpired,
-    ChannelRollback,
-    ManifestMissing,
-    SignatureInvalid,
-    SigningKeyUnknown,
-    OriginRefused,
-    ArchiveInvalid,
-    ExecutableInvalid,
-    CachePermissions,
-    ControlUnavailable,
-    ControlAuthFailed,
-    SupervisorMismatch,
-    ReadinessTimeout,
-    ReadinessInvalid,
-    BindMismatch,
-    ChildExited,
-    HealthFailed,
-    ProtocolIncompatible,
-    TerminateFailed,
-    DiagnosticsTruncated,
-}
-
-impl DiagnosticCode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::TrustInvalid => "trust_invalid",
-            Self::TrustExpired => "trust_expired",
-            Self::TrustRollback => "trust_rollback",
-            Self::ChannelInvalid => "channel_invalid",
-            Self::ChannelExpired => "channel_expired",
-            Self::ChannelRollback => "channel_rollback",
-            Self::ManifestMissing => "manifest_missing",
-            Self::SignatureInvalid => "signature_invalid",
-            Self::SigningKeyUnknown => "signing_key_unknown",
-            Self::OriginRefused => "origin_refused",
-            Self::ArchiveInvalid => "archive_invalid",
-            Self::ExecutableInvalid => "executable_invalid",
-            Self::CachePermissions => "cache_permissions",
-            Self::ControlUnavailable => "control_unavailable",
-            Self::ControlAuthFailed => "control_auth_failed",
-            Self::SupervisorMismatch => "supervisor_mismatch",
-            Self::ReadinessTimeout => "readiness_timeout",
-            Self::ReadinessInvalid => "readiness_invalid",
-            Self::BindMismatch => "bind_mismatch",
-            Self::ChildExited => "child_exited",
-            Self::HealthFailed => "health_failed",
-            Self::ProtocolIncompatible => "protocol_incompatible",
-            Self::TerminateFailed => "terminate_failed",
-            Self::DiagnosticsTruncated => "diagnostics_truncated",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LifecycleDiagnostic {
-    component: DiagnosticComponent,
-    code: DiagnosticCode,
+pub enum LifecycleDiagnostic {
+    Install(InstallDiagnosticCode),
+    Supervisor(SupervisorDiagnosticCode),
+    Control(ControlDiagnosticCode),
+    Exchange(ExchangeDiagnosticCode),
 }
 
 impl LifecycleDiagnostic {
-    pub fn new(component: DiagnosticComponent, code: DiagnosticCode) -> Self {
-        Self { component, code }
+    fn component(self) -> &'static str {
+        match self {
+            Self::Install(_) => "install",
+            Self::Supervisor(_) => "supervisor",
+            Self::Control(_) => "control",
+            Self::Exchange(_) => "exchange",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Install(code) => code.as_str(),
+            Self::Supervisor(code) => code.as_str(),
+            Self::Control(code) => code.as_str(),
+            Self::Exchange(code) => code.as_str(),
+        }
     }
 
     fn truncated_for_component(self) -> Self {
-        Self::new(self.component, DiagnosticCode::DiagnosticsTruncated)
+        match self {
+            Self::Install(_) => Self::Install(InstallDiagnosticCode::DiagnosticsTruncated),
+            Self::Supervisor(_) => Self::Supervisor(SupervisorDiagnosticCode::DiagnosticsTruncated),
+            Self::Control(_) => Self::Control(ControlDiagnosticCode::DiagnosticsTruncated),
+            Self::Exchange(_) => Self::Exchange(ExchangeDiagnosticCode::DiagnosticsTruncated),
+        }
     }
 
     fn is_truncated(self) -> bool {
-        self.code == DiagnosticCode::DiagnosticsTruncated
+        self.code() == "diagnostics_truncated"
     }
 }
 
@@ -460,11 +402,67 @@ impl Serialize for LifecycleDiagnostic {
         S: Serializer,
     {
         let mut object = serializer.serialize_struct("LifecycleDiagnostic", 2)?;
-        object.serialize_field("component", self.component.as_str())?;
-        object.serialize_field("code", self.code.as_str())?;
+        object.serialize_field("component", self.component())?;
+        object.serialize_field("code", self.code())?;
         object.end()
     }
 }
+
+macro_rules! diagnostic_codes {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+        }
+    };
+}
+
+diagnostic_codes!(InstallDiagnosticCode {
+    TrustInvalid => "trust_invalid",
+    TrustExpired => "trust_expired",
+    TrustRollback => "trust_rollback",
+    ChannelInvalid => "channel_invalid",
+    ChannelExpired => "channel_expired",
+    ChannelRollback => "channel_rollback",
+    ManifestMissing => "manifest_missing",
+    SignatureInvalid => "signature_invalid",
+    SigningKeyUnknown => "signing_key_unknown",
+    OriginRefused => "origin_refused",
+    ArchiveInvalid => "archive_invalid",
+    ExecutableInvalid => "executable_invalid",
+    CachePermissions => "cache_permissions",
+    DiagnosticsTruncated => "diagnostics_truncated",
+});
+
+diagnostic_codes!(SupervisorDiagnosticCode {
+    SupervisorMismatch => "supervisor_mismatch",
+    ReadinessTimeout => "readiness_timeout",
+    ReadinessInvalid => "readiness_invalid",
+    BindMismatch => "bind_mismatch",
+    ChildExited => "child_exited",
+    TerminateFailed => "terminate_failed",
+    DiagnosticsTruncated => "diagnostics_truncated",
+});
+
+diagnostic_codes!(ControlDiagnosticCode {
+    ControlUnavailable => "control_unavailable",
+    ControlAuthFailed => "control_auth_failed",
+    DiagnosticsTruncated => "diagnostics_truncated",
+});
+
+diagnostic_codes!(ExchangeDiagnosticCode {
+    HealthFailed => "health_failed",
+    ProtocolIncompatible => "protocol_incompatible",
+    DiagnosticsTruncated => "diagnostics_truncated",
+});
 
 /// The sole human/JSON status source. No field can carry an OS error, path, child output, or
 /// arbitrary diagnostic value.
@@ -531,9 +529,9 @@ impl ExchangeLocalStatus {
         let mut output = format!("local exchange: {}", self.state.as_str());
         for diagnostic in &self.diagnostics {
             output.push_str("\n  ");
-            output.push_str(diagnostic.component.as_str());
+            output.push_str(diagnostic.component());
             output.push_str(": ");
-            output.push_str(diagnostic.code.as_str());
+            output.push_str(diagnostic.code());
         }
         output
     }
@@ -626,9 +624,8 @@ mod tests {
     #[test]
     fn status_json_has_the_exact_bounded_shape_and_no_open_diagnostic_values() {
         let mut status = full_status();
-        status.push_diagnostic(LifecycleDiagnostic::new(
-            DiagnosticComponent::Install,
-            DiagnosticCode::ChannelExpired,
+        status.push_diagnostic(LifecycleDiagnostic::Install(
+            InstallDiagnosticCode::ChannelExpired,
         ));
         let value: serde_json::Value =
             serde_json::from_str(&status.render_json().unwrap()).unwrap();
@@ -663,9 +660,8 @@ mod tests {
     #[test]
     fn human_status_is_derived_from_closed_state_and_codes_only() {
         let mut status = full_status();
-        status.push_diagnostic(LifecycleDiagnostic::new(
-            DiagnosticComponent::Control,
-            DiagnosticCode::ControlUnavailable,
+        status.push_diagnostic(LifecycleDiagnostic::Control(
+            ControlDiagnosticCode::ControlUnavailable,
         ));
         let human = status.render_human();
         assert_eq!(
@@ -681,27 +677,15 @@ mod tests {
     fn diagnostics_are_deduplicated_and_bounded_with_a_closed_truncation_code() {
         let mut status = ExchangeLocalStatus::new(ExchangeLocalState::Unhealthy);
         let values = [
-            LifecycleDiagnostic::new(DiagnosticComponent::Install, DiagnosticCode::TrustInvalid),
-            LifecycleDiagnostic::new(DiagnosticComponent::Install, DiagnosticCode::TrustExpired),
-            LifecycleDiagnostic::new(DiagnosticComponent::Install, DiagnosticCode::TrustRollback),
-            LifecycleDiagnostic::new(DiagnosticComponent::Install, DiagnosticCode::ChannelInvalid),
-            LifecycleDiagnostic::new(DiagnosticComponent::Install, DiagnosticCode::ChannelExpired),
-            LifecycleDiagnostic::new(
-                DiagnosticComponent::Install,
-                DiagnosticCode::ChannelRollback,
-            ),
-            LifecycleDiagnostic::new(
-                DiagnosticComponent::Install,
-                DiagnosticCode::ManifestMissing,
-            ),
-            LifecycleDiagnostic::new(
-                DiagnosticComponent::Install,
-                DiagnosticCode::SignatureInvalid,
-            ),
-            LifecycleDiagnostic::new(
-                DiagnosticComponent::Supervisor,
-                DiagnosticCode::ReadinessInvalid,
-            ),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::TrustInvalid),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::TrustExpired),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::TrustRollback),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::ChannelInvalid),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::ChannelExpired),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::ChannelRollback),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::ManifestMissing),
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::SignatureInvalid),
+            LifecycleDiagnostic::Supervisor(SupervisorDiagnosticCode::ReadinessInvalid),
         ];
         status.push_diagnostic(values[0]);
         for value in values {
@@ -722,71 +706,21 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_vocabularies_are_exact_and_value_free() {
-        let components = [
-            DiagnosticComponent::Install,
-            DiagnosticComponent::Supervisor,
-            DiagnosticComponent::Control,
-            DiagnosticComponent::Exchange,
-        ]
-        .map(DiagnosticComponent::as_str);
-        assert_eq!(components, ["install", "supervisor", "control", "exchange"]);
-
-        let codes = [
-            DiagnosticCode::TrustInvalid,
-            DiagnosticCode::TrustExpired,
-            DiagnosticCode::TrustRollback,
-            DiagnosticCode::ChannelInvalid,
-            DiagnosticCode::ChannelExpired,
-            DiagnosticCode::ChannelRollback,
-            DiagnosticCode::ManifestMissing,
-            DiagnosticCode::SignatureInvalid,
-            DiagnosticCode::SigningKeyUnknown,
-            DiagnosticCode::OriginRefused,
-            DiagnosticCode::ArchiveInvalid,
-            DiagnosticCode::ExecutableInvalid,
-            DiagnosticCode::CachePermissions,
-            DiagnosticCode::ControlUnavailable,
-            DiagnosticCode::ControlAuthFailed,
-            DiagnosticCode::SupervisorMismatch,
-            DiagnosticCode::ReadinessTimeout,
-            DiagnosticCode::ReadinessInvalid,
-            DiagnosticCode::BindMismatch,
-            DiagnosticCode::ChildExited,
-            DiagnosticCode::HealthFailed,
-            DiagnosticCode::ProtocolIncompatible,
-            DiagnosticCode::TerminateFailed,
-            DiagnosticCode::DiagnosticsTruncated,
-        ]
-        .map(DiagnosticCode::as_str);
+    fn diagnostic_sum_type_serializes_only_component_specific_codes() {
+        let diagnostics = [
+            LifecycleDiagnostic::Install(InstallDiagnosticCode::TrustInvalid),
+            LifecycleDiagnostic::Supervisor(SupervisorDiagnosticCode::ReadinessTimeout),
+            LifecycleDiagnostic::Control(ControlDiagnosticCode::ControlAuthFailed),
+            LifecycleDiagnostic::Exchange(ExchangeDiagnosticCode::ProtocolIncompatible),
+        ];
         assert_eq!(
-            codes,
-            [
-                "trust_invalid",
-                "trust_expired",
-                "trust_rollback",
-                "channel_invalid",
-                "channel_expired",
-                "channel_rollback",
-                "manifest_missing",
-                "signature_invalid",
-                "signing_key_unknown",
-                "origin_refused",
-                "archive_invalid",
-                "executable_invalid",
-                "cache_permissions",
-                "control_unavailable",
-                "control_auth_failed",
-                "supervisor_mismatch",
-                "readiness_timeout",
-                "readiness_invalid",
-                "bind_mismatch",
-                "child_exited",
-                "health_failed",
-                "protocol_incompatible",
-                "terminate_failed",
-                "diagnostics_truncated",
-            ]
+            serde_json::to_value(diagnostics).unwrap(),
+            serde_json::json!([
+                {"component": "install", "code": "trust_invalid"},
+                {"component": "supervisor", "code": "readiness_timeout"},
+                {"component": "control", "code": "control_auth_failed"},
+                {"component": "exchange", "code": "protocol_incompatible"}
+            ])
         );
     }
 
