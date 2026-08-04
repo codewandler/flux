@@ -86,6 +86,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
 
 ## Next (ready — take the top one unless the user named a story)
+- [C-517 — Give task install a build-directory ownership contract](C-517-isolate-task-install-build-ownership.md) · Core · task install lost libsqlite3-sys compiler output while another cleanup overlapped the build; active targets need one explicit ownership or isolation rule
 
 ### The agent-authored surface — panes the model opens, config it can safely change
 - [C-219 — The agent-authored surface — panes the model opens, config it can safely change (epic)](C-219-agent-authored-surface-epic.md) · Core · the tool→surface seam already exists twice (ToolProgressSink/SpawnActivitySink) and op.register already lets the model extend the harness one layer down — what's missing is the surface layer, and the whole risk is that a model-drawn region can imitate the approval sheet
