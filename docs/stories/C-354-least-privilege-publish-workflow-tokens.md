@@ -1,36 +1,106 @@
 ---
 id: C-354
-title: Scope publication tokens to the steps that publish
+title: Scope promotion and publication tokens to the jobs that consume them
 pillar: Core
-status: backlog
+status: ready
+priority: 2
 epic: release-trust-residuals
 design: docs/designs/release-trust-residuals.md
-note: "release-plugins.yml grants contents:write WORKFLOW-wide including the 5-target matrix that compiles third-party vendor deps; crates-io.yml holds CARGO_REGISTRY_TOKEN at job level across cargo publish, which runs every dependency build.rs"
+note: "v0.56.0 blocker — App-only promotion in release-control; tag-only signing/GitHub Release/Cargo publication in release; plugin branch publication removed"
 ---
 
-# Scope publication tokens to the steps that publish
+# Scope promotion and publication tokens to the jobs that consume them
 
 ## Goal
 
-Stop a compromised third-party build script from finding a write-capable token in its own process
-environment.
+Make every release authority explicit and non-composable: model/build jobs cannot see a write token;
+pre-tag promotion uses only the dedicated App inside `release-control`; signing, GitHub Release and
+Cargo publication use distinct tag-triggered jobs inside `release`.
 
 ## Acceptance
 
-- [ ] `.github/workflows/release-plugins.yml` declares `permissions: contents: read` at workflow
-      level and grants `contents: write` only on the `assemble` job that needs it.
-- [ ] `crates-io.yml` moves `CARGO_REGISTRY_TOKEN` from job-level `env:` to the single publish
-      step's `env:`.
-- [ ] The `assemble` job's concentration of `MINISIGN_SECRET_KEY` + `CARGO_REGISTRY_TOKEN` +
-      `contents: write` is either split or recorded as an accepted concentration with reasoning.
-- [ ] The existing release-policy check is extended to assert workflow-level `permissions` are
-      read-only in every release workflow, so a future job inherits nothing by default.
+- [ ] All four release workflows declare workflow-level `contents: read`. Any other GitHub write
+      permission is granted only on the distinct job that consumes it. No workflow-level or
+      job-level `env` contains a provider key, `PROMOTION_APP_PRIVATE_KEY`, an App installation
+      token, `RELEASE_TOKEN`, `MINISIGN_SECRET_KEY` or `CARGO_REGISTRY_TOKEN`; every long-lived
+      secret appears only in the `env`/input of its single consuming step.
+- [ ] `RELEASE_TOKEN` exists only in a tag-triggered `release`-environment GitHub Release
+      create/upload step. It is absent from `.github/workflows/release-flow.yml` and from every
+      candidate, pull-request, merge and tag-creation step. Tests refuse any use of it to move
+      `main`, create/update/delete `release-candidates/*`, create/update/delete a tag, dispatch a
+      workflow or mint another credential.
+- [ ] `.github/workflows/release-flow.yml` separates these boundaries:
+  - preview, smoke, scribe and local cut use only the selected model secret at step scope and have no
+    GitHub write token;
+  - one narrow job names `release-control`, passes `PROMOTION_APP_PRIVATE_KEY` only to its token-mint
+    step with `PROMOTION_APP_ID`, and uses the resulting `flux-release-promoter` installation token
+    only to push the cut branch, open the normal PR to `main`, observe/merge that PR after its exact
+    head `ci`, create the candidate ref, dispatch/observe its workflow, create the final tag and,
+    only after C-516's live/fleet gates pass, delete the candidate ref;
+  - no model, build, attestation, signing or publication job can reference the key or token.
+
+      The promotion job never pushes directly or force-pushes to `main`. It takes the candidate and
+      eventual tag SHA only from the merged PR's resulting canonical `main` commit. The installation
+      token is never persisted as an artifact, output beyond the job or reusable secret.
+- [ ] `.github/workflows/release.yml` leaves plan, candidate resolution, target/global builds,
+      receipt recording, candidate byte verification and hosting read-only and secret-free. A
+      separate tag-triggered `release`-environment attestation job has only `id-token: write` and
+      `attestations: write`; a later `release`-environment GitHub Release job receives only
+      `RELEASE_TOKEN` at the create/upload step. A manual candidate dispatch cannot enter either
+      signing/publication job even if an input is forged.
+- [ ] `.github/workflows/release-plugins.yml` publishes only on a push of an exact
+      `plugins-v[0-9]+.[0-9]+.[0-9]+` tag. A retained `workflow_dispatch` is structurally a
+      build/validation path only: it has no `publish` input and cannot enter `release` or
+      `release-control`, mint an App token, create a tag, sign, create/upload a GitHub Release or
+      publish a crate. Dry run stops after its secret-free artifacts. Separately, a successful
+      `workflow_run` of the exact required `ci` workflow on protected `main` may enter a narrow
+      `release-control` job only when the run head SHA still equals canonical `main`, the lockstep
+      plugin version is exact and the corresponding tag is absent; that job mints the App token and
+      may create that plugin tag once at the validated canonical-main SHA. The tag event then
+      starts distinct publication jobs after the five-target secret-free build: secret-free index assembly,
+      `release`-environment minisign signing with `MINISIGN_SECRET_KEY` only on the sign step,
+      GitHub Release publication with `RELEASE_TOKEN` only on the create/upload step, and host-kit
+      Cargo publication with `CARGO_REGISTRY_TOKEN` only on the publish step. No job combines these
+      authorities.
+- [ ] `.github/workflows/crates-io.yml` publishes only on a push of an exact
+      `v[0-9]+.[0-9]+.[0-9]+` tag. Checkout, toolchain install, version validation and packaging are
+      secret-free. Its isolated `release`-environment publish job exposes
+      `CARGO_REGISTRY_TOKEN` only on the `scripts/publish-crates-io.sh` step; no branch/manual event,
+      prior build/validation step, workflow/job environment or unrelated job can read it.
+- [ ] Failing-first policy tests parse Actions YAML into workflow/job/step structure (including
+      aliases, expressions, inherited permissions, `on`, `if`, `environment`, `needs`, `uses`,
+      action inputs and `env`) rather than grepping text. Fixtures fail for workflow/job secret
+      scope, inherited write permission, model/build plus write-token co-residence, mixed
+      `release-control`/`release` use, `RELEASE_TOKEN` promotion, App-token publication, missing
+      environment, combined signing/GitHub/Cargo authority, or a secret referenced outside its one
+      authorized step.
+- [ ] Trigger/flow fixtures fail for direct or force push to `main`, candidate/tag creation before
+      the cut PR is merged, a candidate/tag SHA different from the returned merged `main` SHA, a
+      branch/manual plugin signing/publication path, any manual plugin tag-creation path, a plugin
+      controller run whose `ci` conclusion, head branch or head SHA does not match protected current
+      `main`, a tag publication job reachable from `workflow_dispatch`, or a plugin/core tag accepted
+      by the wrong workflow.
+- [ ] The parsed policy test covers the complete current inventory — `release.yml`,
+      `release-flow.yml`, `release-plugins.yml` and `crates-io.yml` — and fails when another release
+      workflow is added without an explicit disposition. Existing pinned-action and release-policy
+      checks stay green; no text-order or naming-only substitute is accepted.
 
 ## Progress
 
 - 2026-08-01 — filed from the job-by-job trust graph built during validation.
+- 2026-08-04 — contract raised to `ready` after re-reading all four live workflows. The current
+  concentration includes `release.yml`'s host job, `release-flow.yml`'s PAT-bearing cut/promotion
+  job, `release-plugins.yml`'s branch-dispatched assemble/publish job and `crates-io.yml`'s job
+  environment. These are observed pre-implementation facts, not accepted future paths; every
+  Acceptance item remains open.
 
 ## Notes
 
-- `release.yml` is already correct on this axis: workflow default is `contents: read, actions: read`
-  and only `host` widens. It is the model for the other two.
+- GitHub permissions are job-scoped, while secrets can be step-scoped. Separate jobs are required
+  wherever GitHub write authority must not coexist with model, build, signing or registry work.
+- C-353 owns the App, cumulative rulesets, environments and external secret entry. C-355 owns the
+  candidate receipt. C-516 owns exact PR/run/tag/public ordering. This story owns trigger and token
+  placement.
+- D-46's checked Acceptance records the historical branch-dispatched plugin pipeline that shipped.
+  This open story supersedes only its publication trigger/authority contract; it does not claim that
+  the tag-triggered replacement has been implemented.

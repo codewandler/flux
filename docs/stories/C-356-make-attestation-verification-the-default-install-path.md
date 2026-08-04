@@ -31,7 +31,12 @@ actually follow, and let a downstream verifier fail closed on unattested release
 ## Progress
 
 - 2026-08-01 — filed from validation of REL-02. Attestations verified live against `v0.44.0`.
+- 2026-08-04 — remains `backlog`, with every acceptance box open. This is the attestation-first
+  consumer-experience residual: C-516 will require the v0.56.0 assets and live attestations to verify,
+  but it does not make verification part of a user's primary install command. Useful and still owed,
+  not a v0.56.0 publication blocker.
 
 ## Notes
 
 - The website contract test will need the mirrored page regenerated in the same commit.
+- Do not use publication of v0.56.0 as evidence that this consumer-path contract is complete.
