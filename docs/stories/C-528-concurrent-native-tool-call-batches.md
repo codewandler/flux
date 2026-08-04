@@ -74,9 +74,21 @@ it to bound.
   the focused `flux-flow` suite and clippy are green. Pre-tool hooks, active cassettes,
   approval-sensitive calls, non-idempotent calls, and incomplete `Network`-without-`Read` metadata
   remain ordered or captured.
+- 2026-08-04: coordinator-review regressions prove an active recording cassette and pre-tool hooks
+  are structural scheduling barriers (`max_active == 1`). The overlap regression reads the
+  turn-scoped `native.batch_call` audit records back from `EventStore` and verifies stable provider
+  call indices and ids. Existing
+  `partial_failure_skips_later_actions_and_is_not_replayed_after_decision_resume` remains green: an
+  approved action failure skips later actions and resume does not replay the batch, so C-528 has not
+  widened concurrency into action execution.
 
 ## Notes
 
+- Native-response inventory on the implementation tree found three `tool_uses` consumers. Model
+  stages and adaptive exploration execute registered operations and therefore share the batch
+  executor. Intent routing intentionally differs: it accepts exactly one reserved
+  `declare_intent` control signal, executes no registered operation, and rejects any multi-call
+  response, so there is no native execution batch to schedule.
 - Related, not duplicate: [C-290](C-290-runtime-resource-limits.md) supplies the concurrency ceiling;
   it does not schedule native model-response calls. [C-451](C-451-the-head-to-head-benchmark.md)
   measures performance but does not close this implementation gap.

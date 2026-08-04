@@ -842,7 +842,7 @@ async fn run_model_stage_inner(
         for (index, (id, native, call_input)) in calls.into_iter().enumerate() {
             let Some(spec) = by_native.get(&native) else {
                 last_error = format!("model stage `{name}` called unavailable tool `{native}`");
-                observe_durable(
+                record_batch_admission(
                     ctx,
                     "native.batch_call",
                     json!({
@@ -864,7 +864,7 @@ async fn run_model_stage_inner(
             let operation = spec.name.clone();
             let Some(tool) = ctx.registry.get(&operation) else {
                 last_error = format!("model stage `{name}` tool `{operation}` disappeared");
-                observe_durable(
+                record_batch_admission(
                     ctx,
                     "native.batch_call",
                     json!({
@@ -885,7 +885,7 @@ async fn run_model_stage_inner(
             };
             if let Err(diagnostics) = validate_call(spec, &call_input, ctx, &selected) {
                 last_error = format!("invalid `{operation}` input: {}", diagnostics.join("; "));
-                observe_durable(
+                record_batch_admission(
                     ctx,
                     "native.batch_call",
                     json!({
@@ -913,7 +913,7 @@ async fn run_model_stage_inner(
                 last_error = format!(
                     "model stage `{name}` call to `{operation}` is not gather-safe for these arguments"
                 );
-                observe_durable(
+                record_batch_admission(
                     ctx,
                     "native.batch_call",
                     json!({
@@ -939,7 +939,7 @@ async fn run_model_stage_inner(
                 format!("model_stage_{round}_{index}"),
             );
             record_host_flow(ctx, &ast, &format!("stage:{name}"), round as u32);
-            observe_durable(
+            record_batch_admission(
                 ctx,
                 "native.batch_call",
                 json!({
@@ -1533,7 +1533,7 @@ async fn adaptive_explore(
                 let ast =
                     one_call_ast(&operation, input.clone(), format!("adaptive_gather_{step}"));
                 record_host_flow(ctx, &ast, "gather", step as u32);
-                observe_durable(
+                record_batch_admission(
                     ctx,
                     "native.batch_call",
                     json!({
@@ -1898,6 +1898,9 @@ async fn declare_intent(
             messages.push(assistant);
         }
 
+        // This is a host-owned routing control signal, not a registered runtime operation: the
+        // protocol requires exactly one declaration and deliberately rejects batches. Keep it out
+        // of native-call scheduling and the Executor dispatch path.
         let parsed = if calls.len() == 1 && calls[0].1 == DECLARE_INTENT {
             parse_intent(&calls[0].2, families)
         } else if calls.is_empty() {
@@ -3136,11 +3139,15 @@ fn observe(ctx: &StagedContext, kind: &str, data: Value) {
     sink.observation(&observation);
 }
 
-/// Record deterministic batch admission without pretending scheduler admission is live progress.
-/// Tool start/result callbacks still surface in real execution order through [`SharedSink`].
-fn observe_durable(ctx: &StagedContext, kind: &str, data: Value) {
-    ctx.executor
-        .observe(Observation::new(kind, EvidencePhase::Turn, data));
+/// Persist deterministic batch admission through the turn audit seam without pretending scheduler
+/// admission is live progress. Tool start/result callbacks still surface in real execution order
+/// through [`SharedSink`].
+fn record_batch_admission(ctx: &StagedContext, kind: &str, data: Value) {
+    let Some((events, turn_id)) = &ctx.audit else {
+        return;
+    };
+    let observation = Observation::new(kind, EvidencePhase::Turn, data);
+    let _ = events.record_observation(&ctx.session_id, *turn_id, &observation);
 }
 
 #[cfg(test)]
@@ -3962,8 +3969,17 @@ mod tests {
                 json!({"value": {"complete": true}}),
             ),
         ];
-        let (context, requests, barrier, _root) = blocking_model_stage_context(responses);
-        let executor = context.executor.clone();
+        let (mut context, requests, barrier, _root) = blocking_model_stage_context(responses);
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let turn_id = events
+            .begin_turn(
+                &context.session_id,
+                "Inspect both fixture records",
+                "test-model",
+            )
+            .unwrap();
+        context.audit = Some((events.clone(), turn_id));
+        let session_id = context.session_id.clone();
         let definition = blocking_model_stage_definition();
 
         let stage = run_model_stage(context, "batch_probe", definition, json!({}));
@@ -4004,8 +4020,12 @@ mod tests {
             .map(|(id, _, _)| id)
             .collect::<Vec<_>>();
         assert_eq!(result_ids, ["read-first", "read-second"]);
-        let evidence = executor.evidence();
-        let admitted = evidence.by_kind("native.batch_call").collect::<Vec<_>>();
+        let admitted = events
+            .observations(&session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|observation| observation.kind == "native.batch_call")
+            .collect::<Vec<_>>();
         assert_eq!(admitted.len(), 2);
         assert_eq!(admitted[0].data["call_index"], 0);
         assert_eq!(admitted[0].data["call_id"], "read-first");
@@ -4254,6 +4274,54 @@ mod tests {
         assert_eq!(stage.result.unwrap(), json!({"complete": true}));
         assert_eq!(barrier.max_active.load(Ordering::SeqCst), 1);
         assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn active_cassette_is_a_conservative_native_batch_barrier() {
+        let responses = vec![
+            native_calls(vec![
+                ("cassette-1", "blocking_inspect", json!({"key": "one"})),
+                ("cassette-2", "blocking_inspect", json!({"key": "two"})),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let (context, _requests, barrier, _root) = blocking_model_stage_context(responses);
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        context
+            .store
+            .set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Record(
+                crate::cassette::RecordScope::new(events, &context.session_id),
+            ))));
+
+        let stage = run_model_stage(
+            context,
+            "cassette_batch",
+            blocking_model_stage_definition(),
+            json!({}),
+        );
+        let controller = async {
+            barrier.wait_for_entered(1).await;
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    barrier.wait_for_entered(2),
+                )
+                .await
+                .is_err(),
+                "ordered cassette cells must not race concurrent native calls"
+            );
+            barrier.release(1);
+            barrier.wait_for_entered(2).await;
+            barrier.release(1);
+        };
+        let (stage, ()) = tokio::join!(stage, controller);
+
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

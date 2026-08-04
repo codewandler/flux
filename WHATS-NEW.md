@@ -41,6 +41,11 @@
 
 ### Improved
 
+- **Flux can inspect independent evidence sources at the same time.** When a model requests several
+  safe reads together, Flux overlaps them within the configured tool-concurrency limit and still
+  returns their results in request order. Writes, approval-sensitive work, hooked calls, and tools
+  without trustworthy read-only metadata remain ordered.
+
 - **The security guide now tells you which secret guarantee you actually have.** It separates
   credentials kept outside Flux or a plugin from values materialized locally and protected by
   scopes and redaction. It also states plainly that unknown credentials pasted into prompts are not
