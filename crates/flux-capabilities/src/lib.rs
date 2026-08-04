@@ -23,6 +23,7 @@
 pub mod datasource;
 pub mod endpoint;
 pub mod harness;
+pub mod usage_observatory;
 
 pub use datasource::{
     chunk_text, datasource_tools, datasource_tools_with_history, freshness, ingest_harness_history,

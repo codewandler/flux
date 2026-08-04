@@ -7,6 +7,8 @@ description = "flux ratatui chat UI: streaming chat view + input, driving the ag
 
 [dependencies]
 flux-core.workspace = true
+# C-512: consume the shared usage timeline/projection; never depend on flux-cli.
+flux-capabilities.workspace = true
 flux-credentials.workspace = true
 flux-flow.workspace = true
 flux-provider.workspace = true

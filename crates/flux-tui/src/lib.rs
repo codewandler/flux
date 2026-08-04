@@ -10,6 +10,7 @@ mod controller;
 pub mod fleet;
 mod interaction;
 pub mod loopmock;
+mod observatory;
 mod panes;
 mod projection;
 mod rendering;
@@ -272,7 +273,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "show or switch model"),
     ("effort", "show or set reasoning effort"),
     ("quit", "exit flux"),
-    ("usage", "tokens, cache hit rate, and cost"),
+    ("usage", "live usage; `history` opens the observatory"),
     ("insights", "summarize current-session facts"),
     ("compact", "compact session context"),
     ("shell", "toggle the generic bash op"),
@@ -1088,6 +1089,7 @@ impl ChatState {
             search: None,
             help_open: false,
             usage_open: false,
+            observatory: None,
             focused: None,
             file_inventory: None,
             path_sel: 0,
@@ -4060,6 +4062,39 @@ where
                     continue;
                 }
 
+                // C-512: historical observatory. Every key is handled here so chat state cannot
+                // drift while the metadata-only analysis view has focus.
+                if let Some(view) = state.observatory.as_mut() {
+                    let seek = (view.clock.range.duration_ms() / 20).max(1);
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => state.observatory = None,
+                        KeyCode::Char(' ') => view.clock.toggle(),
+                        KeyCode::Char('r') => view.clock.restart(),
+                        KeyCode::Left => view.clock.seek(-seek),
+                        KeyCode::Right => view.clock.seek(seek),
+                        KeyCode::Char('+') | KeyCode::Char('=') => view.change_speed(true),
+                        KeyCode::Char('-') => view.change_speed(false),
+                        KeyCode::Char('f') => view.clock.fit_to(15_000),
+                        KeyCode::Char('4') => view.set_window(
+                            flux_capabilities::usage_observatory::UsageRange::FOUR_HOURS_MS,
+                        ),
+                        KeyCode::Char('1') => view.set_window(
+                            flux_capabilities::usage_observatory::UsageRange::DAY_MS,
+                        ),
+                        KeyCode::Char('7') => view.set_window(
+                            flux_capabilities::usage_observatory::UsageRange::WEEK_MS,
+                        ),
+                        KeyCode::Char('g') => view.cycle_group(),
+                        KeyCode::Char('m') => {
+                            view.clock.reduced_motion = !view.clock.reduced_motion
+                        }
+                        KeyCode::Up => view.focused = view.focused.saturating_sub(1),
+                        KeyCode::Down => view.focused = view.focused.saturating_add(1),
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // C-140: usage overlay — Esc/q/Enter close, everything else is swallowed.
                 if state.usage_open {
                     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
@@ -4660,6 +4695,22 @@ async fn handle_command(
 
     match name {
         "" | "help" => state.help_open = true,
+        "usage" if matches!(args, "history" | "observatory") => {
+            let engine = agent.read().await;
+            match crate::observatory::UsageObservatory::from_store(
+                &engine.events,
+                &flux_core::PricingTable::builtin(),
+            ) {
+                Ok(observatory) => {
+                    state.usage_open = false;
+                    state.observatory = Some(observatory);
+                }
+                Err(error) => state.push(Entry::Notice {
+                    text: format!("usage observatory: {error}"),
+                    sev: Sev::Err,
+                }),
+            }
+        }
         "usage" => state.usage_open = true,
         "quit" | "exit" => return Ok(true),
         "queue" => {

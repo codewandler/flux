@@ -9,6 +9,8 @@ description = "flux agent capabilities: a guarded web.fetch tool (browser) + a k
 
 [dependencies]
 flux-core.workspace = true
+# C-512: metadata-only Flux CallUsage/legacy-turn extraction for the shared observatory timeline.
+flux-events = { workspace = true, features = ["sqlite"] }
 flux-datasource.workspace = true
 flux-evidence.workspace = true
 flux-plugin.workspace = true
