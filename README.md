@@ -150,7 +150,7 @@ Effects are local by default. To keep the model, runtime and approval UI on your
 process and network effects land in a separately administered workspace, select the remote mode with
 `flux tui --remote https://worker.example:8790`. The remote side is an authenticated TLS service;
 setup, trust boundaries and the deliberate no-sync rule are covered in the
-[topologies guide](https://codewandler.github.io/flux/topologies#local-runtime-remote-system).
+[topologies guide](https://codewandler.github.io/flux/docs/topologies#local-runtime-remote-system).
 
 ## Safety and execution model
 
@@ -340,9 +340,11 @@ default, and a non-loopback bind without `FLUX_SERVER_TOKEN` is **rejected at st
 [Flux-Lang](https://codewandler.github.io/flux/docs/language/overview) ·
 [editor setup](https://codewandler.github.io/flux/docs/language/editors) ·
 [SDK](https://codewandler.github.io/flux/docs/sdk/overview) ·
-[plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins)
+[plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins) ·
+[team presentation](https://codewandler.github.io/flux/presentation)
 
-In-repo: [`docs/architecture.md`](docs/architecture.md) · [`docs/vision.md`](docs/vision.md) ·
+In-repo: [`docs/README.md`](docs/README.md) (the docs map) ·
+[`docs/architecture.md`](docs/architecture.md) · [`docs/vision.md`](docs/vision.md) ·
 [`docs/usage.md`](docs/usage.md) (command surface map)
 
 ## Contributing

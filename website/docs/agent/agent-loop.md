@@ -5,6 +5,9 @@ description: "How typed intent, scoped exploration, batch approval, and authored
 
 # The agent loop
 
+<!-- Editors: the contributor deep-dive of this loop is docs/agent-loop.md in the repository. The
+two texts are deliberately independent, not mirrors; keep both consistent with the shipped tree. -->
+
 Every conversational turn is driven by an authored Flux-Lang program. The CLI, SDK `Client`, server,
 sub-agents, apps, and conversational text adapters all use the same loop; Rust only supplies the provider,
 session, operation registry, cancellation, and safety envelope.

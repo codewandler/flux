@@ -269,6 +269,7 @@ Bare `flux` opens a line-oriented REPL. Its built-in commands:
 | `/effort [level]` | show or set reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`, `off`) |
 | `/tools` · `/evidence` | list available operations · show the session's evidence trail |
 | `/shell` | explicitly toggle the optional shell group |
+| `/plugin-refresh <name>` | re-read a loaded plugin's operation catalog; the refreshed set is adopted at the next turn boundary (the current turn keeps its catalog) |
 | `/session` · `/sessions` · `/resume <id>` · `/clear` | session management (`/sessions --prune` deletes empty sessions) |
 | `/compact` | compact older conversation history now |
 | `/insights [direction]` | show deterministic facts for the active session, then focus one grounded summary (for example, `focus on blockers`) |

@@ -6,7 +6,7 @@ export default function PresentationRoute() {
   return (
     <Layout
       title="What is flux?"
-      description="A 15-minute interactive engineering presentation about flux, connectors, and Exchange.">
+      description="A 20-minute interactive engineering presentation about flux, connectors, and Exchange.">
       <FluxPresentation />
     </Layout>
   );

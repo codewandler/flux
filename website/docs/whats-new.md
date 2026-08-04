@@ -14,6 +14,9 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Agents can now run a Flux program supplied directly in a `flow_run` call.** Use
+  `inline_program` when a program does not need to be saved first; it supports the same input bindings
+  and execution safeguards as named and file-based flows.
 - **Flux can now use operations granted to an Exchange Service Account.** Set the Exchange URL and
   Service Account token in the host environment. Flux refreshes the available operations between
   turns and sends one-shot calls to Exchange, while Exchange keeps credentials and deployment
@@ -50,6 +53,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   publishes it. A failed build or publication stays visibly failed with its recovery candidate
   preserved; it cannot silently finish as a partial release. The expensive release gate now runs
   once on that exact candidate instead of being repeated during the cut.
+
+- **The engineering presentation grew to thirteen chapters and became easier to share.** It now
+  walks through the agent loop, session records, and model strategy (about twenty minutes end to
+  end), prints as a complete handout, and supports touch swipe, a contents menu, and the browser
+  Back button; keyboard shortcuts keep working after you click a control. Its Exchange chapter
+  reflects what actually ships today, and the presentation is linked from the site's front page,
+  footer, docs overview, and README instead of hiding behind the playground.
 
 ### Fixed
 

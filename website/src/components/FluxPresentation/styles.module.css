@@ -39,7 +39,21 @@
   transition: width 220ms ease;
 }
 
-.stage { min-height: 0; overflow: hidden; }
+.stage { min-height: 0; overflow: hidden; touch-action: pan-y; }
+.slideWrap { height: 100%; min-height: 0; }
+.slideHidden { display: none; }
+
+.srOnly {
+  block-size: 1px;
+  clip-path: inset(50%);
+  inline-size: 1px;
+  margin: -1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+}
+
+.printOnly { display: none; }
 
 .slide {
   display: grid;
@@ -83,7 +97,45 @@
   font-weight: 700;
   letter-spacing: 0.08em;
 }
-.controls > div { display: flex; gap: 0.45rem; }
+.controls > div { align-items: center; display: flex; gap: 0.45rem; }
+.menuWrap { position: relative; }
+.menu {
+  background: var(--ifm-background-surface-color);
+  border: 1px solid var(--flux-hero-border);
+  border-radius: 10px;
+  bottom: calc(100% + 0.6rem);
+  box-shadow: 0 14px 40px rgb(0 0 0 / 0.18);
+  display: grid;
+  left: 50%;
+  max-height: min(62vh, 430px);
+  overflow: auto;
+  padding: 0.4rem;
+  position: absolute;
+  transform: translateX(-50%);
+  width: min(360px, 82vw);
+  z-index: 5;
+}
+.menu button {
+  background: none;
+  border: 0;
+  border-radius: 7px;
+  color: var(--deck-ink);
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+}
+.menu button:hover,
+.menu button:focus-visible { background: var(--flux-hero-bg); }
+.menu button span {
+  color: var(--flux-eyebrow);
+  font-family: ui-monospace, monospace;
+  font-size: 0.68rem;
+  font-weight: 700;
+  margin-right: 0.4rem;
+}
+.menuActive { background: color-mix(in srgb, var(--flux-signal) 12%, transparent) !important; }
 .controls button,
 .segmented button {
   background: var(--ifm-background-surface-color);
@@ -193,15 +245,17 @@
 .pipeline button.pipelineActive { border-color: var(--flux-signal); box-shadow: inset 0 0 0 1px var(--flux-signal); color: var(--deck-ink); }
 .pipeline i { color: var(--flux-signal); font-style: normal; }
 .pipelineDetail {
-  background: #111714;
+  background: var(--flux-hero-bg);
+  border: 1px solid var(--flux-hero-border);
+  border-left: 4px solid var(--flux-signal);
   border-radius: 12px;
-  color: #eef8f3;
+  color: var(--deck-copy);
   min-height: 150px;
   padding: clamp(1rem, 2.5vw, 2rem);
 }
-.pipelineDetail span { color: #70a58f; font-family: ui-monospace, monospace; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; }
-.pipelineDetail h2 { color: white; font-size: clamp(1.4rem, 2.4vw, 2.2rem); margin: 0.45rem 0; }
-.pipelineDetail p { color: #b9c8c1; font-size: clamp(0.95rem, 1.4vw, 1.15rem); margin: 0; }
+.pipelineDetail span { color: var(--flux-eyebrow); font-family: ui-monospace, monospace; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; }
+.pipelineDetail h2 { color: var(--deck-ink); font-size: clamp(1.4rem, 2.4vw, 2.2rem); margin: 0.45rem 0; }
+.pipelineDetail p { color: var(--deck-copy); font-size: clamp(0.95rem, 1.4vw, 1.15rem); margin: 0; }
 .envelope {
   border: 1px solid var(--flux-hero-border);
   border-radius: 12px;
@@ -215,6 +269,49 @@
 
 .demoIntro { font-size: 0.9rem; line-height: 1.45; margin: 0 0 0.7rem; }
 .demo :global(.workbench) { margin-bottom: 0; }
+
+.loopLayout {
+  align-items: start;
+  display: grid;
+  gap: 1.2rem;
+  grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+}
+.loopList {
+  counter-reset: loop;
+  display: grid;
+  gap: 0.75rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.loopList li { padding-left: 2.2rem; position: relative; }
+.loopList li::before {
+  color: var(--flux-eyebrow);
+  content: counter(loop, decimal-leading-zero);
+  counter-increment: loop;
+  font-family: ui-monospace, monospace;
+  font-size: 0.68rem;
+  font-weight: 700;
+  left: 0;
+  position: absolute;
+  top: 0.3rem;
+}
+.loopList strong { color: var(--deck-ink); font-family: ui-monospace, monospace; font-size: 0.92rem; }
+.loopList p { font-size: 0.92rem; line-height: 1.45; margin: 0.15rem 0 0; }
+.loopSide { display: grid; gap: 1rem; }
+
+.sessionsLayout {
+  align-items: start;
+  display: grid;
+  gap: 1.2rem;
+  grid-template-columns: minmax(0, 1.1fr) minmax(300px, 0.9fr);
+}
+.sessionsLayout :global(.theme-code-block) { margin: 0.9rem 0; }
+.sessionsCards { display: grid; gap: 1rem; }
+
+.modelsLayout { display: grid; gap: 1rem; }
+.modelsLayout :global(.theme-code-block) { margin-bottom: 0; }
+.modelCards { display: grid; gap: 1rem; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
 .surfaceGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .surfaceGrid .card { min-height: 125px; }
@@ -341,18 +438,44 @@
   .pipeline i { display: none; }
   .topology { grid-template-columns: 1fr; }
   .topology > b { display: none; }
+  .loopLayout, .sessionsLayout { grid-template-columns: 1fr; }
+  .modelCards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 650px) {
   .deck { min-height: 520px; }
   .slideHeader { margin-bottom: 0.8rem; }
-  .twoColumns, .surfaceGrid, .statusGrid, .opsLayout, .topologyNotes { grid-template-columns: 1fr; }
+  .twoColumns, .surfaceGrid, .statusGrid, .opsLayout, .topologyNotes, .modelCards { grid-template-columns: 1fr; }
   .flowRow { grid-template-columns: 1fr; }
   .flowRow > b { display: none; }
   .snapshot { align-items: flex-start; flex-direction: column; gap: 0.25rem; }
   .controls { grid-template-columns: auto 1fr; }
   .controls > div { justify-self: end; }
   .controls small { display: none; }
+}
+
+@media print {
+  .page { background: none; min-height: 0; padding: 0; }
+  .deck {
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    display: block;
+    height: auto;
+    max-width: none;
+    min-height: 0;
+    overflow: visible;
+  }
+  .progress,
+  .controls { display: none; }
+  .stage { overflow: visible; }
+  .slideWrap { height: auto; }
+  .slideHidden { display: block; }
+  .slide { break-after: page; height: auto; padding: 1.5rem 0; }
+  .slideBody { overflow: visible; }
+  .printOnly { display: block; }
+  .demoScreen { display: none; }
+  .menu { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

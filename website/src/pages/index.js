@@ -146,6 +146,9 @@ export default function Home() {
                 <Link className="button button--secondary button--lg" to="/console/">
                   Open the playground
                 </Link>
+                <Link className="button button--secondary button--lg" to="/presentation/">
+                  Present flux to your team
+                </Link>
               </div>
             </div>
             <div className="hero-code">

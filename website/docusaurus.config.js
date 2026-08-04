@@ -162,6 +162,7 @@ const config = {
             { label: 'SDK', to: '/docs/sdk/flow-client' },
             { label: 'Channels', to: '/docs/channels/overview' },
             { label: "What's new", to: '/docs/whats-new' },
+            { label: 'Team presentation', to: '/presentation/' },
             { label: 'Blog', to: '/blog' },
           ],
         },

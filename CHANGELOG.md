@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`flow_run` can execute Flux-Lang supplied directly in its request.** The new mutually exclusive
+  `inline_program` address is parsed and revalidated against the live operation catalog, then runs
+  through the same session, approval, guarded-IO, input-seeding, and reentry boundaries as stored
+  names and workspace paths. Inline route receipts report no resolved filesystem path.
 - **Flux now embeds the Exchange Service Account client for official integrations** (C-503).
   Operator-only environment configuration binds one Exchange origin and bearer; its authenticated
   effective catalogue is adopted between turns and one-shot operations run through Exchange's HTTP
@@ -92,6 +96,28 @@ All notable changes to this project are documented in this file. The format is b
   documentation regeneration uses the same pinned Docusaurus toolchain as the website gate. The
   automated cut no longer repeats the full six-command gate: the exact candidate SHA runs it once,
   and the immutable receipt binds that gated commit before main or the tag may move.
+
+- **The engineering presentation covers the full runtime story and works as a handout** (C-528).
+  Three new chapters — the adaptive agent loop, sessions as the operational record, and model
+  strategy — grow the deck to thirteen (about twenty minutes), and its Exchange status now matches
+  the shipped Service Account seam with snapshots re-verified against both sibling repositories
+  (connectors v0.20.0, exchange v0.17.0, 2026-08-05). All chapters render in the DOM, so printing
+  yields a complete handout with a static listing in place of the editor and the Monaco workbench
+  mounts only when the demo chapter is first shown. Deck keys keep working after activating any
+  control, touch swipe and a contents menu navigate, browser Back steps chapters, the pipeline
+  detail follows the site theme, and the footer, landing page, docs overview and README link the
+  deck — all pinned by the website contract so the deck can neither drift stale nor become an
+  orphan again.
+
+- **Contributor front doors state the adaptive-loop thesis and stop hardcoding release status**
+  (C-529). `docs/architecture.md`, `CONTRIBUTING.md` and the roadmap's Direction section no longer
+  describe the retired plan-compiler model; a new website-contract test pins the exact retired
+  sentences out. The roadmap's Next preamble and the story board's Status block become evergreen
+  pointers instead of version claims (which had rotted 13–17 releases stale), roadmap design links
+  stay inside `docs/`, the public REPL table documents `/plugin-refresh`, the README's published
+  topologies link regains its `/docs/` segment, `docs/language.md` points at the shipped
+  Glyph/Railflux projections and quoted-key field paths, the agent-loop and A2A contributor/website
+  pairs carry reciprocal pointer notes, and `docs/designs/` states its convention in a README.
 
 ### Fixed
 

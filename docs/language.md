@@ -19,6 +19,8 @@ The shortest version:
 2. **Symbols are not values.** A symbol such as `$draft` names a value id in the session store. Values
    are immutable; a revision is another value id, not mutation in place. A typed model stage sees only
    its declared input and capability-scoped operation schemas. The runtime alone dereferences values.
+   Field paths accept JSON-quoted keys (`$response.headers["content-type"]`, with a `?` form for
+   optional access), so non-identifier keys need no workaround.
 3. **`call` is the operation boundary.** The language knows how to call registered operations, but it
    does not own filesystem, process, provider, or network IO. The `flux-flow` engine adapts `call` onto
    `Executor::dispatch`, so policy, approval, redaction, and guarded IO remain the only production path
@@ -65,4 +67,6 @@ the same operation dispatch envelope.
 - [Agent loop](agent-loop.md) shows the self-hosted turn loop written as Flux-Lang.
 - [Flux-Lang reference](../crates/flux-lang/docs/reference.md) lists every node and field.
 - [Flux-Lang syntax](../crates/flux-lang/docs/syntax.md) specifies writable `.flux` text.
+- [Flux Glyph](../crates/flux-lang/docs/glyph.md) and [Railflux](../crates/flux-lang/docs/railflux.md)
+  document the shipped `fluxlang glyph` / `fluxlang rail` projections of the same AST.
 - [Flux-Lang status](../crates/flux-lang/docs/STATUS.md) tracks PRD conformance against the current tree.

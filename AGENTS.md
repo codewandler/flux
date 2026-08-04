@@ -63,6 +63,7 @@ Read the focused contract before changing these areas:
 - Plugins or the nested plugin workspace: [plugins/AUTHORING.md](plugins/AUTHORING.md)
 - Releases and versioning: [crates/flux-sdk/PUBLISHING.md](crates/flux-sdk/PUBLISHING.md)
 - Architecture and crate placement: [docs/architecture.md](docs/architecture.md)
+- The documentation map (what lives where, contributor tree vs website): [docs/README.md](docs/README.md)
 - Product direction: [docs/vision.md](docs/vision.md) and [docs/roadmap.md](docs/roadmap.md)
 - Unobserved client-builder wiring and `flux-pin` coverage:
   [docs/designs/unobserved-wiring.md](docs/designs/unobserved-wiring.md)

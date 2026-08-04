@@ -79,11 +79,25 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
-> The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.38.0** is released and `[Unreleased]` is empty. That cut carried the **adversarial review
-> remediation** and **Zendesk automation** epics below, plus the earlier tail (C-217, C-218, C-226,
-> C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
-> the itemized history.
+> The entries below are the epic log, newest first, each stamped with its status. For what is
+> released versus merged-but-untagged, read this file's status line (top) together with
+> [CHANGELOG.md](../CHANGELOG.md): versioned sections are tagged releases, and `[Unreleased]`
+> lists work merged since the latest cut. (Historical note: the v0.38.0 cut carried the
+> **adversarial review remediation** and **Zendesk automation** epics below, plus the earlier tail
+> C-217, C-218, C-226, C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252.)
+
+### Flux-Lang authoring ergonomics — typed protocols, concise data and control (epic) — 🔄 **PROPOSED (L-131; L-132…L-140 filed, none started)**
+
+Substantial Flux programs can express typed multi-stage workflows today, but repeated JSON
+parse/assert boundaries, result objects, parallel task branches, counters, and terminal returns hide
+the protocol beneath its scaffolding. This provider-neutral, domain-neutral epic adds reusable data
+contracts and typed task results (L-132/L-133), bounded validation repair (L-134), pure local helpers
+and composable values (L-135/L-136), data-driven fan-out and collecting repeat loops (L-137/L-138),
+then structural task context and explicit optional/result values (L-139/L-140). It is additive to
+L-102's one canonical dialect, builds on L-113/L-116's hardening, and does not weaken the execution
+envelope. Every story carries a generic example; its syntax remains illustrative until that story's
+AST/lowering decision is accepted. Design:
+[flux-lang-authoring-ergonomics](designs/flux-lang-authoring-ergonomics.md).
 
 ### Flux syntax simplification — one way to write each thing (epic) — 🔄 **PROPOSED (L-102; L-103…L-112 filed, none started)**
 
@@ -627,13 +641,13 @@ Defects are tractable and clustered: 17 of 85 non-epic open stories describe som
 grouped in webhook delivery, the Flux-Lang grammar and its editor mirrors, and the redaction path —
 where two stories fail *open*.
 
-**"Done" is not a bug count.** The architecture is settled ([C-337](../designs/architectural-simplification.md)
+**"Done" is not a bug count.** The architecture is settled ([C-337](designs/architectural-simplification.md)
 says "preserve, do not redesign"), but the published API surface is not: C-337 records a scheduled
 breaking window for `AgentSpec`, compatibility doors slated for deletion, and 37 crates with no
 ownership audit — while carrying zero implementation stories. Benchmarking against an API with a
 deliberate break still queued makes regressions indistinguishable from intended churn. So this epic
 closes when the defect clusters close, C-337 is decomposed and its window scheduled, **and**
-[C-255](../designs/adversarial-review-remediation-2026-07-30.md)'s final bullet is ticked — three
+[C-255](designs/adversarial-review-remediation-2026-07-30.md)'s final bullet is ticked — three
 fresh independent reviews finding no reproducible High-severity containment defect. That bullet is the
 repo's own definition of stable, and its first closure pass found twelve defects after every child was
 marked done.
@@ -2204,9 +2218,9 @@ Drift made visible, so it stops being silent. Each maps to a story on the
 
 ## Direction
 
-The through-line is **the LLM is not the runtime**: the model is a compiler front-end that emits a
-Flux-Lang plan, and the deterministic engine runs it — **non-bypassable safety** is the hard
-invariant that buys. Priority is **personal coding agent → reusable SDK → multi-user platform**. See
+The through-line is **the LLM is not the runtime**: the model supplies bounded judgment inside an
+authored adaptive loop, and the deterministic engine owns control flow and every effect —
+**non-bypassable safety** is the hard invariant that buys. Priority is **personal coding agent → reusable SDK → multi-user platform**. See
 [vision.md](vision.md). The annotated original design & planning document (with full
 milestone-by-milestone detail) is retained outside the repo by the author; this roadmap is the
 in-repo canonical summary.

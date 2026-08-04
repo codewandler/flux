@@ -361,6 +361,73 @@ fn cli_reference_covers_every_public_subcommand() {
             missing.len()
         );
     }
+    // C-318 shipped `/plugin-refresh` as a REPL command; it is part of the public CLI story even
+    // though it is not a subcommand `--help` can enumerate.
+    assert!(
+        read("website/docs/agent/cli.md").contains("/plugin-refresh"),
+        "website/docs/agent/cli.md omits the /plugin-refresh REPL command"
+    );
+}
+
+/// C-529: the contributor front doors must teach the current adaptive-loop thesis, not the retired
+/// plan-compiler one, and their status prose must not hardcode release claims that rot. Pins are
+/// scoped to the exact retired sentences (not broad phrase lists) because the roadmap's historical
+/// epic log may legitimately quote old wording.
+#[test]
+fn contributor_entry_docs_do_not_revive_the_retired_compiler_thesis() {
+    let architecture = read("docs/architecture.md");
+    let contributing = read("CONTRIBUTING.md");
+    let roadmap = read("docs/roadmap.md");
+    let readme = read("README.md");
+
+    for (name, text, stale) in [
+        (
+            "docs/architecture.md",
+            &architecture,
+            "it emits a typed Flux-Lang plan",
+        ),
+        (
+            "docs/architecture.md",
+            &architecture,
+            "even a read is a plan node",
+        ),
+        (
+            "CONTRIBUTING.md",
+            &contributing,
+            "the model compiles a request into a plan",
+        ),
+        (
+            "docs/roadmap.md",
+            &roadmap,
+            "compiler front-end that emits a Flux-Lang plan",
+        ),
+    ] {
+        assert!(
+            !text.contains(stale),
+            "{name} revived the retired compiler thesis: `{stale}`"
+        );
+    }
+    for (name, text) in [
+        ("docs/architecture.md", &architecture),
+        ("CONTRIBUTING.md", &contributing),
+    ] {
+        assert!(
+            normalized_prose(text).contains(&normalized_prose("adaptive loop")),
+            "{name} must name the adaptive loop that replaced model-generated plans"
+        );
+    }
+    assert!(
+        !roadmap.contains("is released and `[Unreleased]` is empty"),
+        "docs/roadmap.md's Next preamble must not hardcode a release-boundary claim"
+    );
+    assert!(
+        !roadmap.contains("](../designs/"),
+        "docs/roadmap.md design links must stay inside docs/ (use designs/…)"
+    );
+    assert!(
+        readme.contains("codewandler.github.io/flux/docs/topologies"),
+        "README.md must link the published topologies guide with its /docs/ segment"
+    );
 }
 
 /// The TUI page must document the keys the TUI actually binds.
@@ -1069,6 +1136,11 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
         "Exchange is the only official integration executor",
         "Flux embeds the Exchange client",
         "Core Flux remains useful without Exchange",
+        // C-528: one distinctive claim per added chapter — agent loop, sessions, model strategy.
+        "captured, not executed",
+        "resumes the exact flow",
+        "Sessions are the record",
+        "exercises the full pipeline",
     ] {
         assert!(
             normalized_prose(&deck).contains(&normalized_prose(claim)),
@@ -1080,8 +1152,27 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
         "the demo must reuse the declared L-128 scratch fixture"
     );
     assert!(
-        deck.contains("Source snapshot · 2026-08-03"),
+        deck.contains("Source snapshot · 2026-08-05"),
         "mutable sibling-project claims must carry a visible date"
+    );
+    assert!(
+        !deck.contains("invocation wiring is not built"),
+        "the deck revived the pre-C-503 Exchange gap claim"
+    );
+    let config = read("website/docusaurus.config.js");
+    assert!(
+        config.contains("to: '/presentation/'"),
+        "the site footer must link the presentation"
+    );
+    let homepage = read("website/src/pages/index.js");
+    assert!(
+        homepage.contains("to=\"/presentation/\""),
+        "the landing page must link the presentation"
+    );
+    let intro = read("website/docs/intro.md");
+    assert!(
+        intro.contains("/presentation/"),
+        "the docs overview must link the presentation"
     );
 
     for stale in [
