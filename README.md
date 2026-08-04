@@ -26,9 +26,10 @@
 
 ## The LLM is not the runtime
 
-The model never becomes the execution engine, and never authors executable code. It declares intent,
-explores through exact provider-native operation schemas, and proposes literal actions. An authored
-Flux-Lang loop and a deterministic Rust runtime own everything after that.
+The model never becomes the execution engine. It may author Flux-Lang source, declare intent,
+explore through exact provider-native operation schemas, and propose literal actions, but authored
+text is inert until it is parsed and analysed. Only an explicitly requested run enters the
+deterministic Rust runtime, where authorization, approval and guarded IO own every effect.
 
 ```text
 request → typed intent → scoped exploration → action batch → approval → guarded execution

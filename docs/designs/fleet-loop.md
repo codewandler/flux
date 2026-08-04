@@ -14,10 +14,10 @@ coordinator can re-derive in-flight runs.
 What it does not do is run the loop that Claude Code's `track` plugin runs:
 
 > read a board → select a wave of independent items → give each its own isolated worker that
-> implements, runs the project gate, and commits on a scratch branch → review the returned diff *as
+> implements, runs targeted checks, and commits on a scratch branch → review the returned diff *as
 > evidence* (re-run the failing-first test against the merge base) → up to two rework rounds back to
-> the **same** worker → park after that → integrate **serially with a full gate after every merge**,
-> reverting on red → write the bookkeeping.
+> the **same** worker → park after that → integrate serially on one wave branch → run the full gate
+> once on the final combined tree → publish only on green → write the bookkeeping.
 
 Today that loop exists only as prose in a plugin. This epic makes flux run it.
 
@@ -30,14 +30,15 @@ Not a research proof, not a bridge to the `track` plugin. The loop end-to-end.
 ### 2. The model reasons; the host enforces
 
 This is the load-bearing call. A `WaveCoordinator` in the runtime mechanically performs the
-irreversible, all-or-nothing, order-sensitive actions: isolation, gate, merge, revert, ledger. The
-model performs wave selection and diff review.
+irreversible, all-or-nothing, order-sensitive actions: isolation, ordered integration, the wave
+gate, the publication fence, and ledger writes. The model performs wave selection and diff review.
 
-The consequence is the point: the loop's invariants — **fenced ledger · gate after every merge ·
-never implement · revert on red · park after two rounds** — hold *even when the model is wrong or
-lazy*, because they are host behaviour rather than instructions. The `track` plugin can only
-*describe* the ordering; flux enforces it. `fleet.integrate` is the sharpest instance: it is
-impossible to integrate without gating, because the op does both or neither.
+The consequence is the point: the loop's invariants — **fenced ledger · one writer/worktree per
+story · targeted checks before handoff · one full gate at the wave boundary · never publish red ·
+park after two rounds** — hold *even when the model is wrong or lazy*, because they are host
+behaviour rather than instructions. The `track` plugin can only *describe* the ordering; flux
+enforces it. `fleet.integrate` is the sharpest instance: it can assemble an ordered wave candidate,
+but cannot publish it or write completion bookkeeping without one successful configured full gate.
 
 ### 3. Coordination *prose* does not go into flux
 
@@ -74,15 +75,16 @@ An earlier audit claimed most of this was missing. That audit was wrong; this li
    typed to iterate. Compounding it, string-returning cognition ops return a JSON-**quoted** string
    (C-235), so even scraping the prose fails. **This is the lynchpin: a coordinator cannot reason
    over a board it can only read as prose.**
-2. **No integration verbs.** `git_branch`/`git_merge`/`git_revert` are absent, so the serial, gated,
-   revert-on-red half cannot be written at all.
+2. **No integration verbs.** `git_branch`/`git_merge`/`git_revert` are absent, so ordered assembly of
+   a wave candidate and safe removal of a rejected story cannot be written at all.
 3. **Worker isolation is session-local.** `git_worktree_enter` rebases the *caller's* root and
    forbids nesting (`crates/flux-tools/src/lib.rs:3147-3157`). It cannot give N parallel workers
    their own checkouts.
 4. **The result path is half-designed.** `Task.artifacts` exists, but no worker emits a structured
    handoff and no coordinator op consumes one.
-5. **The track contract lives nowhere.** Fenced ledger, disjointness, no-implement, the 2-round
-   budget, gate-per-merge — all prose in a plugin, none enforced.
+5. **The track contract lives nowhere.** Fenced ledger, one-writer isolation, disjointness,
+   no-implement, the 2-round budget, and the single wave-boundary gate are all prose in a plugin,
+   none enforced.
 6. **Board correctness.** `transition` never clears `runner`/`task_id`, so a `Failed→Ready` retry
    keeps a stale runner and the next sweep chases a dead run
    (`crates/flux-capabilities/src/datasource/memory_board.rs:181-186`). `board.comment` is
@@ -133,7 +135,7 @@ machines."
 | **F2** | [C-240](../stories/C-240-board-correctness-retry-clears-runner-reassign-record-evidence.md) | Retry clears `runner`/`task_id`; `board.reassign`; `board.record_evidence`; the `Blocked→Ready` attempts hole |
 | **F3** | [C-238](../stories/C-238-git-branch-merge-revert-ops.md) | `git_branch`, `git_merge`, `git_revert` |
 | **F4** | [C-241](../stories/C-241-fleet-isolate-per-item-worktree.md) | `fleet.isolate` — a per-item worktree on the coordinator's machine |
-| **F5** | [C-242](../stories/C-242-fleet-integrate-gated-merge-revert-on-red.md) | `fleet.integrate` — gated `--no-ff` merge, revert on red, by construction |
+| **F5** | [C-242](../stories/C-242-fleet-integrate-gated-merge-revert-on-red.md) | `fleet.integrate` — ordered wave assembly plus one unskippable final gate and publication fence |
 | **F6** | [C-243](../stories/C-243-fleet-start-process-runtime.md) | `fleet.start` + `ProcessRuntime` — the `AgentRuntime` port (absorbs A-120…A-122) |
 | **F7** | [C-244](../stories/C-244-worker-template-and-fleet-handoff.md) | The implement-worker template + `fleet.handoff` (structured `Task.artifacts`) |
 | **F8** | [C-245](../stories/C-245-fleet-rework-two-round-budget.md) | `fleet.rework` — same worker, 2-round budget as a host rule |
@@ -165,9 +167,11 @@ carries its own failing-first test, named in its Acceptance.
 The invariants that must be *mechanically* true when the epic closes, each pinned by a test rather
 than by prose:
 
-- Integrating without running the gate is impossible.
-- A red gate leaves the integration branch at its pre-merge tree, via `revert -m 1` — never `reset`,
-  never a rewrite.
+- Publishing an integrated wave without running the gate is impossible.
+- A red gate leaves the exact failed candidate available for diagnosis and publishes no branch,
+  ledger completion, or pull request.
+- Every accepted child result names one story-sized commit from its isolated worktree, and
+  dependency or write-set overlap forces ordered integration rather than competing writers.
 - A third rework round cannot dispatch; it parks.
 - A worker cannot write a fenced ledger path.
 - A `Failed→Ready` retry leaves no stale `runner`/`task_id` for the next sweep to chase.

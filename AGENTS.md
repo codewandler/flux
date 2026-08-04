@@ -26,6 +26,11 @@ only repository policy that must be known before acting. Product documentation s
   documentation mirror with `scripts/build-embedded-docs.sh`, commit
   `crates/flux-server/assets/public-docs.zip` when it changes, then run
   `scripts/build-embedded-docs.sh --check` against that committed checkout.
+- For an explicitly named multi-story wave, give each story exactly one writer and one isolated
+  worktree. Child stories run targeted checks and contribute story-sized commits; integrate those
+  commits in dependency order on one wave branch, serialize overlapping write sets, and run the
+  full repository gate once on the final combined tree. Do not run the full gate in every child
+  worktree or open competing pull requests from child branches.
 - Make the smallest coherent change, preserve unrelated work, run the relevant gate, and report any
   check that could not be run.
 
@@ -78,8 +83,10 @@ runtime UI into this file.
 
 ## Verification
 
-Run the narrowest useful checks while iterating, then the repository gate before declaring a code
-change complete. Repository scripts and workflows route target-touching Cargo commands through
+Run the narrowest useful checks while iterating. For a single-story change, run the repository gate
+before declaring the code change complete; for a named wave, run it once at the integration boundary
+after every accepted story commit is present. Repository scripts and workflows route target-touching
+Cargo commands through
 `scripts/owned-cargo`, whose shared OS lease prevents `task clean` from removing live compiler
 output. Direct operator Cargo commands remain valid, but do not overlap them with cleanup of the
 same `CARGO_TARGET_DIR`:
