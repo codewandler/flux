@@ -53,6 +53,11 @@ All notable changes to this project are documented in this file. The format is b
   deployment. Contributor and release guidance now require regeneration, inclusion of a changed
   archive in the same commit, and a post-commit freshness check.
 
+- **`confirm` approval gates now carry analyzer-derived intent sets**. A confirm body now reports
+  its effective operation names and host effects, unknown/failed body analysis remains explicit, and
+  bodyless confirms are represented as an explicit gate marker. Invalid confirm risk labels are now
+  rejected by analysis during the normal parse/analyze path.
+
 - **Datasources now carry the family's one declared read-only definition** (C-514). flux-roadmap
   Decision 0006 governs the vocabulary: a datasource is a named, declared, read-only record surface
   — *operations do; datasources know* — with exactly one access mode (indexed or live), one

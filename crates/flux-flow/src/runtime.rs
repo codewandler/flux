@@ -2753,6 +2753,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_flow_confirm_passes_captured_intents_to_approval_adapter() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<IntentSet>::new()));
+        let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CapturingApprover {
+            captured: Arc<std::sync::Mutex<Vec<IntentSet>>>,
+            approvals: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl Approver for CapturingApprover {
+            async fn request(
+                &self,
+                _tool: &str,
+                _s: &[String],
+                intents: &IntentSet,
+            ) -> ApprovalChoice {
+                self.approvals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.captured.lock().unwrap().push(intents.clone());
+                ApprovalChoice::Allow
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-{}-confirm-intents",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EffectOnlyWriteTool));
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["effect_write".into()], &[]),
+            Arc::new(CapturingApprover {
+                captured: Arc::clone(&captured),
+                approvals: Arc::clone(&approvals),
+            }),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+        let store = FlowStore::in_memory().unwrap();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "confirm write".into(),
+                risk: Some("high".into()),
+                body: vec![Node::Call {
+                    op: "effect_write".into(),
+                    args: vec![flow_lit(json!({}))],
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_confirm_intents", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "wrote");
+        assert_eq!(
+            approvals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "confirm must consult the runtime approver"
+        );
+        let observed = captured.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1, "exactly one confirm gate was raised");
+        let expected = IntentSet {
+            intents: vec![flux_spec::Intent {
+                behavior: flux_spec::IntentBehavior::Operation,
+                target: flux_spec::IntentTarget::Operation {
+                    name: "effect_write".into(),
+                    effects: vec![flux_spec::Effect::Write, flux_spec::Effect::Filesystem],
+                },
+                role: flux_spec::IntentRole::Operation,
+                certainty: flux_spec::IntentCertainty::Certain,
+            }],
+        };
+        assert_eq!(observed[0], expected);
+    }
+
+    #[tokio::test]
     async fn execute_flow_loop_runs_until_deadline() {
         // loop for 50ms every 0ms: body runs at least once; deadline stops it.
         let store = FlowStore::in_memory().unwrap();

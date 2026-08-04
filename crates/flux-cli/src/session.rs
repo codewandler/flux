@@ -1398,12 +1398,7 @@ pub(super) fn plan_prompt(plan: &flux_runtime::PlanApprovalRequest) -> String {
         ));
     }
     for intent in &plan.intents.intents {
-        if let flux_spec::IntentTarget::Process { command } = &intent.target {
-            lines.push(format!(
-                "process.exec → $ {}",
-                style::yellow(&truncate(command, 80))
-            ));
-        }
+        lines.push(style::yellow(&truncate(&intent.approval_subject(), 80)));
     }
     let mut seen = std::collections::HashSet::new();
     lines.retain(|l| seen.insert(l.clone()));

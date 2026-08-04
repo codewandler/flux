@@ -63,6 +63,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   adopts the complete refreshed set. Existing plugin grants and disabled-tool patterns still apply
   to newly advertised actions, and a rejected refresh changes nothing.
 
+- **Approval screens now show what each confirm guard is about.** A confirm that wraps real work now
+  shows the planned operations and their likely effects, instead of only a plain message. Unknown
+  operations are shown explicitly, and invalid confirm risk labels are rejected before execution.
+
 - **Maintainers can now cut a release by merging `main` into `release`.** The hosted flow writes the
   release notes, derives the version mechanically, prepares and verifies the exact build once, then
   publishes it. A failed build or publication stays visibly failed with its recovery candidate

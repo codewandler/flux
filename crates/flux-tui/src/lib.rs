@@ -7609,14 +7609,45 @@ mod tests {
             destructive: false,
             mutating: true,
             intents: flux_spec::IntentSet {
-                intents: vec![flux_spec::Intent {
-                    behavior: flux_spec::IntentBehavior::CommandExecution,
-                    target: flux_spec::IntentTarget::Process {
-                        command: "cargo test --workspace".into(),
+                intents: vec![
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::CommandExecution,
+                        target: flux_spec::IntentTarget::Process {
+                            command: "cargo test --workspace".into(),
+                        },
+                        role: flux_spec::IntentRole::ProcessCommand,
+                        certainty: flux_spec::IntentCertainty::Certain,
                     },
-                    role: flux_spec::IntentRole::ProcessCommand,
-                    certainty: flux_spec::IntentCertainty::Certain,
-                }],
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::Operation,
+                        target: flux_spec::IntentTarget::Operation {
+                            name: "task.sync".into(),
+                            effects: vec![
+                                flux_spec::Effect::Process,
+                                flux_spec::Effect::LocalSystem,
+                            ],
+                        },
+                        role: flux_spec::IntentRole::Operation,
+                        certainty: flux_spec::IntentCertainty::Certain,
+                    },
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::Unknown,
+                        target: flux_spec::IntentTarget::Operation {
+                            name: "task.ghost".into(),
+                            effects: Vec::new(),
+                        },
+                        role: flux_spec::IntentRole::Operation,
+                        certainty: flux_spec::IntentCertainty::Potential,
+                    },
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::Gate,
+                        target: flux_spec::IntentTarget::Gate {
+                            name: "confirm".into(),
+                        },
+                        role: flux_spec::IntentRole::Gate,
+                        certainty: flux_spec::IntentCertainty::Certain,
+                    },
+                ],
             },
             requirements: vec![
                 flux_runtime::AuthorityRequirement::operation("invoke", "read"),
@@ -7653,6 +7684,12 @@ mod tests {
         );
         assert!(content.contains("src/lib.rs"), "{content}");
         assert!(content.contains("cargo test --workspace"), "{content}");
+        assert!(content.contains("operation task.sync"), "{content}");
+        assert!(
+            content.contains("operation task.ghost (unknown)"),
+            "{content}"
+        );
+        assert!(content.contains("gate.confirm"), "{content}");
     }
 
     /// C-182: the approver must handle whole-plan approval ITSELF. Without an override the trait
@@ -7681,6 +7718,27 @@ mod tests {
             request.subjects
         );
         assert!(
+            request
+                .subjects
+                .iter()
+                .any(|s| s.contains("operation task.sync")),
+            "operation intent reaches the sheet: {:?}",
+            request.subjects
+        );
+        assert!(
+            request
+                .subjects
+                .iter()
+                .any(|s| s.contains("operation task.ghost (unknown)")),
+            "unknown operation intent reaches the sheet: {:?}",
+            request.subjects
+        );
+        assert!(
+            request.subjects.iter().any(|s| s.contains("gate.confirm")),
+            "gate intent reaches the sheet: {:?}",
+            request.subjects
+        );
+        assert!(
             !request.subjects.iter().any(|s| s.contains("op(s)")),
             "the default `N op(s)` collapse must be gone: {:?}",
             request.subjects
@@ -7704,6 +7762,11 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l == "process.exec → $ cargo test --workspace"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "operation task.sync (Process, LocalSystem)"));
+        assert!(lines.iter().any(|l| l == "operation task.ghost (unknown)"));
+        assert!(lines.iter().any(|l| l == "gate.confirm"));
     }
 
     /// A destructive plan says so on its own row, above the scrollable detail list so it can never
