@@ -85,6 +85,26 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
 > the itemized history.
 
+### The first-class board — one fixed tool surface, pluggable backends (epic) — 🔄 **PROPOSED (A-148; L-130 filed; A-134/A-115/A-118 re-pointed)**
+
+flux-roadmap Decision 0006 gave the family one datasource definition — a named, declared,
+**read-only** record surface (*operations do; datasources know*) — and the work board fails that
+test on purpose: it mutates. Today the board rides the `datasource` declaration through a
+`kind "board:…"` prefix hack, its subjects use an unprefixed grammar, and an embedder cannot bind
+one at all. This epic gives the board what the decision says it is: a first-class Flux concept with
+its own `board <name>` declaration (L-130, retiring the `board:*` kinds with a migration note), its
+own `board:<name>/item/<id>` subject namespace (shared with D-251's one-grammar normalization), and
+its own SDK seam (A-134, absorbed from the fleet-coordinator epic). The load-bearing constraint is
+what does *not* change: one small fixed 11-operation tool surface with a closed state machine,
+identical across every backend — memory and markdown today, vendor trackers later through the
+declared-surface pattern (connector-declared status↔state and per-verb operation mappings, Exchange
+tenant Board bindings, every write an admitted granted operation; A-115/A-118, re-pointed off the
+plugin path Milestone 5 deletes, Milestone 3+). The adoption story C-514 carried the vocabulary;
+this epic carries the split. Design: [first-class-board](designs/first-class-board.md).
+Datasource-side siblings filed with it: D-250 (one registry across indexed + live modes), D-252
+(Exchange-bound and catalogue `datasource` kinds), D-253 (protocol-line counterparties), D-254
+(data-pipelines exploration, [data-pipelines](designs/data-pipelines.md)).
+
 ### Flux syntax simplification — one way to write each thing (epic) — 🔄 **PROPOSED (L-102; L-103…L-112 filed, none started)**
 
 The canonical dialect the formatter emits is already the language we want — but it is one of

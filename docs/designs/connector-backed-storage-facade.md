@@ -1,5 +1,18 @@
 # Design: Connector-backed storage — one registry, two safe facades
 
+> **Superseded in part (2026-08-04, C-514).** This design predates flux-roadmap Decisions
+> 0001–0005 and 0006 and is superseded by them where they overlap: official vendor integrations
+> execute only in Exchange (0001), and vendor-facing surfaces follow 0006's **declared-surface
+> pattern** — Flux owns the contract and fixed tool surface, connectors declare the vendor mapping
+> as a projection over their own operations, Exchange binds it per tenant and executes every
+> mutation as an admitted, granted operation. Any revival of this design must be re-derived under
+> that pattern (see Decision 0006's "Boards are their own first-class surface" section, which
+> states it once for the family) rather than implemented as written — in particular its native
+> store adapters, its own registry/binding control plane, and its charter revision for
+> flux-connectors are the parts the decisions overtake. Its data-plane safety rules (no secret
+> output, host-derived tenant paths, bounded blobs) remain good constraints for whatever replaces
+> it.
+
 **Status:** proposed · **Pillar:** Core · **Epic:**
 [D-221](../stories/D-221-connector-backed-storage-facade-epic.md)
 
