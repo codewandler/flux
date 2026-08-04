@@ -17,12 +17,22 @@ Thanks for your interest in flux. Contributions — bug reports, fixes, features
 A change isn't done until all of these pass — CI enforces them:
 
 ```bash
+scripts/build-embedded-docs.sh
+# If the archive changed, include it in the same commit as the website/source change:
+git add crates/flux-server/assets/public-docs.zip
+git commit
+scripts/build-embedded-docs.sh --check
+
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo test -p flux-codegate          # architecture layering lint
 ```
+
+The order matters: the final freshness check is against the committed checkout. Do not open the PR
+with an uncommitted regenerated archive; a change outside `website/**` can still affect generated
+public documentation, so CI runs this check on every pull request without a path filter.
 
 Every behavioral change ships with a test that fails before it. A safety-invariant change (anything
 touching the authorization → approval → guarded-IO chain) must keep the no-bypass tests passing and

@@ -88,6 +88,23 @@ jobs:
             echo "::error::candidate version $CANDIDATE_VERSION does not match workspace version $workspace_version"
             exit 1
           fi
+      # The candidate ref already points at cut-release.sh's committed transaction. Rebuild the
+      # public website from its lockfile and prove that exact commit owns the matching server
+      # archive before spending release-build time or permitting a candidate receipt.
+      - name: Install pinned website toolchain for the exact candidate
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install pinned website dependencies
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npm ci
+        working-directory: website
+      - name: Embedded documentation matches the exact candidate SHA
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: scripts/build-embedded-docs.sh --check
       - name: Install pinned release-gate toolchain
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
