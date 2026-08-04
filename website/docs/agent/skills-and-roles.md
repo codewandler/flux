@@ -164,9 +164,48 @@ Inspect the requested area quickly. Do not modify files. Return evidence with pa
 - Use `tools: []` to grant no operations.
 - A listed tool is still subject to policy, approval, and the parent capability floor.
 
-The built-in roles (`scout`, `planner`, `worker`, `reviewer`, `evaluator`, and `summarizer`) are used
-when no file defines that name. Their instructions are embedded Flux assets rather than repository
-policy. Delegate with `task({role: "scout", task: "map the parser"})`.
+### Role catalogue
+
+The catalogue separates Flux's embedded fallbacks from roles defined by this repository. A project
+or user role with the same name takes precedence over an embedded fallback. Delegate, for example,
+with `task({role: "scout", task: "map the parser"})`.
+
+#### Embedded fallback roles
+
+These six role instructions ship as assets in Flux and are available when no project or user role
+defines the same name.
+
+| Role | Purpose | Kind | Source |
+| --- | --- | --- | --- |
+| `scout` | Read-only, compressed codebase reconnaissance. | Embedded fallback | [source](https://github.com/codewandler/flux/blob/main/crates/flux-agent/assets/roles/scout.md) |
+| `planner` | Turns a task into ordered subtasks and open questions without editing. | Embedded fallback | [source](https://github.com/codewandler/flux/blob/main/crates/flux-agent/assets/roles/planner.md) |
+| `worker` | Executes a delegated subtask with the operations available to it. | Embedded fallback | [source](https://github.com/codewandler/flux/blob/main/crates/flux-agent/assets/roles/worker.md) |
+| `reviewer` | Reviews described changes while remaining read-only. | Embedded fallback | [source](https://github.com/codewandler/flux/blob/main/crates/flux-agent/assets/roles/reviewer.md) |
+| `evaluator` | Decides whether a goal is satisfied or gives one next instruction. | Embedded fallback | [source](https://github.com/codewandler/flux/blob/main/crates/flux-agent/assets/roles/evaluator.md) |
+| `summarizer` | Condenses conversation state into durable facts, decisions, and open threads. | Embedded fallback | [source](https://github.com/codewandler/flux/blob/main/crates/flux-agent/assets/roles/summarizer.md) |
+
+#### Roles defined by this repository
+
+These tracked `.flux/agents` files are repository-defined overrides or examples. They describe how
+Flux's own project delegates work; they are not additional universal roles installed into every
+Flux project.
+
+| Role | Purpose | Kind | Source |
+| --- | --- | --- | --- |
+| `flux-lang-writer` | Authors and validates the smallest requested Flux-Lang change without using effectful execution as a syntax check. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/flux-lang-writer.md) |
+| `product-scout` | Examines user value, UX, and scope for the multi-perspective example. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/product-scout.md) |
+| `release-scribe` | Drafts engineering and customer release notes from supplied commit evidence. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/release-scribe.md) |
+| `review-correctness` | Reviews a frozen context pack for correctness defects without tools. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/review-correctness.md) |
+| `review-maintainability` | Reviews a frozen context pack for maintainability issues without tools. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/review-maintainability.md) |
+| `review-project` | Reviews one dynamically selected project-specific dimension with read-only tools. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/review-project.md) |
+| `review-security` | Reviews a frozen context pack for security defects without tools. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/review-security.md) |
+| `review-synthesizer` | Combines project-adaptive reviewer reports without strengthening their evidence. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/review-synthesizer.md) |
+| `risk-scout` | Examines failure modes, security, and operational risk for the multi-perspective example. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/risk-scout.md) |
+| `tech-scout` | Examines architecture, implementation, and feasibility for the multi-perspective example. | Repository-defined override/example | [source](https://github.com/codewandler/flux/blob/main/.flux/agents/tech-scout.md) |
+
+This GitHub-backed inventory is derived only from tracked repository files. Any other ignored
+`.flux/agents/*.md` files in a checkout are local scaffolding: Flux may discover them in that local
+project, but they are not shipped by the repository and therefore do not appear in this catalogue.
 
 `.agents/skills` and `.claude/skills` are compatibility discovery locations for reusable project
 skills. Their existence does not replace Flux's harness prompt and discovery does not activate a
