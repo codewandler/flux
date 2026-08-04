@@ -647,6 +647,11 @@ pub(super) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Install and supervise the separately released local Exchange service.
+    Exchange {
+        #[command(subcommand)]
+        action: ExchangeAction,
+    },
     /// Inspect the layered prompt context Flux would assemble in this workspace.
     Context {
         #[command(subcommand)]
@@ -656,6 +661,57 @@ pub(super) enum Commands {
     System {
         #[command(subcommand)]
         action: SystemAction,
+    },
+}
+
+/// `flux exchange …` — Exchange client and lifecycle operations.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum ExchangeAction {
+    /// Manage the verified local Exchange process owned by Flux.
+    Local {
+        #[command(subcommand)]
+        action: ExchangeLocalAction,
+    },
+}
+
+/// `flux exchange local …` — the closed C-510 lifecycle grammar.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum ExchangeLocalAction {
+    /// Start the newest compatible release selected by the authenticated stable channel.
+    Start,
+    /// Report the locally recorded and authenticated lifecycle state.
+    Status {
+        /// Emit the stable `flux.exchange-local-status.v1` object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop only the Exchange child owned by the authenticated Flux supervisor.
+    Stop,
+    /// Reinstall the newest compatible stable-channel release while stopped.
+    Reinstall,
+    /// Import one complete provider-signed offline release set through the normal verifier.
+    Import {
+        /// Root-signed provider trust metadata.
+        #[arg(long, value_name = "PATH")]
+        trust: std::path::PathBuf,
+        /// Root signature over `--trust` (repeatable for the provider threshold).
+        #[arg(long = "root-signature", value_name = "PATH", required = true)]
+        root_signatures: Vec<std::path::PathBuf>,
+        /// Delegated stable-channel metadata.
+        #[arg(long, value_name = "PATH")]
+        channel: std::path::PathBuf,
+        /// Delegated channel signature (repeatable for the provider threshold).
+        #[arg(long = "channel-signature", value_name = "PATH", required = true)]
+        channel_signatures: Vec<std::path::PathBuf>,
+        /// Selected immutable release manifest.
+        #[arg(long, value_name = "PATH")]
+        manifest: std::path::PathBuf,
+        /// Delegated release signature (repeatable for the provider threshold).
+        #[arg(long = "release-signature", value_name = "PATH", required = true)]
+        release_signatures: Vec<std::path::PathBuf>,
+        /// Platform archive named and authenticated by the manifest.
+        #[arg(long, value_name = "PATH")]
+        archive: std::path::PathBuf,
     },
 }
 
@@ -1347,6 +1403,183 @@ impl ReviewSeverity {
             "medium" => Self::Medium,
             "high" => Self::High,
             _ => Self::Critical,
+        }
+    }
+}
+
+#[cfg(test)]
+mod exchange_local_cli_tests {
+    use super::*;
+
+    fn parses(argv: &[&str]) -> Cli {
+        Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("{argv:?}: {error}"))
+    }
+
+    fn rejects_unknown(argv: &[&str]) {
+        let error = Cli::try_parse_from(argv).expect_err("forbidden argument parsed");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn exchange_local_cli_accepts_only_the_closed_lifecycle_grammar() {
+        for action in ["start", "stop", "reinstall"] {
+            let cli = parses(&["flux", "exchange", "local", action]);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Exchange {
+                    action: ExchangeAction::Local { .. }
+                })
+            ));
+        }
+
+        let status = parses(&["flux", "exchange", "local", "status", "--json"]);
+        assert!(matches!(
+            status.command,
+            Some(Commands::Exchange {
+                action: ExchangeAction::Local {
+                    action: ExchangeLocalAction::Status { json: true }
+                }
+            })
+        ));
+        let human_status = parses(&["flux", "exchange", "local", "status"]);
+        assert!(matches!(
+            human_status.command,
+            Some(Commands::Exchange {
+                action: ExchangeAction::Local {
+                    action: ExchangeLocalAction::Status { json: false }
+                }
+            })
+        ));
+
+        let import = parses(&[
+            "flux",
+            "exchange",
+            "local",
+            "import",
+            "--trust",
+            "trust.json",
+            "--root-signature",
+            "trust.root-1.minisig",
+            "--root-signature",
+            "trust.root-2.minisig",
+            "--channel",
+            "channel.json",
+            "--channel-signature",
+            "channel.channel-1.minisig",
+            "--manifest",
+            "manifest.json",
+            "--release-signature",
+            "manifest.release-1.minisig",
+            "--archive",
+            "exchange.tar.zst",
+        ]);
+        let Some(Commands::Exchange {
+            action:
+                ExchangeAction::Local {
+                    action:
+                        ExchangeLocalAction::Import {
+                            trust,
+                            root_signatures,
+                            channel,
+                            channel_signatures,
+                            manifest,
+                            release_signatures,
+                            archive,
+                        },
+                },
+        }) = import.command
+        else {
+            panic!("expected offline import");
+        };
+        assert_eq!(trust, std::path::Path::new("trust.json"));
+        assert_eq!(root_signatures.len(), 2);
+        assert_eq!(channel, std::path::Path::new("channel.json"));
+        assert_eq!(channel_signatures.len(), 1);
+        assert_eq!(manifest, std::path::Path::new("manifest.json"));
+        assert_eq!(release_signatures.len(), 1);
+        assert_eq!(archive, std::path::Path::new("exchange.tar.zst"));
+    }
+
+    #[test]
+    fn exchange_local_cli_rejects_every_exact_release_selector() {
+        for selector in [
+            "--release",
+            "--tag",
+            "--version",
+            "--exchange-version",
+            "--exact-version",
+        ] {
+            let argv = ["flux", "exchange", "local", "start", selector, "v1.2.3"];
+            rejects_unknown(&argv);
+        }
+    }
+
+    #[test]
+    fn exchange_local_import_rejects_provenance_and_incomplete_sets() {
+        let complete = [
+            "flux",
+            "exchange",
+            "local",
+            "import",
+            "--trust",
+            "trust.json",
+            "--root-signature",
+            "root.minisig",
+            "--channel",
+            "channel.json",
+            "--channel-signature",
+            "channel.minisig",
+            "--manifest",
+            "manifest.json",
+            "--release-signature",
+            "release.minisig",
+            "--archive",
+            "exchange.tar.zst",
+        ];
+
+        for provenance_flag in ["--provenance", "--offline-provenance"] {
+            let mut argv = complete.to_vec();
+            argv.extend([provenance_flag, "provenance.json"]);
+            rejects_unknown(&argv);
+        }
+
+        for required_flag in [
+            "--trust",
+            "--root-signature",
+            "--channel",
+            "--channel-signature",
+            "--manifest",
+            "--release-signature",
+            "--archive",
+        ] {
+            let position = complete
+                .iter()
+                .position(|arg| *arg == required_flag)
+                .expect("required flag is present");
+            let mut argv = complete.to_vec();
+            argv.drain(position..=position + 1);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "accepted import without {required_flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_local_cli_rejects_artifact_urls_executables_and_limit_widening() {
+        for forbidden in [
+            "--url",
+            "--artifact",
+            "--executable",
+            "--observed-digest",
+            "--observed-size",
+            "--max-bytes",
+            "--max-archive-bytes",
+            "--timeout",
+            "--max-members",
+        ] {
+            let argv = ["flux", "exchange", "local", "start", forbidden, "1"];
+            rejects_unknown(&argv);
         }
     }
 }
