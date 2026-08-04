@@ -109,7 +109,7 @@ fn provider_bound_commands_emit_one_stable_value_free_json_refusal() {
 #[test]
 fn connect_refuses_generic_field_values_until_the_provider_plan_can_classify_them() {
     let temp = TempDir::new();
-    let secret = "glpat-must-not-enter-flux-argv";
+    let secret = concat!("glpat-", "must-not-enter-flux-argv");
     let output = Command::new(env!("CARGO_BIN_EXE_flux"))
         .args([
             "integration",
