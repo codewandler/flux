@@ -68,8 +68,8 @@ ever receiving vendor credentials.
       configuration and that stopping Exchange removes only official external tools.
 - [ ] The local Flux client and Exchange runtime are tested as an HTTP process boundary. Their Rust
       engine dependency lines may differ and are never unified with path/git dependencies or a
-      combined Cargo workspace; compatibility comes only from C-510's pinned release and supported
-      HTTP API/connection-plan versions.
+      combined Cargo workspace; compatibility comes only from the compatible Exchange release
+      selected through C-510's signed channel and the provider protocol versions Flux supports.
 
 ## Progress
 
