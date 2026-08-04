@@ -712,42 +712,46 @@ pub(super) enum ExchangeLocalAction {
     },
 }
 
-/// One syntactically valid non-secret `KEY=VALUE` CLI assignment.
+/// One syntactically valid metadata-selector `KEY=VALUE` assignment.
 ///
-/// `key` is intentionally opaque here. For connection fields, only the provider-owned connection
-/// plan may decide whether it is a field identity or a published alias and whether the field is
-/// non-secret. For grants, only Exchange may interpret it as a metadata selector. Keeping this
-/// parser syntactic prevents Flux from acquiring a vendor field/alias or grant schema.
+/// Only Exchange may interpret this as a grant selector. Connection fields deliberately do not use
+/// this parser until the provider-owned plan can prove that an identity or alias is non-secret.
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct FieldAssignment {
+pub(super) struct SelectorAssignment {
     pub(super) key: String,
     pub(super) value: String,
+    valid: bool,
 }
 
-impl std::fmt::Debug for FieldAssignment {
+impl std::fmt::Debug for SelectorAssignment {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("FieldAssignment")
+            .debug_struct("SelectorAssignment")
             .field("key", &self.key)
             .field("value", &"[redacted]")
             .finish()
     }
 }
 
-impl std::str::FromStr for FieldAssignment {
+impl std::str::FromStr for SelectorAssignment {
     type Err = String;
 
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
-        let Some((key, value)) = input.split_once('=') else {
-            return Err("expected KEY=VALUE".into());
+        let (key, value, valid) = match input.split_once('=') {
+            Some((key, value)) if !key.is_empty() => (key, value, true),
+            _ => ("", input, false),
         };
-        if key.is_empty() {
-            return Err("expected a non-empty KEY in KEY=VALUE".into());
-        }
         Ok(Self {
             key: key.into(),
             value: value.into(),
+            valid,
         })
+    }
+}
+
+impl SelectorAssignment {
+    pub(super) fn is_valid(&self) -> bool {
+        self.valid
     }
 }
 
@@ -761,12 +765,6 @@ pub(super) enum IntegrationAction {
         /// Tenant-scoped connection label (for example, `company` or `sandbox`).
         #[arg(long)]
         name: String,
-        /// Non-secret setting as `IDENTITY_OR_PLAN_ALIAS=VALUE` (repeatable).
-        ///
-        /// Flux resolves the key only against the fetched connection plan. Secret fields are never
-        /// accepted here and are handed directly to an Exchange-owned secure surface instead.
-        #[arg(long = "field", value_name = "KEY=VALUE")]
-        fields: Vec<FieldAssignment>,
         /// Emit one stable JSON result and never prompt.
         #[arg(long)]
         json: bool,
@@ -783,7 +781,7 @@ pub(super) enum IntegrationAction {
         name: String,
         /// Opaque metadata selector `KEY=VALUE` interpreted by Exchange (repeatable).
         #[arg(long = "selector", value_name = "KEY=VALUE", required = true)]
-        selectors: Vec<FieldAssignment>,
+        selectors: Vec<SelectorAssignment>,
         /// Apply the previewed grant. Without this flag the command is preview-only.
         #[arg(long)]
         apply: bool,
@@ -1548,7 +1546,7 @@ mod c509_cli_grammar_tests {
     }
 
     #[test]
-    fn integration_connect_accepts_only_generic_non_secret_field_assignments() {
+    fn integration_connect_withholds_fields_until_a_plan_can_classify_them() {
         let cli = Cli::try_parse_from([
             "flux",
             "integration",
@@ -1556,10 +1554,6 @@ mod c509_cli_grammar_tests {
             "custom-connector",
             "--name",
             "company",
-            "--field",
-            "origin=https://code.example.test",
-            "--field",
-            "account=user@example.test",
             "--json",
             "--no-prompt",
         ])
@@ -1570,7 +1564,6 @@ mod c509_cli_grammar_tests {
                 IntegrationAction::Connect {
                     connector,
                     name,
-                    fields,
                     json,
                     no_prompt,
                 },
@@ -1580,25 +1573,8 @@ mod c509_cli_grammar_tests {
         };
         assert_eq!(connector, "custom-connector");
         assert_eq!(name, "company");
-        assert_eq!(
-            fields,
-            [
-                FieldAssignment {
-                    key: "origin".into(),
-                    value: "https://code.example.test".into(),
-                },
-                FieldAssignment {
-                    key: "account".into(),
-                    value: "user@example.test".into(),
-                },
-            ]
-        );
         assert!(json);
         assert!(no_prompt);
-        let debug = format!("{fields:?}");
-        assert!(debug.contains("origin"));
-        assert!(!debug.contains("https://code.example.test"));
-        assert!(!debug.contains("user@example.test"));
 
         for credential_flag in ["--token", "--password", "--secret", "--credential"] {
             assert!(
@@ -1635,7 +1611,7 @@ mod c509_cli_grammar_tests {
             "--name",
             "company",
             "--field",
-            "missing-separator",
+            "origin=https://code.example.test",
         ])
         .is_err());
     }
@@ -1675,6 +1651,9 @@ mod c509_cli_grammar_tests {
         assert_eq!(connector, "custom-connector");
         assert_eq!(name, "company");
         assert_eq!(selectors.len(), 2);
+        let debug = format!("{selectors:?}");
+        assert!(!debug.contains("custom-value"));
+        assert!(!debug.contains("another-value"));
         assert!(apply);
         assert!(json);
         assert!(no_prompt);

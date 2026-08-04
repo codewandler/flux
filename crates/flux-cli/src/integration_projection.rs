@@ -57,6 +57,7 @@ pub(super) enum Refusal {
     Unavailable,
     AuthenticationRequired,
     Incomplete,
+    InvalidInput,
     Unsupported,
     ConnectionConflict { connector: String, label: String },
 }
@@ -68,6 +69,7 @@ impl Refusal {
             Self::Unavailable => "unavailable",
             Self::AuthenticationRequired => "authentication_required",
             Self::Incomplete => "incomplete",
+            Self::InvalidInput => "invalid_input",
             Self::Unsupported => "unsupported",
             Self::ConnectionConflict { .. } => "conflict",
         }
@@ -212,6 +214,7 @@ mod tests {
             (Refusal::Unavailable, "unavailable"),
             (Refusal::AuthenticationRequired, "authentication_required"),
             (Refusal::Incomplete, "incomplete"),
+            (Refusal::InvalidInput, "invalid_input"),
             (Refusal::Unsupported, "unsupported"),
         ];
 

@@ -51,8 +51,6 @@ fn provider_bound_commands_emit_one_stable_value_free_json_refusal() {
                 "custom-connector",
                 "--name",
                 "company",
-                "--field",
-                "opaque-field=must-not-appear",
                 "--json",
                 "--no-prompt",
             ],
@@ -106,4 +104,95 @@ fn provider_bound_commands_emit_one_stable_value_free_json_refusal() {
         );
         assert!(!stdout.contains("must-not-appear"), "{args:?}: {stdout}");
     }
+}
+
+#[test]
+fn connect_refuses_generic_field_values_until_the_provider_plan_can_classify_them() {
+    let temp = TempDir::new();
+    let secret = "glpat-must-not-enter-flux-argv";
+    let output = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args([
+            "integration",
+            "connect",
+            "gitlab",
+            "--name",
+            "company",
+            "--field",
+            &format!("password={secret}"),
+            "--json",
+            "--no-prompt",
+        ])
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run integration connect with an unavailable plan-bound field");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unexpected argument '--field'"), "{stderr}");
+    assert!(!stderr.contains(secret), "{stderr}");
+    assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn malformed_selector_is_a_stable_value_free_json_refusal() {
+    let temp = TempDir::new();
+    let secret = "selector-value-must-not-reach-diagnostics";
+    let output = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args([
+            "integration",
+            "grant",
+            "gitlab",
+            "--name",
+            "company",
+            "--selector",
+            secret,
+            "--json",
+            "--no-prompt",
+        ])
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run integration grant with a malformed selector");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap(),
+        serde_json::json!({
+            "ok": false,
+            "category": "invalid_input",
+            "command": "integration.grant",
+        })
+    );
+    assert!(!stdout.contains(secret));
+}
+
+#[test]
+fn provider_bound_human_command_writes_only_the_typed_refusal_to_stderr() {
+    let temp = TempDir::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["integration", "list"])
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("NO_COLOR", "1")
+        .env("FLUX_SANDBOX", "off")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run provider-bound human command");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "refused [unsupported]: integration list\n"
+    );
 }

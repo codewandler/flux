@@ -73,7 +73,7 @@ struct EffectiveOperation {
     connection: Option<String>,
 }
 
-/// Sanitized effective-catalogue state suitable for operator-facing list and doctor commands.
+/// Closed effective-catalogue state suitable for operator-facing list and doctor commands.
 ///
 /// Descriptions and input schemas are deliberately absent: they are not needed to observe which
 /// bindings are effective and may contain arbitrary provider-controlled response text.
@@ -326,7 +326,7 @@ impl ExchangeClient {
         let catalogue: EffectiveCatalogue = serde_json::from_slice(&body.bytes).map_err(|_| {
             ExchangeCatalogueError::new(ExchangeCatalogueErrorKind::Malformed, Some(status))
         })?;
-        if !catalogue.generation.starts_with("sha256:") || catalogue.generation.len() != 71 {
+        if !valid_catalogue_generation(&catalogue.generation) {
             return Err(ExchangeCatalogueError::new(
                 ExchangeCatalogueErrorKind::Malformed,
                 Some(status),
@@ -364,6 +364,20 @@ impl ExchangeClient {
             let operation: EffectiveOperation = serde_json::from_value(raw).map_err(|error| {
                 Error::Other(format!("invalid Exchange effective operation: {error}"))
             })?;
+            if !valid_operation_identity(&operation.id) {
+                return Err(Error::Other(
+                    "Exchange effective operation has an invalid operation identity".into(),
+                ));
+            }
+            if operation
+                .connection
+                .as_deref()
+                .is_some_and(|label| !valid_connection_label(label))
+            {
+                return Err(Error::Other(
+                    "Exchange effective operation has an invalid connection label".into(),
+                ));
+            }
             if !operation.admitted {
                 return Err(Error::Other(format!(
                     "Exchange advertised `{}` without positively admitting it",
@@ -621,6 +635,30 @@ fn tool_label(label: &str) -> String {
             }
         })
         .collect()
+}
+
+fn valid_catalogue_generation(generation: &str) -> bool {
+    generation.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
+}
+
+fn valid_operation_identity(identity: &str) -> bool {
+    let mut bytes = identity.bytes();
+    identity.len() <= 256
+        && matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn valid_connection_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 64
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn is_loopback_origin(url: &Url) -> bool {
@@ -977,26 +1015,30 @@ mod tests {
     async fn catalogue_observation_classifies_failures_without_response_detail() {
         const SERVICE_TOKEN: &str = "flux-service-account-token-123";
         const RESPONSE_SECRET: &str = "response-secret-must-not-escape";
-        for (status, body, expected) in [
+        for (status, body, expected, expected_status) in [
             (
                 "401 Unauthorized",
                 json!({"error": RESPONSE_SECRET}).to_string(),
                 ExchangeCatalogueErrorKind::Authentication,
+                401,
             ),
             (
                 "403 Forbidden",
                 json!({"refusal": RESPONSE_SECRET}).to_string(),
                 ExchangeCatalogueErrorKind::Refusal,
+                403,
             ),
             (
                 "503 Service Unavailable",
                 json!({"error": RESPONSE_SECRET}).to_string(),
                 ExchangeCatalogueErrorKind::Unavailable,
+                503,
             ),
             (
                 "200 OK",
                 format!(r#"{{"credential":"{RESPONSE_SECRET}"}}"#),
                 ExchangeCatalogueErrorKind::Malformed,
+                200,
             ),
         ] {
             let (base, server) = one_catalogue_response(status, body).await;
@@ -1005,6 +1047,7 @@ mod tests {
 
             let error = client.observe_catalogue().await.unwrap_err();
             assert_eq!(error.kind, expected);
+            assert_eq!(error.status, Some(expected_status));
             let visible = format!(
                 "{error:?} {error} {}",
                 serde_json::to_string(&error).unwrap()
@@ -1039,6 +1082,53 @@ mod tests {
         let error = client.observe_catalogue().await.unwrap_err();
         assert_eq!(error.kind, ExchangeCatalogueErrorKind::Malformed);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalogue_observation_rejects_noncanonical_or_unbounded_identities() {
+        let cases = [
+            (
+                format!("sha256:{}", "z".repeat(64)),
+                "vendor.search",
+                "company",
+            ),
+            (
+                format!("sha256:{}", "c".repeat(64)),
+                "vendor.search\ncredential",
+                "company",
+            ),
+            (
+                format!("sha256:{}", "d".repeat(64)),
+                "vendor.search",
+                "company/credential",
+            ),
+        ];
+
+        for (generation, operation, connection) in cases {
+            let body = json!({
+                "generation": generation,
+                "operations": [{
+                    "id": operation,
+                    "description": "read",
+                    "input_schema": {"type": "object"},
+                    "effects": ["read"],
+                    "risk": "low",
+                    "idempotency": "idempotent",
+                    "admitted": true,
+                    "connection": connection
+                }]
+            })
+            .to_string();
+            let (base, server) = one_catalogue_response("200 OK", body).await;
+            let client = Arc::new(
+                ExchangeClient::new(&base, "flux-service-account-token-123", Redactor::new())
+                    .unwrap(),
+            );
+
+            let error = client.observe_catalogue().await.unwrap_err();
+            assert_eq!(error.kind, ExchangeCatalogueErrorKind::Malformed);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

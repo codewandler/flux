@@ -845,7 +845,16 @@ fn run_integration_boundary(action: IntegrationAction) -> Result<()> {
 
     let (command, json) = match action {
         IntegrationAction::Connect { json, .. } => (Command::IntegrationConnect, json),
-        IntegrationAction::Grant { json, .. } => (Command::IntegrationGrant, json),
+        IntegrationAction::Grant {
+            selectors, json, ..
+        } => {
+            let refusal = if selectors.iter().all(SelectorAssignment::is_valid) {
+                integration_projection::Refusal::Unsupported
+            } else {
+                integration_projection::Refusal::InvalidInput
+            };
+            return emit_refusal(Command::IntegrationGrant, json, refusal);
+        }
         IntegrationAction::List { json } => (Command::IntegrationList, json),
         IntegrationAction::Doctor { json } => (Command::IntegrationDoctor, json),
     };
@@ -855,14 +864,22 @@ fn run_integration_boundary(action: IntegrationAction) -> Result<()> {
 /// Emit the dependency boundary as a command-shaped refusal. No provider body, field assignment or
 /// selector reaches this projection, and JSON mode never falls through the CLI's human error path.
 fn emit_provider_boundary(command: integration_projection::Command, json: bool) -> Result<()> {
-    use integration_projection::{CommandOutcome, OutputFormat, Refusal};
+    emit_refusal(command, json, integration_projection::Refusal::Unsupported)
+}
+
+fn emit_refusal(
+    command: integration_projection::Command,
+    json: bool,
+    refusal: integration_projection::Refusal,
+) -> Result<()> {
+    use integration_projection::{CommandOutcome, OutputFormat};
 
     let format = if json {
         OutputFormat::Json
     } else {
         OutputFormat::Human
     };
-    let projection = CommandOutcome::refused(command, Refusal::Unsupported)
+    let projection = CommandOutcome::refused(command, refusal)
         .render(format)
         .context("render integration command refusal")?;
     std::io::stdout()
