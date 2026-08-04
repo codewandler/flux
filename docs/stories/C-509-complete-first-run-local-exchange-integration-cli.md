@@ -77,6 +77,22 @@ ever receiving vendor credentials.
   Flux `be76b1105926a1f01d81d95c63c79bbbca204400`. Provider-owned connection-plan, release,
   lifecycle, secure-handoff and end-to-end seams remain gated on Exchange X-125 through X-129 and
   Flux C-510.
+- 2026-08-04: Landed the dependency-independent partial wave: the closed `exchange local` and
+  `integration connect|grant|list|doctor` grammar, generic non-secret field/selector assignments,
+  value-redacted argument diagnostics, and one stable human/JSON outcome projection. Until the
+  provider contracts exist, every command exits deterministically with a value-free `unsupported`
+  refusal instead of prompting, accepting a credential/token flag or pretending setup completed.
+- 2026-08-04: Added a read-only `ExchangeClient::observe_catalogue` seam over the already-merged
+  authenticated effective-catalogue API. It returns only sanitized generation, operation identity,
+  connection label and admitted state, with closed body-free authentication/unavailable/refusal/
+  malformed errors. It deliberately cannot infer incomplete settings or consume the transitional
+  environment token; CLI orchestration waits for the reviewed secure Service Account store/handoff.
+- 2026-08-04: Failing-first evidence covers the command parser and real binary JSON boundary.
+  Targeted `flux-cli`, `codewandler-flux-web`, exhaustive command-classifier, formatting and strict
+  clippy checks are green. No full repository gate was run because this partial wave cannot complete
+  acceptance before X-125's connection plan, X-127's owner-only state, X-128's readiness contract,
+  X-129's production wire identities/fixtures, X-126's signed release artifact/channel and C-510's
+  compatible install/supervision plus secure handoff are available.
 
 ## Notes
 
