@@ -20,11 +20,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   Flux's normal authorization, approval, guarded IO, sandboxing, and redaction. A source-linked
   catalogue now makes every built-in and repository role discoverable.
 
-- **The first-run Exchange command surface is now explicit and safe while provider support lands.**
+- **The first-run Exchange command surface is explicit and safe while its dependencies land.**
   `flux exchange local start|status|stop` and `flux integration connect|grant|list|doctor` now have
-  stable human and JSON outcomes. Until compatible Exchange lifecycle and connection contracts
-  ship, they make no changes and return a deterministic `unsupported` refusal; setting values stay
-  out of diagnostics, and credential or token arguments are not accepted.
+  closed command shapes. Their current deterministic `unsupported` response is a temporary gate,
+  not the final local-lifecycle or integration result contract. Until the compatible Exchange
+  release and Flux lifecycle manager ship, the commands make no changes, setting values stay out of
+  diagnostics, and credential or token arguments are not accepted.
 
 - **Flux can now use operations granted to an Exchange Service Account.** Set the Exchange URL and
   Service Account token in the host environment. Flux refreshes the available operations between
