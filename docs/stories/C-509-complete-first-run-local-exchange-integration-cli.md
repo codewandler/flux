@@ -6,7 +6,7 @@ status: ready
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/managed-exchange-lifecycle.md
-note: "Queued behind X-134/X-126/C-510: C-509 owns FXLM/FXSA onboarding and runtime credential resolution, never lifecycle or vendor values"
+note: "Queued behind corrected X-134/X-126/C-510: C-509 owns native plan/grant UX and one non-secret helper request, never secret-bearing FXLM"
 ---
 
 # Complete the first-run local Exchange and integration CLI tutorial
@@ -18,7 +18,8 @@ Exchange, creates labelled company GitLab and Jira connections from their comple
 settings, grants their authority, verifies the effective tools and uses them from Flux without Flux
 ever receiving vendor credentials. The only Exchange runtime credential that crosses into Flux is
 one Service Account token frame delivered directly to C-509's dedicated receiving writer and stored
-behind an opaque runtime reference.
+behind an opaque runtime reference. A verified Exchange helper, not Flux, owns every secret-bearing
+local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its terminal result.
 
 ## Acceptance
 
@@ -28,24 +29,33 @@ behind an opaque runtime reference.
       selection, install, import, cache and quarantine; supervision, control, readiness and
       liveness; lifecycle idempotence; `start|status|stop` semantics; and every lifecycle diagnostic
       and exit code. The capability exposes no path, executable handle, arbitrary argv, alternate
-      binary, secret, management operation or lifecycle/status field. C-509 neither searches `PATH`
-      nor rediscovers/reopens the cache and adds no duplicate lifecycle machinery, outcome or
-      reclassification.
-- [ ] C-509 owns helper orchestration and the owner-authenticated
-      `exchange.local-management.v1` FXLM client for connection, grant and Service Account mint
-      management, plus the separate strict plan-v2 projection below. Human/operator management
+      binary, secret, management operation, endpoint, tenant, address, cwd, environment, extra argv,
+      raw FD/HANDLE or lifecycle/status field. C-509 neither searches `PATH` nor rediscovers/reopens
+      the cache and adds no duplicate lifecycle machinery, outcome or reclassification.
+- [ ] C-509 owns plan projection, user selection, grant proposal/confirmation and the
+      owner-authenticated `exchange.local-management.v1` value-free FXLM client for plan and grant
+      management. For a credential-bearing connection it owns only one canonical non-secret
+      initiating frame and exactly one value-free terminal helper result. Human/operator management
       remains structurally separate from the Service Account runtime client, whose only authority is
       X-129's effective-catalogue discovery and invoke HTTP v1 surface. FXLM never carries lifecycle
       operations and never shares C-510 control, readiness/liveness or FXSA streams. Its native peer
       authentication and closed state machines, framing, bounds, receipts and value-free errors come
       from X-134 through X-126's future post-X-134 release-v2 inventory.
 - [ ] C-509 launches vendor-input and Service Account mint helpers only through C-510's guard-bound
-      capability and only with X-134's closed provider helper modes. The verified Exchange
-      helper/server opens the direct TTY/browser or receives the provider-authorized writer
-      capability and owns every vendor value. Flux never reads, proxies, parses, orders, inherits,
-      logs, renders or stores a vendor value; only connector, label, exact plan revision and
-      provider-declared non-secret metadata cross from Flux. There is no argv, environment, JSON,
-      generic `--field`, stdin or Flux prompt route for a vendor secret.
+      capability and only with X-134's closed provider helper modes. For vendor-secret onboarding,
+      Flux writes exactly one at-most-65,548-byte canonical initiating FXLM frame plus EOF to a
+      one-way request pipe and reads exactly one at-most-65,548-byte value-free receipt or error frame
+      plus EOF from a distinct bounded terminal-result pipe. The request is only connect `BEGIN`
+      `0x0001` or credential acquire/rotate `BEGIN` `0x0030`; the result is only connect `RECEIPT`
+      `0x0006`, credential `RECEIPT` `0x0032` or `ERROR` `0x7fff`. The verified Exchange helper keeps
+      its owner-authenticated `PLAN_QUERY` validation peer separate from the secret-bearing `BEGIN`
+      ceremony peer, which owns and parses `NEED_SECRETS`, prompts directly through TTY/browser,
+      sends `SECRET` and `COMMIT`, and retains the transaction id, secret ordinals and provider bytes
+      until terminal state. The connection count, state and timing are helper-private X-134 concerns;
+      neither peer nor any intermediate value or secret-bearing frame reaches Flux.
+      Non-secret settings are part of the initiating connection proposal and are never prewritten as
+      a separate transaction. There is no argv, environment, JSON, generic `--field`, stdin or Flux
+      prompt route for a vendor secret.
 - [ ] C-509 owns a hidden receiving credential-writer mode of the currently running shipped Flux
       executable, the dedicated owner-only Service Account store, opaque runtime reference and
       resolver. Exactly one `exchange.service-account-handoff.v1` FXSA frame crosses from the
@@ -58,8 +68,14 @@ behind an opaque runtime reference.
       environment-token bootstrap.
 - [ ] `flux integration connect <connector> --name <name>` consumes X-134's provider-owned
       machine-readable labelled-connection plan backed by Connectors C-87/C-508 declarations. Flux
-      accepts exactly `exchange.connection-plan.v2` before showing a prompt or writing state and
-      refuses every absent, unknown, obsolete v1 or incompatible plan identity. It strictly
+      sends FXLM `PLAN_QUERY` opcode `0x0007` to the supervised native owner endpoint and accepts only
+      the matching `PLAN_RESPONSE` opcode `0x0008` containing the exact canonical
+      `exchange.connection-plan.v2` response before showing a prompt or writing state. The request
+      payload is exactly `{"connector":Connector,"selection":Label|null}`, including required JSON
+      `null` when no label is selected. Native OS-owner
+      authentication is not HTTP identity; Flux must not use its Service Account HTTP client or a
+      browser capability for this read. It refuses every absent, unknown, obsolete v1 or incompatible
+      plan identity and strictly
       projects every plan-published non-secret target and no other target. Vendor fields remain in
       the verified Exchange helper/server and never enter Flux's parser. Flux keeps neither vendor
       values nor a connector-specific form schema.
@@ -77,7 +93,12 @@ behind an opaque runtime reference.
       Flux maintains no vendor alias list. It does not invent `--endpoint` or `--domain` compatibility
       aliases unless Exchange publishes and proves them. Unknown aliases/identities, omitted required
       or unprojected fields visibly refuse before submission rather than producing an incomplete
-      connection.
+      connection. The corpus fails first unless plan discovery uses native `0x0007`/`0x0008`, rejects
+      HTTP Service Account/browser substitution, emits one canonical non-secret initiating frame,
+      and exposes only one terminal value-free helper result. Compile-time/API tests leave no Flux
+      construction or decoding route for `NEED_SECRETS`, transaction ids, secret ordinals, provider
+      bytes, `SECRET` or `COMMIT`; transport tests reject a non-terminal opcode, second frame or
+      oversized frame at the closed terminal boundary without decoding a secret-bearing payload.
 - [ ] `flux integration grant` first previews and applies a low-risk metadata-selector read grant;
       the tutorial proves a write remains refused under it, then previews and applies a high-risk
       metadata-selector grant and separately asks for the concrete write approval before that write
@@ -92,11 +113,12 @@ behind an opaque runtime reference.
       Exchange-unavailable lifecycle failure preserves and points to C-510's status and diagnostic
       rather than duplicating or reclassifying it. No grant is an operation-name allowlist.
 - [ ] C-509 consumes X-134's exhaustive value-free FXLM error/receipt mapping from that same X-126
-      v2 inventory. A pre-decision
-      refusal follows only its closed `never|refresh|operator` retry instruction. An uncertain
-      post-decision connect, grant or mint result uses the opaque receipt id with
-      `commit=query_receipt` and retries only the identical proposal; retry is never an edit path and
-      never repeats vendor input after a committed receipt. Approval denial sends no Exchange
+      v2 inventory. A pre-decision refusal follows only its closed `never|refresh|operator` retry
+      instruction. Direct value-free grant management may use X-134's receipt-query state machine.
+      A credential-bearing connection never exposes its transaction id or secret ordinals to Flux;
+      after a missing terminal helper result Flux may only relaunch with the byte-identical non-secret
+      initiating frame under X-134's final replay rule. Retry is never an edit path and never repeats
+      vendor input after a committed receipt. Approval denial sends no Exchange
       invocation. Uncertain send state is never automatically replayed for a non-idempotent or
       conditional write; a high-risk/effectful invocation requires Flux approval for its exact
       permission subject even after the Exchange grant admits it.
@@ -158,19 +180,26 @@ behind an opaque runtime reference.
   C-509 now waits directly for X-134's plan-v2, FXLM and FXSA provider contracts, X-126's regenerated
   post-X-134 release-v2 corpus and C-510's guard-bound helper capability. This documentation repair
   does not claim C-509 implementation or provider conformance; every acceptance item remains open.
+- 2026-08-04: Reconciled the native-helper boundary to roadmap commit
+  `ecd327ba8a4036889a91a943e952b3e54857e096`: plan discovery is the owner-authenticated native
+  `PLAN_QUERY`/`PLAN_RESPONSE` exchange, while the verified Exchange helper alone owns the
+  secret-bearing connection state machine. C-509 remains `ready` with every acceptance item open;
+  implementation cannot resume until corrected X-134 resolves its story/design/fixture differences.
 
 ## Notes
 
 - Cross-repository authority is flux-roadmap Decisions 0002, 0004 and 0007 at coordinator commit
-  `e78185f`; the canonical Exchange contract baseline inspected for this amendment is
-  `cba95b1157f4f062811cdcc3d309737e97fb4224`.
+  `ecd327ba8a4036889a91a943e952b3e54857e096`; the canonical Flux baseline inspected for this
+  amendment is `1f3283517f98818d09cd3cdb9e1c77ce8c485852` and the canonical Exchange baseline is
+  `9e84f77c1a6db60b967b0fb887198a14af26cd30`.
 - C-509's direct contract inputs are Flux C-503's delivered four-identity HTTP Service Account
   catalogue/invoke client, Flux C-510's local endpoint/status and guard-bound helper capability,
   Connectors C-87/C-508's declarations, and Exchange X-134's plan-v2/local-management-v1/
   service-account-handoff-v1 contracts. X-129 proves only the four unchanged HTTP v1 identities;
   X-134 supersedes X-125's unpublished plan-v1/submission evidence and owns the remaining provider
-  fixtures. C-509 owns strict dynamic CLI projection, helper orchestration, owner-authenticated FXLM,
-  the FXSA receiving writer/store, opaque runtime resolver, grant CAS and approval/retry behavior.
+  fixtures. C-509 owns strict dynamic CLI projection, the value-free native plan/grant client, one
+  non-secret helper request and terminal-result projection, the FXSA receiving writer/store, opaque
+  runtime resolver, grant CAS and approval/retry behavior. It never owns the secret-bearing FXLM peer.
 - The local-release chain is transitive through C-510: C-510 owns all Flux lifecycle behavior and
   consumes Exchange X-126/X-128/X-134 lifecycle identities; C-509 does not acquire lifecycle or
   release ownership from that chain. Its exact released clean-machine journey waits for X-134,
@@ -178,3 +207,8 @@ behind an opaque runtime reference.
   acceptance evidence. Roadmap dependency order keeps this `ready` story queued.
 - The connection name is Exchange's existing tenant-scoped label. It is not a tenant, authority,
   endpoint, credential address or caller-selected runtime placement.
+- Corrected X-134 remains the byte authority. Its current in-flight story/design candidate agrees on
+  the values recorded here, including the newly separated plan-validation and secret-ceremony peers,
+  but those corrections are not canonical until committed with fixtures. C-509 must consume the
+  single committed provider story/design/fixture result verbatim and must not invent alternate
+  connection timing, names or bytes.

@@ -6,7 +6,7 @@ status: ready
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/managed-exchange-lifecycle.md
-note: "Queued behind X-134/X-126: lifecycle owns the verified install and exposes only a guard-bound closed-helper launch capability to C-509"
+note: "Queued behind corrected X-134/X-126: lifecycle exposes only a guard-bound fixed helper with closed request/result pipes"
 ---
 
 # Install and supervise a verified local Exchange release
@@ -19,8 +19,9 @@ shipped Flux binary supervises the Exchange child for its entire lifetime; later
 authenticate to that supervisor instead of rediscovering or signalling a process. C-510 alone owns
 release selection, installation, cache verification and process lifecycle. It gives C-509 only a
 non-path capability bound to the already-selected verified executable for launching the provider's
-closed onboarding helpers. Flux remains a client and process owner, never an Exchange runtime,
-binary distributor or vendor-credential holder.
+fixed onboarding helper mode over one bounded request pipe and one distinct bounded terminal-result
+pipe. Flux remains a client and process owner, never an Exchange runtime, binary distributor or
+vendor-credential holder.
 
 ## Acceptance
 
@@ -180,11 +181,28 @@ binary distributor or vendor-credential holder.
 - [ ] Successful verification returns a non-path `VerifiedInstallGuard` bound to the opened install,
       opened executable and complete verified identity. C-510 retains that guard through every
       lifecycle spawn and supplies C-509 only an in-process helper-launch capability bound to the
-      already-selected guard for the owned instance. The capability can launch only X-134's closed
-      provider helper modes of that exact executable. It exposes no path, executable handle,
-      arbitrary argv, alternate binary, secret, FXLM operation, lifecycle mutation/status field or
-      generic process primitive; C-509 cannot search `PATH`, reopen the cache or weaken verification.
-      C-509 owns when and how those helpers participate in onboarding.
+      already-selected guard for the owned instance. For vendor-secret onboarding the capability
+      accepts only one at-most-65,548-byte canonical non-secret initiating frame, creates a one-way
+      helper request pipe and a distinct one-way terminal-result pipe, and launches only X-134's fixed verified
+      helper mode of that exact executable. It exposes no path, executable handle, caller-selected
+      program or mode, arbitrary/extra argv, alternate binary, endpoint, tenant, address, cwd,
+      environment, secret, FXLM operation, raw FD/HANDLE, lifecycle mutation/status field or generic
+      process primitive; C-509 cannot search `PATH`, reopen the cache or weaken verification. The
+      response side accepts exactly one at-most-65,548-byte value-free receipt or error plus EOF. C-509 owns when
+      to launch and how to project that terminal result, never helper process construction or the
+      secret-bearing FXLM peer.
+- [ ] C-510 consumes corrected X-134's exact helper ABI without a configurable compatibility layer.
+      On Unix it executes only `flux-exchange local vendor-secret` with no additional arguments,
+      maps the request read end to FD 6 and terminal-result write end to FD 7, closes reserved FXSA
+      FD 5, closes every unused pipe end and every other descriptor at or above 3, clears the
+      environment, uses null standard streams and derives the provider-root cwd from the guard. On
+      Windows it executes only `flux-exchange local vendor-secret --request-handle <REQUEST>
+      --response-handle <RESPONSE>` in that order with distinct nonzero canonical decimal HANDLEs;
+      `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` contains exactly those two handles, every unused handle is
+      non-inheritable, the environment is cleared, standard streams use `NUL`, and cwd is guard-derived.
+      The helper's direct TTY/browser access is not routed through Flux pipes. If corrected X-134 lands
+      different names or bytes, this story must be amended to those committed provider fixtures before
+      implementation rather than supporting both contracts.
 
 ### Same-binary supervision, authenticated control and child identity
 
@@ -337,7 +355,13 @@ binary distributor or vendor-credential holder.
       crash, readiness timeout/second frame/wrong bind/wrong start identity/wrong build, diagnostic
       flooding and every JSON state/exit pair. They prove later commands never exercise a PID-signal
       seam, supervisor death leaves no Exchange descendant, and a changed exemption/readiness/status
-      field fails from both producer and consumer sides.
+      field fails from both producer and consumer sides. Failing-first helper-launch tests prove the
+      program and mode cannot be selected by a caller; Unix receives only FD 6 read/FD 7 write with
+      FD 5, unused pipe ends and all other nonstandard descriptors closed; Windows inherits exactly
+      the two named HANDLEs through the closed list; and neither platform admits caller endpoint,
+      tenant, address, cwd, environment, extra argv or raw-handle input. Bounds, one frame plus EOF in
+      each direction, distinct pipes, a value-free terminal-only response and guard-pinned executable
+      identity are exercised with real child processes.
 - [ ] The managed executable remains a separately downloaded Exchange artifact, never an official
       integration plugin, connector runtime, crates.io artifact or binary copied into Flux's release.
       The two products remain an HTTP process boundary and may use different Rust engine dependency
@@ -367,12 +391,18 @@ binary distributor or vendor-credential holder.
   readiness v2; the exact eight-field inventory; X-134 as a direct dependency; and only X-126's
   future post-X-134 `tests/fixtures/exchange-release-v2/` corpus. This documentation repair claims
   neither C-510 implementation nor provider conformance.
+- 2026-08-04: Reconciled the helper-launch capability to roadmap commit
+  `ecd327ba8a4036889a91a943e952b3e54857e096`: it is now a fixed verified program/mode with one
+  bounded request pipe, one distinct bounded terminal-result pipe, an exact Unix FD mapping and a
+  closed Windows HANDLE list. C-510 remains `ready` with every acceptance item open and cannot resume
+  implementation until corrected X-134 has one internally consistent committed byte contract.
 
 ## Notes
 
 - Cross-repository authority is flux-roadmap Decisions 0004 and 0007 at coordinator commit
-  `e78185f`; the canonical Exchange contract baseline inspected for this amendment is
-  `cba95b1157f4f062811cdcc3d309737e97fb4224`.
+  `ecd327ba8a4036889a91a943e952b3e54857e096`; the canonical Flux baseline inspected for this
+  amendment is `1f3283517f98818d09cd3cdb9e1c77ce8c485852` and the canonical Exchange baseline is
+  `9e84f77c1a6db60b967b0fb887198a14af26cd30`.
 - Direct dependencies are Exchange X-126 (root-signed trust metadata, signed monotonic channel,
   immutable release manifests/artifacts and the future canonical v2 fixture inventory), X-128 (the
   unchanged readiness/liveness capability ABI) and X-134 (plan v2, local management, Service
@@ -387,3 +417,8 @@ binary distributor or vendor-credential holder.
   Exchange child is still a separately released product and owns all credential-bearing surfaces.
 - Roadmap dependency order keeps C-510 `ready` but queued behind X-134 and X-126. No acceptance item
   is complete and implementation must not begin from the obsolete provider corpus.
+- Corrected X-134 remains the byte authority. Its current in-flight story/design candidate agrees on
+  the values recorded here, including the newly separated plan-validation and secret-ceremony peers,
+  but those corrections are not canonical until committed with fixtures. C-510 must consume one
+  committed provider story/design/fixture result verbatim; it must not invent local spellings,
+  alternate timing, support both candidates or start implementation before that landing.

@@ -1,8 +1,9 @@
 # Managed Exchange lifecycle and onboarding capability boundary
 
 **Status:** contract only; implementation queued · **Stories:** C-510 and C-509 · **Authority:**
-flux-roadmap Decisions 0004 and 0007 at `e78185f`, with the Exchange provider contract inspected at
-`cba95b1157f4f062811cdcc3d309737e97fb4224`
+flux-roadmap Decisions 0004 and 0007 at
+`ecd327ba8a4036889a91a943e952b3e54857e096`, with the canonical Exchange provider baseline
+inspected at `9e84f77c1a6db60b967b0fb887198a14af26cd30`
 
 This design records Flux's ownership boundary for a managed local Exchange. It defines how Flux
 retains a verified executable and divides work between C-510 and C-509. It does not define Exchange
@@ -38,6 +39,23 @@ unpublished `exchange.connection-plan.v1` submission evidence and proves plan v2
 Service Account handoff and the changed readiness inventory. A package version, local alias or the
 old six-field object cannot substitute for any provider fixture.
 
+## Plan discovery is native, value-free management
+
+Flux reads the connection plan from the supervised Exchange instance's owner-authenticated native
+management endpoint. It sends X-134's FXLM `PLAN_QUERY` request opcode `0x0007` and accepts only the
+matching `PLAN_RESPONSE` opcode `0x0008` whose payload is the exact canonical
+`exchange.connection-plan.v2` response. The query payload is exactly
+`{"connector":Connector,"selection":Label|null}` with a required JSON `null` for no selection. For
+the same resolved owner, connector, selection and state snapshot, the native payload and provider's
+human-user HTTP body are byte-for-byte the same RFC 8785 UTF-8 bytes; Flux does not translate between
+two plan shapes.
+
+The native operating-system owner proof authenticates this read. It is not an HTTP identity, an
+Exchange Service Account, a browser session or a capability that Flux may mint or borrow. Flux must
+not use the Service Account catalogue/invoke client or browser authorization for plan discovery.
+The final query payload, response bytes, bounds and framing remain X-134-owned and must be consumed
+verbatim from its committed fixtures rather than redefined here.
+
 ## Provider fixtures are a future hard input
 
 The only canonical provider corpus Flux may consume is X-126's future, post-X-134
@@ -57,10 +75,10 @@ Flux has no consumable provider release fixture and C-510/C-509 implementation r
 
 | C-510 owns exclusively | C-509 owns exclusively |
 |---|---|
-| channel/trust verification and rollback floors | helper orchestration through C-510's capability |
-| compatible release selection and download/import | owner-authenticated FXLM management |
+| channel/trust verification and rollback floors | plan projection, user selection and grant confirmation |
+| compatible release selection and download/import | native value-free plan reads and grant management |
 | bounded archive verification and atomic cache | strict connection-plan-v2 CLI projection |
-| quarantine and reinstall | vendor-input helper ceremony without vendor values |
+| quarantine and reinstall | one non-secret helper request and one value-free terminal result |
 | `VerifiedInstallGuard` and exact process construction | FXSA receiving writer and owner-only token store |
 | supervisor, lifecycle control, readiness and liveness | opaque runtime reference and token resolver |
 | `start|status|stop`, lifecycle JSON/exits/diagnostics | grant preview/apply CAS, receipts and retries |
@@ -70,6 +88,10 @@ C-510 supplies C-509 the already-owned endpoint and typed lifecycle status for c
 in-process helper-launch capability. C-509 never adds a lifecycle operation, status field, lifecycle
 diagnostic or alternate process-discovery path. Conversely, C-510 never implements an FXLM opcode,
 receives an FXSA token, parses a plan or participates in a grant/connection transaction.
+
+Flux owns plan projection, user selection and grant proposal/confirmation. For a credential-bearing
+connection transaction it owns only one canonical non-secret initiating FXLM frame and the
+value-free terminal result; the verified Exchange helper owns the secret-bearing FXLM peer.
 
 ## A verified install is a retained capability
 
@@ -102,21 +124,40 @@ version never establish ownership.
 ## C-510 exposes one narrow helper-launch capability
 
 C-510 may lend C-509 only an in-process capability bound to the already-selected
-`VerifiedInstallGuard` for the owned instance. It launches only the provider's closed vendor-input
-and Service Account mint helper modes of that exact verified Exchange executable.
+`VerifiedInstallGuard` for the owned instance. For vendor-secret onboarding it launches only the
+provider's fixed helper mode of that exact verified Exchange executable. C-509 supplies one bounded,
+canonical non-secret initiating frame to the typed launcher. C-510 creates a one-way request pipe
+for exactly one at-most-65,548-byte frame plus EOF and a distinct one-way terminal-result pipe for
+exactly one at-most-65,548-byte value-free receipt or error frame plus EOF. The request is only
+connect `BEGIN` `0x0001` or credential acquire/rotate `BEGIN` `0x0030`; the result is only connect
+`RECEIPT` `0x0006`, credential `RECEIPT` `0x0032` or `ERROR` `0x7fff`.
 
 The capability exposes none of the following:
 
 - a filesystem path, executable handle, cache lookup or alternate binary;
-- arbitrary argv, a shell, a generic process builder or a caller-selected helper mode;
+- arbitrary argv, extra argv, a shell, a generic process builder or a caller-selected helper mode;
 - a secret or secret-bearing buffer;
-- an FXLM management operation, endpoint override or tenant/credential address; or
+- an endpoint, tenant, address, working directory, environment value, raw FD/HANDLE aperture or
+  caller-selected FXLM operation; or
 - a lifecycle mutation, lifecycle result, status field or diagnostic extension.
 
-C-509 supplies only provider-authorized non-secret helper inputs and any exact native capability the
-closed mode requires. C-510 constructs the closed argv and process from the guard. This preserves
-C-510's exclusive discovery/verification ownership without moving onboarding semantics into the
-lifecycle layer.
+C-510 constructs the closed process from the guard and derives every native placement value itself.
+The corrected X-134 candidate fixes Unix execution to `flux-exchange local vendor-secret` with no
+additional arguments, request-read FD 6, terminal-write FD 7, reserved FXSA FD 5 closed and every
+other descriptor at or above 3 closed. On Windows it fixes the same mode to exactly
+`flux-exchange local vendor-secret --request-handle <REQUEST> --response-handle <RESPONSE>` in that
+order, with canonical nonzero decimal HANDLE values; `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` contains
+exactly those two distinct handles and every unused handle is non-inheritable. On both platforms the
+environment is cleared, standard streams are the platform null device and the working directory is
+the provider root derived from the guard rather than caller input. Neither the caller nor a generic
+process API can add argv, an inherited descriptor/HANDLE or another placement value. Direct
+TTY/browser access follows the provider's closed helper ABI, not redirected Flux streams.
+
+The exact helper-mode spelling, Unix FD numbers, Windows argument spelling/order, frame bounds and
+terminal-result grammar are consumption assertions owned by corrected X-134. Flux must copy the
+committed provider names and bytes and fail conformance if they drift; it must not create a second
+wire or launch contract while that amendment is still in flight. This preserves C-510's exclusive
+discovery/verification ownership without moving onboarding semantics into the lifecycle layer.
 
 ## Readiness ABI stays stable while its inventory advances
 
@@ -142,10 +183,20 @@ neither can reuse readiness, liveness, child output or C-510's authenticated con
 
 ## Vendor values terminate inside Exchange
 
-C-509 strictly projects only plan-v2 targets the provider classifies as non-secret. Flux may send
-connector, label, exact plan revision, ordered non-secret targets/settings and other provider-
-declared non-secret transaction metadata. The verified Exchange helper/server opens the direct
-TTY/browser vendor-input surface and owns the provider transaction and every vendor value.
+C-509 strictly projects only plan-v2 targets the provider classifies as non-secret. After the user
+selects the projected values, Flux constructs exactly one provider-canonical, non-secret initiating
+FXLM frame containing the connector, label, plan revision and selected non-secret settings. The frame
+is one complete connection proposal: Flux does not prewrite the non-secret settings in a separate
+transaction and does not send any later management frame for that ceremony.
+
+The verified Exchange helper keeps its owner-authenticated native plan-validation operation separate
+from the secret-bearing ceremony peer: `PLAN_QUERY` terminates at `PLAN_RESPONSE|ERROR`, and only a
+distinct connection carries the initiating `BEGIN` through its terminal result. The helper receives
+and parses `NEED_SECRETS`, retains the transaction id and secret
+ordinals, opens the direct TTY/browser vendor-input surface, sends `SECRET` and `COMMIT`, and owns the
+provider transaction through its terminal state. It returns exactly one value-free receipt or error
+to Flux over the distinct bounded result pipe. Intermediate transaction ids and secret ordinals,
+provider bytes and every secret-bearing FXLM frame remain helper-private and never enter Flux.
 
 Flux never reads, proxies, parses, orders, inherits, logs, renders, stores or serializes a vendor
 value. There is no vendor-value route through argv, environment, JSON, generic `--field`, stdin,
@@ -168,11 +219,13 @@ Service Account client.
 
 ## C-509 owns management outcomes and approvals
 
-C-509 speaks the owner-authenticated `exchange.local-management.v1` state machines and consumes
-X-134's closed receipts/errors verbatim. Connect replay uses the identical non-secret proposal and
-never prompts again after a committed receipt. Grant preview consumes the complete connector-scoped
-candidate, revision/ETag and proposal digest; compare-and-swap apply preserves unrelated connectors,
-inbound authority and all provider-owned unmodified fields.
+C-509 speaks only the value-free `exchange.local-management.v1` plan and grant operations and
+consumes X-134's closed receipts/errors verbatim. It does not speak or parse the secret-bearing
+connection state machine. Connect retry may relaunch the helper only with the byte-identical
+non-secret initiating frame and never prompts again after a committed receipt. Grant preview
+consumes the complete connector-scoped candidate, revision/ETag and proposal digest;
+compare-and-swap apply preserves unrelated connectors, inbound authority and all provider-owned
+unmodified fields.
 
 A pre-decision error follows only the provider's closed `never|refresh|operator` retry instruction.
 An uncertain post-decision result uses `query_receipt` and retries only the same proposal; retry is
@@ -180,6 +233,26 @@ never an edit path. Approval is a separate Flux effect boundary: denial sends no
 and uncertain send state is never automatically replayed for a non-idempotent or conditional write.
 A high-risk or effectful invocation requires approval for its exact permission subject even after
 the Exchange grant admits it.
+
+## Corrected X-134 is an implementation gate
+
+Roadmap Decision 0007 fixes the ownership split, native plan opcodes and closed helper capability,
+but delegates every final byte and spelling to X-134. The corrected X-134 story/design candidate
+inspected for this reconciliation agrees on the plan opcodes/payload, fixed helper mode, FD 6/FD 7,
+closed Windows HANDLE list, 65,548-byte frame cap and terminal opcodes recorded above. No unresolved
+content contradiction was observed in that candidate snapshot.
+
+The provider is still freezing the two distinct owner-authenticated connections inside one bounded
+pre-ceremony phase so its outer result deadline encloses the provider's 5 + 300 + 30 second budgets.
+That connection lifecycle and timing remain helper-internal X-134 state: Flux supplies one initiating
+frame and reads one terminal result and neither observes nor shares either peer.
+
+It has not landed in the canonical Exchange baseline, so it is not yet a provider contract Flux may
+implement. Before either C-510 or C-509 implementation resumes, one committed X-134
+story/design/fixture set must agree on every helper spelling and platform ABI, opcode name/number,
+exact query and response byte, bound, receipt and error name. Flux then consumes that single contract
+verbatim and amends these assertions if the provider's final bytes differ. No Flux test fixture or
+parser may make candidate values canonical on its own.
 
 ## Dependency and evidence boundary
 
