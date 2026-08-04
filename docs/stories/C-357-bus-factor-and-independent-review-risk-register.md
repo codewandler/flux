@@ -5,7 +5,7 @@ pillar: Core
 status: backlog
 epic: release-trust-residuals
 design: docs/designs/release-trust-residuals.md
-note: "486 of the last 500 commits from one identity, one admin collaborator, zero merged PRs ever, no release environment; three reviews rated this a material risk and no code change can close it"
+note: "one administrator and 26 merged PRs but zero recorded reviews; no succession or incident-exercise evidence. Independent-review governance remains a visible residual, not a v0.56.0 publication blocker"
 ---
 
 # Record bus factor and independent review as owned risks
@@ -30,8 +30,14 @@ date it, and state what would change it.
 
 - 2026-08-01 — filed from validation of ASSURE-04. The "external-unknown" half resolved to verified
   absent during this pass; the risk itself remains open by nature.
+- 2026-08-04 — revalidated at canonical
+  `9e3108b1b6856e30fa2e0baa2475d75d21fbc19f`: 26 PRs are merged, zero reviews are recorded and one
+  administrator remains. The story stays `backlog` with every acceptance box open. This is an
+  independent-review/governance residual, not a v0.56.0 publication blocker; C-353 may remove
+  bypasses without pretending a second reviewer exists.
 
 ## Notes
 
 - C-255 already recorded bus factor as a residual governance risk rather than a fictional code
   story. This gives it an owner and a date instead of a footnote.
+- A green protected release is not evidence of independent review and does not close this story.
