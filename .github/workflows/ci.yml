@@ -17,6 +17,7 @@ jobs:
   build-ownership:
     name: build ownership · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -42,12 +43,12 @@ jobs:
       - name: Native ownership and Task bootstrap (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: scripts/run-python3.sh scripts/test_build_ownership.py
+        run: scripts/run-python3.sh scripts/test_build_ownership.py -v
 
       - name: Native ownership and Task bootstrap (Windows)
         if: runner.os == 'Windows'
         shell: cmd
-        run: scripts\run-python3.cmd scripts\test_build_ownership.py
+        run: scripts\run-python3.cmd scripts\test_build_ownership.py -v
 
   check:
     name: build · test · clippy · fmt · layering (no sandbox backend)
@@ -363,6 +364,12 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: plugins
+
+      # The direct-dependency ratchet uses cargo metadata --offline after the build. A restored
+      # target cache can satisfy compilation without restoring registry source, so fetch the exact
+      # locked plugin closure before that offline audit.
+      - name: Fetch locked plugin dependencies
+        run: cargo fetch --locked --manifest-path plugins/Cargo.toml
 
       - name: Format
         working-directory: plugins

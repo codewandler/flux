@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -494,24 +495,31 @@ class OwnershipProcessTests(unittest.TestCase):
 
     def test_signalled_parent_cannot_release_while_descendant_remains_live(self) -> None:
         forwarded = signal.SIGBREAK if os.name == "nt" else signal.SIGTERM
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10)
+        environment = self.env.copy()
+        environment["FLUX_DESCENDANT_BARRIER_PORT"] = str(listener.getsockname()[1])
         grandchild = (
-            "import signal, sys; "
+            "import os, signal, socket; "
             f"signal.signal({int(forwarded)}, signal.SIG_IGN); "
-            "print('signal-descendant-ready', flush=True); sys.stdin.buffer.read(1)"
+            "barrier=socket.create_connection(('127.0.0.1', int(os.environ['FLUX_DESCENDANT_BARRIER_PORT']))); "
+            "print('signal-descendant-ready', flush=True); barrier.recv(1)"
         )
         child = (
-            "import signal, subprocess, sys; "
+            "import signal, subprocess, sys, threading; "
             f"signal.signal({int(forwarded)}, lambda *_: sys.exit(29)); "
             f"subprocess.Popen([sys.executable, '-c', {grandchild!r}], close_fds=False); "
-            "sys.stdin.buffer.read(1)"
+            "threading.Event().wait()"
         )
         popen_args = {}
         if os.name == "nt":
             popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         owner = subprocess.Popen(
             self.command("shared", sys.executable, "-c", child),
-            env=self.env,
-            stdin=subprocess.PIPE,
+            env=environment,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -519,6 +527,7 @@ class OwnershipProcessTests(unittest.TestCase):
         )
         assert owner.stdout is not None
         self.assertEqual(owner.stdout.readline().strip(), "signal-descendant-ready")
+        descendant_barrier, _ = listener.accept()
         owner.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
         try:
             cleanup = subprocess.run(
@@ -532,9 +541,9 @@ class OwnershipProcessTests(unittest.TestCase):
             )
             self.assertEqual(cleanup.returncode, 75, cleanup.stderr)
         finally:
-            assert owner.stdin is not None
-            owner.stdin.write("x")
-            owner.stdin.flush()
+            descendant_barrier.sendall(b"x")
+            descendant_barrier.close()
+            listener.close()
         self.assert_owner_exit(owner, 29)
         after = subprocess.run(
             self.command("exclusive", sys.executable, "-c", "raise SystemExit(0)", refuse=True),
