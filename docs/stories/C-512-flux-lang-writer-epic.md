@@ -2,7 +2,7 @@
 id: C-512
 title: "Flux-Lang writer — a specialist agent for checked authored automation (epic)"
 pillar: Core
-status: in-progress
+status: done
 priority: 0
 epic: flux-lang-writer
 areas: [flux-agent, flux-lang, docs]
@@ -20,26 +20,28 @@ about which checks prove syntax, analysis, and execution behavior.
 
 ## Acceptance
 
-- [ ] A tracked `.flux/agents/flux-lang-writer.md` role specializes in creating and editing
+- [x] A tracked `.flux/agents/flux-lang-writer.md` role specializes in creating and editing
       workspace-relative `.flux` sources, reads the repository's Flux-Lang contract before acting,
       and keeps every write and validation command inside the parent's capability/policy floor.
-- [ ] The role validates syntax and analysis without running an effectful program merely as a
+- [x] The role validates syntax and analysis without running an effectful program merely as a
       checker; execution is performed only when the task asks for it and the normal authorization,
       approval, guarded-IO, and sandbox boundaries apply.
-- [ ] Public documentation inventories every embedded built-in role and every tracked project role,
+- [x] Public documentation inventories every embedded built-in role and every tracked project role,
       explains their authority source, and links each entry to its canonical GitHub source (C-513).
-- [ ] A deterministic census test fails when an embedded or tracked role is added, removed, renamed,
+- [x] A deterministic census test fails when an embedded or tracked role is added, removed, renamed,
       or left without a source link in the public catalogue (C-513).
-- [ ] The catalogue distinguishes shipped embedded roles, tracked repository roles, and ignored
+- [x] The catalogue distinguishes shipped embedded roles, tracked repository roles, and ignored
       local/user overrides; it never presents local scaffolding as code available from GitHub.
 
 ## Progress
 
 - 2026-08-04: Filed at owner direction with C-513 as the immediate first delivery.
+- 2026-08-04: Closed after C-513 delivered all five epic outcomes: the tracked capability-scoped
+  writer, validation-versus-execution boundary, complete source-linked catalogue, deterministic
+  census test and explicit local-override distinction.
 
 ## Notes
 
 - The role narrows intent and instructions; its tool list does not replace Flux authorization,
   approval, sandboxing, or guarded IO.
 - Flux-Lang syntax and generated mirrors remain governed by `crates/flux-lang/AGENTS.md`.
-
