@@ -2,7 +2,7 @@
 id: C-509
 title: "Complete the first-run local Exchange and integration CLI tutorial"
 pillar: Core
-status: in-progress
+status: ready
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/ecosystem.md
@@ -93,6 +93,9 @@ ever receiving vendor credentials.
   acceptance before X-125's connection plan, X-127's owner-only state, X-128's readiness contract,
   X-129's production wire identities/fixtures, X-126's signed release artifact/channel and C-510's
   compatible install/supervision plus secure handoff are available.
+- 2026-08-04: Returned the story to `ready` with every acceptance item open. Decision 0003 removes
+  externally gated work from the current wave rather than marking a dependency-independent command
+  skeleton as complete; resume after the named Exchange and Flux lifecycle contracts ship.
 
 ## Notes
 

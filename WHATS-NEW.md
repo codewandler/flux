@@ -17,6 +17,12 @@
 
 ### New
 
+- **The first-run Exchange command surface is now explicit and safe while provider support lands.**
+  `flux exchange local start|status|stop` and `flux integration connect|grant|list|doctor` now have
+  stable human and JSON outcomes. Until compatible Exchange lifecycle and connection contracts
+  ship, they make no changes and return a deterministic `unsupported` refusal; setting values stay
+  out of diagnostics, and credential or token arguments are not accepted.
+
 - **Flux can now use operations granted to an Exchange Service Account.** Set the Exchange URL and
   Service Account token in the host environment. Flux refreshes the available operations between
   turns and sends one-shot calls to Exchange, while Exchange keeps credentials and deployment
