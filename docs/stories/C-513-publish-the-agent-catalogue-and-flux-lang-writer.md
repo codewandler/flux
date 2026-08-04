@@ -2,7 +2,7 @@
 id: C-513
 title: "Publish the complete agent catalogue and add the Flux-Lang writer"
 pillar: Core
-status: ready
+status: in-progress
 priority: 0
 epic: flux-lang-writer
 areas: [flux-agent, flux-lang, docs]
@@ -45,7 +45,7 @@ exact source of each role on GitHub, and delegate Flux-Lang authoring to a purpo
 
 ## Progress
 
-- (not started)
+- 2026-08-04: implementation started on the dispatched `flux-lang-writer-1` wave.
 
 ## Notes
 
@@ -53,4 +53,3 @@ exact source of each role on GitHub, and delegate Flux-Lang authoring to a purpo
   present in one developer checkout.
 - The page already documents role lookup and capability narrowing; extend that canonical page rather
   than creating a second role system or duplicated tutorial.
-
