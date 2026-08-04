@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A tracked Flux-Lang writer role now authors checked `.flux` sources** (C-513).
+  `.flux/agents/flux-lang-writer.md` uses the coding profile and an explicit tool allow-list, reads
+  the repository language contract before editing, and separates parse/analyze checks from an
+  explicitly requested run through the ordinary guarded runtime. The public agent catalogue now
+  links every embedded fallback and tracked project role to its canonical source, with a census
+  test that detects inventory drift. The role narrows delegated capabilities; it does not create a
+  new authority boundary.
+
 - **Flux now embeds the Exchange Service Account client for official integrations** (C-503).
   Operator-only environment configuration binds one Exchange origin and bearer; its authenticated
   effective catalogue is adopted between turns and one-shot operations run through Exchange's HTTP
