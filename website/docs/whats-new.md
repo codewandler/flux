@@ -14,6 +14,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **You can delegate Flux-Lang authoring to a purpose-built repository role.** The
+  `flux-lang-writer` inspects the language contract, makes focused `.flux` changes, and validates
+  syntax and analysis without running an effectful flow as a shortcut. Actual execution still uses
+  Flux's normal authorization, approval, guarded IO, sandboxing, and redaction. A source-linked
+  catalogue now makes every built-in and repository role discoverable.
+
 - **The first-run Exchange command surface is now explicit and safe while provider support lands.**
   `flux exchange local start|status|stop` and `flux integration connect|grant|list|doctor` now have
   stable human and JSON outcomes. Until compatible Exchange lifecycle and connection contracts
