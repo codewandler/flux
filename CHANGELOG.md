@@ -38,6 +38,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Datasources now carry the family's one declared read-only definition** (C-514). flux-roadmap
+  Decision 0006 governs the vocabulary: a datasource is a named, declared, read-only record surface
+  — *operations do; datasources know* — with exactly one access mode (indexed or live), one
+  registry direction across both modes, connector-owned vendor Datasource Definitions,
+  Exchange-owned tenant bindings and read seam, and a flux-owned wire vocabulary and Flux-Lang
+  declaration surface. The work board leaves the datasource vocabulary as a first-class
+  write-capable surface: a new epic charters its own `board` declaration, `board:` subject
+  namespace and SDK seam, and the Jira/GitLab board stories are re-pointed from the plugin path
+  Milestone 5 removes onto Exchange-governed operations. The concepts and ecosystem pages (and
+  their website mirrors), both public datasource pages, and the affected designs — the live-seam
+  non-goal's named consumers, the discoverability registry disposition, and a partial supersession
+  of the connector-backed storage facade — were reconciled in the same documentation-only change.
+  No runtime behavior changed.
+
 - **The Exchange environment bearer is now documented as transitional compatibility** (C-511).
   C-503's lower-level embedded-client setup remains available and redacted, but public and
   contributor guidance no longer presents it as the Milestone 1 bootstrap: C-509 replaces it with

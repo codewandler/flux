@@ -263,6 +263,16 @@ or nested filters; cross-domain fan-out or joins; caching live rows into the syn
 wants that ingests through `DatasourceBackend` separately); a plugin-protocol live-datasource
 capability (the L0 types leave the door open, but v1 ships the native trait + projection only).
 
+> **Amendment (2026-08-04, C-514 / flux-roadmap Decision 0006).** The "plugin-protocol
+> live-datasource capability" door stays open, but its named consumers are no longer plugins — the
+> plugin protocol is deleted by Milestone 5. The L0 vocabulary's future counterparties are
+> **flux-connectors** (the compiled-in connectors catalogue binds as an *indexed* backend, 0006
+> rule 9) and **flux-exchange** (the tenant Datasource read seam: Exchange serves schema/list/get
+> for a bound Datasource through its admission gate with Exchange-minted opaque cursors, and Flux
+> binds each granted tenant Datasource through this design's existing live registration seam —
+> 0006 rules 7–8). Exchange unavailable means vendor datasources unavailable; there is no local
+> vendor adapter and no local index fallback. Program-local backends are unaffected.
+
 ## Story map
 
 Accepted implementation stories — each remains independently testable and committable:

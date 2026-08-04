@@ -3,10 +3,10 @@ id: A-134
 title: "No SDK seam for a `WorkBoard` — decide whether boards are embeddable, then ship `ClientBuilder::try_with_work_board` if they are"
 pillar: Agent
 status: backlog
-epic: fleet-coordinator
-design: docs/designs/fleet-coordinator.md
+epic: first-class-board
+design: docs/designs/first-class-board.md
 areas: [flux-sdk, flux-capabilities]
-note: "filed from A-131's implementor report — live datasources have a documented SDK registration seam, boards have none, so an embedder cannot bind a board at all"
+note: "absorbed into the first-class-board epic (Decision 0006) — the board's own SDK seam, matching try_with_live_datasource's all-in-one guarantees; live datasources have a documented seam, boards have none, so an embedder cannot bind a board at all"
 ---
 
 # No SDK seam for a `WorkBoard` — decide whether boards are embeddable, then ship `ClientBuilder::try_with_work_board` if they are
@@ -64,6 +64,13 @@ embedder will look.
 - (not started)
 
 ## Notes
+- 2026-08-04 (C-514): re-homed from the fleet-coordinator epic into **first-class-board** rather
+  than folded — the story's evidence, seam question and acceptance are still exactly the work, and
+  Decision 0006 answers its framing: the board is a first-class surface (its own declaration and
+  SDK seam), not a datasource. Read the acceptance's "boards are embeddable?" question with that
+  decision in hand; the design pointer is now
+  [first-class-board.md](../designs/first-class-board.md). Coordinate the seam name with L-130's
+  `board` declaration so Program and SDK name the concept the same way.
 - Filed 2026-07-29 from the fleet-coordinator integration run, out of **A-131's implementor report**.
   The evidence as given: `website/docs/agent/datasources.md` documents live-datasource SDK
   registration via `ClientBuilder::try_with_live_datasource`, but `crates/flux-sdk` has no
