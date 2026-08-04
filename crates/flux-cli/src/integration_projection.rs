@@ -48,6 +48,9 @@ impl Command {
     }
 }
 
+// The provider-independent CLI currently emits `Unsupported`; the remaining closed categories are
+// consumed as X-125/C-510 wire the corresponding provider states into this same projection.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Refusal {
     Refused,
@@ -71,6 +74,7 @@ impl Refusal {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CommandOutcome {
     Success { command: Command },
@@ -95,6 +99,7 @@ struct JsonProjection<'a> {
     label: Option<&'a str>,
 }
 
+#[allow(dead_code)]
 impl CommandOutcome {
     pub fn success(command: Command) -> Self {
         Self::Success { command }

@@ -718,10 +718,20 @@ pub(super) enum ExchangeLocalAction {
 /// plan may decide whether it is a field identity or a published alias and whether the field is
 /// non-secret. For grants, only Exchange may interpret it as a metadata selector. Keeping this
 /// parser syntactic prevents Flux from acquiring a vendor field/alias or grant schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct FieldAssignment {
     pub(super) key: String,
     pub(super) value: String,
+}
+
+impl std::fmt::Debug for FieldAssignment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FieldAssignment")
+            .field("key", &self.key)
+            .field("value", &"[redacted]")
+            .finish()
+    }
 }
 
 impl std::str::FromStr for FieldAssignment {
@@ -1585,6 +1595,10 @@ mod c509_cli_grammar_tests {
         );
         assert!(json);
         assert!(no_prompt);
+        let debug = format!("{fields:?}");
+        assert!(debug.contains("origin"));
+        assert!(!debug.contains("https://code.example.test"));
+        assert!(!debug.contains("user@example.test"));
 
         for credential_flag in ["--token", "--password", "--secret", "--credential"] {
             assert!(
