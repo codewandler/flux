@@ -9,8 +9,8 @@ use flux_core::{ContentBlock, Error, Message, Result, Usage};
 use flux_evidence::{Observation, Phase as EvidencePhase, ToolGroup, KIND_TURN_INTENT};
 use flux_lang::ast::{DraftAst, Node, SymbolName};
 use flux_provider::{Effort, Provider, Request, RequestTrace, SystemSegment, ToolDef};
-use flux_runtime::{effective_group, Executor};
-use flux_spec::{AccessKind, Effect, Risk, ToolSpec};
+use flux_runtime::{effective_group, AuthorizeVerdict, Executor};
+use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -63,7 +63,8 @@ checklist of every input fact and governing rule needed for every part; read an 
 for each before answering. Search hits only locate sources--read the source itself. Minimize provider \
 rounds without skipping evidence: emit \
 independent tool calls together in one response, and once multiple relevant paths are known, read \
-them together with `read_many` instead of issuing sequential `read` calls. If the user supplies an \
+them together with `read_many` instead of issuing sequential `read` calls. Batch only independent \
+gather calls; never batch writes, destructive work, or calls that need approval. If the user supplies an \
 as-of time, use it and do not fetch the current time. Flux may capture an action instead of \
 executing it; the tool result will say so. \
 If no actions are captured, answer the user directly only after the evidence checklist is complete. \
@@ -213,6 +214,35 @@ struct GatheredEvidence {
     op: String,
     input: String,
     result: String,
+}
+
+struct AdmittedNativeCall {
+    index: usize,
+    step: usize,
+    call_id: String,
+    operation: String,
+    input: Value,
+    ast: DraftAst,
+    parallel_safe: bool,
+}
+
+enum NativeBatchSlot {
+    Execute(AdmittedNativeCall),
+    Fixed(ContentBlock),
+}
+
+struct ExecutedNativeCall {
+    index: usize,
+    step: usize,
+    call_id: String,
+    operation: String,
+    input: Value,
+    result: std::result::Result<String, String>,
+}
+
+enum NativeBatchResult {
+    Executed(ExecutedNativeCall),
+    Fixed(ContentBlock),
 }
 
 /// One literal operation invocation captured by a model-backed stage. The host, never the model,
@@ -808,21 +838,70 @@ async fn run_model_stage_inner(
             continue;
         }
 
+        let mut slots = Vec::with_capacity(calls.len());
         for (index, (id, native, call_input)) in calls.into_iter().enumerate() {
             let Some(spec) = by_native.get(&native) else {
                 last_error = format!("model stage `{name}` called unavailable tool `{native}`");
-                results.push(ContentBlock::tool_result_text(id, last_error.clone(), true));
+                observe_durable(
+                    ctx,
+                    "native.batch_call",
+                    json!({
+                        "stage": stage_label,
+                        "round": round,
+                        "call_index": index,
+                        "call_id": id,
+                        "native_operation": native,
+                        "disposition": "rejected",
+                    }),
+                );
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
+                    id,
+                    last_error.clone(),
+                    true,
+                )));
                 continue;
             };
             let operation = spec.name.clone();
             let Some(tool) = ctx.registry.get(&operation) else {
                 last_error = format!("model stage `{name}` tool `{operation}` disappeared");
-                results.push(ContentBlock::tool_result_text(id, last_error.clone(), true));
+                observe_durable(
+                    ctx,
+                    "native.batch_call",
+                    json!({
+                        "stage": stage_label,
+                        "round": round,
+                        "call_index": index,
+                        "call_id": id,
+                        "operation": operation,
+                        "disposition": "rejected",
+                    }),
+                );
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
+                    id,
+                    last_error.clone(),
+                    true,
+                )));
                 continue;
             };
             if let Err(diagnostics) = validate_call(spec, &call_input, ctx, &selected) {
                 last_error = format!("invalid `{operation}` input: {}", diagnostics.join("; "));
-                results.push(ContentBlock::tool_result_text(id, last_error.clone(), true));
+                observe_durable(
+                    ctx,
+                    "native.batch_call",
+                    json!({
+                        "stage": stage_label,
+                        "round": round,
+                        "call_index": index,
+                        "call_id": id,
+                        "operation": operation,
+                        "disposition": "rejected",
+                    }),
+                );
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
+                    id,
+                    last_error.clone(),
+                    true,
+                )));
                 continue;
             }
             if !gather_safe(
@@ -834,35 +913,70 @@ async fn run_model_stage_inner(
                 last_error = format!(
                     "model stage `{name}` call to `{operation}` is not gather-safe for these arguments"
                 );
-                results.push(ContentBlock::tool_result_text(id, last_error.clone(), true));
+                observe_durable(
+                    ctx,
+                    "native.batch_call",
+                    json!({
+                        "stage": stage_label,
+                        "round": round,
+                        "call_index": index,
+                        "call_id": id,
+                        "operation": operation,
+                        "disposition": "rejected",
+                    }),
+                );
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
+                    id,
+                    last_error.clone(),
+                    true,
+                )));
                 continue;
             }
+            let parallel_safe = native_call_parallel_safe(ctx, spec, tool.as_ref(), &call_input);
             let ast = one_call_ast(
                 &operation,
-                call_input,
+                call_input.clone(),
                 format!("model_stage_{round}_{index}"),
             );
             record_host_flow(ctx, &ast, &format!("stage:{name}"), round as u32);
-            let outcome = {
-                let mut sink = SharedSink::new(ctx.sink.clone());
-                execute_flow_with_composites(
-                    ctx.store.as_ref(),
-                    ctx.executor.as_ref(),
-                    &ctx.session_id,
-                    &ast,
-                    &[],
-                    &mut sink,
-                )
-                .await
-            };
-            match outcome {
-                Ok(outcome) => {
-                    results.push(ContentBlock::tool_result_text(id, outcome.result, false))
-                }
-                Err(error) => {
-                    last_error = format!("`{operation}` gather call failed: {error}");
-                    results.push(ContentBlock::tool_result_text(id, last_error.clone(), true));
-                }
+            observe_durable(
+                ctx,
+                "native.batch_call",
+                json!({
+                    "stage": stage_label,
+                    "round": round,
+                    "call_index": index,
+                    "call_id": id,
+                    "operation": operation,
+                    "disposition": if parallel_safe { "parallel_gather" } else { "ordered_gather" },
+                }),
+            );
+            slots.push(NativeBatchSlot::Execute(AdmittedNativeCall {
+                index,
+                step: index,
+                call_id: id,
+                operation,
+                input: call_input,
+                ast,
+                parallel_safe,
+            }));
+        }
+        for result in execute_native_call_batch(ctx, slots).await {
+            match result {
+                NativeBatchResult::Fixed(block) => results.push(block),
+                NativeBatchResult::Executed(call) => match call.result {
+                    Ok(result) => {
+                        results.push(ContentBlock::tool_result_text(call.call_id, result, false))
+                    }
+                    Err(error) => {
+                        last_error = format!("`{}` gather call failed: {error}", call.operation);
+                        results.push(ContentBlock::tool_result_text(
+                            call.call_id,
+                            last_error.clone(),
+                            true,
+                        ));
+                    }
+                },
             }
         }
         messages.push(Message::user(results));
@@ -1326,8 +1440,10 @@ async fn adaptive_explore(
         }
 
         let mut results = Vec::new();
-        for (id, name, input) in calls {
+        let mut slots = Vec::with_capacity(calls.len());
+        for (call_index, (id, name, input)) in calls.into_iter().enumerate() {
             state.native_step += 1;
+            let step = state.native_step;
             let Some(spec) = selected_by_native.get(&name) else {
                 state.last_error = format!(
                     "operation `{name}` was not selected by intent; available operations: {}",
@@ -1340,13 +1456,19 @@ async fn adaptive_explore(
                 observe(
                     ctx,
                     "adaptive.call",
-                    json!({"operation": name, "disposition": "rejected", "step": state.native_step}),
+                    json!({
+                        "native_operation": name,
+                        "disposition": "rejected",
+                        "step": step,
+                        "call_index": call_index,
+                        "call_id": id,
+                    }),
                 );
-                results.push(ContentBlock::tool_result_text(
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
                     id,
                     state.last_error.clone(),
                     true,
-                ));
+                )));
                 continue;
             };
             let operation = spec.name.clone();
@@ -1357,20 +1479,42 @@ async fn adaptive_explore(
                 state.last_error = format!(
                     "`{operation}` arguments were not valid JSON ({parse_error}); retry using its declared input schema"
                 );
-                results.push(ContentBlock::tool_result_text(
+                observe(
+                    ctx,
+                    "adaptive.call",
+                    json!({
+                        "operation": operation,
+                        "disposition": "rejected",
+                        "step": step,
+                        "call_index": call_index,
+                        "call_id": id,
+                    }),
+                );
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
                     id,
                     state.last_error.clone(),
                     true,
-                ));
+                )));
                 continue;
             }
             if let Err(diags) = validate_call(spec, &input, ctx, &selected_names) {
                 state.last_error = format!("invalid `{operation}` input: {}", diags.join("; "));
-                results.push(ContentBlock::tool_result_text(
+                observe(
+                    ctx,
+                    "adaptive.call",
+                    json!({
+                        "operation": operation,
+                        "disposition": "rejected",
+                        "step": step,
+                        "call_index": call_index,
+                        "call_id": id,
+                    }),
+                );
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
                     id,
                     state.last_error.clone(),
                     true,
-                ));
+                )));
                 continue;
             }
 
@@ -1385,46 +1529,31 @@ async fn adaptive_explore(
                 tool.intents(&input),
                 &tool.semantic_effects(),
             ) {
-                let ast = one_call_ast(
-                    &operation,
-                    input.clone(),
-                    format!("adaptive_gather_{}", state.native_step),
+                let parallel_safe = native_call_parallel_safe(ctx, spec, tool.as_ref(), &input);
+                let ast =
+                    one_call_ast(&operation, input.clone(), format!("adaptive_gather_{step}"));
+                record_host_flow(ctx, &ast, "gather", step as u32);
+                observe_durable(
+                    ctx,
+                    "native.batch_call",
+                    json!({
+                        "operation": operation,
+                        "disposition": "gather",
+                        "schedule": if parallel_safe { "parallel" } else { "ordered" },
+                        "step": step,
+                        "call_index": call_index,
+                        "call_id": id,
+                    }),
                 );
-                record_host_flow(ctx, &ast, "gather", state.native_step as u32);
-                let mut sink = SharedSink::new(ctx.sink.clone());
-                match execute_flow_with_composites(
-                    ctx.store.as_ref(),
-                    ctx.executor.as_ref(),
-                    &ctx.session_id,
-                    &ast,
-                    &[],
-                    &mut sink,
-                )
-                .await
-                {
-                    Ok(outcome) => {
-                        let redactor = &ctx.executor.context().redactor;
-                        state.gathered.push(GatheredEvidence {
-                            op: operation.clone(),
-                            input: redactor.redact(&input.to_string()),
-                            result: redactor.redact(&outcome.result),
-                        });
-                        observe(
-                            ctx,
-                            "adaptive.call",
-                            json!({"operation": operation, "disposition": "gather", "step": state.native_step}),
-                        );
-                        results.push(ContentBlock::tool_result_text(id, outcome.result, false));
-                    }
-                    Err(error) => {
-                        state.last_error = format!("`{operation}` gather call failed: {error}");
-                        results.push(ContentBlock::tool_result_text(
-                            id,
-                            state.last_error.clone(),
-                            true,
-                        ));
-                    }
-                }
+                slots.push(NativeBatchSlot::Execute(AdmittedNativeCall {
+                    index: call_index,
+                    step,
+                    call_id: id,
+                    operation,
+                    input,
+                    ast,
+                    parallel_safe,
+                }));
             } else {
                 state.proposed.push(ProposedCall {
                     op: operation.clone(),
@@ -1433,16 +1562,67 @@ async fn adaptive_explore(
                 observe(
                     ctx,
                     "adaptive.call",
-                    json!({"operation": operation, "disposition": "captured", "step": state.native_step}),
+                    json!({
+                        "operation": operation,
+                        "disposition": "captured",
+                        "step": step,
+                        "call_index": call_index,
+                        "call_id": id,
+                    }),
                 );
-                results.push(ContentBlock::tool_result_text(
+                slots.push(NativeBatchSlot::Fixed(ContentBlock::tool_result_text(
                     id,
                     format!(
                         "captured as proposed action {}; not executed. Continue gathering or call `{FINALIZE_PLAN}` by itself when the batch is complete.",
                         state.proposed.len()
                     ),
                     false,
-                ));
+                )));
+            }
+        }
+        for result in execute_native_call_batch(ctx, slots).await {
+            match result {
+                NativeBatchResult::Fixed(block) => results.push(block),
+                NativeBatchResult::Executed(call) => match call.result {
+                    Ok(result) => {
+                        let redactor = &ctx.executor.context().redactor;
+                        observe(
+                            ctx,
+                            "adaptive.call",
+                            json!({
+                                "operation": &call.operation,
+                                "disposition": "gather",
+                                "step": call.step,
+                                "call_index": call.index,
+                                "call_id": &call.call_id,
+                            }),
+                        );
+                        state.gathered.push(GatheredEvidence {
+                            op: call.operation,
+                            input: redactor.redact(&call.input.to_string()),
+                            result: redactor.redact(&result),
+                        });
+                        results.push(ContentBlock::tool_result_text(call.call_id, result, false));
+                    }
+                    Err(error) => {
+                        state.last_error =
+                            format!("`{}` gather call failed: {error}", call.operation);
+                        observe(
+                            ctx,
+                            "adaptive.call_failed",
+                            json!({
+                                "operation": call.operation,
+                                "call_index": call.index,
+                                "call_id": call.call_id,
+                            }),
+                        );
+                        results.push(ContentBlock::tool_result_text(
+                            call.call_id,
+                            state.last_error.clone(),
+                            true,
+                        ));
+                    }
+                },
             }
         }
         state.messages.push(Message::user(results));
@@ -2695,6 +2875,105 @@ fn gather_safe(
     allowed && network_is_read
 }
 
+/// The stricter admission needed before two native calls may overlap.
+///
+/// `gather_safe` decides whether a call may execute before an action batch is approved. Parallel
+/// admission additionally requires an idempotent operation and an authorize-only verdict proving
+/// that the concrete call will not enter the approval path. Hooks are an ordering barrier because
+/// authorize-only deliberately does not run them; an active cassette is a barrier because its tape
+/// is ordered. Because the remaining admitted effect set is pure or read-only, two such calls have
+/// no write/write or read/write conflict; calls whose declarations cannot prove that property stay
+/// on the ordered path.
+fn native_call_parallel_safe(
+    ctx: &StagedContext,
+    spec: &ToolSpec,
+    tool: &dyn flux_runtime::Tool,
+    input: &Value,
+) -> bool {
+    !ctx.executor.has_pre_tool_hooks()
+        && ctx.store.cassette().is_none()
+        && spec.idempotency == Idempotency::Idempotent
+        && gather_safe(
+            spec,
+            tool.staging_disposition(),
+            tool.intents(input),
+            &tool.semantic_effects(),
+        )
+        && matches!(
+            ctx.executor.authorize(&spec.name, input),
+            AuthorizeVerdict::Allow
+        )
+}
+
+async fn execute_admitted_native_call(
+    ctx: &StagedContext,
+    call: AdmittedNativeCall,
+) -> NativeBatchResult {
+    let outcome = {
+        let mut sink = SharedSink::new(ctx.sink.clone());
+        execute_flow_with_composites(
+            ctx.store.as_ref(),
+            ctx.executor.as_ref(),
+            &ctx.session_id,
+            &call.ast,
+            &[],
+            &mut sink,
+        )
+        .await
+        .map(|outcome| outcome.result)
+        .map_err(|error| error.to_string())
+    };
+    NativeBatchResult::Executed(ExecutedNativeCall {
+        index: call.index,
+        step: call.step,
+        call_id: call.call_id,
+        operation: call.operation,
+        input: call.input,
+        result: outcome,
+    })
+}
+
+async fn flush_parallel_native_calls(
+    ctx: &StagedContext,
+    pending: &mut Vec<AdmittedNativeCall>,
+) -> Vec<NativeBatchResult> {
+    futures::future::join_all(
+        std::mem::take(pending)
+            .into_iter()
+            .map(|call| execute_admitted_native_call(ctx, call)),
+    )
+    .await
+}
+
+/// Execute one provider-emitted native-call batch while preserving its result slots.
+///
+/// Consecutive calls that passed [`native_call_parallel_safe`] are polled together. Every fixed
+/// refusal/capture and every approval-sensitive or otherwise unproven call is an ordering barrier.
+/// `join_all` retains input order and does not spawn detached tasks: sibling failures remain local,
+/// and dropping this future for turn cancellation drops every in-flight call.
+async fn execute_native_call_batch(
+    ctx: &StagedContext,
+    slots: Vec<NativeBatchSlot>,
+) -> Vec<NativeBatchResult> {
+    let mut results = Vec::with_capacity(slots.len());
+    let mut pending = Vec::new();
+    for slot in slots {
+        match slot {
+            NativeBatchSlot::Execute(call) if call.parallel_safe => pending.push(call),
+            NativeBatchSlot::Execute(call) => {
+                results.extend(flush_parallel_native_calls(ctx, &mut pending).await);
+                results.push(execute_admitted_native_call(ctx, call).await);
+            }
+            NativeBatchSlot::Fixed(block) => {
+                results.extend(flush_parallel_native_calls(ctx, &mut pending).await);
+                results.push(NativeBatchResult::Fixed(block));
+            }
+        }
+    }
+    results.extend(flush_parallel_native_calls(ctx, &mut pending).await);
+    results
+}
+
 fn one_call_ast(op: &str, input: Value, bind: String) -> DraftAst {
     DraftAst {
         body: vec![Node::Bind {
@@ -2857,18 +3136,25 @@ fn observe(ctx: &StagedContext, kind: &str, data: Value) {
     sink.observation(&observation);
 }
 
+/// Record deterministic batch admission without pretending scheduler admission is live progress.
+/// Tool start/result callbacks still surface in real execution order through [`SharedSink`].
+fn observe_durable(ctx: &StagedContext, kind: &str, data: Value) {
+    ctx.executor
+        .observe(Observation::new(kind, EvidencePhase::Turn, data));
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use flux_core::{Chunk, StopReason};
     use flux_events::EventStore;
     use flux_provider::{ChunkStream, Request};
     use flux_runtime::{
-        AllowApprover, ApprovalChoice, Approver, PermissionManager, Tool, ToolContext,
-        ToolRegistry, ToolResult,
+        AllowApprover, ApprovalChoice, Approver, HookOutcome, PermissionManager, PreToolHook,
+        ResourceLimits, Tool, ToolContext, ToolRegistry, ToolResult,
     };
     use flux_spec::Idempotency;
     use flux_system::{System, Workspace};
@@ -3059,7 +3345,65 @@ mod tests {
         calls: Arc<AtomicU64>,
     }
 
+    struct NativeBatchBarrier {
+        entered: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        entered_notify: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for NativeBatchBarrier {
+        fn default() -> Self {
+            Self {
+                entered: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                entered_notify: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl NativeBatchBarrier {
+        async fn wait_for_entered(&self, expected: usize) {
+            loop {
+                let notified = self.entered_notify.notified();
+                if self.entered.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release(&self, permits: usize) {
+            self.release.add_permits(permits);
+        }
+    }
+
+    struct ActiveNativeCall<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveNativeCall<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BlockingGatherTool {
+        spec: ToolSpec,
+        barrier: Arc<NativeBatchBarrier>,
+    }
+
     struct CountingDenyApprover(Arc<AtomicU64>);
+
+    struct CountingContinueHook(Arc<AtomicUsize>);
+
+    impl PreToolHook for CountingContinueHook {
+        fn pre_tool(&self, _tool: &str, _input: &Value) -> HookOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            HookOutcome::Continue
+        }
+    }
 
     #[async_trait]
     impl Approver for CountingDenyApprover {
@@ -3083,6 +3427,34 @@ mod tests {
         async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult::ok(self.result.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl Tool for BlockingGatherTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+            self.barrier.entered.fetch_add(1, Ordering::SeqCst);
+            let active = self.barrier.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _active = ActiveNativeCall(&self.barrier.active);
+            self.barrier.max_active.fetch_max(active, Ordering::SeqCst);
+            self.barrier.entered_notify.notify_waiters();
+            let permit = self
+                .barrier
+                .release
+                .acquire()
+                .await
+                .map_err(|error| Error::Other(error.to_string()))?;
+            permit.forget();
+            if params["fail"].as_bool().unwrap_or(false) {
+                return Err(Error::Other("fixture gather failure".into()));
+            }
+            Ok(ToolResult::ok(
+                params["key"].as_str().unwrap_or_default().to_string(),
+            ))
         }
     }
 
@@ -3240,6 +3612,140 @@ mod tests {
             write_calls,
             _root: temp,
         }
+    }
+
+    fn blocking_model_stage_context(
+        responses: Vec<Vec<Chunk>>,
+    ) -> (
+        StagedContext,
+        Arc<Mutex<Vec<Request>>>,
+        Arc<NativeBatchBarrier>,
+        TempRoot,
+    ) {
+        blocking_model_stage_context_with(responses, true, ResourceLimits::new(), Vec::new())
+    }
+
+    fn blocking_model_stage_context_with(
+        responses: Vec<Vec<Chunk>>,
+        allow_without_approval: bool,
+        limits: ResourceLimits,
+        hooks: Vec<Arc<dyn PreToolHook>>,
+    ) -> (
+        StagedContext,
+        Arc<Mutex<Vec<Request>>>,
+        Arc<NativeBatchBarrier>,
+        TempRoot,
+    ) {
+        let operation = "blocking_inspect";
+        let tool_spec = ToolSpec {
+            description: "Inspect one fixture while the test controls completion".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "fail": {"type": "boolean"}
+                },
+                "required": ["key"],
+                "additionalProperties": false
+            }),
+            ..spec(
+                operation,
+                vec![Effect::Read, Effect::Filesystem],
+                vec![AccessKind::Filesystem],
+                None,
+            )
+        };
+        let barrier = Arc::new(NativeBatchBarrier::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BlockingGatherTool {
+            spec: tool_spec,
+            barrier: barrier.clone(),
+        }));
+        let temp = TempRoot::new("flux-native-batch-test");
+        let allow_rules = if allow_without_approval {
+            vec![operation.into()]
+        } else {
+            Vec::new()
+        };
+        let executor = Arc::new(
+            Executor::new(
+                registry,
+                PermissionManager::from_rules(&allow_rules, &[]),
+                Arc::new(AllowApprover),
+                ToolContext::new(Arc::new(System::new(Workspace::new(temp.path()).unwrap()))),
+            )
+            .with_hooks(hooks)
+            .with_resource_limits(limits),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(CaptureProvider {
+            responses: Mutex::new(responses.into()),
+            requests: requests.clone(),
+        });
+        let registry = executor.active_registry_snapshot();
+        let context = StagedContext {
+            provider,
+            model: "test-model".into(),
+            executor,
+            registry,
+            store: Arc::new(FlowStore::in_memory().unwrap()),
+            session_id: "native-batch-test".into(),
+            conversation: vec![Message::user_text("Inspect both fixture records")],
+            base_system: None,
+            sink: Arc::new(Mutex::new(NoopSink)),
+            audit: None,
+            advertised: HashSet::from([operation.into()]),
+            authored_ceiling: None,
+            groups: Vec::new(),
+            opts: StageOptions::default(),
+            remaining_token_budget: None,
+            adaptive_policy: AdaptiveLoopPolicy::default(),
+            steering: None,
+        };
+        (context, requests, barrier, temp)
+    }
+
+    fn blocking_model_stage_definition() -> ModelStageDefinition {
+        ModelStageDefinition {
+            prompt: "Inspect every requested record before returning.".into(),
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({
+                "type": "object",
+                "properties": {"complete": {"type": "boolean"}},
+                "required": ["complete"],
+                "additionalProperties": false
+            }),
+            model: None,
+            tools: vec!["blocking_inspect".into()],
+            max_tokens: 256,
+            effort: None,
+        }
+    }
+
+    fn ordered_tool_results(message: &Message) -> Vec<(String, bool, String)> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((
+                    tool_use_id.clone(),
+                    *is_error,
+                    content
+                        .iter()
+                        .filter_map(|part| match part {
+                            flux_core::ToolResultContent::Text { text } => Some(text.as_str()),
+                            flux_core::ToolResultContent::Image { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Test driver for the shipped two-stage path. Production control flow lives in
@@ -3438,6 +3944,398 @@ mod tests {
         spec.access = access;
         spec.group = group.map(str::to_string);
         spec
+    }
+
+    /// C-528 failing-first: one provider response carries two independent reads. The tool blocks
+    /// each execution until the test releases it, so concurrency is observed structurally rather
+    /// than inferred from elapsed time.
+    #[tokio::test]
+    async fn model_stage_native_batch_overlaps_independent_gather_calls() {
+        let responses = vec![
+            native_calls(vec![
+                ("read-first", "blocking_inspect", json!({"key": "first"})),
+                ("read-second", "blocking_inspect", json!({"key": "second"})),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let (context, requests, barrier, _root) = blocking_model_stage_context(responses);
+        let executor = context.executor.clone();
+        let definition = blocking_model_stage_definition();
+
+        let stage = run_model_stage(context, "batch_probe", definition, json!({}));
+        let controller = async {
+            let overlapped = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                barrier.wait_for_entered(2),
+            )
+            .await
+            .is_ok();
+            if overlapped {
+                barrier.release(2);
+            } else {
+                barrier.release(1);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    barrier.wait_for_entered(2),
+                )
+                .await
+                .expect("the serial baseline must eventually start the second call");
+                barrier.release(1);
+            }
+            overlapped
+        };
+        let (stage, overlapped) = tokio::join!(stage, controller);
+
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+        assert!(
+            overlapped,
+            "both independent reads must become active before either is released"
+        );
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 2);
+
+        let requests = requests.lock().unwrap();
+        let result_message = requests[1].messages.last().expect("batch result message");
+        let result_ids = ordered_tool_results(result_message)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids, ["read-first", "read-second"]);
+        let evidence = executor.evidence();
+        let admitted = evidence.by_kind("native.batch_call").collect::<Vec<_>>();
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0].data["call_index"], 0);
+        assert_eq!(admitted[0].data["call_id"], "read-first");
+        assert_eq!(admitted[1].data["call_index"], 1);
+        assert_eq!(admitted[1].data["call_id"], "read-second");
+        assert!(admitted
+            .iter()
+            .all(|observation| observation.data["disposition"] == "parallel_gather"));
+    }
+
+    #[tokio::test]
+    async fn adaptive_exploration_uses_the_shared_concurrent_native_batch() {
+        let responses = vec![
+            native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({
+                    "intent": "inspect both fixture records",
+                    "capability_families": ["workspace.read"]
+                }),
+            ),
+            native_calls(vec![
+                (
+                    "adaptive-first",
+                    "blocking_inspect",
+                    json!({"key": "first"}),
+                ),
+                (
+                    "adaptive-second",
+                    "blocking_inspect",
+                    json!({"key": "second"}),
+                ),
+            ]),
+            prose("Both records were inspected."),
+        ];
+        let (context, requests, barrier, _root) = blocking_model_stage_context(responses);
+
+        let exploration = run(context);
+        let controller = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                barrier.wait_for_entered(2),
+            )
+            .await
+            .expect("adaptive exploration must start both independent calls");
+            barrier.release(2);
+        };
+        let (exploration, ()) = tokio::join!(exploration, controller);
+
+        assert_eq!(exploration.result.unwrap()["kind"], "chat");
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 2);
+        let requests = requests.lock().unwrap();
+        let results = ordered_tool_results(
+            requests[2]
+                .messages
+                .last()
+                .expect("adaptive batch result message"),
+        );
+        assert_eq!(results[0].0, "adaptive-first");
+        assert_eq!(results[1].0, "adaptive-second");
+    }
+
+    #[tokio::test]
+    async fn native_batch_obeys_the_runtime_concurrency_ceiling() {
+        let responses = vec![
+            native_calls(vec![
+                ("read-1", "blocking_inspect", json!({"key": "one"})),
+                ("read-2", "blocking_inspect", json!({"key": "two"})),
+                ("read-3", "blocking_inspect", json!({"key": "three"})),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let limits = ResourceLimits::new()
+            .with_max_concurrent_tool_calls(2)
+            .with_tool_call_queue_timeout(std::time::Duration::from_secs(1));
+        let (context, _requests, barrier, _root) =
+            blocking_model_stage_context_with(responses, true, limits, Vec::new());
+
+        let stage = run_model_stage(
+            context,
+            "bounded_batch",
+            blocking_model_stage_definition(),
+            json!({}),
+        );
+        let controller = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                barrier.wait_for_entered(2),
+            )
+            .await
+            .expect("two calls must occupy the two runtime slots");
+            assert_eq!(barrier.active.load(Ordering::SeqCst), 2);
+            barrier.release(1);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                barrier.wait_for_entered(3),
+            )
+            .await
+            .expect("the queued third call must start after a slot is released");
+            barrier.release(2);
+        };
+        let (stage, ()) = tokio::join!(stage, controller);
+
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+        assert_eq!(barrier.entered.load(Ordering::SeqCst), 3);
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn native_batch_queue_timeout_is_an_ordered_actionable_result() {
+        let responses = vec![
+            native_calls(vec![
+                ("held", "blocking_inspect", json!({"key": "held"})),
+                ("timed-out", "blocking_inspect", json!({"key": "queued"})),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let limits = ResourceLimits::new()
+            .with_max_concurrent_tool_calls(1)
+            .with_tool_call_queue_timeout(std::time::Duration::from_millis(25));
+        let (context, requests, barrier, _root) =
+            blocking_model_stage_context_with(responses, true, limits, Vec::new());
+
+        let stage = run_model_stage(
+            context,
+            "timed_batch",
+            blocking_model_stage_definition(),
+            json!({}),
+        );
+        let controller = async {
+            barrier.wait_for_entered(1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            barrier.release(1);
+        };
+        let (stage, ()) = tokio::join!(stage, controller);
+
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+        assert_eq!(barrier.entered.load(Ordering::SeqCst), 1);
+        let requests = requests.lock().unwrap();
+        let results = ordered_tool_results(
+            requests[1]
+                .messages
+                .last()
+                .expect("ordered queue-timeout result message"),
+        );
+        assert_eq!(results[0], ("held".into(), false, "held".into()));
+        assert_eq!(results[1].0, "timed-out");
+        assert!(results[1].1);
+        assert!(results[1].2.contains("max_concurrent_tool_calls"));
+        assert!(results[1].2.contains("Retry once a call completes"));
+    }
+
+    #[tokio::test]
+    async fn approval_sensitive_native_gather_calls_remain_ordered() {
+        let responses = vec![
+            native_calls(vec![
+                ("approval-1", "blocking_inspect", json!({"key": "one"})),
+                ("approval-2", "blocking_inspect", json!({"key": "two"})),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let (context, _requests, barrier, _root) =
+            blocking_model_stage_context_with(responses, false, ResourceLimits::new(), Vec::new());
+
+        let stage = run_model_stage(
+            context,
+            "approval_batch",
+            blocking_model_stage_definition(),
+            json!({}),
+        );
+        let controller = async {
+            barrier.wait_for_entered(1).await;
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    barrier.wait_for_entered(2),
+                )
+                .await
+                .is_err(),
+                "an approval-sensitive sibling must not overlap the active call"
+            );
+            barrier.release(1);
+            barrier.wait_for_entered(2).await;
+            barrier.release(1);
+        };
+        let (stage, ()) = tokio::join!(stage, controller);
+
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hooks_are_a_conservative_native_batch_barrier() {
+        let responses = vec![
+            native_calls(vec![
+                ("hook-1", "blocking_inspect", json!({"key": "one"})),
+                ("hook-2", "blocking_inspect", json!({"key": "two"})),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hooks: Vec<Arc<dyn PreToolHook>> =
+            vec![Arc::new(CountingContinueHook(hook_calls.clone()))];
+        let (context, _requests, barrier, _root) =
+            blocking_model_stage_context_with(responses, true, ResourceLimits::new(), hooks);
+
+        let stage = run_model_stage(
+            context,
+            "hook_batch",
+            blocking_model_stage_definition(),
+            json!({}),
+        );
+        let controller = async {
+            barrier.wait_for_entered(1).await;
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    barrier.wait_for_entered(2),
+                )
+                .await
+                .is_err(),
+                "authorize-only cannot prove a hook-rewritten sibling remains independent"
+            );
+            barrier.release(1);
+            barrier.wait_for_entered(2).await;
+            barrier.release(1);
+        };
+        let (stage, ()) = tokio::join!(stage, controller);
+
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn native_batch_failure_keeps_successful_siblings_and_provider_order() {
+        let responses = vec![
+            native_calls(vec![
+                (
+                    "failed-first",
+                    "blocking_inspect",
+                    json!({"key": "first", "fail": true}),
+                ),
+                (
+                    "successful-second",
+                    "blocking_inspect",
+                    json!({"key": "second"}),
+                ),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let (context, requests, barrier, _root) = blocking_model_stage_context(responses);
+
+        let stage = run_model_stage(
+            context,
+            "failure_batch",
+            blocking_model_stage_definition(),
+            json!({}),
+        );
+        let controller = async {
+            barrier.wait_for_entered(2).await;
+            barrier.release(2);
+        };
+        let (stage, ()) = tokio::join!(stage, controller);
+
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+        let requests = requests.lock().unwrap();
+        let results = ordered_tool_results(
+            requests[1]
+                .messages
+                .last()
+                .expect("mixed batch result message"),
+        );
+        assert_eq!(results[0].0, "failed-first");
+        assert!(results[0].1);
+        assert!(results[0].2.contains("fixture gather failure"));
+        assert_eq!(
+            results[1],
+            ("successful-second".into(), false, "second".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_batch_leaves_no_detached_tool_execution() {
+        let responses = vec![native_calls(vec![
+            ("cancel-1", "blocking_inspect", json!({"key": "one"})),
+            ("cancel-2", "blocking_inspect", json!({"key": "two"})),
+        ])];
+        let (context, _requests, barrier, _root) = blocking_model_stage_context(responses);
+
+        {
+            let stage = run_model_stage(
+                context,
+                "cancelled_batch",
+                blocking_model_stage_definition(),
+                json!({}),
+            );
+            tokio::pin!(stage);
+            tokio::select! {
+                () = barrier.wait_for_entered(2) => {}
+                result = &mut stage => panic!("batch returned before cancellation: {:?}", result.result),
+            }
+            assert_eq!(barrier.active.load(Ordering::SeqCst), 2);
+        }
+
+        assert_eq!(
+            barrier.active.load(Ordering::SeqCst),
+            0,
+            "dropping the owning turn future must drop every in-flight sibling"
+        );
     }
 
     #[tokio::test]
@@ -4568,6 +5466,25 @@ mod tests {
         assert!(gather_safe(
             &network_read,
             flux_spec::StagingDisposition::Infer,
+            flux_spec::IntentSet::new(),
+            &[]
+        ));
+
+        // C-528 live connector-metadata constraint: generated connector specs commonly declare
+        // `Network` without the truthful `Read`/`Write` half today. Low risk and idempotency cannot
+        // turn that incomplete metadata into gather authority; the connector contract must first
+        // say both `Network` and `Read` explicitly.
+        let mut network_only = spec(
+            "connector.get",
+            vec![Effect::Network],
+            vec![AccessKind::Network],
+            None,
+        );
+        network_only.risk = Risk::Low;
+        network_only.idempotency = Idempotency::Idempotent;
+        assert!(!gather_safe(
+            &network_only,
+            flux_spec::StagingDisposition::Gather,
             flux_spec::IntentSet::new(),
             &[]
         ));

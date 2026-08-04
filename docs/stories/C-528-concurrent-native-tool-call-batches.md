@@ -2,7 +2,7 @@
 id: C-528
 title: "Execute independent native tool calls from one model response concurrently"
 pillar: Core
-status: ready
+status: in-progress
 priority: 30
 areas: [flux-flow, flux-runtime]
 note: "Flux-Lang parallel branches and runtime concurrency ceilings already exist, but the native agent loop awaits every model-emitted call in serial order; one response with N independent reads therefore pays N tool latencies"
@@ -65,6 +65,15 @@ it to bound.
 - 2026-08-04: filed from direct source inspection. `staged.rs` serializes model-stage gather calls at
   the loop beginning near line 811 and adaptive exploration calls at the loop beginning near line
   1329 on `7744f27d`. No existing story names or accepts native model-response batch concurrency.
+- 2026-08-04: implementation started from dispatched `origin/main` commit `8d017935`; the primary
+  checkout and its user-owned changes remain untouched in a dedicated story worktree.
+- 2026-08-04: failing-first evidence recorded by
+  `model_stage_native_batch_overlaps_independent_gather_calls`: the serial baseline reached
+  `max_active == 1` and failed because the second read could not start before the first was
+  released. One shared classifier/batch executor now serves model stages and adaptive exploration;
+  the focused `flux-flow` suite and clippy are green. Pre-tool hooks, active cassettes,
+  approval-sensitive calls, non-idempotent calls, and incomplete `Network`-without-`Read` metadata
+  remain ordered or captured.
 
 ## Notes
 
