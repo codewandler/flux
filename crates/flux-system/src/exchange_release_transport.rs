@@ -277,7 +277,7 @@ fn signature_basename(metadata_basename: &str, key_id: &SigningKeyId) -> String 
 }
 
 /// Bytes fetched under the fixed transport ceiling, still awaiting provider authentication.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FetchedReleaseBytes(Vec<u8>);
 
 impl FetchedReleaseBytes {

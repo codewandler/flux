@@ -67,12 +67,14 @@
 //!   non-HTTP schemes, then resolves the host and refuses the destination if **any** answer is
 //!   private, loopback, link-local, unique-local, CGNAT, or an IPv4-mapped form of those — so a
 //!   hostname pointing at `169.254.169.254` cannot slip through — unless the caller's
-//!   [`net::PrivateNetAllow`] scope covers that host. *This is a guard you call, not an ambient
-//!   one:* this crate performs no HTTP of its own. [`net::dial_scoped`] is safe by construction —
-//!   it connects to the vetted addresses inside the guard — but the URL-returning guards hand back
-//!   only a `Url`, and a caller whose HTTP client re-resolves that hostname reopens the
-//!   DNS-rebinding TOCTOU. That is what [`net::guard_url_scoped_pinned`] is for: bind the client to
-//!   the addresses it returns. The same one guard covers every IP [`net::DialTarget`] — TCP, UDP and
+//!   [`net::PrivateNetAllow`] scope covers that host. *This is normally a guard callers consume,
+//!   not an ambient policy.* The sole in-crate HTTP exception is the closed
+//!   [`exchange_release_transport`] broker: its origins, one-hop redirect grammar, media, deadlines
+//!   and byte ceilings are fixed, and each credential-free request connects only to addresses
+//!   returned by [`net::guard_url_scoped_pinned`]. [`net::dial_scoped`] is likewise safe by
+//!   construction — it connects to the vetted addresses inside the guard — but other callers of
+//!   URL-returning guards must bind their HTTP client to those addresses or a re-resolution can
+//!   reopen the DNS-rebinding TOCTOU. The same one guard covers every IP [`net::DialTarget`] — TCP, UDP and
 //!   raw ICMP alike; a datagram target does not get a second, softer policy. Raw ICMP additionally
 //!   requires the privilege to open a raw socket (`CAP_NET_RAW` on Linux, root on macOS), refused at
 //!   construction and named in the error rather than discovered on the wire — see
