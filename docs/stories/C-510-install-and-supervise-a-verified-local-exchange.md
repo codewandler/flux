@@ -6,7 +6,7 @@ status: ready
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/managed-exchange-lifecycle.md
-note: "Queued behind corrected X-134/X-126: lifecycle exposes only a guard-bound fixed helper with closed request/result pipes"
+note: "Queued behind X-134 implementation and X-126: lifecycle exposes only typed guard-bound ceremony and mint launches"
 ---
 
 # Install and supervise a verified local Exchange release
@@ -17,11 +17,11 @@ Make `flux exchange local start|status|stop` a trustworthy clean-machine lifecyc
 compatible Exchange build in the separately signed stable channel. A hidden instance of the same
 shipped Flux binary supervises the Exchange child for its entire lifetime; later commands
 authenticate to that supervisor instead of rediscovering or signalling a process. C-510 alone owns
-release selection, installation, cache verification and process lifecycle. It gives C-509 only a
-non-path capability bound to the already-selected verified executable for launching the provider's
-fixed onboarding helper mode over one bounded request pipe and one distinct bounded terminal-result
-pipe. Flux remains a client and process owner, never an Exchange runtime, binary distributor or
-vendor-credential holder.
+release selection, installation, cache verification and process lifecycle. It gives C-509 only two
+non-path capabilities bound to the already-selected verified executable: a fixed vendor ceremony
+with one bounded request pipe and a distinct bounded terminal-result pipe, and a separate fixed
+Service Account mint with only its FXSA writer. Flux remains a client and process owner, never an
+Exchange runtime, binary distributor or vendor-credential holder.
 
 ## Acceptance
 
@@ -45,11 +45,11 @@ vendor-credential holder.
       `local_management=exchange.local-management.v1`,
       `service_account_handoff=exchange.service-account-handoff.v1` and
       `supervisor=exchange.supervisor-ready.v2`. X-129 proves the four unchanged HTTP v1 identities;
-      X-134 proves the plan-v2, local-management-v1 and handoff-v1 identities and advances only the
-      readiness schema/inventory to v2. A package version, local alias or X-125's superseded plan-v1
-      evidence proves none of those changed bytes. Channel selection reads all eight values from the
-      signed channel entry; the selected manifest, compatibility output and readiness record must
-      later agree exactly.
+      X-134 implementation must prove the plan-v2, local-management-v1 and handoff-v1 identities and
+      advance only the readiness schema/inventory to v2. A package version, local alias or X-125's
+      superseded plan-v1 evidence proves none of those changed bytes. Channel selection reads all
+      eight values from the signed channel entry; the selected manifest, compatibility output and
+      readiness record must later agree exactly.
 - [ ] Exchange X-126/X-128/X-134 own the exact canonical schemas and positive/adversarial fixtures:
       `exchange.release-trust.v1` (at most 64 KiB, 1..=4 keys per delegated role),
       `exchange.release-channel.v2` (at most 256 KiB and 1..=128 release entries),
@@ -180,13 +180,13 @@ vendor-credential holder.
       instance or deletes a known-good install before its replacement is verified.
 - [ ] Successful verification returns a non-path `VerifiedInstallGuard` bound to the opened install,
       opened executable and complete verified identity. C-510 retains that guard through every
-      lifecycle spawn and supplies C-509 only an in-process helper-launch capability bound to the
-      already-selected guard for the owned instance. For vendor-secret onboarding the capability
+      lifecycle spawn and supplies C-509 only two typed in-process launch operations bound to the
+      already-selected guard and authenticated owned instance. For vendor ceremony the operation
       accepts only one at-most-65,548-byte canonical non-secret initiating frame, creates a one-way
       helper request pipe and a distinct one-way terminal-result pipe, and launches only X-134's fixed verified
       helper mode of that exact executable. It exposes no path, executable handle, caller-selected
       program or mode, arbitrary/extra argv, alternate binary, endpoint, tenant, address, cwd,
-      environment, secret, FXLM operation, raw FD/HANDLE, lifecycle mutation/status field or generic
+      environment, secret, arbitrary FXLM operation, raw FD/HANDLE, lifecycle mutation/status field or generic
       process primitive; C-509 cannot search `PATH`, reopen the cache or weaken verification. The
       response side accepts exactly one at-most-65,548-byte value-free receipt or error plus EOF. C-509 owns when
       to launch and how to project that terminal result, never helper process construction or the
@@ -195,14 +195,39 @@ vendor-credential holder.
       On Unix it executes only `flux-exchange local vendor-secret` with no additional arguments,
       maps the request read end to FD 6 and terminal-result write end to FD 7, closes reserved FXSA
       FD 5, closes every unused pipe end and every other descriptor at or above 3, clears the
-      environment, uses null standard streams and derives the provider-root cwd from the guard. On
+      environment and uses null standard streams. On
       Windows it executes only `flux-exchange local vendor-secret --request-handle <REQUEST>
       --response-handle <RESPONSE>` in that order with distinct nonzero canonical decimal HANDLEs;
       `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` contains exactly those two handles, every unused handle is
-      non-inheritable, the environment is cleared, standard streams use `NUL`, and cwd is guard-derived.
-      The helper's direct TTY/browser access is not routed through Flux pipes. If corrected X-134 lands
-      different names or bytes, this story must be amended to those committed provider fixtures before
-      implementation rather than supporting both contracts.
+      non-inheritable, the environment is cleared and standard streams use `NUL`.
+      Every connect and credential acquire/rotate uses this operation, including settings-only
+      zero-secret create. The helper's direct TTY/browser access is not routed through Flux pipes.
+      C-510 finishes request write plus EOF by the absolute deadline five seconds from spawn and,
+      from request EOF, applies one absolute 335-second terminal-result deadline that traffic cannot
+      reset. Within those Flux-owned outer deadlines, X-134 assigns the helper five seconds of
+      pre-ceremony work plus 300 predecision and 30 postdecision seconds; C-510 does not observe
+      helper connections or traffic.
+      Stdout/stderr are empty. Exit 0 follows a complete result frame plus EOF for either receipt or
+      application refusal; exit 1 is reserved for capability, transport or result-write failure that
+      prevents that contract. Missing terminal output permits only byte-identical helper replay. The
+      accepted X-134 names and bytes are the sole provider contract; C-510 must consume their
+      implemented fixtures verbatim rather than supporting an alternate contract.
+- [ ] The second launch operation is Service Account mint and cannot invoke or inherit ceremony
+      pipes. Unix executes only `flux-exchange local service-account-mint --id <id> --expires-at
+      <canonical-decimal> --writer-fd 5`, maps only C-509's dedicated FXSA writer to FD 5 and closes
+      every other nonstandard descriptor. Windows executes the same fixed mode with
+      `--writer-handle <canonical-decimal>` in place of `--writer-fd 5`; the exact writer HANDLE is
+      the complete `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` and every other handle is non-inheritable.
+      Neither typed launch operation accepts a caller-selected program, mode, endpoint, tenant,
+      address, cwd, environment, extra argv or raw handle.
+- [ ] Both helper modes derive their fixed cwd and native endpoint from the authenticated owned
+      instance's OS-account native root: Linux uses `getpwuid_r(geteuid()).pw_dir/.local/state/flux-exchange`,
+      macOS uses `getpwuid_r(geteuid()).pw_dir/Library/Application Support/Flux/Exchange`, and Windows
+      uses `SHGetKnownFolderPath(FOLDERID_LocalAppData)/Flux/Exchange`. They never install or cache
+      guard identity, caller input, or inherited `HOME`/XDG/profile environment as placement identity.
+      Unix uses `<native-root>/run/local-management-v1.sock`; Windows uses X-134's SID-derived
+      `\\.\pipe\flux-exchange-local-management-v1-<sid-hash>`. The helper rederives and authenticates
+      that endpoint rather than receiving it from Flux or inheriting it from the environment.
 
 ### Same-binary supervision, authenticated control and child identity
 
@@ -328,7 +353,7 @@ vendor-credential holder.
 
 ### Failing-first proof and release boundary
 
-- [ ] After X-134 lands, Flux runs only X-126's canonical provider-owned
+- [ ] After X-134 implementation and X-126 publication, Flux runs only X-126's canonical provider-owned
       `tests/fixtures/exchange-release-v2/` positive and adversarial conformance corpus verbatim,
       including its test root/delegated keys, X-128 native cases and X-134 protocol identities. Its
       checked `fixture-set.json` relative-file inventory, Exchange commit and SHA-256 digest fail if
@@ -355,13 +380,19 @@ vendor-credential holder.
       crash, readiness timeout/second frame/wrong bind/wrong start identity/wrong build, diagnostic
       flooding and every JSON state/exit pair. They prove later commands never exercise a PID-signal
       seam, supervisor death leaves no Exchange descendant, and a changed exemption/readiness/status
-      field fails from both producer and consumer sides. Failing-first helper-launch tests prove the
-      program and mode cannot be selected by a caller; Unix receives only FD 6 read/FD 7 write with
-      FD 5, unused pipe ends and all other nonstandard descriptors closed; Windows inherits exactly
-      the two named HANDLEs through the closed list; and neither platform admits caller endpoint,
-      tenant, address, cwd, environment, extra argv or raw-handle input. Bounds, one frame plus EOF in
-      each direction, distinct pipes, a value-free terminal-only response and guard-pinned executable
-      identity are exercised with real child processes.
+      field fails from both producer and consumer sides. Failing-first typed-launch tests prove the
+      program and mode cannot be selected by a caller. Ceremony tests prove Unix receives only FD 6
+      read/FD 7 write with FD 5, unused pipe ends and all other nonstandard descriptors closed, while
+      Windows inherits exactly the two named HANDLEs through the closed list. Mint tests independently
+      prove Unix inherits only writer FD 5 and Windows only its one listed writer HANDLE, with no
+      ceremony pipe shared. Neither platform admits caller endpoint, tenant, address, cwd, environment,
+      extra argv or raw-handle input. Tests derive cwd/endpoint from each OS-account native-root fixture
+      while hostile install/cache identities and `HOME`/XDG/profile values cannot redirect either.
+      Bounds, one frame plus EOF in each direction, distinct ceremony pipes, a value-free terminal-only
+      response and guard-pinned executable identity are exercised with real child processes. Injected
+      monotonic-clock fixtures fail first at request-write/EOF 4/5 seconds and result 334/335 seconds,
+      prove traffic resets no deadline, and cover empty stdout/stderr, receipt/application-refusal exit
+      0, capability/transport/result-write exit 1 and missing-result byte-identical replay only.
 - [ ] The managed executable remains a separately downloaded Exchange artifact, never an official
       integration plugin, connector runtime, crates.io artifact or binary copied into Flux's release.
       The two products remain an HTTP process boundary and may use different Rust engine dependency
@@ -391,18 +422,20 @@ vendor-credential holder.
   readiness v2; the exact eight-field inventory; X-134 as a direct dependency; and only X-126's
   future post-X-134 `tests/fixtures/exchange-release-v2/` corpus. This documentation repair claims
   neither C-510 implementation nor provider conformance.
-- 2026-08-04: Reconciled the helper-launch capability to roadmap commit
-  `ecd327ba8a4036889a91a943e952b3e54857e096`: it is now a fixed verified program/mode with one
-  bounded request pipe, one distinct bounded terminal-result pipe, an exact Unix FD mapping and a
-  closed Windows HANDLE list. C-510 remains `ready` with every acceptance item open and cannot resume
-  implementation until corrected X-134 has one internally consistent committed byte contract.
+- 2026-08-04: Reconciled the launch boundary to roadmap commit
+  `4511f44b4defcb6de92ab8fc1b56bd5b4356ca78`: vendor ceremony and Service Account mint are now
+  distinct typed guard-bound operations with closed platform ABIs, OS-account-root placement and
+  absolute deadline/exit/replay rules. C-510 remains `ready` with every acceptance item open and
+  cannot resume implementation until X-134 implementation and X-126's post-X-134 release-v2 fixture
+  gates are satisfied.
 
 ## Notes
 
 - Cross-repository authority is flux-roadmap Decisions 0004 and 0007 at coordinator commit
-  `ecd327ba8a4036889a91a943e952b3e54857e096`; the canonical Flux baseline inspected for this
-  amendment is `1f3283517f98818d09cd3cdb9e1c77ce8c485852` and the canonical Exchange baseline is
-  `9e84f77c1a6db60b967b0fb887198a14af26cd30`.
+  `4511f44b4defcb6de92ab8fc1b56bd5b4356ca78`; the canonical Flux baseline inspected for this
+  amendment is `1f3283517f98818d09cd3cdb9e1c77ce8c485852`. Canonical Exchange merge
+  `3b16bcb5b1c52984449118775125fe66da1686da` contains accepted X-134 contract head
+  `9dc414c76f231bd179358fd526019a16872a7be1`.
 - Direct dependencies are Exchange X-126 (root-signed trust metadata, signed monotonic channel,
   immutable release manifests/artifacts and the future canonical v2 fixture inventory), X-128 (the
   unchanged readiness/liveness capability ABI) and X-134 (plan v2, local management, Service
@@ -415,10 +448,12 @@ vendor-credential holder.
   consumes those provider identities but does not redefine them.
 - The hidden supervisor is same-binary Flux control-plane code, not a daemon found on `PATH`. The
   Exchange child is still a separately released product and owns all credential-bearing surfaces.
-- Roadmap dependency order keeps C-510 `ready` but queued behind X-134 and X-126. No acceptance item
-  is complete and implementation must not begin from the obsolete provider corpus.
-- Corrected X-134 remains the byte authority. Its current in-flight story/design candidate agrees on
-  the values recorded here, including the newly separated plan-validation and secret-ceremony peers,
-  but those corrections are not canonical until committed with fixtures. C-510 must consume one
-  committed provider story/design/fixture result verbatim; it must not invent local spellings,
-  alternate timing, support both candidates or start implementation before that landing.
+- Roadmap dependency order keeps C-510 `ready` but queued behind X-134 implementation and X-126
+  publication. No acceptance item is complete and implementation must not begin from the obsolete
+  provider corpus.
+- Canonical Exchange merge `3b16bcb5b1c52984449118775125fe66da1686da` and its accepted X-134
+  contract head `9dc414c76f231bd179358fd526019a16872a7be1` are the exact-byte authority. This does
+  not satisfy the connectors C-515 registry-release gate, claim X-134 implementation or provide
+  X-126's post-X-134 release-v2 fixtures. C-510 must consume the implemented provider result
+  verbatim; it must not invent a local spelling, selection, target partition, connection timing or
+  byte contract or support an alternate contract.
