@@ -257,6 +257,13 @@ flux test [<name>]               # replay those fixtures offline as a test gate 
                                  #   so it works as a CI gate; --json for a machine-readable report
 flux plugin install <name>       # the plugin CLI — verified install from the signed plugin pack (@<version>, --all;
                                  #   --dir registers local builds); also ls / status / call / pin / rollback / uninstall / skill
+flux exchange local status      # managed local Exchange lifecycle surface (start/status/stop);
+                                 #   currently makes no change and returns a typed unsupported refusal
+                                 #   until the signed release/lifecycle contract ships; --json is stable
+flux integration list           # labelled Exchange connection surface (connect/grant/list/doctor);
+                                 #   currently makes no change and returns a typed unsupported refusal
+                                 #   until provider onboarding contracts ship; credential flags and
+                                 #   unclassified connection fields are not accepted
 flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mock / terminal-bench / multi);
                                  #   --watch streams the agent live, --report out.md writes a categorized report
 flux review --files a.rs b.rs    # run the embedded strict-review protocol over the files and print a
