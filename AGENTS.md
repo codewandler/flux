@@ -22,6 +22,10 @@ only repository policy that must be known before acting. Product documentation s
   non-trivial design decisions in [docs/designs/](docs/designs/).
 - Add a failing-first test for behavioral changes. Keep the story/design and changelogs consistent
   with the finished behavior; user-visible changes also belong in `WHATS-NEW.md`.
+- Before opening a pull request or entering any publication path, regenerate the committed public
+  documentation mirror with `scripts/build-embedded-docs.sh`, commit
+  `crates/flux-server/assets/public-docs.zip` when it changes, then run
+  `scripts/build-embedded-docs.sh --check` against that committed checkout.
 - Make the smallest coherent change, preserve unrelated work, run the relevant gate, and report any
   check that could not be run.
 

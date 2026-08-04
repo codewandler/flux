@@ -9,6 +9,20 @@ standalone contracts and capabilities that external consumers depend on directly
 dependent resolves its deps from the index.
 The authoritative list is the `CRATES` array in `scripts/publish-crates-io.sh` — this doc mirrors it.
 
+Every candidate and publication starts from a committed embedded-doc transaction. Before opening
+the release pull request or pushing a candidate ref, run this sequence in order:
+
+```sh
+scripts/build-embedded-docs.sh
+# When the archive changed, include it in the release/implementation commit.
+git add crates/flux-server/assets/public-docs.zip
+git commit
+scripts/build-embedded-docs.sh --check
+```
+
+The final check is against the committed checkout. The exact-SHA candidate workflow repeats it with
+the pinned Node/npm website dependencies before the full gate, receipt, artifact builds, or publish.
+
 > Status: **live.** The SDK closure (20 crates) shipped in v0.9.3. The plugin authoring surface (4
 > crates: datasource, credentials, plugin, host-kit) ships with v0.9.4; host-kit left the closure in
 > 0.29.0 (C-146) and `flux-plugin-protocol` joined it. All vanity-prefixed

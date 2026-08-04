@@ -38,6 +38,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Embedded public documentation freshness is now a mandatory PR and publication gate** (C-515).
+  The unfiltered pull-request workflow and exact-SHA release candidate both install the pinned
+  website dependencies and verify `public-docs.zip`; website publication checks before upload or
+  deployment. Contributor and release guidance now require regeneration, inclusion of a changed
+  archive in the same commit, and a post-commit freshness check.
+
 - **Datasources now carry the family's one declared read-only definition** (C-514). flux-roadmap
   Decision 0006 governs the vocabulary: a datasource is a named, declared, read-only record surface
   — *operations do; datasources know* — with exactly one access mode (indexed or live), one

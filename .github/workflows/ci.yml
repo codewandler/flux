@@ -28,6 +28,28 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
+      # The committed server archive mirrors the rendered public website. This stays in the
+      # unfiltered PR workflow: generated website content can change from sources outside
+      # website/**, so a path filter would admit a stale archive.
+      - name: Install pinned website toolchain
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install pinned website dependencies
+        run: npm ci
+        working-directory: website
+
+      - name: Embedded documentation matches the public website
+        run: scripts/build-embedded-docs.sh --check
+
+      - name: Publication workflow contracts
+        run: |
+          scripts/test-embedded-docs-gates.sh
+          scripts/test-release-candidate.sh
+
       - name: Install Rust toolchain
         # Pinned, not `stable`: every Rust release ships new clippy lints that `-D warnings`
         # promotes to errors, so a floating CI toolchain breaks on code that is clean locally
