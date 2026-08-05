@@ -1953,7 +1953,8 @@ pub(super) async fn build_agent_with(
 
     // C-503: one native Service Account client, compiled into the Flux binary. The two values are
     // transitional host startup configuration and never operation/model input; C-509 replaces the
-    // environment bearer with an Exchange-owned direct handoff into secure storage. A partial or
+    // environment bearer only for managed Linux-local bootstrap. Independently provisioned remote
+    // Exchange use retains this seam on every Flux target until secure remote provisioning. A partial or
     // unavailable binding leaves core Flux intact and advertises no Exchange operation; the
     // turn-boundary refresher retries and publishes only complete effective generations through
     // C-318's live catalogue.

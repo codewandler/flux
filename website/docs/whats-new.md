@@ -48,7 +48,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   closed command shapes. Their current deterministic `unsupported` response is a temporary gate,
   not the final local-lifecycle or integration result contract. Until the compatible Exchange
   release and Flux lifecycle manager ship, the commands make no changes, setting values stay out of
-  diagnostics, and credential or token arguments are not accepted.
+  diagnostics, and credential or token arguments are not accepted. The final managed lifecycle and
+  owner onboarding run only on the two Linux GNU targets; other Flux targets keep the commands but
+  return a typed side-effect-free platform refusal and may still use a separately provisioned Linux
+  Exchange through the authenticated runtime HTTP client.
 
 - **Flux can now use operations granted to an Exchange Service Account.** Set the Exchange URL and
   Service Account token in the host environment. Flux refreshes the available operations between

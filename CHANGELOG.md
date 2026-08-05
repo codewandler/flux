@@ -158,8 +158,11 @@ All notable changes to this project are documented in this file. The format is b
 
 - **The Exchange environment bearer is now documented as transitional compatibility** (C-511).
   C-503's lower-level embedded-client setup remains available and redacted, but public and
-  contributor guidance no longer presents it as the Milestone 1 bootstrap: C-509 replaces it with
-  an Exchange-owned direct handoff into secure storage.
+  contributor guidance no longer presents it as the managed Linux-local Milestone 1 bootstrap:
+  C-509 replaces it there with an Exchange-owned direct handoff into secure storage. Independently
+  provisioned remote Exchange use retains the configured origin/bearer on every Flux target until a
+  separate secure remote provisioning contract lands. This Decision 0012 correction changes no
+  shipped lifecycle behavior.
 
 - **Direct dependency changes are now explicit review events** (C-450). CI compares each workspace's
   exact resolved direct edges with a committed review lock, including which selected packages run a

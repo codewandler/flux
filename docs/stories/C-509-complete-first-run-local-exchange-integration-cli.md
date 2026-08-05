@@ -1,27 +1,64 @@
 ---
 id: C-509
-title: "Complete the first-run local Exchange and integration CLI tutorial"
+title: "Complete Linux-local onboarding and cross-platform Exchange use"
 pillar: Core
 status: ready
 priority: 0
 epic: connector-native-integrations
 design: docs/designs/managed-exchange-lifecycle.md
-note: "Queued behind X-134 implementation, X-126 and C-510: C-509 owns native plan/grant UX and typed ceremony/mint inputs, never secret-bearing FXLM"
+note: "Queued behind X-134/X-126/C-510: owner onboarding is Linux-local; every Flux target retains the authenticated remote runtime client"
 ---
 
-# Complete the first-run local Exchange and integration CLI tutorial
+# Complete Linux-local onboarding and cross-platform Exchange use
 
 ## Goal
 
-Make the complete first-run tutorial real from one Flux installation: a person starts the local
-Exchange, creates labelled company GitLab and Jira connections from their complete connector-declared
+Make the complete first-run tutorial real on supported Linux from one Flux installation: a person
+starts the local Exchange, creates labelled company GitLab and Jira connections from their complete connector-declared
 settings, grants their authority, verifies the effective tools and uses them from Flux without Flux
-ever receiving vendor credentials. The only Exchange runtime credential that crosses into Flux is
-one Service Account token frame delivered directly to C-509's dedicated receiving writer and stored
-behind an opaque runtime reference. A verified Exchange helper, not Flux, owns every secret-bearing
+ever receiving vendor credentials. In the managed Linux-local bootstrap, the only Exchange runtime
+credential that crosses into Flux is one Service Account token frame delivered directly to C-509's
+dedicated receiving writer and stored behind an opaque runtime reference. A verified Exchange helper, not Flux, owns every secret-bearing
 local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its terminal result.
+On every Flux platform, the existing authenticated Service Account HTTP client may separately use an
+operator-provisioned Linux Exchange for catalogue discovery and invocation.
 
 ## Acceptance
+
+### Decision 0012 local/remote split
+
+- [ ] All owner-authenticated FXLM plan/grant operations, vendor-input helper launches, FXSA mint
+      handoff, local endpoint/status consumption and secure local Service Account bootstrap execute
+      only with C-510's owned Exchange on `aarch64-unknown-linux-gnu` or
+      `x86_64-unknown-linux-gnu`; only FDs 5/6/7 remain and there is no non-Linux helper ABI.
+- [ ] On macOS, Windows and unsupported Linux triples, `flux exchange local ...` returns C-510's
+      lifecycle status `unsupported_platform`. A C-509 command requiring native plan, connect,
+      credential acquire/rotate, grant or mint instead returns its integration-owned value-free
+      refusal: JSON `{ "ok":false, "category":"unsupported_platform", "command":"<integration command>" }`,
+      human `refused [unsupported_platform]: <integration command>`, and integration exit 1. It does
+      not synthesize or reclassify lifecycle status. Both envelopes occur before provider-channel
+      access, local state mutation, process activity, prompt or credential handling.
+- [ ] Separately, effective-catalogue refresh, catalogue-backed `integration list`, bounded remote
+      `integration doctor`, and ordinary read/approved-write invocation can use an operator-selected, independently provisioned Linux
+      Exchange over C-503's existing pinned HTTPS Service Account client on all five Flux targets.
+      Remote `list` reports only effective admitted operation identity, connection label and admitted
+      state. Remote `doctor` reports only configured origin, Service Account authentication,
+      availability/refusal/malformed response and declares management/incomplete-setting state
+      unavailable and operator-managed; it must not infer the richer local management diagnostics.
+      They never attempt C-510 lifecycle or native FXLM/FXSA against that origin. This contract does
+      not provide remote `connect`, `grant`, vendor-secret entry or Service Account mint; users are
+      directed to the Linux Exchange operator surface for those actions.
+- [ ] C-503's transitional `FLUX_EXCHANGE_URL` plus Service Account bearer remains the only current
+      cross-platform remote attach seam—including Linux Flux using a remote Exchange—until a
+      separately contracted secure remote provisioning flow exists. C-509 replaces that bootstrap
+      only for its completed managed Linux-local direct handoff;
+      it must not claim that native owner authentication can provision a remote host or silently
+      remove remote access from any Flux target.
+- [ ] The end-to-end evidence is split: the complete released and non-published first-run journey
+      executes on both supported Linux targets; macOS and Windows prove the exact side-effect-free
+      local refusal and the bounded remote catalogue/list/doctor/read/approved-write behavior above against a Linux
+      Exchange provisioned independently. Both forms prove vendor credentials never enter Flux.
+      Flux's five-target release matrix remains unchanged.
 
 - [ ] C-509 consumes C-510's channel-selected, verified and process-owned local Exchange endpoint,
       `flux.exchange-local-status.v1` status and two typed in-process launch capabilities bound to
@@ -31,7 +68,7 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
       liveness; lifecycle idempotence; `start|status|stop` semantics; and every lifecycle diagnostic
       and exit code. Neither capability exposes a path, executable handle, arbitrary argv, alternate
       binary, secret, arbitrary management operation, endpoint, tenant, address, cwd, environment,
-      extra argv, raw FD/HANDLE or lifecycle/status field. C-509 neither searches `PATH` nor rediscovers/reopens
+      extra argv, raw FD or lifecycle/status field. C-509 neither searches `PATH` nor rediscovers/reopens
       the cache and adds no duplicate lifecycle machinery, outcome or reclassification.
 - [ ] C-509 owns plan projection, user selection, grant proposal/confirmation and the
       owner-authenticated `exchange.local-management.v1` value-free FXLM client for plan and grant
@@ -74,12 +111,11 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
       while constructing a sensitive Authorization header, bounds its lifetime and never registers
       it in the shared redactor. Unsafe/unavailable storage, framing, resolver or handoff refuses
       without environment, configuration or plaintext fallback, superseding C-503's transitional
-      environment-token bootstrap.
-      C-509 passes that writer only to C-510's separate typed Service Account mint operation. Unix
-      mint maps only the FXSA writer to FD 5; Windows mint inherits only the exact writer HANDLE in a
-      closed HANDLE list. Mint never shares ceremony request FD 6/result FD 7 or their Windows handles,
+      environment-token bootstrap only for managed Linux-local onboarding.
+      C-509 passes that writer only to C-510's separate typed Service Account mint operation. Linux
+      mint maps only the FXSA writer to FD 5. Mint never shares ceremony request FD 6/result FD 7,
       and neither typed operation accepts a caller-selected program, mode, endpoint, tenant, address,
-      cwd, environment, extra argv or raw handle.
+      cwd, environment, extra argv or raw FD.
 - [ ] `flux integration connect <connector> --name <name>` consumes X-134's provider-owned
       machine-readable labelled-connection plan backed by Connectors C-87/C-508 declarations. Flux
       sends FXLM `PLAN_QUERY` opcode `0x0007` to the supervised native owner endpoint and accepts only
@@ -135,7 +171,8 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
       executes. Preview consumes X-134's complete connector-scoped candidate, exact revision/ETag
       and proposal digest; compare-and-swap apply preserves unrelated connectors, inbound authority
       and provider-owned fields. Same-digest replay is idempotent, while stale revision, digest
-      mismatch or unexpressible stored authority refuses before write. `flux integration list`
+      mismatch or unexpressible stored authority refuses before write. In Linux-local mode,
+      `flux integration list`
       reports labelled connection and effective-operation state;
       `flux integration doctor` distinguishes human-bootstrap, Service Account auth, incomplete
       settings, missing grant and Exchange integration-refusal outcomes without printing
@@ -162,9 +199,9 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
       idempotence, diagnostics and exit status remain exclusively C-510 acceptance. JSON mode never
       accepts or emits vendor input or a Service Account token; an operation requiring direct
       vendor input reports the provider's value-free handoff requirement.
-- [ ] A failing-first clean-machine end-to-end test and the user documentation execute this exact
-      sequence against both the released clean-machine path and a non-published workspace that locally
-      binds Flux, flux-connectors and flux-exchange: install/start the compatible Exchange from
+- [ ] Failing-first clean-machine tests and user documentation execute this exact sequence on both
+      supported Linux targets against the released clean-machine path and a non-published workspace
+      that locally binds Flux, flux-connectors and flux-exchange: install/start the compatible Exchange from
       C-510/X-126 after X-134; mint and store the runtime credential through exactly one FXSA frame;
       connect `gitlab/company` with a custom origin; connect `jira/company` with its Cloud site;
       preview/apply the low-risk read grant; list and diagnose effective tools; complete one read;
@@ -173,13 +210,22 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
       enters any Flux surface and the Service Account token enters only the dedicated receiving
       writer/store and sensitive Authorization transport—never output, logs, events, session state,
       ordinary configuration or model-visible state. Stopping Exchange removes only official
-      external tools. Both journeys
-      test the local Flux client and Exchange runtime across the real HTTP process boundary. Their
-      Rust engine dependency lines may differ and are never unified with path/git dependencies or a
-      combined Cargo workspace; compatibility comes only from the Exchange release selected through
-      C-510's signed channel and the provider protocol versions Flux supports.
+      external tools. Those Linux journeys test the local Flux client and Exchange runtime across
+      the real HTTP process boundary. A separate five-target remote-client proof uses an independently
+      provisioned Linux Exchange and is limited to effective catalogue refresh, the bounded remote
+      list/doctor projection above and read/approved-write invocation; it proves local lifecycle and
+      management are never attempted. The two Linux-local journeys consume the Exchange release
+      selected through C-510's signed channel. The five-target remote proof uses an
+      operator-provisioned Exchange compatible with C-503's admitted HTTP/protocol contract and
+      never consults C-510. Their Rust engine dependency lines may differ and are never unified with
+      path/git dependencies or a combined Cargo workspace.
 
 ## Progress
+
+- 2026-08-05: Reconciled the open contract to flux-roadmap Decision 0012 at
+  `dc907fab219d67f80bf08311ebdfdeb766f1e8d7`: onboarding and secure direct handoff are Linux-local;
+  the existing authenticated remote runtime seam remains usable from every Flux target. This is
+  contract-only; C-509 remains `ready` with every Acceptance item open.
 
 - 2026-08-04: Started the independently deliverable CLI command/output skeleton from canonical
   Flux `be76b1105926a1f01d81d95c63c79bbbca204400`. Provider-owned connection-plan, release,
@@ -195,8 +241,10 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
   authenticated effective-catalogue API. It returns only a canonical SHA-256 generation, bounded
   operation identity, Exchange-grammar connection label and admitted state, with closed body-free
   authentication/unavailable/refusal/malformed errors. It deliberately cannot infer incomplete
-  settings or consume the transitional
-  environment token; CLI orchestration waits for the reviewed secure Service Account store/handoff.
+  settings or resolve credentials itself. Remote orchestration may construct its already-
+  authenticated `ExchangeClient` from the retained C-503 configured origin/bearer; only managed
+  Linux-local onboarding waits for and replaces that bootstrap with the reviewed secure Service
+  Account store/handoff.
 - 2026-08-04: Failing-first evidence covers the command parser and real binary JSON boundary.
   Targeted `flux-cli`, `codewandler-flux-web`, exhaustive command-classifier, formatting and strict
   clippy checks are green. The assembled partial wave also passed the full repository gate before
@@ -223,11 +271,8 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
 
 ## Notes
 
-- Cross-repository authority is flux-roadmap Decisions 0002, 0004 and 0007 at coordinator commit
-  `4511f44b4defcb6de92ab8fc1b56bd5b4356ca78`; the canonical Flux baseline inspected for this
-  amendment is `1f3283517f98818d09cd3cdb9e1c77ce8c485852`. Canonical Exchange merge
-  `3b16bcb5b1c52984449118775125fe66da1686da` contains accepted X-134 contract head
-  `9dc414c76f231bd179358fd526019a16872a7be1`.
+- Cross-repository authority is flux-roadmap Decisions 0002, 0004, 0007 and 0012 at
+  `dc907fab219d67f80bf08311ebdfdeb766f1e8d7`.
 - C-509's direct contract inputs are Flux C-503's delivered four-identity HTTP Service Account
   catalogue/invoke client, Flux C-510's local endpoint/status and guard-bound helper capability,
   Connectors C-87/C-508's declarations, and Exchange X-134's plan-v2/local-management-v1/
@@ -244,9 +289,7 @@ local-management transaction from `BEGIN` through `SECRET`/`COMMIT` and its term
   queued.
 - The connection name is Exchange's existing tenant-scoped label. It is not a tenant, authority,
   endpoint, credential address or caller-selected runtime placement.
-- Canonical Exchange merge `3b16bcb5b1c52984449118775125fe66da1686da` and its accepted X-134
-  contract head `9dc414c76f231bd179358fd526019a16872a7be1` are the exact-byte authority. This does
-  not satisfy the connectors C-515 registry-release gate, claim X-134 implementation or provide
-  X-126's post-X-134 release-v2 fixtures. C-509 must consume the implemented provider result verbatim
-  and must not invent alternate selection, target partition, connection timing, name or byte
-  contracts.
+- Exchange merge `3b16bcb5b1c52984449118775125fe66da1686da` and X-134 contract head
+  `9dc414c76f231bd179358fd526019a16872a7be1` are historical pre-0012 protocol baselines only. The
+  sole implementation authority will be X-126's post-X-137/X-138/X-139 Linux-only v2 corpus. C-509
+  consumes that result verbatim and invents no alternate selection, timing, name or byte contract.

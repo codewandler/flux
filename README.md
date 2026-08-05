@@ -278,9 +278,10 @@ println!("{}", out.text);
 
 Flux can mount the connected, granted operations of one Exchange Service Account into each agent
 turn. The environment setup below is a transitional C-503 compatibility seam for the embedded
-client, not the Milestone 1 onboarding contract; C-509 replaces it with an Exchange-owned handoff
-directly into secure storage. For that temporary seam, configure the origin and bearer in the host
-environment:
+client, not the managed Linux-local Milestone 1 onboarding contract. C-509 replaces it there with an
+Exchange-owned handoff directly into secure storage; independently provisioned remote Exchange use
+retains this configured origin/bearer on every Flux target until secure remote provisioning is
+separately contracted. For that temporary seam, configure the origin and bearer in the host environment:
 
 ```bash
 export FLUX_EXCHANGE_URL=https://exchange.example.com

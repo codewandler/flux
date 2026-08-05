@@ -232,7 +232,7 @@ fn line_window(content: &str, needle: &str, radius: usize) -> String {
 }
 
 #[test]
-fn exchange_environment_token_is_explicitly_transitional_until_c509() {
+fn exchange_environment_token_is_linux_local_replaced_and_remote_transitional() {
     const TOKEN: &str = "FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN";
     for path in [
         "README.md",
@@ -242,10 +242,13 @@ fn exchange_environment_token_is_explicitly_transitional_until_c509() {
     ] {
         let content = std::fs::read_to_string(repo_path(path))
             .unwrap_or_else(|error| panic!("read {path}: {error}"));
-        let window = line_window(&content, TOKEN, 6).to_ascii_lowercase();
+        let window = line_window(&content, TOKEN, 12).to_ascii_lowercase();
         assert!(
-            window.contains("transitional") && window.contains("c-509"),
-            "{path} presents the C-503 environment token without naming its transitional status and C-509 replacement:\n{window}"
+            window.contains("transitional")
+                && window.contains("c-509")
+                && window.contains("linux-local")
+                && window.contains("every flux target"),
+            "{path} must scope C-509 to Linux-local replacement and retain transitional remote attach on every Flux target:\n{window}"
         );
     }
 
@@ -253,7 +256,10 @@ fn exchange_environment_token_is_explicitly_transitional_until_c509() {
         .expect("read Flux CLI assembly");
     let assembly = line_window(&source, "host startup configuration", 5).to_ascii_lowercase();
     assert!(
-        assembly.contains("transitional") && assembly.contains("c-509"),
-        "the C-503 assembly comment must name the transitional seam and its C-509 replacement"
+        assembly.contains("transitional")
+            && assembly.contains("c-509")
+            && assembly.contains("linux-local")
+            && assembly.contains("every flux target"),
+        "the C-503 assembly comment must scope C-509 to Linux-local replacement and retain remote attach on every Flux target"
     );
 }
