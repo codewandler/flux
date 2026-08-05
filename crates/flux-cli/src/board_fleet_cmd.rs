@@ -10620,7 +10620,6 @@ mod tests {
         let mut state = FleetState {
             revision: 7,
             running: true,
-            max_workers: 5,
             ..FleetState::default()
         };
         state.main_agent.status = "running".into();
