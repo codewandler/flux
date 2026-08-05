@@ -8609,6 +8609,32 @@ mod tests {
     }
 
     #[test]
+    fn story_worker_launch_argv_enforces_an_operation_ceiling() {
+        let spec = AgentTurnSpec {
+            id: "wave-1-worker-1".into(),
+            worktree: PathBuf::from("/tmp/story-C-565"),
+            read_roots: vec![],
+            store: PathBuf::from("/tmp/story-C-565/store"),
+            model: None,
+            instructions: "Implement only the admitted story.".into(),
+            request: "Work only on flux/C-565.".into(),
+            resume: false,
+            context_origin: json!({"kind":"story-assignment"}),
+        };
+
+        let argv = agent_turn_argv(
+            Path::new("/bin/flux"),
+            &spec,
+            render_agent_turn_prompt(&spec, "private main goal"),
+        );
+
+        assert!(
+            argv.iter().any(|argument| argument == "--operation-ceiling"),
+            "story worker launch had no host-enforced operation ceiling: {argv:?}"
+        );
+    }
+
+    #[test]
     fn story_worker_request_names_only_the_exact_pinned_assignment() {
         let assignment = json!({
             "board_ref": "flux/C-566",

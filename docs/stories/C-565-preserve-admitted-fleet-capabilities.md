@@ -2,7 +2,7 @@
 id: C-565
 title: "Every continued Fleet turn preserves its admitted capability ceiling"
 pillar: Core
-status: ready
+status: in-progress
 priority: 1
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
