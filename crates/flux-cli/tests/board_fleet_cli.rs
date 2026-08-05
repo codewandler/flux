@@ -751,6 +751,22 @@ fn workspace_board_federates_namespaced_items_and_routes_member_writes() {
     let next: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
     assert_eq!(next["data"]["items"][0]["id"], "web/C-1");
 
+    let checked = flux(
+        &workspace,
+        &["board", "--scope", "workspace", "check", "--output", "json"],
+    );
+    assert!(
+        checked.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(checked["data"]["valid"], true);
+    assert_eq!(checked["data"]["stories"], 2);
+    assert_eq!(checked["data"]["members"]["api"]["stories"], 1);
+    assert_eq!(checked["data"]["members"]["web"]["stories"], 1);
+
     let ambiguous = flux(
         &workspace,
         &["board", "--scope", "workspace", "start", "C-1"],

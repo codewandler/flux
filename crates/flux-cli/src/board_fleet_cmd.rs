@@ -44,6 +44,43 @@ fn guarded_run(root: &Path, argv: &[String]) -> Result<flux_system::ProcessOutpu
     })
 }
 
+/// Retain only complete newest lines within `limit` bytes.
+///
+/// Agent stream events are one JSON object per line. Cutting bytes from the front of an oversized
+/// in-flight line creates invalid JSON and can hide a later terminal event. Once a line itself
+/// exceeds the window, discard that whole line through its newline, then resume capture at the next
+/// event. This keeps memory bounded and every retained line parseable.
+fn append_capped_line_buffer(
+    buffer: &mut Vec<u8>,
+    dropping_line: &mut bool,
+    bytes: &[u8],
+    limit: usize,
+) {
+    if limit == 0 {
+        buffer.clear();
+        *dropping_line = !bytes.ends_with(b"\n");
+        return;
+    }
+    let mut remaining = bytes;
+    if *dropping_line {
+        let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') else {
+            return;
+        };
+        remaining = &remaining[newline + 1..];
+        *dropping_line = false;
+    }
+    buffer.extend_from_slice(remaining);
+    while buffer.len() > limit {
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            buffer.drain(..=newline);
+        } else {
+            buffer.clear();
+            *dropping_line = true;
+            break;
+        }
+    }
+}
+
 fn guarded_git(root: &Path, args: &[&str]) -> Result<flux_system::ProcessOutput> {
     let argv = std::iter::once("git".to_string())
         .chain(args.iter().map(|argument| (*argument).to_string()))
@@ -53,12 +90,22 @@ fn guarded_git(root: &Path, args: &[&str]) -> Result<flux_system::ProcessOutput>
 
 async fn guarded_agent_run_async(
     worktree: &Path,
+    read_roots: &[PathBuf],
     fleet_root: &Path,
     agent_id: &str,
     argv: &[String],
 ) -> Result<flux_system::ProcessOutput> {
     const CAPTURE_LIMIT: usize = 1024 * 1024;
-    let system = guarded_system(worktree)?;
+    let mut workspace = flux_system::Workspace::from_env(worktree)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    for root in read_roots {
+        workspace
+            .add_read_root(root)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    let system = flux_system::System::new(workspace).with_sandbox(
+        flux_system::sandbox::Sandbox::resolve(flux_system::sandbox::SandboxSettings::from_env()),
+    );
     let argv = argv.to_vec();
     let fleet_root = fleet_root.to_path_buf();
     let agent_id = agent_id.to_string();
@@ -68,21 +115,22 @@ async fn guarded_agent_run_async(
     let deadline = tokio::time::Instant::now() + CONTROL_PROCESS_TIMEOUT;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let append_capped = |buffer: &mut Vec<u8>, bytes: &[u8]| {
-        buffer.extend_from_slice(bytes);
-        if buffer.len() > CAPTURE_LIMIT {
-            let excess = buffer.len() - CAPTURE_LIMIT;
-            let cut = buffer[excess..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(excess, |position| excess + position + 1);
-            buffer.drain(..cut);
-        }
-    };
+    let mut dropping_stdout_line = false;
+    let mut dropping_stderr_line = false;
     loop {
         let (out, err) = child.read_output();
-        append_capped(&mut stdout, out.as_bytes());
-        append_capped(&mut stderr, err.as_bytes());
+        append_capped_line_buffer(
+            &mut stdout,
+            &mut dropping_stdout_line,
+            out.as_bytes(),
+            CAPTURE_LIMIT,
+        );
+        append_capped_line_buffer(
+            &mut stderr,
+            &mut dropping_stderr_line,
+            err.as_bytes(),
+            CAPTURE_LIMIT,
+        );
         let status = child.status();
         if !status.running {
             // The child can exit a few scheduler ticks before the async pipe drains publish their
@@ -90,8 +138,18 @@ async fn guarded_agent_run_async(
             for _ in 0..5 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let (out, err) = child.read_output();
-                append_capped(&mut stdout, out.as_bytes());
-                append_capped(&mut stderr, err.as_bytes());
+                append_capped_line_buffer(
+                    &mut stdout,
+                    &mut dropping_stdout_line,
+                    out.as_bytes(),
+                    CAPTURE_LIMIT,
+                );
+                append_capped_line_buffer(
+                    &mut stderr,
+                    &mut dropping_stderr_line,
+                    err.as_bytes(),
+                    CAPTURE_LIMIT,
+                );
             }
             return Ok(flux_system::ProcessOutput {
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -120,13 +178,14 @@ async fn guarded_agent_run_async(
 
 fn guarded_agent_run(
     worktree: &Path,
+    read_roots: &[PathBuf],
     fleet_root: &Path,
     agent_id: &str,
     argv: &[String],
 ) -> Result<flux_system::ProcessOutput> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(guarded_agent_run_async(
-            worktree, fleet_root, agent_id, argv,
+            worktree, read_roots, fleet_root, agent_id, argv,
         ))
     })
 }
@@ -134,12 +193,13 @@ fn guarded_agent_run(
 fn guarded_agent_run_on(
     runtime: &tokio::runtime::Handle,
     worktree: &Path,
+    read_roots: &[PathBuf],
     fleet_root: &Path,
     agent_id: &str,
     argv: &[String],
 ) -> Result<flux_system::ProcessOutput> {
     runtime.block_on(guarded_agent_run_async(
-        worktree, fleet_root, agent_id, argv,
+        worktree, read_roots, fleet_root, agent_id, argv,
     ))
 }
 
@@ -1709,7 +1769,13 @@ fn run_board_action(
         BoardAction::Evidence { id, evidence } => {
             append_story_section(command, root, id, "Evidence", evidence)
         }
-        BoardAction::Check => check_board(root),
+        BoardAction::Check => {
+            if command.scope == BoardScopeArg::Workspace && command.board.is_none() {
+                check_workspace_board(root)
+            } else {
+                check_board(root)
+            }
+        }
         BoardAction::Render => {
             let rendered = render_track(root, command.dry_run)?;
             Ok((
@@ -2230,6 +2296,11 @@ fn run_fleet_action(
                     None => "Implement exactly one assigned story in the current isolated worktree. Read its Goal, Acceptance, linked design, applicable decisions and AGENTS.md. Add failing-first evidence for behavior, run targeted checks, commit the exact story-sized result, and return a concise handoff. Never integrate, push, publish, deploy, or edit the fleet ledger.".into(),
                 };
                 let model = template.and_then(|template| template.model.clone());
+                let read_roots = config
+                    .repositories
+                    .iter()
+                    .map(|repository| repository_root(root, repository))
+                    .collect::<Result<Vec<_>>>()?;
                 for agent in state.agents.values_mut().filter(|agent| {
                     agent["id"]
                         .as_str()
@@ -2267,6 +2338,7 @@ fn run_fleet_action(
                         store: agent_store_path(&worktree, &worker)?,
                         id: worker,
                         worktree,
+                        read_roots: read_roots.clone(),
                         model: model.clone(),
                         instructions: instructions.clone(),
                         request,
@@ -4433,6 +4505,13 @@ fn resolve_story_design(root: &Path, design: &str) -> Result<PathBuf> {
 }
 
 fn check_board(root: &Path) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    check_board_with_known_dependencies(root, None)
+}
+
+fn check_board_with_known_dependencies(
+    root: &Path,
+    known_dependencies: Option<&BTreeSet<String>>,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
     let mut warnings = Vec::new();
     let stories = read_stories_with_warnings(root, &mut warnings)?;
     let mut errors = Vec::new();
@@ -4448,7 +4527,9 @@ fn check_board(root: &Path) -> Result<(String, Value, Vec<String>, Option<String
             errors.push(format!("{} filename does not start with its id", story.id));
         }
         for dependency in &story.dependencies {
-            if !stories.iter().any(|candidate| candidate.id == *dependency) {
+            if !stories.iter().any(|candidate| candidate.id == *dependency)
+                && !known_dependencies.is_some_and(|known| known.contains(dependency))
+            {
                 errors.push(format!("{} depends on missing item {dependency}", story.id));
             }
         }
@@ -4519,6 +4600,39 @@ fn check_board(root: &Path) -> Result<(String, Value, Vec<String>, Option<String
             warnings.len()
         ),
         json!({"valid": true, "stories": stories.len()}),
+        warnings,
+        None,
+    ))
+}
+
+fn check_workspace_board(root: &Path) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    let stories = workspace_stories(root)?;
+    let known_dependencies = stories
+        .iter()
+        .map(|story| story.id.clone())
+        .collect::<BTreeSet<_>>();
+    let config = read_fleet_config(root)?;
+    let mut members = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for repository in &config.repositories {
+        let member_root = repository_root(root, repository)?;
+        let (_, data, member_warnings, _) =
+            check_board_with_known_dependencies(&member_root, Some(&known_dependencies))?;
+        warnings.extend(
+            member_warnings
+                .into_iter()
+                .map(|warning| format!("{}: {warning}", repository.id)),
+        );
+        members.insert(repository.id.clone(), data);
+    }
+    Ok((
+        format!(
+            "workspace board valid: {} stories across {} member(s), {} warning(s)",
+            stories.len(),
+            members.len(),
+            warnings.len()
+        ),
+        json!({"valid": true, "stories": stories.len(), "members": members}),
         warnings,
         None,
     ))
@@ -6005,6 +6119,7 @@ struct SpawnOptions<'a> {
 struct AgentTurnSpec {
     id: String,
     worktree: PathBuf,
+    read_roots: Vec<PathBuf>,
     store: PathBuf,
     model: Option<String>,
     instructions: String,
@@ -6027,6 +6142,11 @@ fn read_configured_instructions(root: &Path, path: &Path, label: &str) -> Result
 
 fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<AgentTurnSpec> {
     let config = read_fleet_config(root)?;
+    let read_roots = config
+        .repositories
+        .iter()
+        .map(|repository| repository_root(root, repository))
+        .collect::<Result<Vec<_>>>()?;
     let instructions = match config.main.instructions.as_deref() {
         Some(path) => read_configured_instructions(root, path, "main coordinator instructions")?,
         None => "You are the fleet's only main coordinator. Ingest requirements and agent follow-ups, keep planning authority on the board, schedule only dependency-satisfied work, and never push, publish, deploy, or delete worktrees.".into(),
@@ -6034,6 +6154,7 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
     Ok(AgentTurnSpec {
         id: "main".into(),
         worktree: root.to_path_buf(),
+        read_roots,
         store: agent_store_path(root, "main")?,
         model: config.main.model,
         instructions,
@@ -6066,6 +6187,11 @@ fn addressed_turn_spec(
         .map(PathBuf::from)
         .unwrap_or_else(|| root.to_path_buf());
     let config = read_fleet_config(root)?;
+    let read_roots = config
+        .repositories
+        .iter()
+        .map(|repository| repository_root(root, repository))
+        .collect::<Result<Vec<_>>>()?;
     let template = agent["template"].as_str().and_then(|id| {
         config
             .agent_templates
@@ -6085,6 +6211,7 @@ fn addressed_turn_spec(
         id: target.to_string(),
         store: agent_store_path(&worktree, target)?,
         worktree,
+        read_roots,
         model: agent["model"]
             .as_str()
             .map(str::to_string)
@@ -6157,10 +6284,26 @@ fn execute_agent_turn_with_runtime(
     if let Some(model) = spec.model.as_deref() {
         argv.extend(["--model".into(), model.into()]);
     }
+    for root in &spec.read_roots {
+        argv.extend(["--add-dir".into(), display_path(root)]);
+    }
     argv.push(prompt);
     let output = match runtime {
-        Some(runtime) => guarded_agent_run_on(runtime, &spec.worktree, fleet_root, &spec.id, &argv),
-        None => guarded_agent_run(&spec.worktree, fleet_root, &spec.id, &argv),
+        Some(runtime) => guarded_agent_run_on(
+            runtime,
+            &spec.worktree,
+            &spec.read_roots,
+            fleet_root,
+            &spec.id,
+            &argv,
+        ),
+        None => guarded_agent_run(
+            &spec.worktree,
+            &spec.read_roots,
+            fleet_root,
+            &spec.id,
+            &argv,
+        ),
     }
     .with_context(|| format!("transient-worker: agent {} could not start", spec.id))?;
     let mut events = Vec::new();
@@ -8212,6 +8355,65 @@ mod tests {
         assert_eq!(value["command"], "[redacted]");
         assert_eq!(value["diff"], "[redacted]");
         assert_eq!(value["safe"], "reviewed commit abc123");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn main_coordinator_gets_configured_repositories_as_read_only_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "flux-fleet-main-read-roots-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let fleet = base.join("roadmap");
+        let flux = base.join("flux");
+        let connectors = base.join("connectors");
+        for directory in [&fleet, &flux, &connectors] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::create_dir_all(fleet.join(".flux")).unwrap();
+        std::fs::write(
+            fleet.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"flux\"\nroot = \"../flux\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"connectors\"\nroot = \"../connectors\"\ngate = [\"true\"]\n",
+        )
+        .unwrap();
+
+        let spec = main_turn_spec(&fleet, &FleetState::default(), "inspect".into()).unwrap();
+        assert_eq!(
+            spec.read_roots,
+            vec![
+                flux.canonicalize().unwrap(),
+                connectors.canonicalize().unwrap()
+            ]
+        );
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn fleet_agent_capture_drops_an_oversized_event_without_corrupting_terminal_json() {
+        let mut capture = Vec::new();
+        let mut dropping_line = false;
+        append_capped_line_buffer(
+            &mut capture,
+            &mut dropping_line,
+            br#"{\"type\":\"tool_result\",\"content\":\"abcdefghijklmnopqrstuvwxyz"#,
+            32,
+        );
+        append_capped_line_buffer(
+            &mut capture,
+            &mut dropping_line,
+            b"0123456789\"}\n{\"type\":\"turn_end\",\"outcome\":\"ok\"}\n",
+            64,
+        );
+
+        let lines = String::from_utf8(capture).unwrap();
+        let events = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{lines}");
+        assert_eq!(events[0]["type"], "turn_end");
+        assert_eq!(events[0]["outcome"], "ok");
     }
 
     #[test]

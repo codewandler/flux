@@ -150,6 +150,12 @@
 
 ### Fixed
 
+- **Workspace Board checks and cross-repository Fleet runs now operate on the repositories you
+  configured.** Board validation includes every workspace member and understands namespaced
+  dependencies between them. Fleet agents can read each configured checkout without broadening
+  their write access, and one unusually large activity update can no longer corrupt the final
+  completion record.
+
 - **Long-term quota exhaustion now returns immediately instead of wasting retry time.** When a
   provider explicitly says that usage or credits are exhausted, Flux preserves the reset or limit
   message and returns control after the first response. Ordinary short-lived rate limits continue

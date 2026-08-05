@@ -277,6 +277,15 @@ All notable changes to this project are documented in this file. The format is b
   unavailable, and the explicit `FLUX_SANDBOX=off` kill switch is still not inherited through the
   guarded process boundary.
 
+- **Workspace boards and Fleet now preserve their repository boundaries during real agent runs.**
+  `flux board --scope workspace check` validates every configured member, resolves namespaced
+  dependencies against the federated board and reports the aggregate story count instead of
+  silently checking only the roadmap checkout. Fleet turns receive every configured repository as
+  an explicit read-only root while retaining a single writable worktree, and capture now discards
+  an oversized activity event only at a complete NDJSON line boundary so a later terminal receipt
+  remains parseable. C-560 tracks the separate investigation into why a continued read-only turn
+  produced a 1.23 MB event and the source-side bounds it needs.
+
 - **The native board-and-fleet release gate now distinguishes fixture literals from executable
   build entry points** (C-558). The build-ownership scanner ignores standalone Ruby string
   predicates and literal-to-literal workflow mutations while still rejecting a real bare
