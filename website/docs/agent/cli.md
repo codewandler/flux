@@ -218,11 +218,16 @@ consider "the plan" or "the result". Line `type`s:
 | `turn_start` | once, before the turn begins | `session`, `model`, `input` |
 | `plan` | the agent proposes an action batch | `session`, `data` (batch id, action count, risk, the redacted batch) |
 | `approval` | that batch is requested/approved/denied | `session`, `phase`, `data` |
-| `tool_call` | an operation is about to run | `session`, `name`, `input` |
-| `tool_result` | it finished | `session`, `name`, `is_error`, `content`, `view`, `duration_us` |
+| `tool_call` | an operation is about to run | `session`, `dispatch`, `name`, `input` |
+| `tool_result` | it finished | `session`, `dispatch`, `name`, `is_error`, `content`, `view`, `duration_us` |
 | `steered` | mid-turn guidance was folded in (see below) | `session`, `messages` |
 | `turn_end` | once, at the end | `session`, `outcome` (`ok`/`error`), `error` (only when set), `answer`, `usage`, `cost_usd` |
 | `error` | the turn itself failed to run | `session`, `message` |
+
+`dispatch` is a process-unique id for one operation. It appears on the `tool_call` line and
+again on that call's `tool_result`, so a client pairs the two by identity. Do not pair on
+`name` and arrival order: independent read-only operations in one batch run concurrently and
+may finish in any order.
 
 `--stream-json-input` additionally reads the same NDJSON framing on stdin, for a multi-message
 conversation in one process — requires `--yes` (there is no interactive-approval framing over the

@@ -56,7 +56,7 @@ use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use flux_core::humanize::{fmt_age, fmt_count, fmt_elapsed};
-use flux_core::Usage;
+use flux_core::{DispatchId, Usage};
 use flux_flow::engine::FlowEngine;
 use flux_flow::{AgentSink, SteeringQueue};
 use flux_provider::Provider;
@@ -421,6 +421,10 @@ struct IntentEntry {
 #[derive(Debug)]
 struct ToolEntry {
     name: String,
+    /// C-531: the dispatch this card was opened for, so its result/timing land here and nowhere
+    /// else. `None` for a card rebuilt from durable history on resume — that card is already
+    /// finished and can never receive a live event.
+    dispatch: Option<DispatchId>,
     call: toolview::Call,
     /// The op input (so a diff/preview can be rendered exactly).
     input: serde_json::Value,
@@ -448,10 +452,11 @@ struct ToolOutcome {
 }
 
 impl ToolEntry {
-    fn new(name: String, input: serde_json::Value) -> Self {
+    fn new(dispatch: DispatchId, name: String, input: serde_json::Value) -> Self {
         let call = toolview::format_call(&name, &input);
         ToolEntry {
             name,
+            dispatch: Some(dispatch),
             call,
             input,
             started: Instant::now(),
@@ -475,6 +480,7 @@ impl ToolEntry {
         let summary = toolview::format_result(&name, &content, is_error);
         ToolEntry {
             name,
+            dispatch: None,
             call,
             input,
             started: Instant::now()
@@ -509,6 +515,7 @@ impl ToolEntry {
         };
         ToolEntry {
             name,
+            dispatch: None,
             call,
             input,
             started: Instant::now()
@@ -1852,11 +1859,17 @@ impl ChatState {
         true
     }
 
-    /// Attach a result to the most recent still-running tool card. Ops dispatch sequentially, so the
-    /// newest result-less [`Entry::Tool`] is the one that just returned.
     /// C-158: record one in-flight output line on the newest still-running card named `name`,
-    /// keeping only the last [`MAX_PARTIAL_LINES`]. Matching mirrors `finish_tool` (newest running
-    /// card with this op name), so concurrent same-named ops resolve the same way the result does.
+    /// keeping only the last [`MAX_PARTIAL_LINES`].
+    ///
+    /// C-531 deliberately leaves this on name matching while `finish_tool`/`time_tool` moved to the
+    /// dispatch id: a progress line is decoded from a `tool.progress` observation raised inside the
+    /// safety envelope, below the interpreter that mints the id, so no id reaches here to match on.
+    /// The match is still sound for the only producer — the C-158 bash channel declares
+    /// `AccessKind::Process`, which `native_call_parallel_safe` never admits, so two same-name
+    /// progress-reporting calls are never in flight together. Plumb the id through
+    /// `flux_runtime::ToolProgress` and match on it here the moment a parallel-safe op reports
+    /// progress.
     ///
     /// A line arriving after the result landed is dropped: the card has moved on to its real
     /// summary and must not flip back to a partial view.
@@ -1877,25 +1890,31 @@ impl ChatState {
             }
         }
     }
-    fn finish_tool(&mut self, name: &str, content: String, is_error: bool) {
+    /// Attach a result to the card that issued the call. C-531: matched on the call's
+    /// [`DispatchId`], never on the op name — the previous "newest still-running card with this
+    /// name" scan assumed ops dispatch sequentially, and C-528's parallel gather batches break that
+    /// assumption, cross-attaching two concurrent `read`s' bodies.
+    fn finish_tool(&mut self, dispatch: DispatchId, name: &str, content: String, is_error: bool) {
         // C-533: the transcript boundary — same sanitation posture as panes, approval prompts
         // and fleet names. Applies equally to the no-matching-card notice fallback below.
         let content = trust::sanitize_tool_output(&content);
         let summary = toolview::format_result(name, &content, is_error);
         for entry in self.entries.iter_mut().rev() {
             if let Entry::Tool(tool) = entry {
+                if tool.dispatch != Some(dispatch) {
+                    continue;
+                }
                 // Cancellation is terminal. A tool can finish concurrently with Ctrl-C and its
                 // already-queued result may arrive before the turn's `Finished` marker; keep the
                 // interrupted card cancelled instead of surfacing that late result as a notice.
-                if tool.name == name
-                    && tool
-                        .result
-                        .as_ref()
-                        .is_some_and(|outcome| outcome.cancelled)
+                if tool
+                    .result
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.cancelled)
                 {
                     return;
                 }
-                if tool.result.is_none() && tool.name == name {
+                if tool.result.is_none() {
                     let elapsed = tool
                         .timing
                         .and_then(|timing| timing.execution_us)
@@ -1949,10 +1968,11 @@ impl ChatState {
         }
     }
 
-    fn time_tool(&mut self, name: &str, timing: flux_core::OperationTiming) {
+    /// C-531: the timing belongs to one dispatch, matched by id like its result.
+    fn time_tool(&mut self, dispatch: DispatchId, timing: flux_core::OperationTiming) {
         for entry in self.entries.iter_mut().rev() {
             if let Entry::Tool(tool) = entry {
-                if tool.result.is_none() && tool.name == name {
+                if tool.result.is_none() && tool.dispatch == Some(dispatch) {
                     tool.timing = Some(timing);
                     return;
                 }
@@ -3675,17 +3695,22 @@ where
                     state.gather_mode = true;
                     state.push(Entry::Brief { goal, needs });
                 }
-                UiEvent::ToolCall { name, input } => {
+                UiEvent::ToolCall {
+                    dispatch,
+                    name,
+                    input,
+                } => {
                     state.steps += 1;
-                    state.push(Entry::Tool(ToolEntry::new(name, input)));
+                    state.push(Entry::Tool(ToolEntry::new(dispatch, name, input)));
                 }
                 UiEvent::ToolProgress { name, line } => state.progress_tool(&name, line),
-                UiEvent::ToolTiming { name, timing } => state.time_tool(&name, timing),
+                UiEvent::ToolTiming { dispatch, timing } => state.time_tool(dispatch, timing),
                 UiEvent::ToolResult {
+                    dispatch,
                     name,
                     content,
                     is_error,
-                } => state.finish_tool(&name, content, is_error),
+                } => state.finish_tool(dispatch, &name, content, is_error),
                 UiEvent::Usage(u) => state.record_usage(&u),
                 UiEvent::CallUsage {
                     model,
@@ -5326,6 +5351,12 @@ mod tests {
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
 
+    /// A deterministic dispatch id for a test-constructed tool card (C-531). Live cards get theirs
+    /// from the interpreter; a test states the pairing it means to exercise.
+    fn dispatch(raw: u64) -> DispatchId {
+        DispatchId::from_raw(raw)
+    }
+
     fn screen(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -5788,6 +5819,7 @@ mod tests {
         assert_eq!(state.entries.len(), 1);
         // a discrete entry closes the stream; the next delta starts a fresh assistant message
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "ls"}),
         )));
@@ -5808,10 +5840,11 @@ mod tests {
     fn tool_card_pairs_call_with_result_and_badge() {
         let mut state = ChatState::new("opus".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "cargo test"}),
         )));
-        state.finish_tool("bash", "182 passed; 0 failed".into(), false);
+        state.finish_tool(dispatch(1), "bash", "182 passed; 0 failed".into(), false);
         // still one entry — the result attached to the call, not a new line
         assert_eq!(state.entries.len(), 1);
 
@@ -5828,18 +5861,19 @@ mod tests {
     fn tool_card_separates_approval_wait_from_execution() {
         let mut state = ChatState::new("opus".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "write".into(),
             serde_json::json!({"path": "README.md"}),
         )));
         state.time_tool(
-            "write",
+            dispatch(1),
             flux_core::OperationTiming {
                 total_us: 30_005_000,
                 approval_wait_us: Some(30_000_000),
                 execution_us: Some(5_000),
             },
         );
-        state.finish_tool("write", "wrote README.md".into(), false);
+        state.finish_tool(dispatch(1), "write", "wrote README.md".into(), false);
         let Entry::Tool(tool) = &state.entries[0] else {
             panic!("expected tool entry")
         };
@@ -6371,6 +6405,7 @@ mod tests {
     fn running_tool_card_animates_without_cache_invalidation() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "sleep 5"}),
         )));
@@ -6401,7 +6436,7 @@ mod tests {
         );
 
         // Result lands → done badge, no more patching.
-        state.finish_tool("bash", "ok".into(), false);
+        state.finish_tool(dispatch(1), "bash", "ok".into(), false);
         terminal.draw(|f| render(f, &state)).unwrap();
         let content = screen(&terminal);
         assert!(content.contains("✓"), "{content}");
@@ -6413,6 +6448,99 @@ mod tests {
             .is_some_and(|l| l.running_rows.is_empty()));
     }
 
+    /// C-531 failing-first: two same-name `read` cards are open at once (C-528 admits concurrent
+    /// idempotent reads). The first call's result must resolve the FIRST card and leave the second
+    /// one running — the name-based LIFO scan resolves the newest card instead, so the body of
+    /// `alpha.txt` lands under the `beta.txt` header.
+    #[test]
+    fn tool_result_resolves_its_own_card_not_the_newest_same_name_card() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
+            "read".into(),
+            serde_json::json!({"path": "alpha.txt"}),
+        )));
+        state.push(Entry::Tool(ToolEntry::new(
+            dispatch(2),
+            "read".into(),
+            serde_json::json!({"path": "beta.txt"}),
+        )));
+
+        // The FIRST call's result — the one the name-based LIFO scan used to hand to `beta.txt`.
+        state.finish_tool(dispatch(1), "read", "alpha body".into(), false);
+
+        let mut terminal = Terminal::new(TestBackend::new(72, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let frame = screen(&terminal);
+
+        let settled: Vec<(String, bool)> = state
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool(tool) => Some((
+                    tool.input["path"].as_str().unwrap_or_default().to_string(),
+                    tool.result.is_some(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            settled,
+            vec![
+                ("alpha.txt".to_string(), true),
+                ("beta.txt".to_string(), false)
+            ],
+            "the result belongs to the card that issued it: {frame}"
+        );
+
+        let lines: Vec<String> = state
+            .transcript_lines(72)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = lines.join("\n");
+        let alpha = lines
+            .iter()
+            .position(|line| line.contains("alpha.txt"))
+            .unwrap_or_else(|| panic!("alpha card header: {joined}"));
+        let beta = lines
+            .iter()
+            .position(|line| line.contains("beta.txt"))
+            .unwrap_or_else(|| panic!("beta card header: {joined}"));
+        assert!(
+            lines[alpha..beta].iter().any(|line| line.contains('✓')),
+            "alpha's card must be the resolved one: {joined}"
+        );
+        let Entry::Tool(alpha_card) = &state.entries[0] else {
+            panic!("expected alpha's tool card")
+        };
+        assert_eq!(
+            alpha_card
+                .result
+                .as_ref()
+                .map(|outcome| outcome.content.as_str()),
+            Some("alpha body"),
+            "alpha's card must carry its own body, not beta's"
+        );
+        assert!(
+            lines[beta..]
+                .iter()
+                .any(|line| line.contains(RUNNING_BADGE)),
+            "beta's card must stay running: {joined}"
+        );
+        assert!(
+            !lines[alpha..beta]
+                .iter()
+                .any(|line| line.contains(RUNNING_BADGE)),
+            "alpha's card must not still be running: {joined}"
+        );
+    }
+
     /// C-155: a collapsed card with expandable detail shows a `▸` marker in the header, rendered
     /// through `tool_header_line` so the pad/width math is shared with the C-109 badge patch. The
     /// marker must not be the header row's last span — the C-109 running-badge pairing matches
@@ -6421,10 +6549,11 @@ mod tests {
     fn collapsed_tool_card_shows_a_collapse_marker() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "echo hi"}),
         )));
-        state.finish_tool("bash", "hi".into(), false);
+        state.finish_tool(dispatch(1), "bash", "hi".into(), false);
 
         let lines = state.transcript_lines(72);
         let header = &lines[0];
@@ -6443,10 +6572,11 @@ mod tests {
         let mut state = ChatState::new("mock".into());
         state.expand_tools = true;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "echo hi"}),
         )));
-        state.finish_tool("bash", "hi".into(), false);
+        state.finish_tool(dispatch(1), "bash", "hi".into(), false);
 
         let lines = state.transcript_lines(72);
         let header = &lines[0];
@@ -6461,10 +6591,11 @@ mod tests {
     fn tool_card_without_detail_shows_no_marker() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "true"}),
         )));
-        state.finish_tool("bash", String::new(), false);
+        state.finish_tool(dispatch(1), "bash", String::new(), false);
 
         let lines = state.transcript_lines(72);
         let header = &lines[0];
@@ -6479,6 +6610,7 @@ mod tests {
     fn running_card_still_pairs_with_running_badge() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "sleep 5"}),
         )));
@@ -6506,6 +6638,7 @@ mod tests {
     fn running_card_shows_a_live_output_tail_then_the_summary() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "cargo build"}),
         )));
@@ -6538,7 +6671,7 @@ mod tests {
 
         // The result supersedes the tail entirely: the card switches to its real summary row and
         // the in-flight lines are gone.
-        state.finish_tool("bash", "Finished in 3.1s".into(), false);
+        state.finish_tool(dispatch(1), "bash", "Finished in 3.1s".into(), false);
         let shown = text(&mut state);
         assert!(
             shown.contains('✓'),
@@ -6556,6 +6689,7 @@ mod tests {
     fn live_output_tail_is_bounded_to_the_newest_lines() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "yes"}),
         )));
@@ -6579,10 +6713,11 @@ mod tests {
     fn progress_after_the_result_is_ignored() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "echo hi"}),
         )));
-        state.finish_tool("bash", "hi".into(), false);
+        state.finish_tool(dispatch(1), "bash", "hi".into(), false);
         state.progress_tool("bash", "late straggler".into());
 
         let Entry::Tool(tool) = &state.entries[0] else {
@@ -6604,6 +6739,7 @@ mod tests {
     fn live_output_tail_keeps_the_running_badge_pairing() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "sleep 5"}),
         )));
@@ -6629,6 +6765,7 @@ mod tests {
     fn running_card_animation_keeps_the_gutter_rail() {
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "sleep 5"}),
         )));
@@ -6721,15 +6858,17 @@ mod tests {
         let mut state = ChatState::new("mock".into());
         state.push_user("first turn");
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "read".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("read", "done".into(), false);
+        state.finish_tool(dispatch(1), "read", "done".into(), false);
         state.stream_text("first answer");
         state.end_stream();
         state.last_elapsed = Some(Duration::from_secs(12));
         state.push_user("second turn");
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(2),
             "write".into(),
             serde_json::json!({}),
         )));
@@ -7261,10 +7400,11 @@ mod tests {
         let mut state = ChatState::new("mock".into());
         for (path, old) in [("a.rs", "alpha old"), ("b.rs", "beta old")] {
             state.push(Entry::Tool(ToolEntry::new(
+                dispatch(1),
                 "edit".into(),
                 serde_json::json!({"path": path, "old_string": old, "new_string": "new"}),
             )));
-            state.finish_tool("edit", format!("edited {path}"), false);
+            state.finish_tool(dispatch(1), "edit", format!("edited {path}"), false);
         }
         let flat = |state: &ChatState| -> String {
             state
@@ -7913,6 +8053,7 @@ mod tests {
             .replace("line 2", "line two")
             .replace("line 11", "line eleven");
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "edit".into(),
             serde_json::json!({"path": "src/a.rs", "old_string": old, "new_string": new}),
         )));
@@ -7931,6 +8072,7 @@ mod tests {
         // A non-diffable pending tool renders the sheet without a preview.
         let mut plain = ChatState::new("mock".into());
         plain.push(Entry::Tool(ToolEntry::new(
+            dispatch(2),
             "bash".into(),
             serde_json::json!({"command": "ls"}),
         )));
@@ -9457,10 +9599,11 @@ mod tests {
         let mut state = ChatState::new("opus".into());
         state.expand_tools = true;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "edit".into(),
             serde_json::json!({"path": "a.rs", "old_string": "old line", "new_string": "new line"}),
         )));
-        state.finish_tool("edit", "edited a.rs".into(), false);
+        state.finish_tool(dispatch(1), "edit", "edited a.rs".into(), false);
 
         let mut terminal = Terminal::new(TestBackend::new(72, 14)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
@@ -9499,10 +9642,11 @@ mod tests {
         assert!(!capped.expand_tools, "cards start collapsed without -v");
         capped.expand_tools = true;
         capped.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "seq 40"}),
         )));
-        capped.finish_tool("bash", output.clone(), false);
+        capped.finish_tool(dispatch(1), "bash", output.clone(), false);
         let content = transcript(&capped);
         assert!(content.contains("out line 30"));
         assert!(
@@ -9518,10 +9662,11 @@ mod tests {
             "verbose starts tool cards expanded so the output is visible without Ctrl-E"
         );
         verbose.push(Entry::Tool(ToolEntry::new(
+            dispatch(2),
             "bash".into(),
             serde_json::json!({"command": "seq 40"}),
         )));
-        verbose.finish_tool("bash", output, false);
+        verbose.finish_tool(dispatch(2), "bash", output, false);
         let content = transcript(&verbose);
         assert!(content.contains("out line 31"));
         assert!(
@@ -9553,6 +9698,7 @@ mod tests {
         let mut state = ChatState::new("opus".into());
         state.expand_tools = true;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "cargo test"}),
         )));
@@ -9563,6 +9709,7 @@ mod tests {
 
         // The finished result: summary (first line) and expanded detail rows.
         state.finish_tool(
+            dispatch(1),
             "bash",
             "\u{1b}[31merror\u{1b}[0m: it broke\nstep 10%\rdone\u{7}".into(),
             true,
@@ -9615,10 +9762,12 @@ mod tests {
         let mut state = ChatState::new("opus".into());
         state.expand_tools = true;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "git_diff".into(),
             serde_json::json!({}),
         )));
         state.finish_tool(
+            dispatch(1),
             "git_diff",
             "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,2 @@\n-old\n+new"
                 .into(),
@@ -9669,10 +9818,16 @@ mod tests {
         let mut state = ChatState::new("opus".into());
         state.expand_tools = true;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "bash".into(),
             serde_json::json!({"command": "long"}),
         )));
-        state.finish_tool("bash", format!("first\n{}", "x".repeat(60)), false);
+        state.finish_tool(
+            dispatch(1),
+            "bash",
+            format!("first\n{}", "x".repeat(60)),
+            false,
+        );
         let texts: Vec<String> = state
             .transcript_lines(30)
             .iter()
@@ -9941,18 +10096,21 @@ mod tests {
 
         let mut state = ChatState::new("mock".into());
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "read".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("read", "loaded".into(), false);
+        state.finish_tool(dispatch(1), "read", "loaded".into(), false);
         let succeeded = state.entries.len() - 1;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(2),
             "write".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("write", "denied".into(), true);
+        state.finish_tool(dispatch(2), "write", "denied".into(), true);
         let failed = state.entries.len() - 1;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(3),
             "bash".into(),
             serde_json::json!({}),
         )));
@@ -9977,6 +10135,7 @@ mod tests {
         // A call already queued behind Ctrl-C is still part of the interrupted action. Its final
         // seal happens when that action's `Finished` marker is handled.
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(4),
             "grep".into(),
             serde_json::json!({}),
         )));
@@ -9987,7 +10146,7 @@ mod tests {
 
         // A late result must neither replace the cancelled state nor escape as a stray notice.
         let entry_count = state.entries.len();
-        state.finish_tool("grep", "late success".into(), false);
+        state.finish_tool(dispatch(4), "grep", "late success".into(), false);
         assert_eq!(state.entries.len(), entry_count);
         assert!(outcome(&state, raced).cancelled);
 
@@ -10064,19 +10223,21 @@ mod tests {
             state.push_user(format!("lead-in {i}"));
         }
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "read".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("read", "first failure".into(), true);
+        state.finish_tool(dispatch(1), "read", "first failure".into(), true);
         let first = state.entries.len() - 1;
         for i in 0..8 {
             state.push_user(format!("between {i}"));
         }
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(2),
             "write".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("write", "second failure".into(), true);
+        state.finish_tool(dispatch(2), "write", "second failure".into(), true);
         let second = state.entries.len() - 1;
         state.push_user("tail");
 
@@ -10130,21 +10291,24 @@ mod tests {
         let mut state = ChatState::new("mock".into());
         state.push_user("first turn");
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(1),
             "read".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("read", "first failure".into(), true);
+        state.finish_tool(dispatch(1), "read", "first failure".into(), true);
         let first = state.entries.len() - 1;
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(2),
             "grep".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("grep", "ok".into(), false);
+        state.finish_tool(dispatch(2), "grep", "ok".into(), false);
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(3),
             "write".into(),
             serde_json::json!({}),
         )));
-        state.finish_tool("write", "second failure".into(), true);
+        state.finish_tool(dispatch(3), "write", "second failure".into(), true);
         let second = state.entries.len() - 1;
         assert!(state.jump_failure(true));
         assert_eq!(state.focused, Some(first));
@@ -10154,6 +10318,7 @@ mod tests {
         assert_eq!(state.focused, Some(first));
 
         state.push(Entry::Tool(ToolEntry::new(
+            dispatch(4),
             "bash".into(),
             serde_json::json!({}),
         )));
@@ -10177,10 +10342,11 @@ mod tests {
             state.theme = theme;
             state.expand_tools = true;
             state.push(Entry::Tool(ToolEntry::new(
+                dispatch(1),
                 "bash".into(),
                 serde_json::json!({"command": "printf 'alpha\\nbeta\\n'"}),
             )));
-            state.finish_tool("bash", "alpha\nbeta".into(), is_error);
+            state.finish_tool(dispatch(1), "bash", "alpha\nbeta".into(), is_error);
             state.transcript_lines(72)
         }
 

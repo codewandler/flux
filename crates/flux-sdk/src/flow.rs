@@ -1028,7 +1028,7 @@ struct ExecSink {
 }
 
 impl AgentSink for ExecSink {
-    fn tool_call(&mut self, name: &str, _input: &Value) {
+    fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
         self.tool_calls.push(name.to_string());
     }
 }
@@ -1667,7 +1667,7 @@ mod tests {
         #[derive(Default)]
         struct Calls(Vec<String>);
         impl AgentSink for Calls {
-            fn tool_call(&mut self, name: &str, _input: &Value) {
+            fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
                 self.0.push(name.to_string());
             }
         }
@@ -1705,7 +1705,7 @@ mod tests {
             children: Arc<Mutex<Vec<u64>>>,
         }
         impl AgentSink for Seen {
-            fn tool_call(&mut self, name: &str, _input: &Value) {
+            fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
                 self.calls.lock().unwrap().push(name.to_string());
             }
             fn observation(&mut self, observation: &flux_evidence::Observation) {
@@ -2493,10 +2493,15 @@ flow main
             results: Vec<String>,
         }
         impl AgentSink for RecordSink {
-            fn tool_call(&mut self, name: &str, _input: &Value) {
+            fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
                 self.calls.push(name.to_string());
             }
-            fn tool_result(&mut self, name: &str, _result: &ToolResult) {
+            fn tool_result(
+                &mut self,
+                _dispatch: flux_core::DispatchId,
+                name: &str,
+                _result: &ToolResult,
+            ) {
                 self.results.push(name.to_string());
             }
         }

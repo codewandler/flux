@@ -82,7 +82,7 @@ use flux_agent::{
     AdaptiveLoopPolicy, AgentLoopSpec, AgentSpec, AgentStagePolicy, PromptCacheClass, PromptLayer,
     PromptLayerKind, PromptTrust,
 };
-use flux_core::{Chunk, ContentBlock, StopReason, Usage};
+use flux_core::{Chunk, ContentBlock, DispatchId, StopReason, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;

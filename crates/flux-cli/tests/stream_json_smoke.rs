@@ -119,6 +119,37 @@ fn stream_json_emits_the_expected_ndjson_line_sequence_for_a_mock_run() {
         "missing tool_result: {types:?}"
     );
 
+    // C-531: every tool line carries the dispatch id, and each `tool_result` repeats the id of its
+    // own `tool_call` — the pairing a client needs once concurrent same-name calls can interleave.
+    let dispatch_of = |kind: &str| -> Vec<u64> {
+        lines
+            .iter()
+            .filter(|l| l["type"] == kind)
+            .map(|l| {
+                l["dispatch"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{kind} line carries no dispatch id: {l}"))
+            })
+            .collect()
+    };
+    let call_ids = dispatch_of("tool_call");
+    let result_ids = dispatch_of("tool_result");
+    assert!(!call_ids.is_empty());
+    for id in &result_ids {
+        assert!(
+            call_ids.contains(id),
+            "a tool_result names a dispatch no tool_call announced: {result_ids:?} vs {call_ids:?}"
+        );
+    }
+    let mut unique = call_ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        call_ids.len(),
+        "each dispatch id must be unique: {call_ids:?}"
+    );
+
     // Human-readable rendering is suppressed on stdout: no live-markdown/plan-tree/rule furniture,
     // only JSON lines.
     assert!(

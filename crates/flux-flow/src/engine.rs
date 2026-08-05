@@ -2265,9 +2265,9 @@ pub fn trace_loop() -> bool {
 fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink, reveal: bool) {
     use crate::loop_host::SinkEvent;
     let machinery = match &ev {
-        SinkEvent::ToolCall(name, _)
-        | SinkEvent::ToolTiming(name, _)
-        | SinkEvent::ToolResult(name, _) => is_loop_machinery_op(name),
+        SinkEvent::ToolCall(_, name, _)
+        | SinkEvent::ToolTiming(_, name, _)
+        | SinkEvent::ToolResult(_, name, _) => is_loop_machinery_op(name),
         _ => false,
     };
     if reveal || !machinery {
@@ -2783,7 +2783,7 @@ mod tests {
             self.text.push_str(text);
         }
 
-        fn tool_call(&mut self, name: &str, _input: &Value) {
+        fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
             self.tools.push(name.to_string());
         }
 

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::AgentSink;
+use flux_core::DispatchId;
 use flux_runtime::{
     scope_runtime_turn, ApprovalChoice, Approver, Executor, ToolRegistry, ToolResult,
 };
@@ -309,14 +310,15 @@ impl FlowSink for SinkBridge<'_> {
     fn planning(&mut self, active: bool) {
         self.inner.planning(active);
     }
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        self.inner.tool_call(name, input);
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
+        self.inner.tool_call(dispatch, name, input);
     }
-    fn tool_result(&mut self, name: &str, result: &OpOutcome) {
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &OpOutcome) {
         if let Some(timing) = result.timing.as_ref() {
-            self.inner.tool_timing(name, timing);
+            self.inner.tool_timing(dispatch, name, timing);
         }
         self.inner.tool_result(
+            dispatch,
             name,
             &ToolResult {
                 content: result.content.clone(),
@@ -1389,13 +1391,18 @@ mod tests {
         timings: Vec<(String, flux_core::OperationTiming)>,
     }
     impl AgentSink for CollectSink {
-        fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
+        fn tool_call(&mut self, _dispatch: DispatchId, name: &str, _input: &serde_json::Value) {
             self.calls.push(name.to_string());
         }
         fn observation(&mut self, o: &flux_evidence::Observation) {
             self.observations.push(o.kind.clone());
         }
-        fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+        fn tool_timing(
+            &mut self,
+            _dispatch: DispatchId,
+            name: &str,
+            timing: &flux_core::OperationTiming,
+        ) {
             self.timings.push((name.to_string(), *timing));
         }
     }

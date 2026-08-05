@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use flux_core::{OperationTiming, Usage};
+use flux_core::{DispatchId, OperationTiming, Usage};
 use flux_runtime::ToolResult;
 
 /// Receives streaming output and tool activity from a turn (the CLI/TUI/SDK implements this).
@@ -18,10 +18,15 @@ pub trait AgentSink: Send {
     /// otherwise-silent provider wait as a phase-aware indicator; the resulting typed artifact is
     /// then shown through [`Self::observation`]. Calls are balanced on every exit.
     fn planning(&mut self, _active: bool) {}
-    fn tool_call(&mut self, _name: &str, _input: &Value) {}
-    /// Safety-envelope timing for the immediately following tool result.
-    fn tool_timing(&mut self, _name: &str, _timing: &OperationTiming) {}
-    fn tool_result(&mut self, _name: &str, _result: &ToolResult) {}
+    /// A tool is being dispatched. `dispatch` is minted per call by the interpreter and repeated on
+    /// this call's [`Self::tool_timing`] and [`Self::tool_result`], so a surface pairs the events by
+    /// identity. Matching on name and arrival order is unsound: C-528 admits concurrent same-name
+    /// idempotent reads, and they may complete in any order (C-531).
+    fn tool_call(&mut self, _dispatch: DispatchId, _name: &str, _input: &Value) {}
+    /// Safety-envelope timing for the tool result of `dispatch`.
+    fn tool_timing(&mut self, _dispatch: DispatchId, _name: &str, _timing: &OperationTiming) {}
+    /// The tool named by `dispatch` returned.
+    fn tool_result(&mut self, _dispatch: DispatchId, _name: &str, _result: &ToolResult) {}
     /// An audit observation made during dispatch (e.g. a destructive-command marker).
     fn observation(&mut self, _o: &flux_evidence::Observation) {}
     fn turn_end(&mut self, _usage: Option<Usage>) {}

@@ -1949,7 +1949,7 @@ impl AgentSink for SseSink {
             self.cancel.cancel();
         }
     }
-    fn tool_call(&mut self, name: &str, _input: &Value) {
+    fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
         if self
             .tx
             .try_send(Event::default().event("tool").data(name))
@@ -2010,7 +2010,7 @@ impl AgentSink for Collect {
     fn text_delta(&mut self, t: &str) {
         self.text.push_str(t);
     }
-    fn tool_call(&mut self, name: &str, _input: &Value) {
+    fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
         self.tools.push(name.to_string());
     }
     fn turn_end(&mut self, usage: Option<Usage>) {

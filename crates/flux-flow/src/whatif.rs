@@ -12,9 +12,9 @@
 //! BEFORE a re-plan target turn, so a model/prompt variant can then drive exactly one live turn with
 //! [`crate::engine::FlowEngine::run_turn_pinned`].
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
+use flux_core::DispatchId;
 use flux_events::EventStore;
 use flux_lang::ast::DraftAst;
 use flux_lang::host::OpOutcome;
@@ -45,9 +45,11 @@ fn whatif_err(msg: impl Into<String>) -> FlowError {
 /// (`serde_json::to_string` of the same `serde_json::Value`), so a served cell's `input_hash`
 /// matches on a later replay of `dst` itself.
 ///
-/// `pending` is keyed by op name (a `VecDeque`, not a single slot) so same-named concurrent
-/// `parallel` dispatches pair FIFO instead of a later `tool_call` silently clobbering an earlier
-/// one's still-unmatched input.
+/// C-531: `pending` is keyed by the call's `DispatchId`, so a result is matched to the exact call
+/// that produced it. It used to be a per-op-name `VecDeque` paired FIFO — sound only while
+/// same-name dispatches also COMPLETED in issue order, which C-528's parallel gather batches broke:
+/// two concurrent `read`s released out of order recorded each other's input against the wrong
+/// outcome. The identity match has no such hazard and needs no ordering assumption.
 ///
 /// D-182: `enabled` alone used to be `false` for a [`crate::cassette::OffTape::Live`] scope on the
 /// theory that a live-bridge miss is ALREADY recorded onto `dst` by
@@ -77,7 +79,8 @@ pub struct RerunRecordingSink<'a> {
     /// Buffered `(op, input_json, outcome)` triples awaiting [`Self::finish`]'s reconciliation —
     /// populated only while `defer` is `true`.
     captured: Vec<(String, String, OpOutcome)>,
-    pending: std::collections::HashMap<String, VecDeque<String>>,
+    /// The serialized input of every call still awaiting its result, keyed by dispatch id.
+    pending: std::collections::HashMap<DispatchId, String>,
 }
 
 impl<'a> RerunRecordingSink<'a> {
@@ -184,23 +187,25 @@ impl AgentSink for RerunRecordingSink<'_> {
     fn planning(&mut self, active: bool) {
         self.inner.planning(active);
     }
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
         if self.enabled {
             let input_json = serde_json::to_string(input).unwrap_or_default();
-            self.pending
-                .entry(name.to_string())
-                .or_default()
-                .push_back(input_json);
+            self.pending.insert(dispatch, input_json);
         }
-        self.inner.tool_call(name, input);
+        self.inner.tool_call(dispatch, name, input);
     }
-    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
-        self.inner.tool_timing(name, timing);
+    fn tool_timing(
+        &mut self,
+        dispatch: DispatchId,
+        name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
+        self.inner.tool_timing(dispatch, name, timing);
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
         if self.enabled {
-            if let Some(queue) = self.pending.get_mut(name) {
-                if let Some(input_json) = queue.pop_front() {
+            {
+                if let Some(input_json) = self.pending.remove(&dispatch) {
                     // D-182: `denied` is hardcoded `false` here, not carried through from the real
                     // dispatch — `AgentSink::tool_result`'s `ToolResult` (the bridge every sink sees,
                     // `flux_runtime::ToolResult`) has no `denied` field at all; it is dropped one
@@ -230,7 +235,7 @@ impl AgentSink for RerunRecordingSink<'_> {
                 }
             }
         }
-        self.inner.tool_result(name, result);
+        self.inner.tool_result(dispatch, name, result);
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.inner.observation(o);

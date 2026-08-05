@@ -1817,7 +1817,12 @@ mod tests {
             fn text_delta(&mut self, t: &str) {
                 self.deltas.push(t.to_string());
             }
-            fn tool_result(&mut self, name: &str, _result: &flux_runtime::ToolResult) {
+            fn tool_result(
+                &mut self,
+                _dispatch: flux_core::DispatchId,
+                name: &str,
+                _result: &flux_runtime::ToolResult,
+            ) {
                 self.tool_results.push(name.to_string());
             }
         }

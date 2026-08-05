@@ -21,14 +21,21 @@ pub(super) enum UiEvent {
     },
     Intent(IntentEntry),
     ToolCall {
+        /// C-531: the interpreter's per-dispatch id, repeated on this call's timing and result so
+        /// the transcript pairs them by identity. Concurrent same-name calls (C-528's parallel
+        /// gather batches) complete in any order, so name and arrival order cannot pair them.
+        dispatch: DispatchId,
         name: String,
         input: serde_json::Value,
     },
+    /// C-531: the timing carries only the dispatch it belongs to. The op name used to be the
+    /// match key and is now redundant — the card is found by identity.
     ToolTiming {
-        name: String,
+        dispatch: DispatchId,
         timing: flux_core::OperationTiming,
     },
     ToolResult {
+        dispatch: DispatchId,
         name: String,
         content: String,
         is_error: bool,
@@ -36,6 +43,12 @@ pub(super) enum UiEvent {
     /// C-158: one already-redacted output line from a tool that is **still running**, for the live
     /// tail under its card header. Superseded by the real summary once [`UiEvent::ToolResult`]
     /// lands.
+    ///
+    /// C-531: carries no dispatch id. Progress lines are decoded from a `tool.progress`
+    /// observation raised inside the safety envelope, below the interpreter that mints the id, so
+    /// there is nothing to carry yet. Name matching is sound for the only producer: the C-158 bash
+    /// channel is `AccessKind::Process`, which `native_call_parallel_safe` never admits, so two
+    /// progress-reporting calls of the same name are never in flight at once.
     ToolProgress {
         name: String,
         line: String,
@@ -217,24 +230,31 @@ impl AgentSink for ChannelSink {
         self.send(UiEvent::Planning(active));
     }
 
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
         self.send(UiEvent::ToolCall {
+            dispatch,
             name: name.to_string(),
             input: input.clone(),
         });
     }
 
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
         self.send(UiEvent::ToolResult {
+            dispatch,
             name: name.to_string(),
             content: result.content.clone(),
             is_error: result.is_error,
         });
     }
 
-    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+    fn tool_timing(
+        &mut self,
+        dispatch: DispatchId,
+        _name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
         self.send(UiEvent::ToolTiming {
-            name: name.to_string(),
+            dispatch,
             timing: *timing,
         });
     }

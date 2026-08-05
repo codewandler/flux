@@ -281,12 +281,12 @@ impl ReviewProgressSink {
 }
 
 impl AgentSink for ReviewProgressSink {
-    fn tool_call(&mut self, name: &str, _input: &Value) {
+    fn tool_call(&mut self, _dispatch: DispatchId, name: &str, _input: &Value) {
         self.state.tool_call(name);
         self.paint();
     }
 
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, _dispatch: DispatchId, name: &str, result: &ToolResult) {
         self.state.tool_result(name, result.is_error);
         self.paint();
     }

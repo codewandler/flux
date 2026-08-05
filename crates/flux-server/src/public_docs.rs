@@ -82,11 +82,16 @@ impl flux_flow::AgentSink for WorkbenchSink {
         self.push(json!({"kind": "text", "text": text}));
     }
 
-    fn tool_call(&mut self, name: &str, input: &Value) {
+    fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, input: &Value) {
         self.push(json!({"kind": "tool_call", "name": name, "input": input}));
     }
 
-    fn tool_result(&mut self, name: &str, result: &flux_runtime::ToolResult) {
+    fn tool_result(
+        &mut self,
+        _dispatch: flux_core::DispatchId,
+        name: &str,
+        result: &flux_runtime::ToolResult,
+    ) {
         self.push(json!({
             "kind": "tool_result",
             "name": name,
