@@ -271,6 +271,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Native board/fleet real-child tests are hermetic on CI hosts without bubblewrap** (C-558). The
+  Linux-only mock-agent fixture supplies its own test backend instead of depending on the runner's
+  installed sandbox tools. Production unattended children still fail closed when confinement is
+  unavailable, and the explicit `FLUX_SANDBOX=off` kill switch is still not inherited through the
+  guarded process boundary.
+
 - **The native board-and-fleet release gate now distinguishes fixture literals from executable
   build entry points** (C-558). The build-ownership scanner ignores standalone Ruby string
   predicates and literal-to-literal workflow mutations while still rejecting a real bare

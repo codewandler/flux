@@ -31,6 +31,10 @@ ownership or publishing changed independently-versioned crates under versions al
 - [x] Focused regression tests prove the scanner distinction and version-line closure before the
       full repository gate runs. No build-ownership bypass, release-policy exception or
       independently-versioned-crate exemption is introduced.
+- [x] The native board/fleet real-child fixtures remain hermetic in CI's deliberate no-sandbox-
+      backend job. They provide a Linux test-only backend for mock child agents without forwarding
+      `FLUX_SANDBOX=off`, changing production sandbox resolution, or weakening the unattended
+      fail-closed and explicit-escape regressions.
 - [x] The full repository gate is green from the final committed tree, including embedded public
       documentation fixed-point verification and the exact CI commands that failed on canonical
       `2cb6bbc6947355bc6be91c0847aa1ebb85f46b00`.
@@ -53,3 +57,9 @@ ownership or publishing changed independently-versioned crates under versions al
   1.4.0, while adding `Board` to the closed public policy `ResourceKind` enum requires 1.0.0 →
   2.0.0. Root/plugin dependency floors and both lockfiles carry the new identities; flux-spec stays
   1.4.0 and no other independent version moves.
+- Promotion CI for `eb8c0d6c` exposed a host-dependent board/fleet fixture: the outer test process
+  selected `FLUX_SANDBOX=off`, but guarded process spawning correctly refused to forward that kill
+  switch to its unattended child Flux process. On runners with no `bwrap`, three real-child tests
+  therefore failed closed. A minimal-PATH local reproduction failed with the same diagnostic before
+  the fix; the Linux fixture now supplies a process-local mock backend, and all 25 board/fleet tests
+  pass with `FLUX_BWRAP_BIN=/nonexistent/bwrap`. Production posture code is unchanged.

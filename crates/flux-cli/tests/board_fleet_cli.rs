@@ -1,6 +1,37 @@
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
+
+#[cfg(target_os = "linux")]
+fn fixture_backend_path() -> OsString {
+    static PATH: OnceLock<OsString> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let bin = std::env::temp_dir().join(format!(
+            "flux-board-fleet-test-bin-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&bin).unwrap();
+        let bwrap = bin.join("bwrap");
+        fs::write(
+            &bwrap,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 64\n",
+        )
+        .unwrap();
+        fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ambient = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries = vec![bin];
+        entries.extend(std::env::split_paths(&ambient));
+        std::env::join_paths(entries).unwrap()
+    })
+    .clone()
+}
 
 fn fixture(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -14,14 +45,16 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn flux(root: &PathBuf, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_flux"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flux"));
+    command
         .current_dir(root)
         // These fixtures exercise planning/control semantics, not process confinement. Pin the
-        // posture so unattended child Flux invocations never inherit a developer/CI ambient mode.
+        // outer posture so the board/fleet command itself never inherits a developer/CI mode.
         .env("FLUX_SANDBOX", "off")
-        .args(args)
-        .output()
-        .unwrap()
+        .args(args);
+    #[cfg(target_os = "linux")]
+    command.env("PATH", fixture_backend_path());
+    command.output().unwrap()
 }
 
 fn shell_words(line: &str) -> Vec<String> {
