@@ -90,6 +90,7 @@ const POST_CUTOVER_FIXTURES: &[&str] = &[
     "examples/improve-multi.flux",
     "examples/improve-synthetic.flux",
     "examples/improve-tbench.flux",
+    "examples/release-cut.flux",
     "examples/release.flux",
     "examples/review.flux",
     "examples/zendesk.triage.flux",
@@ -368,7 +369,7 @@ fn shipped_flux_corpus_agreement() {
     scanned.sort();
     accepted.sort();
     post_cutover.sort();
-    assert_eq!(scanned.len(), 20, "the shipped Flux fixture census changed");
+    assert_eq!(scanned.len(), 21, "the shipped Flux fixture census changed");
     assert_eq!(
         post_cutover.len(),
         POST_CUTOVER_FIXTURES.len(),
