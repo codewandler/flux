@@ -130,6 +130,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Greenfield Node ecosystem tasks now route to the dedicated Node tool family** (A-149).
+  Explicit npm, package.json, JavaScript, TypeScript, Vue, Vuex, and React requests can surface
+  `npm` and `node_run` before a project marker exists. Generic `bash` and `proc.run` remain
+  operator-gated and are not added as an automatic fallback.
+
 - **Every Fleet worker turn now retains its admitted capability ceiling** (C-565). Template or
   ad-hoc admission normalizes named capability bundles into an exact host-enforced operation set
   plus mode, writable/read roots and fences. Missing required capabilities fail before a model

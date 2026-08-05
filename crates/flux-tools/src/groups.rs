@@ -5,7 +5,7 @@
 //! group **owns its membership** (`tools`), so no op needs to know it is gated. The runtime resolver
 //! ([`flux_evidence::resolve_active_groups`]) turns the current signals into the active group set.
 
-use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL};
+use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL, KIND_TURN_INTENT};
 
 /// One `surface_when` predicate matching the named `project.signal`.
 fn when(signal: &str) -> Vec<SignalMatch> {
@@ -25,6 +25,17 @@ fn when_any(signals: &[&str]) -> Vec<SignalMatch> {
             signal: Some((*s).into()),
         })
         .collect()
+}
+
+/// Keep the ambient project signal and add bounded task-language hints for greenfield work, where
+/// the files that would emit that project signal do not exist yet.
+fn when_with_turn_intent(signal: &str, intents: &[&str]) -> Vec<SignalMatch> {
+    let mut matchers = when(signal);
+    matchers.extend(intents.iter().map(|intent| SignalMatch {
+        kind: KIND_TURN_INTENT.into(),
+        signal: Some((*intent).into()),
+    }));
+    matchers
 }
 
 /// The built-in tool groups and the signals that surface them. `git` is the live gated group; the
@@ -77,9 +88,23 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
         },
         ToolGroup {
             name: "node".into(),
-            description: "Node.js toolchain operations.".into(),
+            description: "Node.js toolchain operations for npm, package.json, JavaScript, \
+                          TypeScript, Vue, Vuex, and React work."
+                .into(),
             tools: names(&["npm", "node_run"]),
-            surface_when: when("node"),
+            surface_when: when_with_turn_intent(
+                "node",
+                &[
+                    "node.js",
+                    "npm",
+                    "package.json",
+                    "javascript",
+                    "typescript",
+                    "vue",
+                    "vuex",
+                    "react",
+                ],
+            ),
         },
         ToolGroup {
             name: "python".into(),
@@ -333,5 +358,41 @@ mod tests {
             );
             assert_eq!(grp.surface_when[0].signal.as_deref(), Some(signal));
         }
+    }
+
+    /// A-149: a greenfield Node workspace has no package marker yet, so explicit ecosystem terms
+    /// in the request must make the dedicated Node family discoverable. The generic shell remains
+    /// an operator-controlled escape hatch rather than an automatic fallback.
+    #[test]
+    fn node_has_turn_intent_hints_without_widening_shell() {
+        let groups = builtin_groups();
+        let node = groups.iter().find(|group| group.name == "node").unwrap();
+        let shell = groups.iter().find(|group| group.name == "shell").unwrap();
+
+        let node_intents = node
+            .surface_when
+            .iter()
+            .filter(|matcher| matcher.kind == KIND_TURN_INTENT)
+            .filter_map(|matcher| matcher.signal.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            node_intents,
+            vec![
+                "node.js",
+                "npm",
+                "package.json",
+                "javascript",
+                "typescript",
+                "vue",
+                "vuex",
+                "react"
+            ],
+            "the greenfield routing vocabulary must stay explicit and bounded"
+        );
+        assert_eq!(
+            shell.surface_when,
+            when("shell"),
+            "shell must remain operator-gated with no task-language hints"
+        );
     }
 }

@@ -5336,6 +5336,51 @@ mod tests {
         assert_eq!(families["plugin.slack"].specs[0].name, "slack.send");
     }
 
+    /// A-149: the production Node manifest must carry a greenfield request all the way through the
+    /// staged family index and ordinary evidence surfacing without activating the shell escape
+    /// hatch. This deliberately uses the real built-in registry and groups rather than a reduced
+    /// fixture that could drift from production assembly.
+    #[test]
+    fn greenfield_node_intent_reaches_dedicated_tools_without_shell_fallback() {
+        let mut registry = ToolRegistry::new();
+        flux_tools::try_register_builtins(&mut registry).unwrap();
+        let specs = registry.specs();
+        let groups = flux_tools::groups::builtin_groups();
+
+        let families = build_families(&specs, &groups, &HashSet::new());
+        let node = &families["node"];
+        assert_eq!(
+            node.specs
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node_run", "npm"]
+        );
+        assert!(!families.contains_key("shell"));
+        let index = family_index(&families);
+        assert!(index.contains("- node (2 operations; e.g. node_run, npm):"));
+        assert!(index.contains(
+            "Routing hints: javascript, node.js, npm, package.json, react, typescript, vue, vuex."
+        ));
+
+        let observations = flux_evidence::turn_intent_observations(
+            &groups,
+            "Create a greenfield Vue app and run its npm tests",
+        );
+        let active = flux_evidence::resolve_active_groups(&groups, &observations);
+        assert!(active.contains("node"));
+        assert!(!active.contains("shell"));
+        let advertised = registry
+            .active_specs(&groups, &active)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<HashSet<_>>();
+        assert!(advertised.contains("npm"));
+        assert!(advertised.contains("node_run"));
+        assert!(!advertised.contains("bash"));
+        assert!(!advertised.contains("proc.run"));
+    }
+
     #[test]
     fn virtual_family_index_never_hides_a_registered_operation() {
         let specs = (0..12)

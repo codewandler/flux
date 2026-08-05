@@ -192,6 +192,11 @@
 
 ### Fixed
 
+- **New Node, Vue, and React projects can use the Node tools before package files exist.** Requests
+  that explicitly mention npm, package.json, JavaScript, TypeScript, Vue, Vuex, or React now expose
+  the dedicated Node operations instead of leaving the agent with an unusable process route. The
+  generic shell remains opt-in.
+
 - **Workspace Board checks and cross-repository Fleet runs now operate on the repositories you
   configured.** Board validation includes every workspace member and understands namespaced
   dependencies between them. Fleet agents can read each configured checkout without broadening

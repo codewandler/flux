@@ -31,6 +31,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **Fleet supervision opens immediately, even in a large workspace.** Board and Fleet views load in
+  the background, so refreshing them no longer freezes typing or rendering. If a later refresh
+  fails, the last working view stays visible and is clearly marked stale.
+
 - **Board and Fleet terminology is documented from planning through release.** The guides explain
   epics, stories, milestones, program lanes, configured versus dispatched waves, workers, handoffs,
   review, gates and apply. Concepts now appears before Coding, and compact diagrams show the
@@ -184,6 +188,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   footer, docs overview, and README instead of hiding behind the playground.
 
 ### Fixed
+
+- **New Node, Vue, and React projects can use the Node tools before package files exist.** Requests
+  that explicitly mention npm, package.json, JavaScript, TypeScript, Vue, Vuex, or React now expose
+  the dedicated Node operations instead of leaving the agent with an unusable process route. The
+  generic shell remains opt-in.
 
 - **Workspace Board checks and cross-repository Fleet runs now operate on the repositories you
   configured.** Board validation includes every workspace member and understands namespaced
