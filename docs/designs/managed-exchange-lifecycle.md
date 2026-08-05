@@ -1,15 +1,28 @@
-# Managed Exchange lifecycle and onboarding capability boundary
+# Linux-local managed Exchange lifecycle and onboarding capability boundary
 
 **Status:** contract only; implementation queued · **Stories:** C-510 and C-509 · **Authority:**
-flux-roadmap Decisions 0004 and 0007 at
-`4511f44b4defcb6de92ab8fc1b56bd5b4356ca78`; canonical Exchange merge
-`3b16bcb5b1c52984449118775125fe66da1686da` contains accepted X-134 contract head
-`9dc414c76f231bd179358fd526019a16872a7be1`
+flux-roadmap Decisions 0004, 0007 and 0012 at
+`dc907fab219d67f80bf08311ebdfdeb766f1e8d7`
 
 This design records Flux's ownership boundary for a managed local Exchange. It defines how Flux
 retains a verified executable and divides work between C-510 and C-509. It does not define Exchange
-wire bytes. Exchange `docs/designs/local-release-v1.md`, X-126, X-128, X-129 and X-134 remain the
-provider authority for schema names, fields, bounds, framing and conformance verdicts.
+wire bytes. Exchange `docs/designs/local-release-v1.md`, the amended X-134 child sequence and X-126
+remain the provider authority for schema names, fields, bounds, framing and conformance verdicts.
+
+## Linux-local lifecycle and remote client boundary
+
+Managed local Exchange exists only on `aarch64-unknown-linux-gnu` and
+`x86_64-unknown-linux-gnu`. Flux remains a five-target product, but non-Linux Flux returns C-510's
+typed `unsupported_platform` before any local channel, filesystem or process effect. The native
+contract below is Linux `getpwuid_r`, `SO_PEERCRED`, fixed inherited FDs, `SCM_RIGHTS` and
+`linux-proc-start`; it contains no macOS or Windows local realization.
+
+A remote Exchange origin is client-only. Every Flux platform may use the existing authenticated
+Service Account HTTP catalogue/invoke client against an independently provisioned Linux Exchange,
+but C-510 never starts/stops/supervises it and C-509 never sends native plan, connection, grant,
+vendor-input or mint operations to it. Full remote onboarding requires a new authenticated provider
+management/handoff contract. Until that exists, C-503's transitional configured origin plus bearer
+is the only implemented cross-platform remote attach seam.
 
 No production implementation or provider conformance is claimed here. Both Flux stories remain
 `ready` with open acceptance, queued by the roadmap behind the connectors C-515 registry release,
@@ -146,35 +159,29 @@ at-most-65,548-byte value-free receipt or error frame plus EOF. The request is o
 `0x0001` or credential acquire/rotate `BEGIN` `0x0030`; the result is only connect `RECEIPT`
 `0x0006`, credential `RECEIPT` `0x0032` or `ERROR` `0x7fff`.
 
-The Service Account mint operation is a separate typed operation. It launches only
+The Service Account mint operation is a separate typed Linux operation. It launches only
 `flux-exchange local service-account-mint --id <id> --expires-at <canonical-decimal> --writer-fd 5`
-on Unix, or the same fixed mode with `--writer-handle <canonical-decimal>` instead of `--writer-fd`
-on Windows, and accepts only the provider-owned closed mint identity and expiry through that typed
-API. The helper receives C-509's dedicated FXSA writer: Unix maps only that writer to FD 5; Windows
-admits exactly that writer HANDLE through its closed inherited-HANDLE list. It never shares, aliases
-or inherits the ceremony request FD 6/result FD 7 or their Windows handles.
+and accepts only the provider-owned closed mint identity and expiry through that typed API. The
+helper receives C-509's dedicated FXSA writer only as FD 5. It never shares, aliases or inherits the
+ceremony request FD 6/result FD 7.
 
 Neither capability exposes any of the following:
 
 - a filesystem path, executable handle, cache lookup or alternate binary;
 - arbitrary argv, extra argv, a shell, a generic process builder or a caller-selected helper mode;
 - a secret or secret-bearing buffer;
-- an endpoint, tenant, address, working directory, environment value, raw FD/HANDLE aperture or
+- an endpoint, tenant, address, working directory, environment value, raw FD aperture or
   caller-selected FXLM operation; or
 - a lifecycle mutation, lifecycle result, status field or diagnostic extension.
 
 C-510 constructs each closed process from the guard and derives its cwd and native endpoint from the
 authenticated owned instance's OS-account native root. It never derives either from the install or
 cache guard identity, caller input or inherited `HOME`, XDG or profile environment. Corrected X-134
-fixes Unix ceremony execution to `flux-exchange local vendor-secret` with no
+fixes Linux ceremony execution to `flux-exchange local vendor-secret` with no
 additional arguments, request-read FD 6, terminal-write FD 7, reserved FXSA FD 5 closed and every
-other descriptor at or above 3 closed. On Windows it fixes the same mode to exactly
-`flux-exchange local vendor-secret --request-handle <REQUEST> --response-handle <RESPONSE>` in that
-order, with canonical nonzero decimal HANDLE values; `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` contains
-exactly those two distinct handles and every unused handle is non-inheritable. On both platforms the
-environment is cleared, standard streams are the platform null device and the working directory is
-the provider root derived as above. Neither the caller nor a generic
-process API can add argv, an inherited descriptor/HANDLE or another placement value. Direct
+other descriptor at or above 3 closed. The environment is cleared, standard streams are `/dev/null`
+and the working directory is the provider root derived as above. Neither the caller nor a generic
+process API can add argv, an inherited descriptor or another placement value. Direct
 TTY/browser access follows the provider's closed helper ABI, not redirected Flux streams.
 
 C-510 must finish writing the initiating frame and close the request pipe by the absolute deadline
@@ -187,7 +194,7 @@ A complete receipt or application refusal written to the result pipe exits 0; ex
 a capability, transport or result-write failure that prevents the contract. If no terminal output
 crosses, Flux may only launch the helper again with the byte-identical initiating frame.
 
-The exact helper-mode spelling, Unix FD numbers, Windows argument spelling/order, frame bounds and
+The exact helper-mode spelling, Linux FD numbers, frame bounds and
 terminal-result grammar are consumption assertions owned by corrected X-134. Flux must copy the
 committed provider names and bytes and fail conformance if they drift; it must not create a second
 wire or launch contract alongside the accepted X-134 contract. This preserves C-510's exclusive
@@ -195,10 +202,9 @@ discovery/verification ownership without moving onboarding semantics into the li
 
 ## Readiness ABI stays stable while its inventory advances
 
-X-128's capability ABI does not change. Unix uses readiness write FD 3 and liveness read FD 4;
-Windows uses the two existing readiness/liveness HANDLE arguments admitted through the closed handle
-list. Their directions, one-shot readiness framing, process-start identities and payload-free
-liveness behavior remain exactly the provider's X-128 contract.
+X-128's Linux capability ABI does not change: readiness uses write FD 3 and liveness uses read FD 4.
+Their directions, one-shot readiness framing, Linux process-start identity and payload-free liveness
+behavior remain exactly the provider's X-128 contract.
 
 Only the readiness JSON schema identity and protocol inventory advance from the unpublished
 six-field `exchange.supervisor-ready.v1` evidence to `exchange.supervisor-ready.v2` with all eight
@@ -289,14 +295,13 @@ the Exchange grant admits it.
 
 ## Provider authority is an implementation gate
 
-Flux-roadmap Decision 0007 at `4511f44b4defcb6de92ab8fc1b56bd5b4356ca78` controls the capability
-boundary and consumption requirements recorded here. Canonical Exchange merge
-`3b16bcb5b1c52984449118775125fe66da1686da` contains accepted X-134 contract head
-`9dc414c76f231bd179358fd526019a16872a7be1`, which is the provider authority for the exact bytes,
-names, target-selection/partition rules, platform ABI and timeout relationships recorded here. This
-acceptance does not satisfy the connectors C-515 registry-release gate, claim X-134 implementation
-or provide the future X-126 release-v2 fixture inventory. Before C-510 or C-509 implementation
-resumes, Flux must consume the implemented provider contract verbatim; it may not preserve a stale
+Flux-roadmap Decisions 0007 and 0012 at
+`dc907fab219d67f80bf08311ebdfdeb766f1e8d7` control the capability and platform boundary recorded
+here. Exchange merge `3b16bcb5b1c52984449118775125fe66da1686da` and X-134 contract head
+`9dc414c76f231bd179358fd526019a16872a7be1` are historical pre-0012 protocol baselines only; their
+non-Linux ABI is superseded. The sole implementation authority will be the post-X-137/X-138/X-139
+X-126 v2 corpus committed from the Linux-only provider tree. Before C-510 or C-509 implementation
+resumes, Flux must consume that implemented provider contract verbatim; it may not preserve a stale
 alternative spelling, timing or wire format. No Flux test fixture or parser may create a second
 authority.
 

@@ -2,11 +2,12 @@
 //!
 //! Both renderers (ratatui spans, ANSI terminal) consume this one engine, so they lay out
 //! identically: greedy word wrap against `width` (floor 20), hanging list markers emitted once,
-//! repeating blockquote bars, per-line code with a 2-space inset, box-drawing tables, and the
-//! blank-line "gap" discipline between blocks. The visible conventions deliberately match the
-//! wrapper stack this engine replaced (same markers, rules, and wrap points) — with one documented
-//! fix: nested lists render correctly (the old stack collapsed a parent item's marker into its
-//! first child's line).
+//! repeating blockquote bars, per-line code with a glyph gutter and 2-space inset, box-drawing
+//! tables, and the blank-line "gap" discipline between blocks. The visible conventions
+//! deliberately match the wrapper stack this engine replaced (same markers, rules, and wrap
+//! points), except for documented structural fixes: nested lists render correctly (the old stack
+//! collapsed a parent item's marker into its first child's line), and fenced code is framed by a
+//! mono-safe gutter.
 
 use crate::ast::{Alignment, Block, Document, Inline, List, Table};
 use unicode_width::UnicodeWidthStr;
@@ -62,6 +63,17 @@ struct Prefix {
     first: Seg,
     cont: Seg,
     emitted: bool,
+}
+
+impl Prefix {
+    /// A structural prefix repeated on every physical row (blockquote and fenced-code gutters).
+    fn repeating(seg: Seg) -> Self {
+        Prefix {
+            first: seg.clone(),
+            cont: seg,
+            emitted: false,
+        }
+    }
 }
 
 struct Layouter {
@@ -133,32 +145,30 @@ impl Layouter {
             }
             Block::CodeBlock { literal, .. } => {
                 self.gap();
+                self.prefixes.push(Prefix::repeating(Seg {
+                    text: "▎ ".into(),
+                    style: Style {
+                        muted: true,
+                        ..Style::default()
+                    },
+                }));
                 if !literal.is_empty() {
                     for line in literal.split('\n') {
                         self.code_line(line);
                     }
                 }
+                self.prefixes.pop();
                 self.pending_gap = !tight;
             }
             Block::BlockQuote { blocks } => {
                 self.gap();
-                self.prefixes.push(Prefix {
-                    first: Seg {
-                        text: "│ ".into(),
-                        style: Style {
-                            muted: true,
-                            ..Style::default()
-                        },
+                self.prefixes.push(Prefix::repeating(Seg {
+                    text: "│ ".into(),
+                    style: Style {
+                        muted: true,
+                        ..Style::default()
                     },
-                    cont: Seg {
-                        text: "│ ".into(),
-                        style: Style {
-                            muted: true,
-                            ..Style::default()
-                        },
-                    },
-                    emitted: false,
-                });
+                }));
                 self.blocks(blocks, false);
                 self.prefixes.pop();
                 self.pending_gap = !tight;

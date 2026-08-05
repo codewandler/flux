@@ -70,6 +70,11 @@ impl Credential for NoAuthOllama {
     async fn apply(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
         Ok(rb)
     }
+
+    /// Ollama has no account credit/quota contract; an unclassified 429 remains retryable.
+    fn is_terminal_http_error(&self, _status: u16, _body: &str) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,5 +139,13 @@ mod tests {
     fn endpoint_targets_messages_path() {
         // Robust regardless of whether OLLAMA_HOST is set in the environment.
         assert!(ollama_messages_endpoint().ends_with("/v1/messages"));
+    }
+
+    #[test]
+    fn local_429_is_unclassified_and_remains_transient() {
+        let cred = NoAuthOllama {
+            endpoint: ollama_messages_endpoint(),
+        };
+        assert!(!cred.is_terminal_http_error(429, "quota exceeded"));
     }
 }

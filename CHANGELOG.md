@@ -85,6 +85,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Operation execution placement is now explicit per operation** (C-478). The runtime distinguishes
+  local control-plane work, selected-execution-system effects, and native-system-only effects. Remote
+  catalogs retain compatible members of mixed packs, hide native-only operations, and repeat the
+  same fail-closed check at dispatch; unannotated extensions default to native-only remotely while
+  local execution remains unchanged. `/tools` reports the incompatibility reason, and a production
+  census keeps every built-in classification deliberate.
+
+- **Fenced Markdown code blocks now carry a structural `▎ ` gutter** (C-537). The shared layout
+  path applies it to every code row, including blank and list-nested rows, so terminal, ANSI, export,
+  and monochrome rendering identify code blocks consistently without relying on color.
+
 - **Every release authority is now scoped to the single job and step that consumes it** (C-354). All
   four release workflows declare workflow-level `contents: read`; any other GitHub write permission
   is granted on the one job that needs it, and no workflow- or job-level `env` carries a provider
@@ -161,8 +172,11 @@ All notable changes to this project are documented in this file. The format is b
 
 - **The Exchange environment bearer is now documented as transitional compatibility** (C-511).
   C-503's lower-level embedded-client setup remains available and redacted, but public and
-  contributor guidance no longer presents it as the Milestone 1 bootstrap: C-509 replaces it with
-  an Exchange-owned direct handoff into secure storage.
+  contributor guidance no longer presents it as the managed Linux-local Milestone 1 bootstrap:
+  C-509 replaces it there with an Exchange-owned direct handoff into secure storage. Independently
+  provisioned remote Exchange use retains the configured origin/bearer on every Flux target until a
+  separate secure remote provisioning contract lands. This Decision 0012 correction changes no
+  shipped lifecycle behavior.
 
 - **Direct dependency changes are now explicit review events** (C-450). CI compares each workspace's
   exact resolved direct edges with a committed review lock, including which selected packages run a
@@ -245,6 +259,11 @@ All notable changes to this project are documented in this file. The format is b
   pairs carry reciprocal pointer notes, and `docs/designs/` states its convention in a README.
 
 ### Fixed
+
+- **Provider-declared quota exhaustion no longer enters transient retry backoff** (C-545). Codex,
+  OpenAI, Anthropic, OpenRouter, and Bedrock can classify explicit usage-limit or credit-exhaustion
+  responses as terminal, preserving the provider's reset or limit message for the caller. Bare and
+  otherwise unclassifiable HTTP 429 responses remain retryable.
 
 - **The TUI dependency graph no longer carries the unsound `lru 0.12.5` release** (C-205).
   Ratatui, crossterm, ansi-to-tui, the first-party Markdown parity oracles and the maintained

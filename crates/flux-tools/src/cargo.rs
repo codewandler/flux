@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_core::Result;
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{
     tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
     IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
@@ -591,7 +591,7 @@ impl Tool for CargoFmtTool {
 
 /// Register all cargo tools into a registry.
 pub fn try_register_cargo(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools cargo pack",
         vec![
             Arc::new(CargoCheckTool) as Arc<dyn Tool>,
@@ -600,6 +600,7 @@ pub fn try_register_cargo(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(CargoClippyTool),
             Arc::new(CargoFmtTool),
         ],
+        OperationPlacement::SelectedExecutionSystem,
     )
 }
 

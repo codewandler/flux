@@ -218,10 +218,13 @@ current feature rather than an official outbound integration executor. See
 > **Current seam:** Flux's embedded client authenticates as one Service Account, projects its
 > effective catalogue at turn boundaries, and calls Exchange's one-shot HTTP `invoke` route.
 > Its `FLUX_EXCHANGE_URL` plus `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN` environment setup is
-> transitional C-503 compatibility, not the Milestone 1 bootstrap. C-509's final bootstrap uses a
-> separately human-authenticated management surface for plans, connections, grants and Service
-> Account minting; those routes never join the Service-Account-only runtime client. An Exchange-owned
-> direct handoff places the one-time token in secure storage, after which its bytes may exist only in
+> transitional C-503 compatibility, not the Linux-local Milestone 1 bootstrap. On supported Linux,
+> C-509's final bootstrap uses a separately human-authenticated native management surface for plans,
+> connections, grants and Service Account minting; those routes never join the Service-Account-only
+> runtime client and cannot manage a remote host. Independently provisioned remote Exchange use
+> retains the transitional configured origin/bearer on every Flux target, including Linux, until a
+> separately authenticated remote provisioning contract exists. For managed Linux-local bootstrap,
+> an Exchange-owned direct handoff places the one-time token in secure storage, after which its bytes may exist only in
 > a host-owned resolver and sensitive Authorization transport—not argv, environment, ordinary
 > diagnostics/JSON/configuration, logs, events, session state or model-visible state. Tenant, connection,
 > credential, grant and runtime remain Exchange-owned. Generated socket channels can publish their

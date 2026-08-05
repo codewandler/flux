@@ -119,6 +119,20 @@ impl Credential for BearerOpenRouter {
         }
         Ok(rb)
     }
+
+    fn is_terminal_http_error(&self, status: u16, body: &str) -> bool {
+        if status != 402 && status != 429 {
+            return false;
+        }
+        let body = body.to_ascii_lowercase();
+        [
+            "insufficient credits",
+            "insufficient_credits",
+            "purchase more credits",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +265,19 @@ mod tests {
             extra: vec![("X-Title", "flux".into())],
         };
         assert_eq!(cred.endpoint(), OPENROUTER_MESSAGES_ENDPOINT);
+    }
+
+    #[test]
+    fn credit_marker_is_terminal_but_bare_throttling_is_not() {
+        let cred = BearerOpenRouter {
+            api_key: "sk-or-test".into(),
+            extra: Vec::new(),
+        };
+        assert!(cred.is_terminal_http_error(
+            429,
+            r#"{"error":{"message":"Insufficient credits. Purchase more credits to continue."}}"#,
+        ));
+        assert!(!cred.is_terminal_http_error(429, r#"{"error":{"message":"rate limited"}}"#));
     }
 
     #[test]

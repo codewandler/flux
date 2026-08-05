@@ -24,7 +24,7 @@ use serde_json::Value;
 use flux_core::{Chunk, ContextBlock, Error, Result, Usage};
 use flux_evidence::{EvidenceLog, Observation, Phase};
 use flux_provider::{Provider, Request};
-use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{LoopHost, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
 /// Per-turn call cap used when `[consult] max_calls` is not configured — a cheap second opinion,
@@ -98,7 +98,11 @@ impl ConsultTool {
 
     /// Register `consult` into `registry`.
     pub fn try_register(self, registry: &mut ToolRegistry) -> Result<()> {
-        registry.try_register_from("flux-cognition consult operation", Arc::new(self))
+        registry.try_register_from_with_placement(
+            "flux-cognition consult operation",
+            Arc::new(self),
+            OperationPlacement::LocalControlPlane,
+        )
     }
 }
 

@@ -14,7 +14,9 @@ use flux_datasource::live::{
     Reference, Row,
 };
 use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL};
-use flux_runtime::{AuthorityRequirement, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{
+    AuthorityRequirement, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult,
+};
 use flux_spec::{AccessKind, Effect, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -133,7 +135,11 @@ pub fn try_register_live_datasource(
     backend: Arc<dyn LiveDatasource>,
 ) -> Result<LiveDatasourceSurface> {
     let tools = live_datasource_tools(domain, backend)?;
-    registry.try_register_all_from(live_source(domain), tools)?;
+    registry.try_register_all_from_with_placement(
+        live_source(domain),
+        tools,
+        OperationPlacement::NativeSystemOnly,
+    )?;
     Ok(live_surface(domain))
 }
 

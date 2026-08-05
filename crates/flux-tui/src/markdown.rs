@@ -47,4 +47,27 @@ mod tests {
             .collect();
         assert!(flat.contains("just a sentence"));
     }
+
+    #[test]
+    fn fenced_code_gutter_survives_mono() {
+        let text = flux_markdown::render::tui::render_with_theme(
+            "before `inline`\n\n```text\none\n\ntwo\n```\n",
+            &flux_markdown::render::tui::Theme::no_color(),
+            40,
+        );
+        let lines: Vec<String> = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["before inline", "", "▎   one", "▎   ", "▎   two",]
+        );
+    }
 }

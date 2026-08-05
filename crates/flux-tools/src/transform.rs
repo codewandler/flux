@@ -7,12 +7,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_core::{Error, Result};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{Idempotency, Risk, ToolSpec};
 
 /// Register deterministic list transform ops into the cognition group.
 pub fn try_register_transforms(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools deterministic transform pack",
         vec![
             Arc::new(MapTool) as Arc<dyn Tool>,
@@ -24,6 +24,7 @@ pub fn try_register_transforms(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(JoinTool),
             Arc::new(SplitTool),
         ],
+        OperationPlacement::LocalControlPlane,
     )
 }
 

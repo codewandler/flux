@@ -285,7 +285,11 @@ fn read_proposed_policy(path: &str) -> Result<Option<AuthorizationPolicy>> {
 fn simulation_registry() -> Result<ToolRegistry> {
     let mut registry = ToolRegistry::new();
     flux_tools::try_register_builtins(&mut registry)?;
-    registry.try_register_from("flux-cli sub-agent task operation", Arc::new(TaskTool))?;
+    registry.try_register_from_with_placement(
+        "flux-cli sub-agent task operation",
+        Arc::new(TaskTool),
+        flux_runtime::OperationPlacement::LocalControlPlane,
+    )?;
     Ok(registry)
 }
 

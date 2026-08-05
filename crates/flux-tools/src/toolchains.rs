@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_core::Result;
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{
     AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
     IntentSet, IntentTarget, Risk, ToolSpec,
@@ -72,7 +72,7 @@ fn run_argv(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>> {
     Box::pin(async move {
         let out = ctx
-            .system()
+            .execution_system()
             .run(&argv, Duration::from_secs(TOOLCHAIN_TIMEOUT_SECS))
             .await?;
         let mut body = String::new();
@@ -500,7 +500,7 @@ impl Tool for MakeTool {
 
 /// Register all non-Rust toolchain tools into a registry.
 pub fn try_register_toolchains(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools language toolchains pack",
         vec![
             Arc::new(PythonRunTool) as Arc<dyn Tool>,
@@ -512,6 +512,7 @@ pub fn try_register_toolchains(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(GoVetTool),
             Arc::new(MakeTool),
         ],
+        OperationPlacement::SelectedExecutionSystem,
     )
 }
 

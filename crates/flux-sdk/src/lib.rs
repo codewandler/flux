@@ -110,7 +110,9 @@ pub use flux_flow::replay::ReplayReport;
 /// [`ToolContext`](tools::ToolContext)/[`ToolResult`](tools::ToolResult) are the dispatch types;
 /// [`ToolRegistry`](tools::ToolRegistry) is what a `register_pack` closure receives.
 pub mod tools {
-    pub use flux_runtime::{tool_fn, FnTool, Tool, ToolContext, ToolRegistry, ToolResult};
+    pub use flux_runtime::{
+        tool_fn, FnTool, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult,
+    };
     pub use flux_spec::{Risk, ToolSpec};
 }
 
@@ -1051,9 +1053,10 @@ impl ClientBuilder {
         // the catalog AND asked for sub-agents still keeps `task`). The spawner is attached to the
         // dispatch context below.
         if self.sub_agents.is_some() {
-            registry.try_register_from(
+            registry.try_register_from_with_placement(
                 "sdk ClientBuilder sub-agent task operation",
                 Arc::new(TaskTool),
+                flux_runtime::OperationPlacement::LocalControlPlane,
             )?;
         }
         let custom_names: Vec<String> = registry

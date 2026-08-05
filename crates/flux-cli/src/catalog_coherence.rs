@@ -122,7 +122,11 @@ fn production_catalog() -> ToolRegistry {
     )
     .expect("the user interaction op registers");
     registry
-        .try_register_from(TASK_OP_SOURCE, Arc::new(flux_orchestrate::TaskTool))
+        .try_register_from_with_placement(
+            TASK_OP_SOURCE,
+            Arc::new(flux_orchestrate::TaskTool),
+            flux_runtime::OperationPlacement::LocalControlPlane,
+        )
         .expect("the task op registers");
 
     // Cognition + consult + wakeup + eval + reflect/flows/render, through the *production*
@@ -149,12 +153,20 @@ fn production_catalog() -> ToolRegistry {
     // call site is `app_cmd.rs`'s registration loop over `ProgramDatasources::boards`, not
     // `execution.rs`; the census reaches the same `try_register_work_board` the loop calls, which is
     // what makes the classification below more than a name on a list.
-    flux_capabilities::try_register_work_board(
+    let board_surface = flux_capabilities::try_register_work_board(
         &mut registry,
         CENSUS_BOARD_DOMAIN,
         Arc::new(flux_capabilities::MemoryBoard::new()),
     )
     .expect("a declared work board registers");
+    for operation in &board_surface.group.tools {
+        registry
+            .declare_placement(
+                operation,
+                flux_runtime::OperationPlacement::NativeSystemOnly,
+            )
+            .expect("the generated board operation is registered");
+    }
 
     // The record sink matters to the census: `web.fetch` / `web.crawl` disclose their durable
     // `web.page` datasource contribution as the `write_db` *semantic* effect only when a sink is
@@ -180,11 +192,7 @@ fn production_catalog() -> ToolRegistry {
         plugins,
         endpoints.clone(),
     ));
-    registry
-        .try_register_all_from(
-            "cli endpoint integration",
-            flux_capabilities::endpoint_tools(broker, endpoints),
-        )
+    flux_capabilities::try_register_endpoint_ops(&mut registry, broker, endpoints)
         .expect("the endpoint ops register");
 
     // A config-authored model stage. Every `[agent.stages.*]` entry lowers through this one
@@ -570,6 +578,20 @@ fn the_census_is_strictly_wider_than_the_builtin_pack() {
     );
 }
 
+/// C-478: default-native compatibility keeps third-party registration source-compatible, but every
+/// first-party operation in the widest production catalog must carry a deliberate decision. This
+/// is the compile/test-time tripwire for a newly added public operation whose owner forgot to say
+/// whether it is coordinator-local, selected-system-aware, or native-only.
+#[test]
+fn every_production_operation_declares_execution_placement() {
+    let catalog = production_catalog();
+    let undeclared = catalog.undeclared_placement_names();
+    assert!(
+        undeclared.is_empty(),
+        "production operations missing deliberate execution placement: {undeclared:?}"
+    );
+}
+
 /// A-131, the named failing-first test: A-116 landed `fleet.dispatch` / `.status` / `.cancel`, but
 /// they were constructed nowhere outside their own module — the only other mention in the workspace
 /// was a re-export. An op the production assembly never registers cannot be called by a Program, so
@@ -635,7 +657,9 @@ const COVERED_REGISTRATION_SEAMS: &[&str] = &[
     "try_register_web",
     "try_register_model_stage",
     "try_register_from",
+    "try_register_from_with_placement",
     "try_register_all_from",
+    "try_register_all_from_with_placement",
     "try_register",
 ];
 
@@ -743,7 +767,11 @@ impl RegistrationVisitor<'_> {
         let arguments: Vec<String> = arguments.into_iter().map(registration_source).collect();
         let source = matches!(
             seam.as_str(),
-            "try_register" | "try_register_from" | "try_register_all_from"
+            "try_register"
+                | "try_register_from"
+                | "try_register_from_with_placement"
+                | "try_register_all_from"
+                | "try_register_all_from_with_placement"
         )
         .then(|| {
             arguments

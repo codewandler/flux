@@ -428,8 +428,11 @@ impl FlowClient {
     ) -> Result<&mut Self> {
         let tools = crate::plugins::load_tools(&self.system, name, descriptor).await?;
         for tool in tools {
-            self.registry
-                .try_register_from(format!("plugin:{name}"), tool)?;
+            self.registry.try_register_from_with_placement(
+                format!("plugin:{name}"),
+                tool,
+                flux_runtime::OperationPlacement::NativeSystemOnly,
+            )?;
         }
         Ok(self)
     }
@@ -464,9 +467,10 @@ impl FlowClient {
             // C-299: children inherit this client's ceilings, per agent (own concurrency budget) —
             // see `ClientBuilder::resource_limits`.
             .with_resource_limits(self.resource_limits.clone());
-        self.registry.try_register_from(
+        self.registry.try_register_from_with_placement(
             "sdk FlowClient sub-agent task operation",
             Arc::new(TaskTool),
+            flux_runtime::OperationPlacement::LocalControlPlane,
         )?;
         self.spawner = Some(sub_agents.into_spawner(self.system.clone()));
         Ok(self)
@@ -502,9 +506,10 @@ impl FlowClient {
             )
             // C-299: as in `try_with_sub_agents` — children inherit this client's ceilings.
             .with_resource_limits(self.resource_limits.clone());
-        self.registry.try_register_from(
+        self.registry.try_register_from_with_placement(
             "sdk FlowClient sub-agent task operation",
             Arc::new(TaskTool),
+            flux_runtime::OperationPlacement::LocalControlPlane,
         )?;
         self.spawner = Some(
             sub_agents.into_spawner_with_adaptive_policy(self.system.clone(), adaptive_policy),

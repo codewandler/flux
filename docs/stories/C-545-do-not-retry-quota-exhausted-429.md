@@ -2,7 +2,7 @@
 id: C-545
 title: "Do not retry quota-exhausted HTTP 429; surface the terminal limit directly"
 pillar: Core
-status: ready
+status: done
 priority: 33
 epic:
 design:
@@ -22,25 +22,40 @@ to ready at once instead of burning backoff cycles against a wall that will not 
 
 ## Acceptance
 
-- [ ] `is_retryable_status` / the `RetryReason::Status(429)` path
+- [x] `is_retryable_status` / the `RetryReason::Status(429)` path
       (`crates/flux-provider/src/retry.rs:32`, `:166` as of 2026-08-05) no longer treats every 429
       as retryable: a provider-classified terminal 429 bypasses retry entirely. A failing-first
       test drives a codex-shaped `usageLimitExceeded` 429 through the retry policy and proves zero
       retry attempts.
-- [ ] The codex adapter (`crates/flux-providers/src/codex.rs`) classifies its 429 body: a
+- [x] The codex adapter (`crates/flux-providers/src/codex.rs`) classifies its 429 body: a
       `usageLimitExceeded` (or equivalent reset-bearing) payload is terminal; a bare 429 stays
       transient/retryable. Other adapters (anthropic, openai, openrouter, bedrock, ollama) get the
       same hook with a per-provider classification where their error shape carries an explicit
       quota/credit marker (e.g. Anthropic "credit balance is too low"); unclassifiable 429s keep
       today's retry behavior.
-- [ ] The surfaced terminal error carries the provider's reset time / limit message verbatim so an
+- [x] The surfaced terminal error carries the provider's reset time / limit message verbatim so an
       operator (or fleet coordinator) can schedule around it; a test asserts the message and reset
       survive to the caller.
-- [ ] The gate is green in both workspaces.
+- [x] The gate is green in both workspaces.
 
 ## Progress
 
-- (not started)
+- 2026-08-05: added failing-first coverage that drove a codex-shaped `usageLimitExceeded` 429
+  through `NativeProvider`: before the fix it made two HTTP hits despite a one-retry budget
+  (`left: 2`, `right: 1`); after the fix it makes one initial hit, emits zero
+  `RetryReason::Status(429)` events, and returns the reset-bearing JSON body byte-for-byte.
+- 2026-08-05: added `Credential::is_terminal_http_error` as the provider-specific body-aware seam.
+  Codex classifies typed/reset-bearing usage limits; OpenAI, Anthropic, OpenRouter, and Bedrock
+  classify their explicit quota/credit markers; both Ollama transports remain deliberately
+  unclassified. A bare codex 429 still retries once and recovers.
+- 2026-08-05: targeted gate is green:
+  `cargo test -p codewandler-flux-provider -p codewandler-flux-providers` (27 + 192 passed, one
+  live-key test ignored), targeted `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --all -- --check`, and `cargo test -p flux-codegate` (51 passed). Per the dispatched
+  wave contract, the integration parent owns the one final full gate across both workspaces.
+- 2026-08-05: the integrated wave passed the root workspace build, tests, all-target clippy with
+  warnings denied, formatting, and codegate. The nested plugin workspace also passed formatting,
+  all-target clippy, build, tests, and its direct-dependency review-lock check.
 
 ## Notes
 
