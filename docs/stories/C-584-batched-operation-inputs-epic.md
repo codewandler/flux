@@ -40,4 +40,3 @@ independent inputs when one bounded invocation preserves authorization, effects 
 
 - Related but not duplicate: C-528 executes several independent calls concurrently. This epic asks
   when they should have been one operation call in the first place.
-

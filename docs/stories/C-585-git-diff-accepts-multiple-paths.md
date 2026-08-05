@@ -43,4 +43,3 @@ one operation call and result envelope per path.
 
 - One Git invocation returns one combined diff. This is not C-528-style concurrent execution and
   does not concatenate several independently capped results.
-

@@ -43,4 +43,3 @@ inspection the required fallback before an agent contradicts verified execution 
 
 - 2026-08-05 — contracted from `s_2013`, whose durable stream proves the later conversational
   corrections—not the original execution report—were false.
-

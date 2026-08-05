@@ -80,11 +80,15 @@ sha256_file() {
 }
 
 verify_one_sidecar() {
-  local dir=$1 archive=$2 sidecar="$dir/$archive.sha256" digest expected
+  local dir=$1 archive=$2 sidecar="$dir/$archive.sha256" digest expected line_count
   digest=$(sha256_file "$dir/$archive")
   expected="$digest *$archive"
-  [ "$(wc -l <"$sidecar" | tr -d ' ')" = 1 ] && [ "$(cat "$sidecar")" = "$expected" ] || {
-    err "$archive.sha256 must be one newline-terminated lowercase digest record for $archive"
+  line_count=$(wc -l <"$sidecar" | tr -d ' ')
+  # Command substitution removes trailing newlines. Requiring at least one newline while comparing
+  # the remaining bytes accepts cargo-dist's harmless trailing blank line without accepting a
+  # missing terminator, a second record, whitespace, a path, or a different digest.
+  [ "$line_count" -ge 1 ] && [ "$(cat "$sidecar")" = "$expected" ] || {
+    err "$archive.sha256 must contain one newline-terminated lowercase digest record for $archive"
     return 1
   }
   [[ "$expected" =~ ^[0-9a-f]{64}\ \*[^/]+$ ]] || {
@@ -102,8 +106,9 @@ verify_checksums() {
   for archive in "${checksum_members[@]}"; do
     printf '%s *%s\n' "$(sha256_file "$dir/$archive")" "$archive"
   done >"$sum_expected"
-  if ! cmp -s "$sum_expected" "$dir/sha256.sum"; then
-    err "sha256.sum must contain exactly the eleven sorted archive/source digest records"
+  if [ "$(wc -l <"$dir/sha256.sum" | tr -d ' ')" -lt "${#checksum_members[@]}" ] \
+    || [ "$(cat "$sum_expected")" != "$(cat "$dir/sha256.sum")" ]; then
+    err "sha256.sum must contain the eleven exact sorted archive/source digest records"
     diff -u "$sum_expected" "$dir/sha256.sum" >&2 || true
     rm -f "$sum_expected"
     return 1
@@ -152,6 +157,11 @@ if [ "${1:-}" = --self-test ]; then
     printf '%s *%s\n' "$(sha256_file "$good/$archive")" "$archive"
   done >"$good/sha256.sum"
   validate_release_dir "$good"
+
+  cp -a "$good" "$fixture/trailing-blank-sidecar"
+  printf '\n' >>"$fixture/trailing-blank-sidecar/${expected_archives[0]}.sha256"
+  printf '\n' >>"$fixture/trailing-blank-sidecar/sha256.sum"
+  validate_release_dir "$fixture/trailing-blank-sidecar"
 
   for missing in "${expected_assets[@]}"; do
     mapfile -t incomplete < <(printf '%s\n' "${expected_assets[@]}" | grep -Fxv "$missing")

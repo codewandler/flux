@@ -50,4 +50,3 @@ could safely accept arrays, without collecting user prompts, arguments, paths or
 
 - The counts are dated trigger evidence, not a universal benchmark. The implementation must support
   an explicitly selected store and privacy-preserving aggregate output.
-

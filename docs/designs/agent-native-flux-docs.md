@@ -105,4 +105,3 @@ surface. Neither shells out to the other.
 1. C-579 builds and release-gates the deterministic datasource artifact and topic catalogue.
 2. C-580 registers it through the indexed datasource seam and proves bounded offline retrieval.
 3. C-581 adds intent-aware surfacing, generated-skill guidance and public operator documentation.
-

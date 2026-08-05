@@ -76,4 +76,3 @@ currently surfaced operation schemas.
 1. C-590 adds the shared query/detail projection, exact-id CLI selection and agent operations.
 2. C-591 adds the continuation receipt, capability-boundary instruction and the hermetic `s_2013`
    regression.
-

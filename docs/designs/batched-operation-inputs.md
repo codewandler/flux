@@ -79,4 +79,3 @@ reviewed candidates; it does not mechanically rewrite schemas.
   indicate surfacing/guidance behavior, not another schema change.
 - Resource accounting C-574 can later quantify tokens, calls and wall time saved, but does not gate
   the semantic fix.
-

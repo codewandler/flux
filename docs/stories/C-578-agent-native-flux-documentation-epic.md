@@ -41,4 +41,3 @@ Use the indexed datasource contract rather than inventing a documentation-only r
 
 - Depends on the accepted datasource boundary in flux-roadmap Decision 0006.
 - This epic does not move Board back under the datasource vocabulary.
-

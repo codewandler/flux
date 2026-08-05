@@ -41,4 +41,3 @@ indexed datasource contract, with concise topic overview and search journeys.
 ## Notes
 
 - Depends on C-579.
-

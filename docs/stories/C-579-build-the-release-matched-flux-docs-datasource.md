@@ -39,4 +39,3 @@ whose records can be consumed without a checkout, server or network connection.
 
 - Indexed mode is required: this is an in-process, release-fixed corpus with search and relations.
 - Topic overviews are authored navigation records, not generated model summaries.
-
