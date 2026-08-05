@@ -36,7 +36,7 @@ to ready at once instead of burning backoff cycles against a wall that will not 
 - [x] The surfaced terminal error carries the provider's reset time / limit message verbatim so an
       operator (or fleet coordinator) can schedule around it; a test asserts the message and reset
       survive to the caller.
-- [ ] The gate is green in both workspaces.
+- [x] The gate is green in both workspaces.
 
 ## Progress
 
@@ -53,6 +53,9 @@ to ready at once instead of burning backoff cycles against a wall that will not 
   live-key test ignored), targeted `cargo clippy --all-targets -- -D warnings`,
   `cargo fmt --all -- --check`, and `cargo test -p flux-codegate` (51 passed). Per the dispatched
   wave contract, the integration parent owns the one final full gate across both workspaces.
+- 2026-08-05: the integrated wave passed the root workspace build, tests, all-target clippy with
+  warnings denied, formatting, and codegate. The nested plugin workspace also passed formatting,
+  all-target clippy, build, tests, and its direct-dependency review-lock check.
 
 ## Notes
 

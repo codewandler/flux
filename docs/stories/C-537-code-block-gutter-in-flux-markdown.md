@@ -44,6 +44,9 @@ V-8 from `docs/designs/tui-ux-ui-epic.md`, the one surviving item C-341 did not 
   for both crates, and workspace fmt check are green. (`codewandler-flux-markdown` is the actual
   Cargo package id; the story's `-p flux-markdown` selector is not registered.) The committed TUI
   loop-mock snapshot check passed unchanged, so there are no snapshot-file deltas.
+- 2026-08-05 — integrated in the post-C-205 wave; the combined repository build, workspace tests,
+  all-target clippy with warnings denied, both-workspace formatting, codegate, and embedded-docs
+  freshness gate are green.
 - 2026-08-05 — **scope finding**: this is not the one-liner the prior review assumed. The L-02
   parity suite (`crates/flux-markdown/tests/parity.rs`) asserts *exact per-line parity* against the
   old `markdown-terminal`/`markdown-ratatui` oracles for the snippet suite (`fenced_code`,

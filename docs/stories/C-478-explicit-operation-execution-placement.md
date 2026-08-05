@@ -37,7 +37,7 @@ fail-closed without hard-coded registration-order diffs.
 - [x] The blanket `before_*`/registry-diff remote disable blocks in `execution.rs` are removed.
 - [x] Public execution-model docs derive or verify their compatibility categories against the same
       metadata rather than maintaining an unrelated list.
-- [ ] Full gate green in both sandbox postures.
+- [x] Full gate green in both sandbox postures.
 
 ## Progress
 
@@ -55,6 +55,10 @@ fail-closed without hard-coded registration-order diffs.
   1 ignored), CLI (429), and the remaining directly touched packages (1,032 passed, 5 ignored),
   plus focused all-target clippy with warnings denied and `cargo fmt --all -- --check`. The wave
   coordinator owns the one combined full gate in both sandbox postures before shipping.
+- 2026-08-05: the integrated wave passed `scripts/release-full-gate.sh` (workspace build and tests,
+  all-target clippy with warnings denied, both-workspace formatting, and 51 codegate tests), the
+  complete workspace suite with `FLUX_BWRAP_BIN=/nonexistent/bwrap`, and all five
+  `sandbox_backend` integration tests with `FLUX_TEST_SANDBOX_BACKEND=1`.
 
 ## Notes
 
