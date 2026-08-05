@@ -93,10 +93,14 @@ use flux_runtime::context::{
     ContextFragments, ContextLayerKind, ContextLayerTrust, EnvContext, GitContext, ProjectFiles,
     Projector, RepoSignal,
 };
+/// C-463: production code reaches the blanket-allow approver only through
+/// `AutonomyPosture::approver`, so this name is now a test-only fixture import that the sibling
+/// modules' `use super::*` picks up.
+#[cfg(test)]
+use flux_runtime::AllowApprover;
 use flux_runtime::{
-    scope_runtime_turn, AllowApprover, ApprovalChoice, Approver, ExecutionAuthorization,
-    ExecutionEnvironment, PermissionManager, RuntimeTurnContext, SpawnActivitySink, ToolRegistry,
-    ToolResult,
+    scope_runtime_turn, ApprovalChoice, Approver, ExecutionAuthorization, ExecutionEnvironment,
+    PermissionManager, RuntimeTurnContext, SpawnActivitySink, ToolRegistry, ToolResult,
 };
 use flux_spec::IntentSet;
 use flux_system::{System, Workspace};
@@ -5042,6 +5046,14 @@ mod tests {
         }
     }
 
+    /// Serializes the tests that resolve the process-global sandbox environment.
+    ///
+    /// `EnvVarGuard` restores a variable on drop, but restoration is not exclusion: two tests that
+    /// both `set_var("FLUX_SANDBOX", ..)` inside one test binary read each other's writes. They also
+    /// share `Sandbox`'s once-per-process posture-disclosure latch. Both effects are invisible when
+    /// only one such test exists, which is why this arrived with the second one (C-463).
+    static SANDBOX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Restores (or removes) an env var on drop — panic-safe cleanup for env-mutating tests, so a
     /// failed assertion can't leak a widened grant into every later test in the process.
     struct EnvVarGuard {
@@ -5232,6 +5244,7 @@ mod tests {
     fn apply_sandbox_env_resolves_tightest_wins_and_fails_closed_under_require() {
         use clap::Parser;
 
+        let _serial = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g_mode = EnvVarGuard::new("FLUX_SANDBOX");
         let _g_net = EnvVarGuard::new("FLUX_SANDBOX_NET");
         let _g_writable = EnvVarGuard::new("FLUX_SANDBOX_WRITABLE");
@@ -5406,6 +5419,88 @@ mod tests {
         std::env::remove_var("FLUX_SANDBOX");
         std::env::remove_var("FLUX_SANDBOX_NET");
         std::env::remove_var("FLUX_SANDBOX_WRITABLE");
+    }
+
+    /// **C-463.** A named `--posture` carries its confinement into the resolved sandbox posture,
+    /// which is the half of "one coherent choice" that lives outside the approver.
+    ///
+    /// The three rows are the argument: `bounded-autonomy` confines and closes egress (today's
+    /// `--yes` profile, now named); `exploratory` confines just as hard but keeps egress open,
+    /// because research and security hardening are network jobs and a posture that cut them off
+    /// would be selected once and then worked around with `--no-sandbox`; `supervised` imposes no
+    /// floor at all, because a human at the terminal is the boundary.
+    ///
+    /// ⚠ And the no-flag-day row: `flux tui --yes` stays exempt. `--yes` maps onto
+    /// `bounded-autonomy`, but only an *explicitly named* posture contributes a floor here — the
+    /// exemptions `unattended_sandbox_surface` carries are decisions about surfaces, not postures,
+    /// and inferring a floor from the older spelling would silently confine them.
+    #[test]
+    fn a_named_posture_carries_its_confinement_into_the_sandbox_env() {
+        use clap::Parser;
+
+        let _serial = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g_mode = EnvVarGuard::new("FLUX_SANDBOX");
+        let _g_net = EnvVarGuard::new("FLUX_SANDBOX_NET");
+        let _g_bwrap = EnvVarGuard::new("FLUX_BWRAP_BIN");
+        let _g_exec = EnvVarGuard::new("FLUX_SANDBOX_EXEC_BIN");
+        let _g_confined = EnvVarGuard::new("FLUX_SANDBOXED");
+        // No usable backend on either platform, so a `require` floor is observable as a refusal
+        // instead of depending on what this host happens to have installed.
+        std::env::set_var("FLUX_BWRAP_BIN", "/nonexistent/not-a-bwrap-c463");
+        std::env::set_var(
+            "FLUX_SANDBOX_EXEC_BIN",
+            "/nonexistent/not-a-sandbox-exec-c463",
+        );
+        std::env::remove_var("FLUX_SANDBOXED");
+
+        for (argv, mode, net, confined) in [
+            (
+                &["flux", "run", "--posture", "bounded-autonomy", "hi"][..],
+                "require",
+                Some("0"),
+                true,
+            ),
+            // Egress open is the *absence* of narrowing, so nothing is exported — the same
+            // "only set what changes" style every other source here follows, and the reason an
+            // ambient `FLUX_SANDBOX_NET=0` still wins over this posture rather than being reopened.
+            (
+                &["flux", "run", "--posture", "exploratory", "hi"][..],
+                "require",
+                None,
+                true,
+            ),
+            (
+                &["flux", "run", "--posture", "supervised", "hi"][..],
+                "off",
+                None,
+                false,
+            ),
+            // The no-flag-day row.
+            (&["flux", "tui", "--yes"][..], "off", None, false),
+        ] {
+            std::env::remove_var("FLUX_SANDBOX");
+            std::env::remove_var("FLUX_SANDBOX_NET");
+            let cli = super::Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let outcome = super::apply_sandbox_env(&cli, &flux_config::Config::default());
+            assert_eq!(
+                outcome.is_err(),
+                confined,
+                "{argv:?}: a posture that relies on confinement must fail closed with no backend"
+            );
+            assert_eq!(
+                std::env::var("FLUX_SANDBOX").as_deref(),
+                Ok(mode),
+                "{argv:?}"
+            );
+            assert_eq!(
+                std::env::var("FLUX_SANDBOX_NET").ok().as_deref(),
+                net,
+                "{argv:?}: the posture's egress default"
+            );
+        }
+
+        std::env::remove_var("FLUX_SANDBOX");
+        std::env::remove_var("FLUX_SANDBOX_NET");
     }
 
     /// Direct unit test of the `flux_capabilities::CrossPluginAudit` L6 binding

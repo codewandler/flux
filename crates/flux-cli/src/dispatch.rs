@@ -307,6 +307,17 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
     let preset = std::env::var("FLUX_SANDBOX").ok();
     let preset_lc = preset.as_deref().map(str::to_ascii_lowercase);
     let unattended = unattended_sandbox_surface(cli);
+    // C-463: an explicitly named `--posture` contributes its own floor. A posture is one choice
+    // that carries its approval stance, its confinement and its budget together, so the confinement
+    // half arrives here rather than being a second thing the operator has to remember — which is
+    // the whole defect the named postures remove. `AgentFlags::named_posture` deliberately does not
+    // infer a posture from `--yes`; see its documentation for why that would be a flag day.
+    let named_posture = cli
+        .command
+        .as_ref()
+        .and_then(Commands::agent_flags)
+        .and_then(AgentFlags::named_posture);
+    let posture_floor = named_posture.map(|posture| posture.sandbox_floor());
     // The explicit kill switch still wins outright (mirrors `FLUX_OP_CACHE=off`): `--no-sandbox`, or
     // a pre-set `FLUX_SANDBOX=off`, forces `Off` regardless of any confinement request.
     let explicit_off = cli.no_sandbox || preset_lc.as_deref() == Some("off");
@@ -321,6 +332,11 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
         } else {
             SandboxMode::Off
         };
+        // C-463: the named posture's own floor, raised in (never lowered — `raise_mode` is
+        // tightest-wins for the same reason every other source here is).
+        if let Some(floor) = posture_floor {
+            mode = stricter(mode, floor.raise_mode(SandboxMode::Off));
+        }
         // `--sandbox` asks for (at least) `On`.
         if cli.sandbox {
             mode = stricter(mode, SandboxMode::On);
@@ -361,45 +377,59 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
         },
     );
 
-    if let Some(surface) = unattended.filter(|_| explicit_off) {
+    // What is asking for confinement on this invocation, in the operator's own vocabulary: the
+    // surface classification (C-262/C-410), or the posture they named (C-463). One reason, so every
+    // disclosure below tells them the same story about the same run.
+    let confinement_reason: Option<String> = unattended
+        .map(str::to_string)
+        .or_else(|| named_posture.map(|posture| format!("the `{posture}` posture")));
+
+    if let Some(reason) = confinement_reason.as_deref().filter(|_| explicit_off) {
         let source = if cli.no_sandbox {
             "--no-sandbox"
         } else {
             "FLUX_SANDBOX=off"
         };
         eprintln!(
-            "{} unattended sandbox profile BYPASSED by {source}: {surface} is running UNCONFINED. \
+            "{} confinement profile BYPASSED by {source}: {reason} is running UNCONFINED. \
              Sandbox network controls cannot apply; provide equivalent isolation in an outer \
              container/VM and retain this startup line in operator audit logs.",
             style::red("warning:")
         );
     }
 
-    // Network: unattended confinement defaults CLOSED. An exact truthy env or explicit
-    // `[sandbox] network = true` may open it; unknown env values narrow to closed, never widen.
-    // Interactive/local operation retains the pre-C-262 unrestricted default.
+    // Network: a confined-by-default invocation starts CLOSED — a posture that never prompts leans
+    // on destination scope, so egress is part of the same choice (`exploratory` is the deliberate
+    // exception and leaves it open). An exact truthy env or explicit `[sandbox] network = true` may
+    // open it; unknown env values narrow to closed, never widen. Interactive/local operation
+    // retains the pre-C-262 unrestricted default.
+    let closes_network_by_default =
+        unattended.is_some() || posture_floor.is_some_and(|floor| !floor.network);
     let network_env = std::env::var("FLUX_SANDBOX_NET").ok();
     let network = network_env
         .as_deref()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or_else(|| {
-            cfg.sandbox_network()
-                .unwrap_or_else(|| unattended.is_none())
-        });
-    if unattended.is_some() {
+        .unwrap_or_else(|| cfg.sandbox_network().unwrap_or(!closes_network_by_default));
+    if closes_network_by_default {
         std::env::set_var("FLUX_SANDBOX_NET", if network { "1" } else { "0" });
     } else if !network {
         std::env::set_var("FLUX_SANDBOX_NET", "0");
     }
-    if let Some(surface) = unattended.filter(|_| network && !explicit_off) {
+    // Only when the *default* was closed and something reopened it. `exploratory` leaves egress
+    // open by design, so it is not an override and gets no warning — a posture that argues for the
+    // network is not the same event as a closed one being opened behind the operator's back.
+    if let Some(reason) = confinement_reason
+        .as_deref()
+        .filter(|_| closes_network_by_default && network && !explicit_off)
+    {
         let source = if network_env.is_some() {
             "FLUX_SANDBOX_NET"
         } else {
             "[sandbox] network = true"
         };
         eprintln!(
-            "{} unattended sandbox network opened explicitly by {source} for {surface}; spawned \
-             processes are confined but may reach the network.",
+            "{} sandbox network opened explicitly by {source} for {reason}; spawned processes are \
+             confined but may reach the network.",
             style::red("warning:")
         );
     }
@@ -443,6 +473,17 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
                  filesystem and network isolation. To accept unconfined operation explicitly, use \
                  --no-sandbox (recorded as a prominent startup warning)."
             )
+        } else if let Some(posture) = named_posture {
+            // C-463: the same fail-closed refusal, told in the operator's own vocabulary. They
+            // named a posture whose confinement is half of what it means; starting it unconfined
+            // would deliver the other half of the choice and quietly drop this one.
+            anyhow::anyhow!(
+                "the `{posture}` posture refused to start: {e}. It relies on {}, so it will not \
+                 run without confinement. Install a supported sandbox backend, run flux inside an \
+                 outer container/VM that provides equivalent isolation, or choose a posture that \
+                 does not rely on one (`--posture supervised`).",
+                posture.relies_on()
+            )
         } else {
             anyhow::anyhow!("{e}")
         }
@@ -474,7 +515,7 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
                 style::red("warning:")
             );
         }
-    } else if let Some(surface) = unattended {
+    } else if let Some(reason) = confinement_reason.as_deref() {
         // C-410: the disclosure the *succeeding* case owed and never paid. Every other line in this
         // function fires when confinement is absent or was opted out of; a run that is genuinely
         // confined said nothing at all. That silence is what turns this profile into a support
@@ -488,7 +529,7 @@ pub(super) fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<
         // that keeps state in `~/.config/<vendor>` is refused. stderr, once per process, same
         // channel and same reasoning as the C-217 disclosure above.
         eprintln!(
-            "{} sandbox: {surface} is CONFINED — spawned processes have network {} and may write \
+            "{} sandbox: {reason} is CONFINED — spawned processes have network {} and may write \
              only to the workspace, $TMPDIR and toolchain caches. Open the network with \
              `[sandbox] network = true` (or FLUX_SANDBOX_NET=1), widen writes with \
              `[sandbox] writable`, or opt out with --no-sandbox.",

@@ -103,11 +103,17 @@ call—goes through the same envelope:
   The plan preview and dispatch use the same requirements; a denial stops before approval or IO.
 - **Reads** allowed by the authorization profile are pre-approved by the default permission rules;
   they run without prompting.
-- **Writes / commands** prompt for approval unless you pass `--yes` or have an allow-rule in
-  `.flux/config.toml`.
+- **Writes / commands** prompt for approval under the default `supervised` posture, unless you have
+  an allow-rule in `.flux/config.toml`.
 - **Destructive** operations (`rm -rf`, force-push, `mkfs`, …) are disclosed in the aggregate batch
-  approval. `--yes` installs a headless allow-all approver for trusted unattended work, but it never
-  overrides an authorization-policy denial.
+  approval. An autonomous posture answers that gate rather than skipping it, and never overrides an
+  authorization-policy denial.
+- **Who answers is a named posture** (`--posture supervised|bounded-autonomy|exploratory|refusing`;
+  `--yes` is the older spelling of `bounded-autonomy`). One name selects the approver, the OS-sandbox
+  floor and the resource budget together. Authorization, guarded IO and the evidence trail do not
+  vary with it — approval is the only stage of the three with a human in it. See
+  `website/docs/agent/safety.md` for what each posture relies on and what it does not protect
+  against.
 - Secrets are redacted from tool output and logs.
 
 Approve a prompt with `y` (once), `a` (always — saved to `.flux/config.toml`), or `N` (deny).
@@ -342,6 +348,7 @@ default and shown in full with `-v`.
   frozen into the batch shown at the approval boundary.
 - Use an authored flow or custom `--loop` when an invariant must hold structurally—for example,
   “search the handbook before every answer”—rather than depending on prompt compliance.
-- Pass `--yes` only when you trust the task to run unattended: it auto-approves **every** step,
-  destructive ones included — there is no re-confirmation under `--yes`. Without it, destructive
-  steps get their own prompt.
+- An autonomous posture (`--yes` / `--posture bounded-autonomy`, or `--posture exploratory`)
+  auto-approves **every** admitted step, destructive ones included — there is no re-confirmation.
+  In exchange it runs under a fail-closed sandbox and a resource budget, which is what constrains it
+  instead of the prompt. Under `supervised`, destructive steps get their own prompt.

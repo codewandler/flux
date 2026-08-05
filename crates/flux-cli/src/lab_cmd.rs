@@ -43,13 +43,17 @@ fn record_client(flags: &AgentFlags) -> Result<flux_sdk::Client> {
     let ResolvedProvider {
         provider, model, ..
     } = resolve_cli_provider(&model_spec, true)?;
+    // C-463: a recording session runs through the SDK with no terminal to prompt at, so
+    // `supervised` is refused rather than downgraded; unstated stays `refusing`, which is the
+    // deny-all approver `flux record` has always installed.
+    let posture = flags.headless_posture("`flux record`")?;
     record_client_from(
         provider,
         model,
         &cwd,
         flux_sdk::Storage::dir(flux_store_dir()?),
-        flags.yes,
-        cli_resource_limits(&cfg),
+        posture,
+        cli_resource_limits(&cfg, posture),
     )
 }
 
@@ -65,12 +69,14 @@ fn record_client_from(
     model: String,
     cwd: &std::path::Path,
     storage: flux_sdk::Storage,
-    auto_approve: bool,
+    posture: flux_runtime::AutonomyPosture,
     resource_limits: flux_runtime::ResourceLimits,
 ) -> Result<flux_sdk::Client> {
     flux_sdk::Client::builder()
         .model(model)
-        .auto_approve(auto_approve)
+        // C-463: one named choice, so the approver this recording client runs and the confinement
+        // and budget it resolves cannot come from three settings that disagree.
+        .posture(posture)
         // C-307: `flux record` runs a real, live turn, so the operator's `[limits]` ceilings apply
         // to it exactly as they do to `flux run`. (`flux test`'s [`offline_client`] is deliberately
         // NOT wired — see its doc comment.)
@@ -310,9 +316,9 @@ mod record_client_ceiling_wiring {
             "mock".to_string(),
             &root,
             flux_sdk::Storage::in_memory(),
-            true,
+            flux_runtime::AutonomyPosture::BoundedAutonomy,
             // The one C-314 seam on this surface: `flux record` turns `[limits]` into ceilings here.
-            cli_resource_limits(&cfg),
+            cli_resource_limits(&cfg, flux_runtime::AutonomyPosture::BoundedAutonomy),
         )
         .expect("build the recording client");
 
