@@ -94,7 +94,15 @@ pub trait OpHost: Send + Sync {
     /// up op metadata. Resolution is never advertised-filtered (a pre-authored flow may name any op).
     fn catalog(&self) -> &dyn OpCatalog;
 
-    /// Request human approval for an explicit `confirm` gate. `label` is the human-readable prompt.
+    /// Request human approval for an explicit `confirm` gate.
+    ///
+    /// - `label` is the human-readable prompt shown to the approver.
+    /// - `intents` carries the canonical, analyzer-derived operation/effect intent set for the
+    ///   gate body. Implementations that enforce policy must treat this as authoritative for this
+    ///   gate decision; default adapters are intentionally minimal (often just binary).
+    ///
+    /// The default adapter contracts used by production hosts are no-ops unless the embedder
+    /// overrides this method explicitly with a real enforcement policy.
     async fn request_approval(&self, label: &str, intents: &IntentSet) -> ApprovalChoice;
 
     /// Trim an op's model-facing view to the host's output budget — applied when building the

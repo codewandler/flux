@@ -477,9 +477,7 @@ fn plan_detail_lines(plan: &PlanApprovalRequest) -> Vec<String> {
         lines.push(format!("{} → {subject}", requirement.action.0));
     }
     for intent in &plan.intents.intents {
-        if let flux_spec::IntentTarget::Process { command } = &intent.target {
-            lines.push(format!("process.exec → $ {command}"));
-        }
+        lines.push(intent.approval_subject());
     }
     let mut seen = std::collections::HashSet::new();
     lines.retain(|line| seen.insert(line.clone()));
@@ -702,6 +700,85 @@ mod tests {
         }
         benign.await.unwrap();
         privileged.await.unwrap();
+    }
+
+    /// Non-process intent shapes are rendered into approval subjects, so two shapes with the same tool
+    /// and different intent families still compare to different requests.
+    #[test]
+    fn operation_and_gate_shapes_appear_in_approval_subjects() {
+        use flux_spec::{
+            Effect, Intent, IntentBehavior, IntentCertainty, IntentRole, IntentTarget,
+        };
+
+        let subjects = plan_detail_lines(&PlanApprovalRequest {
+            summary: "medium".into(),
+            ops: vec!["approve".into()],
+            destructive: false,
+            mutating: true,
+            intents: flux_spec::IntentSet {
+                intents: vec![
+                    Intent {
+                        behavior: IntentBehavior::Operation,
+                        target: IntentTarget::Operation {
+                            name: "mutating_task".into(),
+                            effects: vec![Effect::Process, Effect::LocalSystem],
+                        },
+                        role: IntentRole::Operation,
+                        certainty: IntentCertainty::Certain,
+                    },
+                    Intent {
+                        behavior: IntentBehavior::Unknown,
+                        target: IntentTarget::Operation {
+                            name: "ghost".into(),
+                            effects: Vec::new(),
+                        },
+                        role: IntentRole::Operation,
+                        certainty: IntentCertainty::Potential,
+                    },
+                    Intent {
+                        behavior: IntentBehavior::Gate,
+                        target: IntentTarget::Gate {
+                            name: "confirm".into(),
+                        },
+                        role: IntentRole::Gate,
+                        certainty: IntentCertainty::Certain,
+                    },
+                ],
+            },
+            requirements: vec![],
+        });
+
+        assert!(subjects.contains(&"operation mutating_task (Process, LocalSystem)".to_string()));
+        assert!(subjects.contains(&"operation ghost (unknown)".to_string()));
+        assert!(subjects.contains(&"gate.confirm".to_string()));
+    }
+
+    #[test]
+    fn plan_detail_lines_never_silently_drops_intent_shape() {
+        let subjects = plan_detail_lines(&PlanApprovalRequest {
+            summary: "mutating".into(),
+            ops: vec!["bash".into()],
+            destructive: false,
+            mutating: false,
+            intents: flux_spec::IntentSet {
+                intents: vec![flux_spec::Intent {
+                    behavior: flux_spec::IntentBehavior::CommandExecution,
+                    target: flux_spec::IntentTarget::Path {
+                        path: "/tmp/ops".into(),
+                    },
+                    role: flux_spec::IntentRole::ReadTarget,
+                    certainty: flux_spec::IntentCertainty::Certain,
+                }],
+            },
+            requirements: vec![],
+        });
+
+        assert!(
+            subjects
+                .iter()
+                .any(|s| s.contains("unsupported intent shape:")),
+            "approval subjects must render unmatched shapes instead of dropping them: {subjects:?}"
+        );
     }
 
     /// ⚠ Single use: a captured decision cannot be replayed onto the next request.

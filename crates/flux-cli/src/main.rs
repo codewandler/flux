@@ -3787,14 +3787,42 @@ mod tests {
             destructive: false,
             mutating: true,
             intents: flux_spec::IntentSet {
-                intents: vec![flux_spec::Intent {
-                    behavior: flux_spec::IntentBehavior::CommandExecution,
-                    target: flux_spec::IntentTarget::Process {
-                        command: "cargo test".to_string(),
+                intents: vec![
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::CommandExecution,
+                        target: flux_spec::IntentTarget::Process {
+                            command: "cargo test".to_string(),
+                        },
+                        role: flux_spec::IntentRole::ProcessCommand,
+                        certainty: flux_spec::IntentCertainty::Certain,
                     },
-                    role: flux_spec::IntentRole::ProcessCommand,
-                    certainty: flux_spec::IntentCertainty::Certain,
-                }],
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::Operation,
+                        target: flux_spec::IntentTarget::Operation {
+                            name: "sync_task".into(),
+                            effects: vec![flux_spec::Effect::Filesystem, flux_spec::Effect::Write],
+                        },
+                        role: flux_spec::IntentRole::Operation,
+                        certainty: flux_spec::IntentCertainty::Certain,
+                    },
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::Unknown,
+                        target: flux_spec::IntentTarget::Operation {
+                            name: "mystery_task".into(),
+                            effects: Vec::new(),
+                        },
+                        role: flux_spec::IntentRole::Operation,
+                        certainty: flux_spec::IntentCertainty::Potential,
+                    },
+                    flux_spec::Intent {
+                        behavior: flux_spec::IntentBehavior::Gate,
+                        target: flux_spec::IntentTarget::Gate {
+                            name: "confirm".into(),
+                        },
+                        role: flux_spec::IntentRole::Gate,
+                        certainty: flux_spec::IntentCertainty::Certain,
+                    },
+                ],
             },
             requirements: vec![
                 AuthorityRequirement::new(
@@ -3820,6 +3848,15 @@ mod tests {
             "paths are trimmed to the last two components: {prompt}"
         );
         assert!(prompt.contains("process.exec → $ cargo test"), "{prompt}");
+        assert!(
+            prompt.contains("operation sync_task (Filesystem, Write)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("operation mystery_task (unknown)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("gate.confirm"), "{prompt}");
         assert!(
             !prompt.contains("op.invoke"),
             "operation requirements are skipped: {prompt}"

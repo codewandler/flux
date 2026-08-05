@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use flux_spec::{Idempotency, Risk};
+use flux_spec::{Effect, Idempotency, Risk};
 
 use crate::ast::{
     is_valid_decl_name, is_valid_op_name, DraftAst, FlowEffect, HirFlow, Node, SymbolName, TypeRef,
@@ -1035,19 +1035,24 @@ pub fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
 /// consumer can tell *which* call moves money rather than only that *something* in the flow does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectAnnotation {
+    /// The operation this annotation belongs to.
+    pub operation: String,
+    /// Whether the operation resolved in the active catalog.
+    pub known: bool,
+    /// The concrete operation name this annotation was derived from.
     /// Semantic effects attributed to this call (deduped, first-seen order — same convention as
     /// [`HirFlow::effects`]).
     pub effects: Vec<FlowEffect>,
+    /// Host effects on the operation definition, truthfully copied for intent rendering.
+    pub host_effects: Vec<Effect>,
     /// The op's declared risk tier, driving approval thresholds.
     pub risk: Risk,
     /// Whether re-running this op is safe.
     pub idempotency: Idempotency,
 }
 
-/// Derive one call's [`EffectAnnotation`] from the catalog, or `None` when `op` is unregistered —
-/// the same "unknown operation" condition [`check_node`]'s `Node::Call` arm diagnoses. Callers must
-/// keep the `None` entry (see [`annotate_effects`]) rather than treat it as "no effects": an unknown
-/// op's effects are *unknown*, not empty.
+/// Derive one call's [`EffectAnnotation`] from the catalog. Unknown operations still
+/// produce a concrete annotation with `known = false` so intent derivation can stay explicit.
 ///
 /// Three contribution sources fold into `effects`, in order: the op's lowered host effects (mapped
 /// back onto a representative [`FlowEffect`] via [`host_effect_to_flow`]), the op's own CATALOG-
@@ -1060,9 +1065,19 @@ fn call_effect_annotation(
     op: &str,
     ops: &dyn OpCatalog,
     enclosing_effect: Option<FlowEffect>,
-) -> Option<EffectAnnotation> {
-    let sig = ops.lookup(op)?;
+) -> EffectAnnotation {
+    let Some(sig) = ops.lookup(op) else {
+        return EffectAnnotation {
+            operation: op.to_string(),
+            known: false,
+            effects: Vec::new(),
+            host_effects: Vec::new(),
+            risk: Risk::Low,
+            idempotency: Idempotency::Conditional,
+        };
+    };
     let mut effects: Vec<FlowEffect> = Vec::new();
+    let host_effects = sig.effects.to_vec();
     for e in sig.effects {
         if let Some(f) = host_effect_to_flow(e) {
             if !effects.contains(&f) {
@@ -1080,11 +1095,14 @@ fn call_effect_annotation(
             effects.push(e);
         }
     }
-    Some(EffectAnnotation {
+    EffectAnnotation {
+        operation: op.to_string(),
+        known: true,
         effects,
+        host_effects,
         risk: sig.risk,
         idempotency: sig.idempotency,
-    })
+    }
 }
 
 /// Walk an analyzed flow and return, per `call` node, its [`EffectAnnotation`] keyed by the same
@@ -1092,18 +1110,14 @@ fn call_effect_annotation(
 /// per-node (attributed) sibling of [`gather_effects`]'s deduped flow-level union
 /// ([`HirFlow::effects`]): right for the approval envelope, lossy for "which node did this."
 ///
-/// An unregistered op annotates honestly as `None` rather than being silently skipped — the entry
-/// still appears at its node path, matching [`analyze_call`]'s "unknown operation" diagnostic — so
-/// a consumer (e.g. a visual editor pinning `Money`/`High`-risk nodes) can render "unknown effect"
-/// instead of mistaking absence-from-the-list for "no effect."
+/// Unknown ops still annotate with `known = false`, preserving the call path so a consumer (e.g. a
+/// visual editor pinning `Money`/`High`-risk nodes) can render an explicit unknown intent instead
+/// of mistaking absence from this list for "no effect."
 ///
 /// Mirrors [`for_each_node`]'s traversal shape and [`check_node`]/[`check_body`]'s path labels in
 /// lock-step — the two conventions must never drift apart, or a node path this function emits
 /// would not line up with the diagnostic path a repairing model or UI already understands.
-pub fn annotate_effects(
-    ast: &DraftAst,
-    ops: &dyn OpCatalog,
-) -> Vec<(String, Option<EffectAnnotation>)> {
+pub fn annotate_effects(ast: &DraftAst, ops: &dyn OpCatalog) -> Vec<(String, EffectAnnotation)> {
     let mut out = Vec::new();
     let mut d = Diags::default();
     annotate_body(&ast.body, "body", ops, &mut d, &mut out);
@@ -1116,7 +1130,7 @@ fn annotate_body(
     label: &str,
     ops: &dyn OpCatalog,
     d: &mut Diags,
-    out: &mut Vec<(String, Option<EffectAnnotation>)>,
+    out: &mut Vec<(String, EffectAnnotation)>,
 ) {
     for (i, n) in body.iter().enumerate() {
         d.with(format!("{label}[{i}]"), |d| {
@@ -1140,7 +1154,7 @@ fn annotate_node(
     ops: &dyn OpCatalog,
     enclosing_effect: Option<FlowEffect>,
     d: &mut Diags,
-    out: &mut Vec<(String, Option<EffectAnnotation>)>,
+    out: &mut Vec<(String, EffectAnnotation)>,
 ) {
     match node {
         Node::Call { op, args } => {
@@ -1697,7 +1711,15 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
             check_body(body, "body", ops, bound, d);
             check_body(handler, "handler", ops, bound, d);
         }
-        Node::Confirm { body, .. } => {
+        Node::Confirm { body, risk, .. } => {
+            if let Some(risk) = risk {
+                const ALLOWED_CONFIRM_RISKS: [&str; 4] = ["low", "medium", "high", "critical"];
+                if !ALLOWED_CONFIRM_RISKS.contains(&risk.as_str()) {
+                    d.add(format!(
+                        "invalid confirm risk `{risk}` — use one of: low, medium, high, critical"
+                    ));
+                }
+            }
             check_body(body, "body", ops, bound, d);
         }
         Node::Race { branches, bind, .. } => {
@@ -2875,6 +2897,32 @@ mod tests {
             finding.node_path.as_deref(),
             Some("body[0].then[0]"),
             "the structured node_path field must match the path rendered in the message suffix"
+        );
+    }
+
+    #[test]
+    fn analyze_rejects_invalid_confirm_risk() {
+        let ops = catalog();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "Proceed?".into(),
+                risk: Some("criticality".into()),
+                body: vec![Node::Call {
+                    op: "read".into(),
+                    args: vec![Node::Lit {
+                        value: serde_json::json!("README.md"),
+                    }],
+                }],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("invalid confirm risk")
+                    && d.message.contains("criticality")),
+            "invalid risk values should be rejected with a path-qualified diagnostic: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
@@ -4522,8 +4570,8 @@ mod tests {
             .find(|(path, _)| path == "body[1].value")
             .unwrap_or_else(|| panic!("expected an entry for the write node, got: {annotated:?}"));
 
-        let read_ann = read.1.as_ref().expect("`read` is a known op");
-        let write_ann = write.1.as_ref().expect("`charge_card` is a known op");
+        let read_ann = &read.1;
+        let write_ann = &write.1;
 
         assert!(
             !read_ann.effects.contains(&FlowEffect::Money),
@@ -4540,6 +4588,7 @@ mod tests {
             Risk::High,
             "the write node must carry its op's risk tier"
         );
+        assert_eq!(write_ann.operation, "charge_card");
     }
 
     /// Failing-first for D-138: an op that declares `Money` directly in its CATALOG signature
@@ -4564,18 +4613,16 @@ mod tests {
         assert_eq!(annotated.len(), 1);
         let (path, ann) = &annotated[0];
         assert_eq!(path, "body[0]");
-        let ann = ann
-            .as_ref()
-            .expect("`charge_card` is a known op in EffectCatalog");
         assert!(
             ann.effects.contains(&FlowEffect::Money),
             "a plain, untagged call to a Money-declaring op must still annotate `Money`, got {:?}",
             ann.effects
         );
+        assert_eq!(ann.operation, "charge_card");
     }
 
-    /// Failing-first for D-133: an unknown op must still get an entry at its node path (`None`),
-    /// not be silently skipped — mirroring [`analyze_call`]'s own "unknown operation" diagnostic.
+    /// Failing-first for D-133: an unknown op must still get an entry at its node path, marked
+    /// explicitly as unknown (`known = false`) rather than being silently skipped.
     #[test]
     fn annotate_effects_honestly_flags_unknown_ops_instead_of_skipping() {
         let ops = EffectCatalog;
@@ -4598,9 +4645,13 @@ mod tests {
             "the unknown-op call must still get an entry, not be skipped: {annotated:?}"
         );
         assert_eq!(annotated[0].0, "body[0]");
+        assert_eq!(
+            annotated[0].1.operation, "nope.op",
+            "unknown operations still carry their concrete op name"
+        );
         assert!(
-            annotated[0].1.is_none(),
-            "an unknown op annotates as `None` (honest absence), not a guessed signature"
+            !annotated[0].1.known,
+            "unknown operations are explicitly marked `known: false`"
         );
     }
 }
