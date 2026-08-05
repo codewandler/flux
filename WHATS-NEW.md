@@ -15,6 +15,30 @@
 
 ## [Unreleased]
 
+### New
+
+- **A workspace can now carry its complete cross-repository program in `.flux/board.toml`.** Plain
+  `flux board` selects the configured workspace, validates every repository story and dependency,
+  and reports the active milestone, ordered work and configured waves. `flux fleet schedule` reads
+  that same plan instead of keeping another schedule. Board configuration, Fleet configuration and
+  live Fleet state remain separate files with separate owners.
+
+- **The terminal UI can supervise the Fleet main coordinator and its Board.** Launch
+  `flux tui --fleet` in a Fleet root, or use `--fleet=ROOT`, to resume the exact durable main
+  conversation. `F2`, `/fleet`, or `/board` opens bounded native views of active workers, work,
+  decisions, failures, planning documents, and exact progress statistics; wide terminals also keep
+  an attention rail beside the chat. Requirements show accepted, delivered, and completed/failed
+  acknowledgement across restart. Viewing is read-only, and deciding an open question requires a
+  second explicit confirmation. Ordinary `flux tui` remains a labelled standalone chat, and the
+  operations view cannot push, release, deploy, apply a Fleet candidate, or clean worktrees.
+
+### Improved
+
+- **Board and Fleet terminology is documented from planning through release.** The guides explain
+  epics, stories, milestones, program lanes, configured versus dispatched waves, workers, handoffs,
+  review, gates and apply. Concepts now appears before Coding, and compact diagrams show the
+  eligibility, worktree, rework and publication boundaries.
+
 ## [0.56.0] - 2026-08-05
 
 ### New
@@ -29,15 +53,6 @@
   local until you explicitly run `flux fleet apply`, and neither command pushes, releases, deploys,
   or removes worktrees for you. The new **Coding / AI-assisted development** docs section explains
   the whole model and every backend.
-
-- **The terminal UI can now supervise the Fleet main coordinator and its Board.** Launch
-  `flux tui --fleet` in a Fleet root, or use `--fleet=ROOT`, to resume the exact durable main
-  conversation. `F2`, `/fleet`, or `/board` opens bounded native views of active workers, work,
-  decisions, failures, planning documents, and exact progress statistics; wide terminals also keep
-  an attention rail beside the chat. Requirements show accepted, delivered, and completed/failed
-  acknowledgement across restart. Viewing is read-only, and deciding an open question requires a
-  second explicit confirmation. Ordinary `flux tui` remains a labelled standalone chat, and the
-  operations view cannot push, release, deploy, apply a Fleet candidate, or clean worktrees.
 
 - **You can now name how much autonomy an agent runs with, in one choice.** `--posture supervised`
   asks you before each effect. `--posture bounded-autonomy` never asks and instead constrains the
@@ -88,11 +103,6 @@
   Quoted numeric keys remain object keys, while unquoted numeric brackets remain list indexes.
 
 ### Improved
-
-- **The Board and Fleet guide is easier to follow from contract to delivery.** Concepts now appears
-  before Coding in the public navigation, and compact diagrams show story states, dispatch
-  eligibility, isolated worktrees, review/rework, integration, local apply, and the separate
-  publication boundary.
 
 - **Fleet workers keep the same tools and workspace authority for their whole assignment.** Flux
   validates each worker's declared capability bundles before it starts, then preserves that exact
