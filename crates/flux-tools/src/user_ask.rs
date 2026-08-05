@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flux_core::{Error, Result};
 use flux_runtime::{
-    InteractionCapabilities, InteractionOrigin, PromptAudioRef, Tool, ToolContext, ToolRegistry,
-    ToolResult, UserPrompt,
+    InteractionCapabilities, InteractionOrigin, OperationPlacement, PromptAudioRef, Tool,
+    ToolContext, ToolRegistry, ToolResult, UserPrompt,
 };
 use flux_spec::{tool_output_schema, FlowEffect, Idempotency, StagingDisposition, ToolSpec};
 use serde_json::Value;
@@ -70,9 +70,10 @@ pub fn try_register_user_interaction(
     let Some(capabilities) = capabilities else {
         return Ok(());
     };
-    registry.try_register_from(
+    registry.try_register_from_with_placement(
         "flux-tools user interaction operation",
         Arc::new(UserAskTool { capabilities }),
+        OperationPlacement::LocalControlPlane,
     )
 }
 

@@ -33,7 +33,7 @@ use flux_evidence::{EvidenceLog, Observation, Phase};
 use flux_lang::ast::{FlowEffect, TypeRef};
 use flux_lang::opspec::{OpSpec, Param};
 use flux_provider::{Effort, Provider, Request};
-use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{LoopHost, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Idempotency, Risk, ToolSpec};
 
 mod consult;
@@ -497,7 +497,11 @@ impl CognitionPack {
                 effort: self.effort,
             }) as Arc<dyn Tool>
         });
-        registry.try_register_all_from(source, tools)
+        registry.try_register_all_from_with_placement(
+            source,
+            tools,
+            OperationPlacement::LocalControlPlane,
+        )
     }
 
     /// Intentionally replace this pack's canonical operation family.
@@ -513,7 +517,7 @@ impl CognitionPack {
         let source = source.into();
         let mut assembled = registry.clone();
         for kind in OpKind::ALL {
-            assembled.replace_from(
+            assembled.replace_from_with_placement(
                 source.clone(),
                 Arc::new(CognitionOp {
                     kind,
@@ -523,6 +527,7 @@ impl CognitionPack {
                     thinking: self.thinking,
                     effort: self.effort,
                 }),
+                OperationPlacement::LocalControlPlane,
             )?;
         }
         *registry = assembled;

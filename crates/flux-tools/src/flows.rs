@@ -19,7 +19,7 @@ use serde_json::Value;
 use flux_core::{Error, Result};
 use flux_lang::ast::{DraftAst, Node, Param};
 use flux_lang::program::Module;
-use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{LoopHost, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_system::{PathAccess, System};
 
@@ -194,12 +194,13 @@ impl StoredFlowCatalog {
 /// Register the flow discovery/run pack. `flow_run` needs the model-in-the-loop host for nested
 /// authored execution and remains model-facing.
 pub fn try_register_flows(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools stored-flow pack",
         vec![
             Arc::new(FlowListTool) as Arc<dyn Tool>,
             Arc::new(FlowRunTool),
         ],
+        OperationPlacement::LocalControlPlane,
     )
 }
 

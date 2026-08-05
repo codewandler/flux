@@ -953,16 +953,25 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                     // C-162: `[tools] disable` ops stay registered (dispatch still refuses them),
                     // so mark them here rather than hiding them — a mysteriously-missing op is one
                     // command from an explanation instead of a silent gap in this listing.
-                    let disabled = agent.executor.disabled_ops_for(&registry);
                     let rendered: Vec<String> = names
                         .into_iter()
-                        .map(|name| {
-                            if disabled.contains(&name) {
-                                format!("{name} (disabled by config)")
-                            } else {
-                                name
-                            }
-                        })
+                        .map(
+                            |name| match agent.executor.operation_unavailability(&name) {
+                                Some(flux_runtime::OperationUnavailability::DisabledByConfig) => {
+                                    format!("{name} (disabled by config)")
+                                }
+                                Some(
+                                    flux_runtime::OperationUnavailability::IncompatiblePlacement {
+                                        placement,
+                                        target,
+                                    },
+                                ) => format!(
+                                    "{name} (unavailable: {} on selected target {target})",
+                                    placement.label()
+                                ),
+                                None => name,
+                            },
+                        )
                         .collect();
                     eprintln!("tools: {}", rendered.join(", "));
                 }

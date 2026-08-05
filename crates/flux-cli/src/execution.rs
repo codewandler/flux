@@ -1375,7 +1375,11 @@ pub(super) fn try_register_fleet(
         )),
         Arc::new(flux_orchestrate::FleetStopTool::new(runtime)),
     ];
-    registry.try_register_all_from("flux-cli fleet lifecycle", lifecycle)?;
+    registry.try_register_all_from_with_placement(
+        "flux-cli fleet lifecycle",
+        lifecycle,
+        flux_runtime::OperationPlacement::NativeSystemOnly,
+    )?;
 
     let private_net = fleet_private_net();
     let dispatch = flux_orchestrate::FleetDispatchTool::new(private_net.clone(), None);
@@ -1397,7 +1401,11 @@ pub(super) fn try_register_fleet(
         )),
         Arc::new(flux_orchestrate::FleetCancelTool::new(private_net, None)),
     ];
-    registry.try_register_all_from("flux-cli fleet dispatch", tools)?;
+    registry.try_register_all_from_with_placement(
+        "flux-cli fleet dispatch",
+        tools,
+        flux_runtime::OperationPlacement::LocalControlPlane,
+    )?;
     Ok(())
 }
 
@@ -1755,7 +1763,6 @@ pub(super) async fn build_agent_with(
         System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
     );
     let selected_execution_system = resolve_selected_execution_system(flags, &system).await?;
-    let remote_mode = selected_execution_system.is_some();
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
     let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());
@@ -1822,7 +1829,11 @@ pub(super) async fn build_agent_with(
     if flags.dev {
         flux_tools::try_register_dev_builtins(&mut registry)?;
     }
-    registry.try_register_from("flux-cli sub-agent task operation", Arc::new(TaskTool))?;
+    registry.try_register_from_with_placement(
+        "flux-cli sub-agent task operation",
+        Arc::new(TaskTool),
+        flux_runtime::OperationPlacement::LocalControlPlane,
+    )?;
     // C-223/C-305: the `pane.*` vocabulary, surfaced by the presence of a `SurfaceSink` at assembly
     // time — the `[consult] model` precedent, not a `ToolGroup` (there is no `project.signal` for
     // "a human is watching a terminal"). Fail-closed and decided exactly once: a headless `flux
@@ -1835,21 +1846,6 @@ pub(super) async fn build_agent_with(
             .as_ref()
             .map(|interaction| interaction.capabilities()),
     )?;
-    let mut remote_unsupported_ops = std::collections::HashSet::new();
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            [
-                "sqlite_query",
-                "sys_info",
-                "git_worktree_enter",
-                "git_worktree_leave",
-                "fleet.isolate",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
-    }
-
     // Model-backed cognition ops (ai.extract/rank/judge/reason, synth, ai.rewrite): the L3
     // CognitionPack, advertised on the real CLI path so a plan can call the model as a typed op.
     // `CognitionPack` needs its own `Arc<dyn Provider>` (the engine's `provider` is moved below), so
@@ -1866,7 +1862,6 @@ pub(super) async fn build_agent_with(
                 None
             }
         };
-    let before_outer_packs = registry.names();
     register_tool_packs(
         &mut registry,
         cog_provider,
@@ -1876,30 +1871,13 @@ pub(super) async fn build_agent_with(
         &canonical_spec,
         &events,
     )?;
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            registry
-                .names()
-                .into_iter()
-                .filter(|name| !before_outer_packs.contains(name)),
-        );
-    }
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
     // backend is also the sink `web.fetch` contributes `web.page` records to (below), so read pages
     // are groundable.
     let backend = build_doc_index(&system).await;
-    let before_datasources = registry.names();
     flux_capabilities::try_register_datasource_ops(&mut registry, backend.clone())?;
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            registry
-                .names()
-                .into_iter()
-                .filter(|name| !before_datasources.contains(name)),
-        );
-    }
 
     // This run's session on the store opened above. `session_override` (L-25's `flow run --resume`)
     // wins outright — it names an already-halted session to continue, distinct from the REPL's own
@@ -1932,7 +1910,6 @@ pub(super) async fn build_agent_with(
             store: events.clone(),
             stream: session_id.clone(),
         });
-        let before_web = registry.names();
         flux_web::try_register_web(
             &mut registry,
             &flux_web::WebOptions {
@@ -1948,17 +1925,8 @@ pub(super) async fn build_agent_with(
                 allowed_secrets: cfg.web.allowed_secrets.clone(),
             },
         )?;
-        if remote_mode {
-            remote_unsupported_ops.extend(
-                registry
-                    .names()
-                    .into_iter()
-                    .filter(|name| !before_web.contains(name)),
-            );
-        }
     }
 
-    let before_integrations = registry.names();
     let integrations = assemble_integrations(
         system.clone(),
         Arc::new(super::app_cmd::WorkspaceSystemSource(
@@ -1974,15 +1942,11 @@ pub(super) async fn build_agent_with(
     .await?;
     let live_plugins = Arc::new(integrations.live_plugins);
     for (source, tool) in integrations.tools {
-        registry.try_register_from(source, tool)?;
-    }
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            registry
-                .names()
-                .into_iter()
-                .filter(|name| !before_integrations.contains(name)),
-        );
+        registry.try_register_from_with_placement(
+            source,
+            tool,
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        )?;
     }
     let plugin_groups = integrations.groups;
     let mut ambient_signals = integrations.ambient_signals;
@@ -2138,10 +2102,8 @@ pub(super) async fn build_agent_with(
             ))
         );
     }
-    let mut disabled = disabled_tools.disabled;
-    disabled.extend(remote_unsupported_ops);
     let executor = executor
-        .with_disabled_ops(disabled)
+        .with_disabled_ops(disabled_tools.disabled)
         .with_disabled_patterns(cfg.tools.disable.clone());
     // Record the available toolchain as a startup observation (audit backbone).
     executor.observe(flux_evidence::Observation::new(

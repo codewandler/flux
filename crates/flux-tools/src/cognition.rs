@@ -25,13 +25,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{Idempotency, Risk, ToolSpec};
 
 /// Register all pure cognition ops into a registry.
 pub fn try_register_cognition(registry: &mut ToolRegistry) -> Result<()> {
     let mut assembled = registry.clone();
-    assembled.try_register_all_from(
+    assembled.try_register_all_from_with_placement(
         "flux-tools pure cognition pack",
         vec![
             Arc::new(NeedTool) as Arc<dyn Tool>,
@@ -44,9 +44,10 @@ pub fn try_register_cognition(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(FirstTool),
             Arc::new(LastTool),
         ],
+        OperationPlacement::LocalControlPlane,
     )?;
     crate::transform::try_register_transforms(&mut assembled)?;
-    assembled.try_register_all_from(
+    assembled.try_register_all_from_with_placement(
         "flux-tools review and object cognition pack",
         vec![
             Arc::new(ReviewNormalizeTool) as Arc<dyn Tool>,
@@ -66,6 +67,7 @@ pub fn try_register_cognition(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(AllTool),
             Arc::new(HasTool),
         ],
+        OperationPlacement::LocalControlPlane,
     )?;
     *registry = assembled;
     Ok(())

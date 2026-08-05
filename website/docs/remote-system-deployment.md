@@ -190,9 +190,12 @@ has an address and runs this daemon, it is a remote execution system like any ot
 
 ## Operation compatibility and trust boundary
 
-Port-aware core file, search, edit, process, and network operations use the selected remote system.
-Operations that still own native-only handles are hidden and refused. Native integrations and
-plugins are also disabled in remote mode today; there is **no local fallback**. Run such an
+The live catalog declares one of three compatibility placements for every production operation:
+`local-control-plane` work intentionally stays on the coordinator; `selected-execution-system`
+operations send guarded effects to the selected remote system; and `native-system-only` operations
+are hidden and refused. Unannotated downstream operations default to `native-system-only` and fail
+closed. There is **no local fallback**. Native integrations and plugins are classified that way
+today. Run such an
 integration where its authority exists, or use the served-agent topology until remote-capable plugin
 placement is implemented.
 

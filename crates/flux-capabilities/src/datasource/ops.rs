@@ -11,7 +11,7 @@ use flux_core::{Error, Result};
 use flux_datasource::{
     BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput, SourceSummary,
 };
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, ToolSpec};
 
 use super::harness_history::{record_is_from, HarnessSelector, HARNESS_SOURCE};
@@ -97,9 +97,10 @@ pub fn try_register_datasource_ops_with_history(
     backend: Arc<dyn DatasourceBackend>,
     history: &HarnessHistory,
 ) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-capabilities datasource pack",
         datasource_tools_with_history(backend, history),
+        OperationPlacement::NativeSystemOnly,
     )
 }
 

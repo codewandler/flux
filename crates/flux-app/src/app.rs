@@ -911,9 +911,11 @@ impl Engine {
             // `FlowClient::with_sub_agents` use, so a journey delegates through the identical envelope.
             // Children audit into the app's own event store by default (A-08), correlated per spawn.
             let spawner = sub_agents.map(|sa| {
-                if let Err(error) =
-                    registry.try_register_from("app sub-agent task operation", Arc::new(TaskTool))
-                {
+                if let Err(error) = registry.try_register_from_with_placement(
+                    "app sub-agent task operation",
+                    Arc::new(TaskTool),
+                    flux_runtime::OperationPlacement::LocalControlPlane,
+                ) {
                     registration_error.borrow_mut().get_or_insert(error);
                 }
                 sa.with_audit(events.clone()).into_spawner(system.clone())
@@ -2111,12 +2113,16 @@ fn scope_datasource_tools(registry: &mut ToolRegistry, allowed: &[String]) -> Re
     let mut scoped = registry.clone();
     for name in DATASOURCE_OPS {
         if let Some(inner) = scoped.get(name) {
-            scoped.replace_from(
+            let placement = scoped
+                .effective_placement(name)
+                .unwrap_or(flux_runtime::OperationPlacement::NativeSystemOnly);
+            scoped.replace_from_with_placement(
                 "flux-app declared datasource-scope adapter",
                 Arc::new(DatasourceScopedTool {
                     inner,
                     allowed: allowed.to_vec(),
                 }),
+                placement,
             )?;
         }
     }

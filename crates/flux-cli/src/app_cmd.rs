@@ -786,7 +786,11 @@ pub(super) async fn run_app(
         .transpose()?;
     let mut integration_registry = ToolRegistry::new();
     for (source, tool) in extra_tools {
-        integration_registry.try_register_from(source, tool)?;
+        integration_registry.try_register_from_with_placement(
+            source,
+            tool,
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        )?;
     }
     // The declared work boards (A-113's port). `try_register_work_board` *derives* the generated op
     // set from the port itself, so an operation added to `WorkBoard` reaches a Program through this
@@ -799,7 +803,14 @@ pub(super) async fn run_app(
     let mut board_handles: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)> = Vec::new();
     for (domain, board) in boards {
         board_handles.push((domain.clone(), Arc::clone(&board)));
-        flux_capabilities::try_register_work_board(&mut integration_registry, &domain, board)?;
+        let surface =
+            flux_capabilities::try_register_work_board(&mut integration_registry, &domain, board)?;
+        for operation in &surface.group.tools {
+            integration_registry.declare_placement(
+                operation,
+                flux_runtime::OperationPlacement::NativeSystemOnly,
+            )?;
+        }
     }
     // Outbound A2A dispatch (A-116). Registered through the same helper the agent assembly uses, so
     // `flux app run` and `flux run` offer the identical fleet catalog under the identical grant.

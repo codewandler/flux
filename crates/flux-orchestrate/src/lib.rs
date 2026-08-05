@@ -35,9 +35,10 @@ use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
     active_runtime_turn_context, scope_runtime_turn, ApprovalChoice, Approver,
-    AuthorityRequirement, ExecutionAuthorization, Executor, IdentityCell, PermissionManager,
-    ResourceLimits, SpawnActivity, SpawnActivityEvent, SpawnActivitySink, SpawnOutcome,
-    SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult, SPAWN_CLEANUP_GRACE,
+    AuthorityRequirement, ExecutionAuthorization, Executor, IdentityCell, OperationPlacement,
+    PermissionManager, ResourceLimits, SpawnActivity, SpawnActivityEvent, SpawnActivitySink,
+    SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
+    SPAWN_CLEANUP_GRACE,
 };
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
@@ -385,20 +386,32 @@ impl Spawner for LocalSpawner {
                         projected_base.remove(&name);
                     }
                     Some(tool) if projected_base.get(&name).is_some() => {
-                        projected_base.replace_from(
-                            adopted.source(&name).unwrap_or("live parent catalog"),
-                            tool,
-                        )?;
+                        let source = adopted.source(&name).unwrap_or("live parent catalog");
+                        match adopted.declared_placement(&name) {
+                            Some(placement) => {
+                                projected_base
+                                    .replace_from_with_placement(source, tool, placement)?;
+                            }
+                            None => {
+                                projected_base.replace_from(source, tool)?;
+                            }
+                        }
                     }
                     Some(_) => {}
                 }
             }
             for name in adopted.names() {
                 if parent_base.get(&name).is_none() && projected_base.get(&name).is_some() {
-                    projected_base.replace_from(
-                        adopted.source(&name).unwrap_or("live parent catalog"),
-                        adopted.get(&name).expect("name came from adopted registry"),
-                    )?;
+                    let source = adopted.source(&name).unwrap_or("live parent catalog");
+                    let tool = adopted.get(&name).expect("name came from adopted registry");
+                    match adopted.declared_placement(&name) {
+                        Some(placement) => {
+                            projected_base.replace_from_with_placement(source, tool, placement)?;
+                        }
+                        None => {
+                            projected_base.replace_from(source, tool)?;
+                        }
+                    }
                 }
             }
         }
@@ -441,9 +454,10 @@ impl Spawner for LocalSpawner {
             // Nested delegation intentionally restores the canonical task handler after role
             // narrowing. Use the explicit replacement seam so an injected same-name handler can
             // never survive silently.
-            registry.replace_from(
+            registry.replace_from_with_placement(
                 "flux-orchestrate canonical nested task operation",
                 Arc::new(TaskTool),
+                OperationPlacement::LocalControlPlane,
             )?;
             let child_base = projected_base.subset(effective_tools.as_deref());
             ctx = ctx.with_spawner(Arc::new(self.at_depth(
@@ -4631,11 +4645,16 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(None));
         let execution_seen = Arc::new(std::sync::Mutex::new(None));
         let mut base = ToolRegistry::new();
-        base.register(Arc::new(RootProbe {
-            seen: seen.clone(),
-            execution_seen: Some(execution_seen.clone()),
-            transition_to: child_worktree_root.clone(),
-        }));
+        base.try_register_from_with_placement(
+            "C-100 root probe fixture",
+            Arc::new(RootProbe {
+                seen: seen.clone(),
+                execution_seen: Some(execution_seen.clone()),
+                transition_to: child_worktree_root.clone(),
+            }),
+            OperationPlacement::SelectedExecutionSystem,
+        )
+        .unwrap();
         let mut roles = RoleRegistry::default();
         roles.insert(parse_role(
             "---\ntools: [root_probe]\n---\nYou are a scout.",

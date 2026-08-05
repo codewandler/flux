@@ -17,7 +17,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
-use flux_runtime::{AuthorityRequirement, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{
+    AuthorityRequirement, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult,
+};
 use flux_secret::endpoint::EndpointRecord;
 use flux_spec::{AccessKind, ToolSpec};
 
@@ -59,9 +61,10 @@ pub fn try_register_endpoint_ops(
     broker: Arc<EndpointBroker>,
     endpoints: Arc<EndpointRegistry>,
 ) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-capabilities endpoint pack",
         endpoint_tools(broker, endpoints),
+        OperationPlacement::NativeSystemOnly,
     )
 }
 

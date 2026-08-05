@@ -192,6 +192,19 @@ workspace in its header for the entire session. Port-aware coding operations are
 that still own native-only resources are hidden and refused in remote mode, never run on the local
 machine as a fallback.
 
+Operation compatibility comes from one typed declaration on the live catalog:
+
+- **`local-control-plane`** — coordinator work such as model/session/UI control stays local and is
+  valid with either a native or selected remote execution system.
+- **`selected-execution-system`** — guarded effects use the selected system, so they land locally in
+  native mode and on the remote host in remote mode.
+- **`native-system-only`** — the implementation still owns native host state or handles and is
+  hidden and refused whenever a non-native target is selected. An unannotated downstream operation
+  receives this fail-closed classification automatically.
+
+These categories are compatibility metadata, not authorization. Every available operation still
+passes through authorization, approval, and guarded IO.
+
 - **Where your files are:** the **remote workspace is canonical**. Every project-relative read,
   write, discovery operation and process cwd uses that tree. There is **no implicit synchronization**
   with the directory from which the local TUI was started. A local editor sees a different tree

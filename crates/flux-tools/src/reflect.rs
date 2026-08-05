@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use flux_core::{Error, Result};
 use flux_runtime::{
-    CompositeRegisterRequest, CompositeRegistrar, LoopHost, Tool, ToolContext, ToolRegistry,
-    ToolResult,
+    CompositeRegisterRequest, CompositeRegistrar, LoopHost, OperationPlacement, Tool, ToolContext,
+    ToolRegistry, ToolResult,
 };
 use flux_spec::{
     AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
@@ -20,7 +20,7 @@ use flux_spec::{
 /// purpose: these ops are only meaningful when a model-in-the-loop host is installed. Adaptive
 /// machinery is tagged to the hidden `reflect` group; `op.register` is model-facing.
 pub fn try_register_reflect(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools authored-loop reflect pack",
         vec![
             Arc::new(DetectIntentOp) as Arc<dyn Tool>,
@@ -31,6 +31,7 @@ pub fn try_register_reflect(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(AiSegmentOp),
             Arc::new(RegisterCompositeOp),
         ],
+        OperationPlacement::LocalControlPlane,
     )
 }
 
@@ -61,7 +62,11 @@ pub fn install_reflect(registry: &mut ToolRegistry) -> Result<()> {
         Arc::new(AiSegmentOp),
         Arc::new(RegisterCompositeOp),
     ] {
-        assembled.replace_from(SOURCE, tool)?;
+        assembled.replace_from_with_placement(
+            SOURCE,
+            tool,
+            OperationPlacement::LocalControlPlane,
+        )?;
     }
     *registry = assembled;
     Ok(())
@@ -76,7 +81,7 @@ pub fn try_register_model_stage(
     input_schema: Value,
     output_schema: Value,
 ) -> Result<()> {
-    registry.try_register_from(
+    registry.try_register_from_with_placement(
         "configured model stage",
         Arc::new(ModelStageOp {
             spec: ToolSpec {
@@ -96,6 +101,7 @@ pub fn try_register_model_stage(
                 group: None,
             },
         }),
+        OperationPlacement::LocalControlPlane,
     )
 }
 

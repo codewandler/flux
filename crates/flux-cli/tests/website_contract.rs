@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use flux_cognition::{CognitionPack, ConsultTool, DEFAULT_CONSULT_MAX_CALLS};
 use flux_core::{Chunk, StopReason};
 use flux_provider::{ChunkStream, NullProvider, Provider, Request};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2490,6 +2490,22 @@ fn execution_targets_have_one_complete_placement_and_deployment_contract() {
             deployment.contains(required),
             "{REMOTE_SYSTEM_DEPLOYMENT} is missing the deployment contract `{required}`"
         );
+    }
+}
+
+/// C-478: public topology and deployment guidance use the runtime's exact typed placement
+/// vocabulary instead of maintaining an independent prose-only list that can drift.
+#[test]
+fn operation_placement_vocabulary_matches_public_docs() {
+    for path in [TOPOLOGIES, REMOTE_SYSTEM_DEPLOYMENT] {
+        let page = read(path);
+        for placement in OperationPlacement::ALL {
+            assert!(
+                page.contains(placement.label()),
+                "{path} is missing the runtime placement label `{}`",
+                placement.label()
+            );
+        }
     }
 }
 

@@ -11,7 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use flux_core::{Error, Result};
 use flux_runtime::{
-    CatalogRefresher, LiveToolCatalog, Tool, ToolContext, ToolRegistry, ToolResult,
+    CatalogRefresher, LiveToolCatalog, OperationPlacement, Tool, ToolContext, ToolRegistry,
+    ToolResult,
 };
 use flux_secret::Redactor;
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
@@ -218,7 +219,11 @@ impl ExchangeClient {
         let generation = catalogue.generation.clone();
         let tools = self.project(catalogue)?;
         let source = format!("exchange effective catalogue {generation}");
-        registry.try_register_all_from(source, tools.iter().cloned())?;
+        registry.try_register_all_from_with_placement(
+            source,
+            tools.iter().cloned(),
+            OperationPlacement::NativeSystemOnly,
+        )?;
         let names = tools.into_iter().map(|tool| tool.spec().name).collect();
         *self
             .state
@@ -587,7 +592,11 @@ impl CatalogRefresher for ExchangeCatalogRefresher {
             for name in &previous {
                 registry.remove(name);
             }
-            registry.try_register_all_from(source, tools.iter().cloned())
+            registry.try_register_all_from_with_placement(
+                source,
+                tools.iter().cloned(),
+                OperationPlacement::NativeSystemOnly,
+            )
         }) {
             drop(state);
             self.client.withdraw(catalog)?;

@@ -29,7 +29,9 @@ use serde_json::Value;
 
 use flux_core::{Error, Result};
 use flux_policy::{Action, ResourceKind, ResourceRef};
-use flux_runtime::{AuthorityRequirement, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{
+    AuthorityRequirement, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult,
+};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
 /// The evidence-gated group `command.invoke` belongs to (surfaced only when
@@ -38,11 +40,12 @@ pub const GROUP: &str = "agent_invoke";
 
 /// Register the `command.invoke` op.
 pub fn try_register_command_invoke(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools agent-invocation pack (D-187)",
         vec![std::sync::Arc::new(CommandInvokeTool {
             env: flux_runtime::metadata::DiscoveryEnv::from_process(),
         }) as std::sync::Arc<dyn Tool>],
+        OperationPlacement::LocalControlPlane,
     )
 }
 

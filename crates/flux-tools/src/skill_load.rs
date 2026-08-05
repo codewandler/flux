@@ -13,15 +13,16 @@ use serde_json::Value;
 
 use flux_core::{Error, Result};
 use flux_evidence::{Observation, Phase};
-use flux_runtime::{SkillLoader, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, SkillLoader, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{tool_input_schema, Idempotency, Risk, ToolSpec};
 
 /// Register `skill.load` (D-188). Always registered — like `observe`/`evidence` — because
 /// per-turn *surfacing*, not registry presence, is what stays off by default; see the module docs.
 pub(crate) fn try_register_skill_load(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools skill-load pack",
         vec![Arc::new(SkillLoadOp) as Arc<dyn Tool>],
+        OperationPlacement::LocalControlPlane,
     )
 }
 

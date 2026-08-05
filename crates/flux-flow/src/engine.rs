@@ -1267,7 +1267,7 @@ impl FlowEngine {
         // config/skills/roles loading deliberately stays fixed to `self.cwd` (entering a worktree
         // changes the working directory, not the agent's authority).
         let active_system = self.executor.context().system();
-        let disabled = self.executor.disabled_ops_for(registry);
+        let disabled = self.executor.unavailable_ops_for(registry);
         let (advertised, surfaced) = surfaced_op_names(
             registry,
             &self.groups,

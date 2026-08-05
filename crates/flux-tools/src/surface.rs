@@ -37,8 +37,8 @@ use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
 use flux_runtime::{
-    PaneCommand, PaneData, PaneLifetime, PaneSlot, SurfaceReporter, Tool, ToolContext,
-    ToolRegistry, ToolResult,
+    OperationPlacement, PaneCommand, PaneData, PaneLifetime, PaneSlot, SurfaceReporter, Tool,
+    ToolContext, ToolRegistry, ToolResult,
 };
 use flux_spec::{Idempotency, IntentSet, Risk, ToolSpec};
 
@@ -66,13 +66,14 @@ pub fn try_register_surface_ops(
     if !surface_sink_installed {
         return Ok(());
     }
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools surface pane pack",
         vec![
             Arc::new(PaneOpenOp) as Arc<dyn Tool>,
             Arc::new(PaneUpdateOp),
             Arc::new(PaneCloseOp),
         ],
+        OperationPlacement::LocalControlPlane,
     )
 }
 
