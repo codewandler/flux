@@ -468,6 +468,8 @@ impl ToolEntry {
         is_error: bool,
         elapsed: Duration,
     ) -> Self {
+        // C-533: resumed sessions cross the same transcript boundary as live ones.
+        let content = trust::sanitize_tool_output(&content);
         let call = toolview::format_call(&name, &input);
         let summary = toolview::format_result(&name, &content, is_error);
         ToolEntry {
@@ -495,7 +497,10 @@ impl ToolEntry {
         let input = serde_json::Value::Null;
         let call = toolview::format_call(&name, &input);
         let is_error = error.is_some();
-        let content = error.unwrap_or_default();
+        // C-533: an engine error string can embed tool output; sanitize like any other content.
+        let content = error
+            .map(|error| trust::sanitize_tool_output(&error))
+            .unwrap_or_default();
         let summary = if is_error {
             toolview::format_result(&name, &content, true)
         } else {
@@ -1855,6 +1860,9 @@ impl ChatState {
     /// A line arriving after the result landed is dropped: the card has moved on to its real
     /// summary and must not flip back to a partial view.
     fn progress_tool(&mut self, name: &str, line: String) {
+        // C-533: strip escapes/control bytes before the line can reach a span — the reporter
+        // redacts secrets (C-158) but passes subprocess bytes through verbatim.
+        let line = trust::sanitize_tool_output(&line);
         for entry in self.entries.iter_mut().rev() {
             if let Entry::Tool(tool) = entry {
                 if tool.result.is_none() && tool.name == name {
@@ -1869,6 +1877,9 @@ impl ChatState {
         }
     }
     fn finish_tool(&mut self, name: &str, content: String, is_error: bool) {
+        // C-533: the transcript boundary — same sanitation posture as panes, approval prompts
+        // and fleet names. Applies equally to the no-matching-card notice fallback below.
+        let content = trust::sanitize_tool_output(&content);
         let summary = toolview::format_result(name, &content, is_error);
         for entry in self.entries.iter_mut().rev() {
             if let Entry::Tool(tool) = entry {
@@ -3187,6 +3198,10 @@ fn truncate(s: &str, max: usize) -> String {
 /// Hard-wrap styled lines to terminal display columns while preserving line/span styles. Markdown
 /// is already word-wrapped; this closes the remaining long-user-input/tool/notice cases so viewport
 /// offsets are exact and Ratatui never has to reflow rows hidden outside the viewport.
+///
+/// C-536: continuation rows repeat the logical line's leading rail-and-indent run (the C-149
+/// gutter, any nested rail, the card indent) so a wrapped row keeps its left edge instead of
+/// dissolving to column 0.
 fn wrap_styled_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let max = width as usize;
     if max == 0 {
@@ -3208,14 +3223,19 @@ fn wrap_styled_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>
             continue;
         }
 
+        let (prefix, prefix_cols) = hanging_prefix(&spans, max);
         let mut row = Vec::new();
         let mut columns: usize = 0;
+        // Columns already occupied when the current row started: 0 for the first row,
+        // `prefix_cols` for continuations. A row always accepts at least one character beyond its
+        // base, so wrapping makes progress even when the prefix nearly fills the width.
+        let mut row_base: usize = 0;
         for span in spans {
             let span_style = span.style;
             let mut chunk = String::new();
             for ch in span.content.chars() {
                 let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if columns > 0 && columns.saturating_add(ch_width) > max {
+                if columns > row_base && columns.saturating_add(ch_width) > max {
                     if !chunk.is_empty() {
                         row.push(Span::styled(std::mem::take(&mut chunk), span_style));
                     }
@@ -3224,7 +3244,9 @@ fn wrap_styled_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>
                         alignment,
                         spans: std::mem::take(&mut row),
                     });
-                    columns = 0;
+                    row.extend(prefix.iter().cloned());
+                    columns = prefix_cols;
+                    row_base = prefix_cols;
                 }
                 chunk.push(ch);
                 columns = columns.saturating_add(ch_width);
@@ -3240,6 +3262,37 @@ fn wrap_styled_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>
         });
     }
     out
+}
+
+/// C-536: the spans covering a logical line's leading rail-and-indent run — rail glyphs (`│`) and
+/// whitespace, kept with their span styles — cloned onto each continuation row by
+/// [`wrap_styled_lines`]. Empty when the line has no such run, or when the run would eat the whole
+/// width (a degenerate narrow frame wraps content rather than repeating rails it has no room for).
+fn hanging_prefix(spans: &[Span<'static>], max: usize) -> (Vec<Span<'static>>, usize) {
+    let mut prefix: Vec<Span<'static>> = Vec::new();
+    let mut cols = 0usize;
+    'spans: for span in spans {
+        let mut run = String::new();
+        for ch in span.content.chars() {
+            if ch == '│' || (ch != '\n' && ch.is_whitespace()) {
+                cols += UnicodeWidthChar::width(ch).unwrap_or(0);
+                run.push(ch);
+            } else {
+                if !run.is_empty() {
+                    prefix.push(Span::styled(run, span.style));
+                }
+                break 'spans;
+            }
+        }
+        if !run.is_empty() {
+            prefix.push(Span::styled(run, span.style));
+        }
+    }
+    if cols == 0 || cols >= max {
+        (Vec::new(), 0)
+    } else {
+        (prefix, cols)
+    }
 }
 
 /// Whether a `FLUX_*` boolean env value is ON: `1`/`true`/`yes`/`on`, case-insensitive. Mere
@@ -9491,8 +9544,9 @@ mod tests {
                 .map(|span| span.content.clone().into_owned())
                 .collect::<String>()
         };
-        let clean =
-            |text: &str| !text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\r');
+        let clean = |text: &str| {
+            !text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\r')
+        };
 
         // The C-158 live tail.
         let mut state = ChatState::new("opus".into());
@@ -9514,7 +9568,22 @@ mod tests {
         );
         let done = flat(&state);
         assert!(done.contains("error: it broke"), "text survives: {done:?}");
-        assert!(clean(&done), "finished card carries no control bytes: {done:?}");
+        assert!(
+            clean(&done),
+            "finished card carries no control bytes: {done:?}"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let frame = screen(&terminal);
+        assert!(
+            frame.contains("error: it broke"),
+            "text survives: {frame:?}"
+        );
+        assert!(
+            clean(&frame),
+            "rendered frame carries no control bytes: {frame:?}"
+        );
 
         // Historical ingest (the resume path).
         let mut resumed = ChatState::new("opus".into());
@@ -9535,6 +9604,39 @@ mod tests {
             clean(&historical),
             "historical card carries no control bytes: {historical:?}"
         );
+    }
+
+    /// C-536: a wrapped transcript row keeps its left edge — continuation rows repeat the gutter
+    /// rail and the logical line's leading indent instead of dissolving to column 0.
+    #[test]
+    fn wrapped_detail_rows_keep_the_gutter_and_indent() {
+        let mut state = ChatState::new("opus".into());
+        state.expand_tools = true;
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "long"}),
+        )));
+        state.finish_tool("bash", format!("first\n{}", "x".repeat(60)), false);
+        let texts: Vec<String> = state
+            .transcript_lines(30)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        // The 60-char detail line wraps at 30 columns; every continuation row must still carry
+        // the rail + detail indent rather than starting at column 0.
+        let wrapped: Vec<&String> = texts.iter().filter(|t| t.contains("xxx")).collect();
+        assert!(wrapped.len() >= 2, "the long line wrapped: {texts:?}");
+        for row in &wrapped[1..] {
+            assert!(
+                row.starts_with("│    x"),
+                "continuation keeps the left edge: {row:?} in {texts:?}"
+            );
+        }
     }
 
     /// `FLUX_VERBOSE` is value-parsed, not presence-tested: only `1|true|yes|on`

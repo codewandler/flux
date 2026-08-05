@@ -2,7 +2,7 @@
 id: C-533
 title: "Sanitize tool output at the transcript boundary"
 pillar: Core
-status: in-progress
+status: done
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
 areas: [flux-tui]
@@ -20,19 +20,22 @@ boundary exists to deny.
 
 ## Acceptance
 
-- [ ] Failing-first TestBackend frame test: a finished bash card whose result contains `\x1b[31m`,
+- [x] Failing-first TestBackend frame test: a finished bash card whose result contains `\x1b[31m`,
       `\r`, and `\x07` renders with no ESC/control cells anywhere in the frame.
-- [ ] Live-tail partial lines (C-158) are sanitized the same way.
-- [ ] Historical/resumed tool entries are sanitized on ingest.
-- [ ] The sanitizer is shared with `trust.rs`'s escape-consumption (one implementation), without
+- [x] Live-tail partial lines (C-158) are sanitized the same way.
+- [x] Historical/resumed tool entries are sanitized on ingest.
+- [x] The sanitizer is shared with `trust.rs`'s escape-consumption (one implementation), without
       applying the reserved-glyph replacement (that is chrome-forgery defense, not tool-text
       hygiene).
-- [ ] The plan-tree ANSI path (`plan.rs`, `ansi-to-tui`) is untouched.
-- [ ] `cargo test -p flux-tui` green.
+- [x] The plan-tree ANSI path (`plan.rs`, `ansi-to-tui`) is untouched.
+- [x] `cargo test -p flux-tui` green.
 
 ## Progress
 
 - 2026-08-05 — filed from the tool-output review; implementation started same session.
+- 2026-08-05 — closed on the reconciled local `main`: live, completed, and resumed tool content all
+  cross the shared escape/control sanitizer before transcript rendering; the TestBackend regression
+  and the complete `flux-tui` package suite (292 tests across unit and loop-mock targets) pass.
 
 ## Notes
 

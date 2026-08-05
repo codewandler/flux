@@ -278,7 +278,7 @@ fn is_invisible(ch: char) -> bool {
 /// This is the **single-line** form: a newline is a control character like any other, because
 /// every caller of it renders into one row. [`sanitize_block`] is the multi-line form.
 pub(crate) fn sanitize(raw: &str) -> String {
-    sanitize_inner(raw, false)
+    sanitize_inner(raw, false, true)
 }
 
 /// [`sanitize`] for the one payload that is legitimately multi-line: `markdown` source, whose
