@@ -89,6 +89,11 @@
 
 ### Improved
 
+- **The Board and Fleet guide is easier to follow from contract to delivery.** Concepts now appears
+  before Coding in the public navigation, and compact diagrams show story states, dispatch
+  eligibility, isolated worktrees, review/rework, integration, local apply, and the separate
+  publication boundary.
+
 - **Fleet workers keep the same tools and workspace authority for their whole assignment.** Flux
   validates each worker's declared capability bundles before it starts, then preserves that exact
   ceiling across messages, restarts, resume, and rework. Changing a template affects only newly

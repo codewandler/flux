@@ -196,6 +196,33 @@ program order, combines story/program dependencies, and never falls back to an u
 story when the workspace has a program catalogue. Explicit `BOARD/ITEM` arguments go through the
 same authority and readiness checks.
 
+Before an item is dispatchable, every boundary in this chain must hold:
+
+```text
+repository story exists
+          │
+          ▼
+Goal and Acceptance define done
+          │
+          ▼
+workspace schedule authorizes the BoardRef
+          │
+          ▼
+dependencies are satisfied
+          │
+          ▼
+story is ready on the pinned canonical ref
+          │
+          ▼
+worker capacity + write-set independence are valid
+          │
+          ▼
+dispatch
+```
+
+Fleet refuses rather than borrowing a dirty checkout, guessing a missing contract, or widening a
+worker's scope to make the schedule fit.
+
 ```sh
 flux fleet refresh --output json
 flux fleet schedule --output json
@@ -264,6 +291,30 @@ A fresh read-only reviewer inspects the exact handoff commit. Findings are struc
 command-output, or invariant records with reviewer identity. A REWORK decision is delivered back to
 the same persistent worker session, preserving its context.
 
+```text
+assignment
+    │
+    ▼
+isolated writer session + story worktree
+    │
+    ▼
+failing-first evidence → implementation → targeted checks
+    │
+    ▼
+exact commit + typed handoff
+    │
+    ▼
+fresh read-only review
+    ├── ACCEPT ──→ dependency-order integration
+    └── REWORK ──→ same writer session (at most two deliveries)
+                         │
+                         └── third failure ──→ parked
+```
+
+The reviewer is not a second writer, and the original writer does not review itself. Review changes
+the next execution step; the host-observed commit, write set, commands, and evidence remain the
+facts.
+
 The host allows two rework deliveries. A third request parks the item with unresolved findings; a
 board transition, cancellation, restart, or new CLI call cannot reset the counter.
 
@@ -296,6 +347,29 @@ unrunnable gate is red. A conflict or red gate records the exact candidate and p
 planning stories do not become done.
 
 A green gate records a local `fleet/<wave>` branch as apply-eligible. Nothing is published yet:
+
+```text
+targeted checks green
+          │
+          ▼
+story commit accepted by review
+          │
+          ▼
+wave integration gate green
+          │
+          ▼
+local candidate recorded
+          │
+          ▼
+explicit local apply
+          │
+          ▼
+canonical story status done
+          │
+          ▼
+push / release / deployment / milestone exit
+        remain separate operator actions
+```
 
 ```sh
 flux fleet status --output json

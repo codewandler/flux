@@ -137,6 +137,20 @@ All profiles expose the common operations `list`, `get`, `query`, `create`, `tra
 The execution profile keeps the existing eleven-operation WorkBoard surface. Planning does not
 pretend a story is a worker run, and execution does not invent priorities or roadmap status.
 
+For the planning profile, the ordinary story path is intentionally small:
+
+```text
+backlog ──→ ready ──→ in-progress ──→ done
+                         │
+                         └──────────→ blocked
+                                         │
+                                         └──→ ready
+```
+
+`ready` is an explicit authorization, not a synonym for “mentioned in a roadmap.” `done` means the
+story's Goal and Acceptance are satisfied in the owning repository; a Fleet worker finishing a turn
+does not close it by itself.
+
 ## Planning documents are not queue items
 
 A planning board has four document families:

@@ -32,6 +32,9 @@ wave, and shows real progress without requiring knowledge of Flux internals or t
 - [ ] Watching is honest: `dashboard` is a point-in-time terminal view and `events --follow --output
       ndjson` is the live stream. The guide does not call either the future polished TUI from C-556/
       C-557 and does not present tmux panes as a control channel.
+- [ ] Public navigation places Concepts before Coding, and the Coding guide uses readable text
+      diagrams for the planning lifecycle, dispatch eligibility, worktree topology, writer/reviewer
+      loop and the separate integration/apply/publication completion boundaries.
 - [ ] Recovery examples cover failed worker inspection, acknowledged steering, resume, rework,
       integrate and explicit local-only apply, with push/release/deploy still separate.
 - [ ] Public link/command fixtures and the website build pass; the legacy agent/fleet redirect and
