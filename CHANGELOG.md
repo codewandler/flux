@@ -57,6 +57,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Core release promotion now binds preview, protected-main integration and public closure into one
+  gate** (C-516). `release_plan` reads fully framed commit messages and treats a non-empty
+  `[Unreleased]` `Action needed` section as the pre-1.0 breaking signal, correcting the current
+  preview from `0.55.1` to `0.56.0`. Promotion opens and merges a normal cut PR only after the exact
+  head's `ci`, stages the resulting canonical-main SHA as the candidate, creates the annotated tag
+  through the promoter App, selects only new exact-tag/SHA workflow runs, verifies the live Release
+  and whole `/releases/latest` fleet, and deletes evidence last. New Releases have one exact
+  28-asset inventory; every archive sidecar and the eleven-entry checksum index are recomputed, all
+  downloaded bytes must match positive unique GitHub metadata, and every asset must carry the exact
+  tag/SHA release-workflow attestation.
+
 - **The fleet delivery contract now validates one integrated wave instead of every child merge.**
   A named wave has at most one writer and isolated worktree per story, targeted checks at story
   handoff, dependency-ordered integration on one branch, and one unskippable full repository gate

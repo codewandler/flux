@@ -2,7 +2,7 @@
 id: C-516
 title: Make release preview, exact asset inventory, and latest-state audit one promotion gate
 pillar: Core
-status: ready
+status: in-progress
 priority: 4
 epic: release-trust-residuals
 design: docs/designs/release-trust-residuals.md
@@ -93,6 +93,15 @@ the final step, never early cleanup.
       release policy/documentation gate run before implementation is declared complete.
 
 ## Progress
+
+- 2026-08-05 — implemented the coherent C-516 lane on canonical `d21b92dd`: fully framed complete
+  commit parsing plus the `[Unreleased]` action-needed signal now pins the live `0.55.0 -> 0.56.0`
+  preview; staged/live verification enforces the exact 28 names, sidecars, eleven-record sum,
+  GitHub metadata bytes and attestations; promotion now encodes normal PR/`ci`/merged-main candidate,
+  App tag, exact new runs, live Release, fleet/latest and cleanup-last ordering. Focused parser,
+  promotion-policy, asset, fleet and release-integrity fixtures pass. Final `done` reconciliation is
+  intentionally left to the integration wave because C-353/C-354 concurrently own the
+  `release-control` App-token job wiring and C-355 owns receipt v3 in the same files.
 
 - 2026-08-04 — filed `ready` from the release-trust audit at canonical
   `9e3108b1b6856e30fa2e0baa2475d75d21fbc19f` after PR #29. The current plan reads `%s` only,

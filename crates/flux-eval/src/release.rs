@@ -64,12 +64,150 @@ pub const RELEASE_SCRIPTS: &[&str] = &["scripts/check-crate-versions.sh", "scrip
 /// A conventional-commit breaking marker on a subject line: `type!:` or `type(scope)!:`. Anchored at
 /// the start of a line because a `!` anywhere else in a subject is prose, not a signal.
 static BREAKING_TITLE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^[a-zA-Z]+(\([^)]*\))?!:").expect("breaking-title pattern compiles")
+    Regex::new(r"^[A-Za-z][A-Za-z0-9_-]*(\([^()\r\n]+\))?!:")
+        .expect("breaking-title pattern compiles")
 });
 
 /// The `BREAKING CHANGE:` / `BREAKING:` footer form, which some commits use instead of `!`.
-static BREAKING_FOOTER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^BREAKING[ -]?CHANGE:|^BREAKING:").expect("footer compiles"));
+static BREAKING_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(BREAKING CHANGE|BREAKING-CHANGE|BREAKING):[^\r\n]*\S[^\r\n]*$")
+        .expect("footer compiles")
+});
+
+static COMMIT_SHA: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9a-f]{40}$").expect("commit SHA compiles"));
+
+static TRAILER_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z0-9-]+(?: [A-Za-z0-9-]+)*:[^\r\n]*$").expect("trailer line compiles")
+});
+
+const COMMIT_RECORD_SEPARATOR: char = '\u{1e}';
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReleaseCommitRecord {
+    pub sha: String,
+    pub message: String,
+}
+
+/// Decode `git log --format=%H%x00%B%x00%x1e` output. The NUL-delimited fields and explicit record
+/// separator keep an unterminated body, a footer-looking next subject, and embedded newlines from
+/// changing commit boundaries.
+pub fn parse_commit_records(raw: &str) -> Result<Vec<ReleaseCommitRecord>> {
+    let mut records = Vec::new();
+    for raw_record in raw.split(COMMIT_RECORD_SEPARATOR) {
+        let record = raw_record.trim_matches(['\r', '\n']);
+        if record.is_empty() {
+            continue;
+        }
+        let Some((sha, rest)) = record.split_once('\0') else {
+            return Err(Error::Other(
+                "release log record has no SHA delimiter".into(),
+            ));
+        };
+        let Some(message) = rest.strip_suffix('\0') else {
+            return Err(Error::Other(format!(
+                "release log record {sha} has no message terminator"
+            )));
+        };
+        if !COMMIT_SHA.is_match(sha) || message.contains('\0') {
+            return Err(Error::Other(format!(
+                "release log record has invalid framing or SHA `{sha}`"
+            )));
+        }
+        records.push(ReleaseCommitRecord {
+            sha: sha.to_string(),
+            message: message.to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn footer_block(message: &str) -> Vec<&str> {
+    let lines: Vec<&str> = message.trim_end_matches(['\r', '\n']).lines().collect();
+    if lines.len() == 1 && BREAKING_FOOTER.is_match(lines[0]) {
+        return lines;
+    }
+    let Some(blank) = lines.iter().rposition(|line| line.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let candidate = &lines[blank + 1..];
+    if candidate.is_empty()
+        || candidate.iter().any(|line| {
+            !line.starts_with(' ')
+                && !line.starts_with('\t')
+                && !TRAILER_LINE.is_match(line.trim_end())
+        })
+    {
+        return Vec::new();
+    }
+    candidate.to_vec()
+}
+
+/// Breaking markers from one complete commit message. Subject and footer positions are evaluated
+/// independently so incidental body prose and adjacent records cannot become a signal.
+pub fn commit_breaking_markers(message: &str) -> Vec<String> {
+    let normalized = message.replace("\r\n", "\n");
+    let mut markers = Vec::new();
+    if let Some(subject) = normalized.lines().next().map(str::trim_end) {
+        if BREAKING_TITLE.is_match(subject) {
+            markers.push(subject.to_string());
+        }
+    }
+    markers.extend(
+        footer_block(&normalized)
+            .into_iter()
+            .map(str::trim_end)
+            .filter(|line| BREAKING_FOOTER.is_match(line))
+            .map(str::to_string),
+    );
+    markers
+}
+
+/// Whether the current customer-facing release notes contain a non-empty migration section.
+pub fn unreleased_action_needed(whats_new: &str) -> bool {
+    let mut in_unreleased = false;
+    let mut in_action = false;
+    for line in whats_new.lines() {
+        let heading = line.trim();
+        if heading == "## [Unreleased]" {
+            in_unreleased = true;
+            in_action = false;
+            continue;
+        }
+        if in_unreleased && heading.starts_with("## [") {
+            break;
+        }
+        if !in_unreleased {
+            continue;
+        }
+        if heading.starts_with("### ") {
+            in_action = heading == "### Action needed";
+            continue;
+        }
+        if in_action && !heading.is_empty() && !heading.starts_with("<!--") {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn derive_release_bump(
+    commits: &[ReleaseCommitRecord],
+    action_needed: bool,
+    current_version: &str,
+) -> &'static str {
+    let breaking = action_needed
+        || commits
+            .iter()
+            .any(|record| !commit_breaking_markers(&record.message).is_empty());
+    if !breaking {
+        "patch"
+    } else if current_version.starts_with("0.") {
+        "minor"
+    } else {
+        "major"
+    }
+}
 
 /// The first `version = "X.Y.Z"` line of a manifest — the same `grep -m1 '^version = '` that
 /// `scripts/cut-release.sh` reads, so the host's prediction and the script's answer come from one
@@ -164,6 +302,24 @@ async fn git(ctx: &ToolContext, args: &[&str]) -> Result<String> {
     Ok(out.stdout.trim().to_string())
 }
 
+async fn git_framed_log(ctx: &ToolContext, range: &str) -> Result<String> {
+    let argv = vec![
+        "git".to_string(),
+        "log".to_string(),
+        range.to_string(),
+        "--format=%H%x00%B%x00%x1e".to_string(),
+    ];
+    let out = ctx.system().run(&argv, Duration::from_secs(60)).await?;
+    if out.exit_code != 0 {
+        return Err(Error::Other(format!(
+            "git log {range} failed [exit {}]: {}",
+            out.exit_code,
+            out.stderr.trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
 // ---------------------------------------------------------------------------
 // release_plan
 // ---------------------------------------------------------------------------
@@ -225,13 +381,33 @@ impl Tool for ReleasePlanTool {
             .await?
             .parse()
             .map_err(|_| Error::Other(format!("could not count commits in {range}")))?;
-        let log = git(ctx, &["log", &range, "--format=%s"]).await?;
+        let commits = parse_commit_records(&git_framed_log(ctx, &range).await?)?;
+        if commits.len() as u64 != commit_count {
+            return Err(Error::Other(format!(
+                "release log framing produced {} records for {commit_count} commits in {range}",
+                commits.len()
+            )));
+        }
+        let log = commits
+            .iter()
+            .map(|record| record.message.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let diffstat = git(ctx, &["diff", "--stat", &range]).await?;
 
         let current = current_version(ctx).await?;
-        let bump = derive_bump(&log, &current);
+        let whats_new = ctx.system().read_file("WHATS-NEW.md").await?;
+        let action_needed = unreleased_action_needed(&whats_new);
+        let bump = derive_release_bump(&commits, action_needed, &current);
         let next = next_version(&current, bump)?;
-        let breaking = breaking_titles(&log);
+        let breaking = commits
+            .iter()
+            .flat_map(|record| {
+                commit_breaking_markers(&record.message)
+                    .into_iter()
+                    .map(|marker| format!("{} {marker}", record.sha))
+            })
+            .collect::<Vec<_>>();
 
         let view = format!(
             "{last_tag} → {next} ({bump}); {commit_count} commit(s), {} breaking",
@@ -242,9 +418,11 @@ impl Tool for ReleasePlanTool {
                 "last_tag": last_tag,
                 "range": range,
                 "commit_count": commit_count,
+                "commits": commits,
                 "log": log,
                 "diffstat": diffstat,
                 "breaking": breaking,
+                "action_needed": action_needed,
                 "bump": bump,
                 "current_version": current,
                 "next_version": next,
@@ -830,6 +1008,92 @@ mod tests {
             "minor"
         );
         assert_eq!(derive_bump("BREAKING: the wire moved", "0.37.0"), "minor");
+    }
+
+    #[test]
+    fn complete_commit_records_keep_breaking_markers_in_their_valid_locations() {
+        let framed = concat!(
+            "1111111111111111111111111111111111111111\0fix(core): ordinary subject\n\n",
+            "This prose says BREAKING CHANGE: incidentally.\0\x1e\n",
+            "2222222222222222222222222222222222222222\0feat(api): revise wire\n\n",
+            "Details.\n\nBREAKING-CHANGE: callers must migrate\0\x1e\n",
+            "3333333333333333333333333333333333333333\0refactor(cli)!: remove legacy flag\0\x1e",
+        );
+        let records = parse_commit_records(framed).expect("valid framed git log");
+        assert_eq!(records.len(), 3);
+        assert!(records[0].message.contains("incidentally"));
+        assert!(commit_breaking_markers(&records[0].message).is_empty());
+        assert_eq!(
+            commit_breaking_markers(&records[1].message),
+            vec!["BREAKING-CHANGE: callers must migrate"]
+        );
+        assert_eq!(
+            commit_breaking_markers(&records[2].message),
+            vec!["refactor(cli)!: remove legacy flag"]
+        );
+        assert_eq!(derive_release_bump(&records, false, "0.55.0"), "minor");
+    }
+
+    #[test]
+    fn record_boundaries_cannot_form_a_phantom_breaking_footer() {
+        let framed = concat!(
+            "1111111111111111111111111111111111111111\0fix: end with BREAKING\0\x1e",
+            "2222222222222222222222222222222222222222\0CHANGE: ordinary next subject\0\x1e",
+        );
+        let records = parse_commit_records(framed).unwrap();
+        assert_eq!(derive_release_bump(&records, false, "0.55.0"), "patch");
+        assert!(parse_commit_records("badly-framed-record").is_err());
+    }
+
+    #[test]
+    fn unreleased_action_needed_forces_the_pre_one_zero_minor() {
+        let notice = "# What's new in flux\n\n## [Unreleased]\n\n### Fixed\n\n- fixed\n\n### Action needed\n\n- migrate now\n\n## [0.55.0]\n\n### Action needed\n\n- old migration\n";
+        assert!(unreleased_action_needed(notice));
+        let records =
+            parse_commit_records("1111111111111111111111111111111111111111\0fix: safe patch\0\x1e")
+                .unwrap();
+        assert_eq!(derive_release_bump(&records, true, "0.55.0"), "minor");
+        assert_eq!(
+            next_version("0.55.0", derive_release_bump(&records, true, "0.55.0")).unwrap(),
+            "0.56.0"
+        );
+
+        let empty = "## [Unreleased]\n\n### Action needed\n\n\n### Fixed\n- fixed\n\n## [0.55.0]\n### Action needed\n- historical only\n";
+        assert!(!unreleased_action_needed(empty));
+    }
+
+    #[test]
+    fn current_v055_baseline_previews_v0560() {
+        let manifest = include_str!("../../../Cargo.toml");
+        let whats_new = include_str!("../../../WHATS-NEW.md");
+        let current = manifest_version(manifest).expect("workspace version");
+        assert_eq!(
+            current, "0.55.0",
+            "fixture is pinned to the v0.55.0 baseline"
+        );
+        assert!(unreleased_action_needed(whats_new));
+        let records = parse_commit_records(
+            "1111111111111111111111111111111111111111\0fix: otherwise patch\0\x1e",
+        )
+        .unwrap();
+        let bump = derive_release_bump(&records, true, &current);
+        assert_eq!(next_version(&current, bump).unwrap(), "0.56.0");
+    }
+
+    #[test]
+    fn all_supported_footer_tokens_are_exact_and_footer_only() {
+        for token in ["BREAKING CHANGE", "BREAKING-CHANGE", "BREAKING"] {
+            let message = format!("feat: change\n\nbody\n\n{token}: migration");
+            assert_eq!(commit_breaking_markers(&message).len(), 1, "{token}");
+        }
+        for prose in [
+            "fix: mention BREAKING CHANGE: here",
+            "fix: ordinary\n\nA paragraph with BREAKING: incidental prose.",
+            "fix: ordinary\n\nNOT BREAKING: migration",
+            "fix: ordinary\n\nBREAKING CHANGE : malformed",
+        ] {
+            assert!(commit_breaking_markers(prose).is_empty(), "{prose}");
+        }
     }
 
     #[test]

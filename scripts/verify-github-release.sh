@@ -1,138 +1,131 @@
 #!/usr/bin/env bash
-#
-# Verify that a version tag has a GitHub Release object with the binary assets users install from
-# /releases/latest. Intended for the post-tag Release workflow and for maintainer backfill checks.
-#
-# Two modes, and the difference is *when* they run (C-412):
-#
-#   <tag>           AFTER publication. Reads the live Release, and additionally verifies a provenance
-#                   attestation for every executable asset — which can only be done once the assets
-#                   are downloadable. This is the historical mode.
-#   --staged <dir>  BEFORE publication. Reads the local directory `gh release create` is about to
-#                   upload, and applies the same asset-set rules to it. No network, no attestations.
-#
-# Why the staged mode exists: the `host` job published the Release and *then* verified it, so a run
-# with an incomplete artifact directory created a public, broken Release and only afterwards went
-# red. v0.47.0 is that exact sequence — attempt 1 of the tag run published at 12:55:07 inside a
-# `host` job that started at 12:54:47 and failed at 12:55:08 on the verify step, leaving a Release
-# whose only asset was `dist-manifest.json` with `/releases/latest` pointing at it. A check that runs
-# after publication can only report the damage; the staged mode is the same check moved to where it
-# can prevent it.
+# Exact pre-publication and live GitHub Release verifier (C-516).
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/verify-github-release.sh [--repo owner/name] <tag>
+usage: scripts/verify-github-release.sh [--repo owner/name] [--expected-sha <40-hex>] <tag>
        scripts/verify-github-release.sh --staged <dir>
        scripts/verify-github-release.sh --self-test
-
-Checks that <tag> has a GitHub Release with installer scripts, checksum metadata,
-at least one Unix archive plus one Windows zip, and a valid GitHub provenance
-attestation for every executable release asset.
-
-With --staged, applies the same asset-set rules to a local directory before it is
-published, so an incomplete set never becomes a public Release. Attestations are not
-checked in this mode — they do not exist yet.
-
-Requires: gh authenticated for the target repo (not needed for --staged).
 EOF
 }
 
-REPO="${GITHUB_REPOSITORY:-codewandler/flux}"
-TAG=""
-STAGED_DIR=""
+REPO=${GITHUB_REPOSITORY:-codewandler/flux}
+EXPECTED_SHA=${EXPECTED_RELEASE_SHA:-${GITHUB_SHA:-}}
+TAG=
+STAGED_DIR=
 
 err() {
-  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
     echo "::error::$*" >&2
   else
     echo "error: $*" >&2
   fi
 }
 
-# cargo-dist ships TWO apps (`flux-cli` and the protocol-mandated `flux-lsp`), a `.sha256` sidecar
-# beside every asset, and a `source.tar.gz`. Since the LSP crate became publishable its package name
-# is `codewandler-flux-lsp`, while the binary inside remains `flux-lsp`; cargo-dist names archives
-# and installers after the package. Historical releases retain the former `flux-lsp-*` spelling.
-# The closed-set rule below is the point of this function —
-# an extra filename must never become a second, unverified distribution channel — but it has to be
-# closed over the set that is actually published. Keep `--self-test` fed from a REAL release listing:
-# the first version of this check was written against a hand-made `flux-cli`-only list, passed its own
-# self-test, and then rejected every real release on the first `.sha256` it met.
-executable_assets=()
-sidecar_targets=()
-validate_asset_set() {
-  local name
-  local has_unix_archive=0
-  local has_windows_zip=0
-  executable_assets=()
-  sidecar_targets=()
-  for name in "$@"; do
-    case "$name" in
-      # Checksum sidecars and the source archive are metadata, not an install channel: they carry no
-      # executable code, so they are allowed without an attestation. A sidecar naming an asset that
-      # does not exist IS a stray file, and is rejected below.
-      *.sha256) sidecar_targets+=("${name%.sha256}") ;;
-      dist-manifest.json|sha256.sum|source.tar.gz) ;;
-      flux-cli-installer.sh|flux-cli-installer.ps1) executable_assets+=("$name") ;;
-      flux-lsp-installer.sh|flux-lsp-installer.ps1|\
-      codewandler-flux-lsp-installer.sh|codewandler-flux-lsp-installer.ps1)
-        executable_assets+=("$name")
-        ;;
-      flux-cli-*.tar.xz) executable_assets+=("$name"); has_unix_archive=1 ;;
-      flux-cli-*.zip) executable_assets+=("$name"); has_windows_zip=1 ;;
-      # flux-lsp is shipped but optional — allowed and attestation-verified when present, never
-      # required, so dropping the LSP from a release does not red this gate.
-      flux-lsp-*.tar.xz|codewandler-flux-lsp-*.tar.xz) executable_assets+=("$name") ;;
-      flux-lsp-*.zip|codewandler-flux-lsp-*.zip) executable_assets+=("$name") ;;
-      *)
-        err "release contains an unsupported/unverified asset: $name"
-        return 1
-        ;;
-    esac
+targets=(
+  aarch64-apple-darwin
+  aarch64-unknown-linux-gnu
+  x86_64-apple-darwin
+  x86_64-unknown-linux-gnu
+  x86_64-pc-windows-msvc
+)
+apps=(flux-cli codewandler-flux-lsp)
+expected_archives=()
+expected_assets=(
+  flux-cli-installer.sh
+  flux-cli-installer.ps1
+  codewandler-flux-lsp-installer.sh
+  codewandler-flux-lsp-installer.ps1
+  dist-manifest.json
+  sha256.sum
+  source.tar.gz
+  source.tar.gz.sha256
+)
+for app in "${apps[@]}"; do
+  for target in "${targets[@]}"; do
+    ext=tar.xz
+    [ "$target" != x86_64-pc-windows-msvc ] || ext=zip
+    archive="$app-$target.$ext"
+    expected_archives+=("$archive")
+    expected_assets+=("$archive" "$archive.sha256")
   done
-  [ "$has_unix_archive" -eq 1 ] || { err "release has no flux-cli-*.tar.xz asset"; return 1; }
-  [ "$has_windows_zip" -eq 1 ] || { err "release has no flux-cli-*.zip asset"; return 1; }
+done
+mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort)
+mapfile -t expected_archives < <(printf '%s\n' "${expected_archives[@]}" | LC_ALL=C sort)
+checksum_members=("${expected_archives[@]}" source.tar.gz)
+mapfile -t checksum_members < <(printf '%s\n' "${checksum_members[@]}" | LC_ALL=C sort)
 
-  # Every `.sha256` must shadow a real asset in this same listing. Without this a stray
-  # `anything.sha256` would pass as "metadata" and reintroduce the hole the closed set exists to shut.
-  local target found
-  for target in "${sidecar_targets[@]}"; do
-    found=0
-    for name in "$@"; do
-      [ "$name" = "$target" ] && { found=1; break; }
-    done
-    [ "$found" -eq 1 ] || { err "release has a checksum sidecar for a missing asset: $target.sha256"; return 1; }
-  done
+validate_asset_names() {
+  local names=("$@") duplicates
+  [ "${#names[@]}" -eq 28 ] || {
+    err "release must contain exactly 28 assets, got ${#names[@]}"
+    return 1
+  }
+  duplicates=$(printf '%s\n' "${names[@]}" | LC_ALL=C sort | uniq -d)
+  [ -z "$duplicates" ] || {
+    err "release contains duplicate asset name(s): $(tr '\n' ' ' <<<"$duplicates")"
+    return 1
+  }
+  mapfile -t actual < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+  [ "${actual[*]}" = "${expected_assets[*]}" ] || {
+    err "release asset names differ from the exact v0.56.0 inventory"
+    diff -u <(printf '%s\n' "${expected_assets[@]}") <(printf '%s\n' "${actual[@]}") >&2 || true
+    return 1
+  }
 }
 
-# The assets a release must carry whatever else it has: the two installer scripts the release body's
-# own `curl … | sh` lines fetch, the checksum index, and the manifest. One definition, called by both
-# modes, so the pre-publication and post-publication checks cannot drift apart — a staged check that
-# was weaker than the published one would let exactly the shape it exists to stop through.
-require_core_assets() {
-  local missing=() required name found
-  for required in \
-    dist-manifest.json \
-    flux-cli-installer.sh \
-    flux-cli-installer.ps1 \
-    sha256.sum
-  do
-    found=0
-    for name in "$@"; do
-      [ "$name" = "$required" ] && { found=1; break; }
-    done
-    [ "$found" -eq 1 ] || missing+=("$required")
+sha256_file() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+verify_one_sidecar() {
+  local dir=$1 archive=$2 sidecar="$dir/$archive.sha256" digest expected
+  digest=$(sha256_file "$dir/$archive")
+  expected="$digest *$archive"
+  [ "$(wc -l <"$sidecar" | tr -d ' ')" = 1 ] && [ "$(cat "$sidecar")" = "$expected" ] || {
+    err "$archive.sha256 must be one newline-terminated lowercase digest record for $archive"
+    return 1
+  }
+  [[ "$expected" =~ ^[0-9a-f]{64}\ \*[^/]+$ ]] || {
+    err "invalid checksum syntax for $archive"
+    return 1
+  }
+}
+
+verify_checksums() {
+  local dir=$1 archive sum_expected
+  for archive in "${expected_archives[@]}" source.tar.gz; do
+    verify_one_sidecar "$dir" "$archive" || return 1
   done
-  [ "${#missing[@]}" -eq 0 ] && return 0
-  err "release asset set is missing required asset(s): ${missing[*]}"
-  printf 'assets present:\n' >&2
-  printf '  %s\n' "$@" >&2
-  return 1
+  sum_expected=$(mktemp "${TMPDIR:-/tmp}/flux-sha256-sum.XXXXXX")
+  for archive in "${checksum_members[@]}"; do
+    printf '%s *%s\n' "$(sha256_file "$dir/$archive")" "$archive"
+  done >"$sum_expected"
+  if ! cmp -s "$sum_expected" "$dir/sha256.sum"; then
+    err "sha256.sum must contain exactly the eleven sorted archive/source digest records"
+    diff -u "$sum_expected" "$dir/sha256.sum" >&2 || true
+    rm -f "$sum_expected"
+    return 1
+  fi
+  rm -f "$sum_expected"
+}
+
+validate_release_dir() {
+  local dir=$1 path
+  [ -d "$dir" ] || { err "artifact directory does not exist: $dir"; return 1; }
+  names=()
+  for path in "$dir"/*; do
+    [ -e "$path" ] || continue
+    [ -f "$path" ] || { err "artifact entry is not a regular file: $path"; return 1; }
+    names+=("$(basename "$path")")
+  done
+  validate_asset_names "${names[@]}" || return 1
+  verify_checksums "$dir" || return 1
 }
 
 verify_attestation() {
-  local artifact="$1" source_digest="$2"
+  local artifact=$1 source_digest=$2
   gh attestation verify "$artifact" \
     --repo "$REPO" \
     --signer-workflow "$REPO/.github/workflows/release.yml" \
@@ -141,249 +134,130 @@ verify_attestation() {
     --deny-self-hosted-runners
 }
 
-if [ "${1:-}" = "--self-test" ]; then
-  # The REAL executable asset set of the v0.54.0 candidate, not a hand-picked subset. The earlier
-  # fixture listed only flux-cli archives and so agreed with a classifier that rejected every actual
-  # release. If cargo-dist's output shape changes, update this from `gh release view <tag> --json
-  # assets --jq '.assets[].name'` — never by trimming it until the check passes.
-  real_release_assets=(
-    dist-manifest.json sha256.sum source.tar.gz source.tar.gz.sha256
-    flux-cli-installer.sh flux-cli-installer.ps1
-    flux-cli-aarch64-apple-darwin.tar.xz         flux-cli-aarch64-apple-darwin.tar.xz.sha256
-    flux-cli-aarch64-unknown-linux-gnu.tar.xz    flux-cli-aarch64-unknown-linux-gnu.tar.xz.sha256
-    flux-cli-x86_64-apple-darwin.tar.xz          flux-cli-x86_64-apple-darwin.tar.xz.sha256
-    flux-cli-x86_64-unknown-linux-gnu.tar.xz     flux-cli-x86_64-unknown-linux-gnu.tar.xz.sha256
-    flux-cli-x86_64-pc-windows-msvc.zip          flux-cli-x86_64-pc-windows-msvc.zip.sha256
-    codewandler-flux-lsp-installer.sh codewandler-flux-lsp-installer.ps1
-    codewandler-flux-lsp-aarch64-apple-darwin.tar.xz         codewandler-flux-lsp-aarch64-apple-darwin.tar.xz.sha256
-    codewandler-flux-lsp-aarch64-unknown-linux-gnu.tar.xz    codewandler-flux-lsp-aarch64-unknown-linux-gnu.tar.xz.sha256
-    codewandler-flux-lsp-x86_64-apple-darwin.tar.xz          codewandler-flux-lsp-x86_64-apple-darwin.tar.xz.sha256
-    codewandler-flux-lsp-x86_64-unknown-linux-gnu.tar.xz     codewandler-flux-lsp-x86_64-unknown-linux-gnu.tar.xz.sha256
-    codewandler-flux-lsp-x86_64-pc-windows-msvc.zip          codewandler-flux-lsp-x86_64-pc-windows-msvc.zip.sha256
-  )
-  validate_asset_set "${real_release_assets[@]}"
-  # Both apps' archives and installers must be classified as executable, or they would ship
-  # unattested. 10 archives + 4 installers = 14.
-  if [ "${#executable_assets[@]}" -ne 14 ]; then
-    echo "self-test expected 14 executable assets in a real release, got ${#executable_assets[@]}" >&2
+if [ "${1:-}" = --self-test ]; then
+  fixture=$(mktemp -d "${TMPDIR:-/tmp}/flux-release-assets.XXXXXX")
+  trap 'rm -rf -- "$fixture"' EXIT
+  good="$fixture/good"
+  mkdir -p "$good"
+  for name in "${expected_assets[@]}"; do
+    case "$name" in
+      *.sha256|sha256.sum) ;;
+      *) printf 'fixture bytes for %s\n' "$name" >"$good/$name" ;;
+    esac
+  done
+  for archive in "${expected_archives[@]}" source.tar.gz; do
+    printf '%s *%s\n' "$(sha256_file "$good/$archive")" "$archive" >"$good/$archive.sha256"
+  done
+  for archive in "${checksum_members[@]}"; do
+    printf '%s *%s\n' "$(sha256_file "$good/$archive")" "$archive"
+  done >"$good/sha256.sum"
+  validate_release_dir "$good"
+
+  for missing in "${expected_assets[@]}"; do
+    mapfile -t incomplete < <(printf '%s\n' "${expected_assets[@]}" | grep -Fxv "$missing")
+    if validate_asset_names "${incomplete[@]}" >/dev/null 2>&1; then
+      err "self-test accepted inventory without $missing"
+      exit 1
+    fi
+  done
+  if validate_asset_names "${expected_assets[@]}" "${expected_assets[0]}" >/dev/null 2>&1; then
+    err "self-test accepted a duplicate asset name"
     exit 1
   fi
-  legacy_release_assets=("${real_release_assets[@]/codewandler-flux-lsp/flux-lsp}")
-  validate_asset_set "${legacy_release_assets[@]}"
-  if [ "${#executable_assets[@]}" -ne 14 ]; then
-    echo "self-test stopped classifying a historical flux-lsp release" >&2
-    exit 1
-  fi
-  # Continue the adversarial probes against today's package-named inventory.
-  validate_asset_set "${real_release_assets[@]}"
-  if validate_asset_set "${real_release_assets[@]}" flux-cli-backdoor.exe >/dev/null 2>&1; then
-    echo "self-test accepted an executable outside the attestation download set" >&2
-    exit 1
-  fi
-  # A sidecar is only metadata because it shadows a real asset; one that shadows nothing is a stray.
-  if validate_asset_set "${real_release_assets[@]}" flux-cli-backdoor.tar.xz.sha256 >/dev/null 2>&1; then
-    echo "self-test accepted a checksum sidecar for a nonexistent asset" >&2
-    exit 1
-  fi
-  # The core-asset rule is shared by both modes; prove it fires rather than trusting the sharing.
-  if require_core_assets "${real_release_assets[@]}" >/dev/null 2>&1; then :; else
-    echo "self-test rejected a real release's core asset set" >&2
-    exit 1
-  fi
-  if require_core_assets flux-cli-installer.sh sha256.sum >/dev/null 2>&1; then
-    echo "self-test accepted an asset set with no dist-manifest.json" >&2
+  if validate_asset_names "${expected_assets[@]}" backdoor.exe >/dev/null 2>&1; then
+    err "self-test accepted an extra asset"
     exit 1
   fi
 
-  # --staged: the same rules against a directory, before anything is published (C-412). Driven
-  # through the real entry point with real files, because the whole point of this mode is what it
-  # does to a directory on disk — a fixture of filenames would not exercise the listing at all.
-  staged_root="$(mktemp -d)"
-  stage_dir() {
-    local dir="$staged_root/$1"; shift
-    mkdir -p "$dir"
-    local name
-    for name in "$@"; do
-      : >"$dir/$name"
-    done
-    printf '%s' "$dir"
-  }
-  good_dir="$(stage_dir good "${real_release_assets[@]}")"
-  if ! "$0" --staged "$good_dir" >/dev/null 2>&1; then
-    echo "self-test rejected a staged directory holding a real release's asset set" >&2
-    rm -rf -- "$staged_root"
-    exit 1
-  fi
-  # v0.47.0's shape: the manifest reached the artifact directory and nothing else did.
-  v047_dir="$(stage_dir v047 dist-manifest.json)"
-  if "$0" --staged "$v047_dir" >/dev/null 2>&1; then
-    echo "self-test accepted a staged directory holding only dist-manifest.json" >&2
-    rm -rf -- "$staged_root"
-    exit 1
-  fi
-  empty_dir="$staged_root/empty"
-  mkdir -p "$empty_dir"
-  if "$0" --staged "$empty_dir" >/dev/null 2>&1; then
-    echo "self-test accepted an empty staged directory" >&2
-    rm -rf -- "$staged_root"
-    exit 1
-  fi
-  if "$0" --staged "$staged_root/does-not-exist" >/dev/null 2>&1; then
-    echo "self-test accepted a staged directory that does not exist" >&2
-    rm -rf -- "$staged_root"
-    exit 1
-  fi
-  # The closed set has to apply before publication too, or the staged gate would wave through an
-  # executable that the post-publication gate then rejects — after it is already downloadable.
-  backdoor_dir="$(stage_dir backdoor "${real_release_assets[@]}" flux-cli-backdoor.exe)"
-  if "$0" --staged "$backdoor_dir" >/dev/null 2>&1; then
-    echo "self-test accepted a staged executable outside the closed asset set" >&2
-    rm -rf -- "$staged_root"
-    exit 1
-  fi
-  rm -rf -- "$staged_root"
+  for scenario in corrupt-sidecar uppercase-sidecar path-sidecar corrupt-sum duplicate-sum orphan-sum; do
+    bad="$fixture/$scenario"
+    cp -a "$good" "$bad"
+    case "$scenario" in
+      corrupt-sidecar) printf '%064d *%s\n' 0 "${expected_archives[0]}" >"$bad/${expected_archives[0]}.sha256" ;;
+      uppercase-sidecar) tr 'a-f' 'A-F' <"$bad/${expected_archives[0]}.sha256" >"$bad/x"; mv "$bad/x" "$bad/${expected_archives[0]}.sha256" ;;
+      path-sidecar) sed -i 's/ \*/ *subdir\//' "$bad/${expected_archives[0]}.sha256" ;;
+      corrupt-sum) { printf '%064d *%s\n' 0 "${checksum_members[0]}"; tail -n +2 "$good/sha256.sum"; } >"$bad/sha256.sum" ;;
+      duplicate-sum) head -1 "$bad/sha256.sum" >>"$bad/sha256.sum" ;;
+      orphan-sum) printf '%064d *orphan.tar.xz\n' 0 >>"$bad/sha256.sum" ;;
+    esac
+    if validate_release_dir "$bad" >/dev/null 2>&1; then
+      err "self-test accepted $scenario"
+      exit 1
+    fi
+  done
 
   captured=()
   gh() { captured=("$@"); }
-  TAG="v1.2.3"
-  digest="1111111111111111111111111111111111111111"
-  verify_attestation artifact.tar.xz "$digest"
+  TAG=v0.56.0
+  verify_attestation "$good/${expected_assets[0]}" 1111111111111111111111111111111111111111
   args=" ${captured[*]} "
-  if [[ "$args" != *" --source-ref refs/tags/$TAG "* || "$args" != *" --source-digest $digest "* ]]; then
-    echo "self-test lost exact tag-ref/source-digest attestation binding" >&2
-    exit 1
-  fi
-  echo "PASS release verifier self-test rejects unverified extra assets before and after publication, and binds exact source digest"
+  [[ "$args" = *" --source-ref refs/tags/v0.56.0 "* ]]
+  [[ "$args" = *" --source-digest 1111111111111111111111111111111111111111 "* ]]
+  [[ "$args" = *" --deny-self-hosted-runners "* ]]
+  echo "PASS exact 28-asset inventory, checksum, and attestation-binding self-test"
   exit 0
 fi
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repo)
-      [ "$#" -ge 2 ] || { usage; exit 2; }
-      REPO="$2"
-      shift 2
-      ;;
-    --staged)
-      [ "$#" -ge 2 ] || { usage; exit 2; }
-      STAGED_DIR="$2"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    -*)
-      echo "unknown option: $1" >&2
-      usage
-      exit 2
-      ;;
-    *)
-      [ -z "$TAG" ] || { echo "unexpected extra argument: $1" >&2; usage; exit 2; }
-      TAG="$1"
-      shift
-      ;;
+    --repo) [ "$#" -ge 2 ] || { usage; exit 2; }; REPO=$2; shift 2 ;;
+    --expected-sha) [ "$#" -ge 2 ] || { usage; exit 2; }; EXPECTED_SHA=$2; shift 2 ;;
+    --staged) [ "$#" -ge 2 ] || { usage; exit 2; }; STAGED_DIR=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage; exit 2 ;;
+    *) [ -z "$TAG" ] || { usage; exit 2; }; TAG=$1; shift ;;
   esac
 done
 
-# Pre-publication mode (C-412). Runs on the directory `gh release create` is about to upload, so a
-# set that would produce a broken Release is rejected while the Release does not yet exist. Only the
-# attestation half is skipped, and only because the assets are not downloadable yet — the asset-set
-# rules below are the same function calls the post-publication mode makes.
 if [ -n "$STAGED_DIR" ]; then
-  [ -z "$TAG" ] || { echo "--staged takes a directory, not a tag" >&2; usage; exit 2; }
-  [ -d "$STAGED_DIR" ] || { err "staged artifact directory does not exist: $STAGED_DIR"; exit 1; }
-  staged=()
-  for staged_path in "$STAGED_DIR"/*; do
-    [ -f "$staged_path" ] || continue
-    staged+=("$(basename "$staged_path")")
-  done
-  # An empty directory is the v0.47.0 shape in its purest form, and would otherwise sail through
-  # every loop below without executing a single comparison.
-  [ "${#staged[@]}" -gt 0 ] || { err "staged artifact directory has no files: $STAGED_DIR"; exit 1; }
-  require_core_assets "${staged[@]}"
-  validate_asset_set "${staged[@]}"
-  echo "staged artifact set in $STAGED_DIR is publishable: ${#staged[@]} file(s), ${#executable_assets[@]} executable."
+  [ -z "$TAG" ] || { usage; exit 2; }
+  validate_release_dir "$STAGED_DIR"
+  echo "staged release has the exact 28 assets and valid checksums"
   exit 0
 fi
 
 [ -n "$TAG" ] || { usage; exit 2; }
+[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "tag is not exact SemVer: $TAG"; exit 1; }
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { err "expected merged-main SHA is required"; exit 2; }
+command -v gh >/dev/null 2>&1 || { err "gh is not installed"; exit 2; }
 
-if ! gh release view "$TAG" --repo "$REPO" --json tagName >/tmp/flux-release-view.json 2>/tmp/flux-release-view.err; then
-  err "GitHub Release for $REPO@$TAG does not exist"
-  cat /tmp/flux-release-view.err >&2 || true
+tag_ref=$(gh api "repos/$REPO/git/ref/tags/$TAG") || { err "could not resolve $TAG"; exit 2; }
+[ "$(jq -r '.object.type' <<<"$tag_ref")" = tag ] || { err "$TAG is not annotated"; exit 1; }
+tag_object_sha=$(jq -r '.object.sha' <<<"$tag_ref")
+tag_object=$(gh api "repos/$REPO/git/tags/$tag_object_sha") || { err "could not peel $TAG"; exit 2; }
+[ "$(jq -r '.object.type' <<<"$tag_object")" = commit ] || { err "$TAG does not peel to a commit"; exit 1; }
+peeled_sha=$(jq -r '.object.sha' <<<"$tag_object")
+[ "$peeled_sha" = "$EXPECTED_SHA" ] || { err "$TAG peels to $peeled_sha, expected $EXPECTED_SHA"; exit 1; }
+
+release=$(gh api "repos/$REPO/releases/tags/$TAG") || { err "GitHub Release for $REPO@$TAG does not exist"; exit 1; }
+[ "$(jq -r '.tag_name' <<<"$release")" = "$TAG" ] || { err "Release tag mismatch"; exit 1; }
+[ "$(jq -r '.target_commitish' <<<"$release")" = "$EXPECTED_SHA" ] || { err "Release target is not $EXPECTED_SHA"; exit 1; }
+[ "$(jq -r '.draft' <<<"$release")" = false ] || { err "Release is still a draft"; exit 1; }
+[ "$(jq -r '.prerelease' <<<"$release")" = false ] || { err "Release is a prerelease"; exit 1; }
+
+mapfile -t assets < <(jq -r '.assets[].name' <<<"$release")
+validate_asset_names "${assets[@]}"
+metadata_duplicates=$(jq -r '.assets[].id' <<<"$release" | sort -n | uniq -d)
+[ -z "$metadata_duplicates" ] || { err "Release has duplicate asset IDs"; exit 1; }
+jq -e 'all(.assets[]; (.id | type == "number" and . > 0) and (.size | type == "number" and . > 0) and (.digest | test("^sha256:[0-9a-f]{64}$")))' <<<"$release" >/dev/null || {
+  err "every asset must have a positive unique ID/size and lowercase GitHub SHA-256 digest"
   exit 1
-fi
+}
 
-release_tag="$(gh release view "$TAG" --repo "$REPO" --json tagName --jq '.tagName')"
-if [ "$release_tag" != "$TAG" ]; then
-  err "release lookup returned tag $release_tag, expected $TAG"
-  exit 1
-fi
+verify_dir=$(mktemp -d "${TMPDIR:-/tmp}/flux-live-release.XXXXXX")
+trap 'rm -rf -- "$verify_dir"' EXIT
+gh release download "$TAG" --repo "$REPO" --dir "$verify_dir"
+validate_release_dir "$verify_dir"
 
-mapfile -t assets < <(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
-
-require_core_assets "${assets[@]}"
-
-# Closed-set verification: release.yml attests and uploads one canonical artifact directory. An
-# extra filename must never become a second, unverified distribution channel beside that set.
-validate_asset_set "${assets[@]}"
-
-source_digest="$(gh api "repos/$REPO/commits/$TAG" --jq '.sha')"
-if ! [[ "$source_digest" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
-  err "could not resolve $REPO@$TAG to an exact source commit digest"
-  exit 1
-fi
-
-verify_dir="$(mktemp -d)"
-cleanup() { rm -rf -- "$verify_dir"; }
-trap cleanup EXIT
-# These patterns must cover exactly the assets validate_asset_set classified as executable — the
-# equality check below compares the two sets and fails on any drift, so adding an executable asset
-# class above without a pattern here is caught rather than silently left unverified.
-# Patterns stay per-app rather than a broad `flux-*` glob so that a future third app has to be
-# classified above and listed here deliberately, instead of being downloaded by accident.
-gh release download "$TAG" --repo "$REPO" --dir "$verify_dir" \
-  --pattern 'flux-cli-*.tar.xz' \
-  --pattern 'flux-cli-*.zip' \
-  --pattern 'flux-cli-installer.sh' \
-  --pattern 'flux-cli-installer.ps1' \
-  --pattern 'flux-lsp-*.tar.xz' \
-  --pattern 'flux-lsp-*.zip' \
-  --pattern 'flux-lsp-installer.sh' \
-  --pattern 'flux-lsp-installer.ps1' \
-  --pattern 'codewandler-flux-lsp-*.tar.xz' \
-  --pattern 'codewandler-flux-lsp-*.zip' \
-  --pattern 'codewandler-flux-lsp-installer.sh' \
-  --pattern 'codewandler-flux-lsp-installer.ps1'
-
-mapfile -t expected_downloads < <(printf '%s\n' "${executable_assets[@]}" | sort)
-downloaded_assets=()
-for artifact in "$verify_dir"/*; do
-  [ -f "$artifact" ] || continue
-  downloaded_assets+=("$(basename "$artifact")")
-done
-mapfile -t actual_downloads < <(printf '%s\n' "${downloaded_assets[@]}" | sort)
-if [ "${expected_downloads[*]}" != "${actual_downloads[*]}" ]; then
-  err "downloaded executable asset set does not exactly match the release"
-  printf 'expected:\n' >&2
-  printf '  %s\n' "${expected_downloads[@]}" >&2
-  printf 'downloaded:\n' >&2
-  printf '  %s\n' "${actual_downloads[@]}" >&2
-  exit 1
-fi
+while IFS=$'\t' read -r name size digest; do
+  [ "$(wc -c <"$verify_dir/$name" | tr -d ' ')" = "$size" ] || { err "$name size differs from GitHub metadata"; exit 1; }
+  [ "sha256:$(sha256_file "$verify_dir/$name")" = "$digest" ] || { err "$name digest differs from GitHub metadata"; exit 1; }
+done < <(jq -r '.assets[] | [.name, (.size|tostring), .digest] | @tsv' <<<"$release")
 
 verified=0
 for artifact in "$verify_dir"/*; do
-  [ -f "$artifact" ] || continue
-  if ! verify_attestation "$artifact" "$source_digest" \
-    >"$verify_dir/attestation.out" 2>"$verify_dir/attestation.err"; then
-    err "release asset $(basename "$artifact") has no valid $REPO release-workflow attestation for tag $TAG"
-    cat "$verify_dir/attestation.err" >&2 || true
-    exit 1
-  fi
+  verify_attestation "$artifact" "$EXPECTED_SHA" >/dev/null
   verified=$((verified + 1))
 done
-[ "$verified" -gt 0 ] || { err "no executable release assets were downloaded for attestation verification"; exit 1; }
-
-echo "GitHub Release $REPO@$TAG is published with ${#assets[@]} asset(s); $verified executable asset(s) have valid provenance."
+[ "$verified" -eq 28 ] || { err "attested $verified assets, expected 28"; exit 1; }
+echo "GitHub Release $REPO@$TAG targets $EXPECTED_SHA with 28 byte-verified, attested assets."

@@ -49,6 +49,12 @@
 
 ### Improved
 
+- **Release downloads now close as one exact, auditable set.** The release controller derives
+  migration versions from complete change records and the customer-facing action-needed section,
+  merges the deterministic cut through protected `main`, and verifies all 28 expected downloads,
+  checksums, provenance, publication workflows and the latest-release pointer before cleaning up
+  recovery evidence.
+
 - **Flux can inspect independent evidence sources at the same time.** When a model requests several
   safe reads together, Flux overlaps them within the configured tool-concurrency limit and still
   returns their results in request order. Writes, approval-sensitive work, hooked calls, and tools

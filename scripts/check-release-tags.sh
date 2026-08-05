@@ -139,6 +139,7 @@ REQUIRED_PLATFORM_ARCHIVES=5
 # install. This is a boundary with a reason, not a per-tag pardon list — every `vX.Y.Z` at or after
 # it is held to the full rule, with no exceptions and nowhere to add one.
 INSTALLABLE_SINCE='v0.3.0'
+EXACT_RELEASE_SINCE='v0.56.0'
 
 # Only `vX.Y.Z` tags are release tags. This deliberately excludes the `plugins-v*` pack line (cut by
 # a separate hand-driven workflow with its own assets) and pre-0.3 dev tags like
@@ -192,6 +193,34 @@ install_asset_gaps() {
   [ "$archives" -ge "$REQUIRED_PLATFORM_ARCHIVES" ] ||
     gaps="$gaps, platform archives ($archives of $REQUIRED_PLATFORM_ARCHIVES flux-cli targets)"
   printf '%s' "${gaps#, }"
+}
+
+# New releases have one closed 28-name contract. Historical releases keep the installability audit
+# above because their deliberately different cargo-dist inventories are immutable history.
+exact_asset_gaps() {
+  local names=$1 app target ext archive
+  local expected='dist-manifest.json
+sha256.sum
+source.tar.gz
+source.tar.gz.sha256
+flux-cli-installer.sh
+flux-cli-installer.ps1
+codewandler-flux-lsp-installer.sh
+codewandler-flux-lsp-installer.ps1'
+  for app in flux-cli codewandler-flux-lsp; do
+    for target in aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+      ext=tar.xz
+      [ "$target" != x86_64-pc-windows-msvc ] || ext=zip
+      archive=$app-$target.$ext
+      expected="$expected
+$archive
+$archive.sha256"
+    done
+  done
+  expected=$(printf '%s\n' "$expected" | grep -v '^$' | LC_ALL=C sort)
+  actual=$(printf '%s\n' "$names" | grep -v '^$' | LC_ALL=C sort)
+  [ "$actual" = "$expected" ] && [ "$(printf '%s\n' "$names" | grep -c .)" -eq 28 ] && return 0
+  printf 'the exact 28-name release inventory'
 }
 
 # The Release-workflow runs for tag $2 in repo $1, one `status<TAB>conclusion` record per run, newest
@@ -375,6 +404,22 @@ flux-lsp-x86_64-pc-windows-msvc.zip.sha256'
   got="$(install_asset_gaps "$v046_assets")"
   [ -z "$got" ] || { fail "self-test: v0.46.0's real 28 assets reported an install gap: $got"; exit 1; }
 
+  v056_assets=$(printf '%s\n' "$v046_assets" | sed 's/^flux-lsp/codewandler-flux-lsp/')
+  got="$(exact_asset_gaps "$v056_assets")"
+  [ -z "$got" ] || { fail "self-test: v0.56.0's exact 28 assets reported '$got'"; exit 1; }
+  for mutation in \
+    "$(printf '%s\n' "$v056_assets" | grep -Fxv 'codewandler-flux-lsp-installer.ps1')" \
+    "$v056_assets
+backdoor.exe" \
+    "$v056_assets
+flux-cli-installer.sh"
+  do
+    [ -n "$(exact_asset_gaps "$mutation")" ] || {
+      fail "self-test: exact new-release inventory accepted missing, extra, or duplicate names"
+      exit 1
+    }
+  done
+
   # v0.3.0's real 16 assets — the pre-flux-lsp era. A rule that required the LSP, or a count floor
   # calibrated on today's 28, would fail every release before v0.23.0.
   v030_assets='dist-manifest.json
@@ -539,7 +584,11 @@ while IFS="$TAB" read -r release_tag release_assets; do
   [ -n "$(printf '%s\n' "$release_tag" | version_tags)" ] || continue
   at_least_version "$release_tag" "$INSTALLABLE_SINCE" || continue
   asset_names="$(printf '%s\n' "$release_assets" | tr ' ' '\n' | grep -v '^$')"
-  gaps="$(install_asset_gaps "$asset_names")"
+  if at_least_version "$release_tag" "$EXACT_RELEASE_SINCE"; then
+    gaps="$(exact_asset_gaps "$asset_names")"
+  else
+    gaps="$(install_asset_gaps "$asset_names")"
+  fi
   [ -n "$gaps" ] || continue
   uninstallable_report="$uninstallable_report  $release_tag — $(printf '%s\n' "$asset_names" | grep -c .) asset(s), missing $gaps"$'\n'
 done <<<"$all_release_records"
