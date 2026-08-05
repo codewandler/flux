@@ -2,7 +2,7 @@
 id: C-560
 title: "Bound oversized Fleet agent events at their source"
 pillar: "Agent"
-status: backlog
+status: ready
 priority: 30
 areas: [flux-cli, flux-runtime]
 note: "Research why a read-only three-repository Fleet task produced a 1.23 MB model request/event; define per-event and accumulated context bounds before optimizing transport"
@@ -42,3 +42,5 @@ cannot grow with whole repository files, repeated tool history or unbounded repa
 ## Evidence
 
 - 2026-08-05 Fleet research at fleet revision 18. Evidence: execute_agent_turn_with_runtime resumes with --continue; staged adaptive exploration sends state.messages.clone() on every round, then appends assistant output and repair prompts; round 7 and repair attempt 6 follow directly from zero-based explore_calls; ModelCallMetrics measures message_bytes separately from system and tool-schema bytes; Fleet parses child stream lines into an unbounded Vec<Value>. Leading inference: repeated full adaptive-history replay is the primary source of the 1,231,783 message bytes, with continued-session retention a likely fixed prefix; 28 operation schemas cannot explain that metric. Proposed hermetic fixture: six scripted roughly 200 KiB tool results followed by a seventh explore request, with 28 lightweight operations and resume enabled. Candidate budgets for design review: 64 KiB per model-history tool result, 256 KiB per NDJSON event, 512 KiB continued history, and 1 MiB total provider request. The receipt-amplification path remains unproven and needs the next bounded source pass.
+
+- 2026-08-05 Fleet receipt-amplification research at revision 21. Proven path: execute_agent_turn_with_runtime retains every parsed child event in events; clones turn_end; projects answer and usage again; execute_and_record_agent_turn clones the complete receipt into agent last_turn, intake receipt when present, and the agent.turn.completed persistence payload. The narrowest effective budget seam is line.as_bytes().len() before serde_json::from_str, where an oversized event can be atomically replaced by a bounded structured omission before parsing and downstream copies. Smallest failing fixture: three in-memory NDJSON lines with one event at MAX_EVENT_BYTES + 1 and a small terminal event; pre-fix it survives unchanged in receipt events, post-fix it is refused or summarized with actual bytes and limit. Persistence serialization and rehydration into continued model history remain separate evidence tasks.
