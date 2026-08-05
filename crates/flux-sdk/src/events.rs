@@ -9,7 +9,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use flux_core::{Result, Usage};
+use flux_core::{DispatchId, OperationTiming, Result, Usage};
 use flux_flow::AgentSink;
 use flux_runtime::ToolResult;
 use tokio::sync::mpsc;
@@ -32,6 +32,9 @@ pub enum AgentEvent {
     Planning(bool),
     /// `AgentSink::tool_call` — an op is about to dispatch with this input.
     ToolCall {
+        /// C-531: the per-dispatch id, repeated on this call's [`AgentEvent::ToolResult`]. Pair on
+        /// it: concurrent same-name ops finish in any order, so name and arrival order cannot.
+        dispatch: DispatchId,
         /// The op name.
         name: String,
         /// The op's input value.
@@ -40,6 +43,8 @@ pub enum AgentEvent {
     /// `AgentSink::tool_result` — an op finished; the full two-face result (canonical `content` +
     /// optional model-facing `view`).
     ToolResult {
+        /// The id of the [`AgentEvent::ToolCall`] this result belongs to.
+        dispatch: DispatchId,
         /// The op name.
         name: String,
         /// The op's result.
@@ -188,16 +193,18 @@ impl AgentSink for ChannelSink {
         self.collect.planning(active);
         let _ = self.tx.send(AgentEvent::Planning(active));
     }
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        self.collect.tool_call(name, input);
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
+        self.collect.tool_call(dispatch, name, input);
         let _ = self.tx.send(AgentEvent::ToolCall {
+            dispatch,
             name: name.to_string(),
             input: input.clone(),
         });
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        self.collect.tool_result(name, result);
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        self.collect.tool_result(dispatch, name, result);
         let _ = self.tx.send(AgentEvent::ToolResult {
+            dispatch,
             name: name.to_string(),
             result: result.clone(),
         });
@@ -233,13 +240,17 @@ impl AgentSink for TeeSink<'_> {
         self.collect.planning(active);
         self.consumer.planning(active);
     }
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        self.collect.tool_call(name, input);
-        self.consumer.tool_call(name, input);
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
+        self.collect.tool_call(dispatch, name, input);
+        self.consumer.tool_call(dispatch, name, input);
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        self.collect.tool_result(name, result);
-        self.consumer.tool_result(name, result);
+    fn tool_timing(&mut self, dispatch: DispatchId, name: &str, timing: &OperationTiming) {
+        self.collect.tool_timing(dispatch, name, timing);
+        self.consumer.tool_timing(dispatch, name, timing);
+    }
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        self.collect.tool_result(dispatch, name, result);
+        self.consumer.tool_result(dispatch, name, result);
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.collect.observation(o);

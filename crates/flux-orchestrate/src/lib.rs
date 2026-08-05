@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_agent::{register_agent_ops, AdaptiveLoopPolicy};
-use flux_core::{Error, Result, Usage};
+use flux_core::{DispatchId, Error, Result, Usage};
 use flux_events::EventStore;
 use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
@@ -814,7 +814,11 @@ struct TextCollector {
     depth: usize,
     redactor: flux_secret::Redactor,
     next_call_id: u64,
-    pending: std::collections::HashMap<String, Vec<u64>>,
+    /// C-531: the reporter's own `call_id` for every dispatch still in flight, keyed by the
+    /// interpreter's `DispatchId`. It used to be a per-op-name stack popped LIFO on the result,
+    /// which cross-attached two concurrent same-name reads (C-528 admits them) to each other's
+    /// card in the fleet pane. The identity match needs no ordering assumption.
+    pending: std::collections::HashMap<DispatchId, u64>,
     terminal_usage: Option<Usage>,
     cancelled: bool,
     terminal_emitted: bool,
@@ -861,13 +865,6 @@ impl TextCollector {
         }
     }
 
-    fn active_call(&self, name: &str) -> Option<u64> {
-        self.pending
-            .get(name)
-            .and_then(|calls| calls.last())
-            .copied()
-    }
-
     /// Emit exactly one terminal event at the spawner boundary. `AgentSink::turn_end` alone is
     /// insufficient: a timed-out child can finalize its engine turn and still make `spawn` fail.
     fn finish(&mut self, is_error: bool, usage: Option<Usage>) {
@@ -901,17 +898,14 @@ impl AgentSink for TextCollector {
         self.emit(SpawnActivityEvent::Planning { active });
     }
 
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
         self.tool_calls += 1;
         if self.activity.is_none() {
             return;
         }
         self.next_call_id += 1;
         let call_id = self.next_call_id;
-        self.pending
-            .entry(name.to_string())
-            .or_default()
-            .push(call_id);
+        self.pending.insert(dispatch, call_id);
         let mut input = input.clone();
         // Every node kind, keys included — the tree's one total walk (C-323, consolidated in
         // C-338). A registered all-digit credential has no other protection, so a skipped `Number`
@@ -924,8 +918,13 @@ impl AgentSink for TextCollector {
         });
     }
 
-    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
-        if let Some(call_id) = self.active_call(name) {
+    fn tool_timing(
+        &mut self,
+        dispatch: DispatchId,
+        name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
+        if let Some(&call_id) = self.pending.get(&dispatch) {
             self.emit(SpawnActivityEvent::ToolTiming {
                 call_id,
                 name: name.to_string(),
@@ -934,8 +933,8 @@ impl AgentSink for TextCollector {
         }
     }
 
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        let Some(call_id) = self.pending.get_mut(name).and_then(Vec::pop) else {
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        let Some(call_id) = self.pending.remove(&dispatch) else {
             return;
         };
         // Result content and error text stay inside the child/model transcript. Only the outcome

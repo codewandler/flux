@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use flux_core::{Error, OperationTiming, Usage};
+use flux_core::{DispatchId, Error, OperationTiming, Usage};
 use flux_spec::{Intent, IntentBehavior, IntentCertainty, IntentRole, IntentSet, IntentTarget};
 
 use crate::analyze::{self, EffectAnnotation};
@@ -1023,8 +1023,8 @@ enum SinkEvent {
     Text(String),
     Thinking(String),
     Planning(bool),
-    ToolCall(String, serde_json::Value),
-    ToolResult(String, OpOutcome),
+    ToolCall(DispatchId, String, serde_json::Value),
+    ToolResult(DispatchId, String, OpOutcome),
     Observation(flux_evidence::Observation),
     TurnEnd(Option<Usage>),
 }
@@ -1048,8 +1048,8 @@ impl BufferSink {
                 SinkEvent::Text(t) => sink.text_delta(&t),
                 SinkEvent::Thinking(t) => sink.thinking_delta(&t),
                 SinkEvent::Planning(a) => sink.planning(a),
-                SinkEvent::ToolCall(n, i) => sink.tool_call(&n, &i),
-                SinkEvent::ToolResult(n, r) => sink.tool_result(&n, &r),
+                SinkEvent::ToolCall(d, n, i) => sink.tool_call(d, &n, &i),
+                SinkEvent::ToolResult(d, n, r) => sink.tool_result(d, &n, &r),
                 SinkEvent::Observation(o) => sink.observation(&o),
                 SinkEvent::TurnEnd(u) => sink.turn_end(u),
             }
@@ -1067,13 +1067,19 @@ impl FlowSink for BufferSink {
     fn planning(&mut self, active: bool) {
         self.events.push(SinkEvent::Planning(active));
     }
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        self.events
-            .push(SinkEvent::ToolCall(name.to_string(), input.clone()));
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
+        self.events.push(SinkEvent::ToolCall(
+            dispatch,
+            name.to_string(),
+            input.clone(),
+        ));
     }
-    fn tool_result(&mut self, name: &str, result: &OpOutcome) {
-        self.events
-            .push(SinkEvent::ToolResult(name.to_string(), result.clone()));
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &OpOutcome) {
+        self.events.push(SinkEvent::ToolResult(
+            dispatch,
+            name.to_string(),
+            result.clone(),
+        ));
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.events.push(SinkEvent::Observation(o.clone()));
@@ -3988,7 +3994,11 @@ async fn run_call(
     // A concise, bounded, allow-listed source label for later model feedback. This deliberately
     // reuses the read/grep-only summary seam rather than dumping arbitrary inputs into context.
     let provenance = op_summary_prefix(op, &input);
-    sink.tool_call(op, &input);
+    // C-531: one id per dispatch, stamped on both ends of this await. Concurrent same-name calls
+    // (C-528's parallel gather batches) interleave their sink events, so the pairing has to travel
+    // with them; a surface that matched on the op name alone cross-attached the results.
+    let dispatch = DispatchId::next();
+    sink.tool_call(dispatch, op, &input);
     let composite = executor.catalog().composite(op);
     let outcome = if let Some(composite) = composite {
         execute_composite_call(store, executor, session_id, &composite, input, bind, sink).await?
@@ -3998,6 +4008,7 @@ async fn run_call(
     // Surface the model-facing VIEW (numbered read, diff, …) to the sink — what the model/user sees.
     // The canonical `outcome.content` remains what control flow and interpolation use.
     sink.tool_result(
+        dispatch,
         op,
         &OpOutcome {
             content: outcome.view.clone(),
@@ -5943,7 +5954,7 @@ mod tests {
             calls: Vec<String>,
         }
         impl FlowSink for RecSink {
-            fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+            fn tool_call(&mut self, _dispatch: DispatchId, name: &str, input: &serde_json::Value) {
                 self.calls.push(format!("{name}:{input}"));
             }
         }
@@ -10105,7 +10116,7 @@ mod tests {
         assert!(
             sink.events
                 .iter()
-                .any(|ev| matches!(ev, SinkEvent::ToolResult(n, _) if n == "echo")),
+                .any(|ev| matches!(ev, SinkEvent::ToolResult(_, n, _) if n == "echo")),
             "completed branch's buffered sink output was replayed"
         );
         assert!(

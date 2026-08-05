@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use flux_agent::{resolve_compact_threshold_env, AgentProfile, AgentSpec, Permissions};
-use flux_core::{Error, Result, Usage};
+use flux_core::{DispatchId, Error, OperationTiming, Result, Usage};
 use flux_events::EventStore;
 use flux_evidence::{Observation, Phase};
 use flux_flow::engine::FlowEngine;
@@ -2558,7 +2558,7 @@ impl AgentSink for RecordingSink {
     fn text_delta(&mut self, text: &str) {
         self.text.push_str(text);
     }
-    fn tool_call(&mut self, name: &str, _input: &Value) {
+    fn tool_call(&mut self, _dispatch: DispatchId, name: &str, _input: &Value) {
         self.tools.push(name.to_string());
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
@@ -2599,11 +2599,14 @@ impl AgentSink for UsageCapture<'_> {
     fn planning(&mut self, active: bool) {
         self.inner.planning(active);
     }
-    fn tool_call(&mut self, name: &str, input: &Value) {
-        self.inner.tool_call(name, input);
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &Value) {
+        self.inner.tool_call(dispatch, name, input);
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        self.inner.tool_result(name, result);
+    fn tool_timing(&mut self, dispatch: DispatchId, name: &str, timing: &OperationTiming) {
+        self.inner.tool_timing(dispatch, name, timing);
+    }
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        self.inner.tool_result(dispatch, name, result);
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.inner.observation(o);

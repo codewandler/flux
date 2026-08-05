@@ -774,7 +774,7 @@ impl AgentSink for CliSink {
             self.stop_spinner();
         }
     }
-    fn tool_call(&mut self, name: &str, input: &Value) {
+    fn tool_call(&mut self, _dispatch: DispatchId, name: &str, input: &Value) {
         self.commit();
         self.steps += 1;
         self.iter += 1;
@@ -797,10 +797,15 @@ impl AgentSink for CliSink {
         self.pending = Some((label, std::time::Instant::now()));
         self.pending_timing = None;
     }
-    fn tool_timing(&mut self, _name: &str, timing: &flux_core::OperationTiming) {
+    fn tool_timing(
+        &mut self,
+        _dispatch: DispatchId,
+        _name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
         self.pending_timing = Some(*timing);
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, _dispatch: DispatchId, name: &str, result: &ToolResult) {
         let (label, start) = self
             .pending
             .take()
@@ -1432,14 +1437,14 @@ impl AgentSink for GoalSink {
         std::io::stdout().flush().ok();
         self.text.push_str(t);
     }
-    fn tool_call(&mut self, name: &str, input: &Value) {
+    fn tool_call(&mut self, _dispatch: DispatchId, name: &str, input: &Value) {
         eprintln!(
             "\n{} {}",
             style::blue("→"),
             render_call_label(name, input, verbose())
         );
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, _dispatch: DispatchId, name: &str, result: &ToolResult) {
         let mark = if result.is_error {
             style::red("✗")
         } else {

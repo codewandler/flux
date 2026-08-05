@@ -76,8 +76,8 @@ until a buffer fills). Every variant is internally tagged on `type` and carries 
 |---|---|---|
 | `turn_start` | CLI-known facts before the turn begins | `session`, `model`, `input` |
 | `plan` | `Observation{kind: "action_batch.proposed"}` (`loop_host.rs`'s `approve_batch`, forwarded live via `SharedSink` — the adaptive loop's proposed action batch **is** its plan for the turn; confirmed empirically against a live `-m mock` run, see below) | `session`, `data` (the observation's own payload — `batch_id`/`actions`/`risk`/`batch`, passed through) |
-| `tool_call` | `AgentSink::tool_call` | `session`, `name`, `input` |
-| `tool_result` | `AgentSink::tool_result` + the immediately preceding `AgentSink::tool_timing` | `session`, `name`, `is_error`, `content`, `view`, `duration_us` |
+| `tool_call` | `AgentSink::tool_call` | `session`, `dispatch` (C-531), `name`, `input` |
+| `tool_result` | `AgentSink::tool_result` + the immediately preceding `AgentSink::tool_timing` | `session`, `dispatch` (C-531 — the id of its own `tool_call`), `name`, `is_error`, `content`, `view`, `duration_us` |
 | `approval` | `Observation{kind: "approval.requested" \| "approval.approved" \| "approval.denied"}` (`loop_host.rs`'s `approve_batch`, forwarded live via `SharedSink` — confirmed the batch-approval path, not just recorded to the durable evidence log) | `session`, `phase` (`requested`/`approved`/`denied`), `data` (the observation's own payload — `scope`/`batch_id`/`actions`/`risk`/`wait_us`; no dedicated `tool` field, since the batch-level approval this fires from has no single-tool subject — a batch can hold several) |
 | `steered` | `Observation{kind: "turn.steering"}` | `session`, `messages` |
 | `turn_end` | `AgentSink::turn_end` plus the terminal `run_turn` result | `session`, `outcome` (`ok`/`error`), optional `error`, `answer`, `usage`, `cost_usd` |

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use flux_core::{Error, Message, Result, Usage};
+use flux_core::{DispatchId, Error, Message, Result, Usage};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
     CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, SkillLoadOutcome,
@@ -1145,16 +1145,21 @@ impl AgentSink for SharedSink {
         self.0.lock().unwrap().planning(active);
     }
 
-    fn tool_call(&mut self, name: &str, input: &Value) {
-        self.0.lock().unwrap().tool_call(name, input);
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &Value) {
+        self.0.lock().unwrap().tool_call(dispatch, name, input);
     }
 
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        self.0.lock().unwrap().tool_result(name, result);
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        self.0.lock().unwrap().tool_result(dispatch, name, result);
     }
 
-    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
-        self.0.lock().unwrap().tool_timing(name, timing);
+    fn tool_timing(
+        &mut self,
+        dispatch: DispatchId,
+        name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
+        self.0.lock().unwrap().tool_timing(dispatch, name, timing);
     }
 
     fn observation(&mut self, observation: &flux_evidence::Observation) {
@@ -1171,9 +1176,9 @@ pub enum SinkEvent {
     Text(String),
     Thinking(String),
     Planning(bool),
-    ToolCall(String, Value),
-    ToolTiming(String, flux_core::OperationTiming),
-    ToolResult(String, ToolResult),
+    ToolCall(DispatchId, String, Value),
+    ToolTiming(DispatchId, String, flux_core::OperationTiming),
+    ToolResult(DispatchId, String, ToolResult),
     Observation(flux_evidence::Observation),
     TurnEnd(Option<Usage>),
 }
@@ -1184,9 +1189,9 @@ impl SinkEvent {
             Self::Text(text) => sink.text_delta(&text),
             Self::Thinking(text) => sink.thinking_delta(&text),
             Self::Planning(active) => sink.planning(active),
-            Self::ToolCall(name, input) => sink.tool_call(&name, &input),
-            Self::ToolTiming(name, timing) => sink.tool_timing(&name, &timing),
-            Self::ToolResult(name, result) => sink.tool_result(&name, &result),
+            Self::ToolCall(dispatch, name, input) => sink.tool_call(dispatch, &name, &input),
+            Self::ToolTiming(dispatch, name, timing) => sink.tool_timing(dispatch, &name, &timing),
+            Self::ToolResult(dispatch, name, result) => sink.tool_result(dispatch, &name, &result),
             Self::Observation(observation) => sink.observation(&observation),
             Self::TurnEnd(usage) => sink.turn_end(usage),
         }
@@ -1215,22 +1220,31 @@ impl AgentSink for ChannelSink {
         let _ = self.0.send(SinkEvent::Planning(active));
     }
 
-    fn tool_call(&mut self, name: &str, input: &Value) {
-        let _ = self
-            .0
-            .send(SinkEvent::ToolCall(name.to_string(), input.clone()));
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &Value) {
+        let _ = self.0.send(SinkEvent::ToolCall(
+            dispatch,
+            name.to_string(),
+            input.clone(),
+        ));
     }
 
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        let _ = self
-            .0
-            .send(SinkEvent::ToolResult(name.to_string(), result.clone()));
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        let _ = self.0.send(SinkEvent::ToolResult(
+            dispatch,
+            name.to_string(),
+            result.clone(),
+        ));
     }
 
-    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+    fn tool_timing(
+        &mut self,
+        dispatch: DispatchId,
+        name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
         let _ = self
             .0
-            .send(SinkEvent::ToolTiming(name.to_string(), *timing));
+            .send(SinkEvent::ToolTiming(dispatch, name.to_string(), *timing));
     }
 
     fn observation(&mut self, observation: &flux_evidence::Observation) {

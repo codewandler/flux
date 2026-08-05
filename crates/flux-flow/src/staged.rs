@@ -3156,7 +3156,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use flux_core::{Chunk, StopReason};
+    use flux_core::{Chunk, DispatchId, StopReason};
     use flux_events::EventStore;
     use flux_provider::{ChunkStream, Request};
     use flux_runtime::{
@@ -3197,6 +3197,30 @@ mod tests {
     struct NoopSink;
     impl AgentSink for NoopSink {}
 
+    /// C-531: records every tool call/result the sink stream carries, shared with the test through
+    /// `Arc`s so the recording survives the sink being moved into a [`StagedContext`].
+    #[derive(Default, Clone)]
+    struct PairingSink {
+        calls: Arc<Mutex<Vec<(DispatchId, String, Value)>>>,
+        results: Arc<Mutex<Vec<(DispatchId, String, String)>>>,
+    }
+
+    impl AgentSink for PairingSink {
+        fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &Value) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((dispatch, name.to_string(), input.clone()));
+        }
+
+        fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+            self.results
+                .lock()
+                .unwrap()
+                .push((dispatch, name.to_string(), result.content.clone()));
+        }
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         tools: Vec<String>,
@@ -3210,12 +3234,12 @@ mod tests {
             self.events.push(format!("planning:{active}"));
         }
 
-        fn tool_call(&mut self, name: &str, _input: &Value) {
+        fn tool_call(&mut self, _dispatch: DispatchId, name: &str, _input: &Value) {
             self.tools.push(name.to_string());
             self.events.push(format!("tool:{name}"));
         }
 
-        fn tool_result(&mut self, name: &str, result: &ToolResult) {
+        fn tool_result(&mut self, _dispatch: DispatchId, name: &str, result: &ToolResult) {
             self.results
                 .push((name.to_string(), result.content.clone(), result.is_error));
         }
@@ -3712,6 +3736,144 @@ mod tests {
         (context, requests, barrier, temp)
     }
 
+    /// C-531: like [`NativeBatchBarrier`], but each call blocks on the gate for **its own key**, so
+    /// the test dictates the completion order of two concurrent same-name calls instead of
+    /// releasing whichever waiter happens to reach a shared semaphore first.
+    #[derive(Default)]
+    struct KeyedBarrier {
+        entered: AtomicUsize,
+        entered_notify: tokio::sync::Notify,
+        gates: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    }
+
+    impl KeyedBarrier {
+        fn gate(&self, key: &str) -> Arc<tokio::sync::Semaphore> {
+            self.gates
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(0)))
+                .clone()
+        }
+
+        async fn wait_for_entered(&self, expected: usize) {
+            loop {
+                let notified = self.entered_notify.notified();
+                if self.entered.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release(&self, key: &str) {
+            self.gate(key).add_permits(1);
+        }
+    }
+
+    struct KeyedBlockingReadTool {
+        spec: ToolSpec,
+        barrier: Arc<KeyedBarrier>,
+    }
+
+    #[async_trait]
+    impl Tool for KeyedBlockingReadTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+            let key = params["key"].as_str().unwrap_or_default().to_string();
+            let gate = self.barrier.gate(&key);
+            self.barrier.entered.fetch_add(1, Ordering::SeqCst);
+            self.barrier.entered_notify.notify_waiters();
+            let permit = gate
+                .acquire()
+                .await
+                .map_err(|error| Error::Other(error.to_string()))?;
+            permit.forget();
+            Ok(ToolResult::ok(key))
+        }
+    }
+
+    /// C-531: a context whose `read` tool blocks per input key until the test releases that key,
+    /// with a [`PairingSink`] recording every tool call/result event the surfaces would see.
+    fn keyed_read_batch_context(
+        responses: Vec<Vec<Chunk>>,
+    ) -> (StagedContext, PairingSink, Arc<KeyedBarrier>, TempRoot) {
+        let tool_spec = ToolSpec {
+            description: "Read one fixture record while the test controls completion order".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+                "additionalProperties": false
+            }),
+            ..spec(
+                "read",
+                vec![Effect::Read, Effect::Filesystem],
+                vec![AccessKind::Filesystem],
+                None,
+            )
+        };
+        let barrier = Arc::new(KeyedBarrier::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(KeyedBlockingReadTool {
+            spec: tool_spec,
+            barrier: barrier.clone(),
+        }));
+        let temp = TempRoot::new("flux-dispatch-id-test");
+        let executor = Arc::new(Executor::new(
+            registry,
+            PermissionManager::from_rules(&["read".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(temp.path()).unwrap()))),
+        ));
+        let provider: Arc<dyn Provider> = Arc::new(CaptureProvider {
+            responses: Mutex::new(responses.into()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let registry = executor.active_registry_snapshot();
+        let sink = PairingSink::default();
+        let context = StagedContext {
+            provider,
+            model: "test-model".into(),
+            executor,
+            registry,
+            store: Arc::new(FlowStore::in_memory().unwrap()),
+            session_id: "dispatch-id-test".into(),
+            conversation: vec![Message::user_text("Read both fixture records")],
+            base_system: None,
+            sink: Arc::new(Mutex::new(sink.clone())),
+            audit: None,
+            advertised: HashSet::from(["read".into()]),
+            authored_ceiling: None,
+            groups: Vec::new(),
+            opts: StageOptions::default(),
+            remaining_token_budget: None,
+            adaptive_policy: AdaptiveLoopPolicy::default(),
+            steering: None,
+        };
+        (context, sink, barrier, temp)
+    }
+
+    fn keyed_read_stage_definition() -> ModelStageDefinition {
+        ModelStageDefinition {
+            prompt: "Read every requested record before returning.".into(),
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({
+                "type": "object",
+                "properties": {"complete": {"type": "boolean"}},
+                "required": ["complete"],
+                "additionalProperties": false
+            }),
+            model: None,
+            tools: vec!["read".into()],
+            max_tokens: 256,
+            effort: None,
+        }
+    }
+
     fn blocking_model_stage_definition() -> ModelStageDefinition {
         ModelStageDefinition {
             prompt: "Inspect every requested record before returning.".into(),
@@ -4086,6 +4248,93 @@ mod tests {
         );
         assert_eq!(results[0].0, "adaptive-first");
         assert_eq!(results[1].0, "adaptive-second");
+    }
+
+    /// C-531 failing-first: one provider response carries two independent, same-name `read` calls.
+    /// `flush_parallel_native_calls` polls them together and the test releases them OUT OF ORDER,
+    /// so the second call's result reaches the sink before the first call's. Arrival order is the
+    /// only pairing an id-less sink stream offers, and here it cross-attaches: every surface that
+    /// matches a result to a card by name/order shows the wrong body under the wrong header.
+    #[tokio::test]
+    async fn concurrent_same_name_results_pair_with_their_own_call() {
+        let responses = vec![
+            native_calls(vec![
+                ("read-a", "read", json!({"key": "a"})),
+                ("read-b", "read", json!({"key": "b"})),
+            ]),
+            native_call(
+                "return",
+                RETURN_STAGE_RESULT,
+                json!({"value": {"complete": true}}),
+            ),
+        ];
+        let (context, sink, barrier, _root) = keyed_read_batch_context(responses);
+
+        let stage = run_model_stage(
+            context,
+            "keyed_reads",
+            keyed_read_stage_definition(),
+            json!({}),
+        );
+        let recorded = sink.clone();
+        let controller = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                barrier.wait_for_entered(2),
+            )
+            .await
+            .expect("both same-name reads must be in flight together");
+            // Release the SECOND call first and let it settle, so the two results reach the sink
+            // in the opposite order from their calls.
+            barrier.release("b");
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if recorded.results.lock().unwrap().len() == 1 {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the second read must complete first");
+            barrier.release("a");
+        };
+        let (stage, ()) = tokio::join!(stage, controller);
+        assert_eq!(stage.result.unwrap(), json!({"complete": true}));
+
+        let calls = sink.calls.lock().unwrap().clone();
+        let results = sink.results.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "both calls must surface: {calls:?}");
+        assert_eq!(results.len(), 2, "both results must surface: {results:?}");
+        assert_eq!(calls[0].2["key"], "a", "calls surface in issue order");
+        assert_eq!(calls[1].2["key"], "b");
+        // The results arrive in the OPPOSITE order, which is exactly what makes arrival-order
+        // pairing unsound — and what the dispatch id has to survive.
+        assert_eq!(results[0].2, "b", "the second read completed first");
+        assert_eq!(results[1].2, "a");
+        assert_ne!(calls[0].0, calls[1].0, "each call mints its own id");
+
+        // The tool echoes its own input key, so a correctly paired stream reads a→"a", b→"b".
+        let paired: Vec<(String, String)> = results
+            .iter()
+            .map(|(dispatch, _, content)| {
+                let call = calls
+                    .iter()
+                    .find(|(id, _, _)| id == dispatch)
+                    .unwrap_or_else(|| {
+                        panic!("every result carries its own call's dispatch id: {calls:?}")
+                    });
+                (
+                    call.2["key"].as_str().unwrap_or_default().to_string(),
+                    content.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            paired,
+            vec![("b".into(), "b".into()), ("a".into(), "a".into())],
+            "each result must pair with its own call: {calls:?} / {results:?}"
+        );
     }
 
     #[tokio::test]
