@@ -34,6 +34,10 @@
 
 ### Improved
 
+- **Fleet supervision opens immediately, even in a large workspace.** Board and Fleet views load in
+  the background, so refreshing them no longer freezes typing or rendering. If a later refresh
+  fails, the last working view stays visible and is clearly marked stale.
+
 - **Board and Fleet terminology is documented from planning through release.** The guides explain
   epics, stories, milestones, program lanes, configured versus dispatched waves, workers, handoffs,
   review, gates and apply. Concepts now appears before Coding, and compact diagrams show the

@@ -1008,6 +1008,13 @@ pub(super) async fn run_tui(
     let mut options = tui_options(auto_approve, model_spec, surface_cwd, panes, interactions);
     if let Some(fleet) = fleet.as_ref() {
         let attached = fleet.source.attach_session(&session_id)?;
+        let mut initial_snapshot = fleet.initial_snapshot.clone();
+        initial_snapshot.main_session = Some(session_id.clone());
+        if let Ok(revision) = attached.revision.parse() {
+            initial_snapshot.revision = revision;
+        }
+        options.operations_initial_snapshot = Some(initial_snapshot);
+        options.operations_refresh_token = Some(fleet.source.refresh_token()?);
         options.operations_source = Some(fleet.source.clone());
         options.workspace_root = Some(fleet.root.display().to_string());
         options.execution_target = Some(format!(

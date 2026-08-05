@@ -97,6 +97,10 @@ pub(super) enum UiEvent {
     /// payload — the internal half of A-79's contract — and an inline variant would set this enum's
     /// size for every event the surface sends.
     SpawnActivity(Box<flux_runtime::SpawnActivity>),
+    OperationsSnapshot {
+        result: Box<Result<operations::FleetBoardSnapshot, String>>,
+        refresh_token: Option<String>,
+    },
     Finished,
 }
 

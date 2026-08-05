@@ -44,6 +44,12 @@ Turn durable fleet and board projections into useful native views for supervisio
   renders durable planning links and intake acknowledgements, and consumes the Board stats cube
   without UI-side progress arithmetic. Source and layout fixtures plus the complete crate suites
   pass.
+- 2026-08-06 — moved initial and refreshed Board/Fleet projection builds off the terminal event
+  loop after live roadmap scale exposed synchronous startup and refresh stalls. Attachment supplies
+  a cheap truthful seed and durable-state token while one coalesced blocking worker builds the full
+  view; loading, unavailable and stale states are explicit and a failed refresh preserves the last
+  good projection. Regression coverage holds a source snapshot blocked while the async caller stays
+  responsive and verifies startup-error versus later-stale behavior.
 
 ## Notes
 

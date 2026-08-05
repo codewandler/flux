@@ -38,6 +38,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- Fleet-attached TUI startup and refresh now build Board/Fleet projections away from the terminal
+  event loop. A cheap durable-state token avoids redundant rebuilds, explicit loading/unavailable
+  states replace a frozen screen, and a failed later refresh keeps the last-good view marked stale.
 - Concurrent `fleet.isolate` calls now serialize Git's shared worktree-administration mutation
   while retaining disjoint checkout allocation, preventing partially written `.git/worktrees`
   metadata from breaking a parallel Board/Fleet wave.

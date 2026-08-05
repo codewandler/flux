@@ -1083,6 +1083,7 @@ pub(super) struct FleetTuiLaunch {
     pub(super) root: PathBuf,
     pub(super) store: PathBuf,
     pub(super) session: Option<String>,
+    pub(super) initial_snapshot: flux_tui::operations::FleetBoardSnapshot,
     pub(super) source: flux_tui::operations::SharedFleetBoardSource,
 }
 
@@ -1101,16 +1102,193 @@ pub(super) fn prepare_fleet_tui(root: &Path) -> Result<FleetTuiLaunch> {
             root.join(".flux/fleet.toml").display()
         )
     }
-    read_fleet_config(&root)?;
+    let config = read_fleet_config(&root)?;
     let state = read_fleet_state(&root)?;
     let store = agent_store_path(&root, "main")?;
     let session = state.main_agent.session.clone();
+    let initial_snapshot = fleet_tui_initial_snapshot(&root, &state, &config);
     Ok(FleetTuiLaunch {
         root: root.clone(),
         store,
         session,
+        initial_snapshot,
         source: Arc::new(FleetTuiSource { root }),
     })
+}
+
+fn fleet_tui_initial_snapshot(
+    root: &Path,
+    state: &FleetState,
+    config: &FleetConfig,
+) -> flux_tui::operations::FleetBoardSnapshot {
+    use flux_tui::operations::{
+        FleetBoardSnapshot, FleetCapacityView, FleetGoalView, FleetWaveView,
+    };
+
+    let is_active = |status: &str| matches!(status, "active" | "running" | "working");
+    let active = state
+        .agents
+        .values()
+        .filter(|agent| agent["status"].as_str().is_some_and(is_active))
+        .count();
+    let active_wave = state
+        .waves
+        .iter()
+        .find(|(_, wave)| {
+            !matches!(
+                wave["status"].as_str(),
+                Some("completed" | "failed" | "cancelled" | "parked")
+            )
+        })
+        .map(|(id, wave)| FleetWaveView {
+            id: id.clone(),
+            status: wave["status"].as_str().unwrap_or("unknown").to_string(),
+            items: value_strings(&wave["items"])
+                .into_iter()
+                .take(config.max_wave)
+                .collect(),
+        });
+    let goals = state
+        .goals
+        .values()
+        .take(100)
+        .map(|goal| FleetGoalView {
+            scope: serde_json::to_value(goal.scope)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".into()),
+            name: goal.name.clone(),
+            statement: bounded_text(&goal.statement, 500),
+            revision: goal.revision,
+        })
+        .collect();
+
+    FleetBoardSnapshot {
+        schema: "flux.tui-board-fleet/v1".into(),
+        root: display_path(root),
+        running: state.running,
+        main_status: state.main_agent.status.clone(),
+        main_session: state.main_agent.session.clone(),
+        revision: state.revision,
+        goals_revision: state.main_agent.goals_revision,
+        goals,
+        active_wave,
+        capacity: FleetCapacityView {
+            configured: config.max_workers,
+            desired: None,
+            active,
+            draining: None,
+            registered: state.agents.len(),
+        },
+        workers: Vec::new(),
+        workers_total: state.agents.len(),
+        items: Vec::new(),
+        items_total: 0,
+        decisions: Vec::new(),
+        decisions_total: 0,
+        documents: Vec::new(),
+        documents_total: 0,
+        metrics_schema: "unavailable".into(),
+        metrics: Vec::new(),
+        stats_facts: Vec::new(),
+        status_counts: Vec::new(),
+        history: Vec::new(),
+        failures: Vec::new(),
+        failures_total: 0,
+        intake: Vec::new(),
+        intake_total: state.intake.len(),
+        blocked_items: 0,
+        attention_required: false,
+    }
+}
+
+fn hash_path_metadata(path: &Path, hasher: &mut impl Hasher) {
+    path.hash(hasher);
+    let Ok(metadata) = fs::metadata(path) else {
+        "missing".hash(hasher);
+        return;
+    };
+    metadata.len().hash(hasher);
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) {
+            elapsed.as_secs().hash(hasher);
+            elapsed.subsec_nanos().hash(hasher);
+        }
+    }
+}
+
+fn repository_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let mut git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let body = fs::read_to_string(dot_git).ok()?;
+        let path = body.trim().strip_prefix("gitdir:")?.trim();
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    };
+    if let Ok(common) = fs::read_to_string(git_dir.join("commondir")) {
+        let common = PathBuf::from(common.trim());
+        git_dir = if common.is_absolute() {
+            common
+        } else {
+            git_dir.join(common)
+        };
+    }
+    Some(git_dir)
+}
+
+fn hash_canonical_ref_metadata(root: &Path, canonical_ref: &str, hasher: &mut impl Hasher) {
+    let Some(git_dir) = repository_git_dir(root) else {
+        return;
+    };
+    hash_path_metadata(&git_dir.join("packed-refs"), hasher);
+    hash_path_metadata(&git_dir.join("HEAD"), hasher);
+    if canonical_ref.starts_with("refs/") {
+        hash_path_metadata(&git_dir.join(canonical_ref), hasher);
+    } else {
+        hash_path_metadata(&git_dir.join("refs/remotes").join(canonical_ref), hasher);
+        hash_path_metadata(&git_dir.join("refs/heads").join(canonical_ref), hasher);
+    }
+}
+
+fn fleet_tui_refresh_token(root: &Path) -> Result<String> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in [
+        root.join(".flux/fleet/state.json"),
+        root.join(".flux/fleet.toml"),
+        root.join(".flux/board.toml"),
+        root.join(".flux/board-state.json"),
+        root.join("ROADMAP.md"),
+        root.join("VISION.md"),
+    ] {
+        hash_path_metadata(&path, &mut hasher);
+    }
+    for directory in [root.join("decisions"), root.join("docs/decisions")] {
+        if let Ok(entries) = fs::read_dir(directory) {
+            let mut paths = entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect::<Vec<_>>();
+            paths.sort();
+            for path in paths {
+                hash_path_metadata(&path, &mut hasher);
+            }
+        }
+    }
+    if root.join(".flux/board.toml").is_file() {
+        let board = read_board_workspace_config(root)?;
+        for member in &board.members {
+            let member_root = board_member_root(root, member)?;
+            member.id.hash(&mut hasher);
+            member.canonical_ref.hash(&mut hasher);
+            hash_canonical_ref_metadata(&member_root, &member.canonical_ref, &mut hasher);
+        }
+    }
+    Ok(format!("{:016x}", hasher.finish()))
 }
 
 impl FleetTuiSource {
@@ -1226,6 +1404,10 @@ impl FleetTuiSource {
 }
 
 impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
+    fn refresh_token(&self) -> Result<String> {
+        fleet_tui_refresh_token(&self.root)
+    }
+
     fn snapshot(&self) -> Result<flux_tui::operations::FleetBoardSnapshot> {
         use flux_tui::operations::{
             BoardDecisionView, BoardItemView, DecisionOptionView, FleetBoardSnapshot,
@@ -10714,6 +10896,10 @@ mod tests {
         assert_eq!(launch.root, root.canonicalize().unwrap());
         assert_eq!(launch.session.as_deref(), Some("s-main"));
         assert!(launch.store.ends_with("sessions/main"));
+        assert_eq!(launch.initial_snapshot.revision, 7);
+        assert_eq!(launch.initial_snapshot.main_status, "running");
+        assert!(launch.initial_snapshot.items.is_empty());
+        let initial_refresh_token = launch.source.refresh_token().unwrap();
 
         let snapshot = source.snapshot().unwrap();
 
@@ -10755,6 +10941,14 @@ mod tests {
         assert_eq!(snapshot.decisions[0].decision_ref, "workspace/D-1");
         assert_eq!(snapshot.metrics_schema, "flux.board-stats/v1");
         assert!(snapshot.attention_required);
+
+        let mut changed = read_fleet_state(&root).unwrap();
+        changed.revision += 100;
+        write_fleet_state(&root, &changed).unwrap();
+        assert_ne!(
+            launch.source.refresh_token().unwrap(),
+            initial_refresh_token
+        );
 
         fs::remove_dir_all(root).ok();
     }

@@ -210,6 +210,15 @@ pub struct FleetAck {
 /// acknowledgements and an explicitly confirmed Board decision.
 pub trait FleetBoardSource: Send + Sync {
     fn snapshot(&self) -> Result<FleetBoardSnapshot>;
+    /// Cheap token for deciding whether the durable runtime projection changed.
+    ///
+    /// The TUI polls this on its refresh cadence. Implementations must not build a full snapshot
+    /// here: a slow token would move the same latency back onto the terminal event loop.
+    fn refresh_token(&self) -> Result<String> {
+        Ok(String::new())
+    }
+    /// Drop implementation-owned derived caches before an explicit operator refresh.
+    fn invalidate_snapshot_cache(&self) {}
     fn attach_session(&self, session: &str) -> Result<FleetAck>;
     fn accept_requirement(&self, text: &str, session: &str) -> Result<FleetAck>;
     fn deliver_requirement(&self, id: &str, session: &str) -> Result<FleetAck>;
@@ -271,6 +280,7 @@ pub(crate) struct PendingRequirement {
 #[derive(Clone, Debug)]
 pub(crate) struct OperationsState {
     pub snapshot: FleetBoardSnapshot,
+    pub projection_status: ProjectionStatus,
     pub open: bool,
     pub tab: OperationsTab,
     pub selected: usize,
@@ -283,10 +293,19 @@ pub(crate) struct OperationsState {
     pub turn_failed: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectionStatus {
+    Loading,
+    Ready,
+    Stale,
+    Error,
+}
+
 impl OperationsState {
     pub(crate) fn new(snapshot: FleetBoardSnapshot) -> Self {
         Self {
             snapshot,
+            projection_status: ProjectionStatus::Ready,
             open: false,
             tab: OperationsTab::Overview,
             selected: 0,
@@ -300,6 +319,12 @@ impl OperationsState {
         }
     }
 
+    pub(crate) fn loading(snapshot: FleetBoardSnapshot) -> Self {
+        let mut state = Self::new(snapshot);
+        state.projection_status = ProjectionStatus::Loading;
+        state
+    }
+
     pub(crate) fn select_tab(&mut self, tab: OperationsTab) {
         self.tab = tab;
         self.selected = 0;
@@ -310,8 +335,18 @@ impl OperationsState {
 
     pub(crate) fn refresh(&mut self, snapshot: FleetBoardSnapshot) {
         self.snapshot = snapshot;
+        self.projection_status = ProjectionStatus::Ready;
         self.refresh_error = None;
         self.selected = self.selected.min(self.rows_len().saturating_sub(1));
+    }
+
+    pub(crate) fn refresh_failed(&mut self, error: String) {
+        self.projection_status = if self.projection_status == ProjectionStatus::Loading {
+            ProjectionStatus::Error
+        } else {
+            ProjectionStatus::Stale
+        };
+        self.refresh_error = Some(error);
     }
 
     pub(crate) fn rows_len(&self) -> usize {
@@ -400,6 +435,17 @@ pub(crate) fn render_attention_rail(frame: &mut Frame, state: &ChatState, area: 
             theme.muted_style(),
         ),
     ];
+    match ops.projection_status {
+        ProjectionStatus::Loading => lines.push(Line::styled(
+            "Board/Fleet projection loading…",
+            theme.muted_style(),
+        )),
+        ProjectionStatus::Error => lines.push(Line::styled(
+            "Board/Fleet projection unavailable",
+            theme.err_style(),
+        )),
+        ProjectionStatus::Ready | ProjectionStatus::Stale => {}
+    }
     if let Some(wave) = &snapshot.active_wave {
         lines.push(Line::styled(
             format!("wave {} · {}", wave.id, wave.status),
@@ -587,6 +633,30 @@ pub(crate) fn render_overlay(frame: &mut Frame, state: &ChatState) {
 }
 
 fn overlay_lines(ops: &OperationsState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    if matches!(
+        ops.projection_status,
+        ProjectionStatus::Loading | ProjectionStatus::Error
+    ) {
+        let mut lines = vec![Line::styled(
+            if ops.projection_status == ProjectionStatus::Loading {
+                " loading Board and Fleet projection…"
+            } else {
+                " Board and Fleet projection unavailable"
+            },
+            if ops.projection_status == ProjectionStatus::Loading {
+                theme.muted_style()
+            } else {
+                theme.err_style()
+            },
+        )];
+        if let Some(error) = ops.refresh_error.as_deref() {
+            lines.push(Line::styled(
+                truncate(&format!(" {error}"), width),
+                theme.err_style(),
+            ));
+        }
+        return lines;
+    }
     if ops.detail_open {
         return detail_lines(ops, theme, width);
     }
@@ -1195,6 +1265,28 @@ mod tests {
         state.select_tab(OperationsTab::Workers);
         assert_eq!(state.selected, 0);
         assert!(!state.detail_open);
+    }
+
+    #[test]
+    fn projection_failures_distinguish_unavailable_startup_from_stale_data() {
+        let initial = snapshot();
+        let mut state = OperationsState::loading(initial.clone());
+        assert_eq!(state.projection_status, ProjectionStatus::Loading);
+
+        state.refresh_failed("initial read failed".into());
+        assert_eq!(state.projection_status, ProjectionStatus::Error);
+        assert_eq!(state.snapshot, initial);
+
+        let mut current = snapshot();
+        current.revision = 10;
+        state.refresh(current.clone());
+        assert_eq!(state.projection_status, ProjectionStatus::Ready);
+        assert_eq!(state.snapshot, current);
+        assert_eq!(state.refresh_error, None);
+
+        state.refresh_failed("later read failed".into());
+        assert_eq!(state.projection_status, ProjectionStatus::Stale);
+        assert_eq!(state.snapshot.revision, 10);
     }
 
     #[test]

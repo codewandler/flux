@@ -45,6 +45,9 @@ document link, metric and failure rows. It owns no repository parser. The embedd
 `FleetBoardSource` implementation backed by the same typed Board/Fleet readers and mutations as the
 command family. The source returns bounded, deterministic snapshots and explicit unavailable/error
 fields. Refresh is point-in-time and never blocks keyboard handling on an unbounded watch.
+Attachment supplies a cheap truthful seed immediately; full projections run on a blocking worker
+and are coalesced while one refresh is in flight. A cheap token over authoritative durable inputs
+lets the event loop skip unchanged rebuilds without treating the token itself as projected state.
 
 The view model has hard caps for rows and detail bytes. It includes total counts and truncation
 markers, so a large Fleet cannot look smaller merely because the TUI bounded it. Statistics carry

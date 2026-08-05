@@ -104,6 +104,10 @@ pub struct TuiRunOptions {
     pub interaction_queue: Option<Arc<InteractionQueue>>,
     /// Typed Board/Fleet projection and bounded mutation bridge. `None` is explicitly standalone.
     pub operations_source: Option<operations::SharedFleetBoardSource>,
+    /// Cheap truthful attachment seed rendered while the first full projection loads off-thread.
+    pub operations_initial_snapshot: Option<operations::FleetBoardSnapshot>,
+    /// Source token corresponding to [`Self::operations_initial_snapshot`].
+    pub operations_refresh_token: Option<String>,
     /// Surface workspace root when it differs from the process cwd (Fleet-root attachment).
     pub workspace_root: Option<String>,
 }
@@ -120,6 +124,8 @@ impl TuiRunOptions {
             pane_queue: None,
             interaction_queue: None,
             operations_source: None,
+            operations_initial_snapshot: None,
+            operations_refresh_token: None,
             workspace_root: None,
         }
     }
@@ -3503,6 +3509,7 @@ pub async fn run_with_options(
         EventLoopServices {
             model_resolver: options.model_resolver,
             operations_source: options.operations_source,
+            operations_refresh_token: options.operations_refresh_token,
         },
         crossterm::event::EventStream::new(),
     )
@@ -3564,8 +3571,11 @@ pub fn session_state(
     state.project_session(&agent.events, session_id)?;
     state.previous_sessions = previous_session_count(&agent.events, session_id)?;
     state.history = load_history(&agent.events);
-    if let Some(source) = options.operations_source.as_ref() {
-        state.operations = Some(crate::operations::OperationsState::new(source.snapshot()?));
+    if options.operations_source.is_some() {
+        let snapshot = options.operations_initial_snapshot.clone().ok_or_else(|| {
+            anyhow::anyhow!("Fleet attachment is missing its initial operations snapshot")
+        })?;
+        state.operations = Some(crate::operations::OperationsState::loading(snapshot));
     }
     Ok(state)
 }
@@ -3622,6 +3632,7 @@ pub async fn drive_event_loop_headless(
         EventLoopServices {
             model_resolver: None,
             operations_source: None,
+            operations_refresh_token: None,
         },
         input,
     )
@@ -3644,6 +3655,7 @@ const HEADLESS_HEIGHT: u16 = 40;
 struct EventLoopServices {
     model_resolver: Option<Arc<dyn ModelResolver>>,
     operations_source: Option<operations::SharedFleetBoardSource>,
+    operations_refresh_token: Option<String>,
 }
 
 async fn event_loop<B, S>(
@@ -3666,6 +3678,7 @@ where
     let EventLoopServices {
         model_resolver,
         operations_source,
+        operations_refresh_token,
     } = services;
 
     let mut cancel = CancellationToken::new();
@@ -3684,6 +3697,13 @@ where
         Duration::from_secs(1),
     );
     operations_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut operations_refresh_in_flight = false;
+    let mut operations_force_refresh_pending = false;
+    let mut operations_last_refresh_token = operations_refresh_token;
+    if let Some(source) = operations_source.as_ref() {
+        spawn_operations_snapshot(&tx, source.clone());
+        operations_refresh_in_flight = true;
+    }
 
     loop {
         // C-305: the agent's pane commands, applied BEFORE this iteration's UI events on purpose —
@@ -3821,6 +3841,35 @@ where
                 UiEvent::SpawnActivity(activity) => {
                     state.record_spawn_activity(&activity, Instant::now())
                 }
+                UiEvent::OperationsSnapshot {
+                    result,
+                    refresh_token,
+                } => {
+                    operations_refresh_in_flight = false;
+                    if let Some(token) = refresh_token {
+                        operations_last_refresh_token = Some(token);
+                    }
+                    match *result {
+                        Ok(snapshot) => {
+                            if let Some(operations) = state.operations.as_mut() {
+                                operations.refresh(snapshot);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(operations) = state.operations.as_mut() {
+                                operations.refresh_failed(error);
+                            }
+                        }
+                    }
+                    if operations_force_refresh_pending {
+                        operations_force_refresh_pending = false;
+                        if let Some(source) = operations_source.as_ref() {
+                            source.invalidate_snapshot_cache();
+                            spawn_operations_snapshot(&tx, source.clone());
+                            operations_refresh_in_flight = true;
+                        }
+                    }
+                }
                 UiEvent::Steered(messages) => {
                     // The engine consumed these from the shared queue (the strip empties by
                     // itself); leave a transcript record that the running turn was steered.
@@ -3833,7 +3882,15 @@ where
                     }
                 }
                 UiEvent::Finished => {
-                    complete_attached_requirements(state, operations_source.as_ref());
+                    if complete_attached_requirements(state, operations_source.as_ref()) {
+                        request_operations_snapshot(
+                            &tx,
+                            operations_source.as_ref(),
+                            &mut operations_refresh_in_flight,
+                            &mut operations_force_refresh_pending,
+                            true,
+                        );
+                    }
                     seal_interrupted_action(state, &mut interrupted_action_id);
                     if let Some((_tool, reply)) = pending_reply.take() {
                         let _ = reply.send(ApprovalChoice::Deny);
@@ -3899,7 +3956,22 @@ where
             // 62 ms lands redraws on the 16 fps boundaries of the animated footer bar.
             _ = tokio::time::sleep(Duration::from_millis(spinners::FPS_MS)), if state.running() => continue,
             _ = operations_tick.tick(), if operations_source.is_some() => {
-                refresh_operations_snapshot(state, operations_source.as_ref());
+                if !operations_refresh_in_flight {
+                    if let Some(source) = operations_source.as_ref() {
+                        match source.refresh_token() {
+                            Ok(token) if Some(&token) != operations_last_refresh_token.as_ref() => {
+                                spawn_operations_snapshot(&tx, source.clone());
+                                operations_refresh_in_flight = true;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                if let Some(operations) = state.operations.as_mut() {
+                                    operations.refresh_failed(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             },
         };
@@ -4373,7 +4445,13 @@ where
                                     operations.confirm_decision = false;
                                     operations.detail_open = false;
                                 }
-                                refresh_operations_snapshot(state, operations_source.as_ref());
+                                request_operations_snapshot(
+                                    &tx,
+                                    operations_source.as_ref(),
+                                    &mut operations_refresh_in_flight,
+                                    &mut operations_force_refresh_pending,
+                                    true,
+                                );
                             }
                             Err(error) => {
                                 if let Some(operations) = state.operations.as_mut() {
@@ -4383,7 +4461,13 @@ where
                             }
                         }
                     } else if refresh {
-                        refresh_operations_snapshot(state, operations_source.as_ref());
+                        request_operations_snapshot(
+                            &tx,
+                            operations_source.as_ref(),
+                            &mut operations_refresh_in_flight,
+                            &mut operations_force_refresh_pending,
+                            true,
+                        );
                     }
                     continue;
                 }
@@ -5533,29 +5617,44 @@ fn start_insights(
     cancel
 }
 
-/// Push `input` as a user message and spawn the agent turn that streams back into the transcript.
-/// Returns the turn's cancellation token (Ctrl-C cancels it).
-fn refresh_operations_snapshot(
-    state: &mut ChatState,
-    source: Option<&operations::SharedFleetBoardSource>,
+/// Build the potentially expensive Board/Fleet projection away from the terminal event loop.
+fn spawn_operations_snapshot(
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    source: operations::SharedFleetBoardSource,
 ) {
-    let (Some(source), Some(_)) = (source, state.operations.as_ref()) else {
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        // The token is intentionally read before the snapshot. If durable state changes while the
+        // snapshot is being built, the next one-second poll observes a different token and starts
+        // another refresh instead of incorrectly treating the older projection as current.
+        let refresh_token = source.refresh_token().ok();
+        let result = source.snapshot().map_err(|error| error.to_string());
+        let _ = tx.send(UiEvent::OperationsSnapshot {
+            result: Box::new(result),
+            refresh_token,
+        });
+    });
+}
+
+fn request_operations_snapshot(
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    source: Option<&operations::SharedFleetBoardSource>,
+    in_flight: &mut bool,
+    force_pending: &mut bool,
+    invalidate: bool,
+) {
+    let Some(source) = source else {
         return;
     };
-    match source.snapshot() {
-        Ok(snapshot) => {
-            if let Some(operations) = state.operations.as_mut() {
-                operations.refresh(snapshot);
-            }
-        }
-        Err(error) => {
-            if let Some(operations) = state.operations.as_mut() {
-                // Keep the last good projection. Clearing it would turn an IO failure into a
-                // fabricated empty Fleet, which is operationally dangerous.
-                operations.refresh_error = Some(error.to_string());
-            }
-        }
+    if *in_flight {
+        *force_pending |= invalidate;
+        return;
     }
+    if invalidate {
+        source.invalidate_snapshot_cache();
+    }
+    spawn_operations_snapshot(tx, source.clone());
+    *in_flight = true;
 }
 
 fn accept_attached_requirement(
@@ -5686,12 +5785,12 @@ fn acknowledge_steered_requirement(
 fn complete_attached_requirements(
     state: &mut ChatState,
     source: Option<&operations::SharedFleetBoardSource>,
-) {
+) -> bool {
     let Some(source) = source else {
-        return;
+        return false;
     };
     let Some(operations) = state.operations.as_ref() else {
-        return;
+        return false;
     };
     let failed = operations.turn_failed;
     let ids = operations
@@ -5725,7 +5824,7 @@ fn complete_attached_requirements(
             .retain(|pending| !pending.delivered || !ids.contains(&pending.id));
         operations.turn_failed = false;
     }
-    refresh_operations_snapshot(state, Some(source));
+    !ids.is_empty()
 }
 
 fn start_conversation_turn(
@@ -5851,6 +5950,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
+    use std::sync::Barrier;
 
     /// A deterministic dispatch id for a test-constructed tool card (C-531). Live cards get theirs
     /// from the interpreter; a test states the pairing it means to exercise.
@@ -5872,6 +5972,142 @@ mod tests {
         match event {
             UiEvent::Tagged { event, .. } => *event,
             event => event,
+        }
+    }
+
+    fn fleet_snapshot() -> operations::FleetBoardSnapshot {
+        operations::FleetBoardSnapshot {
+            schema: "flux.tui-board-fleet/v1".into(),
+            root: "/workspace".into(),
+            running: true,
+            main_status: "running".into(),
+            main_session: Some("s-main".into()),
+            revision: 7,
+            goals_revision: 0,
+            goals: Vec::new(),
+            active_wave: None,
+            capacity: operations::FleetCapacityView {
+                configured: 5,
+                desired: None,
+                active: 0,
+                draining: None,
+                registered: 0,
+            },
+            workers: Vec::new(),
+            workers_total: 0,
+            items: Vec::new(),
+            items_total: 0,
+            decisions: Vec::new(),
+            decisions_total: 0,
+            documents: Vec::new(),
+            documents_total: 0,
+            metrics_schema: "unavailable".into(),
+            metrics: Vec::new(),
+            stats_facts: Vec::new(),
+            status_counts: Vec::new(),
+            history: Vec::new(),
+            failures: Vec::new(),
+            failures_total: 0,
+            intake: Vec::new(),
+            intake_total: 0,
+            blocked_items: 0,
+            attention_required: false,
+        }
+    }
+
+    struct BlockingFleetSource {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl operations::FleetBoardSource for BlockingFleetSource {
+        fn snapshot(&self) -> anyhow::Result<operations::FleetBoardSnapshot> {
+            self.entered.wait();
+            self.release.wait();
+            Ok(fleet_snapshot())
+        }
+
+        fn refresh_token(&self) -> anyhow::Result<String> {
+            Ok("revision-7".into())
+        }
+
+        fn attach_session(&self, _session: &str) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn accept_requirement(
+            &self,
+            _text: &str,
+            _session: &str,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn deliver_requirement(
+            &self,
+            _id: &str,
+            _session: &str,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn complete_requirement(
+            &self,
+            _id: &str,
+            _session: &str,
+            _succeeded: bool,
+            _error: Option<&str>,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn decide(
+            &self,
+            _decision_ref: &str,
+            _outcome: &str,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_fleet_snapshot_does_not_block_the_terminal_event_loop() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let source: operations::SharedFleetBoardSource = Arc::new(BlockingFleetSource {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        spawn_operations_snapshot(&tx, source);
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "a blocked projection must not emit or block the async caller"
+        );
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            UiEvent::OperationsSnapshot {
+                result,
+                refresh_token,
+            } => {
+                let snapshot = result.unwrap();
+                assert_eq!(snapshot.revision, 7);
+                assert_eq!(refresh_token.as_deref(), Some("revision-7"));
+            }
+            _ => panic!("unexpected projection event"),
         }
     }
 
