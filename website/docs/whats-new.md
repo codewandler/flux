@@ -14,6 +14,21 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **You can now name how much autonomy an agent runs with, in one choice.** `--posture supervised`
+  asks you before each effect. `--posture bounded-autonomy` never asks and instead constrains the
+  run with policy, a fail-closed sandbox and budgets — the posture unattended runs already used.
+  `--posture exploratory` suits research and long investigations where being interrupted is itself
+  the problem, leaning on hard isolation and full evidence instead. `--posture refusing` denies
+  everything. Each posture sets its approval, confinement and budget together, so you cannot end up
+  with approvals switched off and confinement left open. The documentation states plainly what each
+  one relies on and what it does not protect you against. `--yes` keeps working and means
+  `bounded-autonomy`.
+
+- **Streaming JSON output now identifies which call each tool event belongs to.** Tool call and tool
+  result lines carry a new `dispatch` field holding the same identifier on both ends of one call, so
+  a script consuming the stream can pair a result with its call directly instead of guessing by tool
+  name. The field is additive; existing consumers are unaffected.
+
 - **`flux review` now shows what it is doing while reviewers work.** By default it displays a live
   reviewer tree in a terminal and readable progress lines when redirected. Use
   `--progress tree|plain|off` to choose the display explicitly. Progress goes to stderr, so the final
@@ -101,6 +116,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **A tool's result, timing and progress always land on the tool card that started it.** When
+  several same-named reads or searches run at once, a result that arrived out of order could resolve
+  whichever card was newest, leaving the real one spinning and the finished one showing another
+  call's output. Each call now carries its own identity from start to finish, so the transcript,
+  the fleet pane and replayed runs all pair correctly no matter how many calls overlap.
+
 - **Building and installing Flux from one checkout no longer loses live compiler output to
   repository cleanup.** `task install` keeps its Cargo target reusable while it verifies and
   installs both `flux` and `flux-lsp`; `task clean` now refuses until active repository builds have
@@ -126,6 +147,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   JSON code block is normalized safely.
 
 ### Action needed
+
+- **Bringing real room audio to a sandboxed agent requires granting the audio socket explicitly.**
+  The sandbox hides the host's `/run` directory, so naming your audio server on the sidecar's command
+  line is necessary but not sufficient — the socket itself has to be granted. Add the directory that
+  holds it, for example `writable = ["/run/user/1000/pulse"]` under `[sandbox]`, using your own user
+  id. Flux now refuses at startup if a configured writable path under `/run` does not exist, naming
+  the path and the likely cause, rather than creating an empty directory that applies cleanly and
+  silently reaches nothing. If you previously had such a path in your config, correct it — a wrong
+  user id was indistinguishable from working audio until now.
 
 - **Rust server integrations must use the guarded address-based serving APIs.** The helpers that
   accepted an already-bound native TCP listener have been removed. Single-agent serving now uses the
