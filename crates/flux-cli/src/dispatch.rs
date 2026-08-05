@@ -172,6 +172,8 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Export { .. }
         | Commands::Auth { .. }
         | Commands::Endpoint { .. }
+        | Commands::Exchange { .. }
+        | Commands::Integration { .. }
         | Commands::Policy { .. }
         | Commands::Catalog { .. }
         | Commands::Skill { .. }
@@ -795,6 +797,8 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
+            Some(Commands::Exchange { action }) => run_exchange_boundary(action),
+            Some(Commands::Integration { action }) => run_integration_boundary(action),
             Some(Commands::Policy { action }) => run_policy(action),
             Some(Commands::Catalog { action }) => run_catalog(action),
             Some(Commands::Skill {
@@ -820,6 +824,73 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
     if let Err(e) = run.await {
         eprintln!("{} {e:#}", style::red("error:"));
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_exchange_boundary(action: ExchangeAction) -> Result<()> {
+    use integration_projection::Command;
+
+    let (command, json) = match action {
+        ExchangeAction::Local { action } => match action {
+            ExchangeLocalAction::Start { json, .. } => (Command::ExchangeLocalStart, json),
+            ExchangeLocalAction::Status { json } => (Command::ExchangeLocalStatus, json),
+            ExchangeLocalAction::Stop { json, .. } => (Command::ExchangeLocalStop, json),
+        },
+    };
+    emit_provider_boundary(command, json)
+}
+
+fn run_integration_boundary(action: IntegrationAction) -> Result<()> {
+    use integration_projection::Command;
+
+    let (command, json) = match action {
+        IntegrationAction::Connect { json, .. } => (Command::IntegrationConnect, json),
+        IntegrationAction::Grant {
+            selectors, json, ..
+        } => {
+            let refusal = if selectors.iter().all(SelectorAssignment::is_valid) {
+                integration_projection::Refusal::Unsupported
+            } else {
+                integration_projection::Refusal::InvalidInput
+            };
+            return emit_refusal(Command::IntegrationGrant, json, refusal);
+        }
+        IntegrationAction::List { json } => (Command::IntegrationList, json),
+        IntegrationAction::Doctor { json } => (Command::IntegrationDoctor, json),
+    };
+    emit_provider_boundary(command, json)
+}
+
+/// Emit the dependency boundary as a command-shaped refusal. No provider body, field assignment or
+/// selector reaches this projection, and JSON mode never falls through the CLI's human error path.
+fn emit_provider_boundary(command: integration_projection::Command, json: bool) -> Result<()> {
+    emit_refusal(command, json, integration_projection::Refusal::Unsupported)
+}
+
+fn emit_refusal(
+    command: integration_projection::Command,
+    json: bool,
+    refusal: integration_projection::Refusal,
+) -> Result<()> {
+    use integration_projection::{CommandOutcome, OutputFormat};
+
+    let format = if json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    };
+    let projection = CommandOutcome::refused(command, refusal)
+        .render(format)
+        .context("render integration command refusal")?;
+    std::io::stdout()
+        .write_all(projection.stdout.as_bytes())
+        .context("write integration command stdout")?;
+    std::io::stderr()
+        .write_all(projection.stderr.as_bytes())
+        .context("write integration command stderr")?;
+    if projection.exit_status != 0 {
+        std::process::exit(i32::from(projection.exit_status));
     }
     Ok(())
 }

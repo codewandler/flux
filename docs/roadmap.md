@@ -99,6 +99,26 @@ envelope. Every story carries a generic example; its syntax remains illustrative
 AST/lowering decision is accepted. Design:
 [flux-lang-authoring-ergonomics](designs/flux-lang-authoring-ergonomics.md).
 
+### The first-class board — one fixed tool surface, pluggable backends (epic) — 🔄 **PROPOSED (A-148; L-130 filed; A-134/A-115/A-118 re-pointed)**
+
+flux-roadmap Decision 0006 gave the family one datasource definition — a named, declared,
+**read-only** record surface (*operations do; datasources know*) — and the work board fails that
+test on purpose: it mutates. Today the board rides the `datasource` declaration through a
+`kind "board:…"` prefix hack, its subjects use an unprefixed grammar, and an embedder cannot bind
+one at all. This epic gives the board what the decision says it is: a first-class Flux concept with
+its own `board <name>` declaration (L-130, retiring the `board:*` kinds with a migration note), its
+own `board:<name>/item/<id>` subject namespace (shared with D-251's one-grammar normalization), and
+its own SDK seam (A-134, absorbed from the fleet-coordinator epic). The load-bearing constraint is
+what does *not* change: one small fixed 11-operation tool surface with a closed state machine,
+identical across every backend — memory and markdown today, vendor trackers later through the
+declared-surface pattern (connector-declared status↔state and per-verb operation mappings, Exchange
+tenant Board bindings, every write an admitted granted operation; A-115/A-118, re-pointed off the
+plugin path Milestone 5 deletes, Milestone 3+). The adoption story C-514 carried the vocabulary;
+this epic carries the split. Design: [first-class-board](designs/first-class-board.md).
+Datasource-side siblings filed with it: D-250 (one registry across indexed + live modes), D-252
+(Exchange-bound and catalogue `datasource` kinds), D-253 (protocol-line counterparties), D-254
+(data-pipelines exploration, [data-pipelines](designs/data-pipelines.md)).
+
 ### Flux syntax simplification — one way to write each thing (epic) — 🔄 **PROPOSED (L-102; L-103…L-112 filed, none started)**
 
 The canonical dialect the formatter emits is already the language we want — but it is one of
@@ -828,18 +848,18 @@ Design: [zendesk-automation.md](designs/zendesk-automation.md).
 
 0.36.0 shipped a fleet *coordinator* — a Program declares a board and hands items to remote agents
 over A2A with `runner`/`task_id` written back — but not the loop the `track` plugin actually runs:
-select a wave of independent items, give each an isolated worker that implements and gates and commits
-on a scratch branch, review the returned diff **as evidence**, two rework rounds to the *same* worker,
-park after that, integrate serially with a full gate after **every** merge and revert on red, then
-write the ledger. The load-bearing decision is where that contract lives: **the model reasons, the
-host enforces.** A `WaveCoordinator` owns the irreversible, order-sensitive actions — isolation, gate,
-merge, revert, ledger — and the model owns only wave selection and diff review. The point is not
-tidiness: it means fenced ledger, gate-after-every-merge, never-implement, revert-on-red and
-park-after-two hold *even when the model is wrong or lazy*, because they are host behaviour rather
-than instructions a prompt can lose. `fleet.integrate` is the sharpest instance — it gates and merges
-or does neither, so the most-violated rule in the loop becomes unskippable; and gating per merge is
-what attributes the failure of two stories that each compile alone but not together, which is exactly
-the case that produces no git conflict. Coordination *prose* deliberately stays out of flux: the
+select a wave of independent items, give each an isolated worker that implements and runs targeted
+checks and commits on a scratch branch, review the returned diff **as evidence**, two rework rounds
+to the *same* worker, park after that, integrate serially on one wave branch, run the full gate once
+on the combined tree, publish only on green, then write the ledger. The load-bearing decision is
+where that contract lives: **the model reasons, the host enforces.** A `WaveCoordinator` owns the
+irreversible, order-sensitive actions — isolation, ordered integration, wave gate, publication fence
+and ledger — and the model owns only wave selection and diff review. The point is not tidiness: it
+means fenced ledger, one writer/worktree per story, targeted checks before handoff, one wave-boundary
+gate, never-publish-red and park-after-two hold *even when the model is wrong or lazy*, because they
+are host behaviour rather than instructions a prompt can lose. `fleet.integrate` is the sharpest
+instance — it can assemble an ordered candidate but cannot publish it or write completion bookkeeping
+without one successful configured full gate. Coordination *prose* deliberately stays out of flux: the
 wave-selection and review heuristics are content, and they live in a reference `coordinator.flux` and
 its guidance. Sequenced so the data path lands before anything reasons over it — **F1** makes the
 board readable (`board.query` with a real `output_schema`; today `render_compact` drops `runner`,

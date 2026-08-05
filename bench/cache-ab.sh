@@ -22,6 +22,8 @@ set -euo pipefail
 
 MODEL="claude/claude-sonnet-5"
 RUNS=1
+# Prebuilt-consumer only: this benchmark never invokes a builder. FLUX_BIN deliberately selects an
+# already-built executable; the fallback is convenience for an operator using Cargo's default root.
 FLUX="${FLUX_BIN:-./target/debug/flux}"
 
 while [ $# -gt 0 ]; do

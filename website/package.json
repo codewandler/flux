@@ -4,9 +4,11 @@
   "private": true,
   "scripts": {
     "start": "docusaurus start",
+    "prebuild": "npm test",
     "build": "docusaurus build",
     "serve": "docusaurus serve",
-    "clear": "docusaurus clear"
+    "clear": "docusaurus clear",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.1",

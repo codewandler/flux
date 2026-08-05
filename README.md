@@ -26,9 +26,10 @@
 
 ## The LLM is not the runtime
 
-The model never becomes the execution engine, and never authors executable code. It declares intent,
-explores through exact provider-native operation schemas, and proposes literal actions. An authored
-Flux-Lang loop and a deterministic Rust runtime own everything after that.
+The model never becomes the execution engine. It may author Flux-Lang source, declare intent,
+explore through exact provider-native operation schemas, and propose literal actions, but authored
+text is inert until it is parsed and analysed. Only an explicitly requested run enters the
+deterministic Rust runtime, where authorization, approval and guarded IO own every effect.
 
 ```text
 request → typed intent → scoped exploration → action batch → approval → guarded execution
@@ -110,7 +111,12 @@ reviewed tag instead.
 </details>
 
 From a clone: `cargo build --release` → `target/release/flux`, or `task install` for `flux` and
-`flux-lsp` together. Plugin packs ship separately as `plugins-v*`.
+`flux-lsp` together. `task install` requires Python 3.10+ before Cargo starts (`python3`, then
+`python` on Linux/macOS; `python`, then `py -3` on Windows). It preserves an absolute or
+workspace-relative `CARGO_TARGET_DIR`, holds shared ownership of that reusable target for the whole
+verification/install sequence, and refuses concurrent `task clean` rather than risking live
+compiler output. Set `PYTHON=<executable>` only when the platform's standard launcher is not the
+desired interpreter. Plugin packs ship separately as `plugins-v*`.
 
 ## Quickstart
 

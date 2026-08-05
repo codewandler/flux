@@ -4,6 +4,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Prebuilt-consumer only: this evaluation never builds Flux. FLUX_BIN is the explicit artifact
+# contract; the target/debug fallback is only for an operator who built at Cargo's default root.
 FLUX_BIN="${FLUX_BIN:-$ROOT_DIR/target/debug/flux}"
 TRIALS="${TRIALS:-3}"
 EFFORT="${EFFORT:-low}"

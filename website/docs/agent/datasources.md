@@ -5,8 +5,9 @@ description: "The agent's governed data layer: indexed knowledge and async live 
 
 # Datasources
 
-A **datasource** is a governed data boundary the agent reaches through
-[operations](../language/ops.md). Flux supports two complementary read forms:
+A **datasource** is a named, declared, **read-only** record surface the agent reaches through
+[operations](../language/ops.md). Operations *do*; datasources *know* — anything that mutates is
+not a datasource. Every datasource has one declared access mode:
 
 | | Indexed knowledge | Live system of record |
 |---|---|---|
@@ -17,18 +18,20 @@ A **datasource** is a governed data boundary the agent reaches through
 | Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` |
 
 The split is intentional. A stable local snapshot benefits from indexing and ranked search; a
-changing system of record needs async calls and backend-owned continuation cursors. Work that is
-claimed and moved is a separate [work-board](#work-boards) contract with an enforced state machine.
-None is a side channel: datasource reads and board operations enter the ordinary operation catalog
-and cross authorization → approval → guarded IO.
+changing system of record needs async calls and backend-owned continuation cursors. The two access
+modes stay two contracts — what they share is identity and the read-only definition. Work that is
+claimed and moved therefore is not a datasource at all but a separate [work-board](#work-boards)
+contract with an enforced state machine. None is a side channel: datasource reads and board
+operations enter the ordinary operation catalog and cross authorization → approval → guarded IO.
 
 ## Datasources vs. operations
 
 - An **operation** is the universal callable unit—the verbs of the system. Every tool, plugin
   operation, toolchain command, cognition op, and datasource read uses the same catalog and safety
   envelope.
-- A **datasource** defines the data and access contract. An indexed datasource owns records; a live
-  datasource owns an entity/filter/page schema and a host-side backend.
+- A **datasource** defines the data and access contract, and it is read-only by definition. An
+  indexed datasource owns records; a live datasource owns an entity/filter/page schema and a
+  host-side backend.
 - The agent reaches either form **through operations**. Indexed retrieval uses the common operations
   listed below;
   registering a live domain named `support` generates `support.list` and `support.get`.
@@ -198,7 +201,8 @@ For embedding code and the indexed `try_register_pack` recipe, see
 
 ## Work boards
 
-A **work board** is not a third datasource read model. It is a write-capable work registry with a
+A **work board** is not a datasource — it mutates, and a datasource is read-only by definition. It
+is a write-capable work registry with a
 typed item state machine—`ready`, `claimed`, `in_progress`, `review`, `done`, `blocked`,
 `failed`—behind a swappable backend. The full spine, and which transitions are legal, is in
 [Work boards and the fleet](./fleet.md#the-item-lifecycle). Indexed knowledge and live read domains
@@ -236,6 +240,14 @@ its own.
 
 `board:memory` cannot outlive the process that created it, so a Program relying on crash recovery
 wants `board:markdown`.
+
+:::note Direction
+Because a board mutates, it is leaving the datasource vocabulary: the direction is a first-class
+`board` declaration with its own `board:` permission namespace, retiring the `kind "board:*"`
+spelling, with the fixed operation surface listed above staying identical across every backend. What this
+page documents is the current shipped behavior — the `datasource` declaration slot above remains
+the way to bind a board today.
+:::
 
 The machine-oriented reads are `board.query`, which returns a page as typed JSON rows (every field
 present, absent optionals as `null`) so a flow can `each` over items and `match` on their state, and

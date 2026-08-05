@@ -4034,6 +4034,16 @@ impl Executor {
         &self.ctx
     }
 
+    /// Whether a pre-tool hook can observe, rewrite, or refuse a concrete dispatch.
+    ///
+    /// Native model-response batching uses this as a conservative scheduling barrier: the
+    /// authorize-only preview intentionally does not run hooks, so a caller cannot prove that a
+    /// hook-rewritten invocation remains approval-insensitive. The live dispatch still runs every
+    /// hook normally; this method only decides whether sibling calls may overlap before then.
+    pub fn has_pre_tool_hooks(&self) -> bool {
+        !self.hooks.is_empty()
+    }
+
     /// The current allow rules (for persistence by the caller).
     pub fn allow_rules(&self) -> Vec<String> {
         self.perms.lock().unwrap().allow_rules()

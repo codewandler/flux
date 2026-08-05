@@ -211,10 +211,20 @@ rather than consume it — is answered once in the `port` module and not repeate
 
 ## What knows: datasources and evidence
 
-**Datasource** — a governed readable surface of records the agent looks things up in. It may be an
-indexed snapshot (workspace documents, synchronized integration data) or a live system-of-record
-adapter. Operations *do*; datasources *know*. A **Datasource Definition** declares the schema and
-retrieval surface; a host binds it to an installed datasource and its authority.
+**Datasource** — a named, **declared, read-only** surface of records the agent looks things up in.
+Operations *do*; datasources *know* — and the family test cuts both ways: anything that mutates is
+not a datasource, so grant sentences and read-surface reasoning stay true without qualifiers. Every
+datasource declares exactly one **access mode**: *indexed* (a local copy of records — workspace
+documents, synchronized integration data — with search, lookup and relations) or *live* (a governed
+read-through to a system of record, paged with opaque cursors). The two contracts stay separate;
+identity does not — flux keeps one registry so an agent can enumerate every declared datasource
+across both modes. A **Datasource Definition** declares the schema and retrieval surface; a host
+binds it to an installed datasource and its authority. Ownership splits once, family-wide: vendor
+Datasource Definitions belong to the connector package (what a vendor exposes is true regardless of
+who runs it), tenant bindings and the governed read seam belong to Exchange, and the wire
+vocabulary, the registry and the Flux-Lang declaration surface belong to flux. The work board is
+deliberately **not** a datasource — it mutates, so it is its own first-class write-capable surface
+with its own declaration and `board:` subject namespace as that direction lands.
 
 The two meet cleanly, and this is deliberate: **a datasource is read through operations.** Retrieval
 (`search`, `get`, `list`, …) is just more read-only operations in the same catalog, so knowledge

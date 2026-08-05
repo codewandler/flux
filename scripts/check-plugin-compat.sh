@@ -33,6 +33,7 @@
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+source scripts/build-ownership.sh
 
 REPO="${REPO:-codewandler/flux}"
 WORK="$(mktemp -d)"
@@ -105,8 +106,10 @@ for binary in "${BINARIES[@]}"; do
 done
 
 echo "== building this tree's flux =="
-cargo build -p flux-cli --bin flux >/dev/null 2>&1 || fail "could not build flux from this tree"
-FLUX="$PWD/target/debug/flux"
+FLUX="$WORK/flux"
+with_build_ownership sh -c \
+  'cargo build -p flux-cli --bin flux >/dev/null 2>&1 && cp "$CARGO_TARGET_DIR/debug/flux" "$1"' \
+  sh "$FLUX" || fail "could not build and snapshot flux from this tree"
 
 # Install into a throwaway home so the developer's real ~/.flux is untouched.
 #

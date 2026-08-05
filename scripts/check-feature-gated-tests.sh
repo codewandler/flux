@@ -33,6 +33,9 @@
 #
 set -euo pipefail
 
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+source "$ROOT/scripts/build-ownership.sh"
+
 cd "$(git rev-parse --show-toplevel)"
 
 # package<TAB>feature<TAB>disposition<TAB>why
@@ -108,7 +111,7 @@ fi
 while IFS= read -r pkg; do
   feats=$(printf '%s\n' "$LEDGER" | awk -F'\t' -v p="$pkg" '$1 == p && $3 == "run" { print $2 }' | paste -sd, -)
   echo "==> cargo test -p $pkg --features $feats"
-  cargo test -p "$pkg" --features "$feats"
+  owned_cargo test -p "$pkg" --features "$feats"
 done < <(printf '%s\n' "$LEDGER" | awk -F'\t' '$3 == "run" { print $1 }' | sort -u)
 
 # --- 3. what is deliberately not run ----------------------------------------------------------

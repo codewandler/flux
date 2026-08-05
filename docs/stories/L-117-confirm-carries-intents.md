@@ -2,7 +2,7 @@
 id: L-117
 title: "`confirm` approvals carry a real IntentSet"
 pillar: Language
-status: ready
+status: done
 priority: 12
 epic: flux-lang-hardening
 design: docs/designs/flux-lang-hardening.md
@@ -23,21 +23,24 @@ label-only contract is the intended seam, record that decision and document it a
 
 ## Acceptance
 
-- [ ] Failing-first: a `confirm` wrapping an effectful call passes an `IntentSet` naming the
+- [x] Failing-first: a `confirm` wrapping an effectful call passes an `IntentSet` naming the
       body's ops/effects to `request_approval`; a bodyless `confirm` passes an explicit
       gate-only marker, not silence.
-- [ ] The analyzer's already-gathered effect/op information (`analyze.rs:842-869`) is the source —
+- [x] The analyzer's already-gathered effect/op information (`analyze.rs:842-869`) is the source —
       no second effect-derivation path.
-- [ ] `risk` is validated against the documented set (`low|medium|high|critical`) at lowering,
+- [x] `risk` is validated against the documented set (`low|medium|high|critical`) at lowering,
       instead of flowing through as arbitrary text.
-- [ ] The engine adapter (`flux-flow`'s `ExecutorHost`) consumes the intents, and the OpHost trait
+- [x] The engine adapter (`flux-flow`'s `ExecutorHost`) consumes the intents, and the OpHost trait
       docs state who enforces what (the crate's default hooks are no-ops — `host.rs:119-131` —
       which stays true but becomes loudly documented).
-- [ ] If the decision goes the other way (label-only by design), the design doc records why and
+- [x] If the decision goes the other way (label-only by design), the design doc records why and
       `host.rs` documents the contract; the empty-set call becomes an explicit named constant.
 
 ## Progress
--
+- Completed and verified with runtime tests, renderer tests, and flow adapter tests:
+  - confirm intent capture from bodyful, nested, and unknown calls
+  - conservative operation mutability and unknown-fail-closed classification
+  - host contract docs and request-approval validation
 
 ## Notes
 

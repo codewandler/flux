@@ -37,6 +37,13 @@ It ships as a CLI and TUI you use daily, an embeddable Rust SDK, and an HTTP ser
 any particular vendor. Its future official-integration surface is one native Exchange client, not a
 connector runtime host.
 
+For data the same split holds. A **datasource** is a named, declared, **read-only** record surface —
+*operations do; datasources know* — with one declared access mode, indexed or live. flux owns the
+published wire vocabulary, the one registry across both modes, and the Flux-Lang declaration
+surface; which vendor entities exist belongs to the connector package, and tenant bindings belong to
+Exchange. The work board is not a datasource — it mutates — and is becoming a first-class flux
+concept with its own declaration rather than a `datasource` kind.
+
 ```bash
 flux run "add a test for the parser"
 ```
@@ -77,6 +84,12 @@ A connector describes an external capability reached over a declared protocol. A
 optional — a public search API is as valid a connector as a paid SaaS product. What makes something a
 connector is that its surface can be *described*.
 
+Vendor-data **Datasource Definitions** live here for the same reason: which entities a vendor
+exposes and how to read them is true of the integration regardless of who runs it. A connector
+declares its datasource members as projections over its own operations, so every datasource read
+executes as an admitted operation; flux keeps only the wire vocabulary and the consuming seam, and
+Exchange keeps only tenancy and authorization.
+
 Generated HTTP is the complete outbound runtime today, not the permanent boundary. Docker,
 Kubernetes, SQL, Prometheus, secret stores, and other rich protocols are migration targets too.
 Their connectors may carry attested vendor-specific binaries or images and select guarded socket,
@@ -116,8 +129,11 @@ use the same bounded authority. That inverts the usual assumption and shapes the
   durable store keeps only its verifier. `/api/agents` is a bounded compatibility alias for create.
 
 **Still direction:** rich outbound runtime dispatch, webhooks and polls, general hosted channels
-beyond the generated socket slice, general execution records beyond value-free workflow node
-activity, streamed results, leases, isolated per-tenant workers, and installed Apps. The
+beyond the generated socket slice, tenant Datasource bindings with their governed read seam
+(a connector-declared datasource member bound to a connection label; Exchange serves schema/list/get
+through its existing admission gate and never invents retrieval of its own), general execution
+records beyond value-free workflow node activity, streamed results, leases, isolated per-tenant
+workers, and installed Apps. The
 [Exchange inventory](https://github.com/codewandler/flux-exchange#what-exists-today) is authoritative.
 
 **The security property that makes it usable by agents:**
@@ -195,8 +211,12 @@ current feature rather than an official outbound integration executor. See
 > **Current seam:** Flux's embedded client authenticates as one Service Account, projects its
 > effective catalogue at turn boundaries, and calls Exchange's one-shot HTTP `invoke` route.
 > Its `FLUX_EXCHANGE_URL` plus `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN` environment setup is
-> transitional C-503 compatibility, not the Milestone 1 bootstrap; C-509 replaces the bearer
-> environment path with an Exchange-owned direct handoff into secure storage. Tenant, connection,
+> transitional C-503 compatibility, not the Milestone 1 bootstrap. C-509's final bootstrap uses a
+> separately human-authenticated management surface for plans, connections, grants and Service
+> Account minting; those routes never join the Service-Account-only runtime client. An Exchange-owned
+> direct handoff places the one-time token in secure storage, after which its bytes may exist only in
+> a host-owned resolver and sensitive Authorization transport—not argv, environment, ordinary
+> diagnostics/JSON/configuration, logs, events, session state or model-visible state. Tenant, connection,
 > credential, grant and runtime remain Exchange-owned. Generated socket channels can publish their
 > closed declared event sets to
 > authenticated `/api/subscribe`, but Flux does not yet consume subscribe, streaming, cancellation,

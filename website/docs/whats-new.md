@@ -1,22 +1,43 @@
----
-title: What's new
-description: "Customer-facing Flux release notes, generated from the changelog embedded in the CLI."
----
+<!--
+  WHATS-NEW.md — the CUSTOMER changelog. Audience: people who USE flux, not people who
+  build it. Voice rules:
+    - Plain language, feature-first. Say what the user can now do or what behaves
+      differently — never how it is implemented.
+    - NO story IDs, NO crate names, NO internal jargon (engineering detail lives in
+      CHANGELOG.md).
+    - Per release, use only the sections that apply: "### New", "### Improved",
+      "### Fixed", "### Action needed" (breaking or attention-worthy changes).
+  This file is embedded into the `flux` binary and shown by `flux changelog`.
+  `scripts/cut-release.sh` rolls [Unreleased] into the release section on every cut.
+-->
 
 # What's new in flux
 
-This is the same customer changelog embedded in the binary. From a terminal, use
-`flux changelog` for the latest release, `flux changelog --all` for the full history, or
-`flux changelog <version>` for one release.
-
-<!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
 ### New
 
+- **`flux review` now shows what it is doing while reviewers work.** By default it displays a live
+  reviewer tree in a terminal and readable progress lines when redirected. Use
+  `--progress tree|plain|off` to choose the display explicitly. Progress goes to stderr, so the final
+  Markdown or JSON report on stdout stays clean for scripts.
+
 - **Agents can now run a Flux program supplied directly in a `flow_run` call.** Use
   `inline_program` when a program does not need to be saved first; it supports the same input bindings
   and execution safeguards as named and file-based flows.
+- **You can delegate Flux-Lang authoring to a purpose-built repository role.** The
+  `flux-lang-writer` inspects the language contract, makes focused `.flux` changes, and validates
+  syntax and analysis without running an effectful flow as a shortcut. Actual execution still uses
+  Flux's normal authorization, approval, guarded IO, sandboxing, and redaction. A source-linked
+  catalogue now makes every built-in and repository role discoverable.
+
+- **The first-run Exchange command surface is explicit and safe while its dependencies land.**
+  `flux exchange local start|status|stop` and `flux integration connect|grant|list|doctor` now have
+  closed command shapes. Their current deterministic `unsupported` response is a temporary gate,
+  not the final local-lifecycle or integration result contract. Until the compatible Exchange
+  release and Flux lifecycle manager ship, the commands make no changes, setting values stay out of
+  diagnostics, and credential or token arguments are not accepted.
+
 - **Flux can now use operations granted to an Exchange Service Account.** Set the Exchange URL and
   Service Account token in the host environment. Flux refreshes the available operations between
   turns and sends one-shot calls to Exchange, while Exchange keeps credentials and deployment
@@ -27,6 +48,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   Quoted numeric keys remain object keys, while unquoted numeric brackets remain list indexes.
 
 ### Improved
+
+- **Flux can inspect independent evidence sources at the same time.** When a model requests several
+  safe reads together, Flux overlaps them within the configured tool-concurrency limit and still
+  returns their results in request order. Writes, approval-sensitive work, hooked calls, and tools
+  without trustworthy read-only metadata remain ordered.
 
 - **The security guide now tells you which secret guarantee you actually have.** It separates
   credentials kept outside Flux or a plugin from values materialized locally and protected by
@@ -48,6 +74,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   adopts the complete refreshed set. Existing plugin grants and disabled-tool patterns still apply
   to newly advertised actions, and a rejected refresh changes nothing.
 
+- **Approval screens now show what each confirm guard is about.** A confirm that wraps real work now
+  shows the planned operations and their likely effects, instead of only a plain message. Unknown
+  operations are shown explicitly, and invalid confirm risk labels are rejected before execution.
+
 - **Maintainers can now cut a release by merging `main` into `release`.** The hosted flow writes the
   release notes, derives the version mechanically, prepares and verifies the exact build once, then
   publishes it. A failed build or publication stays visibly failed with its recovery candidate
@@ -62,6 +92,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   footer, docs overview, and README instead of hiding behind the playground.
 
 ### Fixed
+
+- **Building and installing Flux from one checkout no longer loses live compiler output to
+  repository cleanup.** `task install` keeps its Cargo target reusable while it verifies and
+  installs both `flux` and `flux-lsp`; `task clean` now refuses until active repository builds have
+  finished. Existing absolute or relative `CARGO_TARGET_DIR` choices continue to work.
 
 - **JaaS room joins no longer race each other or re-resolve their signalling host.** Two concurrent
   joins now create one live room session, and the XMPP WebSocket connects only to the address Flux's
@@ -2545,4 +2580,3 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 Engineering-level detail for every release lives in
 [CHANGELOG.md](https://github.com/codewandler/flux/blob/main/CHANGELOG.md).
-<!-- END generated:whats-new -->

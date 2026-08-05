@@ -5,7 +5,7 @@ pillar: Core
 status: done
 epic: plugin-platform-hardening
 design: docs/designs/plugin-distribution.md
-note: "workflow_dispatch `release-plugins.yml`: build the pack on 5 native runners, package per-plugin archives, emit a minisign-signed `plugins-index.json`, create the `plugins-v<ver>` release (`--latest=false`); core dist release untouched"
+note: "historical workflow_dispatch publisher shipped; open C-354 makes dispatch build-only and reserves signing, GitHub Release and Cargo publication for the App-created plugins-v* tag event"
 ---
 
 # Plugin pack release pipeline — per-plugin artifacts + signed index
@@ -70,6 +70,13 @@ without pulling the excluded `plugins/` workspace into the core cargo-dist relea
   set — required before the first `publish: true` run). One runner correction along the way: the
   x86_64-apple-darwin leg starved on the retired `macos-13` label; switched to `macos-15-intel`
   (what dist's core release resolves to) in `75dbe25`, first run cancelled + re-dispatched.
+- 2026-08-04 **historical contract superseded for future publication.** The checked Acceptance above
+  records the branch-dispatched D-46 pipeline that shipped; it is not evidence for the open v0.56.0
+  release contract. C-354 now requires `plugins-v*` tag-triggered publication, separate protected
+  jobs, and a build-only manual dispatch with no branch-event signing, Release, Cargo or tag-creation
+  path. Separately, the automatic protected-main controller may ask the App to create the exact tag;
+  only that tag event can begin publication. The checked boxes above are historical evidence; every
+  C-354 Acceptance item remains open.
 
 ## Notes
 - Design: [plugin-distribution](../designs/plugin-distribution.md) — see "Build & release plumbing"
@@ -78,9 +85,15 @@ without pulling the excluded `plugins/` workspace into the core cargo-dist relea
 - The pack version is the plugins workspace's lockstep `workspace.package.version`; the workflow
   should verify the `version` input matches it (or bump-check) to keep manifest `version` fields,
   tag, and index agreeing.
-- Key custody: the minisign secret key is a repo Actions secret; the public key lands in flux-cli in
-  D-47. Generate the keypair as part of this story and record the pubkey in the design doc.
-- Document "never hand-push a `plugins-v*` tag" wherever the release process is described
-  (a hand-pushed tag red-Xs the dist plan job harmlessly, but noisily).
+- Historical key custody used a repository Actions secret. C-353/C-354 supersede that placement:
+  `MINISIGN_SECRET_KEY` belongs only to the tag-only `release` environment and is exposed only to its
+  signing step. Secret re-entry is a later external maintainer action; automation never reads or
+  extracts the value. The public key remains in flux-cli under D-47.
+- A matching `plugins-v*` tag is created once only by `flux-release-promoter`; manual or administrator
+  tag creation is refused by the creation ruleset, and the no-bypass immutability ruleset then refuses
+  every update or deletion. The former hand-push/red-X rationale is historical, not authorization.
 - `scripts/smoke-plugins.sh` may run env-gated as a post-release validation step — optional, not a
   gate.
+- Do not use this story's checked branch-publication Acceptance as implementation guidance after
+  C-354. The generated board note points to the open superseding contract so it cannot be mistaken
+  for an allowed future path.

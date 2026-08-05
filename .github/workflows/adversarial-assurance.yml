@@ -17,6 +17,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
 
 jobs:
   codeql-rust:
@@ -141,11 +142,11 @@ jobs:
         run: |
           mkdir -p target/adversarial-artifacts
           ./scripts/run-adversarial-assurance.sh --miri-preflight
-          cargo miri setup
-          timeout 12m cargo miri test --locked --offline \
+          scripts/owned-cargo miri setup
+          timeout 12m scripts/owned-cargo miri test --locked --offline \
             -p codewandler-flux-plugin-protocol --test adversarial_frames \
             2>&1 | tee target/adversarial-artifacts/miri-plugin-ndjson.log
-          timeout 8m cargo miri test --locked --offline \
+          timeout 8m scripts/owned-cargo miri test --locked --offline \
             -p codewandler-flux-lang --lib lexer::tests:: \
             2>&1 | tee target/adversarial-artifacts/miri-flux-lang-lexer.log
 

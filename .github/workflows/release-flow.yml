@@ -50,6 +50,7 @@ permissions:
   actions: write
 
 env:
+  CARGO_TARGET_DIR: target
   # `inputs` is empty on a push event, so both values need explicit host-owned defaults. A release
   # branch push always applies; a manual dispatch keeps its selected preview/rehearsal posture.
   RELEASE_APPLY: ${{ github.event_name == 'push' && 'true' || (inputs.apply && 'true' || 'false') }}
@@ -147,7 +148,7 @@ jobs:
       # The release binary is what both the smoke test and the flow run under, so build it once.
       - name: Build the flux binary
         if: steps.creds.outputs.have_key == 'true'
-        run: cargo build --release --bin flux
+        run: scripts/owned-cargo build --release --bin flux
 
       # A live provider turn against a cheap model. Its failure blocks the cut by ordering: a broken
       # provider path is exactly the class the offline gate cannot see. Legs whose own credential is

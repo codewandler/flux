@@ -218,14 +218,27 @@ grep -Fq 'scripts/build-embedded-docs.sh --check' "$ROOT/scripts/cut-release.sh"
   || fail "cut-release does not verify the release-current embedded docs"
 grep -Fq 'crates/flux-server/assets/public-docs.zip' "$ROOT/scripts/cut-release.sh" \
   || fail "cut-release does not transact and commit the embedded docs archive"
+embedded_build_line=$(grep -nF 'scripts/build-embedded-docs.sh >/dev/null' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+embedded_check_line=$(grep -nF 'scripts/build-embedded-docs.sh --check >/dev/null' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+release_commit_line=$(grep -nF 'git commit --only "${COMMIT_PATHS[@]}"' "$ROOT/scripts/cut-release.sh" | cut -d: -f1)
+[ -n "$embedded_build_line" ] && [ -n "$embedded_check_line" ] && [ -n "$release_commit_line" ] \
+  && [ "$embedded_build_line" -lt "$embedded_check_line" ] \
+  && [ "$embedded_check_line" -lt "$release_commit_line" ] \
+  || fail "cut-release must regenerate and verify embedded docs before the release commit"
+grep -Fq 'COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip)' "$ROOT/scripts/cut-release.sh" \
+  || fail "public-docs.zip is not a path-limited member of the release commit"
 grep -Fq 'promotes those artifacts without recompiling' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
   || fail "publishing runbook does not document build-once promotion"
 
+grep -Fq 'scripts/build-embedded-docs.sh --check' "$WORKFLOW" \
+  || fail "candidate workflow does not prove embedded docs at the exact checked-out SHA"
 grep -Fq 'scripts/release-full-gate.sh "$GITHUB_SHA"' "$WORKFLOW" \
   || fail "candidate workflow does not gate its exact checked-out SHA"
+embedded_gate_line=$(grep -nF 'scripts/build-embedded-docs.sh --check' "$WORKFLOW" | cut -d: -f1)
 gate_line=$(grep -nF 'scripts/release-full-gate.sh "$GITHUB_SHA"' "$WORKFLOW" | cut -d: -f1)
 receipt_line=$(grep -nF 'scripts/release-candidate.sh write release-candidate.txt' "$WORKFLOW" | cut -d: -f1)
-[ -n "$gate_line" ] && [ -n "$receipt_line" ] && [ "$gate_line" -lt "$receipt_line" ] \
+[ -n "$embedded_gate_line" ] && [ -n "$gate_line" ] && [ -n "$receipt_line" ] \
+  && [ "$embedded_gate_line" -lt "$gate_line" ] && [ "$gate_line" -lt "$receipt_line" ] \
   || fail "candidate receipt can be written before the mandatory full gate"
 grep -Fq 'FLUX_RELEASE_CANDIDATE_OWNS_GATE' "$FLOW_WORKFLOW" \
   || fail "automatic flow does not delegate the one full gate to its exact-SHA candidate"

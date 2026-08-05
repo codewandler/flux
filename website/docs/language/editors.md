@@ -28,8 +28,10 @@ cargo install --git https://github.com/codewandler/flux flux-lsp
 ```
 
 From a clone of the repository, `cargo install --path crates/flux-lsp` does the same, and
-`task install` installs the `flux` CLI and `flux-lsp` together. Verify with `which flux-lsp` —
-the editor configs below expect it on `$PATH`.
+`task install` installs the `flux` CLI and `flux-lsp` together. The Task path requires Python 3.10+
+before Cargo starts so it can hold cross-process ownership of the selected reusable target; its
+platform launcher is automatic, with `PYTHON=<executable>` as an explicit override. Verify with
+`which flux-lsp` — the editor configs below expect it on `$PATH`.
 
 ## What the LSP gives you
 

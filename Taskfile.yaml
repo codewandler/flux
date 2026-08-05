@@ -1,30 +1,119 @@
 # https://taskfile.dev
 version: '3'
 
+vars:
+  # Python is the pre-Cargo bootstrap for build ownership. The platform launchers select and
+  # validate Python 3.10+ before Cargo starts; PYTHON remains an explicit executable-path override.
+  PYTHON: '{{default "" .PYTHON}}'
+
 tasks:
   test:
     desc: Run the workspace unit tests
+    dir: '{{.TASKFILE_DIR}}'
     cmds:
-      - cargo test --workspace --lib
+      - task: _test-owned-posix
+      - task: _test-owned-windows
+
+  _test-owned-posix:
+    internal: true
+    platforms: [linux, darwin]
+    cmds:
+      - 'FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}" -- cargo test --workspace --lib'
+
+  _test-owned-windows:
+    internal: true
+    platforms: [windows]
+    cmds:
+      - 'set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}" -- cargo test --workspace --lib'
 
   install:
     desc: Run unit tests, then install the flux binary and the flux-lsp language server
+    dir: '{{.TASKFILE_DIR}}'
     cmds:
-      - task: test
-      - cargo install --path crates/flux-cli --force
-      - cargo install --path crates/flux-lsp --force
+      - task: _install-owned-posix
+      - task: _install-owned-windows
+
+  _install-owned-posix:
+    internal: true
+    platforms: [linux, darwin]
+    cmds:
+      # One outer shared owner spans verification and both installs; the shell is its single child.
+      - >-
+        FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py shared
+        --workspace-root "{{.TASKFILE_DIR}}" -- sh -c
+        'cargo fetch --locked && cargo test --workspace --lib && cargo install --path crates/flux-cli --force && cargo install --path crates/flux-lsp --force'
+
+  _install-owned-windows:
+    internal: true
+    platforms: [windows]
+    cmds:
+      - >-
+        set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py shared
+        --workspace-root "{{.TASKFILE_DIR}}" -- cmd /d /s /c
+        "cargo fetch --locked && cargo test --workspace --lib && cargo install --path crates/flux-cli --force && cargo install --path crates/flux-lsp --force"
+
+  clean:
+    desc: Clean the selected root-workspace Cargo target after all active builds finish
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - task: _clean-owned-posix
+      - task: _clean-owned-windows
+
+  _clean-owned-posix:
+    internal: true
+    platforms: [linux, darwin]
+    cmds:
+      - 'FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py exclusive --refuse --workspace-root "{{.TASKFILE_DIR}}" -- cargo clean --workspace'
+
+  _clean-owned-windows:
+    internal: true
+    platforms: [windows]
+    cmds:
+      - 'set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py exclusive --refuse --workspace-root "{{.TASKFILE_DIR}}" -- cargo clean --workspace'
 
   plugins:build:
     desc: Build every native flux plugin in release mode
+    dir: '{{.TASKFILE_DIR}}'
     cmds:
-      - cargo build --manifest-path plugins/Cargo.toml --workspace --release
+      - task: _plugins-build-owned-posix
+      - task: _plugins-build-owned-windows
+
+  _plugins-build-owned-posix:
+    internal: true
+    platforms: [linux, darwin]
+    cmds:
+      - 'FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}/plugins" -- cargo build --workspace --release'
+
+  _plugins-build-owned-windows:
+    internal: true
+    platforms: [windows]
+    cmds:
+      - 'set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}\plugins" -- cargo build --workspace --release'
 
   plugins:install:
     desc: Build and register every native flux plugin
+    dir: '{{.TASKFILE_DIR}}'
     cmds:
-      - task: plugins:build
-      - flux plugin install "{{.TASKFILE_DIR}}/plugins/target/release"
-      - flux plugin ls
+      - task: _plugins-install-owned-posix
+      - task: _plugins-install-owned-windows
+
+  _plugins-install-owned-posix:
+    internal: true
+    platforms: [linux, darwin]
+    cmds:
+      - >-
+        FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py shared
+        --workspace-root "{{.TASKFILE_DIR}}/plugins" -- sh -c
+        'cargo build --workspace --release && flux plugin install "$CARGO_TARGET_DIR/release" && flux plugin ls'
+
+  _plugins-install-owned-windows:
+    internal: true
+    platforms: [windows]
+    cmds:
+      - >-
+        set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py shared
+        --workspace-root "{{.TASKFILE_DIR}}\plugins" -- cmd /d /s /c
+        "cargo build --workspace --release && flux plugin install "%CARGO_TARGET_DIR%\release" && flux plugin ls"
 
   deps:upgrade:
     desc: Upgrade every dependency to latest (incl. major bumps) in the root AND plugins workspaces, then refresh both lockfiles

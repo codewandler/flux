@@ -10,22 +10,58 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** see the [roadmap](../roadmap.md) header for the current version and the
-  [CHANGELOG](../../CHANGELOG.md) for the itemized history; its `[Unreleased]` section is work
-  merged since the latest cut. (This block deliberately names no version: a hand-written release
-  claim here once rotted thirteen releases stale before being caught, 2026-08-05.)
-- **Epics in flight:** the generated **Now (in progress)** list below is the source of truth;
-  epics carry an `(epic)` suffix, and each epic's narrative lives in the [roadmap](../roadmap.md).
-- **A pattern worth keeping** (from the v0.42.0 review cycle): three stories shipped with a ticked
-  acceptance box that no test observed — found by mutating the wiring line and seeing no test fail,
-  by an ingest asserting a memory bound its code did not have, and by a byte ceiling unenforced on
-  one of three adapters. None of these fail a gate; reviews look for exactly this class.
-- **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the
-  loop machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
+- **Released:** v0.42.0 (2026-07-31) — see [CHANGELOG](../../CHANGELOG.md) and the
+  [roadmap](../roadmap.md). Cut as a **MINOR**, which pre-1.0 is this repo's breaking signal, for two
+  independent breaking changes: `flux_flow::voice::VoiceTurnHandler::turn` gained a `Speaker` (D-204),
+  and `SubAgents` gained a public field (C-299). Both are in the publish closure.
+- **Shipped in v0.42.0** — nine stories, and the honest summary is that three of them are foundations
+  whose *consumers* are not wired yet:
+  **Rooms.** D-204 landed a `Room` port (presence, occupants, attributed inbound text) as channel kind
+  `room`, and D-205 landed a real **XMPP MUC backend** over RFC 7395 — no browser, no vendor SDK. The
+  dependency choice was a safety decision: `tokio-xmpp` opens its own socket and resolves its own DNS,
+  so its egress could not route through `guard_url_scoped`; `quick-xml` plus ~200 lines of our own
+  protocol could. `address_rule` is now **enforced** (D-207): the agent answers only when addressed and
+  a per-room sliding reply budget converges an agent pair. ⚠ The default is `mention`, so an existing
+  room deployment goes quiet until it sets `address_rule "always"`. Addressing matches the nick the
+  *service* assigned (status 110), not the configured one — matching the config after a reassignment
+  would make the agent permanently silent.
+  **Harness history.** C-214 extracts `HarnessMessage` from codex/claude-code/opencode transcripts;
+  C-215 exposes it as `search(query, harness)` with containment that is *structural* rather than
+  maintained — off by default by construction, redacted and escaped **at ingest**, per-harness subject.
+  No in-tree host wires it yet, deliberately.
+  **The rest.** C-231 stopped the ad-hoc prune from silently deleting cross-session memory (caught
+  before it had a caller). C-299 made `[limits]` bind for the binary and descend into sub-agents,
+  **per-child** — a shared ceiling was built first and reproduced a real deadlock. L-97 added Flux
+  Glyph, an opcode projection with a round-trip proven as a property over all 43 node kinds. C-223
+  landed `pane.open/update/close` **partial** — the vocabulary is inert until C-305 wires the sink.
+  D-214 pinned the Zendesk flow's op set to what the connector pack projects.
+- **What the reviews caught, because it is the pattern worth keeping:** three stories shipped with a
+  ticked acceptance box that no test observed. C-299's was found by *mutating the wiring line* and
+  seeing no test name change; C-215's ingest asserted a memory bound its code did not have (an OOM on
+  real data); C-214's byte ceiling was unenforced on one of three adapters. None of these fail a gate.
+- **Epics in flight:** **meeting rooms** (D-203) — D-204/D-205 done, D-207 raised to priority 5 because
+  it now gates safe use rather than polish; the design's self-announcement invariant is still in no
+  story's Acceptance. **harness history** (C-212) — C-214/C-215 done, C-302 (flux adapter) and C-216
+  (redaction corpus) open. **agent-authored surface** (C-219) — C-223 partial, C-305/C-306 filed.
+  **Zendesk automation** (D-199) — one bullet open, owned by another repository.
+- **Filed from review findings this cut, not from planning:** C-302…C-309. Two are security-relevant
+  (C-303 query injection reaches a shipped path; C-304 a seam the connector pack's source wrongly
+  claimed was already filed), and C-308 + C-309 are the same class — a **red test the workspace gate
+  cannot see**, because a target behind a non-default feature is invisible to `cargo test --workspace`.
+  Both are now closed, and the class is closed with them: `scripts/check-feature-gated-tests.sh` makes
+  every `(package, feature)` pair in both workspaces carry a disposition, so "nobody thought about the
+  gate" stops being possible. Its remaining two `skip`s are cost-based, not defect-based.
+  C-309 is the one worth reading: the fixture was not stale and the authority contract had not
+  regressed — the *projection* under-declared `access`, so the effect-less `[Process, Network]`
+  default and the contract were mutually unsatisfiable, and the fix that made the tests pass most
+  easily would have removed the authorization floor rather than satisfied it.
+- **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
+  machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green in **both** workspaces — `cargo test` · `clippy --all-targets -D warnings` · `fmt`
-  · the `flux-codegate` layering lint. For publish/protocol drift, run
-  `scripts/check-host-kit-protocol-drift.sh` and `scripts/check-crate-versions.sh` rather than
-  trusting a note written here at some earlier cut.
+  · the `flux-codegate` layering lint. ⚠ `scripts/check-host-kit-protocol-drift.sh` is **red and
+  pre-existing**: `codewandler-flux-plugin-protocol` 1.1.0 is live on crates.io while the published
+  `codewandler-flux-host-kit` still requires `^1`. The in-repo half is already correct; what is owed is
+  a pack/host-kit publish, which is a registry upload.
 
 <!-- BEGIN track:board -->
 <!-- Generated by /track:board (track plugin) from story frontmatter. Do not hand-edit this region; edit the stories and re-run /track:board. -->
@@ -35,7 +71,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 - [A-119 — Agent fleet runtime — addressing, lifecycle and discovery for a fleet of agents (epic)](A-119-agent-fleet-runtime-epic.md) · Agent · EPIC — C-243 shipped the AgentRuntime port plus process/external workers; Docker/Kubernetes placement, address vocabulary and discovery remain
 - [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
-- [C-239 — The fleet runs the track / impl-coord loop — complete and usable (epic)](C-239-fleet-loop-epic.md) · Core · EPIC — the model reasons, the host enforces: a WaveCoordinator does isolation/gate/merge/revert/ledger so the loop's invariants hold even when the model is wrong
+- [C-239 — The fleet runs the track / impl-coord loop — complete and usable (epic)](C-239-fleet-loop-epic.md) · Core · EPIC — the model reasons, the host enforces: isolated story writers feed one ordered wave branch, one final gate and one publication decision
 - [C-251 — Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version](C-251-release-from-a-push-flux-authored.md) · Core · flux automating its own release is the most honest dogfood there is; the load-bearing decision is that the MODEL writes prose and the HOST does version math, because a wrong version on crates.io is irreversible
 - [C-255 — Adversarial review remediation — close every actionable finding from the three 2026-07-30 reviews (epic)](C-255-adversarial-review-remediation-epic.md) · Core · REVIEW EPIC — three independent passes rated 5.5/10, 6/10, and 7/10; all reject Flux as a standalone unattended boundary
 - [C-314 — Two `[limits]` wirings nothing observes, and an occupancy test that guards less than its prose](C-314-limits-wirings-nothing-observes.md) · Core · filed from C-307's review, not from planning — `flux review` and `flux record` newly honour [limits], but deleting BOTH wirings leaves the entire flux-cli suite green; this is the exact rot C-299 and C-307 exist to close, newly planted on two more call sites
@@ -43,8 +79,8 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-394 — flux-system as a shared execution substrate (epic)](C-394-execution-substrate-epic.md) · Core · EPIC — file/env/process/network ports and the authenticated remote system ship; inbound-listener migration and the owned container-process backend remain
 - [C-409 — Channel-served HTTP has none of flux-server's resource limits](C-409-channel-served-http-has-no-resource-limits.md) · Core · F3 of the 2026-08-01 security-posture review at 0.47.1. C-189 gave flux-server body caps, timeouts, rate limits and concurrency admission; the two channel adapters that bind their own listeners got none of it. Not an auth bypass — both refuse a non-loopback bind without authentication — but a webhook behind a proxy inherits none of its sibling's hardening
 - [C-435 — The port has no network trait — and no guarded inbound primitive at all](C-435-a-guarded-network-port.md) · Core · ⚠ measured 2026-08-01: port.rs declares FOUR traits — GuardedEnv, GuardedProcess, GuardedHostFiles, GuardedWorkspaceFiles — and NONE for network. Egress guarding lives in net.rs as free functions; inbound binding is scattered (flux-server's guard_open_bind, and C-409 found the adapters that bind their own listeners got none of its hardening). The prerequisite for embedding any protocol stack under flux's guard
+- [C-491 — Present the Flux ecosystem from the release-matched local docs](C-491-interactive-flux-engineering-presentation.md) · Core · A 15-minute dev+SRE deck: Flux's runtime boundary, a guarded local demo, connectors, Exchange, and honest shipped-vs-direction status.
 - [C-500 — Connector-native integrations replace the official plugin fleet (epic)](C-500-connector-native-integrations-epic.md) · Core · EPIC — Flux embeds one Exchange client while all official integrations execute in Exchange; the Flux release ends with no plugin artifacts or fallback
-- [C-530 — Stream built-in review flow progress through the shared flow-run sink](C-530-stream-built-in-review-flow-progress.md) · Core · flux review must show its context, concurrent reviewers, and aggregation while the immutable built-in flow is running
 - [D-199 — Zendesk automation — deterministic support workflows with bounded AI (epic)](D-199-zendesk-automation-epic.md) · Agent · EPIC — L-92, A-136, D-200, D-201, D-202 all closed; D-214 landed flux's half of the connector-pack interop. Open on ONE external dependency: two flux-connectors gaps (no zendesk `authority`; `{subdomain}` unresolved) that no flux change can close
 - [D-206 — JaaS / Brave Talk room backend — guest-token acquisition and refresh](D-206-jaas-brave-talk-room-backend.md) · Agent · layers vendor token acquisition on D-205's XMPP machinery: CSRF + PUT /api/v1/rooms/<room>, conference-request, 3h token refresh; ⚠ read Brave's acceptable-use before this is more than own-room use
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
@@ -71,8 +107,8 @@ _flux's central claim is that **the LLM is not the runtime** — authored contro
 - [D-222 — `EventDecl::when` const-equality matching — the narrowed event a connector arm currently refuses](D-222-connector-event-when-matching.md) · Agent · filed from D-216's implementation, not from planning — `when` was named as v1 scope in D-216's Notes and the epic design's item 5, but D-216 shipped a load REFUSAL instead of matching, deliberately and fail-closed; this is the story that decides whether matching arrives or the refusal becomes the permanent answer
 
 ### Connector Native Integrations
-- [C-509 — Complete the first-run local Exchange and integration CLI tutorial](C-509-complete-first-run-local-exchange-integration-cli.md) · Core · Milestone 1 product exit: one clean Flux install starts local Exchange, connects named custom-origin GitLab and Jira, grants, diagnoses and invokes without holding vendor credentials
-- [C-510 — Install and supervise a verified local Exchange release](C-510-install-and-supervise-a-verified-local-exchange.md) · Core · Milestone 1 runtime prerequisite: a signed monotonic Exchange channel, atomic verified cache and same-binary authenticated supervisor — never PATH, PID signalling or an unsigned fallback
+- [C-509 — Complete the first-run local Exchange and integration CLI tutorial](C-509-complete-first-run-local-exchange-integration-cli.md) · Core · Queued behind X-134 implementation, X-126 and C-510: C-509 owns native plan/grant UX and typed ceremony/mint inputs, never secret-bearing FXLM
+- [C-510 — Install and supervise a verified local Exchange release](C-510-install-and-supervise-a-verified-local-exchange.md) · Core · Queued behind X-134 implementation and X-126: lifecycle exposes only typed guard-bound ceremony and mint launches
 
 ### Connector Platform
 - [C-405 — The plugin pack carries twelve private percent-encoders and one has already drifted](C-405-the-plugin-packs-twelve-encoders-have-started-to-drift.md) · Core · found by C-313's census — drift observed, not predicted. `plugins/gitlab`'s `enc` omits `~` from the unreserved set, so it emits %7E where the other eleven emit `~`. The nested workspace structurally cannot delegate to flux-core, so the fix is a shared encoder in host-kit — a protocol-line change owing a pack release
@@ -145,6 +181,12 @@ _`docs/reviews/single/2026-08-01-pi-flux-harness-comparison.md` is two isolated 
 ### a portable Flux runtime — WebAssembly as a second execution substrate
 - [C-268 — A portable Flux runtime — WebAssembly as a second execution substrate (epic)](C-268-portable-wasm-runtime-epic.md) · Core · EPIC — run someone else's .flux inside a sandbox that starts with NO authority; port the interpreter, never a Flux-to-Wasm codegen. Blockers measured: flux-system::System is a struct not a trait; flux-flow binds rusqlite in 1/22 files
 
+### Release trust residuals — 2026-08-04
+- [C-353 — Protect main and gate release secrets behind protected environments](C-353-protect-main-and-gate-release-secrets.md) · Core · v0.56.0 blocker — cumulative tag rulesets, PR-only main, repository-only flux-release-promoter, separate release-control/release environments, and external value-free secret entry
+- [C-354 — Scope promotion and publication tokens to the jobs that consume them](C-354-least-privilege-publish-workflow-tokens.md) · Core · v0.56.0 blocker — App-only promotion in release-control; tag-only signing/GitHub Release/Cargo publication in release; plugin branch publication removed
+- [C-355 — Bind artifact digests into the release-candidate receipt](C-355-bind-artifact-digests-into-the-candidate-receipt.md) · Core · v0.56.0 blocker — receipt v3 binds the exact seven non-expired artifacts-* ZIPs by name, immutable ID, size and GitHub-reported sha256 digest before namespaced extraction or publication
+- [C-516 — Make release preview, exact asset inventory, and latest-state audit one promotion gate](C-516-release-preview-exact-assets-and-latest-promotion-gate.md) · Core · v0.56.0 blocker — cut PR through ci, merged-main candidate/tag binding, full-message versioning, exact 28 assets/runs and fleet/latest audit before cleanup
+
 ### Remote agents — run the agent here, land the effects there
 _Running an agent on your own machine means your machine is what it touches. Sometimes that is exactly_
 - [C-463 — Name the autonomy postures — `auto_approve: bool` is doing the work of a first-class choice](C-463-autonomy-postures.md) · Core · ⚠ owner-directed: no per-effect approval is a VALID model, not a degraded one — research, security hardening and long exploration are cases where interrupting the agent per effect is actively the wrong design. flux already ships that posture (C-410: unattended = fail-closed sandbox + auto-approve) and never names it, so it reads as safety switched off
@@ -212,10 +254,12 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 ## Backlog
 - [C-161 — User-defined review checks — project criteria layered over the built-in reviewer roles](C-161-user-defined-review-checks.md) · Core · flux review runs three embedded reviewer roles (review.rs:100-108) overridable only wholesale via .flux/agents/review-*.md — there is no per-CRITERION project check with its own severity and path scope, though --fail-on <severity> already exists (args.rs:381-384) so the severity plumbing is done
 - [C-163 — Plugin-registered commands and host UI prompts](C-163-plugin-commands-and-host-ui.md) · Core · plugins expose OPS only — PluginCapabilities (flux-plugin-protocol lib.rs:515-578) has no ui/command verb, and the host-callback surface is just host.read/host.write — so a plugin cannot add a slash command or ask the user a question; the frame protocol is command-keyed (lib.rs:44-59) on an independent additive 1.x line, which is exactly the seam this needs
+- [D-250 — One datasource registry — enumerate every declared datasource across indexed and live modes](D-250-one-datasource-registry-across-modes.md) · Agent · Decision 0006 rule 2: the two contracts stay two clean traits; what merges is identity — `sources` reports both modes, so the agent can answer \"what do I know?\" completely
+- [D-251 — One authority-subject grammar: `datasource:<name>/<entity>[/<id>]` — live ops gain the prefix, web.page normalizes, boards use `board:`](D-251-datasource-authority-subject-grammar.md) · Agent · Decision 0006 rule 13 — flux's permission subjects currently use five different datasource grammars; this story leaves exactly one, plus a separate `board:` namespace for the write-capable surface
+- [D-252 — DatasourceDecl kind extension — a tenant Exchange Datasource binding and the compiled-in connectors catalogue](D-252-datasource-decl-exchange-and-catalogue-kinds.md) · Agent · Decision 0006 rule 3: Flux-Lang declares every datasource — the `datasource` decl keeps its indexed program-local kinds and gains two new ones; unknown kinds stay hard errors, registration stays an owner decision
+- [D-253 — flux-datasource 1.x counterparties — flux-connectors and flux-exchange compose the published contract; board.rs is flux-internal within 1.x](D-253-datasource-protocol-line-counterparties.md) · Agent · Decision 0006 rule 4: flux owns the wire vocabulary on its own protocol line; after plugin removal the consumers change but the composition rule (Decision 0004, connector-secrets) applies verbatim
+- [D-254 — Data pipelines — a pipeline is a Flux-Lang Program (design exploration)](D-254-data-pipelines-exploration.md) · Agent · design-exploration, Milestone 3+ — reads + transforms + a declared sink, triggered, installable as an App; no first-class pipeline syntax; the secret-record invariant binds immediately
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
-
-### The agent-authored surface — panes the model opens, config it can safely change
-- [C-527 — ui.display — show the user a file, diff, flow or artifact by reference](C-527-ui-display-reference-first-user-presentation.md) · Core · The agent should point at what it already made; it must not spend context reconstructing a file, diff or flow merely to show it to the user
 
 ### Agent change recovery and provenance — 2026-08-01
 - [C-382 — Agent change recovery and provenance — know what you changed, and be able to take it back (epic)](C-382-agent-change-recovery-and-provenance-epic.md) · Agent · EPIC — 15 git ops and no history-preserving undo; write receipts are pre-dispatch and content-blind; every read-only git observer is refused the evidence phase; the transcript datasource is built and reachable from no shipped assembly
@@ -268,10 +312,6 @@ _The hosted connectors platform needs ordinary customer storage and credential s
 ### Connector Platform
 - [C-420 — The connectors seam — a vendor credential flux is structurally unable to hold (epic)](C-420-connector-platform-epic.md) · Core · tracker filed 2026-08-01 by a board audit. ⚠ Seven of its eight stories are DONE and the epic had no narrative anywhere — no tracker, no design, no roadmap entry — so the credential boundary, one of flux's central invariants, was recorded only inside the stories that built it
 
-### Context-local Git worktrees
-_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
-- [C-525 — Tell the model its confinement and worktree topology, then expose native worktree operations](C-525-surface-confinement-and-native-worktree-operations.md) · Core · No trial-and-error escape probes: inject proven sandbox/worktree facts before the first turn and manage linked worktrees through guarded Git ops
-
 ### Egress pinning and confinement residuals — 2026-08-01
 - [C-345 — Egress pinning and confinement residuals — pin every outer adapter, not just the reviewed ones (epic)](C-345-egress-pinning-and-confinement-residuals-epic.md) · Core · EPIC — NET-01/NET-02/PROC-01/PROC-02 all validate as historical-fixed, but the fix was applied per REVIEWED adapter; three unreviewed egress paths still resolve twice, one while carrying a credential
 - [C-346 — Pin A2A push-notification delivery to the addresses its guard vetted](C-346-pin-a2a-push-notification-delivery.md) · Core · the NET-01 shape on a path that ships X-A2A-Notification-Token — guarded but unpinned, on a shared pooled client with no no_proxy(); C-59 claims this is closed and it is not
@@ -291,16 +331,21 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 - [C-433 — A distilled sequence of clicks is automation, not a test — what the agent verified has to survive freezing](C-433-a-frozen-script-asserts.md) · Core · ⚠ the epic's worst failure mode: a green suite that asserts nothing is worse than no suite, because it is trusted. 'Test the happy path' means checking something; a frozen click sequence proves only that the clicks did not error
 - [C-434 — The worked recipe — explore a real site, freeze it, run the frozen script in CI](C-434-the-e2e-recipe.md) · Core · this epic's proof and a member of the flux-recipes family (C-427's contract applies). Filed under explore-then-freeze so it is not orphaned if that epic re-sequences. ⚠ Needs a target that can be committed — a public demo app, not a production login
 
+### the first-class board — one fixed tool surface, pluggable backends
+_Flux-roadmap Decision 0006 gives the family one datasource definition — a named, declared,_
+- [A-115 — JiraBoard through Exchange-governed operations, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · re-pointed by Decision 0006: the vendor mapping is a connector board member and every write an admitted Exchange operation — the plugin path this was written over is deleted by Milestone 5; the status↔State mapping stays config, not code
+- [A-118 — GitlabBoard — a second Exchange-governed tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · re-pointed by Decision 0006 away from plugins/gitlab (Milestone 5 deletes the plugin path); deferrable — its value is the proof that WorkBoard is not 'Jira with a trait on top'
+- [A-134 — No SDK seam for a `WorkBoard` — decide whether boards are embeddable, then ship `ClientBuilder::try_with_work_board` if they are](A-134-sdk-seam-for-a-workboard.md) · Agent · absorbed into the first-class-board epic (Decision 0006) — the board's own SDK seam, matching try_with_live_datasource's all-in-one guarantees; live datasources have a documented seam, boards have none, so an embedder cannot bind a board at all
+- [A-148 — The first-class board — one fixed tool surface, pluggable backends (epic)](A-148-first-class-board-epic.md) · Agent · EPIC — the board leaves the datasource vocabulary per Decision 0006: its own `board` declaration, its own `board:` subject namespace, its own SDK seam; the 11-op WorkBoard surface stays identical across every backend
+- [L-130 — A first-class `board` declaration — retire the `kind \"board:*\"` datasource spelling](L-130-board-declaration-in-flux-lang.md) · Language · Decision 0006: the board leaves the `datasource` slot — `board <name>` is its own declaration, and a datasource kind can no longer name something that mutates
+
 ### Fleet coordinator — flux orchestrating flux across repos
-- [A-115 — JiraBoard over the existing jira plugin, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · the status↔State mapping is config, not code — Jira workflows differ per project, and a hardcoded transition name makes the backend work at exactly one company
-- [A-118 — GitlabBoard — a second real tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · deferrable past the epic's first release — its value is the proof that WorkBoard is not 'Jira with a trait on top'
 - [A-132 — A run-routed `Bus::emit` silently drops its event when the supervisor queue is full — decide the semantics and make them observable](A-132-run-routed-emit-drops-on-a-full-supervisor-queue.md) · Agent · filed from A-129's implementor report — pre-existing lossy path, but A-129's admission bound makes a full supervisor queue far more reachable, and `emit` returns `0` for both 'dropped' and 'nobody listening'
 - [A-133 — Startup does not strictly precede bus events under `App::run` — the run lease activates before `Start` completes](A-133-startup-strictly-precedes-bus-events.md) · Agent · filed from A-112's implementor report and still unaddressed — it has been living as a Note on A-129, which explicitly declined it as out of Acceptance
-- [A-134 — No SDK seam for a `WorkBoard` — decide whether boards are embeddable, then ship `ClientBuilder::try_with_work_board` if they are](A-134-sdk-seam-for-a-workboard.md) · Agent · filed from A-131's implementor report — live datasources have a documented SDK registration seam, boards have none, so an embedder cannot bind a board at all
 - [A-135 — `A2aClient` hardwires its transport, so there is no socket-free way to test a fleet journey](A-135-socket-free-fleet-journey-test.md) · Agent · A-117's blocker B3, the only one of its five with no owner — every fleet test today binds a real loopback listener because A2aClient offers no injectable-transport seam
 
 ### Fleet loop — the fleet runs the track / impl-coord loop
-- [C-242 — `fleet.integrate` — gate-after-every-merge becomes impossible to skip, and red reverts itself](C-242-fleet-integrate-gated-merge-revert-on-red.md) · Core · F5 — the sharpest instance of host-enforces: the op gates and merges or does neither, so the rule stops being an instruction a model can skip
+- [C-242 — `fleet.integrate` — one ordered wave, one unskippable final gate](C-242-fleet-integrate-gated-merge-revert-on-red.md) · Core · F5 — assemble story commits in order, gate the final combined tree once, and make publication on red impossible
 - [C-244 — The implement-worker template + `fleet.handoff` — a worker can only return text today, so reviewing the diff as evidence has no channel](C-244-worker-template-and-fleet-handoff.md) · Core · F7 — where Task.artifacts stops being decorative: SpawnOutcome has no artifact field and flux-server never populates artifacts, so the review half of the loop is unimplementable without this
 - [C-245 — `fleet.rework` — the 2-round budget as a host rule, so a third round parks instead of dispatching](C-245-fleet-rework-two-round-budget.md) · Core · F8 — rework must reach the SAME worker (contextId continuity already exists); the budget is enforced by the op, not asked for in a prompt
 
@@ -372,13 +417,10 @@ _Debugging an agent today means reading a transcript after the fact and running 
 ### Quorum Approval
 - [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
 
-### Release trust residuals — 2026-08-01
-- [C-352 — Release trust residuals — the authority half of REL-01 that no code change addressed (epic)](C-352-release-trust-residuals-epic.md) · Core · EPIC — bootstrap integrity and consumer attestation are genuinely closed (verified live against v0.44.0), but main has NO branch protection, NO rulesets, zero merged PRs and no release environment; ci.yml has been red on main for six pushes and blocked nothing
-- [C-353 — Protect main and gate release secrets behind a protected environment](C-353-protect-main-and-gate-release-secrets.md) · Core · branches/main/protection -> 404; rulesets -> []; environments -> only github-pages; merged PRs -> zero. Every assurance lane in the repo is advisory until this lands
-- [C-354 — Scope publication tokens to the steps that publish](C-354-least-privilege-publish-workflow-tokens.md) · Core · release-plugins.yml grants contents:write WORKFLOW-wide including the 5-target matrix that compiles third-party vendor deps; crates-io.yml holds CARGO_REGISTRY_TOKEN at job level across cargo publish, which runs every dependency build.rs
-- [C-355 — Bind artifact digests into the release-candidate receipt](C-355-bind-artifact-digests-into-the-candidate-receipt.md) · Core · the receipt binds version + commit SHA + run id only; host downloads artifacts-* by run id and uploads them verbatim, then attests whatever arrived — provenance of the workflow, not integrity of the build output
+### Release trust residuals — 2026-08-04
+- [C-352 — Release trust residuals — the authority half of REL-01 that no code change addressed (epic)](C-352-release-trust-residuals-epic.md) · Core · EPIC — main/release refs, a dedicated promotion App, separate control/publication environments and exact promotion closure remain open; C-353/C-354/C-355/C-516 block v0.56.0
 - [C-356 — Make attestation verification part of the primary install path](C-356-make-attestation-verification-the-default-install-path.md) · Core · the installer IS attested, but the documented primary path is download-then-sh with no verify step; the checksums it embeds come from the same workflow and are not an independent root
-- [C-357 — Record bus factor and independent review as owned risks with a review date](C-357-bus-factor-and-independent-review-risk-register.md) · Core · 486 of the last 500 commits from one identity, one admin collaborator, zero merged PRs ever, no release environment; three reviews rated this a material risk and no code change can close it
+- [C-357 — Record bus factor and independent review as owned risks with a review date](C-357-bus-factor-and-independent-review-risk-register.md) · Core · one administrator and 26 merged PRs but zero recorded reviews; no succession or incident-exercise evidence. Independent-review governance remains a visible residual, not a v0.56.0 publication blocker
 
 ### Remote agents — run the agent here, land the effects there
 _Running an agent on your own machine means your machine is what it touches. Sometimes that is exactly_
@@ -426,19 +468,6 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-104 — Materialize reverse actions — pre-image capture at the dispatch seam + EventKind::Compensated](A-104-preimage-capture-and-compensated-event.md) · Agent · capture runs inside the guarded boundary immediately before execution (NOT at approval time — prior bytes aren't knowable then); BREAKING: EventKind is a closed set, a new variant ⇒ MINOR
 - [A-105 — flux undo --turn <n> — reverse-batch reconstruction, LIFO execution, itemized report](A-105-flux-undo-turn.md) · Agent · the epic's headline verb; undo is NOT privileged — it runs through the ordinary approval + guarded envelope, so the undo itself records compensations and is undoable
 - [A-106 — Irreversibility disclosure — surface 'cannot be undone' at approval and to policy](A-106-irreversibility-disclosure-at-approval.md) · Agent · the risk signal that IS available at approval time because declaration is static; rides the C-182 op list + C-154 risk tint rather than adding a new sheet
-
-### TUI polish — 5 UX + 5 UI improvements
-_The TUI became a daily driver with A-65 and gained its boot splash + spinners with C-101. The_
-- [C-526 — Make TUI copy/paste work without hidden terminal choreography](C-526-tui-copy-paste-without-hidden-terminal-choreography.md) · Core · Dogfood report: text could neither be copied nor pasted in the TUI despite C-105 and C-111 being marked done
-
-### Usage Observatory
-- [C-512 — Usage Observatory — animated cross-harness, provider, and model replay in the TUI (epic)](C-512-usage-observatory-epic.md) · Core · EPIC — turn the existing cross-harness usage import and per-call Flux events into a truthful 4h/1d/7d time-lapse: replay activity, compare harness/provider/model token and cost totals, and keep estimated or unattributed data visibly honest
-- [C-513 — Extract one shared cross-harness usage timeline](C-513-shared-cross-harness-usage-timeline.md) · Core · Make flux usage and the future observatory consume one read-only timeline instead of copying CLI parsers into the TUI
-- [C-514 — Project truthful usage attribution and cost](C-514-truthful-usage-attribution-and-cost.md) · Core · Keep provider, model, timestamp and price provenance explicit; never double-count Flux call and turn totals
-- [C-515 — Build adaptive usage buckets and comparisons](C-515-adaptive-usage-buckets-and-comparisons.md) · Core · Derive stable plot-width buckets, cumulative totals, hierarchy groups and previous-period deltas from the truthful timeline
-- [C-516 — Ship the static Usage Observatory TUI](C-516-static-usage-observatory-tui.md) · Core · Make the observatory complete and responsive before motion: KPIs, route flow, timelines, comparisons, filters and inspection
-- [C-517 — Add deterministic usage replay and bounded animation](C-517-deterministic-usage-replay-and-animation.md) · Core · Drive the static observatory with a virtual clock, seekable playback, coalesced pulses and bounded per-frame work
-- [C-518 — Close Usage Observatory accessibility, performance, and entry points](C-518-usage-observatory-closure.md) · Core · Wire navigation and help, preserve live /usage, and prove the complete observatory accessible and responsive
 
 ### Verified Webhook Channel
 - [C-292 — Webhook signature schemes — one parameterized HMAC, constant-time, replay-bounded](C-292-webhook-signature-schemes.md) · Core · four vendors' 'unique' schemes collapse to one algorithm over {digest, encoding, signed-template, tolerance}; test vectors must come from vendor documentation, never from our own implementation — and the verifier must accept a SET of candidate digests, because Stripe sends several v1= during a secret rotation
@@ -911,7 +940,6 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-488 — Prove and release generated WebSocket channels](C-488-prove-and-release-generated-websocket-channels.md) · Core · cross-repository e2e, environment-gated live Asterisk smoke, capability truth and ordered releases after the already-shipped plugin removal
 - [C-489 — Reject tracked Cargo build output](C-489-reject-tracked-cargo-build-output.md) · Core · make the codegate reject force-added target/ and target-* trees before binary garbage reaches main
 - [C-490 — Derive grounded insights from the durable session log](C-490-session-derived-insights.md) · Core · flux insights reports today's work; /insights reports the active session; code derives every fact and one tool-free model call narrates them
-- [C-491 — Present the Flux ecosystem from the release-matched local docs](C-491-interactive-flux-engineering-presentation.md) · Core · A dev+SRE deck: Flux's runtime boundary, a guarded local demo, connectors, Exchange, and honest shipped-vs-direction status. Shipped as 15 minutes/ten chapters in 0.53.0; C-528 grew it to ~20 minutes/thirteen.
 - [C-492 — Reserve Agent for the runtime across the family vocabulary](C-492-reserve-agent-for-the-runtime.md) · Core · Exchange's legacy bearer principal collides with Flux Agent; define App, Event, qualified providers, Managed Agent and Service Account once
 - [C-493 — Keep bundled SQLite on the declared MSRV](C-493-keep-bundled-sqlite-on-the-declared-msrv.md) · Core · rusqlite 0.40 pulled libsqlite3-sys build syntax newer than Rust 1.87; repair the published 0.52 line without raising the promise
 - [C-494 — The MSRV repair does not restore a vulnerable PDF parser](C-494-pdf-msrv-fix-does-not-restore-a-vulnerable-parser.md) · Core · the 1.87-compatible pdf-extract downgrade pulled lopdf 0.38, vulnerable to untrusted recursive PDF objects; make safe extraction opt-in and keep default fetches opaque
@@ -926,8 +954,12 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-507 — A malformed compaction environment override is silent on served agents](C-507-served-compaction-env-typo-is-silent.md) · Core · CLI and served agents now consume one flux-agent parse/outcome contract; malformed explicit values warn and fall back, while per-agent settings bypass the environment
 - [C-508 — Adopt the cross-repository Exchange-only integration program](C-508-adopt-the-cross-repository-exchange-only-program.md) · Core · Decision 0001 now governs the program: Exchange executes every official integration; Flux embeds one client and ships no local official fallback
 - [C-511 — Label the Exchange environment token as transitional](C-511-label-the-exchange-environment-token-transitional.md) · Core · C-503 compatibility must not be mistaken for C-509's secure first-run bootstrap
-- [C-528 — Grow the engineering presentation to thirteen chapters and harden its UX](C-528-presentation-thirteen-chapters-and-ux-hardening.md) · Core · Extend the C-491 deck with agent-loop, sessions, and model-strategy chapters; fix its stale Exchange claims; make it discoverable, printable, touch- and keyboard-robust.
-- [C-529 — Contributor docs freshness sweep: retire the compiler-thesis remnants and rotting status blocks](C-529-contributor-docs-freshness-sweep.md) · Core · architecture.md/CONTRIBUTING.md/roadmap.md still teach the retired plan-compiler thesis; board and roadmap status prose rotted 13-17 releases; several small doc gaps.
+- [C-512 — Flux-Lang writer — a specialist agent for checked authored automation (epic)](C-512-flux-lang-writer-epic.md) · Core · EPIC — a capability-scoped repository role authors canonical .flux programs, validates them without executing effects as a shortcut, and stays discoverable through a source-linked agent catalogue
+- [C-513 — Publish the complete agent catalogue and add the Flux-Lang writer](C-513-publish-the-agent-catalogue-and-flux-lang-writer.md) · Core · owner-directed first slice — add the flux-lang-writer role and make every shipped or tracked agent role discoverable through a GitHub-source-linked, census-tested public catalogue
+- [C-514 — Adopt the Decision 0006 datasource vocabulary](C-514-adopt-decision-0006-datasource-vocabulary.md) · Core · Decision 0006 now governs datasources: one declared read-only definition, two access modes, connector-owned definitions, Exchange-owned tenant bindings, flux-owned vocabulary/registry/declaration — and the board leaves the datasource vocabulary
+- [C-515 — Make embedded documentation freshness a mandatory PR and release gate](C-515-gate-embedded-docs-before-publication.md) · Core · PR website workflow currently admits stale public-docs.zip — regenerate, commit, then check the archive in every PR and publication path
+- [C-517 — Give task install a build-directory ownership contract](C-517-isolate-task-install-build-ownership.md) · Core · task install lost libsqlite3-sys compiler output while another cleanup overlapped the build; active targets need one explicit ownership or isolation rule
+- [C-528 — Execute independent native tool calls from one model response concurrently](C-528-concurrent-native-tool-call-batches.md) · Core · Flux-Lang parallel branches and runtime concurrency ceilings already exist, but the native agent loop awaits every model-emitted call in serial order; one response with N independent reads therefore pays N tool latencies
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)
@@ -973,7 +1005,7 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [D-43 — medium cluster schemars migration + parity ports (huggingface/opsgenie/docker)](D-43-medium-cluster-schemars-parity.md) · Agent · full D-36 per-plugin loop for the 3 medium plugins — schemars migration + fluxplane parity re-audit + ported gaps (3 workers in parallel); docker (33 ops, largest of the batch)
 - [D-44 — final cluster schemars migration + parity ports (websearch/jira/confluence/kubernetes/aws) — D-36 COMPLETE](D-44-final-cluster-schemars-parity.md) · Agent · the final batch — all 5 remaining plugins migrated in parallel; D-36 (schemars migration of all 17 in-repo plugins) is now COMPLETE
 - [D-45 — Enforce sql/asterisk per-call read timeout through the host conn.read](D-45-sql-asterisk-conn-read-timeout.md) · Core · Closes the D-40/D-41 deferred item — `timeout` is now wire-enforced, not just parsed.
-- [D-46 — Plugin pack release pipeline — per-plugin artifacts + signed index](D-46-plugin-pack-release-pipeline.md) · Core · workflow_dispatch `release-plugins.yml`: build the pack on 5 native runners, package per-plugin archives, emit a minisign-signed `plugins-index.json`, create the `plugins-v<ver>` release (`--latest=false`); core dist release untouched
+- [D-46 — Plugin pack release pipeline — per-plugin artifacts + signed index](D-46-plugin-pack-release-pipeline.md) · Core · historical workflow_dispatch publisher shipped; open C-354 makes dispatch build-only and reserves signing, GitHub Release and Cargo publication for the App-created plugins-v* tag event
 - [D-47 — Remote `flux plugin install <name>[@version]` — verified fetch into a versioned store](D-47-remote-plugin-install.md) · Core · the demand side: resolve the `plugins-v` release → verify minisign-signed index (embedded pubkey, no skip flag) → sha256-check → unpack to `~/.flux/plugins/bin/<name>/<version>/` → descriptor records version+sha256+source; local scan moves behind `install --dir`
 - [D-48 — Enforced pin/rollback — spawn-time hash verification over the versioned store](D-48-enforceable-pin-rollback.md) · Core · turn `flux plugin pin`/`rollback` from advisory labels into supply-chain statements: pin fetches+repoints+records hash, rollback is an offline flip to `previous`, and a sha256-carrying descriptor is re-hashed before every spawn (drift = hard refusal); `status` gains the verification column
 - [D-49 — Plugin naming + docs truth pass — the crate / the pack / the CLI](D-49-plugin-naming-docs-pass.md) · Core · docs-truth pass (C-16/L-19 pattern): apply the canonical trio vocabulary — the plugin protocol crate (`flux-plugin`) vs the plugin pack (`flux-plugin-<name>` binaries) vs the plugin CLI (`flux plugin …`) — and document the remote install path once it ships

@@ -464,9 +464,7 @@ pub(super) fn plan_detail_lines(plan: &flux_runtime::PlanApprovalRequest) -> Vec
         lines.push(format!("{} → {subject}", requirement.action.0));
     }
     for intent in &plan.intents.intents {
-        if let flux_spec::IntentTarget::Process { command } = &intent.target {
-            lines.push(format!("process.exec → $ {command}"));
-        }
+        lines.push(truncate(&intent.approval_subject(), 80));
     }
     let mut seen = std::collections::HashSet::new();
     lines.retain(|line| seen.insert(line.clone()));

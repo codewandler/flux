@@ -1,5 +1,14 @@
 # Design: datasource & endpoint discoverability
 
+> **Disposition (2026-08-04, C-514 / flux-roadmap Decision 0006).** This design's registry
+> direction resumes under 0006 rule 2: what merges across the two datasource contracts is
+> *identity* — Flux maintains **one registry** so a program or agent can enumerate every declared
+> datasource across both the indexed and live access modes, and `sources` reports both. That
+> widened scope is carried by [D-250](../stories/D-250-one-datasource-registry-across-modes.md);
+> the "spans three subsystems that do not share a registry" observation below is the problem
+> statement it inherits. Harness history remains a selector feature of the index, not a third
+> mode. The endpoint-discoverability half of this design (D-115…D-117, shipped) is unaffected.
+
 **Status:** proposed · **Pillar:** Agent + Core · **Stories:**
 [D-114](../stories/D-114-datasource-sources-op.md) ·
 [D-115](../stories/D-115-endpoint-group-surfacing.md) ·

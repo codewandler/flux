@@ -18,6 +18,23 @@ All notable changes to this project are documented in this file. The format is b
   `inline_program` address is parsed and revalidated against the live operation catalog, then runs
   through the same session, approval, guarded-IO, input-seeding, and reentry boundaries as stored
   names and workspace paths. Inline route receipts report no resolved filesystem path.
+- **Independent native gather calls from one model response now execute concurrently** (C-528).
+  Model stages and adaptive exploration share one batch scheduler that admits only idempotent,
+  low-risk, non-mutating calls with explicit read-only effects and an approval-free authorization
+  verdict. Pre-tool hooks, active cassettes, approval-sensitive calls, incomplete connector
+  `Network`-without-`Read` metadata, and every captured action remain ordered. Results retain the
+  provider's call order and ids across completion, refusal, failure and queue timeout; execution
+  still crosses the existing authorization, approval, cancellation, redaction, guarded-IO and
+  `max_concurrent_tool_calls` envelope.
+
+- **A tracked Flux-Lang writer role now authors checked `.flux` sources** (C-513).
+  `.flux/agents/flux-lang-writer.md` uses the coding profile and an explicit tool allow-list, reads
+  the repository language contract before editing, and separates parse/analyze checks from an
+  explicitly requested run through the ordinary guarded runtime. The public agent catalogue now
+  links every embedded fallback and tracked project role to its canonical source, with a census
+  test that detects inventory drift. The role narrows delegated capabilities; it does not create a
+  new authority boundary.
+
 - **Flux now embeds the Exchange Service Account client for official integrations** (C-503).
   Operator-only environment configuration binds one Exchange origin and bearer; its authenticated
   effective catalogue is adopted between turns and one-shot operations run through Exchange's HTTP
@@ -39,6 +56,45 @@ All notable changes to this project are documented in this file. The format is b
   and are mirrored in Prism, tree-sitter, TextMate and IntelliJ.
 
 ### Changed
+
+- **The fleet delivery contract now validates one integrated wave instead of every child merge.**
+  A named wave has at most one writer and isolated worktree per story, targeted checks at story
+  handoff, dependency-ordered integration on one branch, and one unskippable full repository gate
+  on the final combined tree. Overlapping write sets are serialized, child branches do not open
+  competing pull requests, and a red gate preserves the failed candidate while publishing nothing.
+  The still-backlog C-242 contract and its design were corrected before implementation; no runtime
+  behaviour changed.
+
+- **Flux-Lang's authoring-ergonomics roadmap now has implementation contracts for L-131 through
+  L-140.** The wave covers structural type aliases and nested records, typed task outputs and repair
+  branches, constructors and multiline values, settled fan-out, collecting loops, structured agent
+  context, and first-class `Option`/`Result` foundations. This release adds the reviewed contracts,
+  not those language features.
+
+- **Embedded public documentation freshness is now a mandatory PR and publication gate** (C-515).
+  The unfiltered pull-request workflow and exact-SHA release candidate both install the pinned
+  website dependencies and verify `public-docs.zip`; website publication checks before upload or
+  deployment. Contributor and release guidance now require regeneration, inclusion of a changed
+  archive in the same commit, and a post-commit freshness check.
+
+- **`confirm` approval gates now carry analyzer-derived intent sets**. A confirm body now reports
+  its effective operation names and host effects, unknown/failed body analysis remains explicit, and
+  bodyless confirms are represented as an explicit gate marker. Invalid confirm risk labels are now
+  rejected by analysis during the normal parse/analyze path.
+
+- **Datasources now carry the family's one declared read-only definition** (C-514). flux-roadmap
+  Decision 0006 governs the vocabulary: a datasource is a named, declared, read-only record surface
+  — *operations do; datasources know* — with exactly one access mode (indexed or live), one
+  registry direction across both modes, connector-owned vendor Datasource Definitions,
+  Exchange-owned tenant bindings and read seam, and a flux-owned wire vocabulary and Flux-Lang
+  declaration surface. The work board leaves the datasource vocabulary as a first-class
+  write-capable surface: a new epic charters its own `board` declaration, `board:` subject
+  namespace and SDK seam, and the Jira/GitLab board stories are re-pointed from the plugin path
+  Milestone 5 removes onto Exchange-governed operations. The concepts and ecosystem pages (and
+  their website mirrors), both public datasource pages, and the affected designs — the live-seam
+  non-goal's named consumers, the discoverability registry disposition, and a partial supersession
+  of the connector-backed storage facade — were reconciled in the same documentation-only change.
+  No runtime behavior changed.
 
 - **The Exchange environment bearer is now documented as transitional compatibility** (C-511).
   C-503's lower-level embedded-client setup remains available and redacted, but public and
@@ -126,6 +182,17 @@ All notable changes to this project are documented in this file. The format is b
   pairs carry reciprocal pointer notes, and `docs/designs/` states its convention in a README.
 
 ### Fixed
+
+- **Repository builds now own their Cargo target while compiler output is live** (C-517).
+  `task install` acquires one cross-process shared lease before the resolved target is first touched
+  and retains it across workspace library tests plus both supported binary installs. Every
+  repository build entry point uses the same persistent sibling lock; `task clean` requires
+  exclusive ownership and refuses with an actionable diagnostic while builders are active.
+  Absolute, workspace-relative and fleet-provided `CARGO_TARGET_DIR` values remain reusable, and
+  Python 3.10+ supplies the pre-Cargo portable bootstrap through native Linux/macOS `flock` and
+  Windows `LockFileEx` branches. The regression gate reproduces the old deterministic compiler
+  output disappearance class and separately observes a real bundled-SQLite object under
+  `release/build/libsqlite3-sys-*/out` without claiming an unobserved incident participant.
 
 - **JaaS rooms now close the two residual races in their otherwise-pinned join path** (C-413).
   Concurrent initial joins are serialized across check, handshake and install so only one session

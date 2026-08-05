@@ -18,6 +18,11 @@ permissions:
   contents: read
   actions: read
 
+# release.yml is dist-generated. Re-apply this ownership override after `dist generate`; the
+# structural release/inventory checks reject regeneration that restores an unowned `dist build`.
+env:
+  CARGO_TARGET_DIR: target
+
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
 # Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
@@ -88,6 +93,23 @@ jobs:
             echo "::error::candidate version $CANDIDATE_VERSION does not match workspace version $workspace_version"
             exit 1
           fi
+      # The candidate ref already points at cut-release.sh's committed transaction. Rebuild the
+      # public website from its lockfile and prove that exact commit owns the matching server
+      # archive before spending release-build time or permitting a candidate receipt.
+      - name: Install pinned website toolchain for the exact candidate
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install pinned website dependencies
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npm ci
+        working-directory: website
+      - name: Embedded documentation matches the exact candidate SHA
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: scripts/build-embedded-docs.sh --check
       - name: Install pinned release-gate toolchain
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -271,11 +293,20 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      - name: Build artifacts
+      - name: Build artifacts (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Build artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          rem release.yml is generated; keep cargo-dist under the same pre-Cargo target lease.
+          scripts\run-python3.cmd scripts\build_ownership.py shared --workspace-root "%CD%" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo dist ran successfully
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -324,7 +355,8 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
+          # release.yml is generated; keep cargo-dist under the same pre-Cargo target lease.
+          scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
