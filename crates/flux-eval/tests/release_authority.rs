@@ -656,25 +656,57 @@ fn release_flow_installs_the_locked_docs_toolchain_before_running_flux() {
     );
 }
 
-/// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`. The
-/// release and crates.io workflows are tag-push-triggered, so this workflow needs a separately
-/// configured push credential; otherwise a green auto-cut silently publishes nothing.
+/// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`, so the
+/// promotion path needs a separately configured credential; otherwise a green auto-cut silently
+/// publishes nothing. C-354 makes that credential the dedicated `flux-release-promoter` App rather
+/// than the publication PAT: the App's installation token is short-lived, repository-scoped, and is
+/// the one identity the tag-creation ruleset bypasses. `RELEASE_TOKEN` creates GitHub Releases from
+/// the tag-only `release` environment and is not a promotion identity at all.
 #[test]
-fn the_tag_push_uses_a_credential_that_can_trigger_the_publication_workflows() {
-    let code = release_flow_workflow_code();
+fn promotion_uses_the_dedicated_app_and_never_the_publication_token() {
+    let workflow = workflow_code("release-flow.yml");
     assert!(
-        code.contains("secrets.RELEASE_TOKEN"),
-        "release-flow.yml must use a non-GITHUB_TOKEN credential for its main/tag pushes; refs \
-         pushed with GITHUB_TOKEN do not trigger release.yml or crates-io.yml"
+        !workflow.contains("secrets.RELEASE_TOKEN"),
+        "RELEASE_TOKEN must not appear in release-flow.yml: it publishes a GitHub Release and must \
+         never be able to move main, a candidate ref or a tag"
     );
     assert!(
-        code.contains("actions: write") && code.contains("contents: read"),
-        "the workflow token needs Actions write to dispatch/watch the candidate, while repository \
-         contents stay read-only because RELEASE_TOKEN alone moves refs"
+        workflow.contains("secrets.PROMOTION_APP_PRIVATE_KEY")
+            && workflow.contains("vars.PROMOTION_APP_ID")
+            && workflow.contains("scripts/mint-promotion-token.sh"),
+        "release-flow.yml must mint the flux-release-promoter installation token from the App key \
+         and the non-secret App ID"
     );
     assert!(
-        !code.contains("contents: write"),
-        "do not give GITHUB_TOKEN contents write: RELEASE_TOKEN is the narrowly configured, \
-         trigger-capable credential for main and tag pushes"
+        workflow.contains("environment: release-control"),
+        "the promotion job must run in the release-control environment, which is the only place the \
+         App key exists"
     );
+    assert!(
+        workflow.contains("actions: write") && workflow.contains("contents: read"),
+        "the controller needs Actions write to dispatch/watch the candidate, while repository \
+         contents stay read-only because only the App token moves refs"
+    );
+    assert!(
+        !workflow.contains("contents: write"),
+        "do not give GITHUB_TOKEN contents write: the App installation token is the narrowly \
+         scoped, trigger-capable credential for the cut branch and the tag"
+    );
+
+    // The model half of the workflow must not be able to reach the promotion identity, which is a
+    // statement about the job boundary rather than about the file.
+    let cut_job = workflow
+        .split("\n  release-control:")
+        .next()
+        .expect("release-flow.yml must contain a release-control job");
+    for credential in [
+        "PROMOTION_APP_PRIVATE_KEY",
+        "PROMOTION_TOKEN",
+        "RELEASE_TOKEN",
+    ] {
+        assert!(
+            !cut_job.contains(credential),
+            "the model/smoke/scribe/cut job must not reference {credential}"
+        );
+    }
 }

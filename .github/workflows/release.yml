@@ -122,15 +122,10 @@ jobs:
       - name: Mandatory full gate for the exact candidate SHA
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: scripts/release-full-gate.sh "$GITHUB_SHA"
-      - name: Check release token is configured
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        env:
-          RELEASE_TOKEN_CONFIGURED: ${{ secrets.RELEASE_TOKEN != '' }}
-        run: |
-          if [ "$RELEASE_TOKEN_CONFIGURED" != "true" ]; then
-            echo "::error::RELEASE_TOKEN is required for tag publishes. Configure a fine-grained PAT for this repo with Contents: write; GITHUB_TOKEN has produced HTTP 403 on release creation."
-            exit 1
-          fi
+      # C-354: the plan job does not read RELEASE_TOKEN, not even to test that it is configured.
+      # `secrets.RELEASE_TOKEN != ''` is still a reference to the credential from a job that plans,
+      # builds and holds the model-visible manifest — and its absence is reported by the one job
+      # that actually holds it, in the `release` environment, before anything is published.
       - name: Install dist
         shell: bash
         run: scripts/install-release-tooling.sh
@@ -436,7 +431,10 @@ jobs:
           echo "- Candidate run: \`$GITHUB_RUN_ID\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Retention: 14 days; after expiry the tag workflow rebuilds explicitly" >> "$GITHUB_STEP_SUMMARY"
 
-  # Determines if we should publish/announce
+  # Assembles and CHECKS the exact asset set. C-354: this job holds no publication authority at all
+  # — no environment, no write permission, no long-lived secret. Everything it produces is handed to
+  # the two authority-bearing jobs below as an ordinary workflow artifact, so a defect here cannot
+  # reach a signing key, a Release credential or the attestation identity.
   host:
     needs:
       - plan
@@ -449,12 +447,8 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     permissions:
       actions: read
-      attestations: write
-      contents: write
-      id-token: write
+      contents: read
     runs-on: "ubuntu-22.04"
-    outputs:
-      val: ${{ steps.host.outputs.summary }}
     steps:
       # C-412: the first thing this job does is refuse to publish nothing. `if:` above admits
       # `skipped` builds because promoting a prepared candidate legitimately skips them — but with
@@ -596,59 +590,129 @@ jobs:
       # attested either.
       - name: Verify the artifact set before publishing
         run: scripts/verify-github-release.sh --staged artifacts
+      # The checked set crosses to the authority-bearing jobs as bytes, not as a job output: the
+      # announcement prose travels inside `artifacts/dist-manifest.json`, which is a release asset
+      # anyway. A job output carrying that prose is silently dropped when it matches a masked
+      # repository secret (C-412), and the two jobs below cannot afford to receive an empty title.
+      #
+      # The name deliberately does NOT start with `artifacts-`: that prefix is the candidate
+      # receipt's closed producer set (C-355).
+      - name: Hand the checked asset set to the publication jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-staged-assets
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # C-354: the attestation identity and nothing else. This job can mint a provenance statement; it
+  # cannot create a Release, publish a crate, move a ref or read any long-lived secret.
+  attest:
+    needs:
+      - plan
+      - host
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: "ubuntu-22.04"
+    environment: release
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Collect the checked asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-staged-assets
+          path: artifacts
       - name: Attest core release artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
           subject-path: artifacts/*
+
+  # C-354: the GitHub Release identity and nothing else. `RELEASE_TOKEN` appears once, in the `env`
+  # of the create/upload step. It is not a workflow env, not a job env, and not readable by the
+  # plan, build, hosting or attestation jobs — and it is never used to move a ref, create a tag,
+  # dispatch a workflow or mint another credential.
+  publish-github-release:
+    needs:
+      - plan
+      - host
+      - attest
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: "ubuntu-22.04"
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Collect the checked asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-staged-assets
+          path: artifacts
       - name: Create GitHub Release
         env:
-          # Scoped release token: a fine-grained PAT (this repo only, Contents: write) stored as the
-          # `RELEASE_TOKEN` secret, so the release object is created even when the org restricts the
+          # Scoped release token: a fine-grained PAT (this repo only, Contents: write) held by the
+          # `release` environment, so the release object is created even when the org restricts the
           # default GITHUB_TOKEN or GitHub App integration from creating releases.
           # NOTE: release.yml is cargo-dist-generated — re-apply this override after `dist generate`.
           GH_TOKEN: "${{ secrets.RELEASE_TOKEN }}"
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::RELEASE_TOKEN is not set on the release environment. Configure a fine-grained PAT for this repo with Contents: write; GITHUB_TOKEN has produced HTTP 403 on release creation."
+            exit 1
+          fi
+          # Title and body come from the checked manifest that is already a release asset, so the
+          # announcement prose never has to survive a job output.
+          manifest=artifacts/dist-manifest.json
+          title=$(jq -r '.announcement_title // empty' "$manifest")
+          jq -r '.announcement_github_body // empty' "$manifest" > "$RUNNER_TEMP/notes.txt"
+          [ -n "$title" ] || { echo "::error::the staged dist-manifest.json has no announcement title"; exit 1; }
+          prerelease=""
+          if [ "$(jq -r '.announcement_is_prerelease' "$manifest")" = "true" ]; then
+            prerelease="--prerelease"
+          fi
 
-          tag="${{ needs.plan.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; refreshing assets with --clobber"
-            gh release upload "$tag" artifacts/* --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refreshing assets with --clobber"
+            gh release upload "$RELEASE_TAG" artifacts/* --clobber
           else
             for attempt in 1 2 3; do
-              if gh release create "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*; then
+              if gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $prerelease --title "$title" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*; then
                 break
               fi
-              if gh release view "$tag" >/dev/null 2>&1; then
-                echo "Release $tag exists after create failure; refreshing assets with --clobber"
-                gh release upload "$tag" artifacts/* --clobber
+              if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                echo "Release $RELEASE_TAG exists after create failure; refreshing assets with --clobber"
+                gh release upload "$RELEASE_TAG" artifacts/* --clobber
                 break
               fi
               if [ "$attempt" -eq 3 ]; then
-                echo "::error::failed to create GitHub Release $tag after $attempt attempts"
+                echo "::error::failed to create GitHub Release $RELEASE_TAG after $attempt attempts"
                 exit 1
               fi
               sleep $((attempt * 15))
             done
           fi
+      # Reading a public Release and its attestations needs no publication credential, so the
+      # verifier runs on the job's own read-only GITHUB_TOKEN.
       - name: Verify GitHub Release
         env:
-          GH_TOKEN: "${{ secrets.RELEASE_TOKEN }}"
+          GH_TOKEN: "${{ github.token }}"
         run: scripts/verify-github-release.sh "${{ needs.plan.outputs.tag }}"
 
   announce:
     needs:
       - plan
-      - host
+      - publish-github-release
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
+    # The GitHub Release job however must run to completion, no skipping allowed!
+    if: ${{ always() && needs.publish-github-release.result == 'success' }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
