@@ -149,9 +149,13 @@ permissive `[permissions] allow` rule and inside an already-approved action batc
 that was not visible in the approved batch prompts again at dispatch. This is intentional and
 covered by tests; see [Safety & approvals](./agent/safety.md).
 
-Passing `--yes` auto-approves every admitted step, including destructive ones, but does not widen a
-policy, app, or agent ceiling. Use it only in trusted, non-interactive contexts (CI, the server
-daemon).
+`--yes` (that is, `--posture bounded-autonomy`) auto-approves every admitted step, including
+destructive ones, but does not widen a policy, app, or agent ceiling. It is a posture rather than a
+bypass: what constrains the run instead of the prompt is authorization policy, a fail-closed OS
+sandbox with the network closed, and resource budgets. What it does not protect against is an
+*authorised* effect inside the workspace, so run it where losing the working tree is survivable. See
+[Autonomy is a posture](./agent/safety.md#autonomy-is-a-posture) for the four postures and what each
+one leans on.
 
 ## My context keeps getting compacted
 

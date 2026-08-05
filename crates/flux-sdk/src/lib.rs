@@ -387,6 +387,16 @@ pub use flux_runtime::{
     AgentCensusRefusal, ConcurrencyRefusal, ResourceLimits, DEFAULT_TOOL_CALL_QUEUE_TIMEOUT,
 };
 
+/// The **autonomy posture** (C-463) — the named choice that selects approval stance, OS-sandbox
+/// floor and resource budget together, so an embedder cannot set one and miss the others.
+///
+/// Pass it to [`ClientBuilder::posture`] or
+/// [`FlowClientBuilder::posture`](flow::FlowClientBuilder::posture). Running without per-effect
+/// approval is a posture on this list, not an absence of one: authorization, guarded IO and the
+/// evidence trail are identical under all four, and what varies is only the single stage of
+/// *authorization → approval → guarded IO* that has a human in it.
+pub use flux_runtime::{ApprovalStance, AutonomyPosture, SandboxFloor};
+
 /// The Rust **embedded DSL** for authoring flows — builder primitives that construct the Flux-Lang
 /// AST. Build a [`flux_lang::ast::DraftAst`] with `dsl::Flow`/`dsl::Block` (loops and control-flow are
 /// first-class), then drive it through [`FlowClient::analyze`] + [`FlowClient::execute`]. Re-exported
@@ -578,6 +588,35 @@ impl ClientBuilder {
     /// sandbox and resource-limit decisions remain authoritative. See [`Sandbox`].
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
+        self
+    }
+    /// Name the [`AutonomyPosture`] this client runs under (C-463) — **one** choice that selects the
+    /// approval stance, the OS-sandbox floor and the resource budget together.
+    ///
+    /// This is the door C-444's finding argues for. Approval, confinement and ceilings are not three
+    /// independent settings that happen to be usually set together; they are three questions with
+    /// one answer, and a caller that could set the first alone would be reconstructing the exact
+    /// configuration the SDK was found in. Naming a posture answers all three at once:
+    ///
+    /// - [`Supervised`](AutonomyPosture::Supervised) — a human answers each guarded effect. A library
+    ///   has no approval UI, so this posture requires [`approver`](Self::approver): your channel *is*
+    ///   the posture, and [`build`](Self::build) refuses rather than substituting one.
+    /// - [`BoundedAutonomy`](AutonomyPosture::BoundedAutonomy) — never prompt; authorization policy, a
+    ///   fail-closed sandbox with the network closed and [`ResourceLimits::autonomous`] constrain
+    ///   instead. This is what [`auto_approve(true)`](Self::auto_approve) has always selected.
+    /// - [`Exploratory`](AutonomyPosture::Exploratory) — never prompt, and treat interruption as the
+    ///   harm. Same fail-closed confinement, deliberately wider grants (egress stays open, ceilings
+    ///   are looser) and an uncapped evidence trail.
+    /// - [`Refusing`](AutonomyPosture::Refusing) — refuse every effect reaching the approval stage.
+    ///   The headless default.
+    ///
+    /// Explicit [`with_sandbox`](Self::with_sandbox) and [`resource_limits`](Self::resource_limits)
+    /// calls still win outright: the posture supplies defaults for what you did not state, and never
+    /// overrides what you did. Each posture's [`relies_on`](AutonomyPosture::relies_on) and
+    /// [`does_not_protect_against`](AutonomyPosture::does_not_protect_against) state what it leans on
+    /// and what it leaves to you.
+    pub fn posture(mut self, posture: AutonomyPosture) -> Self {
+        self.envelope.posture = Some(posture);
         self
     }
     /// Inject a custom [`Approver`] the executor consults per op — a policy between the blanket
@@ -982,7 +1021,7 @@ impl ClientBuilder {
             .into_iter()
             .filter(|n| !base_names.contains(n))
             .collect();
-        let approver = self.envelope.resolve_approver();
+        let approver = self.envelope.resolve_approver()?;
 
         let storage = self.storage.unwrap_or_default();
         // D-178: default auto-resurrect on exactly where a crashed turn can survive the process.

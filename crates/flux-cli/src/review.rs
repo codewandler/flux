@@ -190,7 +190,10 @@ pub(super) async fn run_review(
     // assembles its envelope through the SDK rather than `build_agent_with` — so it needs the same
     // ceilings wired explicitly. Resolved once and shared by the flow client and the children (each
     // child copies the numbers into its own budget at spawn).
-    let resource_limits = cli_resource_limits(&cfg);
+    // `flux review` runs a fixed, read-only flow with no operator attached and auto-approves it
+    // under the fail-closed unattended sandbox profile — which is `bounded-autonomy` by name
+    // (C-463), so its budget comes from the same place every other surface's does.
+    let resource_limits = cli_resource_limits(&cfg, flux_runtime::AutonomyPosture::BoundedAutonomy);
 
     // Wire roles + sub-agents exactly like `build_agent`: `strict_review`'s bounded 3-role reviewer
     // fan-out (via `task`) delegates through the identical envelope the top-level agent uses.
@@ -391,7 +394,7 @@ mod review_flow_client_ceiling_wiring {
             "mock".to_string(),
             root.clone(),
             // The one C-314 seam on this surface: `flux review` turns `[limits]` into ceilings here.
-            cli_resource_limits(&cfg),
+            cli_resource_limits(&cfg, flux_runtime::AutonomyPosture::BoundedAutonomy),
         )
         .expect("build the review flow client");
         client

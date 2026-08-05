@@ -171,8 +171,25 @@ pub(super) struct AgentFlags {
     pub(super) agent: bool,
 
     /// Auto-approve every tool call (headless). Without it, unmatched calls prompt for approval.
+    /// The older spelling of `--posture bounded-autonomy`, and unchanged by it.
     #[arg(long)]
     pub(super) yes: bool,
+
+    /// The autonomy posture this run adopts — one named choice that selects who approves, how the
+    /// run is confined and what its budget is, together:
+    ///
+    /// `supervised` (default) — you answer each guarded effect at the terminal.
+    /// `bounded-autonomy` — never prompt; authorization policy, a fail-closed OS sandbox with the
+    /// network closed, and resource budgets constrain instead. Same as `--yes`.
+    /// `exploratory` — never prompt, and treat interruption as the harm: fail-closed sandbox,
+    /// network open, wider ceilings, uncapped evidence. For research, security hardening and long
+    /// exploration.
+    /// `refusing` — refuse every effect that reaches the approval stage.
+    ///
+    /// None of these is a reduced form of another; each states what it relies on and what it does
+    /// not protect against (`docs/agent/safety`).
+    #[arg(long, value_name = "NAME", value_parser = parse_autonomy_posture)]
+    pub(super) posture: Option<flux_runtime::AutonomyPosture>,
 
     /// Show tool output in full (no truncation). Action batches and tool inputs are always shown in
     /// full; this also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
@@ -267,6 +284,85 @@ impl AgentFlags {
         }
         AgentFlagsOnly::parse_from(&args).agent
     }
+
+    /// The [`AutonomyPosture`](flux_runtime::AutonomyPosture) this invocation runs under — the
+    /// single value that decides its approver, its OS-sandbox floor and its resource budget (C-463).
+    ///
+    /// ⚠ **No flag day.** `--yes` is not a fourth setting sitting beside `--posture`; it is the
+    /// older spelling of `bounded-autonomy` and keeps meaning exactly what it always meant — never
+    /// prompt, and let authorization policy, the fail-closed sandbox floor (C-262 / C-410) and the
+    /// resource budgets constrain instead. Naming the posture is that same choice said out loud.
+    ///
+    /// A contradiction is refused rather than resolved. `--yes --posture supervised` is two
+    /// opposite instructions, and quietly picking a winner would leave the operator's command line
+    /// and the run's behaviour disagreeing about whether anyone is being asked.
+    pub(super) fn autonomy_posture(&self) -> anyhow::Result<flux_runtime::AutonomyPosture> {
+        use flux_runtime::{ApprovalStance, AutonomyPosture};
+        match (self.posture, self.yes) {
+            (Some(posture), true) if posture.approval() != ApprovalStance::None => {
+                anyhow::bail!(
+                    "`--yes` and `--posture {posture}` are opposite approval postures: `--yes` \
+                     never asks, while `{posture}` {}. Pick one — `--yes` on its own is \
+                     `--posture bounded-autonomy`",
+                    match posture.approval() {
+                        ApprovalStance::PerEffect => "asks a human before each guarded effect",
+                        _ => "refuses every effect that reaches the approval stage",
+                    }
+                )
+            }
+            (Some(posture), _) => Ok(posture),
+            (None, true) => Ok(AutonomyPosture::for_auto_approval()),
+            // The CLI's default really is a human at a terminal; a surface with no terminal
+            // (`app run --serve`) chooses its own and never reaches this.
+            (None, false) => Ok(AutonomyPosture::Supervised),
+        }
+    }
+
+    /// The posture for a CLI surface with **no terminal to prompt at** — `flux record`, and
+    /// `flux app run <program>`, whose channels (cron, webhook, Slack) fire with no operator
+    /// attached.
+    ///
+    /// Same resolution as [`autonomy_posture`](Self::autonomy_posture), except that `supervised` is
+    /// not on the menu because there is nobody to ask. Unstated resolves to `refusing` — which is
+    /// what these surfaces have always installed — and *explicitly* naming `supervised` is refused
+    /// rather than quietly downgraded, because a stated posture the surface silently replaces is
+    /// the accident the named postures exist to prevent.
+    pub(super) fn headless_posture(
+        &self,
+        surface: &str,
+    ) -> anyhow::Result<flux_runtime::AutonomyPosture> {
+        use flux_runtime::AutonomyPosture;
+        let posture = self.autonomy_posture()?;
+        if posture == AutonomyPosture::Supervised {
+            if self.posture.is_some() {
+                anyhow::bail!(
+                    "`--posture supervised` asks a human before each guarded effect, and {surface} \
+                     has no terminal to ask at. Choose `bounded-autonomy` (never prompt; \
+                     authorization policy, a fail-closed sandbox and resource budgets constrain \
+                     instead), `exploratory`, or `refusing`"
+                );
+            }
+            return Ok(AutonomyPosture::Refusing);
+        }
+        Ok(posture)
+    }
+
+    /// The **explicitly named** posture, if any — the only form that contributes a sandbox floor of
+    /// its own in `apply_sandbox_env`.
+    ///
+    /// `--yes` is deliberately not read here even though it maps onto `bounded-autonomy`. That
+    /// posture's floor is exactly what `unattended_sandbox_surface` already contributes for the
+    /// flag, and the exemptions that classifier carries (the TUI, where an operator is watching the
+    /// whole run) are decisions about *surfaces*, not about postures. Inferring a floor from the
+    /// older spelling would silently confine those surfaces — a flag day this story rules out.
+    pub(super) fn named_posture(&self) -> Option<flux_runtime::AutonomyPosture> {
+        self.posture
+    }
+}
+
+/// Parse a `--posture` value, listing the four names on a typo rather than guessing one.
+fn parse_autonomy_posture(value: &str) -> Result<flux_runtime::AutonomyPosture, String> {
+    value.parse().map_err(|e: flux_core::Error| e.to_string())
 }
 
 /// The flux subcommands. Each renders its own `flux <cmd> --help`. With no subcommand, `flux` opens
@@ -1693,5 +1789,146 @@ mod c509_cli_grammar_tests {
             "tickets.delete",
         ])
         .is_err());
+    }
+}
+
+/// C-463 — the autonomy posture is one named choice on the CLI too, and `--yes` is a spelling of
+/// one of them rather than a fourth setting beside them.
+#[cfg(test)]
+mod c463_autonomy_posture_tests {
+    use super::*;
+    use clap::Parser;
+    use flux_runtime::{ApprovalStance, AutonomyPosture};
+    use flux_system::sandbox::SandboxMode;
+
+    fn flags(argv: &[&str]) -> AgentFlags {
+        let mut args = vec!["flux"];
+        args.extend_from_slice(argv);
+        AgentFlagsOnly::parse_from(&args).agent
+    }
+
+    /// ⚠ **No flag day.** `--yes` still works and still means what it meant; it is now the older
+    /// spelling of a posture whose name states the rest of what it always implied.
+    #[test]
+    fn yes_is_the_older_spelling_of_bounded_autonomy() {
+        let posture = flags(&["--yes"]).autonomy_posture().unwrap();
+        assert_eq!(posture, AutonomyPosture::BoundedAutonomy);
+        assert_eq!(
+            posture,
+            flags(&["--posture", "bounded-autonomy"])
+                .autonomy_posture()
+                .unwrap(),
+            "the two spellings must resolve to the same posture, or `--yes` has quietly become a \
+             fourth setting beside `--posture`"
+        );
+    }
+
+    /// The acceptance claim, at the surface an operator actually types: **one** value decides the
+    /// approver, the confinement floor and the budget. Nothing here can select the first without
+    /// also selecting the other two, which is the whole bug C-444 found from the SDK side.
+    #[test]
+    fn one_named_posture_selects_approver_confinement_and_budget_together() {
+        for (argv, expected) in [
+            (
+                &["--posture", "supervised"][..],
+                AutonomyPosture::Supervised,
+            ),
+            (&["--yes"][..], AutonomyPosture::BoundedAutonomy),
+            (
+                &["--posture", "exploratory"][..],
+                AutonomyPosture::Exploratory,
+            ),
+            (&["--posture", "refusing"][..], AutonomyPosture::Refusing),
+        ] {
+            let posture = flags(argv).autonomy_posture().unwrap();
+            assert_eq!(posture, expected, "{argv:?}");
+            if posture.approval() == ApprovalStance::None {
+                assert_eq!(
+                    posture.sandbox_floor().mode,
+                    SandboxMode::Require,
+                    "{argv:?}: chose not to prompt without choosing confinement"
+                );
+                assert!(
+                    !posture.budget().is_unbounded(),
+                    "{argv:?}: chose not to prompt without choosing a ceiling"
+                );
+            }
+        }
+    }
+
+    /// The CLI default is a human at a terminal — stated, rather than being whatever is left when
+    /// no flag is passed.
+    #[test]
+    fn the_default_posture_is_supervised() {
+        assert_eq!(
+            flags(&[]).autonomy_posture().unwrap(),
+            AutonomyPosture::Supervised
+        );
+    }
+
+    /// Two opposite instructions are refused, not silently resolved: a run whose command line and
+    /// whose behaviour disagree about whether anyone is being asked is the accident this prevents.
+    #[test]
+    fn contradictory_flags_are_refused_rather_than_resolved() {
+        for argv in [
+            &["--yes", "--posture", "supervised"][..],
+            &["--yes", "--posture", "refusing"][..],
+        ] {
+            let err = flags(argv)
+                .autonomy_posture()
+                .expect_err("{argv:?} must be refused")
+                .to_string();
+            assert!(
+                err.contains("opposite approval postures"),
+                "{argv:?}: {err}"
+            );
+        }
+        // Agreeing spellings are not a contradiction: both say "do not ask".
+        assert!(flags(&["--yes", "--posture", "exploratory"])
+            .autonomy_posture()
+            .is_ok());
+    }
+
+    /// A surface with no terminal cannot honour `supervised`. It refuses rather than downgrading —
+    /// a stated posture the surface silently replaces is exactly the class of accident the named
+    /// postures remove — and its unstated default stays `refusing`, which is what these surfaces
+    /// have always installed.
+    #[test]
+    fn a_headless_surface_refuses_supervised_and_defaults_to_refusing() {
+        assert_eq!(
+            flags(&[]).headless_posture("`flux record`").unwrap(),
+            AutonomyPosture::Refusing
+        );
+        assert_eq!(
+            flags(&["--yes"]).headless_posture("`flux record`").unwrap(),
+            AutonomyPosture::BoundedAutonomy
+        );
+        let err = flags(&["--posture", "supervised"])
+            .headless_posture("`flux record`")
+            .expect_err("an explicit supervised posture must be refused, not downgraded")
+            .to_string();
+        assert!(err.contains("no terminal to ask at"), "{err}");
+    }
+
+    /// Only an explicitly named posture contributes a sandbox floor of its own. `--yes` keeps
+    /// contributing exactly what it contributed before, through the surface classifier — otherwise
+    /// the surfaces that classifier deliberately exempts (the TUI, where an operator is watching
+    /// the whole run) would silently start being confined.
+    #[test]
+    fn only_an_explicit_posture_contributes_a_sandbox_floor() {
+        assert_eq!(flags(&["--yes"]).named_posture(), None);
+        assert_eq!(
+            flags(&["--posture", "exploratory"]).named_posture(),
+            Some(AutonomyPosture::Exploratory)
+        );
+    }
+
+    /// A typo is refused with the four names, never resolved to the nearest one.
+    #[test]
+    fn an_unknown_posture_name_is_refused_at_parse_time() {
+        let err = Cli::try_parse_from(["flux", "run", "--posture", "yolo", "hi"])
+            .expect_err("an unknown posture must not parse")
+            .to_string();
+        assert!(err.contains("bounded-autonomy"), "{err}");
     }
 }

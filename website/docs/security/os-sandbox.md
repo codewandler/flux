@@ -94,10 +94,23 @@ its declared channels until Ctrl-C and its cron/webhook/Slack triggers fire turn
 attached. Those forms refuse startup when no backend is usable. Every other subcommand is classified
 explicitly as *not* one of them, so a new subcommand cannot join the list by accident — the rest of
 `flux plugin …` is management rather than operation invocation and stays on the interactive
-contract. The SDK applies the same rule to the one posture it can classify without an argv: a
-`Client`/`FlowClient` built with `auto_approve(true)` or an injected custom approver resolves to
-`require` with the sandbox network closed, and to autonomous resource ceilings, unless the embedder
-states a sandbox or ceiling of its own — which wins outright. A custom approver is opaque to the SDK:
+contract.
+
+A named [autonomy posture](../agent/safety.md#autonomy-is-a-posture) contributes its own floor as
+well, because confinement is part of the choice rather than a second thing to remember:
+`--posture bounded-autonomy` resolves to `require` with the network **closed**, and
+`--posture exploratory` to `require` with the network **open** — that posture leans on host
+isolation and its evidence trail rather than on destination scope, and egress is what makes research
+and security-hardening work possible at all. `--posture supervised` and `--posture refusing` impose
+no floor of their own. ⚠ `--yes` is the older spelling of `bounded-autonomy` but is *not* read as a
+posture here: it keeps contributing exactly what the surface classification above already gives it,
+so the forms that classification deliberately exempts (`flux tui --yes`, where an operator is
+watching the whole run) are unchanged.
+
+The SDK applies the same rule to the postures it can classify without an argv: a `Client`/`FlowClient`
+built with `posture(..)`, with `auto_approve(true)`, or with an injected custom approver resolves to
+that posture's floor — `require` with the sandbox network closed for the autonomous ones — and to its
+resource ceilings, unless the embedder states a sandbox or ceiling of its own, which wins outright. A custom approver is opaque to the SDK:
 it may prompt a human, but it may also blanket-allow, so silence resolves conservatively. Otherwise
 direct SDK/server embedders receive no automatic posture from `flux-server` and must inject a sandbox
 or export its environment settings. The built-in deny posture defaults to off with networking open

@@ -26,7 +26,7 @@ and [Safety & approvals](./safety.md).
 
 | Command | What it does |
 |---|---|
-| `flux run "…"` | run an adaptive turn (`--yes` auto-approves; `-c` continues the last session) |
+| `flux run "…"` | run an adaptive turn (`--posture` selects the [autonomy posture](#autonomy-posture---posture); `-c` continues the last session) |
 | `flux run <module.flux> --entry <flow>` | select one top-level flow from a multi-flow module, execute it once with `--inputs` / repeatable `--arg`, and exit |
 | `flux` | interactive REPL |
 | `flux tui` | the full-screen [chat UI](./tui.md) with an in-UI approval sheet |
@@ -166,6 +166,35 @@ flux sessions --since 2026-07-01 --until 2026-07-15
 Matching is a read over the same durable, redacted event log every other session tool uses — no
 new index, and a secret's plaintext can never be used as a `--query` to confirm a redacted
 session's existence.
+
+## Autonomy posture (`--posture`)
+
+Who answers a guarded effect is a named choice, and it selects the approver, the OS-sandbox floor
+and the resource budget **together** — see
+[Autonomy is a posture](./safety.md#autonomy-is-a-posture) for what each one relies on and what it
+does not protect against.
+
+```bash
+flux run "refactor the parser"                            # supervised (default): you answer each effect
+flux run --posture bounded-autonomy "fix the flaky test"  # never prompt; confined, egress closed, budgeted
+flux run --yes "fix the flaky test"                       # the older spelling of the same posture
+flux run --posture exploratory "audit this repo for auth bugs"
+flux app run agent.flux --posture refusing                # nothing that reaches approval runs
+```
+
+- `--posture supervised` (default on interactive surfaces) — a human at the terminal, per effect.
+- `--posture bounded-autonomy` — no prompt; authorization policy, a fail-closed sandbox with the
+  network **closed**, and resource budgets constrain instead. `--yes` selects this.
+- `--posture exploratory` — no prompt, and interruption is the harm: the same fail-closed
+  confinement with egress **open**, wider ceilings and an uncapped evidence trail. For research,
+  security hardening and long exploration.
+- `--posture refusing` — every effect reaching the approval stage is denied. The default on a
+  surface with no operator attached (`flux app run <program>`, `flux record`), which also refuse an
+  explicit `--posture supervised` rather than silently downgrading it.
+- `--yes` together with a contradictory `--posture` is refused, not resolved. `--yes --posture
+  exploratory` is fine: both say "do not ask".
+- Authorization, guarded IO and the evidence trail do **not** vary with the posture. Approval is the
+  only stage of the three with a human in it.
 
 ## Turn controls
 

@@ -1083,8 +1083,19 @@ pub(super) const DEFAULT_ALLOW: &[&str] = &[
 /// rather than one executor), so calling this twice would silently fork one configured ceiling of N
 /// into two independent ceilings of N — the top-level agent and its sub-agents would then each get
 /// their own budget instead of counting against the operator's single number.
-pub(super) fn cli_resource_limits(cfg: &flux_config::Config) -> flux_runtime::ResourceLimits {
-    flux_runtime::ResourceLimits::from_config(&cfg.limits)
+pub(super) fn cli_resource_limits(
+    cfg: &flux_config::Config,
+    posture: flux_runtime::AutonomyPosture,
+) -> flux_runtime::ResourceLimits {
+    let configured = flux_runtime::ResourceLimits::from_config(&cfg.limits);
+    if configured.is_unbounded() {
+        // C-463: silence means the posture decides. A posture that never prompts carries a budget
+        // as part of the same choice, because when the prompt is gone the budget is one of the
+        // three things left constraining the run — "unattended *and* unbounded" was the finding.
+        // An operator who wrote a `[limits]` table stated their own ceiling and keeps it verbatim.
+        return posture.budget();
+    }
+    configured
 }
 
 /// Assemble the CLI's shared runtime envelope from already-resolved surface decisions.
@@ -1480,13 +1491,14 @@ struct ResolvedPermissions {
 
 /// Resolve the permission floor, approver, and pre-tool hooks. Read-only tools are pre-allowed by
 /// default (empty allow-list) so the common case needs no config; network/mutating tools still gate.
-/// A configured allow-list replaces the [`DEFAULT_ALLOW`] default entirely. `--yes` swaps the
-/// interactive approver for auto-allow. Hooks are the observe/modify/deny JS scripts under the
-/// project and user `.flux/hooks/*.js`.
+/// A configured allow-list replaces the [`DEFAULT_ALLOW`] default entirely. The approver comes from
+/// the resolved [`AutonomyPosture`](flux_runtime::AutonomyPosture) — `--yes` is the older spelling
+/// of `bounded-autonomy`, so it still gets the blanket allow. Hooks are the observe/modify/deny JS
+/// scripts under the project and user `.flux/hooks/*.js`.
 fn resolve_permissions(
     cwd: &std::path::Path,
     cfg: &flux_config::Config,
-    flags: &AgentFlags,
+    posture: flux_runtime::AutonomyPosture,
     approver_override: Option<Arc<dyn Approver>>,
 ) -> ResolvedPermissions {
     let mut allow = cfg.permissions.allow.clone();
@@ -1497,10 +1509,15 @@ fn resolve_permissions(
     // C-453: a surface with no terminal chooses its own approver (the served agent's posture). Only
     // the PROMPT differs — the permission floor, hooks and everything downstream are identical, so
     // this cannot be used to widen what a run may do, only to change who is asked.
+    //
+    // C-463: otherwise the posture decides, and the terminal prompt is what it decides *with*. A
+    // `supervised` posture IS `StdinApprover` on this surface; the autonomous ones determine their
+    // own approver and ignore the channel, which is why the same call answers all four.
     let approver: Arc<dyn Approver> = match approver_override {
         Some(approver) => approver,
-        None if flags.yes => Arc::new(AllowApprover),
-        None => Arc::new(StdinApprover),
+        None => posture
+            .approver(Some(Arc::new(StdinApprover)))
+            .expect("a terminal channel is supplied, so every posture resolves"),
     };
     let mut hook_dirs = vec![cwd.join(".flux").join("hooks")];
     if let Some(home) = std::env::var_os("HOME") {
@@ -1689,6 +1706,13 @@ pub(super) async fn build_agent_with(
     let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
     // Validate this input-driven expansion bound before provider, plugin, or agent assembly work.
     let max_iterations = agent_max_iterations(flags, &cfg.agent)?;
+    // C-463: the autonomy posture, resolved ONCE here and used for both halves it decides — the
+    // approver (`resolve_permissions`) and the budget (`cli_resource_limits`). Resolving it in one
+    // place is the point of the type: two derivations could disagree, and "approval says one thing,
+    // the budget says another" is precisely the incoherent combination it replaces. Validated this
+    // early so a contradictory `--yes --posture supervised` is refused before any provider,
+    // plugin, or sub-agent assembly happens.
+    let posture = flags.autonomy_posture()?;
     // Role metadata controls the child tool ceiling (omitting tools inherits the parent's catalog),
     // so strict project/user discovery must win over every eager provider failure. If a malformed
     // role were discovered later, a credential/provider error could mask the actionable file path
@@ -1764,7 +1788,7 @@ pub(super) async fn build_agent_with(
     // sub-agent spawner just below and the top-level environment further down. Resolved once
     // deliberately: a second `cli_resource_limits` call would mint a second semaphore, so the
     // top-level agent's own executors would stop sharing one budget with each other.
-    let resource_limits = cli_resource_limits(&cfg);
+    let resource_limits = cli_resource_limits(&cfg, posture);
 
     // Sub-agent spawner (multi-agent orchestration): the `task` tool delegates to roles, each run
     // as an isolated sub-agent — bounded by the same authorization policy (no blanket allow).
@@ -2077,7 +2101,7 @@ pub(super) async fn build_agent_with(
         perms,
         approver,
         hooks,
-    } = resolve_permissions(&cwd, &cfg, flags, approver_override);
+    } = resolve_permissions(&cwd, &cfg, posture, approver_override);
 
     let mut environment = assemble_cli_execution_environment(
         system.clone(),
@@ -3271,7 +3295,7 @@ pub(crate) mod cli_resource_ceiling_wiring {
                 None,
                 Vec::new(),
                 // The one C-299 seam: the CLI turns `[limits]` into runtime ceilings here.
-                cli_resource_limits(&cfg),
+                cli_resource_limits(&cfg, flux_runtime::AutonomyPosture::Supervised),
             )
             .into_executor(),
         );

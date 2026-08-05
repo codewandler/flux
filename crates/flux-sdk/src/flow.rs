@@ -63,7 +63,7 @@ use flux_provider::{Provider, RealtimeConfig, RealtimeProvider};
 #[cfg(test)]
 use flux_runtime::ToolContext;
 use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, ExecutionAuthorization, ExecutionEnvironment, Executor,
+    Approver, AutonomyPosture, ExecutionAuthorization, ExecutionEnvironment, Executor,
     PermissionManager, ResourceLimits, SpawnActivity, SpawnActivitySink, Spawner, Tool,
     ToolRegistry,
 };
@@ -164,6 +164,15 @@ impl FlowClientBuilder {
         self.envelope.auto_approve = yes;
         self
     }
+    /// Name the [`AutonomyPosture`] this client runs under (C-463) — one choice that selects the
+    /// approval stance, the OS-sandbox floor and the resource budget **together**.
+    ///
+    /// See [`ClientBuilder::posture`](crate::ClientBuilder::posture) for the full contract, which is
+    /// identical on both doors.
+    pub fn posture(mut self, posture: AutonomyPosture) -> Self {
+        self.envelope.posture = Some(posture);
+        self
+    }
     /// Inject a custom [`Approver`] the executor consults per op — a policy between the blanket
     /// allow of [`auto_approve`](Self::auto_approve) and the headless default deny (e.g. a
     /// risk-aware confirm gate). Overrides `auto_approve`. Mirrors flux-orchestrate's
@@ -246,9 +255,12 @@ impl FlowClientBuilder {
         // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
         // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
         let sandbox = self.envelope.resolve_sandbox();
-        // C-444: resolved before the envelope is destructured below — silence means the approval
-        // posture decides (autonomous ⇒ bounded), an explicit call is honored verbatim.
+        // C-444/C-463: resolved before the envelope is destructured below — silence means the named
+        // posture decides, an explicit call is honored verbatim.
         let resource_limits = self.envelope.resolve_resource_limits();
+        // Resolved once, here, rather than per executor: the posture chose it, so there is exactly
+        // one place the choice becomes an approver and no second copy to drift from it.
+        let approver = self.envelope.resolve_approver()?;
         let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
         let registry = try_assemble_registry(provider.clone(), self.model.clone())?;
         let store = Arc::new(self.storage.unwrap_or_default().into_flow_store()?);
@@ -264,8 +276,7 @@ impl FlowClientBuilder {
             store,
             allow: self.envelope.allow,
             deny: self.envelope.deny,
-            auto_approve: self.envelope.auto_approve,
-            approver: self.envelope.approver,
+            approver,
             authorization: self.envelope.authorization,
             redactor: self.envelope.redactor,
             resource_limits,
@@ -313,9 +324,11 @@ pub struct FlowClient {
     store: Arc<FlowStore>,
     allow: Vec<String>,
     deny: Vec<String>,
-    auto_approve: bool,
-    /// Custom per-op approval policy (see [`FlowClientBuilder::approver`]); overrides `auto_approve`.
-    approver: Option<Arc<dyn Approver>>,
+    /// The approval policy this client runs, resolved **once** at
+    /// [`build`](FlowClientBuilder::build) from the named [`AutonomyPosture`] (or from an injected
+    /// [`FlowClientBuilder::approver`], which wins). Stored resolved rather than as the settings it
+    /// came from, so a per-run executor cannot re-derive it and reach a different answer.
+    approver: Arc<dyn Approver>,
     /// Mandatory policy and identity profile cloned into every per-run executor.
     authorization: ExecutionAuthorization,
     /// Shared secret scrubber installed on every per-run execution environment.
@@ -900,16 +913,11 @@ impl FlowClient {
 
     fn build_executor(&self) -> Executor {
         let perms = PermissionManager::from_rules(&self.allow, &self.deny);
-        let approver: Arc<dyn Approver> = match &self.approver {
-            Some(custom) => custom.clone(),
-            None if self.auto_approve => Arc::new(AllowApprover),
-            None => Arc::new(DenyApprover),
-        };
         let mut environment = ExecutionEnvironment::new(
             self.system.clone(),
             self.registry.clone(),
             perms,
-            approver,
+            self.approver.clone(),
             self.authorization.clone(),
         )
         .with_redactor(self.redactor.clone())
@@ -1075,6 +1083,7 @@ mod tests {
     use async_trait::async_trait;
     use flux_core::{Chunk, Result as CoreResult};
     use flux_provider::{ChunkStream, Request};
+    use flux_runtime::AllowApprover;
     use serde_json::json;
     use std::sync::Mutex;
 
