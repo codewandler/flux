@@ -859,6 +859,12 @@ kinds to a native implementation workhorse, C-570 adds acknowledged progress and
 and C-572 composes a fresh read-only reviewer loop plus same-writer repair over the existing typed
 PASS/REWORK/PARK and two-round host rules.
 
+C-587 turns each frozen candidate into mandatory self-improvement evidence: tool-free code review
+sees only story contract plus exact diff while an independent tool-free reflector sees request,
+bounded redacted transcript and host-verified outcome. They run concurrently, final handoff waits for
+both receipts, and structured context/tool/instruction/loop friction is collected in a central Fleet
+improvement projection without copying raw transcripts or granting either agent outcome authority.
+
 C-575 supplies immutable physical-usage receipts, C-542 supplies one time/call/token
 target-versus-limit vocabulary, and C-571 reserves and settles them across Fleet, wave, assignment,
 agent and loop scopes, with C-130 later adding monetary and rolling

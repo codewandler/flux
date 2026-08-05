@@ -31,6 +31,9 @@ reviewers, research tasks and future backends receive purpose-specific loops, re
 - [ ] Fresh review and same-session repair execute through explicit reviewer/repair loop bindings
       while host evidence and the two-rework ceiling remain authoritative
       ([C-572](C-572-fleet-review-and-rework-loops.md)).
+- [ ] Every frozen implementation candidate starts tool-free review and structured reflection
+      concurrently; final handoff requires both receipts and C-587 collects reflection findings in a
+      central bounded improvement projection.
 - [ ] Fleet, wave, task, agent and loop scopes reserve and settle one narrow-only budget envelope;
       time, calls, tokens and host-counted resources are bounded before monetary enforcement plugs
       into the same ledger ([C-542](C-542-granular-time-token-budgets-visible-in-tui.md),
@@ -51,7 +54,8 @@ reviewers, research tasks and future backends receive purpose-specific loops, re
   exhausted the general adaptive explorer before producing a commit. Existing loop, activity,
   review, pause and budget contracts were inventoried in the linked design before the story split.
   The metrics-driven controller was then added as C-573 from operator feedback; C-583 records the
-  manual operation/CLI capacity actuator that controller will later use.
+  manual operation/CLI capacity actuator that controller will later use. C-587 makes independent
+  review plus harness reflection mandatory before handoff so live Fleet work feeds self-improvement.
 
 ## Notes
 

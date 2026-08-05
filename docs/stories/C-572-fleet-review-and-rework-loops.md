@@ -7,7 +7,7 @@ epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-flow, flux-runtime, flux-orchestrate, flux-cli]
 depends_on: [C-567, C-570]
-note: "fresh read-only reviewer loop over exact commit; typed PASS/REWORK/PARK; repair resumes the writer loop and the host keeps the two-round ceiling"
+note: "fresh tool-free review over story contract + exact diff; typed PASS/REWORK/PARK; repair resumes the writer loop and the host keeps the two-round ceiling"
 ---
 
 # Review through a loop without letting the writer review itself
@@ -19,15 +19,18 @@ typed findings, same-writer rework and host-enforced evidence.
 
 ## Acceptance
 
-- [ ] Failing first, the Fleet workhorse can hand off but review behavior is selected by general
-      agent defaults rather than an admitted reviewer binding. The fixed state machine starts one
-      fresh read-only reviewer at the exact handoff commit and snapshots its loop/capability/budget.
-- [ ] The reviewer loop invokes or composes the shipped `strict_review` Flux flow, inspects only the
-      admitted commit/context and returns typed `PASS`, `REWORK(findings)` or `PARK(findings)`.
-      Malformed output and review gaps never become PASS.
-- [ ] The writer reports `handoff_ready` before review begins. Reviewer context contains no writer
-      conversation and reviewer capabilities cannot write; the writer never applies its own review
-      result.
+- [ ] Failing first, the Fleet workhorse can freeze a candidate but review behavior is selected by
+      general agent defaults rather than an admitted reviewer binding. The fixed state machine starts
+      one fresh tool-free reviewer and snapshots its loop/capability/budget.
+- [ ] The reviewer packet contains exactly the complete story Goal/Acceptance, normalized exact diff,
+      candidate/base identities and diff digest. It contains no writer conversation, reflection
+      packet, ambient Fleet goals or arbitrary repository files, and the reviewer has no operations.
+- [ ] The reviewer loop invokes a packet-input form of the shipped strict-review protocol and returns
+      typed `PASS`, `REWORK(findings)` or `PARK(findings)`. Malformed output, truncated diff, missing
+      story contract and review gaps never become PASS.
+- [ ] The writer reports `candidate_ready` before C-587 starts review and reflection concurrently.
+      Reviewer context contains no writer conversation or capabilities; the writer never applies its
+      own review result, and final `handoff_ready` remains host-derived.
 - [ ] `REWORK` continues the original writer session at the workhorse loop's explicit `repair`
       entry point with structured findings and reviewed-commit identity. The existing two-delivery
       C-245 budget and third-attempt PARK remain durable host invariants.
@@ -46,3 +49,5 @@ typed findings, same-writer rework and host-enforced evidence.
 
 - This is how “review belongs in the loop harness” composes with Decision 0010: review is a distinct
   fresh agent loop in the Fleet pipeline, not a self-review phase inside the writer.
+- C-587 owns the parallel reflection sibling, mandatory two-receipt barrier and central improvement
+  projection. This story owns only code/contract review and repair semantics.

@@ -8,7 +8,8 @@
 [C-571](../stories/C-571-hierarchical-fleet-budget-ledger.md),
 [C-572](../stories/C-572-fleet-review-and-rework-loops.md),
 [C-573](../stories/C-573-metrics-driven-fleet-policy-controller.md),
-[C-583](../stories/C-583-live-fleet-capacity-control.md)
+[C-583](../stories/C-583-live-fleet-capacity-control.md),
+[C-587](../stories/C-587-mandatory-fleet-review-reflection.md)
 
 ## Outcome
 
@@ -136,29 +137,65 @@ read assignment contract
   -> establish failing/validation evidence
   -> implement only the assigned contract
   -> run targeted validation
-  -> report handoff-ready
-  -> return typed FleetHandoff
+  -> freeze candidate + report candidate-ready
+  -> host starts review and reflection concurrently
+  -> return typed FleetHandoff only after both receipts settle
 ```
 
 It does not run open-ended intent detection, select another story, inspect unrelated repositories,
 coordinate the Fleet or review its own work. A research loop can be exploratory because that is its
 declared job; an implementation loop is not.
 
-Review is loop-directed but remains independent:
+Review and reflection are loop-directed but remain independent:
 
 ```text
-workhorse handoff
-  -> fresh read-only reviewer start at exact commit
-  -> reviewer loop invokes the shipped strict-review flow
-  -> typed PASS | REWORK(findings) | PARK(findings)
+frozen candidate
+  -> async {
+       fresh tool-free reviewer(story contract + exact diff)
+       fresh tool-free reflector(request + bounded transcript + verified outcome)
+     }
+  -> typed PASS | REWORK(findings) | PARK(findings) + AgentReflection/v1
   -> REWORK continues the writer's exact session at entry `repair`
   -> host parks after the existing two-rework ceiling
 ```
 
-The workhorse reports `handoff_ready` before review begins. The reviewer inherits neither writer
-conversation nor writer capabilities, and the writer never applies its own review result. The host
-still verifies commits, write sets, commands and evidence; putting behavior in a loop does not move
-enforcement into prompts.
+The workhorse reports `candidate_ready` before these fresh agents begin; `handoff_ready` is a
+host-derived state only after review passes and the mandatory reflection receipt is stored. The
+reviewer receives exactly the story contract, normalized diff, candidate identity and diff digest—no
+writer conversation, repository tools or ambient checkout. The reflector receives the original
+assignment request, the redacted bounded worker transcript and host-verified outcome/evidence
+summary, not repository tools. The writer applies neither result by itself. The host still verifies
+commits, write sets, commands and evidence; putting behavior in loops does not move enforcement into
+prompts.
+
+### Mandatory reflection and the improvement corpus
+
+Reflection is about the harness, not whether the code should merge. `AgentReflection/v1` contains a
+small prose summary plus structured, severity-ranked observations for context quality, missing
+information, missing or awkward tools, ambiguous/conflicting instructions, loop/harness friction,
+budget pressure and proposed improvements. Each observation carries an enum category, evidence
+reference, confidence and affected component; it cannot set Board state, review status or worker
+success. Deterministic facts such as tool errors, retries, truncation and budget exhaustion remain
+host-derived beside—not overwritten by—the model assessment.
+
+The transcript packet is complete when it fits its declared cap. Otherwise it uses deterministic
+selection, reports omitted ranges/bytes and sets `context_complete: false`; a reflection must be able
+to say that the available context was insufficient. Credential-shape redaction and secret-output
+exclusion run before the model call. Raw transcript text remains in its existing worker session
+store and is not copied into the central corpus.
+
+The host appends the structured receipt to durable Fleet events keyed by Fleet, wave, BoardRef,
+attempt, worker/session, loop/model and candidate digest. A bounded central improvement projection
+deduplicates and aggregates categories across workers while retaining receipt/evidence references.
+`flux fleet insights` and later TUI views read that projection; an export can feed the existing
+`painpoints_collect`/`improvements_aggregate` self-improvement machinery. C-490 `/insights` remains
+the on-demand session fact/narration surface and may link the receipt, but it is not silently changed
+into the Fleet corpus.
+
+Review and reflection start concurrently with independent budgets. Malformed, missing, failed or
+unpersisted output cannot silently produce handoff: bounded retry then typed attention/PARK is the
+failure posture. Every candidate attempt records both terminal states, including REWORK and PARK, so
+the improvement dataset does not contain only successful work.
 
 ## Upstream progress and cooperative yield
 
@@ -172,7 +209,7 @@ An `AgentReportChannel` adds a durable acknowledged record:
 AgentReport
   report id + monotonic sequence
   agent/session/parent/assignment/loop binding
-  phase + state: active | waiting | handoff_ready | budget_warning
+  phase + state: active | waiting | candidate_ready | handoff_ready | budget_warning
   bounded redacted summary
   optional completed/total units
   evidence references, never embedded command output or diffs
@@ -318,15 +355,17 @@ coordinator still grants BoardRef, mode, capabilities, fences, budget and lease.
 2. **C-567** — bind Fleet task kinds to native workhorse loop profiles and prove five writers can
    implement instead of recursively explore.
 3. **C-570** — add durable typed progress and cooperative yield.
-4. **C-572** — run fresh review and same-session repair through explicit loops.
-5. **C-575 + C-542 + C-571** — record physical usage, unify local time/token projections, then add
+4. **C-572** — run fresh diff-and-story-only review and same-session repair through explicit loops.
+5. **C-587** — run mandatory structured reflection beside review and persist the central improvement
+   projection before handoff can complete.
+6. **C-575 + C-542 + C-571** — record physical usage, unify local time/token projections, then add
    Fleet reservation/settlement.
-6. **C-583** — expose revisioned desired Fleet capacity plus safe drain through one operation/CLI
+7. **C-583** — expose revisioned desired Fleet capacity plus safe drain through one operation/CLI
    contract, keeping nested task children distinct from Fleet workers.
-7. **C-573** — tune allowed model/effort/concurrency/reservations from freshness-labelled metrics.
-8. **C-552/C-553** — extend the generic backend and foreign CLI adapters against the settled loop,
+8. **C-573** — tune allowed model/effort/concurrency/reservations from freshness-labelled metrics.
+9. **C-552/C-553** — extend the generic backend and foreign CLI adapters against the settled loop,
    report and budget contracts.
-9. **C-130** — enforce monetary and rolling per-principal caps through the shared ledger.
+10. **C-130** — enforce monetary and rolling per-principal caps through the shared ledger.
 
 C-543/C-544 can follow C-569 without waiting for Fleet budgets. C-556/C-557 consume
 C-570/C-571/C-573's typed projections instead of inventing another progress calculation.

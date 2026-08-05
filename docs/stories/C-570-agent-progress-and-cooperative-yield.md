@@ -29,6 +29,9 @@ where it can safely yield, using one bounded durable protocol rather than stdout
 - [ ] Reports cannot transition a Board item, mark work done, change Fleet membership, assert
       unverified evidence or widen capability/budget. Host projections derive operational state from
       admitted state plus verified receipts.
+- [ ] `candidate_ready` means implementation is frozen for C-572/C-587 review and reflection;
+      `handoff_ready` is host-derived only after both mandatory receipts settle successfully. A
+      worker cannot report itself past that barrier.
 - [ ] Native `task` transports reports through the existing correlated child boundary without
       exposing thinking/tool-result content. Fleet and C-552 TaskAgentBackend map the same schema to
       their event streams; `SpawnActivity` remains compatible host telemetry.

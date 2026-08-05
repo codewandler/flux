@@ -285,9 +285,10 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 ### explicit agent-loop harnesses, progress and hierarchical budgets
 - [C-570 — Agents report typed progress and cooperatively yield upstream](C-570-agent-progress-and-cooperative-yield.md) · Core · SpawnActivity is host telemetry; add durable child-authored reports, acknowledgement and a resumable safe-checkpoint yield
 - [C-571 — Fleet budgets reserve and settle across fleet, wave, task, agent and loop](C-571-hierarchical-fleet-budget-ledger.md) · Core · narrow-only hierarchical targets/limits with durable reservation, idempotent settlement, warnings and resumable exhaustion
-- [C-572 — Fleet review and rework run under explicit reviewer and repair loops](C-572-fleet-review-and-rework-loops.md) · Core · fresh read-only reviewer loop over exact commit; typed PASS/REWORK/PARK; repair resumes the writer loop and the host keeps the two-round ceiling
+- [C-572 — Fleet review and rework run under explicit reviewer and repair loops](C-572-fleet-review-and-rework-loops.md) · Core · fresh tool-free review over story contract + exact diff; typed PASS/REWORK/PARK; repair resumes the writer loop and the host keeps the two-round ceiling
 - [C-573 — Live Fleet metrics drive bounded model, effort and concurrency policy](C-573-metrics-driven-fleet-policy-controller.md) · Core · closed-loop optimization inside authorized caps: freshness-labelled metrics, allowlisted actuators, safe-boundary changes, hysteresis and durable decisions
 - [C-583 — Scale Fleet worker capacity through one operation and CLI contract](C-583-live-fleet-capacity-control.md) · Core · one Fleet worker is one admitted agent; revisioned desired capacity scales assignment-bound workers up and drains down, while nested task children stay separate
+- [C-587 — Every Fleet candidate produces independent review and structured reflection before handoff](C-587-mandatory-fleet-review-reflection.md) · Improve · after implementation freezes, async tool-free review(story+diff) and reflection(request+transcript+outcome) are mandatory; reflections feed a central improvement corpus
 
 ### Watch the agent think — the loop as a live thread, expandable down to the graph
 _flux's central claim is that **the LLM is not the runtime** — authored control flow and a deterministic_
