@@ -57,7 +57,8 @@ chmod +x "$TMP/gate-bin/git" "$TMP/gate-bin/cargo"
 : >"$TMP/gate.log"
 env PATH="$TMP/gate-bin:$PATH" MOCK_GATE_ROOT="$TMP/gate-root" MOCK_GATE_SHA="$SHA" \
   MOCK_GATE_LOG="$TMP/gate.log" "$FULL_GATE" "$SHA" >/dev/null
-expected_gate_commands='build --workspace
+expected_gate_commands='fetch --locked
+build --workspace
 test --workspace
 clippy --workspace --all-targets -- -D warnings
 fmt --all --check

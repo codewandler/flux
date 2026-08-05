@@ -108,7 +108,9 @@ All notable changes to this project are documented in this file. The format is b
   `[Unreleased]` notes already in the repository, and preserves the exact version, protocol,
   transaction, candidate-receipt and publication gates. Model selection, Anthropic/OpenRouter/OpenAI
   credentials and live-provider smoke are absent from the automatic path, and the parsed authority
-  policy rejects their reintroduction.
+  policy rejects their reintroduction. The candidate gate also fetches the complete locked
+  dependency graph before its offline architecture checks, including packages used only by other
+  compilation targets.
 
 - **The v0.56.0 release path now runs from the repository's existing Actions secrets without a
   dedicated GitHub App, release Environments, rulesets or branch protection** (C-559; supersedes the

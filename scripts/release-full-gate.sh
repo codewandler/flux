@@ -30,6 +30,9 @@ else
 fi
 
 gate() { "$@" || { echo "!! gate step failed: $*" >&2; exit 1; }; }
+# Codegate resolves the complete workspace graph with Cargo in offline mode. Populate the locked
+# graph first, including target-specific packages that a build for this runner does not compile.
+gate cargo fetch --locked
 gate owned_cargo build --workspace
 gate owned_cargo test --workspace
 gate owned_cargo clippy --workspace --all-targets -- -D warnings
