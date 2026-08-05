@@ -145,6 +145,10 @@ impl Credential for ApiKeyAnthropic {
     async fn apply(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
         Ok(rb.header("x-api-key", &self.api_key))
     }
+
+    fn is_terminal_http_error(&self, status: u16, body: &str) -> bool {
+        anthropic_terminal_error(status, body)
+    }
 }
 
 /// `claude` provider: Claude Max / Claude-Code **subscription** via OAuth Bearer token.
@@ -171,6 +175,27 @@ impl Credential for OAuthAnthropic {
     fn system_prefix(&self) -> Option<String> {
         Some(CLAUDE_CODE_SYSTEM_PREFIX.to_string())
     }
+
+    fn is_terminal_http_error(&self, status: u16, body: &str) -> bool {
+        anthropic_terminal_error(status, body)
+    }
+}
+
+/// Anthropic reports exhausted prepaid credit as an `invalid_request_error` (commonly HTTP 400),
+/// while account rate limits use 429. The former is already non-retryable by status; classifying
+/// the explicit credit marker here keeps the provider hook truthful for either status shape.
+fn anthropic_terminal_error(status: u16, body: &str) -> bool {
+    if status != 400 && status != 429 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    [
+        "credit balance is too low",
+        "credit_balance_too_low",
+        "purchase more credits",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +280,18 @@ mod tests {
         assert!(q.effort_output_config);
         assert!(q.sampling_params);
         assert!(q.extra_body.is_empty());
+    }
+
+    #[test]
+    fn credit_exhaustion_is_terminal_but_bare_throttling_is_not() {
+        assert!(anthropic_terminal_error(
+            400,
+            r#"{"type":"invalid_request_error","message":"Credit balance is too low"}"#,
+        ));
+        assert!(!anthropic_terminal_error(
+            429,
+            r#"{"type":"rate_limit_error"}"#
+        ));
     }
 
     #[test]

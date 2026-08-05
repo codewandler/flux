@@ -171,8 +171,36 @@ fn http_native_with_turn_state(
             extra: codex_headers(),
             send_account_id: true,
             turn_state,
+            terminal_error: codex_terminal_error,
         }),
     )
+}
+
+/// The ChatGPT backend uses a typed `usageLimitExceeded` error for exhausted subscription windows.
+/// Accept its snake-case equivalent and explicit reset-bearing usage/quota payloads, but never a
+/// bare 429 (or Retry-After alone), which is an ordinary transient throttle.
+fn codex_terminal_error(status: u16, body: &str) -> bool {
+    if status != 429 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if compact.contains("usagelimitexceeded")
+        || compact.contains("usagelimitreached")
+        || lower.contains("usage limit reached")
+        || lower.contains("usage limit exceeded")
+        || lower.contains("purchase more credits")
+    {
+        return true;
+    }
+
+    let reset_bearing = ["\"reset_at\"", "\"resets_at\"", "\"reset_time\""]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    reset_bearing && (lower.contains("usage") || lower.contains("quota"))
 }
 
 // ---------------------------------------------------------------------------
@@ -685,8 +713,8 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    use flux_core::{Chunk, ContentBlock, Result, StopReason};
-    use flux_provider::{Provider, Request};
+    use flux_core::{Chunk, ContentBlock, Error, Result, StopReason};
+    use flux_provider::{with_retry_observer, Provider, Request, RetryEvent, RetryObserver};
 
     /// A token source with a fixed token + account id (what `import_codex` would yield).
     struct StubTokens;
@@ -697,6 +725,15 @@ mod tests {
         }
         fn account_id(&self) -> Option<String> {
             Some("acct_123".to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct RetryCounter(AtomicUsize);
+
+    impl RetryObserver for RetryCounter {
+        fn retrying(&self, _event: &RetryEvent) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -939,6 +976,123 @@ mod tests {
             }
         });
         (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// A local HTTP stub that answers every request with one non-success status and the exact
+    /// provider body supplied by the test. The hit counter distinguishes the initial request from
+    /// retry attempts without coupling the assertion to backoff timing.
+    async fn error_server(
+        status: u16,
+        reason: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// One ordinary throttle followed by success, proving the terminal classifier is narrow.
+    async fn transient_429_server() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempt = hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let response = if attempt == 0 {
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), handle, hits)
+    }
+
+    /// C-545 failing-first contract: the ChatGPT backend's weekly usage limit is a terminal 429,
+    /// not a transient per-minute throttle. It must surface on the initial request, retaining the
+    /// vendor's reset timestamp and operator message byte-for-byte.
+    #[tokio::test]
+    async fn usage_limit_exceeded_429_surfaces_without_retry_and_preserves_body() {
+        const BODY: &str = r#"{"type":"usageLimitExceeded","message":"Usage limit reached; try again at Aug 11, 2026 09:00 UTC","reset_at":"2026-08-11T09:00:00Z"}"#;
+        let (url, handle, hits) = error_server(429, "Too Many Requests", BODY).await;
+        let provider = http_native(Arc::new(StubTokens), &url).with_max_retries(1);
+        let retries = Arc::new(RetryCounter::default());
+
+        let err = match with_retry_observer(
+            retries.clone(),
+            provider.stream(Request::new("gpt-5.6-sol", "hi")),
+        )
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a terminal usage limit must fail the call"),
+        };
+        match err {
+            Error::Api { status, message } => {
+                assert_eq!(status, 429);
+                assert_eq!(message, BODY, "limit/reset detail must survive verbatim");
+            }
+            other => panic!("expected the raw provider API error, got {other}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "terminal quota exhaustion must make zero retry attempts"
+        );
+        assert_eq!(
+            retries.0.load(Ordering::SeqCst),
+            0,
+            "terminal quota exhaustion must not enter RetryReason::Status(429)"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn bare_429_remains_transient_and_retries() {
+        let (url, handle, hits) = transient_429_server().await;
+        let provider = http_native(Arc::new(StubTokens), &url).with_max_retries(1);
+        let retries = Arc::new(RetryCounter::default());
+
+        let result = with_retry_observer(
+            retries.clone(),
+            provider.stream(Request::new("gpt-5.6-sol", "hi")),
+        )
+        .await;
+        assert!(result.is_ok(), "the retry should recover the bare throttle");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "one transient 429 must make exactly one retry attempt"
+        );
+        assert_eq!(retries.0.load(Ordering::SeqCst), 1);
+        handle.abort();
     }
 
     /// The codex provider with the WS transport attached unconditionally — what `oauth_at` builds

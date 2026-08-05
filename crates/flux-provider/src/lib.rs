@@ -250,6 +250,16 @@ pub trait Credential: Send + Sync {
     /// `x-codex-turn-state`) and replay it from [`apply`](Credential::apply) on the next request —
     /// the request/response halves of a sticky-routing echo. Default: ignore them.
     fn observe_response_headers(&self, _headers: &reqwest::header::HeaderMap) {}
+
+    /// Classify a provider HTTP error as terminal even when its status is normally retryable.
+    ///
+    /// Providers use this body-aware hook for quota/credit exhaustion: a bare `429` remains a
+    /// transient throttle, while an explicit usage-limit reset or exhausted-balance marker can
+    /// fail immediately. The generic HTTP path still surfaces the original response body
+    /// verbatim in [`Error::Api`]. Default: no provider-specific terminal classification.
+    fn is_terminal_http_error(&self, _status: u16, _body: &str) -> bool {
+        false
+    }
 }
 
 /// Axis (c): an **alternative streaming transport** (e.g. the codex WebSocket) tried *before*
@@ -862,8 +872,16 @@ impl Provider for NativeProvider {
                             continue;
                         }
                     }
-                    if is_retryable_status(status.as_u16()) && attempt < self.max_retries {
-                        let delay = retry_delay(Some(&resp), attempt);
+                    // Classification needs the provider's structured error body. Read it before
+                    // deciding whether a generally retryable status is transient, while capturing
+                    // Retry-After first because consuming the response consumes its headers too.
+                    let retryable_status = is_retryable_status(status.as_u16());
+                    let delay = (retryable_status && attempt < self.max_retries)
+                        .then(|| retry_delay(Some(&resp), attempt));
+                    let message = resp.text().await.unwrap_or_default();
+                    let terminal = self.cred.is_terminal_http_error(status.as_u16(), &message);
+                    if retryable_status && !terminal && attempt < self.max_retries {
+                        let delay = delay.expect("retryable response has a captured delay");
                         tracing::warn!(
                             status = status.as_u16(),
                             attempt,
@@ -883,7 +901,6 @@ impl Provider for NativeProvider {
                         attempt += 1;
                         continue;
                     }
-                    let message = resp.text().await.unwrap_or_default();
                     return Err(Error::Api {
                         status: status.as_u16(),
                         message,
