@@ -48,6 +48,10 @@ wrong.
 - [ ] Standard gate green in both workspaces.
 
 ## Progress
+- 2026-08-04 — reproduced again in a live Flux session as
+  `provider error: sse stream: connection closed after 67s`. This is the exact transport class this
+  story owns: the elapsed duration is useful retry telemetry, but the closure still ended the turn
+  instead of entering the bounded visible-resume path.
 - 2026-07-29 — found driving `flux run` as a headless sub-agent implementor. Four runs against
   `openrouter/google/gemini-3.6-flash`, `gemini-3.5-flash` and `gemini-2.5-flash` all died mid-run
   (three on `stream closed before completion` at ~12k/14.7k/21.1k context, one on an upstream
@@ -59,6 +63,9 @@ wrong.
 - Seams: the provider stream error surfaces through `crates/flux-flow/src/loop_host.rs:574-586`
   (`explore`) as a stage `Err`; `--continue` / `--resume` are wired in `crates/flux-cli/src/args.rs`
   and dispatched from `crates/flux-cli/src/dispatch.rs`.
+- The lower transport mapping currently formats event-source failures as `sse stream: {error}` in
+  the Messages, OpenAI Chat and OpenAI Responses codecs. Preserve the structured source/cause and
+  elapsed duration before the string is wrapped so retry policy does not depend on matching prose.
 - ⚠ **Resume must not corrupt session shape.** Re-entering a turn after a partial stream is exactly
   the termination-path class AGENTS.md flags as having recurred three times: a resumed turn must not
   leave a split `tool_use`/`tool_result` pair or a user-after-user sequence. Only a live provider 400

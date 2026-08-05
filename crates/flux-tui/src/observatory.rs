@@ -41,7 +41,10 @@ impl UsageObservatory {
 
     /// Metadata-only Flux loader. Cross-harness adapters can append facts before construction; this
     /// path intentionally asks the event store only for stream ids and typed events.
-    pub(crate) fn from_store(store: &EventStore, pricing: &PricingTable) -> flux_core::Result<Self> {
+    pub(crate) fn from_store(
+        store: &EventStore,
+        pricing: &PricingTable,
+    ) -> flux_core::Result<Self> {
         let mut facts = Vec::new();
         for stream in store.all_streams()? {
             let events = store.load_stream(&stream, None)?;
@@ -110,24 +113,20 @@ impl UsageObservatory {
         .max(1) as usize;
         let frame = replay_frame(&self.facts, &self.clock, &self.filter, plot_width.min(32));
         let comparison = compare_previous(&self.facts, self.clock.range, &self.filter);
-        let rows = groups(
-            &self.facts,
-            self.clock.range,
-            &self.filter,
-            self.group_by,
-        );
-        let series = buckets(
-            &self.facts,
-            self.clock.range,
-            plot_width,
-            &self.filter,
-        );
+        let rows = groups(&self.facts, self.clock.range, &self.filter, self.group_by);
+        let series = buckets(&self.facts, self.clock.range, plot_width, &self.filter);
         let play = if self.clock.playing { "▶" } else { "Ⅱ" };
-        let motion = if self.clock.reduced_motion { "no-motion" } else { "motion" };
+        let motion = if self.clock.reduced_motion {
+            "no-motion"
+        } else {
+            "motion"
+        };
         let mut out = vec![format!(
             " usage observatory · {}× · {play} · {motion} · cursor {} / {} ",
             self.clock.speed,
-            self.clock.cursor_ms.saturating_sub(self.clock.range.start_ms),
+            self.clock
+                .cursor_ms
+                .saturating_sub(self.clock.range.start_ms),
             self.clock.range.duration_ms(),
         )];
         out.push(format!(
@@ -165,12 +164,19 @@ impl UsageObservatory {
                     ));
                 }
             }
-            out.push(format!(" group: {:?} · compare: previous equal period ", self.group_by));
-            for (index, row) in rows.iter().take(match layout {
-                ObservatoryLayout::Wide => 8,
-                ObservatoryLayout::Medium => 5,
-                ObservatoryLayout::Compact => 3,
-            }).enumerate() {
+            out.push(format!(
+                " group: {:?} · compare: previous equal period ",
+                self.group_by
+            ));
+            for (index, row) in rows
+                .iter()
+                .take(match layout {
+                    ObservatoryLayout::Wide => 8,
+                    ObservatoryLayout::Medium => 5,
+                    ObservatoryLayout::Compact => 3,
+                })
+                .enumerate()
+            {
                 let focus = if index == self.focused { '›' } else { ' ' };
                 out.push(format!(
                     " {focus} {} · {} calls · {} tok · ${:.4} + {} unpriced ",
@@ -204,16 +210,29 @@ mod tests {
         HarnessKind::ALL
             .into_iter()
             .enumerate()
-            .map(|(index, harness)| UsageFact::priced(
-                harness,
-                format!("s{index}"),
-                if index == 0 { "routed/vendor/model" } else { "gpt-5" },
-                if index == 3 { ProviderAttribution::Proven("opencode-provider".into()) } else { ProviderAttribution::Unknown },
-                Some(index as i64 + 1),
-                TimePrecision::Call,
-                Usage { input_tokens: (index + 1) as u64, ..Default::default() },
-                &PricingTable::builtin(),
-            ))
+            .map(|(index, harness)| {
+                UsageFact::priced(
+                    harness,
+                    format!("s{index}"),
+                    if index == 0 {
+                        "routed/vendor/model"
+                    } else {
+                        "gpt-5"
+                    },
+                    if index == 3 {
+                        ProviderAttribution::Proven("opencode-provider".into())
+                    } else {
+                        ProviderAttribution::Unknown
+                    },
+                    Some(index as i64 + 1),
+                    TimePrecision::Call,
+                    Usage {
+                        input_tokens: (index + 1) as u64,
+                        ..Default::default()
+                    },
+                    &PricingTable::builtin(),
+                )
+            })
             .collect()
     }
 
@@ -230,7 +249,10 @@ mod tests {
 
     #[test]
     fn usage_observatory_layout_matrix() {
-        let mut states = vec![UsageObservatory::new(Vec::new(), UsageRange::new(0, 10).unwrap())];
+        let mut states = vec![UsageObservatory::new(
+            Vec::new(),
+            UsageRange::new(0, 10).unwrap(),
+        )];
         let mut rich = UsageObservatory::new(fixture(), UsageRange::new(0, 10).unwrap());
         rich.clock.reduced_motion = true;
         states.push(rich);
@@ -254,18 +276,24 @@ mod tests {
     #[test]
     fn seven_day_observatory_stays_bounded_and_responsive() {
         let facts = (0..50_000)
-            .map(|index| UsageFact::priced(
-                HarnessKind::ALL[index % 4],
-                format!("s{}", index % 100),
-                "gpt-5",
-                ProviderAttribution::Unknown,
-                Some(index as i64),
-                TimePrecision::Call,
-                Usage { input_tokens: 1, ..Default::default() },
-                &PricingTable::builtin(),
-            ))
+            .map(|index| {
+                UsageFact::priced(
+                    HarnessKind::ALL[index % 4],
+                    format!("s{}", index % 100),
+                    "gpt-5",
+                    ProviderAttribution::Unknown,
+                    Some(index as i64),
+                    TimePrecision::Call,
+                    Usage {
+                        input_tokens: 1,
+                        ..Default::default()
+                    },
+                    &PricingTable::builtin(),
+                )
+            })
             .collect();
-        let mut view = UsageObservatory::new(facts, UsageRange::new(0, UsageRange::WEEK_MS).unwrap());
+        let mut view =
+            UsageObservatory::new(facts, UsageRange::new(0, UsageRange::WEEK_MS).unwrap());
         view.clock.seek(UsageRange::WEEK_MS);
         assert!(view.lines(120, 40).len() <= 40);
     }

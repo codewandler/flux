@@ -4078,12 +4078,10 @@ where
                         KeyCode::Char('4') => view.set_window(
                             flux_capabilities::usage_observatory::UsageRange::FOUR_HOURS_MS,
                         ),
-                        KeyCode::Char('1') => view.set_window(
-                            flux_capabilities::usage_observatory::UsageRange::DAY_MS,
-                        ),
-                        KeyCode::Char('7') => view.set_window(
-                            flux_capabilities::usage_observatory::UsageRange::WEEK_MS,
-                        ),
+                        KeyCode::Char('1') => view
+                            .set_window(flux_capabilities::usage_observatory::UsageRange::DAY_MS),
+                        KeyCode::Char('7') => view
+                            .set_window(flux_capabilities::usage_observatory::UsageRange::WEEK_MS),
                         KeyCode::Char('g') => view.cycle_group(),
                         KeyCode::Char('m') => {
                             view.clock.reduced_motion = !view.clock.reduced_motion

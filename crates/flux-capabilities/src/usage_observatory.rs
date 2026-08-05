@@ -69,7 +69,10 @@ impl CostStatus {
     }
 
     pub fn is_unpriced(self) -> bool {
-        matches!(self, Self::UnpricedUnknownModel | Self::UnpricedMissingUsage)
+        matches!(
+            self,
+            Self::UnpricedUnknownModel | Self::UnpricedMissingUsage
+        )
     }
 }
 
@@ -206,7 +209,8 @@ pub fn flux_facts(
             if let Some(turn_id) = event.turn_id {
                 covered_turns.insert(turn_id);
             }
-            if usage.total() > 0 || usage.reasoning_tokens > 0 || usage.reported_cost_usd.is_some() {
+            if usage.total() > 0 || usage.reasoning_tokens > 0 || usage.reported_cost_usd.is_some()
+            {
                 out.push(UsageFact::priced(
                     HarnessKind::Flux,
                     session_id,
@@ -225,7 +229,8 @@ pub fn flux_facts(
             continue;
         }
         if let Some(usage) = turn.usage {
-            if usage.total() > 0 || usage.reasoning_tokens > 0 || usage.reported_cost_usd.is_some() {
+            if usage.total() > 0 || usage.reasoning_tokens > 0 || usage.reported_cost_usd.is_some()
+            {
                 let mut fact = UsageFact::priced(
                     HarnessKind::Flux,
                     session_id,
@@ -241,7 +246,11 @@ pub fn flux_facts(
             }
         }
     }
-    out.sort_by(|a, b| a.event_ms().cmp(&b.event_ms()).then_with(|| a.session_id.cmp(&b.session_id)));
+    out.sort_by(|a, b| {
+        a.event_ms()
+            .cmp(&b.event_ms())
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
     out
 }
 
@@ -408,7 +417,10 @@ pub fn buckets(
             let start = range.start_ms + duration * index as i64 / count as i64;
             let end = range.start_ms + duration * (index + 1) as i64 / count as i64;
             UsageBucket {
-                range: UsageRange { start_ms: start, end_ms: end },
+                range: UsageRange {
+                    start_ms: start,
+                    end_ms: end,
+                },
                 totals: UsageTotals::default(),
             }
         })
@@ -417,8 +429,7 @@ pub fn buckets(
     for fact in selected(facts, range, filter) {
         let ts = fact.event_ms().expect("selected facts have time");
         let offset = ts.saturating_sub(range.start_ms) as i128;
-        let index = ((offset * count as i128) / duration as i128)
-            .min((count - 1) as i128) as usize;
+        let index = ((offset * count as i128) / duration as i128).min((count - 1) as i128) as usize;
         out[index].totals.add_fact(fact);
         sessions[index].insert((fact.harness, fact.session_id.clone()));
     }
@@ -458,7 +469,11 @@ pub fn groups(
             GroupBy::Harness => fact.harness.label().to_string(),
             GroupBy::Provider => provider.to_string(),
             GroupBy::Model => fact.canonical_model.clone(),
-            GroupBy::Route => format!("{} → {provider} → {}", fact.harness.label(), fact.canonical_model),
+            GroupBy::Route => format!(
+                "{} → {provider} → {}",
+                fact.harness.label(),
+                fact.canonical_model
+            ),
         };
         let row = rows.entry(key).or_default();
         row.0.add_fact(fact);
@@ -539,7 +554,8 @@ pub fn visible_pulses(
         start_ms: range.start_ms,
         end_ms: cursor_ms.saturating_add(1).min(range.end_ms),
     };
-    let mut routes = BTreeMap::<(HarnessKind, String, String, TimePrecision, CostStatus), Pulse>::new();
+    let mut routes =
+        BTreeMap::<(HarnessKind, String, String, TimePrecision, CostStatus), Pulse>::new();
     for fact in selected(facts, visible, filter) {
         let provider = fact.provider.value().unwrap_or("unknown").to_string();
         let key = (
@@ -620,8 +636,8 @@ impl ReplayClock {
 
     pub fn fit_to(&mut self, replay_duration_ms: i64) {
         if replay_duration_ms > 0 {
-            self.speed = (self.range.duration_ms() as f64 / replay_duration_ms as f64)
-                .clamp(0.5, 100.0);
+            self.speed =
+                (self.range.duration_ms() as f64 / replay_duration_ms as f64).clamp(0.5, 100.0);
         }
     }
 
@@ -693,7 +709,10 @@ mod tests {
             ProviderAttribution::Unknown,
             Some(at),
             TimePrecision::Call,
-            Usage { input_tokens: tokens, ..Default::default() },
+            Usage {
+                input_tokens: tokens,
+                ..Default::default()
+            },
             &PricingTable::builtin(),
         )
     }
@@ -719,16 +738,49 @@ mod tests {
             .enumerate()
             .map(|(i, harness)| fact(harness, "s", "gpt-5", i as i64, 1))
             .collect::<Vec<_>>();
-        assert_eq!(facts.iter().map(|f| f.harness).collect::<BTreeSet<_>>(), HarnessKind::ALL.into_iter().collect());
+        assert_eq!(
+            facts.iter().map(|f| f.harness).collect::<BTreeSet<_>>(),
+            HarnessKind::ALL.into_iter().collect()
+        );
     }
 
     #[test]
     fn call_usage_wins_without_doubling_turn_usage() {
-        let usage = Usage { input_tokens: 10, output_tokens: 2, ..Default::default() };
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            ..Default::default()
+        };
         let events = vec![
-            stored(1, None, 1, EventKind::TurnStarted { user_input: "secret sentinel".into(), model: "gpt-5".into() }),
-            stored(2, Some(1), 2, EventKind::CallUsage { model: "gpt-5".into(), usage: usage.clone() }),
-            stored(3, Some(1), 3, EventKind::TurnEnded { outcome: "ok".into(), iterations: 1, answer: "secret sentinel".into(), usage: Some(usage) }),
+            stored(
+                1,
+                None,
+                1,
+                EventKind::TurnStarted {
+                    user_input: "secret sentinel".into(),
+                    model: "gpt-5".into(),
+                },
+            ),
+            stored(
+                2,
+                Some(1),
+                2,
+                EventKind::CallUsage {
+                    model: "gpt-5".into(),
+                    usage: usage.clone(),
+                },
+            ),
+            stored(
+                3,
+                Some(1),
+                3,
+                EventKind::TurnEnded {
+                    outcome: "ok".into(),
+                    iterations: 1,
+                    answer: "secret sentinel".into(),
+                    usage: Some(usage),
+                },
+            ),
         ];
         let facts = flux_facts("s", &events, &PricingTable::builtin());
         assert_eq!(facts.len(), 1);
@@ -753,7 +805,11 @@ mod tests {
         b.session_id = "b".into();
         b.started_at_ms = Some(2);
         b.ended_at_ms = Some(2);
-        let got = totals(&[a, b], UsageRange::new(0, 3).unwrap(), &UsageFilter::default());
+        let got = totals(
+            &[a, b],
+            UsageRange::new(0, 3).unwrap(),
+            &UsageFilter::default(),
+        );
         assert_eq!(got.usage.cache_read_input_tokens, 14);
         assert_eq!(got.usage.cache_creation_1h_input_tokens, 4);
         assert_eq!(got.usage.reasoning_tokens, 10);
@@ -763,13 +819,25 @@ mod tests {
     #[test]
     fn mixed_cost_provenance_survives_aggregation() {
         let mut reported = fact(HarnessKind::Flux, "a", "gpt-5", 1, 10);
-        reported.cost = Some(CostCell { usd: 1.0, subscription: false, source: CostSourceCell::Reported, status: CostStatus::Reported, basis: "provider_reported" });
+        reported.cost = Some(CostCell {
+            usd: 1.0,
+            subscription: false,
+            source: CostSourceCell::Reported,
+            status: CostStatus::Reported,
+            basis: "provider_reported",
+        });
         reported.cost_status = CostStatus::Reported;
         let mut estimated = reported.clone();
         estimated.session_id = "b".into();
         estimated.started_at_ms = Some(2);
         estimated.ended_at_ms = Some(2);
-        estimated.cost = Some(CostCell { usd: 2.0, subscription: false, source: CostSourceCell::Estimated, status: CostStatus::EstimatedTable, basis: "pricing_table" });
+        estimated.cost = Some(CostCell {
+            usd: 2.0,
+            subscription: false,
+            source: CostSourceCell::Estimated,
+            status: CostStatus::EstimatedTable,
+            basis: "pricing_table",
+        });
         estimated.cost_status = CostStatus::EstimatedTable;
         let mut unknown = estimated.clone();
         unknown.session_id = "c".into();
@@ -777,57 +845,96 @@ mod tests {
         unknown.ended_at_ms = Some(3);
         unknown.cost = None;
         unknown.cost_status = CostStatus::UnpricedUnknownModel;
-        let got = totals(&[reported, estimated, unknown], UsageRange::new(0, 4).unwrap(), &UsageFilter::default());
-        assert_eq!((got.reported_usd, got.estimated_usd, got.unpriced_calls), (1.0, 2.0, 1));
+        let got = totals(
+            &[reported, estimated, unknown],
+            UsageRange::new(0, 4).unwrap(),
+            &UsageFilter::default(),
+        );
+        assert_eq!(
+            (got.reported_usd, got.estimated_usd, got.unpriced_calls),
+            (1.0, 2.0, 1)
+        );
     }
 
     #[test]
     fn adaptive_buckets_fit_plot_width_without_losing_totals() {
-        let facts = (0..100).map(|i| fact(HarnessKind::Flux, &format!("s{i}"), "gpt-5", i, 1)).collect::<Vec<_>>();
+        let facts = (0..100)
+            .map(|i| fact(HarnessKind::Flux, &format!("s{i}"), "gpt-5", i, 1))
+            .collect::<Vec<_>>();
         let range = UsageRange::new(0, 100).unwrap();
         let series = buckets(&facts, range, 17, &UsageFilter::default());
         assert_eq!(series.len(), 17);
-        assert_eq!(cumulative(&series).last().unwrap().usage.total(), totals(&facts, range, &UsageFilter::default()).usage.total());
+        assert_eq!(
+            cumulative(&series).last().unwrap().usage.total(),
+            totals(&facts, range, &UsageFilter::default()).usage.total()
+        );
     }
 
     #[test]
     fn previous_period_is_equal_length_and_adjacent() {
-        let facts = vec![fact(HarnessKind::Flux, "a", "gpt-5", 5, 10), fact(HarnessKind::Flux, "b", "gpt-5", 15, 20)];
+        let facts = vec![
+            fact(HarnessKind::Flux, "a", "gpt-5", 5, 10),
+            fact(HarnessKind::Flux, "b", "gpt-5", 15, 20),
+        ];
         let range = UsageRange::new(10, 20).unwrap();
         assert_eq!(range.previous(), UsageRange::new(0, 10).unwrap());
         let comparison = compare_previous(&facts, range, &UsageFilter::default());
         assert_eq!(comparison.token_percent, Some(100.0));
-        assert!(compare_previous(&facts, UsageRange::new(20, 30).unwrap(), &UsageFilter::default()).token_percent.is_none());
+        assert!(compare_previous(
+            &facts,
+            UsageRange::new(20, 30).unwrap(),
+            &UsageFilter::default()
+        )
+        .token_percent
+        .is_none());
     }
 
     #[test]
     fn virtual_clock_replay_is_frame_deterministic() {
-        let facts = vec![fact(HarnessKind::Flux, "a", "gpt-5", 5, 10), fact(HarnessKind::Codex, "b", "gpt-5", 8, 20)];
+        let facts = vec![
+            fact(HarnessKind::Flux, "a", "gpt-5", 5, 10),
+            fact(HarnessKind::Codex, "b", "gpt-5", 8, 20),
+        ];
         let mut clock = ReplayClock::new(UsageRange::new(0, 10).unwrap());
         clock.playing = true;
         clock.set_speed(2.0);
         clock.advance(4);
-        assert_eq!(replay_frame(&facts, &clock, &UsageFilter::default(), 8), replay_frame(&facts, &clock, &UsageFilter::default(), 8));
+        assert_eq!(
+            replay_frame(&facts, &clock, &UsageFilter::default(), 8),
+            replay_frame(&facts, &clock, &UsageFilter::default(), 8)
+        );
     }
 
     #[test]
     fn seek_backward_restores_checkpointed_totals() {
-        let facts = (0..100).map(|i| fact(HarnessKind::Flux, "s", "gpt-5", i, 1)).collect::<Vec<_>>();
+        let facts = (0..100)
+            .map(|i| fact(HarnessKind::Flux, "s", "gpt-5", i, 1))
+            .collect::<Vec<_>>();
         let mut clock = ReplayClock::new(UsageRange::new(0, 100).unwrap());
         clock.seek(80);
         clock.seek(-50);
         let restored = replay_frame(&facts, &clock, &UsageFilter::default(), 4);
         let mut fresh = ReplayClock::new(clock.range);
         fresh.seek(30);
-        assert_eq!(restored, replay_frame(&facts, &fresh, &UsageFilter::default(), 4));
+        assert_eq!(
+            restored,
+            replay_frame(&facts, &fresh, &UsageFilter::default(), 4)
+        );
     }
 
     #[test]
     fn dense_replay_keeps_frame_work_bounded() {
-        let facts = (0..50_000).map(|i| fact(HarnessKind::Flux, "s", "gpt-5", i, 1)).collect::<Vec<_>>();
+        let facts = (0..50_000)
+            .map(|i| fact(HarnessKind::Flux, "s", "gpt-5", i, 1))
+            .collect::<Vec<_>>();
         let mut clock = ReplayClock::new(UsageRange::new(0, 50_001).unwrap());
         clock.seek(50_001);
-        assert!(replay_frame(&facts, &clock, &UsageFilter::default(), 32).pulses.len() <= 32);
+        assert!(
+            replay_frame(&facts, &clock, &UsageFilter::default(), 32)
+                .pulses
+                .len()
+                <= 32
+        );
         assert!(buckets(&facts, clock.range, 120, &UsageFilter::default()).len() <= 120);
     }
 
