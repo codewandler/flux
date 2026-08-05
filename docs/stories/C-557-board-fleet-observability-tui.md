@@ -5,6 +5,7 @@ pillar: Core
 status: backlog
 epic: board-fleet-tui
 design: docs/designs/board-fleet-tui.md
+dependencies: [C-556]
 areas: [flux-tui, flux-cli, flux-capabilities]
 depends_on: [C-556, C-570, C-571, C-573]
 note: "follow-up UI — read-only peeks and native visualizations, not embedded CLI output"
@@ -19,7 +20,7 @@ Turn durable fleet and board projections into useful native views for supervisio
 ## Acceptance
 
 - [ ] A worker peek correlates channel/activity, bounded logs, assignment, worktree, handoff, review
-      and rework without granting an extra write path.
+      and rework without granting an extra write path; absent evidence is labelled unavailable.
 - [ ] Loop binding, acknowledged progress/yield and hierarchical budget usage are projected from
       C-569/C-570/C-571 typed state; the UI does not infer them from output or recalculate totals.
 - [ ] C-573 policy, pins and last adaptation reasons are visible with metric freshness and
@@ -33,6 +34,11 @@ Turn durable fleet and board projections into useful native views for supervisio
 - [ ] Large boards/workers stay bounded and responsive; snapshots cover empty, active, attention and
       failure states in narrow and wide terminals.
 - [ ] CLI human rendering remains compact and independent; the TUI uses typed state, not ANSI capture.
+
+## Progress
+
+- 2026-08-05 — reconciled under C-582 and made explicitly dependent on C-556's attachment and typed
+  projection-source lifecycle.
 
 ## Notes
 
