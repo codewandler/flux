@@ -1063,21 +1063,24 @@ mod tests {
     }
 
     #[test]
-    fn current_v055_baseline_previews_v0560() {
+    fn live_manifest_baseline_previews_the_next_release() {
+        // Derive from the live manifest and customer changelog instead of pinning a version:
+        // a hard pin cannot survive its own release cut, whose gate compiles this test after
+        // the version bump and changelog roll.
         let manifest = include_str!("../../../Cargo.toml");
         let whats_new = include_str!("../../../WHATS-NEW.md");
         let current = manifest_version(manifest).expect("workspace version");
-        assert_eq!(
-            current, "0.55.0",
-            "fixture is pinned to the v0.55.0 baseline"
-        );
-        assert!(unreleased_action_needed(whats_new));
         let records = parse_commit_records(
             "1111111111111111111111111111111111111111\0fix: otherwise patch\0\x1e",
         )
         .unwrap();
-        let bump = derive_release_bump(&records, true, &current);
-        assert_eq!(next_version(&current, bump).unwrap(), "0.56.0");
+        let action_needed = unreleased_action_needed(whats_new);
+        let bump = derive_release_bump(&records, action_needed, &current);
+        if current.starts_with("0.") {
+            assert_eq!(bump, if action_needed { "minor" } else { "patch" });
+        }
+        let next = next_version(&current, bump).unwrap();
+        assert_ne!(next, current);
     }
 
     #[test]
