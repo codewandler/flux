@@ -85,10 +85,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Automatic Flux releases no longer depend on a model provider account** (C-251). The release
+  workflow now runs the host-only `examples/release-cut.flux`, consumes the reviewed
+  `[Unreleased]` notes already in the repository, and preserves the exact version, protocol,
+  transaction, candidate-receipt and publication gates. Model selection, Anthropic/OpenRouter/OpenAI
+  credentials and live-provider smoke are absent from the automatic path, and the parsed authority
+  policy rejects their reintroduction.
+
 - **The v0.56.0 release path now runs from the repository's existing Actions secrets without a
   dedicated GitHub App, release Environments, rulesets or branch protection** (C-559; supersedes the
-  C-353 configuration proposal and the matching C-354/C-516 identity clauses). Model, smoke, scribe,
-  build, receipt and verification work remains mutation-credential-free. `RELEASE_TOKEN` is scoped
+  C-353 configuration proposal and the matching C-354/C-516 identity clauses). Plan, cut, build,
+  receipt and verification work remains mutation-credential-free. `RELEASE_TOKEN` is scoped
   to the isolated core promotion, plugin tag-control and GitHub Release steps; it preflights before
   mutation and performs PAT-authenticated tag pushes so both tag workflows run. The ambient
   `GITHUB_TOKEN` is limited to exact candidate dispatch and Actions observation. Parsed adversarial
@@ -233,15 +240,14 @@ All notable changes to this project are documented in this file. The format is b
   evidence-ratcheted, and the final migration removes every plugin artifact and release path.
 
 - **A merge from `main` into the dedicated `release` branch is now the complete release action**
-  (C-251). `.github/workflows/release-flow.yml` runs the live smoke and narrow Flux-authored cut,
-  while `scripts/promote-release-flow.sh` keeps the trigger-capable PAT out of the model step, stages
+  (C-251). `.github/workflows/release-flow.yml` runs the deterministic host-only Flux-authored cut,
+  while `scripts/promote-release-flow.sh` keeps the trigger-capable PAT out of the cut step, stages
   the exact cut SHA on a versioned candidate ref, verifies its immutable receipt before advancing
   `main`, and waits for both tag workflows plus the public Release verifier. Any failure preserves
   the candidate ref and names the recovery evidence instead of leaving a green partial release. The
-  live gate defaults to direct Anthropic Haiku, with an explicit OpenRouter override, so the normal
-  release does not also depend on an OpenRouter credit balance. Hosted runners install and self-test
-  bubblewrap before the agentic smoke and Flux cut, including enabling the user-namespace primitive
-  restricted by Ubuntu 24.04's hosted AppArmor default, preserving the fail-closed sandbox posture.
+  cut consumes reviewed repository notes and accepts no model/provider credential. Hosted runners
+  install and self-test bubblewrap before Flux runs its fixed process operations, including enabling
+  the user-namespace primitive restricted by Ubuntu 24.04's hosted AppArmor default.
   They also install the website's locked Node dependencies before the transactional cut, so embedded
   documentation regeneration uses the same pinned Docusaurus toolchain as the website gate. The
   automated cut no longer repeats the full six-command gate: the exact candidate SHA runs it once,

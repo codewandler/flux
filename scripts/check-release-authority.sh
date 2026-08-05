@@ -17,12 +17,14 @@
 #
 #   * Every release workflow declares workflow-level `contents: read` and grants no other write.
 #     Any additional write permission is declared on the one job that consumes it.
-#   * Each long-lived secret is bound to the explicit (workflow, job, step) consumers in AUTHORIZED
+#   * Provider credentials are forbidden from all four release workflows. Release availability is
+#     a repository property, not an Anthropic, OpenRouter or OpenAI account property.
+#   * Each publication secret is bound to the explicit (workflow, job, step) consumers in AUTHORIZED
 #     below. Anywhere else — workflow `env`, job `env`, another step, or a `run` interpolation — is
 #     a violation, including in a step that would "obviously" be fine.
 #   * `RELEASE_TOKEN` may appear only in the isolated core promotion, plugin tag-control and GitHub
 #     Release steps. Signing and Cargo publication keep their own secrets. No job holds two release
-#     authorities, and no job holds one beside a model credential or unrelated GitHub write scope.
+#     authorities, and no job holds one beside unrelated GitHub write scope.
 #   * No release workflow may depend on a GitHub App variable/key, token mint, or Environment.
 #   * Publication jobs are reachable only from an exact version tag: their `if` must carry the
 #     tag-derived conjunct, and the value it reads must not be derivable from a dispatch input.
@@ -56,9 +58,9 @@ violations = []
 def note(list, message) = list << message
 
 RELEASE_WORKFLOWS = %w[release.yml release-flow.yml release-plugins.yml crates-io.yml].freeze
-MODEL_SECRETS = %w[ANTHROPIC_API_KEY OPENROUTER_API_KEY].freeze
+PROVIDER_SECRETS = %w[ANTHROPIC_API_KEY OPENROUTER_API_KEY OPENAI_API_KEY].freeze
 PUBLICATION_SECRETS = %w[RELEASE_TOKEN MINISIGN_SECRET_KEY CARGO_REGISTRY_TOKEN].freeze
-LONG_LIVED = (MODEL_SECRETS + PUBLICATION_SECRETS).freeze
+LONG_LIVED = (PROVIDER_SECRETS + PUBLICATION_SECRETS).freeze
 REMOVED_SETTINGS = %w[PROMOTION_APP_ID PROMOTION_APP_PRIVATE_KEY mint-promotion-token.sh].freeze
 # GITHUB_TOKEN is minted per job and bounded by that job's `permissions:` block, which this check
 # already constrains. It is not a long-lived credential and is not part of the placement table.
@@ -67,11 +69,6 @@ AMBIENT = %w[GITHUB_TOKEN].freeze
 # Every authorized consumer of a long-lived credential: workflow -> job -> step name.
 AUTHORIZED = {
   'release-flow.yml' => {
-    'cut' => {
-      'Does a model credential exist?' => MODEL_SECRETS,
-      'Live smoke against a cheap model' => MODEL_SECRETS,
-      'Run examples/release.flux' => MODEL_SECRETS,
-    },
     'release-control' => {
       'Promote the merged cut to a public release' => %w[RELEASE_TOKEN],
     },
@@ -334,7 +331,7 @@ documents.each do |name, doc|
 
     used.uniq!
     publication = used & PUBLICATION_SECRETS
-    model = used & MODEL_SECRETS
+    provider = used & PROVIDER_SECRETS
 
     # --- 4. Authorities do not compose inside one job. ---
     if publication.length > 1
@@ -342,17 +339,10 @@ documents.each do |name, doc|
            "#{name}: job `#{job_name}` combines publication authority #{publication.join(' + ')}; " \
            'signing, GitHub Release and Cargo publication are distinct jobs')
     end
-    unless model.empty?
-      unless publication.empty?
-        note(violations,
-             "#{name}: job `#{job_name}` runs a model credential beside release authority " \
-             "#{publication.join(', ')}")
-      end
-      unless job_writes.empty?
-        note(violations,
-             "#{name}: job `#{job_name}` runs a model credential with GitHub write permission " \
-             "#{job_writes.join(', ')}")
-      end
+    unless provider.empty?
+      note(violations,
+           "#{name}: job `#{job_name}` reintroduces forbidden provider credential " \
+           "#{provider.join(', ')}; release workflows must be credential-free outside publication")
     end
 
     # --- 5. Each RELEASE_TOKEN consumer is bound to its one host-owned purpose. ---
@@ -465,7 +455,7 @@ if flow.is_a?(Hash)
     escalated = writes(effective_permissions(flow, cut))
     unless escalated.empty?
       violations << "release-flow.yml: job `cut` holds write permission #{escalated.join(', ')}; the " \
-                    'model, smoke, scribe and local cut path takes no GitHub write token'
+                    'deterministic plan and local cut path takes no GitHub write token'
     end
   end
 end
@@ -612,17 +602,18 @@ when 'inherited-write-permission'
   doc = load(dest, 'release.yml')
   doc['permissions']['contents'] = 'write'
   store(dest, 'release.yml', doc)
-when 'model-and-write-token'
+when 'provider-credential-reintroduced'
   doc = load(dest, 'release-flow.yml')
-  doc['jobs']['cut']['permissions'] = { 'contents' => 'write' }
+  flow = step(doc, 'cut', 'Run the credential-free release flow')
+  (flow['env'] ||= {})['ANTHROPIC_API_KEY'] = '${{ secrets.ANTHROPIC_API_KEY }}'
   store(dest, 'release-flow.yml', doc)
 when 'reintroduced-environment'
   doc = load(dest, 'release-flow.yml')
   doc['jobs']['release-control']['environment'] = 'release-control'
   store(dest, 'release-flow.yml', doc)
-when 'release-token-in-model-step'
+when 'release-token-in-cut-step'
   doc = load(dest, 'release-flow.yml')
-  flow = step(doc, 'cut', 'Run examples/release.flux')
+  flow = step(doc, 'cut', 'Run the credential-free release flow')
   (flow['env'] ||= {})['RELEASE_TOKEN'] = '${{ secrets.RELEASE_TOKEN }}'
   store(dest, 'release-flow.yml', doc)
 when 'app-token-publication'
@@ -745,9 +736,9 @@ if [ "$MODE" = "self-test" ]; then
 workflow-secret-scope
 job-secret-scope
 inherited-write-permission
-model-and-write-token
+provider-credential-reintroduced
 reintroduced-environment
-release-token-in-model-step
+release-token-in-cut-step
 app-token-publication
 reintroduced-app-variable
 missing-plugin-pat

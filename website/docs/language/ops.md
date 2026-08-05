@@ -460,10 +460,14 @@ outside it.
 
 ## Cutting a release
 
-These five drive [`examples/release.flux`](https://github.com/codewandler/flux/blob/main/examples/release.flux),
-which cuts a flux release as a Flux-Lang program. They exist as separate, narrow ops rather than as
-`proc.run` calls because a release flow needs exactly two programs and three writable files: fixed
-argv and a fixed path set are authority you cannot mistype.
+The automatic path is
+[`examples/release-cut.flux`](https://github.com/codewandler/flux/blob/main/examples/release-cut.flux):
+a deterministic program over `release_plan`, `release_verify_versions`, and `release_cut`. It uses
+already-reviewed `[Unreleased]` notes and calls no model. The remaining two ops support the optional
+model-assisted release-note rehearsal in
+[`examples/release.flux`](https://github.com/codewandler/flux/blob/main/examples/release.flux).
+These are separate, narrow ops rather than `proc.run` calls because fixed argv and a fixed path set
+are authority you cannot mistype.
 
 | op | arguments | description |
 |---|---|---|
@@ -473,11 +477,11 @@ argv and a fixed path set are authority you cannot mistype.
 | `changelog_insert` | `file, body, [section], [apply]` | Insert markdown under a changelog's `## [<section>]` heading, deterministically and idempotently. `apply` defaults to false (preview) |
 | `release_cut` | `bump, [apply]` | Cut with `scripts/cut-release.sh <bump>` (fixed argv), stopping at the **local** annotated tag. `apply` defaults to false |
 
-The division of labour is the point: **the model writes prose, the host decides the version.**
-`release_plan` derives the bump from conventional-commit titles — a `!` means breaking, and breaking
-means a minor bump while flux is `0.y` — so no version is ever read back out of a model reply.
-crates.io is yank-only, and a wrong version cannot be withdrawn. A model may return a `bump_opinion`
-and disagree in writing; the run surfaces the disagreement and cuts the host's number anyway.
+The irreversible decision stays in the host. `release_plan` derives the bump from complete commit
+messages plus the customer-facing `Action needed` signal — a `!` or `BREAKING` marker means breaking,
+and breaking means a minor bump while flux is `0.y`. crates.io is yank-only, and a wrong version
+cannot be withdrawn. The automatic release neither selects nor calls a model. In the optional manual
+notes rehearsal, a model may return a `bump_opinion`, but that field cannot change the host's number.
 
 `task()` returns text, even when the prompt requests JSON. `release_parse_notes` is the explicit host
 boundary that accepts only the exact release-note object before the flow reads any of its fields.
