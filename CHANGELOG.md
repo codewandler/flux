@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-08-05
+
 ### Added
 
 - **`flux review` now shows live progress while its built-in review flow runs** (C-530). The CLI can

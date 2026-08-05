@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.56.0] - 2026-08-05
+
 ### New
 
 - **`flux review` now shows what it is doing while reviewers work.** By default it displays a live
