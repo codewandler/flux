@@ -57,6 +57,9 @@ private reasoning, expose tool inputs/results, or require new Flux-Lang syntax.
 - 2026-08-04 — completed the sink-backed SDK lifecycle, correlated reviewer projection, stderr
   tree/plain/off renderers, CLI wiring, and periodic idle/stall refresh. The final report and
   severity exit gate remain on their existing path.
+- 2026-08-05 — recovered the completed implementation onto current `origin/main`, regenerated the
+  customer website mirror, story board, and embedded public-doc archive, and verified the focused
+  SDK/CLI behavior against the integrated runtime.
 
 ## Verification
 
@@ -66,13 +69,21 @@ private reasoning, expose tool inputs/results, or require new Flux-Lang syntax.
 - `cargo fmt --all -- --check`
 - `cargo clippy -p flux-cli --all-targets --no-deps -- -D warnings`
 - `cargo test -p flux-codegate`
+- `FLUX_UPDATE_GOLDEN=1 cargo test -p codewandler-flux-lang --test website_in_sync
+  website_customer_changelog_is_in_sync` (expected regeneration failure)
+- `cargo test -p codewandler-flux-lang --test website_in_sync
+  website_customer_changelog_is_in_sync`
+- `python3 /home/timo/projects/agentplugins/plugins/track/scripts/gen_board.py docs` (idempotent
+  second run)
+- `scripts/build-embedded-docs.sh`
+- `scripts/build-embedded-docs.sh --check`
 
 The focused tests cover the shared direct/child event bridge and the bounded three-reviewer phase
 projection. The package check, formatting gate, no-dependency CLI clippy gate, and architecture gate
-cover the shipped wiring. A broader `cargo clippy -p flux-cli --all-targets -- -D warnings` was also
-attempted, but pre-existing changes in `crates/flux-capabilities/src/usage_observatory.rs` fail on
-`clippy::misnamed_getters` and `clippy::too_many_arguments`; those unrelated user-owned changes were
-left untouched. A provider-backed visual smoke test is not part of the offline gate.
+cover the shipped wiring. Website generation also runs its documentation test before each build;
+the regenerated mirror and embedded archive both pass their exact freshness checks. The board
+generator reports the pre-existing C-320 `status: active` warning while producing an idempotent
+board. A provider-backed visual smoke test is not part of the offline gate.
 
 ## Architecture
 
