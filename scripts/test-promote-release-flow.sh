@@ -31,6 +31,8 @@ required = {
   canonical_main: 'git/ref/heads/main',
   exact_tree: 'merged main does not contain the exact cut diff',
   candidate: '"$MERGED_SHA:$CANDIDATE_REF"',
+  candidate_readback: 'does not point at the merged canonical-main SHA',
+  receipt: 'scripts/release-candidate.sh verify',
   release_baseline: 'RELEASE_BASELINE=$(latest_run_id release.yml)',
   crates_baseline: 'CRATES_BASELINE=$(latest_run_id crates-io.yml)',
   tag_object: 'git/tags',
@@ -46,7 +48,7 @@ indexes = required.transform_values do |needle|
   abort "missing promotion boundary #{needle}" unless index
   index
 end
-order = %i[bundle cut_branch pr exact_ci merge canonical_main exact_tree candidate release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
+order = %i[bundle cut_branch pr exact_ci merge canonical_main exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
 order.each_cons(2) do |left, right|
   abort "promotion order regressed: #{left} must precede #{right}" unless indexes.fetch(left) < indexes.fetch(right)
 end
@@ -75,6 +77,7 @@ for needle in \
   'app_gh pr merge' \
   'git/ref/heads/main' \
   '"$MERGED_SHA:$CANDIDATE_REF"' \
+  'scripts/release-candidate.sh verify' \
   'RELEASE_BASELINE=$(latest_run_id release.yml)' \
   'CRATES_BASELINE=$(latest_run_id crates-io.yml)' \
   'wait_for_exact_run release.yml' \

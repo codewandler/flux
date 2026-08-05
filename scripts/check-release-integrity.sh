@@ -148,6 +148,33 @@ abort "publication does not wait for the checked artifact set" unless
 abort "artifacts are attested only after publication" unless
   Array(publish_job["needs"]).include?("attest")
 
+# C-355 — the promotion source is authenticated before anything consumes it.
+#
+# The tag run used to take the promotion source with `pattern: artifacts-*` + `merge-multiple: true`
+# and hand the merged directory straight to `dist host`. The receipt now binds seven immutable IDs,
+# sizes and digests, and the consumer hashes the raw ZIP bytes and extracts into per-record
+# namespaces. That step is worthless if it drifts below the first consumer of the bytes, so its
+# position relative to `dist host`, the staged asset check and the handoff is the invariant.
+candidate_index = host_steps.index do |step|
+  step["name"] == "Verify and safely assemble the receipt-bound candidate bytes"
+end
+abort "host does not verify and safely extract the receipt-bound candidate bytes (C-355)" unless candidate_index
+dist_host_index = host_steps.index { |step| step.fetch("run", "").match?(/(?:^|\s)dist\s+host\b/) }
+abort "host has no dist host step" unless dist_host_index
+abort "the candidate bytes reach `dist host` before they are verified" unless candidate_index < dist_host_index
+abort "the candidate bytes are verified only after the staged asset check" unless candidate_index < staged_index
+abort "the candidate bytes are verified only after the publication handoff" unless candidate_index < handoff_index
+host_steps.each do |step|
+  next unless step.fetch("uses", "").start_with?("actions/download-artifact@")
+
+  with = step.fetch("with", {})
+  next unless with["run-id"]
+  next unless with["pattern"] || with["merge-multiple"]
+
+  abort "the promotion source is downloaded from the candidate run by pattern; " \
+        "`merge-multiple: true` is not the trust boundary (C-355)"
+end
+
 # The planning job may inspect hosting (`--steps=check`) but may not ask to create it. In the pinned
 # dist 0.32.0 `--steps=create` is inert on the GitHub backend — it is NOT what published v0.47.0, and
 # anyone reading this check should not conclude that it was. It is forbidden because a planning job
@@ -245,6 +272,18 @@ when "candidate-receipt-skips-when-nothing-built"
   candidate["if"] = "${{ always() && needs.plan.outputs.preparing == 'true' && " \
                     "needs.build-local-artifacts.result == 'success' && " \
                     "needs.build-global-artifacts.result == 'success' }}"
+when "candidate-bytes-consumed-before-verification"
+  host = jobs.fetch("host")
+  index = step_index(host) { |step| step["name"] == "Verify and safely assemble the receipt-bound candidate bytes" }
+  moved = host.fetch("steps").delete_at(index)
+  host.fetch("steps") << moved
+when "promotion-source-downloaded-by-pattern"
+  host = jobs.fetch("host")
+  index = step_index(host) { |step| step["name"] == "Download the candidate receipt" }
+  step = host.fetch("steps").fetch(index)
+  step.fetch("with").delete("name")
+  step.fetch("with")["pattern"] = "artifacts-*"
+  step.fetch("with")["merge-multiple"] = true
 when "release-token-escapes-the-publication-job"
   jobs.fetch("host")["env"]["GH_TOKEN"] = "${{ secrets.RELEASE_TOKEN }}"
 when "attestation-write-escapes-into-a-build-job"
@@ -285,6 +324,8 @@ if [ "${1:-}" = "--self-test" ]; then
     hosting-create-verb-in-plan \
     publishes-without-checking-the-builds \
     candidate-receipt-skips-when-nothing-built \
+    candidate-bytes-consumed-before-verification \
+    promotion-source-downloaded-by-pattern \
     release-token-escapes-the-publication-job \
     attestation-write-escapes-into-a-build-job
   do

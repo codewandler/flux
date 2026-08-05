@@ -87,6 +87,9 @@ jobs:
         run: |
           scripts/test-embedded-docs-gates.sh
           scripts/test-release-candidate.sh
+          # C-355: receipt v3 and the raw-ZIP trust boundary, including every corruption class the
+          # promotion consumer must refuse before it writes a single extracted byte.
+          scripts/run-python3.sh scripts/test_candidate_artifacts.py
           # C-354: the promotion ordering fixtures existed but were never run by CI, so a
           # regression in the irreversible half was only ever caught by reading the script.
           scripts/test-promote-release-flow.sh

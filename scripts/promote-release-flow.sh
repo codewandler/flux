@@ -160,6 +160,10 @@ merged_sha_for_resume=$MERGED_SHA
 echo "Staging merged canonical-main SHA $MERGED_SHA at $CANDIDATE_REF"
 git_with_promoter push "$PUSH_URL" "$MERGED_SHA:$CANDIDATE_REF"
 candidate_staged=1
+# C-355: the candidate ref IS the promotion source, so read it back rather than assuming the push
+# landed what we asked for. Everything downstream is bound to this SHA.
+[ "$(remote_sha "$CANDIDATE_REF")" = "$MERGED_SHA" ] \
+  || fail "$CANDIDATE_REF does not point at the merged canonical-main SHA $MERGED_SHA"
 
 CANDIDATE_BASELINE=$(latest_run_id release.yml)
 actions_gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$CANDIDATE_BRANCH" -f "version=$VERSION"

@@ -195,6 +195,46 @@ The matching tag run verifies the receipt and promotes those artifacts without r
 retaining the normal public-release asset verification. The tag simultaneously starts the
 idempotent crates.io publisher.
 
+### The candidate receipt is `flux-release-candidate-v3` (C-355)
+
+v2 bound a version, a commit and an immutable run ID — *which run*, but nothing about *what came out
+of it*. The tag run then downloaded `artifacts-*` by pattern and let `merge-multiple: true` decide
+what got published. v3 binds the closure instead. Alongside the scalars, the receipt names each of
+the seven expected uploads:
+
+```text
+artifacts-plan-dist-manifest
+artifacts-build-local-aarch64-apple-darwin
+artifacts-build-local-aarch64-unknown-linux-gnu
+artifacts-build-local-x86_64-apple-darwin
+artifacts-build-local-x86_64-unknown-linux-gnu
+artifacts-build-local-x86_64-pc-windows-msvc
+artifacts-build-global
+```
+
+with its API-reported name, positive immutable database ID, `size_in_bytes` and `digest`, spelled
+exactly `sha256:<64 lowercase hex>`, in one canonical order and encoding. Recording paginates the
+artifacts API of that exact repository and run, after every producer job has succeeded. A missing,
+expired, duplicate, malformed or extra `artifacts-*` upload fails recording and verification closed.
+**v2 is not accepted as a compatibility substitute** — candidate discovery and every consumer
+require v3.
+
+**The raw ZIP is the trust boundary.** Promotion downloads each archive by its receipt-bound
+immutable artifact ID and, before opening it, checks that the response is a real ZIP, hashes those
+exact raw bytes, and compares the digest, size and API identity to the receipt. A redirect or a
+metadata record that resolves to a different artifact is refused there, not later. Only then is each
+archive extracted into a fresh directory named from its receipt record, by an extractor that refuses
+absolute paths, `..` traversal, backslash/drive/UNC names, NUL and control characters, symlinks,
+hardlinks, devices and FIFOs, duplicate members and cross-archive destination collisions. The host
+input is assembled from the seven verified namespaces afterwards; `merge-multiple: true` is a
+convenience in the download action and is not the trust boundary.
+
+The checksums *inside* the archives cannot replace any of this: they are produced by the same run
+and travel in the same bytes, so they authenticate neither the transport nor the API handoff.
+
+Owned by `scripts/candidate_artifacts.py` (with `scripts/release-candidate.sh` as the stable entry
+point); adversarial fixtures for every corruption class in `scripts/test_candidate_artifacts.py`.
+
 If any full-gate command fails, the candidate run creates no receipt. The promotion helper is
 waiting with `--exit-status`, so it retains the candidate ref for diagnosis and leaves both `main`
 and the tag untouched.
@@ -295,8 +335,15 @@ scripts/release-candidate.sh verify "$receipt_dir/release-candidate.txt" \
   X.Y.Z "$sha" "$run_id"
 test "$(scripts/find-release-candidate.sh "$repo" "$sha")" = "$run_id"
 
-# Only the verified commit may now become main and a public version tag.
-git push origin HEAD:main
+# C-355: prove the seven receipt-bound archives download, hash and extract safely BEFORE the tag
+# exists. A byte failure here leaves the candidate ref in place for diagnosis and creates nothing.
+scripts/release-candidate.sh fetch "$receipt_dir/release-candidate.txt" \
+  "$receipt_dir/consume" --run-id "$run_id"
+
+# Only the verified commit may now reach main — through a normal pull request, never a direct
+# push (C-353/C-354) — and only that merged canonical-main SHA may carry the public tag.
+gh pr create --base main --head "$candidate" --title "release: cut $tag"
+# ...merge it through branch protection, then tag the resulting canonical main commit:
 git push origin "$tag"
 
 # Wait for release.yml and crates-io.yml to finish, then:
