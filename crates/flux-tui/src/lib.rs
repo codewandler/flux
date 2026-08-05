@@ -11,6 +11,7 @@ pub mod fleet;
 mod interaction;
 pub mod loopmock;
 mod observatory;
+pub mod operations;
 mod panes;
 mod projection;
 mod rendering;
@@ -101,6 +102,10 @@ pub struct TuiRunOptions {
     pub pane_queue: Option<Arc<PaneQueue>>,
     /// Typed-question channel minted before agent assembly; `None` keeps the surface headless.
     pub interaction_queue: Option<Arc<InteractionQueue>>,
+    /// Typed Board/Fleet projection and bounded mutation bridge. `None` is explicitly standalone.
+    pub operations_source: Option<operations::SharedFleetBoardSource>,
+    /// Surface workspace root when it differs from the process cwd (Fleet-root attachment).
+    pub workspace_root: Option<String>,
 }
 
 impl TuiRunOptions {
@@ -114,6 +119,8 @@ impl TuiRunOptions {
             theme: None,
             pane_queue: None,
             interaction_queue: None,
+            operations_source: None,
+            workspace_root: None,
         }
     }
 }
@@ -284,6 +291,8 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("sessions", "list recent sessions"),
     ("resume", "resume a session id"),
     ("queue", "manage queued follow-ups"),
+    ("fleet", "open Fleet operations"),
+    ("board", "open Board work and decisions"),
     ("theme", "show or switch the color theme"),
 ];
 
@@ -1154,6 +1163,7 @@ impl ChatState {
             panes_overflowing: false,
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
+            operations: None,
         }
     }
 
@@ -2617,22 +2627,42 @@ impl ChatState {
     /// The top header bar: identity + model on the left, cumulative session tokens on the right.
     fn header_line(&self, width: u16) -> Line<'static> {
         let t = &self.theme;
+        let surface = self.operations.as_ref().map(|operations| {
+            let wave = operations
+                .snapshot
+                .active_wave
+                .as_ref()
+                .map(|wave| wave.id.as_str())
+                .unwrap_or("—");
+            format!(
+                "Fleet main · {} · r{} · F2 · g{}/r{} · wave {}",
+                operations.snapshot.connection_label(),
+                operations.snapshot.revision,
+                operations.snapshot.goals.len(),
+                operations.snapshot.goals_revision,
+                wave
+            )
+        });
         let target = self
             .execution_target
             .as_deref()
             .map(|target| format!(" · {target}"))
             .unwrap_or_default();
+        let mut identity = Vec::new();
+        if let Some(surface) = surface {
+            identity.push(surface);
+        }
+        if !self.session_id.is_empty() {
+            identity.push(self.session_id.clone());
+        }
+        identity.push(format!(
+            "{}{}",
+            self.model_spec.as_deref().unwrap_or(&self.model),
+            target
+        ));
         let left = vec![
             Span::styled("flux", t.accent_style().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!(
-                    "  {} · {}{}",
-                    self.session_id,
-                    self.model_spec.as_deref().unwrap_or(&self.model),
-                    target,
-                ),
-                t.muted_style(),
-            ),
+            Span::styled(format!("  {}", identity.join(" · ")), t.muted_style()),
         ];
         let mut right: Vec<Vec<Span<'static>>> = Vec::new();
         // C-06: the header used to sum only input/output, silently ignoring cache read/write
@@ -2698,8 +2728,14 @@ impl ChatState {
                 t.muted_style(),
             )]);
         }
-        // Segment order [auto-ok, tokens, cache, cost, shell, gather, effort]; bar_line drops
-        // from the end, so the badges shed first and auto-ok survives the longest (C-102/C-116).
+        // Standalone identity is the least-precious header segment: visible during ordinary chat,
+        // but shed before safety/cost metrics on a narrow or information-dense bar.
+        if self.operations.is_none() {
+            right.push(vec![Span::styled("standalone", t.muted_style())]);
+        }
+        // Segment order [auto-ok, tokens, cache, cost, shell, gather, effort, standalone];
+        // bar_line drops from the end, so optional identity/badges shed first and auto-ok survives
+        // the longest (C-102/C-116).
         for seg in right.iter_mut().skip(1) {
             seg.insert(0, Span::styled(" · ", t.muted_style()));
         }
@@ -3464,7 +3500,10 @@ pub async fn run_with_options(
         &mut state,
         tx,
         rx,
-        options.model_resolver,
+        EventLoopServices {
+            model_resolver: options.model_resolver,
+            operations_source: options.operations_source,
+        },
         crossterm::event::EventStream::new(),
     )
     .await;
@@ -3509,9 +3548,11 @@ pub fn session_state(
     state.theme_name = theme_name;
     // C-157: the surface's cwd at launch, shown in the empty-transcript orientation card. A
     // single read at startup — same posture as `session_id`/`model`, not re-read per frame.
-    state.workspace_root = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    state.workspace_root = options.workspace_root.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    });
     // C-116: seed the header mode badges — auto-approve from the launch options, effort from
     // the engine's current setting (later `/effort` changes are mirrored by the handler).
     state.auto_approve = options.auto_approve;
@@ -3523,6 +3564,9 @@ pub fn session_state(
     state.project_session(&agent.events, session_id)?;
     state.previous_sessions = previous_session_count(&agent.events, session_id)?;
     state.history = load_history(&agent.events);
+    if let Some(source) = options.operations_source.as_ref() {
+        state.operations = Some(crate::operations::OperationsState::new(source.snapshot()?));
+    }
     Ok(state)
 }
 
@@ -3575,7 +3619,10 @@ pub async fn drive_event_loop_headless(
         state,
         tx.clone(),
         rx,
-        None,
+        EventLoopServices {
+            model_resolver: None,
+            operations_source: None,
+        },
         input,
     )
     .await?;
@@ -3594,13 +3641,18 @@ pub async fn drive_event_loop_headless(
 const HEADLESS_WIDTH: u16 = 120;
 const HEADLESS_HEIGHT: u16 = 40;
 
+struct EventLoopServices {
+    model_resolver: Option<Arc<dyn ModelResolver>>,
+    operations_source: Option<operations::SharedFleetBoardSource>,
+}
+
 async fn event_loop<B, S>(
     terminal: &mut Terminal<B>,
     agent: Arc<tokio::sync::RwLock<FlowEngine>>,
     state: &mut ChatState,
     tx: mpsc::UnboundedSender<UiEvent>,
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
-    model_resolver: Option<Arc<dyn ModelResolver>>,
+    services: EventLoopServices,
     mut input: S,
 ) -> anyhow::Result<()>
 where
@@ -3610,6 +3662,11 @@ where
 {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
     use futures_util::StreamExt as _;
+
+    let EventLoopServices {
+        model_resolver,
+        operations_source,
+    } = services;
 
     let mut cancel = CancellationToken::new();
     let mut pending_reply: Option<(String, oneshot::Sender<ApprovalChoice>)> = None;
@@ -3622,6 +3679,11 @@ where
     // The action whose cancellation token the operator triggered. Keep this until `Finished` so
     // tool-call events already in flight behind the keypress are sealed too.
     let mut interrupted_action_id = None;
+    let mut operations_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    operations_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // C-305: the agent's pane commands, applied BEFORE this iteration's UI events on purpose —
@@ -3744,7 +3806,14 @@ where
                         reason,
                     })
                 }
-                UiEvent::Notice { text, sev } => state.push(Entry::Notice { text, sev }),
+                UiEvent::Notice { text, sev } => {
+                    if sev == Sev::Err {
+                        if let Some(operations) = state.operations.as_mut() {
+                            operations.turn_failed = true;
+                        }
+                    }
+                    state.push(Entry::Notice { text, sev })
+                }
                 UiEvent::Approval { request, reply } => {
                     approval_queue.push_back((request, reply));
                     show_next_approval(state, &mut pending_reply, &mut approval_queue);
@@ -3756,6 +3825,7 @@ where
                     // The engine consumed these from the shared queue (the strip empties by
                     // itself); leave a transcript record that the running turn was steered.
                     for text in messages {
+                        acknowledge_steered_requirement(state, operations_source.as_ref(), &text);
                         state.push(Entry::Notice {
                             text: format!("↪ steering delivered: {text}"),
                             sev: Sev::Info,
@@ -3763,6 +3833,7 @@ where
                     }
                 }
                 UiEvent::Finished => {
+                    complete_attached_requirements(state, operations_source.as_ref());
                     seal_interrupted_action(state, &mut interrupted_action_id);
                     if let Some((_tool, reply)) = pending_reply.take() {
                         let _ = reply.send(ApprovalChoice::Deny);
@@ -3787,7 +3858,13 @@ where
                     // A queued message starts only after the prior task's Finished marker.
                     if !state.queue_open && state.queue_edit.is_none() {
                         if let Some(queued) = state.queue.pop_front() {
-                            cancel = start_turn(&agent, &tx, state, queued);
+                            cancel = start_conversation_turn(
+                                &agent,
+                                &tx,
+                                state,
+                                queued,
+                                operations_source.as_ref(),
+                            );
                         }
                     }
                 }
@@ -3821,6 +3898,10 @@ where
             }
             // 62 ms lands redraws on the 16 fps boundaries of the animated footer bar.
             _ = tokio::time::sleep(Duration::from_millis(spinners::FPS_MS)), if state.running() => continue,
+            _ = operations_tick.tick(), if operations_source.is_some() => {
+                refresh_operations_snapshot(state, operations_source.as_ref());
+                continue;
+            },
         };
         match ev {
             Event::Resize(_, _) => continue,
@@ -3847,6 +3928,20 @@ where
                 continue;
             }
             Event::Mouse(m) => {
+                if state
+                    .operations
+                    .as_ref()
+                    .is_some_and(|operations| operations.open)
+                {
+                    if let Some(operations) = state.operations.as_mut() {
+                        match m.kind {
+                            MouseEventKind::ScrollUp => operations.move_selection(-1),
+                            MouseEventKind::ScrollDown => operations.move_selection(1),
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 match m.kind {
                     MouseEventKind::ScrollUp => scroll_up(state, 3),
                     MouseEventKind::ScrollDown => scroll_down(state, 3),
@@ -4173,6 +4268,126 @@ where
                     continue;
                 }
 
+                // C-556/C-557: the operations overlay is a surface-owned, typed projection. It
+                // captures every key while open; only a twice-confirmed decision reaches a write.
+                if key.code == KeyCode::F(2) && state.operations.is_some() {
+                    if let Some(operations) = state.operations.as_mut() {
+                        operations.open = !operations.open;
+                        operations.detail_open = false;
+                        operations.confirm_decision = false;
+                    }
+                    continue;
+                }
+                if state
+                    .operations
+                    .as_ref()
+                    .is_some_and(|operations| operations.open)
+                {
+                    let mut decide = None;
+                    let mut refresh = false;
+                    if let Some(operations) = state.operations.as_mut() {
+                        match key.code {
+                            KeyCode::Esc if operations.confirm_decision => {
+                                operations.confirm_decision = false
+                            }
+                            KeyCode::Esc if operations.detail_open => {
+                                operations.detail_open = false;
+                                operations.confirm_decision = false;
+                            }
+                            KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
+                                operations.open = false;
+                                operations.detail_open = false;
+                                operations.confirm_decision = false;
+                            }
+                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                let tab = operations.tab.cycle(-1);
+                                operations.select_tab(tab);
+                            }
+                            KeyCode::Tab => {
+                                let tab = operations.tab.cycle(1);
+                                operations.select_tab(tab);
+                            }
+                            KeyCode::Char('1') => {
+                                operations.select_tab(crate::operations::OperationsTab::Overview)
+                            }
+                            KeyCode::Char('2') => {
+                                operations.select_tab(crate::operations::OperationsTab::Board)
+                            }
+                            KeyCode::Char('3') => {
+                                operations.select_tab(crate::operations::OperationsTab::Workers)
+                            }
+                            KeyCode::Char('4') => {
+                                operations.select_tab(crate::operations::OperationsTab::Decisions)
+                            }
+                            KeyCode::Char('5') => {
+                                operations.select_tab(crate::operations::OperationsTab::Stats)
+                            }
+                            KeyCode::Up => operations.move_selection(-1),
+                            KeyCode::Down => operations.move_selection(1),
+                            KeyCode::PageUp => operations.move_selection(-10),
+                            KeyCode::PageDown => operations.move_selection(10),
+                            KeyCode::Left
+                                if operations.detail_open
+                                    && operations.tab
+                                        == crate::operations::OperationsTab::Decisions =>
+                            {
+                                operations.decision_option =
+                                    operations.decision_option.saturating_sub(1);
+                                operations.confirm_decision = false;
+                            }
+                            KeyCode::Right
+                                if operations.detail_open
+                                    && operations.tab
+                                        == crate::operations::OperationsTab::Decisions =>
+                            {
+                                let options = operations
+                                    .selected_decision()
+                                    .map_or(0, |decision| decision.options.len());
+                                operations.decision_option =
+                                    (operations.decision_option + 1).min(options.saturating_sub(1));
+                                operations.confirm_decision = false;
+                            }
+                            KeyCode::Enter
+                                if operations.detail_open
+                                    && operations.tab
+                                        == crate::operations::OperationsTab::Decisions =>
+                            {
+                                decide = operations.confirm_selected_decision();
+                            }
+                            KeyCode::Enter => operations.detail_open = true,
+                            KeyCode::Char('r') => refresh = true,
+                            _ => {}
+                        }
+                    }
+                    if let Some((decision_ref, outcome)) = decide {
+                        match operations_source
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Board/Fleet operations source is unavailable")
+                            })
+                            .and_then(|source| source.decide(&decision_ref, &outcome))
+                        {
+                            Ok(ack) => {
+                                if let Some(operations) = state.operations.as_mut() {
+                                    operations.last_ack = Some(ack);
+                                    operations.confirm_decision = false;
+                                    operations.detail_open = false;
+                                }
+                                refresh_operations_snapshot(state, operations_source.as_ref());
+                            }
+                            Err(error) => {
+                                if let Some(operations) = state.operations.as_mut() {
+                                    operations.refresh_error = Some(error.to_string());
+                                    operations.confirm_decision = false;
+                                }
+                            }
+                        }
+                    } else if refresh {
+                        refresh_operations_snapshot(state, operations_source.as_ref());
+                    }
+                    continue;
+                }
+
                 // C-140: usage overlay — Esc/q/Enter close, everything else is swallowed.
                 if state.usage_open {
                     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
@@ -4253,7 +4468,13 @@ where
                             state.queue_open = false;
                             if !state.running() {
                                 if let Some(next) = state.queue.pop_front() {
-                                    cancel = start_turn(&agent, &tx, state, next);
+                                    cancel = start_conversation_turn(
+                                        &agent,
+                                        &tx,
+                                        state,
+                                        next,
+                                        operations_source.as_ref(),
+                                    );
                                 }
                             }
                         }
@@ -4478,7 +4699,11 @@ where
                 if state.queue_edit.is_none() {
                     if let Some(token) = state.at_token() {
                         if state.file_inventory.is_none() {
-                            let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                            let root = if state.workspace_root.is_empty() {
+                                std::env::current_dir().unwrap_or_else(|_| ".".into())
+                            } else {
+                                std::path::PathBuf::from(&state.workspace_root)
+                            };
                             state.file_inventory = Some(Arc::new(workspace_file_inventory(
                                 &root,
                                 PATH_INVENTORY_CAP,
@@ -4582,7 +4807,13 @@ where
                             state.input = fresh_textarea();
                             if !running {
                                 if let Some(next) = state.queue.pop_front() {
-                                    cancel = start_turn(&agent, &tx, state, next);
+                                    cancel = start_conversation_turn(
+                                        &agent,
+                                        &tx,
+                                        state,
+                                        next,
+                                        operations_source.as_ref(),
+                                    );
                                 }
                             }
                         } else if state.slash_query().is_some() {
@@ -4609,7 +4840,13 @@ where
                                 state.clear_ctrl_c_arm();
                                 state.input = fresh_textarea();
                                 if let Some(next) = state.queue.pop_front() {
-                                    cancel = start_turn(&agent, &tx, state, next);
+                                    cancel = start_conversation_turn(
+                                        &agent,
+                                        &tx,
+                                        state,
+                                        next,
+                                        operations_source.as_ref(),
+                                    );
                                 }
                             } else {
                                 // C-156: blank composer, idle, nothing to cancel — the one
@@ -4627,7 +4864,13 @@ where
                             state.input = fresh_textarea(); // non-empty line → clear it
                             if cancelled_edit {
                                 if let Some(next) = state.queue.pop_front() {
-                                    cancel = start_turn(&agent, &tx, state, next);
+                                    cancel = start_conversation_turn(
+                                        &agent,
+                                        &tx,
+                                        state,
+                                        next,
+                                        operations_source.as_ref(),
+                                    );
                                 }
                             }
                         }
@@ -4669,7 +4912,13 @@ where
                             let _ = state.take_input();
                             if state.queue_cancel_edit() && !running {
                                 if let Some(next) = state.queue.pop_front() {
-                                    cancel = start_turn(&agent, &tx, state, next);
+                                    cancel = start_conversation_turn(
+                                        &agent,
+                                        &tx,
+                                        state,
+                                        next,
+                                        operations_source.as_ref(),
+                                    );
                                 }
                             }
                             continue;
@@ -4703,13 +4952,34 @@ where
                         if state.queue_commit_edit(text.clone()) {
                             if !running {
                                 if let Some(next) = state.queue.pop_front() {
-                                    cancel = start_turn(&agent, &tx, state, next);
+                                    cancel = start_conversation_turn(
+                                        &agent,
+                                        &tx,
+                                        state,
+                                        next,
+                                        operations_source.as_ref(),
+                                    );
                                 }
                             }
                         } else if running {
-                            state.enqueue(text);
+                            if accept_attached_requirement(
+                                state,
+                                operations_source.as_ref(),
+                                &text,
+                                false,
+                            ) {
+                                state.enqueue(text);
+                            } else {
+                                state.set_input(&text);
+                            }
                         } else {
-                            cancel = start_turn(&agent, &tx, state, text);
+                            cancel = start_conversation_turn(
+                                &agent,
+                                &tx,
+                                state,
+                                text,
+                                operations_source.as_ref(),
+                            );
                         }
                     }
                     // Everything else (text, backspace, arrows, word-nav, home/end) edits the input —
@@ -4802,6 +5072,28 @@ async fn handle_command(
                 state.queue_sel = state.queue_sel.min(state.queue.len() - 1);
             }
         }
+        "fleet" => match state.operations.as_mut() {
+            Some(operations) => {
+                operations.select_tab(crate::operations::OperationsTab::Overview);
+                operations.open = true;
+            }
+            None => state.push(Entry::Notice {
+                text: "standalone chat has no Fleet attachment · relaunch with `flux tui --fleet`"
+                    .into(),
+                sev: Sev::Info,
+            }),
+        },
+        "board" => match state.operations.as_mut() {
+            Some(operations) => {
+                operations.select_tab(crate::operations::OperationsTab::Board);
+                operations.open = true;
+            }
+            None => state.push(Entry::Notice {
+                text: "standalone chat has no attached Board · relaunch with `flux tui --fleet`"
+                    .into(),
+                sev: Sev::Info,
+            }),
+        },
         "shell" => {
             let was_on = flux_runtime::shell_opt_in();
             flux_runtime::set_shell_opt_in(!was_on);
@@ -5090,7 +5382,7 @@ async fn handle_command(
 fn command_is_read_only(name: &str, args: &str) -> bool {
     matches!(
         name,
-        "help" | "tools" | "evidence" | "session" | "queue" | "theme"
+        "help" | "tools" | "evidence" | "session" | "queue" | "theme" | "fleet" | "board"
     ) || (name == "sessions" && args != "--prune")
         || (name == "effort" && args.is_empty())
 }
@@ -5243,6 +5535,214 @@ fn start_insights(
 
 /// Push `input` as a user message and spawn the agent turn that streams back into the transcript.
 /// Returns the turn's cancellation token (Ctrl-C cancels it).
+fn refresh_operations_snapshot(
+    state: &mut ChatState,
+    source: Option<&operations::SharedFleetBoardSource>,
+) {
+    let (Some(source), Some(_)) = (source, state.operations.as_ref()) else {
+        return;
+    };
+    match source.snapshot() {
+        Ok(snapshot) => {
+            if let Some(operations) = state.operations.as_mut() {
+                operations.refresh(snapshot);
+            }
+        }
+        Err(error) => {
+            if let Some(operations) = state.operations.as_mut() {
+                // Keep the last good projection. Clearing it would turn an IO failure into a
+                // fabricated empty Fleet, which is operationally dangerous.
+                operations.refresh_error = Some(error.to_string());
+            }
+        }
+    }
+}
+
+fn accept_attached_requirement(
+    state: &mut ChatState,
+    source: Option<&operations::SharedFleetBoardSource>,
+    text: &str,
+    deliver: bool,
+) -> bool {
+    let Some(current) = state.operations.as_ref() else {
+        return true;
+    };
+    if !current.snapshot.can_send() {
+        let main_status = current.snapshot.main_status.clone();
+        state.push(Entry::Notice {
+            text: format!(
+                "Fleet main is {} · run `flux fleet start` and refresh with F2/r before sending",
+                main_status
+            ),
+            sev: Sev::Warn,
+        });
+        return false;
+    }
+    let Some(source) = source else {
+        state.push(Entry::Notice {
+            text: "Fleet attachment lost its typed operations source".into(),
+            sev: Sev::Err,
+        });
+        return false;
+    };
+    let session = state.session_id.clone();
+    let pending_index = state.operations.as_ref().and_then(|operations| {
+        operations
+            .pending
+            .iter()
+            .position(|pending| !pending.delivered && pending.text == text)
+    });
+    let index = if let Some(index) = pending_index {
+        index
+    } else {
+        match source.accept_requirement(text, &session) {
+            Ok(ack) => {
+                let Some(operations) = state.operations.as_mut() else {
+                    return false;
+                };
+                operations.last_ack = Some(ack.clone());
+                operations.pending.push(operations::PendingRequirement {
+                    id: ack.id,
+                    text: text.to_string(),
+                    delivered: false,
+                });
+                operations.pending.len() - 1
+            }
+            Err(error) => {
+                state.push(Entry::Notice {
+                    text: format!("Fleet intake refused: {error}"),
+                    sev: Sev::Err,
+                });
+                return false;
+            }
+        }
+    };
+    if !deliver {
+        return true;
+    }
+    let id = state
+        .operations
+        .as_ref()
+        .and_then(|operations| operations.pending.get(index))
+        .map(|pending| pending.id.clone())
+        .unwrap_or_default();
+    match source.deliver_requirement(&id, &session) {
+        Ok(ack) => {
+            if let Some(operations) = state.operations.as_mut() {
+                if let Some(pending) = operations.pending.get_mut(index) {
+                    pending.delivered = true;
+                }
+                operations.last_ack = Some(ack.clone());
+                operations.snapshot.main_status = "working".into();
+                if let Ok(revision) = ack.revision.parse() {
+                    operations.snapshot.revision = revision;
+                }
+                operations.turn_failed = false;
+            }
+            true
+        }
+        Err(error) => {
+            state.push(Entry::Notice {
+                text: format!("Fleet delivery failed: {error}"),
+                sev: Sev::Err,
+            });
+            false
+        }
+    }
+}
+
+fn acknowledge_steered_requirement(
+    state: &mut ChatState,
+    source: Option<&operations::SharedFleetBoardSource>,
+    text: &str,
+) {
+    let Some(source) = source else {
+        return;
+    };
+    let Some(index) = state.operations.as_ref().and_then(|operations| {
+        operations
+            .pending
+            .iter()
+            .position(|pending| !pending.delivered && pending.text == text)
+    }) else {
+        return;
+    };
+    let id = state.operations.as_ref().unwrap().pending[index].id.clone();
+    match source.deliver_requirement(&id, &state.session_id) {
+        Ok(ack) => {
+            if let Some(operations) = state.operations.as_mut() {
+                operations.pending[index].delivered = true;
+                operations.last_ack = Some(ack);
+            }
+        }
+        Err(error) => {
+            if let Some(operations) = state.operations.as_mut() {
+                operations.refresh_error = Some(format!("delivery {id}: {error}"));
+            }
+        }
+    }
+}
+
+fn complete_attached_requirements(
+    state: &mut ChatState,
+    source: Option<&operations::SharedFleetBoardSource>,
+) {
+    let Some(source) = source else {
+        return;
+    };
+    let Some(operations) = state.operations.as_ref() else {
+        return;
+    };
+    let failed = operations.turn_failed;
+    let ids = operations
+        .pending
+        .iter()
+        .filter(|pending| pending.delivered)
+        .map(|pending| pending.id.clone())
+        .collect::<Vec<_>>();
+    for id in &ids {
+        match source.complete_requirement(
+            id,
+            &state.session_id,
+            !failed,
+            failed.then_some("Fleet-main TUI turn failed; inspect the durable transcript"),
+        ) {
+            Ok(ack) => {
+                if let Some(operations) = state.operations.as_mut() {
+                    operations.last_ack = Some(ack);
+                }
+            }
+            Err(error) => {
+                if let Some(operations) = state.operations.as_mut() {
+                    operations.refresh_error = Some(format!("completion {id}: {error}"));
+                }
+            }
+        }
+    }
+    if let Some(operations) = state.operations.as_mut() {
+        operations
+            .pending
+            .retain(|pending| !pending.delivered || !ids.contains(&pending.id));
+        operations.turn_failed = false;
+    }
+    refresh_operations_snapshot(state, Some(source));
+}
+
+fn start_conversation_turn(
+    agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    state: &mut ChatState,
+    input: String,
+    source: Option<&operations::SharedFleetBoardSource>,
+) -> CancellationToken {
+    if accept_attached_requirement(state, source, &input, true) {
+        start_turn(agent, tx, state, input)
+    } else {
+        state.set_input(&input);
+        CancellationToken::new()
+    }
+}
+
 fn start_turn(
     agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
     tx: &mpsc::UnboundedSender<UiEvent>,
@@ -5698,11 +6198,7 @@ mod tests {
                 && !symbols.contains('┘'),
             "permanent transcript/composer boxes must be gone: {symbols}"
         );
-        let draft = buffer
-            .content
-            .iter()
-            .find(|c| c.symbol() == "d")
-            .expect("draft cell");
+        let draft = buffer.cell((1, 8)).expect("draft cell");
         assert_eq!(draft.bg, state.theme.composer_bg);
         assert_eq!(buffer.cell((0, 8)).expect("composer origin").symbol(), "▍");
         assert_eq!(buffer.cell((1, 8)).expect("composer text").symbol(), "d");
@@ -7086,11 +7582,7 @@ mod tests {
         terminal.draw(|f| render(f, &state)).unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.cell((0, 0)).expect("cell").bg, Theme::LIGHT.base_bg);
-        let draft = buffer
-            .content
-            .iter()
-            .find(|c| c.symbol() == "d")
-            .expect("draft cell");
+        let draft = buffer.cell((1, 8)).expect("draft cell");
         assert_eq!(draft.bg, Theme::LIGHT.composer_bg);
     }
 

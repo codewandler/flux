@@ -249,7 +249,10 @@ Full reference: [configuration](https://codewandler.github.io/flux/docs/referenc
   (`.flux/hooks/*.js`) can validate, transform or deny calls.
 - `flux tui` is the same daily driver in a dense borderless UI: mid-turn steering (type while a turn
   runs, with queued messages still editable), themes, history and transcript search, `@` path
-  completion, hunk-view diffs, session picker and replay, live model switching.
+  completion, hunk-view diffs, session picker and replay, live model switching. Launch
+  `flux tui --fleet[=ROOT]` to resume the exact Fleet-main coordinator and supervise its Board,
+  workers, decisions, failures and exact progress stats with `F2`; ordinary `flux tui` remains an
+  explicitly labelled standalone chat.
 
 ## Programs, presets, and the SDK
 

@@ -30,6 +30,15 @@
   or removes worktrees for you. The new **Coding / AI-assisted development** docs section explains
   the whole model and every backend.
 
+- **The terminal UI can now supervise the Fleet main coordinator and its Board.** Launch
+  `flux tui --fleet` in a Fleet root, or use `--fleet=ROOT`, to resume the exact durable main
+  conversation. `F2`, `/fleet`, or `/board` opens bounded native views of active workers, work,
+  decisions, failures, planning documents, and exact progress statistics; wide terminals also keep
+  an attention rail beside the chat. Requirements show accepted, delivered, and completed/failed
+  acknowledgement across restart. Viewing is read-only, and deciding an open question requires a
+  second explicit confirmation. Ordinary `flux tui` remains a labelled standalone chat, and the
+  operations view cannot push, release, deploy, apply a Fleet candidate, or clean worktrees.
+
 - **You can now name how much autonomy an agent runs with, in one choice.** `--posture supervised`
   asks you before each effect. `--posture bounded-autonomy` never asks and instead constrains the
   run with policy, a fail-closed sandbox and budgets — the posture unattended runs already used.

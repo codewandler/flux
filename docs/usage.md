@@ -88,6 +88,8 @@ Inside the REPL:
 flux tui                 # dense full-screen chat
 flux tui -c              # continue the newest session
 flux tui -m mock         # exercise the full UI offline
+flux tui --fleet         # attach to the current directory's exact Fleet-main session
+flux tui --fleet=../roadmap # attach to another Fleet root
 ```
 
 The TUI keeps the transcript borderless and separates its multiline composer only with a quiet
@@ -101,6 +103,16 @@ reconstructs messages, plans, tool results, notices, and usage from the durable 
 re-running operations. Use PgUp/PgDn or the mouse wheel for scrollback and `Ctrl-End` to follow the
 latest activity. `Ctrl-E` expands thinking/tool details, `Ctrl-C` interrupts a turn, and `Ctrl-D` or
 `/quit` exits. Approvals use `y` once, `a` always, and any other key to deny.
+
+Fleet attachment is explicit; ordinary `flux tui` stays standalone. The attached form validates the
+Fleet root and resumes the reserved main coordinator's recorded store/session. Start it with
+`flux fleet start`, then use `F2`, `/fleet`, or `/board` for the bounded operations view. Wide
+terminals keep an attention rail beside the primary conversation; narrow terminals use the attached
+header and full-screen view. Tabs cover the Board, workers, decisions, failures, planning documents,
+and the exact `flux.board-stats/v1` values. Intake acknowledgement progresses through accepted,
+delivered, and completed/failed and reconstructs after restart. Observation is read-only; applying a
+decision requires an explicit second Enter confirmation, and the TUI has no push, release, deploy,
+Fleet-apply, or cleanup control.
 
 ## Approval & safety
 

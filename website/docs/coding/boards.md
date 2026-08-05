@@ -168,6 +168,12 @@ records the question, structured options/trade-offs, recommendation, and linked 
 stories become blocked; unrelated ready work remains eligible. Deciding records outcome/rationale
 and restores each linked story's prior state and priority.
 
+When `flux tui` is explicitly attached with `--fleet[=ROOT]`, `F2` (or `/board`) opens the same
+planning data as bounded native views. Observation stays read-only. Choosing an open decision is the
+one Board write available there and requires two Enter presses: one to review the selected option,
+one to confirm it. The [TUI operations guide](../agent/tui.md#board-and-fleet-operations) documents
+the full navigation and acknowledgement behavior; JSON CLI output remains the automation API.
+
 Before changing a story, an AI coding agent should read the vision, roadmap, applicable accepted
 decisions, the story's Goal and Acceptance, and its linked design. `flux board skill` gives the same
 instruction in a short Agent Skill document.

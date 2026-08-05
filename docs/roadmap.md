@@ -930,13 +930,16 @@ backend over A2A and verifies remote artifacts inside a local isolation boundary
 Network identity alone never grants a BoardRef or worker authority. Design:
 [remote-fleet-membership](designs/remote-fleet-membership.md).
 
-### Board and fleet operations TUI (epic) — ⏸ **BACKLOG (C-556, C-557; after C-570/C-571 projections)**
+### Board and fleet operations TUI (epic) — 🔄 **CORE SHIPPED (C-582 done; C-556/C-557 typed follow-ups active)**
 
 The CLI stays the automation API, while the human UI centers the one main coordinator conversation.
-C-556 builds the responsive conversational shell and attention rail. C-557 adds read-only worker
-channel/activity peeks plus native board, decision, dependency and exact-statistics views. The TUI
-projects typed durable loop/progress/budget/controller state and must be materially more useful than
-embedding compact CLI output.
+C-556 delivered explicit exact-session Fleet-main attachment, the responsive conversational shell,
+durable intake acknowledgement and attention rail. C-557 delivered bounded worker channel/activity
+peeks plus native Board, planning-document, decision, dependency, red-gate and exact-statistics
+views. The TUI projects typed durable state and is materially more useful than embedded compact CLI
+output while retaining a narrow explicit mutation boundary. The later C-569/C-570/C-571/C-573
+loop, progress, budget and policy projections remain explicit unavailable follow-ups rather than
+inferred UI state.
 Design: [board-fleet-tui](designs/board-fleet-tui.md).
 
 ### Agent-native Flux documentation (epic) — ⏸ **BACKLOG (C-578…C-581)**

@@ -54,7 +54,8 @@ the `flux.board-stats/v1` values; the TUI formats those values and never recompu
 
 At wide widths the transcript/composer remains primary and a surface-owned attention rail shows
 Fleet state, active wave, worker counts, open decisions, blocked items and red gates. At narrow
-widths the rail becomes a one-line attention badge; `F2` opens the full operations overlay.
+widths the rail disappears so chat keeps the available columns; the persistent attached header
+keeps connection, revision and the `F2` affordance visible, and `F2` opens the full operations overlay.
 `/fleet` opens overview, `/board` opens Board work, and the overlay tabs are Overview, Board,
 Workers, Decisions and Stats. Arrow keys move, Tab/Shift-Tab change tabs, Enter opens detail or begins
 an explicitly labelled decision confirmation, `r` refreshes and Esc returns to chat. Mouse wheel

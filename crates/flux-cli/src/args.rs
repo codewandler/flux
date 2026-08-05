@@ -430,6 +430,17 @@ pub(super) enum Commands {
     Tui {
         #[command(flatten)]
         agent: AgentFlags,
+        /// Attach the chat to the durable Fleet main coordinator. With no value, use the current
+        /// directory; use `--fleet=ROOT` to select another Fleet explicitly. Ordinary `flux tui`
+        /// remains a standalone chat and never changes stores based on directory detection.
+        #[arg(
+            long,
+            value_name = "ROOT",
+            num_args = 0..=1,
+            default_missing_value = ".",
+            require_equals = true
+        )]
+        fleet: Option<std::path::PathBuf>,
     },
     /// Fork a recorded session at a decision point (A-46): the prefix replays hermetically from
     /// the cassette (no side effects), then the tail DIVERGES live through the real approval
@@ -1012,7 +1023,7 @@ impl Commands {
     pub(super) fn agent_flags(&self) -> Option<&AgentFlags> {
         match self {
             Self::Run { agent, .. }
-            | Self::Tui { agent }
+            | Self::Tui { agent, .. }
             | Self::Fork { agent, .. }
             | Self::Record { agent, .. }
             | Self::App {
@@ -1808,6 +1819,37 @@ mod c509_cli_grammar_tests {
             "tickets.delete",
         ])
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod fleet_tui_cli_tests {
+    use super::*;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn fleet_attachment_is_explicit_and_defaults_to_the_current_root() {
+        let attached = Cli::try_parse_from(["flux", "tui", "--fleet"])
+            .expect("an explicit current-root Fleet attachment must parse");
+        let Some(Commands::Tui { fleet, .. }) = attached.command else {
+            panic!("tui command expected")
+        };
+        assert_eq!(fleet, Some(PathBuf::from(".")));
+
+        let selected = Cli::try_parse_from(["flux", "tui", "--fleet=/workspace/program"])
+            .expect("an explicit Fleet root must parse");
+        let Some(Commands::Tui { fleet, .. }) = selected.command else {
+            panic!("tui command expected")
+        };
+        assert_eq!(fleet, Some(PathBuf::from("/workspace/program")));
+
+        let standalone = Cli::try_parse_from(["flux", "tui"])
+            .expect("ordinary standalone TUI must keep parsing");
+        let Some(Commands::Tui { fleet, .. }) = standalone.command else {
+            panic!("tui command expected")
+        };
+        assert_eq!(fleet, None);
     }
 }
 

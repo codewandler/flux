@@ -2,7 +2,7 @@
 id: C-582
 title: "The operations TUI makes Fleet main, workers and Boards one supervisable surface (epic)"
 pillar: Core
-status: in-progress
+status: done
 epic: board-fleet-tui
 design: docs/designs/board-fleet-tui.md
 areas: [flux-tui, flux-cli, flux-orchestrate, flux-capabilities]
@@ -19,17 +19,17 @@ workers and evidence without parsing CLI output or watching tmux.
 
 ## Acceptance
 
-- [ ] C-556 ships explicit Fleet-main attachment, a coordinator-first conversation and the
+- [x] C-556 ships explicit Fleet-main attachment, a coordinator-first conversation and the
       responsive attention rail while preserving standalone `flux tui` behavior.
-- [ ] C-557 ships bounded native Board, worker, decision, failure and statistics views over the same
+- [x] C-557 ships bounded native Board, worker, decision, failure and statistics views over the same
       typed projections used by the CLI.
-- [ ] Every view reconstructs from durable Board/Fleet/session state, labels unavailable data
+- [x] Every view reconstructs from durable Board/Fleet/session state, labels unavailable data
       honestly and performs no terminal, tmux, ANSI or subprocess scraping.
-- [ ] Only explicit conversation intake and decision controls may mutate state; observation never
+- [x] Only explicit conversation intake and decision controls may mutate state; observation never
       gains push, release, deploy, hidden Board mutation or worktree-cleanup authority.
-- [ ] Public operator documentation explains standalone versus attached launch, navigation,
+- [x] Public operator documentation explains standalone versus attached launch, navigation,
       acknowledgement states and recovery after restart.
-- [ ] Narrow/wide, empty/active/attention/failure snapshots and interaction tests protect the
+- [x] Narrow/wide, empty/active/attention/failure snapshots and interaction tests protect the
       experience, and the repository gate is green.
 
 ## Progress
@@ -37,6 +37,9 @@ workers and evidence without parsing CLI output or watching tmux.
 - 2026-08-05 — promoted from the separately contracted C-556/C-557 follow-up stories at the user's
   request. The epic owns only the native `flux tui` surface; generic external harness adapters and
   remote Fleet membership remain separate.
+- 2026-08-05 — completed with explicit Fleet-main attachment, durable acknowledgement and bounded
+  native operations views. Public TUI, Board and Fleet guides document the launch, keyboard flow,
+  recovery and authority boundary; focused and full crate gates pass.
 
 ## Notes
 

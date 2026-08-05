@@ -967,10 +967,13 @@ impl flux_tui::ModelResolver for CliTuiModelResolver {
 /// load (with a warning) rather than shadowing it — mirrors `flux-tui`'s `BUILTIN_COMMANDS` names.
 const TUI_BUILTIN_COMMANDS: &[&str] = &[
     "help", "usage", "clear", "new", "model", "effort", "quit", "exit", "compact", "shell",
-    "tools", "evidence", "session", "sessions", "resume", "queue", "insights",
+    "tools", "evidence", "session", "sessions", "resume", "queue", "insights", "fleet", "board",
 ];
 
-pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {
+pub(super) async fn run_tui(
+    flags: AgentFlags,
+    fleet_root: Option<std::path::PathBuf>,
+) -> Result<()> {
     let auto_approve = flags.yes;
     // C-305: the pane channel is minted HERE, before the agent exists, and that ordering is the
     // whole story. `flux_tui::run_with_options` does not create the surface until after the agent is
@@ -980,14 +983,46 @@ pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {
     // what makes that an assembly-time decision instead of a per-call one.
     let panes = flux_tui::PaneQueue::new();
     let interactions = flux_tui::InteractionQueue::new();
-    let (agent, session_id, model_spec, _spawner) =
-        build_agent_with_surface(&flags, panes.clone(), interactions.clone()).await?;
+    let fleet = fleet_root.as_deref().map(prepare_fleet_tui).transpose()?;
+    let (agent, session_id, model_spec, _spawner) = if let Some(fleet) = fleet.as_ref() {
+        build_agent_with_surface_at(
+            &flags,
+            panes.clone(),
+            interactions.clone(),
+            fleet.session.clone(),
+            AgentBuildLocation {
+                workspace_root: fleet.root.clone(),
+                store_dir: fleet.store.clone(),
+            },
+        )
+        .await?
+    } else {
+        build_agent_with_surface(&flags, panes.clone(), interactions.clone()).await?
+    };
     let initial_rules = agent.executor.allow_rules();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut options = tui_options(auto_approve, model_spec, &cwd, panes, interactions);
+    let surface_cwd = fleet
+        .as_ref()
+        .map(|fleet| fleet.root.as_path())
+        .unwrap_or(cwd.as_path());
+    let mut options = tui_options(auto_approve, model_spec, surface_cwd, panes, interactions);
+    if let Some(fleet) = fleet.as_ref() {
+        let attached = fleet.source.attach_session(&session_id)?;
+        options.operations_source = Some(fleet.source.clone());
+        options.workspace_root = Some(fleet.root.display().to_string());
+        options.execution_target = Some(format!(
+            "Fleet root {} · {}",
+            fleet.root.display(),
+            attached.level
+        ));
+    }
     if let Some(endpoint) = flags.remote.as_deref() {
         let identity = agent.executor.execution_system().substrate_identity();
-        options.execution_target = Some(format!("remote {endpoint} · {}", identity.workspace));
+        let remote = format!("remote {endpoint} · {}", identity.workspace);
+        options.execution_target = Some(match options.execution_target.take() {
+            Some(attached) => format!("{attached} · {remote}"),
+            None => remote,
+        });
     }
     // Persist even when the TUI returns an error: an earlier "always allow" choice remains a user
     // decision and must not vanish because terminal restoration or a later turn failed.

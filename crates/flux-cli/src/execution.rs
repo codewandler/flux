@@ -737,7 +737,16 @@ where
 
 /// Open the unified event store under `~/.flux/events.db` (conversation + run trace + turn telemetry).
 pub(super) fn open_event_store() -> Result<EventStore> {
-    let dir = flux_store_dir()?;
+    open_event_store_in(None)
+}
+
+/// Open the unified event store in an explicitly selected agent store. Fleet-main attachment uses
+/// this instead of mutating `FLUX_STORE_DIR` after Tokio worker threads exist.
+fn open_event_store_in(store_dir: Option<&std::path::Path>) -> Result<EventStore> {
+    let dir = match store_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => flux_store_dir()?,
+    };
     std::fs::create_dir_all(&dir)?;
     EventStore::open(dir.join("events.db")).context("open event store")
 }
@@ -765,7 +774,17 @@ pub(super) fn flux_store_dir() -> Result<std::path::PathBuf> {
 /// Open flux-flow's own store under `~/.flux/flow.db` (values, symbols, suspensions). Run-trace
 /// events are forwarded to the shared `events` log.
 pub(super) fn open_flow_store(events: Arc<EventStore>) -> Result<FlowStore> {
-    let dir = flux_store_dir()?;
+    open_flow_store_in(events, None)
+}
+
+fn open_flow_store_in(
+    events: Arc<EventStore>,
+    store_dir: Option<&std::path::Path>,
+) -> Result<FlowStore> {
+    let dir = match store_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => flux_store_dir()?,
+    };
     std::fs::create_dir_all(&dir)?;
     FlowStore::open(dir.join("flow.db"), events).context("open flow store")
 }
@@ -1168,11 +1187,19 @@ pub(super) type LiveAgentBuild = (
     Arc<super::app_cmd::LivePluginCatalog>,
 );
 
+/// Host-selected workspace and durable stores for a specialized surface. Keeping this explicit
+/// avoids process-global cwd/environment changes after the async runtime has started.
+#[derive(Clone, Debug)]
+pub(super) struct AgentBuildLocation {
+    pub(super) workspace_root: std::path::PathBuf,
+    pub(super) store_dir: std::path::PathBuf,
+}
+
 pub(super) async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     let (agent, session, spec, spawner, _) =
-        build_agent_with(flags, true, None, None, None, None).await?;
+        build_agent_with(flags, true, None, None, None, None, None).await?;
     Ok((agent, session, spec, spawner))
 }
 
@@ -1185,6 +1212,7 @@ pub(super) async fn build_agent_interactive(flags: &AgentFlags) -> Result<LiveAg
         None,
         None,
         Some(Arc::new(crate::user_interaction::StdinUserInteraction)),
+        None,
     )
     .await
 }
@@ -1200,7 +1228,7 @@ pub(super) async fn build_agent_with_approver(
     approver: Arc<dyn Approver>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     let (agent, session, spec, spawner, _) =
-        build_agent_with(flags, true, None, None, Some(approver), None).await?;
+        build_agent_with(flags, true, None, None, Some(approver), None, None).await?;
     Ok((agent, session, spec, spawner))
 }
 
@@ -1223,6 +1251,29 @@ pub(super) async fn build_agent_with_surface(
         Some(surface_sink),
         None,
         Some(user_interaction),
+        None,
+    )
+    .await?;
+    Ok((agent, session, spec, spawner))
+}
+
+/// Build the TUI agent at an explicit workspace/store and optionally resume an exact session.
+/// Fleet main uses this path; ordinary TUI assembly stays on the default workspace and store.
+pub(super) async fn build_agent_with_surface_at(
+    flags: &AgentFlags,
+    surface_sink: Arc<dyn flux_runtime::SurfaceSink>,
+    user_interaction: Arc<dyn flux_runtime::UserInteraction>,
+    session_override: Option<String>,
+    location: AgentBuildLocation,
+) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
+    let (agent, session, spec, spawner, _) = build_agent_with(
+        flags,
+        true,
+        session_override,
+        Some(surface_sink),
+        None,
+        Some(user_interaction),
+        Some(location),
     )
     .await?;
     Ok((agent, session, spec, spawner))
@@ -1239,7 +1290,7 @@ pub(super) async fn build_agent_lazy(
     session_override: Option<String>,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
     let (agent, session, spec, spawner, _) =
-        build_agent_with(flags, false, session_override, None, None, None).await?;
+        build_agent_with(flags, false, session_override, None, None, None, None).await?;
     Ok((agent, session, spec, spawner))
 }
 
@@ -1644,6 +1695,7 @@ async fn assemble_engine(
     cfg: &flux_config::Config,
     flags: &AgentFlags,
     system: &System,
+    store_dir: Option<&std::path::Path>,
 ) -> Result<FlowEngine> {
     let EngineParts {
         provider,
@@ -1661,7 +1713,7 @@ async fn assemble_engine(
         user_interaction,
         catalog_refresher,
     } = parts;
-    let flow = open_flow_store(events.clone())?;
+    let flow = open_flow_store_in(events.clone(), store_dir)?;
     let spec = AgentSpec {
         model,
         profile: flux_agent::AgentProfile::Coding,
@@ -1735,9 +1787,13 @@ pub(super) async fn build_agent_with(
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     approver_override: Option<Arc<dyn Approver>>,
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
+    location: Option<AgentBuildLocation>,
 ) -> Result<LiveAgentBuild> {
     // Guarded system rooted at the current directory; layered config loaded from it.
-    let cwd = std::env::current_dir().context("current dir")?;
+    let cwd = match location.as_ref() {
+        Some(location) => location.workspace_root.clone(),
+        None => std::env::current_dir().context("current dir")?,
+    };
     let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
     // Validate this input-driven expansion bound before provider, plugin, or agent assembly work.
     let max_iterations = agent_max_iterations(flags, &cfg.agent)?;
@@ -1816,7 +1872,11 @@ pub(super) async fn build_agent_with(
     // The unified event store, opened BEFORE the sub-agent spawner (A-08: child runs audit into
     // this same store by default) and before plugins (the egress-audit hook appends
     // `PrivateNetAdmit` events to this stream).
-    let events = Arc::new(open_event_store()?);
+    let events = Arc::new(open_event_store_in(
+        location
+            .as_ref()
+            .map(|location| location.store_dir.as_path()),
+    )?);
 
     // C-299: the operator's `[limits]` ceilings, resolved ONCE here and handed to both the
     // sub-agent spawner just below and the top-level environment further down. Resolved once
@@ -2204,6 +2264,9 @@ pub(super) async fn build_agent_with(
         &cfg,
         flags,
         system.as_ref(),
+        location
+            .as_ref()
+            .map(|location| location.store_dir.as_path()),
     )
     .await?;
     Ok((agent, session_id, canonical_spec, spawner, live_plugins))

@@ -1078,6 +1078,1012 @@ impl Default for FleetState {
     }
 }
 
+/// Launch facts for an explicitly attached Fleet-main TUI.
+pub(super) struct FleetTuiLaunch {
+    pub(super) root: PathBuf,
+    pub(super) store: PathBuf,
+    pub(super) session: Option<String>,
+    pub(super) source: flux_tui::operations::SharedFleetBoardSource,
+}
+
+#[derive(Clone, Debug)]
+struct FleetTuiSource {
+    root: PathBuf,
+}
+
+/// Validate one Fleet root and resolve the reserved main agent's exact durable store/session.
+/// This does not start the Fleet, dispatch work or mutate a Board.
+pub(super) fn prepare_fleet_tui(root: &Path) -> Result<FleetTuiLaunch> {
+    let root = confined_root(root)?;
+    if !root.join(".flux/fleet.toml").is_file() {
+        bail!(
+            "not-found: no Fleet configuration at {} (run `flux fleet init` first)",
+            root.join(".flux/fleet.toml").display()
+        )
+    }
+    read_fleet_config(&root)?;
+    let state = read_fleet_state(&root)?;
+    let store = agent_store_path(&root, "main")?;
+    let session = state.main_agent.session.clone();
+    Ok(FleetTuiLaunch {
+        root: root.clone(),
+        store,
+        session,
+        source: Arc::new(FleetTuiSource { root }),
+    })
+}
+
+impl FleetTuiSource {
+    fn mutate<F>(&self, kind: &str, mutate: F) -> Result<flux_tui::operations::FleetAck>
+    where
+        F: FnOnce(&mut FleetState) -> Result<(String, String, Value)>,
+    {
+        let mut state = read_fleet_state(&self.root)?;
+        let (id, level, data) = mutate(&mut state)?;
+        write_fleet_state(&self.root, &state)?;
+        append_fleet_event(&self.root, kind, data)?;
+        Ok(flux_tui::operations::FleetAck {
+            id,
+            level: level.clone(),
+            revision: state.revision.to_string(),
+            message: format!("{kind}: {level}"),
+        })
+    }
+
+    fn all_decisions(&self) -> Result<Vec<Value>> {
+        fn collect(root: &Path, namespace: &str, output: &mut Vec<Value>) -> Result<()> {
+            let directory = if root.join("decisions").is_dir() {
+                root.join("decisions")
+            } else {
+                root.join("docs/decisions")
+            };
+            for mut decision in decision_records(&directory)? {
+                let id = decision["id"].as_str().unwrap_or_default();
+                decision["ref"] = json!(format!("{namespace}/{id}"));
+                decision["board"] = json!(namespace);
+                output.push(decision);
+            }
+            Ok(())
+        }
+
+        let mut decisions = Vec::new();
+        collect(&self.root, "workspace", &mut decisions)?;
+        let config = read_fleet_config(&self.root)?;
+        for repository in &config.repositories {
+            collect(
+                &repository_root(&self.root, repository)?,
+                &repository.id,
+                &mut decisions,
+            )?;
+        }
+        decisions.sort_by(|left, right| {
+            left["ref"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["ref"].as_str().unwrap_or_default())
+        });
+        Ok(decisions)
+    }
+
+    fn stories(&self) -> Result<Vec<Story>> {
+        let config = read_fleet_config(&self.root)?;
+        if config.repositories.is_empty() {
+            read_stories(&self.root)
+        } else {
+            workspace_stories(&self.root)
+        }
+    }
+
+    fn board_command(&self, action: BoardAction) -> Result<BoardCommand> {
+        let workspace = !read_fleet_config(&self.root)?.repositories.is_empty();
+        Ok(BoardCommand {
+            root: self.root.clone(),
+            board: None,
+            scope: if workspace {
+                BoardScopeArg::Workspace
+            } else {
+                BoardScopeArg::Repository
+            },
+            profile: BoardProfileArg::Planning,
+            output: AgentOutput::Human,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            session: None,
+            action,
+        })
+    }
+
+    fn decision_root(&self, namespace: &str) -> Result<PathBuf> {
+        if namespace == "workspace" {
+            return Ok(self.root.clone());
+        }
+        let config = read_fleet_config(&self.root)?;
+        let matches = config
+            .repositories
+            .iter()
+            .filter(|repository| repository.id == namespace || repository.board == namespace)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [repository] => repository_root(&self.root, repository),
+            [] => bail!("not-found: Board/Fleet TUI decision namespace {namespace}"),
+            _ => bail!("conflict/precondition: ambiguous decision namespace {namespace}"),
+        }
+    }
+}
+
+impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
+    fn snapshot(&self) -> Result<flux_tui::operations::FleetBoardSnapshot> {
+        use flux_tui::operations::{
+            BoardDecisionView, BoardItemView, DecisionOptionView, FleetBoardSnapshot,
+            FleetCapacityView, FleetFailureView, FleetGoalView, FleetIntakeView, FleetWaveView,
+            FleetWorkerView, MAX_DECISIONS, MAX_DOCUMENTS, MAX_FAILURES, MAX_INTAKE, MAX_ITEMS,
+            MAX_WORKERS,
+        };
+        const MAX_GOALS: usize = 100;
+        const MAX_HISTORY_DAYS: usize = 120;
+        const MAX_ITEM_LINKS: usize = 50;
+        const MAX_DECISION_OPTIONS: usize = 20;
+
+        let state = read_fleet_state(&self.root)?;
+        let stories = self.stories()?;
+        let decisions = self.all_decisions()?;
+        let stats_command = self.board_command(BoardAction::Stats {
+            history: true,
+            since: None,
+        })?;
+        let stats = stats(&stats_command, &self.root, true, None)?;
+
+        let is_active = |status: &str| matches!(status, "active" | "running" | "working");
+        let active = state
+            .agents
+            .values()
+            .filter(|agent| agent["status"].as_str().is_some_and(is_active))
+            .count();
+        let mut workers = state
+            .agents
+            .iter()
+            .map(|(id, agent)| {
+                let assignment = &agent["assignment"];
+                let status = agent["status"].as_str().unwrap_or("unknown").to_string();
+                FleetWorkerView {
+                    id: bounded_text(id, 200),
+                    role: bounded_text(agent["role"].as_str().unwrap_or("worker"), 200),
+                    status,
+                    board_ref: assignment["board_ref"]
+                        .as_str()
+                        .or_else(|| agent["board_ref"].as_str())
+                        .map(|value| bounded_text(value, 500)),
+                    wave: assignment["wave"]
+                        .as_str()
+                        .or_else(|| agent["wave"].as_str())
+                        .map(|value| bounded_text(value, 500)),
+                    session: agent["runtime_session"]
+                        .as_str()
+                        .or_else(|| agent["session"].as_str())
+                        .map(|value| bounded_text(value, 500)),
+                    worktree: assignment["worktree"]
+                        .as_str()
+                        .map(|value| bounded_text(value, 500)),
+                    handoff: value_summary(assignment.get("handoff")),
+                    review: value_summary(assignment.get("review").or_else(|| agent.get("review"))),
+                    rework_round: assignment["rework_round"]
+                        .as_u64()
+                        .or_else(|| agent["rework_round"].as_u64()),
+                    last_activity: agent["last_activity"]
+                        .as_str()
+                        .or_else(|| agent["last_turn"]["ack"].as_str())
+                        .map(|value| bounded_text(value, 500)),
+                    activity: event_log_summaries(&agent["last_turn"]["events"]),
+                    error: agent["last_error"]
+                        .as_str()
+                        .map(|value| bounded_text(value, 500)),
+                }
+            })
+            .collect::<Vec<_>>();
+        workers.sort_by(|left, right| {
+            worker_status_order(&left.status)
+                .cmp(&worker_status_order(&right.status))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let workers_total = workers.len();
+        workers.truncate(MAX_WORKERS);
+
+        let mut items = stories
+            .iter()
+            .map(|story| BoardItemView {
+                board_ref: bounded_text(&story.id, 200),
+                title: bounded_text(&story.title, 500),
+                status: bounded_text(&story.status, 100),
+                priority: story.priority,
+                dependencies: story
+                    .dependencies
+                    .iter()
+                    .take(MAX_ITEM_LINKS)
+                    .map(|value| bounded_text(value, 200))
+                    .collect(),
+                design: story
+                    .design
+                    .as_deref()
+                    .map(|value| bounded_text(value, 500)),
+                epic: story.epic.as_deref().map(|value| bounded_text(value, 500)),
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            story_status_order(&left.status)
+                .cmp(&story_status_order(&right.status))
+                .then_with(|| {
+                    left.priority
+                        .unwrap_or(i64::MAX)
+                        .cmp(&right.priority.unwrap_or(i64::MAX))
+                })
+                .then_with(|| left.board_ref.cmp(&right.board_ref))
+        });
+        let items_total = items.len();
+        items.truncate(MAX_ITEMS);
+
+        let mut decision_views = decisions
+            .iter()
+            .map(|decision| BoardDecisionView {
+                decision_ref: bounded_text(decision["ref"].as_str().unwrap_or_default(), 200),
+                board: bounded_text(decision["board"].as_str().unwrap_or_default(), 200),
+                id: bounded_text(decision["id"].as_str().unwrap_or_default(), 200),
+                title: bounded_text(decision["title"].as_str().unwrap_or_default(), 500),
+                question: bounded_text(decision["question"].as_str().unwrap_or_default(), 1_000),
+                status: bounded_text(decision["status"].as_str().unwrap_or("open"), 100),
+                blocks: value_strings(&decision["blocks"])
+                    .into_iter()
+                    .take(MAX_ITEM_LINKS)
+                    .map(|value| bounded_text(&value, 200))
+                    .collect(),
+                options: decision["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(MAX_DECISION_OPTIONS)
+                    .filter_map(|option| {
+                        Some(DecisionOptionView {
+                            id: bounded_text(option["id"].as_str()?, 200),
+                            tradeoff: option["tradeoff"]
+                                .as_str()
+                                .map(|value| bounded_text(value, 500)),
+                            recommended: option["recommended"].as_bool().unwrap_or(false),
+                        })
+                    })
+                    .collect(),
+                outcome: decision["outcome"]
+                    .as_str()
+                    .map(|value| bounded_text(value, 500)),
+                rationale: decision["rationale"]
+                    .as_str()
+                    .map(|value| bounded_text(value, 1_000)),
+                path: decision["path"]
+                    .as_str()
+                    .map(|value| bounded_text(value, 500)),
+            })
+            .collect::<Vec<_>>();
+        decision_views.sort_by(|left, right| {
+            decision_status_order(&left.status)
+                .cmp(&decision_status_order(&right.status))
+                .then_with(|| left.decision_ref.cmp(&right.decision_ref))
+        });
+        let decisions_total = decision_views.len();
+        decision_views.truncate(MAX_DECISIONS);
+
+        let mut documents = planning_documents(&self.root, &read_fleet_config(&self.root)?)?;
+        let documents_total = documents.len();
+        documents.truncate(MAX_DOCUMENTS);
+
+        let metrics = [
+            "epics",
+            "stories",
+            "tasks",
+            "criteria",
+            "implementation",
+            "program_stories",
+            "tranche_lanes",
+            "waves",
+            "program_groups",
+        ]
+        .into_iter()
+        .map(|name| metric_ratio(name, &stats[name]))
+        .collect::<Vec<_>>();
+        let status_counts = stats["status"]
+            .as_object()
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .filter_map(|(status, value)| Some((status.clone(), value.as_u64()?)))
+            .collect::<Vec<_>>();
+        let stats_facts = vec![
+            (
+                "vision".into(),
+                if stats["documents"]["vision"]["present"].as_bool() == Some(true) {
+                    "present".into()
+                } else {
+                    "absent".into()
+                },
+            ),
+            (
+                "roadmap".into(),
+                if stats["documents"]["roadmap"]["present"].as_bool() == Some(true) {
+                    "present".into()
+                } else {
+                    "absent".into()
+                },
+            ),
+            (
+                "decisions".into(),
+                format!(
+                    "{} total · {} open · {} decided",
+                    stats["documents"]["decisions"]["total"]
+                        .as_u64()
+                        .unwrap_or(0),
+                    stats["documents"]["decisions"]["open"]
+                        .as_u64()
+                        .unwrap_or(0),
+                    stats["documents"]["decisions"]["decided"]
+                        .as_u64()
+                        .unwrap_or(0)
+                ),
+            ),
+            (
+                "designs".into(),
+                format!(
+                    "{} total · {} linked stories",
+                    stats["documents"]["designs"]["total"].as_u64().unwrap_or(0),
+                    stats["documents"]["designs"]["linked_stories"]
+                        .as_u64()
+                        .unwrap_or(0)
+                ),
+            ),
+            (
+                "canonical commits".into(),
+                stats["canonical_commits"]["total"]
+                    .as_u64()
+                    .map_or_else(|| "unavailable".into(), |value| value.to_string()),
+            ),
+            (
+                "workspace members".into(),
+                stats["members"]
+                    .as_object()
+                    .map_or_else(|| "unavailable".into(), |members| members.len().to_string()),
+            ),
+        ];
+        let mut history = stats["history"]["days"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|day| {
+                Some((
+                    day["date"].as_str()?.to_string(),
+                    day["scope_added"].as_u64().unwrap_or(0),
+                    day["scope_removed"].as_u64().unwrap_or(0),
+                    day["completed"].as_u64().unwrap_or(0),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if history.len() > MAX_HISTORY_DAYS {
+            history.drain(..history.len() - MAX_HISTORY_DAYS);
+        }
+
+        let mut failures = Vec::new();
+        for (id, agent) in &state.agents {
+            let status = agent["status"].as_str().unwrap_or("unknown");
+            let error = agent["last_error"].as_str();
+            if matches!(status, "failed" | "parked") || error.is_some() {
+                failures.push(FleetFailureView {
+                    subject: bounded_text(id, 200),
+                    kind: "worker".into(),
+                    message: bounded_text(error.unwrap_or(status), 500),
+                    candidate: None,
+                    evidence: agent["assignment"]["board_ref"]
+                        .as_str()
+                        .or_else(|| agent["board_ref"].as_str())
+                        .map(|value| bounded_text(value, 200)),
+                });
+            }
+        }
+        for (id, wave) in &state.waves {
+            let status = wave["status"].as_str().unwrap_or_default();
+            let mut detailed = false;
+            if let Some(conflict) = wave.get("conflict").filter(|value| !value.is_null()) {
+                detailed = true;
+                failures.push(FleetFailureView {
+                    subject: bounded_text(conflict["story"].as_str().unwrap_or(id.as_str()), 200),
+                    kind: "integration conflict".into(),
+                    message: bounded_text(
+                        &format!(
+                            "{} conflicting file(s)",
+                            conflict["files"].as_array().map_or(0, Vec::len)
+                        ),
+                        500,
+                    ),
+                    candidate: conflict["candidate"]
+                        .as_str()
+                        .map(|value| bounded_text(value, 200)),
+                    evidence: conflict["stderr"]
+                        .as_str()
+                        .or_else(|| conflict["commit"].as_str())
+                        .map(|value| bounded_text(value, 500)),
+                });
+            }
+            for repository in wave["topology"]["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let gate = &repository["gate"];
+                if gate["status"].as_str() != Some("red") {
+                    continue;
+                }
+                detailed = true;
+                let repository_id = repository["id"].as_str().unwrap_or("repository");
+                failures.push(FleetFailureView {
+                    subject: bounded_text(&format!("{id}/{repository_id}"), 200),
+                    kind: "red gate".into(),
+                    message: gate["reason"]
+                        .as_str()
+                        .map(|value| bounded_text(value, 500))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "exit {}",
+                                gate["evidence"]["exit_code"]
+                                    .as_i64()
+                                    .map_or_else(|| "unknown".into(), |value| value.to_string())
+                            )
+                        }),
+                    candidate: gate["candidate"]
+                        .as_str()
+                        .or_else(|| repository["candidate"].as_str())
+                        .map(|value| bounded_text(value, 200)),
+                    evidence: gate_evidence_summary(gate.get("evidence")),
+                });
+            }
+            if !detailed
+                && (status.contains("fail")
+                    || status.contains("red")
+                    || status.contains("park")
+                    || status.contains("conflict"))
+            {
+                failures.push(FleetFailureView {
+                    subject: id.clone(),
+                    kind: "wave".into(),
+                    message: bounded_text(status, 500),
+                    candidate: wave["candidate"]
+                        .as_str()
+                        .map(|value| bounded_text(value, 200)),
+                    evidence: value_summary(wave.get("evidence")),
+                });
+            }
+        }
+        if let Some(error) = state.main_agent.last_error.as_deref() {
+            failures.push(FleetFailureView {
+                subject: "main".into(),
+                kind: "coordinator".into(),
+                message: bounded_text(error, 500),
+                candidate: None,
+                evidence: state.main_agent.session.clone(),
+            });
+        }
+        let failures_total = failures.len();
+        failures.truncate(MAX_FAILURES);
+
+        let mut intake = state
+            .intake
+            .iter()
+            .map(|(id, intake)| FleetIntakeView {
+                id: bounded_text(id, 200),
+                acknowledgement: bounded_text(intake["ack"].as_str().unwrap_or("unknown"), 100),
+                source: bounded_text(intake["source"].as_str().unwrap_or("unknown"), 100),
+                session: intake["session"]
+                    .as_str()
+                    .map(|value| bounded_text(value, 200)),
+                summary: bounded_text(intake["text"].as_str().unwrap_or("unavailable"), 500),
+            })
+            .collect::<Vec<_>>();
+        intake.sort_by_key(|entry| {
+            entry
+                .id
+                .strip_prefix("intake-")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+        let intake_total = intake.len();
+        if intake.len() > MAX_INTAKE {
+            intake.drain(..intake.len() - MAX_INTAKE);
+        }
+
+        let active_wave = state
+            .waves
+            .iter()
+            .find(|(_, wave)| {
+                !matches!(
+                    wave["status"].as_str(),
+                    Some("completed" | "failed" | "cancelled" | "parked")
+                )
+            })
+            .map(|(id, wave)| FleetWaveView {
+                id: id.clone(),
+                status: wave["status"].as_str().unwrap_or("unknown").to_string(),
+                items: value_strings(&wave["items"])
+                    .into_iter()
+                    .take(state.max_wave)
+                    .collect(),
+            });
+        let goals = state
+            .goals
+            .values()
+            .take(MAX_GOALS)
+            .map(|goal| FleetGoalView {
+                scope: serde_json::to_value(goal.scope)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unknown".into()),
+                name: goal.name.clone(),
+                statement: bounded_text(&goal.statement, 500),
+                revision: goal.revision,
+            })
+            .collect::<Vec<_>>();
+        let blocked_items = stories
+            .iter()
+            .filter(|story| story.status == "blocked")
+            .count();
+        let attention_required = failures_total > 0
+            || blocked_items > 0
+            || decision_views
+                .iter()
+                .any(|decision| decision.status == "open");
+
+        Ok(FleetBoardSnapshot {
+            schema: "flux.tui-board-fleet/v1".into(),
+            root: display_path(&self.root),
+            running: state.running,
+            main_status: state.main_agent.status,
+            main_session: state.main_agent.session,
+            revision: state.revision,
+            goals_revision: state.main_agent.goals_revision,
+            goals,
+            active_wave,
+            capacity: FleetCapacityView {
+                configured: state.max_workers,
+                desired: None,
+                active,
+                draining: None,
+                registered: state.agents.len(),
+            },
+            workers,
+            workers_total,
+            items,
+            items_total,
+            decisions: decision_views,
+            decisions_total,
+            documents,
+            documents_total,
+            metrics_schema: stats["schema"]
+                .as_str()
+                .unwrap_or("unavailable")
+                .to_string(),
+            metrics,
+            stats_facts,
+            status_counts,
+            history,
+            failures,
+            failures_total,
+            intake,
+            intake_total,
+            blocked_items,
+            attention_required,
+        })
+    }
+
+    fn attach_session(&self, session: &str) -> Result<flux_tui::operations::FleetAck> {
+        if session.trim().is_empty() {
+            bail!("input/schema: Fleet-main TUI session cannot be empty")
+        }
+        let state = read_fleet_state(&self.root)?;
+        if state.main_agent.session.as_deref() == Some(session) {
+            return Ok(flux_tui::operations::FleetAck {
+                id: "main".into(),
+                level: "attached".into(),
+                revision: state.revision.to_string(),
+                message: "Fleet main session resumed".into(),
+            });
+        }
+        if let Some(existing) = state.main_agent.session.as_deref() {
+            bail!(
+                "conflict/precondition: Fleet main records session {existing}, refusing to attach {session}"
+            )
+        }
+        self.mutate("fleet.tui.attached", |state| {
+            state.revision += 1;
+            state.main_agent.session = Some(session.to_string());
+            Ok((
+                "main".into(),
+                "attached".into(),
+                json!({"agent":"main","session":session,"status":state.main_agent.status}),
+            ))
+        })
+    }
+
+    fn accept_requirement(
+        &self,
+        text: &str,
+        session: &str,
+    ) -> Result<flux_tui::operations::FleetAck> {
+        if text.trim().is_empty() {
+            bail!("input/schema: coordinator intake text cannot be empty")
+        }
+        self.mutate("coordinator.intake.accepted", |state| {
+            if !state.running {
+                bail!("conflict/precondition: main coordinator is stopped; run `flux fleet start`")
+            }
+            state.revision += 1;
+            state.main_agent.intake_sequence += 1;
+            let id = format!("intake-{}", state.main_agent.intake_sequence);
+            let intake = json!({
+                "id": id,
+                "target": "main",
+                "source": "user",
+                "from": "flux-tui",
+                "text": redact(text),
+                "session": session,
+                "ack": "accepted",
+                "goals_revision": state.main_agent.goals_revision,
+            });
+            state.intake.insert(id.clone(), intake.clone());
+            Ok((id, "accepted".into(), intake))
+        })
+    }
+
+    fn deliver_requirement(
+        &self,
+        id: &str,
+        session: &str,
+    ) -> Result<flux_tui::operations::FleetAck> {
+        self.mutate("agent.turn.delivered", |state| {
+            let intake = state
+                .intake
+                .get_mut(id)
+                .with_context(|| format!("not-found: Fleet intake {id}"))?;
+            if intake["ack"].as_str() != Some("accepted") {
+                bail!("conflict/precondition: Fleet intake {id} is not awaiting delivery")
+            }
+            state.revision += 1;
+            intake["ack"] = json!("delivered");
+            intake["session"] = json!(session);
+            state.main_agent.status = "working".into();
+            Ok((
+                id.to_string(),
+                "delivered".into(),
+                json!({"agent":"main","intake":id,"session":session,"ack":"delivered"}),
+            ))
+        })
+    }
+
+    fn complete_requirement(
+        &self,
+        id: &str,
+        session: &str,
+        succeeded: bool,
+        error: Option<&str>,
+    ) -> Result<flux_tui::operations::FleetAck> {
+        self.mutate(
+            if succeeded {
+                "agent.turn.completed"
+            } else {
+                "agent.turn.failed"
+            },
+            |state| {
+                let intake = state
+                    .intake
+                    .get_mut(id)
+                    .with_context(|| format!("not-found: Fleet intake {id}"))?;
+                if intake["ack"].as_str() != Some("delivered") {
+                    bail!("conflict/precondition: Fleet intake {id} was not delivered")
+                }
+                state.revision += 1;
+                let level = if succeeded { "completed" } else { "failed" };
+                intake["ack"] = json!(level);
+                intake["session"] = json!(session);
+                if let Some(error) = error {
+                    intake["error"] = json!(redact(error));
+                }
+                state.main_agent.session = Some(session.to_string());
+                state.main_agent.status = if succeeded {
+                    if state.running { "running" } else { "stopped" }
+                } else {
+                    "failed"
+                }
+                .into();
+                state.main_agent.last_error = error.map(redact);
+                Ok((
+                    id.to_string(),
+                    level.into(),
+                    json!({"agent":"main","intake":id,"session":session,"ack":level,"error":error.map(redact)}),
+                ))
+            },
+        )
+    }
+
+    fn decide(&self, decision_ref: &str, outcome: &str) -> Result<flux_tui::operations::FleetAck> {
+        let (namespace, id) = decision_ref.split_once('/').with_context(|| {
+            format!("input/schema: decision ref {decision_ref:?} must be BOARD/ID")
+        })?;
+        let root = self.decision_root(namespace)?;
+        let command = BoardCommand {
+            root: root.clone(),
+            board: None,
+            scope: BoardScopeArg::Repository,
+            profile: BoardProfileArg::Planning,
+            output: AgentOutput::Human,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            session: None,
+            action: BoardAction::Decision {
+                action: DecisionAction::Decide {
+                    id: id.to_string(),
+                    outcome: outcome.to_string(),
+                    rationale: Some("explicitly selected by the operator in flux tui".into()),
+                },
+            },
+        };
+        let (human, _, _, revision) = decision_doc(
+            &command,
+            &root,
+            &DecisionAction::Decide {
+                id: id.to_string(),
+                outcome: outcome.to_string(),
+                rationale: Some("explicitly selected by the operator in flux tui".into()),
+            },
+        )?;
+        Ok(flux_tui::operations::FleetAck {
+            id: decision_ref.to_string(),
+            level: "decided".into(),
+            revision: revision.unwrap_or_else(|| "unknown".into()),
+            message: human,
+        })
+    }
+}
+
+fn value_strings(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn value_summary(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    if let Some(value) = value.as_str() {
+        return Some(bounded_text(value, 500));
+    }
+    if let Some(values) = value.as_array() {
+        return Some(format!("{} record(s)", values.len()));
+    }
+    if let Some(fields) = value.as_object() {
+        let summary = ["summary", "status", "decision", "outcome", "commit", "id"]
+            .into_iter()
+            .filter_map(|key| {
+                let value = fields.get(key)?;
+                let value = value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| value.as_u64().map(|value| value.to_string()))?;
+                Some(format!("{key}={}", bounded_text(&value, 160)))
+            })
+            .collect::<Vec<_>>();
+        return Some(if summary.is_empty() {
+            format!("{} field(s)", fields.len())
+        } else {
+            bounded_text(&summary.join(" · "), 500)
+        });
+    }
+    Some(bounded_text(&value.to_string(), 500))
+}
+
+fn gate_evidence_summary(value: Option<&Value>) -> Option<String> {
+    let evidence = value?.as_object()?;
+    let argv = evidence
+        .get("argv")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(20)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let exit = evidence
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let stderr = evidence
+        .get("stderr")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            evidence
+                .get("stdout")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or("no captured output");
+    Some(bounded_text(
+        &format!("argv={argv} · exit={exit} · {stderr}"),
+        500,
+    ))
+}
+
+fn event_log_summaries(value: &Value) -> Vec<String> {
+    const MAX_ACTIVITY_EVENTS: usize = 20;
+    let Some(events) = value.as_array() else {
+        return Vec::new();
+    };
+    events
+        .iter()
+        .rev()
+        .take(MAX_ACTIVITY_EVENTS)
+        .rev()
+        .map(|event| {
+            let kind = event["type"].as_str().unwrap_or("event");
+            let subject = ["name", "operation", "stage", "original_type"]
+                .into_iter()
+                .find_map(|key| event[key].as_str())
+                .unwrap_or("—");
+            let outcome = event["outcome"]
+                .as_str()
+                .or_else(|| event["status"].as_str())
+                .or_else(|| event["reason"].as_str())
+                .unwrap_or("recorded");
+            bounded_text(&format!("{kind} · {subject} · {outcome}"), 300)
+        })
+        .collect()
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let head = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn worker_status_order(status: &str) -> u8 {
+    match status {
+        "working" | "running" | "active" => 0,
+        "failed" | "parked" => 1,
+        "accepted" | "idle" => 2,
+        "draining" => 3,
+        "completed" | "done" => 4,
+        "cancelled" => 5,
+        _ => 6,
+    }
+}
+
+fn story_status_order(status: &str) -> u8 {
+    match status {
+        "in-progress" => 0,
+        "ready" => 1,
+        "blocked" => 2,
+        "backlog" => 3,
+        "done" => 4,
+        _ => 5,
+    }
+}
+
+fn decision_status_order(status: &str) -> u8 {
+    match status {
+        "open" => 0,
+        "decided" => 1,
+        "superseded" => 2,
+        _ => 3,
+    }
+}
+
+fn metric_ratio(name: &str, value: &Value) -> flux_tui::operations::MetricRatioView {
+    flux_tui::operations::MetricRatioView {
+        name: name.to_string(),
+        schema: value["schema"].as_str().unwrap_or("present").to_string(),
+        done: value["done"].as_u64(),
+        remaining: value["remaining"].as_u64(),
+        total: value["total"].as_u64(),
+        percent: value["percent"].as_f64(),
+    }
+}
+
+fn planning_documents(
+    workspace: &Path,
+    config: &FleetConfig,
+) -> Result<Vec<flux_tui::operations::PlanningDocumentView>> {
+    use flux_tui::operations::PlanningDocumentView;
+    fn collect(root: &Path, namespace: &str, output: &mut Vec<PlanningDocumentView>) -> Result<()> {
+        for (kind, candidates) in [
+            (
+                "vision",
+                [root.join("docs/VISION.md"), root.join("VISION.md")],
+            ),
+            (
+                "roadmap",
+                [root.join("docs/ROADMAP.md"), root.join("ROADMAP.md")],
+            ),
+        ] {
+            if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+                output.push(PlanningDocumentView {
+                    kind: kind.into(),
+                    id: format!("{namespace}/{kind}"),
+                    title: markdown_title(&path).unwrap_or_else(|| kind.into()),
+                    status: None,
+                    path: display_path(&path),
+                });
+            }
+        }
+        for (kind, directory) in [
+            ("decision", root.join("docs/decisions")),
+            ("design", root.join("docs/designs")),
+        ] {
+            if !directory.is_dir() {
+                continue;
+            }
+            let mut paths = fs::read_dir(&directory)?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
+                .collect::<Vec<_>>();
+            paths.sort();
+            for path in paths {
+                let body = fs::read_to_string(&path)?;
+                let frontmatter = parse_frontmatter(&body);
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let id = frontmatter.get("id").map(String::as_str).unwrap_or(&stem);
+                output.push(PlanningDocumentView {
+                    kind: kind.into(),
+                    id: format!("{namespace}/{id}"),
+                    title: body
+                        .lines()
+                        .find_map(|line| line.trim().strip_prefix("# "))
+                        .unwrap_or(id)
+                        .to_string(),
+                    status: frontmatter.get("status").cloned(),
+                    path: display_path(&path),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    let mut result = Vec::new();
+    collect(workspace, "workspace", &mut result)?;
+    for repository in &config.repositories {
+        collect(
+            &repository_root(workspace, repository)?,
+            &repository.id,
+            &mut result,
+        )?;
+    }
+    result.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(result)
+}
+
+fn markdown_title(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# ")
+            .map(str::trim)
+            .map(str::to_string)
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct StoredResult {
     fingerprint: String,
@@ -9554,6 +10560,114 @@ fn redact_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_tui::operations::FleetBoardSource as _;
+
+    fn fleet_tui_fixture(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "flux-fleet-tui-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".flux/fleet")).unwrap();
+        fs::create_dir_all(root.join("docs/stories")).unwrap();
+        fs::create_dir_all(root.join("docs/decisions")).unwrap();
+        fs::create_dir_all(root.join("docs/designs")).unwrap();
+        fs::write(
+            root.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\nmax_workers = 5\nmax_wave = 10\nmax_rework = 2\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/stories/C-1-active.md"),
+            "---\nid: C-1\ntitle: Active story\nstatus: in-progress\npriority: 1\ndesign: docs/designs/active.md\nepic: operations\n---\n\n# Active story\n\n## Acceptance\n\n- [ ] visible\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/stories/C-2-blocked.md"),
+            "---\nid: C-2\ntitle: Blocked story\nstatus: blocked\npriority: 2\n---\n\n# Blocked story\n\n## Acceptance\n\n- [ ] unblocked\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/decisions/D-1.md"),
+            "---\nid: D-1\nstatus: open\noptions: [alpha, beta]\nrecommended: alpha\nblocks: []\n---\n\n# Pick a mode\n\n## Question\n\nWhich mode?\n\n## Options\n\n- alpha — bounded — recommended\n- beta — broad\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/designs/active.md"),
+            "---\nid: active\nstatus: accepted\n---\n\n# Active design\n",
+        )
+        .unwrap();
+        root
+    }
+
+    fn populated_fleet_tui_state() -> FleetState {
+        let mut state = FleetState {
+            revision: 7,
+            running: true,
+            max_workers: 5,
+            ..FleetState::default()
+        };
+        state.main_agent.status = "running".into();
+        state.main_agent.session = Some("s-main".into());
+        state.main_agent.goals_revision = 3;
+        state.goals.insert(
+            "project/operations".into(),
+            FleetGoal {
+                scope: GoalScope::Project,
+                name: "operations".into(),
+                statement: "Keep the Board and Fleet visible".into(),
+                revision: 3,
+            },
+        );
+        state
+            .waves
+            .insert("wave-7".into(), json!({"status":"working","items":["C-1"]}));
+        state.waves.insert(
+            "wave-red".into(),
+            json!({
+                "status":"red",
+                "topology":{"repositories":[{
+                    "id":"flux",
+                    "candidate":"abc123",
+                    "gate":{"status":"red","candidate":"abc123","evidence":{
+                        "argv":["cargo","test"],"exit_code":101,"stderr":"test failed"
+                    }}
+                }]}
+            }),
+        );
+        for index in 0..105 {
+            state.agents.insert(
+                format!("worker-{index:03}"),
+                json!({
+                    "role":"writer",
+                    "status": if index == 0 { "working" } else { "completed" },
+                    "runtime_session": format!("s-{index}"),
+                    "assignment": {
+                        "board_ref":"C-1",
+                        "wave":"wave-7",
+                        "worktree":format!("/worktrees/{index}"),
+                        "handoff":{"summary":"bounded handoff","events":["x".repeat(10_000)]}
+                    },
+                    "last_activity":"agent.turn.completed",
+                    "last_turn":{"events":[{"type":"tool_result","name":"read","outcome":"ok"}]}
+                }),
+            );
+        }
+        state.agents.insert(
+            "worker-failed-after-cap".into(),
+            json!({
+                "role":"writer",
+                "status":"failed",
+                "last_error":"gate failed",
+                "assignment":{"board_ref":"C-2","wave":"wave-7"}
+            }),
+        );
+        state
+    }
+
     #[test]
     fn planning_state_machine_is_closed() {
         assert!(valid_planning_transition("ready", "in-progress"));
@@ -9572,6 +10686,106 @@ mod tests {
             assert!(skill.len() < 4096);
             assert!(skill.contains("schema --output json"));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fleet_tui_snapshot_is_typed_bounded_and_exact_about_unavailable_capacity() {
+        let root = fleet_tui_fixture("snapshot");
+        write_fleet_state(&root, &populated_fleet_tui_state()).unwrap();
+        let source = FleetTuiSource {
+            root: root.canonicalize().unwrap(),
+        };
+
+        let launch = prepare_fleet_tui(&root).unwrap();
+        assert_eq!(launch.root, root.canonicalize().unwrap());
+        assert_eq!(launch.session.as_deref(), Some("s-main"));
+        assert!(launch.store.ends_with("sessions/main"));
+
+        let snapshot = source.snapshot().unwrap();
+
+        assert_eq!(snapshot.schema, "flux.tui-board-fleet/v1");
+        assert_eq!(snapshot.revision, 7);
+        assert_eq!(snapshot.main_session.as_deref(), Some("s-main"));
+        assert_eq!(snapshot.capacity.configured, 5);
+        assert_eq!(snapshot.capacity.active, 1);
+        assert_eq!(snapshot.capacity.registered, 106);
+        assert_eq!(snapshot.capacity.desired, None);
+        assert_eq!(snapshot.capacity.draining, None);
+        assert_eq!(snapshot.workers_total, 106);
+        assert_eq!(snapshot.workers.len(), flux_tui::operations::MAX_WORKERS);
+        assert_eq!(snapshot.failures_total, 2);
+        assert!(snapshot
+            .failures
+            .iter()
+            .any(|failure| failure.subject == "worker-failed-after-cap"));
+        let red_gate = snapshot
+            .failures
+            .iter()
+            .find(|failure| failure.kind == "red gate")
+            .unwrap();
+        assert_eq!(red_gate.candidate.as_deref(), Some("abc123"));
+        assert!(red_gate.evidence.as_deref().unwrap().contains("cargo test"));
+        assert!(snapshot
+            .workers
+            .iter()
+            .filter_map(|worker| worker.handoff.as_deref())
+            .all(|handoff| handoff.len() < 500 && !handoff.contains(&"x".repeat(1_000))));
+        assert!(snapshot
+            .workers
+            .iter()
+            .any(|worker| worker.activity.first().map(String::as_str)
+                == Some("tool_result · read · ok")));
+        assert_eq!(snapshot.items_total, 2);
+        assert_eq!(snapshot.blocked_items, 1);
+        assert_eq!(snapshot.decisions_total, 1);
+        assert_eq!(snapshot.decisions[0].decision_ref, "workspace/D-1");
+        assert_eq!(snapshot.metrics_schema, "flux.board-stats/v1");
+        assert!(snapshot.attention_required);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fleet_tui_intake_and_decision_actions_use_durable_native_state() {
+        let root = fleet_tui_fixture("mutations");
+        write_fleet_state(&root, &populated_fleet_tui_state()).unwrap();
+        let source = FleetTuiSource {
+            root: root.canonicalize().unwrap(),
+        };
+
+        let accepted = source
+            .accept_requirement("finish the active wave", "s-main")
+            .unwrap();
+        assert_eq!(accepted.level, "accepted");
+        let delivered = source.deliver_requirement(&accepted.id, "s-main").unwrap();
+        assert_eq!(delivered.level, "delivered");
+        let completed = source
+            .complete_requirement(&accepted.id, "s-main", true, None)
+            .unwrap();
+        assert_eq!(completed.level, "completed");
+        let state = read_fleet_state(&root).unwrap();
+        assert_eq!(state.intake[&accepted.id]["ack"], "completed");
+        assert_eq!(state.main_agent.status, "running");
+        let reconstructed = source.snapshot().unwrap();
+        assert_eq!(reconstructed.intake_total, 1);
+        assert_eq!(reconstructed.intake[0].id, accepted.id);
+        assert_eq!(reconstructed.intake[0].acknowledgement, "completed");
+        let events = fs::read_to_string(root.join(".flux/fleet/events.ndjson")).unwrap();
+        for kind in [
+            "coordinator.intake.accepted",
+            "agent.turn.delivered",
+            "agent.turn.completed",
+        ] {
+            assert!(events.contains(kind), "missing {kind}: {events}");
+        }
+
+        let decision = source.decide("workspace/D-1", "alpha").unwrap();
+        assert_eq!(decision.level, "decided");
+        let body = fs::read_to_string(root.join("docs/decisions/D-1.md")).unwrap();
+        assert!(body.contains("status: decided"), "{body}");
+        assert!(body.contains("outcome: \"alpha\""), "{body}");
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

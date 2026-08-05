@@ -24,6 +24,17 @@ All notable changes to this project are documented in this file. The format is b
   together for humans, Claude and Codex. Neither fleet run nor apply pushes, publishes, releases,
   deploys or automatically deletes worktrees.
 
+- **`flux tui --fleet[=ROOT]` is a native Board/Fleet operations surface** (C-556, C-557, C-582).
+  Explicit attachment validates one Fleet root, opens the reserved main coordinator's isolated
+  store and exact recorded session, and journals conversation intake through accepted, delivered,
+  and completed/failed acknowledgements. A typed in-process projection supplies a responsive
+  attention rail plus bounded Overview, Board, Workers, Decisions, and Stats views from the same
+  durable readers and exact `flux.board-stats/v1` cube as the CLI; it does not capture ANSI, scrape
+  tmux, or spawn CLI subprocesses. Refresh keeps the last-good snapshot on failure. Only explicit
+  intake and a twice-confirmed open-decision choice may mutate state; push, release, deploy,
+  Fleet-apply, cleanup, and capacity changes remain outside the TUI. Desired/draining capacity is
+  shown as unavailable until canonical Fleet state carries it.
+
 - **Autonomy is now a named posture rather than an absence of safety** (C-463).
   `flux_runtime::AutonomyPosture` names four choices — `supervised`, `bounded-autonomy`,
   `exploratory` and `refusing` — and each one selects its approval stance, sandbox floor and budget

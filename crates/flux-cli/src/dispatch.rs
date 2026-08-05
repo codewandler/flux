@@ -740,7 +740,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 }
                 run_prompt(agent, prompt).await
             }
-            Some(Commands::Tui { agent }) => run_tui(agent).await,
+            Some(Commands::Tui { agent, fleet }) => run_tui(agent, fleet).await,
             Some(Commands::Fork {
                 session,
                 at,

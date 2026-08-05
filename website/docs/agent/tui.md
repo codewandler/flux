@@ -16,6 +16,8 @@ flux tui -m opus               # pick a model for the session
 flux tui --yes                 # auto-approve every admitted tool call (no approval sheet)
 flux tui -c                    # continue the most recent session
 flux tui --remote https://worker.example:8790  # approve here; effects land there
+flux tui --fleet               # attach to the Fleet rooted in the current directory
+flux tui --fleet=../roadmap    # attach to an explicit Fleet root
 ```
 
 `flux tui` takes the same turn-control flags as `flux run` — see [CLI](./cli.md#turn-controls) for
@@ -25,6 +27,45 @@ flux tui --remote https://worker.example:8790  # approve here; effects land ther
 In remote mode the header continuously shows the endpoint and canonical remote workspace. It is not
 a startup notice that scrolls away. The directory where the TUI started remains the local control
 plane; flux does not synchronize it with the remote tree.
+
+## Board and Fleet operations
+
+Ordinary `flux tui` remains a standalone chat and says so in the header. Fleet attachment is always
+explicit: `--fleet` means the current directory and `--fleet=ROOT` names another root. The attached
+form validates `.flux/fleet.toml`, opens the reserved `main` coordinator's isolated session store,
+and resumes the exact session recorded in durable Fleet state. It never substitutes the newest
+unrelated chat session.
+
+Start the supervisor before sending coordinator requirements:
+
+```bash
+flux fleet start --output json
+flux tui --fleet
+```
+
+The attached header continuously says `Fleet main`, connected or stopped, the Fleet revision, and
+`F2`. A stopped or failed main remains inspectable but refuses conversation input until it is
+started and the view is refreshed. At 104 columns and wider, a right-hand attention rail summarizes
+the active wave, worker capacity, open decisions, blocked work, and failures. Narrow terminals keep
+the full chat width and use the header plus the full-screen operations view.
+
+Press `F2`, or run `/fleet` or `/board`, to open that view. `Tab`/`Shift-Tab` or `1`–`5` select
+Overview, Board, Workers, Decisions, and Stats; arrows and PgUp/PgDn move the selection; `Enter`
+opens detail; `r` refreshes; `Esc`, `q`, or `F2` closes it. Worker detail correlates the durable
+assignment, session, worktree, handoff, review, rework, activity, and error evidence. Missing fields
+say `unavailable`. Capacity distinguishes configured, desired, active, draining, and registered;
+desired/draining likewise remain unavailable until the Fleet's durable state records them.
+
+The Board view includes ready, active, blocked, and completed stories, dependencies, linked planning
+documents, decision lifecycles, and the exact `flux.board-stats/v1` ratios/history used by
+`flux board stats`. Lists and text are bounded before rendering; a refresh error keeps the last good
+snapshot and marks it stale instead of inventing an empty Fleet.
+
+Conversation input is durably acknowledged as `accepted`, `delivered`, then `completed` or `failed`.
+Those recent acknowledgements reconstruct after restart together with the main transcript. Viewing
+operations is read-only. The only Board mutation in the view is choosing an option on an open
+decision: open its detail, select with Left/Right, press Enter to review the confirmation, then Enter
+again to apply. The TUI cannot push, release, deploy, apply a Fleet candidate, or clean worktrees.
 
 Press `F1` at any time for the in-app keybinding and slash-command list. That overlay is
 generated from the same tables the UI dispatches on, so it can never drift from the running binary.
@@ -52,6 +93,7 @@ runs.
 | `Ctrl-C` | Context-sensitive: interrupt a running turn · clear a non-empty composer · arm quit when idle and blank (see [Leaving](#leaving)). |
 | `Ctrl-D` | Quit — only when the session is idle **and** the composer is empty. |
 | `F1` | Open the help overlay (`F1`, `Esc`, `q`, or `Enter` closes it). |
+| `F2` | Open/close the attached Board + Fleet operations view. No effect in standalone chat. |
 | `Esc` | Dismiss the active popup, cancel a queue edit, or clear a half-typed slash command. |
 
 ### Terminal support for the newline keys
@@ -146,6 +188,7 @@ These are the TUI's built-ins. A command file discovered from `.flux/commands`, 
 | `/new` · `/clear` | Start a fresh session |
 | `/compact` | Compact older conversation history now |
 | `/queue` | Manage queued follow-ups (see [Queue and steering](#queue-and-steering)) |
+| `/fleet` · `/board` | Open the operations view when this TUI was launched with `--fleet` |
 | `/quit` · `/exit` | Clear queued follow-ups, cancel a running turn, then leave once cancellation finishes |
 
 While a turn is running, only the read-only commands (`/help`, `/tools`, `/evidence`, `/session`,

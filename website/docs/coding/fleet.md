@@ -134,6 +134,21 @@ Every fleet has exactly one reserved `main` coordinator. It is the only agent th
 intake and execution orchestration. The Board owns roadmap and scheduling truth. All user tasks and worker follow-ups route through it;
 worker records carry `parent: main` and no template or ad-hoc request may use the coordinator role.
 
+For an interactive operator surface, explicitly attach the TUI to this coordinator:
+
+```sh
+flux fleet start --output json
+flux tui --fleet               # current directory is the Fleet root
+flux tui --fleet=../roadmap    # or name the Fleet root
+```
+
+This opens the exact durable `main` session and keeps the conversation primary. `F2`, `/fleet`, or
+`/board` opens bounded native Board, worker, decision, failure, planning-document, and exact-stats
+views; wide terminals also show an attention rail. Typed requirements are journalled through
+accepted, delivered, and completed/failed acknowledgement states. A stopped Fleet is observable but
+cannot accept input. See the [TUI guide](../agent/tui.md#board-and-fleet-operations) for navigation,
+decision confirmation, restart behavior, and the deliberately narrow mutation boundary.
+
 The main agent plans against revisioned context rather than an untracked system prompt:
 
 ```sh
