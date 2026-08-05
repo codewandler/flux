@@ -384,9 +384,76 @@ pub(super) enum FleetAction {
         #[arg(long, default_value = "user")]
         from: String,
     },
+    /// Admit a template-based or ad-hoc worker through the main coordinator.
+    Spawn {
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long, conflicts_with = "instructions_file")]
+        instructions: Option<String>,
+        #[arg(long, conflicts_with = "instructions")]
+        instructions_file: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_name = "BOARD/ITEM")]
+        item: Option<String>,
+        #[arg(long, value_enum)]
+        mode: Option<FleetTaskMode>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        #[arg(long = "fence")]
+        fences: Vec<String>,
+    },
     Run {
         #[arg(value_name = "BOARD/ITEM")]
         items: Vec<String>,
+    },
+    /// Verify a story worker's exact commit, write set and targeted validation evidence.
+    Handoff {
+        wave: String,
+        #[arg(value_name = "BOARD/ITEM")]
+        item: String,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        worker: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long = "write-set", value_name = "PATH")]
+        write_set: Vec<String>,
+        #[arg(long = "test-arg", value_name = "ARGV", allow_hyphen_values = true)]
+        test_argv: Vec<String>,
+        #[arg(long)]
+        failing_before: bool,
+        #[arg(long)]
+        passing_after: bool,
+        #[arg(long)]
+        no_failing_test_reason: Option<String>,
+        #[arg(long)]
+        summary: String,
+    },
+    /// Return structured review findings to the same worker session; the third request parks.
+    Rework {
+        wave: String,
+        #[arg(value_name = "BOARD/ITEM")]
+        item: String,
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long)]
+        reviewed_commit: String,
+        #[arg(long = "path", value_name = "PATH:LINE:DETAIL")]
+        paths: Vec<String>,
+        #[arg(long = "command-output")]
+        command_outputs: Vec<String>,
+        #[arg(long = "invariant")]
+        invariants: Vec<String>,
+    },
+    /// Assemble accepted story commits and run each repository's final gate exactly once.
+    Integrate {
+        wave: String,
     },
     Task {
         target: String,
@@ -493,7 +560,7 @@ impl GoalScope {
     }
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Serialize)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum IntakeSource {
     #[default]
@@ -502,7 +569,7 @@ pub(super) enum IntakeSource {
     Automation,
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Serialize)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum FleetTaskMode {
     #[default]
@@ -618,6 +685,14 @@ struct FleetConfig {
     #[serde(default)]
     decision_mode: DecisionMode,
     #[serde(default)]
+    main: MainAgentConfig,
+    #[serde(default = "default_true")]
+    allow_ad_hoc_agents: bool,
+    #[serde(default)]
+    agent_templates: Vec<AgentTemplate>,
+    #[serde(default = "default_worktree_root")]
+    worktree_root: PathBuf,
+    #[serde(default)]
     repositories: Vec<FleetRepository>,
     #[serde(default)]
     tranches: Vec<ScheduleGroup>,
@@ -625,6 +700,33 @@ struct FleetConfig {
     waves: Vec<ScheduleGroup>,
     #[serde(default)]
     groups: Vec<ScheduleGroup>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainAgentConfig {
+    #[serde(default)]
+    instructions: Option<PathBuf>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentTemplate {
+    id: String,
+    role: String,
+    instructions: PathBuf,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    mode: FleetTaskMode,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    fences: Vec<String>,
+    #[serde(default = "default_template_instances")]
+    max_instances: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -673,11 +775,20 @@ const fn default_max_wave() -> usize {
 const fn default_max_rework() -> usize {
     2
 }
+const fn default_true() -> bool {
+    true
+}
+const fn default_template_instances() -> usize {
+    1
+}
 fn default_canonical_ref() -> String {
     "origin/main".into()
 }
 fn default_board_binding() -> String {
     "default".into()
+}
+fn default_worktree_root() -> PathBuf {
+    PathBuf::from(".flux/fleet/worktrees")
 }
 
 impl Default for FleetState {
@@ -1606,7 +1717,7 @@ fn run_fleet_action(
                 fs::create_dir_all(root.join(".flux/fleet"))?;
                 let config = root.join(".flux/fleet.toml");
                 if !config.exists() {
-                    fs::write(&config, format!("schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\nmax_rework = {max_rework}\ndecision_mode = \"human\" # or \"auto\" for an independent adversarial decision agent\n\n# [[repositories]]\n# id = \"repo\"\n# root = \".\"\n# board = \"default\"\n# canonical_ref = \"origin/main\"\n# gate = [\"cargo\", \"test\", \"--workspace\"]\n"))?;
+                    fs::write(&config, format!("schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\nmax_rework = {max_rework}\ndecision_mode = \"human\" # or \"auto\" for an independent adversarial decision agent\nallow_ad_hoc_agents = true\nworktree_root = \".flux/fleet/worktrees\"\n\n# [main]\n# instructions = \".flux/fleet/main.md\"\n# model = \"codex/gpt-5.6-sol\"\n\n# [[agent_templates]]\n# id = \"story-worker\"\n# role = \"writer\"\n# instructions = \".flux/fleet/agents/story-worker.md\"\n# mode = \"write\"\n# max_instances = {max_workers}\n\n# [[repositories]]\n# id = \"repo\"\n# root = \".\"\n# board = \"default\"\n# canonical_ref = \"origin/main\"\n# gate = [\"cargo\", \"test\", \"--workspace\"]\n"))?;
                 }
                 write_fleet_state(root, &state)?;
                 append_fleet_event(
@@ -1726,6 +1837,34 @@ fn run_fleet_action(
                 state.revision,
             ))
         }
+        FleetAction::Spawn {
+            template,
+            role,
+            instructions,
+            instructions_file,
+            model,
+            item,
+            mode,
+            name,
+            capabilities,
+            fences,
+        } => fleet_spawn(
+            command,
+            root,
+            state,
+            SpawnOptions {
+                template: template.as_deref(),
+                role: role.as_deref(),
+                instructions: instructions.as_deref(),
+                instructions_file: instructions_file.as_deref(),
+                model: model.as_deref(),
+                item: item.as_deref(),
+                mode: *mode,
+                name: name.as_deref(),
+                capabilities,
+                fences,
+            },
+        ),
         FleetAction::Status | FleetAction::Dashboard => {
             let data = json!({"state": state, "sources": fleet_sources(root)?, "schedule": fleet_schedule(root)?, "human_decisions": open_decisions(root)?});
             Ok((fleet_status_human(&data), data, vec![], state.revision))
@@ -1820,36 +1959,101 @@ fn run_fleet_action(
                 bail!("not-found: no dependency-satisfied ready items");
             }
             let wave = format!("wave-{}", state.revision + 1);
+            let topology = prepare_wave_worktrees(command, root, &wave, &selected)?;
             state.revision += 1;
             for (index, item) in selected.iter().enumerate() {
                 let worker = format!("{}-worker-{}", wave, index + 1);
+                let assignment = topology["repositories"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
+                    .find(|story| story["board_ref"].as_str() == Some(item.as_str()))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 state.agents.insert(
                     worker.clone(),
                     json!({
                         "id": worker,
                         "role": "worker",
+                        "parent": "main",
                         "created_by": "main",
                         "board_ref": item,
                         "status": "accepted",
                         "transport": "flux-local",
+                        "session": format!("{wave}-session-{}", index + 1),
+                        "assignment": assignment,
                     }),
                 );
             }
-            state.waves.insert(wave.clone(), json!({"id": wave, "items": selected, "status": "accepted", "coordinator": "main", "goals_revision": state.main_agent.goals_revision, "apply_eligible": false}));
+            state.waves.insert(wave.clone(), json!({"id": wave, "items": selected, "status": "accepted", "coordinator": "main", "goals_revision": state.main_agent.goals_revision, "topology": topology, "apply_eligible": false}));
             persist_fleet_mutation(
                 command,
                 root,
                 &state,
                 "wave.accepted",
-                json!({"wave": wave, "items": selected, "coordinator": "main"}),
+                json!({"wave": wave, "items": selected, "coordinator": "main", "topology": topology}),
             )?;
             Ok((
                 format!("{wave} accepted: {} item(s)", selected.len()),
-                json!({"wave": wave, "items": selected, "ack": "accepted"}),
+                json!({"wave": wave, "items": selected, "ack": "accepted", "topology": topology}),
                 vec![],
                 state.revision,
             ))
         }
+        FleetAction::Handoff {
+            wave,
+            item,
+            commit,
+            worker,
+            session,
+            write_set,
+            test_argv,
+            failing_before,
+            passing_after,
+            no_failing_test_reason,
+            summary,
+        } => fleet_handoff(
+            command,
+            root,
+            state,
+            HandoffInput {
+                wave,
+                item,
+                commit,
+                worker: worker.as_deref(),
+                session: session.as_deref(),
+                write_set,
+                test_argv,
+                failing_before: *failing_before,
+                passing_after: *passing_after,
+                no_failing_test_reason: no_failing_test_reason.as_deref(),
+                summary,
+            },
+        ),
+        FleetAction::Rework {
+            wave,
+            item,
+            reviewer,
+            reviewed_commit,
+            paths,
+            command_outputs,
+            invariants,
+        } => fleet_rework(
+            command,
+            root,
+            state,
+            ReworkInput {
+                wave,
+                item,
+                reviewer,
+                reviewed_commit,
+                paths,
+                command_outputs,
+                invariants,
+            },
+        ),
+        FleetAction::Integrate { wave } => integrate_wave(command, root, state, wave),
         FleetAction::Task {
             target,
             instruction,
@@ -2093,7 +2297,11 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
                 action: FleetGoalAction::Set { .. } | FleetGoalAction::Remove { .. }
             }
             | FleetAction::Ingest { .. }
+            | FleetAction::Spawn { .. }
             | FleetAction::Run { .. }
+            | FleetAction::Handoff { .. }
+            | FleetAction::Rework { .. }
+            | FleetAction::Integrate { .. }
             | FleetAction::Task { .. }
             | FleetAction::Message { .. }
             | FleetAction::Cancel { .. }
@@ -2224,7 +2432,11 @@ fn fleet_operations() -> &'static [&'static str] {
         "stop",
         "goal",
         "ingest",
+        "spawn",
         "run",
+        "handoff",
+        "rework",
+        "integrate",
         "task",
         "message",
         "cancel",
@@ -3999,6 +4211,14 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
         )
     }
     validate_fleet_limits(config.max_workers, config.max_wave, config.max_rework)?;
+    if !config.worktree_root.is_absolute()
+        && config
+            .worktree_root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("permission: relative worktree_root cannot escape the fleet root")
+    }
     let mut ids = BTreeSet::new();
     let mut roots: Vec<(String, PathBuf)> = Vec::new();
     for repository in &config.repositories {
@@ -4041,10 +4261,60 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
         }
         roots.push((repository.id.clone(), canonical));
     }
+    if let Some(instructions) = &config.main.instructions {
+        confined_config_file(root, instructions, "main instructions")?;
+    }
+    let mut template_ids = BTreeSet::new();
+    for template in &config.agent_templates {
+        flux_datasource::board::BoardId::new(&template.id)
+            .map_err(|error| anyhow::anyhow!("input/schema: agent template {error}"))?;
+        if template.id == "main" || !template_ids.insert(&template.id) {
+            bail!(
+                "conflict/precondition: duplicate or reserved agent template id {:?}",
+                template.id
+            )
+        }
+        if template.role.trim().is_empty() {
+            bail!(
+                "input/schema: agent template {} has an empty role",
+                template.id
+            )
+        }
+        if !(1..=config.max_workers).contains(&template.max_instances) {
+            bail!(
+                "input/schema: agent template {} max_instances must be 1..={} ",
+                template.id,
+                config.max_workers
+            )
+        }
+        confined_config_file(
+            root,
+            &template.instructions,
+            &format!("agent template {} instructions", template.id),
+        )?;
+    }
     validate_schedule_groups(&config.tranches, "tranche", usize::MAX)?;
     validate_schedule_groups(&config.waves, "wave", 10)?;
     validate_schedule_groups(&config.groups, "group", usize::MAX)?;
     Ok(config)
+}
+
+fn confined_config_file(root: &Path, path: &Path, label: &str) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("not-found: {label} at {}", candidate.display()))?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        bail!(
+            "permission: {label} must be a file confined under {}",
+            root.display()
+        )
+    }
+    Ok(canonical)
 }
 
 fn validate_schedule_groups(groups: &[ScheduleGroup], kind: &str, cap: usize) -> Result<()> {
@@ -4222,6 +4492,162 @@ fn validate_fleet_limits(workers: usize, wave: usize, rework: usize) -> Result<(
     Ok(())
 }
 
+struct SpawnOptions<'a> {
+    template: Option<&'a str>,
+    role: Option<&'a str>,
+    instructions: Option<&'a str>,
+    instructions_file: Option<&'a Path>,
+    model: Option<&'a str>,
+    item: Option<&'a str>,
+    mode: Option<FleetTaskMode>,
+    name: Option<&'a str>,
+    capabilities: &'a [String],
+    fences: &'a [String],
+}
+
+fn fleet_spawn(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    options: SpawnOptions<'_>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    if !state.running {
+        bail!("conflict/precondition: main coordinator is stopped; run `flux fleet start`")
+    }
+    let config = read_fleet_config(root)?;
+    let template = options
+        .template
+        .map(|id| {
+            config
+                .agent_templates
+                .iter()
+                .find(|template| template.id == id)
+                .with_context(|| format!("not-found: agent template {id}"))
+        })
+        .transpose()?;
+    if template.is_none() && !config.allow_ad_hoc_agents {
+        bail!("permission: ad-hoc agents are disabled by .flux/fleet.toml")
+    }
+    let role = options
+        .role
+        .or_else(|| template.map(|template| template.role.as_str()))
+        .context("input/schema: ad-hoc spawn requires --role")?;
+    if role.trim().is_empty() || role == "coordinator" || role == "main" {
+        bail!("input/schema: worker role cannot be empty or coordinator-shaped")
+    }
+    let mode = options
+        .mode
+        .or_else(|| template.map(|template| template.mode))
+        .unwrap_or_default();
+    if mode == FleetTaskMode::Write && options.item.is_none() {
+        bail!("input/schema: a write-capable worker requires --item BOARD/ITEM")
+    }
+    if let Some(item) = options.item {
+        validate_board_refs(&[item.to_string()])?;
+    }
+    let instructions_path = match options.instructions_file {
+        Some(path) => Some(confined_config_file(
+            root,
+            path,
+            "ad-hoc agent instructions",
+        )?),
+        None => template
+            .map(|template| {
+                confined_config_file(
+                    root,
+                    &template.instructions,
+                    &format!("agent template {} instructions", template.id),
+                )
+            })
+            .transpose()?,
+    };
+    let instructions = match (options.instructions, instructions_path.as_ref()) {
+        (Some(instructions), _) => instructions.to_string(),
+        (None, Some(path)) => fs::read_to_string(path)?,
+        (None, None) => {
+            bail!("input/schema: ad-hoc spawn requires --instructions or --instructions-file")
+        }
+    };
+    if instructions.trim().is_empty() {
+        bail!("input/schema: agent instructions cannot be empty")
+    }
+    if let Some(template) = template {
+        let instances = state
+            .agents
+            .values()
+            .filter(|agent| agent["template"].as_str() == Some(&template.id))
+            .filter(|agent| {
+                !matches!(
+                    agent["status"].as_str(),
+                    Some("completed" | "cancelled" | "failed")
+                )
+            })
+            .count();
+        if instances >= template.max_instances {
+            bail!(
+                "conflict/precondition: agent template {} already has its {} active instance(s)",
+                template.id,
+                template.max_instances
+            )
+        }
+    }
+    let id = options
+        .name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent-{}", state.revision + 1));
+    flux_datasource::board::BoardId::new(&id)
+        .map_err(|error| anyhow::anyhow!("input/schema: agent {error}"))?;
+    if id == "main" || state.agents.contains_key(&id) {
+        bail!("conflict/precondition: agent id {id:?} is reserved or already registered")
+    }
+    let mut capabilities = template
+        .map(|template| template.capabilities.clone())
+        .unwrap_or_default();
+    capabilities.extend(options.capabilities.iter().cloned());
+    capabilities.sort();
+    capabilities.dedup();
+    let mut fences = template
+        .map(|template| template.fences.clone())
+        .unwrap_or_default();
+    fences.extend(options.fences.iter().cloned());
+    fences.sort();
+    fences.dedup();
+    state.revision += 1;
+    let registration = json!({
+        "schema": "flux.fleet-agent-registration/v1",
+        "id": id,
+        "parent": "main",
+        "role": role,
+        "template": template.map(|template| template.id.as_str()),
+        "ephemeral": template.is_none(),
+        "transport": "flux-local",
+        "model": options.model.or_else(|| template.and_then(|template| template.model.as_deref())),
+        "mode": mode,
+        "board_ref": options.item,
+        "instructions": redact(&instructions),
+        "instructions_source": instructions_path.as_ref().map(|path| display_path(path)),
+        "capabilities": capabilities,
+        "fences": fences,
+        "status": "admitted",
+        "lease": {"generation": state.revision, "holder": id, "status": "active"},
+        "created_by": "main",
+    });
+    state.agents.insert(id.clone(), registration.clone());
+    persist_fleet_mutation(
+        command,
+        root,
+        &state,
+        "agent.admitted",
+        registration.clone(),
+    )?;
+    Ok((
+        format!("{id} admitted by main coordinator"),
+        registration,
+        vec![],
+        state.revision,
+    ))
+}
+
 fn fleet_goal(
     command: &FleetCommand,
     root: &Path,
@@ -4364,9 +4790,20 @@ fn fleet_sources(root: &Path) -> Result<Value> {
             "concurrency": repository.concurrency, "modified": false
         }));
     }
-    Ok(
-        json!({"root": display_path(root), "config": true, "repositories": repositories, "modified": false}),
-    )
+    Ok(json!({
+        "root": display_path(root),
+        "config": true,
+        "main": {"instructions": config.main.instructions, "model": config.main.model},
+        "allow_ad_hoc_agents": config.allow_ad_hoc_agents,
+        "worktree_root": config.worktree_root,
+        "agent_templates": config.agent_templates.iter().map(|template| json!({
+            "id": template.id, "role": template.role, "mode": template.mode,
+            "model": template.model, "max_instances": template.max_instances,
+            "capabilities": template.capabilities, "fences": template.fences
+        })).collect::<Vec<_>>(),
+        "repositories": repositories,
+        "modified": false
+    }))
 }
 
 fn open_decisions(root: &Path) -> Result<Value> {
@@ -4566,6 +5003,204 @@ fn fleet_worktrees(root: &Path) -> Result<Value> {
     }
     Ok(json!({"worktrees":worktrees,"modified":false}))
 }
+
+fn prepare_wave_worktrees(
+    command: &FleetCommand,
+    root: &Path,
+    wave: &str,
+    items: &[String],
+) -> Result<Value> {
+    let config = read_fleet_config(root)?;
+    let worktree_root = if config.worktree_root.is_absolute() {
+        config.worktree_root.clone()
+    } else {
+        root.join(&config.worktree_root)
+    };
+    let wave_root = worktree_root.join(wave);
+    if wave_root.exists() {
+        bail!(
+            "conflict/precondition: wave worktree root already exists: {}",
+            wave_root.display()
+        )
+    }
+    let authoritative = if config.repositories.is_empty() {
+        read_stories(root)?
+            .into_iter()
+            .map(|mut story| {
+                story.id = format!("default/{}", story.id);
+                story.dependencies = story
+                    .dependencies
+                    .into_iter()
+                    .map(|dependency| format!("default/{dependency}"))
+                    .collect();
+                story
+            })
+            .collect::<Vec<_>>()
+    } else {
+        workspace_stories(root)?
+    };
+    let states = authoritative
+        .iter()
+        .map(|story| (story.id.as_str(), story.status.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    for item in items {
+        let story = authoritative
+            .iter()
+            .find(|story| story.id == *item)
+            .with_context(|| format!("not-found: fleet item {item}"))?;
+        if story.status != "ready" {
+            bail!(
+                "conflict/precondition: fleet item {item} is {}, not ready",
+                story.status
+            )
+        }
+        for dependency in &story.dependencies {
+            if states.get(dependency.as_str()).copied() != Some("done") {
+                bail!("conflict/precondition: fleet item {item} waits for dependency {dependency}")
+            }
+        }
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    for item in items {
+        let (repository, _) = item
+            .split_once('/')
+            .context("input/schema: fleet item must be BOARD/ITEM")?;
+        grouped
+            .entry(repository.to_string())
+            .or_default()
+            .push(item.clone());
+    }
+    let mut repositories = Vec::new();
+    for (repository_id, story_refs) in grouped {
+        let (repository_root, canonical_ref, gate) = if config.repositories.is_empty() {
+            if repository_id != "default" {
+                bail!("not-found: fleet repository {repository_id}")
+            }
+            (root.to_path_buf(), "HEAD".to_string(), Vec::new())
+        } else {
+            let repository = config
+                .repositories
+                .iter()
+                .find(|repository| repository.id == repository_id)
+                .with_context(|| format!("not-found: fleet repository {repository_id}"))?;
+            (
+                repository_root(root, repository)?,
+                repository.canonical_ref.clone(),
+                repository.gate.clone(),
+            )
+        };
+        let dirty = git_output(&repository_root, &["status", "--porcelain"])
+            .is_some_and(|status| !status.is_empty());
+        if dirty {
+            bail!(
+                "conflict/precondition: repository {repository_id} is dirty; wave dispatch refuses to modify it"
+            )
+        }
+        let base = git_output(&repository_root, &["rev-parse", &canonical_ref]).with_context(|| {
+            format!(
+                "validation/gate: repository {repository_id} cannot resolve canonical ref {canonical_ref}"
+            )
+        })?;
+        let repository_dir = wave_root.join(&repository_id);
+        let integration_path = repository_dir.join("integration");
+        let integration_branch = format!("fleet/{wave}/{repository_id}/integration");
+        validate_new_worktree_target(&repository_root, &integration_path, &integration_branch)?;
+        let mut stories = Vec::new();
+        for board_ref in story_refs {
+            let (_, item_id) = board_ref.split_once('/').expect("validated BoardRef");
+            let slug = safe_ref_segment(item_id);
+            let branch = format!("fleet/{wave}/{repository_id}/story/{slug}");
+            let path = repository_dir.join("stories").join(&slug);
+            validate_new_worktree_target(&repository_root, &path, &branch)?;
+            stories.push(json!({
+                "board_ref": board_ref,
+                "branch": branch,
+                "worktree": display_path(&path),
+                "base_commit": base,
+                "targeted_gate": Value::Null,
+                "handoff": Value::Null,
+            }));
+        }
+        if !command.dry_run {
+            fs::create_dir_all(repository_dir.join("stories"))?;
+            add_git_worktree(
+                &repository_root,
+                &integration_path,
+                &integration_branch,
+                &base,
+            )?;
+            for story in &stories {
+                add_git_worktree(
+                    &repository_root,
+                    Path::new(story["worktree"].as_str().unwrap_or_default()),
+                    story["branch"].as_str().unwrap_or_default(),
+                    &base,
+                )?;
+            }
+        }
+        repositories.push(json!({
+            "id": repository_id,
+            "source_root": display_path(&repository_root),
+            "canonical_ref": canonical_ref,
+            "base_commit": base,
+            "integration": {"branch": integration_branch, "worktree": display_path(&integration_path)},
+            "stories": stories,
+            "final_gate": gate,
+        }));
+    }
+    Ok(json!({
+        "schema": "flux.fleet-wave-topology/v1",
+        "wave": wave,
+        "worktree_root": display_path(&wave_root),
+        "dry_run": command.dry_run,
+        "repositories": repositories,
+    }))
+}
+
+fn safe_ref_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn validate_new_worktree_target(root: &Path, path: &Path, branch: &str) -> Result<()> {
+    if path.exists() {
+        bail!(
+            "conflict/precondition: worktree target already exists: {}",
+            path.display()
+        )
+    }
+    let reference = format!("refs/heads/{branch}");
+    if git_output(root, &["show-ref", "--verify", &reference]).is_some() {
+        bail!("conflict/precondition: worktree branch already exists: {branch}")
+    }
+    Ok(())
+}
+
+fn add_git_worktree(root: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", branch])
+        .arg(path)
+        .arg(base)
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "validation/gate: git worktree add for {branch} failed: {}",
+            redact(&String::from_utf8_lossy(&output.stderr))
+        )
+    }
+    Ok(())
+}
+
 fn worktrees_human(data: &Value) -> String {
     data["worktrees"]
         .as_array()
@@ -4581,6 +5216,708 @@ fn worktrees_human(data: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+struct HandoffInput<'a> {
+    wave: &'a str,
+    item: &'a str,
+    commit: &'a str,
+    worker: Option<&'a str>,
+    session: Option<&'a str>,
+    write_set: &'a [String],
+    test_argv: &'a [String],
+    failing_before: bool,
+    passing_after: bool,
+    no_failing_test_reason: Option<&'a str>,
+    summary: &'a str,
+}
+
+struct ReworkInput<'a> {
+    wave: &'a str,
+    item: &'a str,
+    reviewer: &'a str,
+    reviewed_commit: &'a str,
+    paths: &'a [String],
+    command_outputs: &'a [String],
+    invariants: &'a [String],
+}
+
+fn wave_story_indices(wave: &Value, item: &str) -> Result<(usize, usize)> {
+    for (repository_index, repository) in wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (story_index, story) in repository["stories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if story["board_ref"].as_str() == Some(item) {
+                return Ok((repository_index, story_index));
+            }
+        }
+    }
+    bail!("not-found: wave does not contain {item}")
+}
+
+fn normalize_write_set(paths: &[String]) -> Result<Vec<String>> {
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            bail!("permission: write-set paths must be repository-relative")
+        }
+        let mut clean = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(value) => {
+                    clean.push(value.to_string_lossy().into_owned())
+                }
+                _ => bail!("permission: write-set path escapes the repository"),
+            }
+        }
+        if clean.is_empty() {
+            bail!("input/schema: write-set paths cannot be empty")
+        }
+        normalized.insert(clean.join("/"));
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn diff_write_set(worktree: &Path, base: &str, commit: &str) -> Result<Vec<String>> {
+    let range = format!("{base}..{commit}");
+    let output = git_output(
+        worktree,
+        &["diff", "--name-only", "--diff-filter=ACDMRTUXB", &range],
+    )
+    .context("validation/gate: could not inspect handoff diff")?;
+    normalize_write_set(&output.lines().map(str::to_owned).collect::<Vec<_>>())
+}
+
+fn path_hits_fence(path: &str, fence: &str) -> bool {
+    let fence = fence.trim().trim_start_matches("./").trim_end_matches('/');
+    if fence.is_empty() {
+        return false;
+    }
+    let prefix = fence.strip_suffix("/**").unwrap_or(fence);
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn clipped_redacted(bytes: &[u8]) -> String {
+    const MAX: usize = 16 * 1024;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if text.len() > MAX {
+        &text[..MAX]
+    } else {
+        &text
+    };
+    redact(text)
+}
+
+fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
+    let (program, args) = argv
+        .split_first()
+        .context("input/schema: validation argv must contain a program")?;
+    if program.trim().is_empty() {
+        bail!("input/schema: validation argv program cannot be empty")
+    }
+    let output = std::process::Command::new(program)
+        .args(args)
+        .current_dir(worktree)
+        .output()
+        .with_context(|| {
+            format!("validation/gate: could not execute validation program {program:?}")
+        })?;
+    Ok(json!({
+        "argv": argv,
+        "success": output.status.success(),
+        "exit_code": output.status.code(),
+        "stdout": clipped_redacted(&output.stdout),
+        "stderr": clipped_redacted(&output.stderr),
+    }))
+}
+
+fn fleet_handoff(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    input: HandoffInput<'_>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    validate_board_refs(&[input.item.to_string()])?;
+    if input.summary.trim().is_empty() {
+        bail!("input/schema: handoff summary cannot be empty")
+    }
+    if input.write_set.is_empty() {
+        bail!("input/schema: handoff requires an explicit write set")
+    }
+    if input.test_argv.is_empty() {
+        bail!("input/schema: handoff requires typed validation argv")
+    }
+    let wave = state
+        .waves
+        .get(input.wave)
+        .cloned()
+        .with_context(|| format!("not-found: wave {}", input.wave))?;
+    let (repository_index, story_index) = wave_story_indices(&wave, input.item)?;
+    let repository = &wave["topology"]["repositories"][repository_index];
+    let story = &repository["stories"][story_index];
+    let worktree = PathBuf::from(
+        story["worktree"]
+            .as_str()
+            .context("validation/gate: story assignment has no worktree")?,
+    );
+    let branch = story["branch"]
+        .as_str()
+        .context("validation/gate: story assignment has no branch")?;
+    let base = story["base_commit"]
+        .as_str()
+        .context("validation/gate: story assignment has no base commit")?;
+    let resolved = git_output(
+        &worktree,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", input.commit),
+        ],
+    )
+    .context("validation/gate: handoff commit does not exist")?;
+    if resolved != input.commit {
+        bail!("input/schema: handoff commit must be the full exact object id {resolved}")
+    }
+    if git_output(&worktree, &["rev-parse", "HEAD"]).as_deref() != Some(input.commit) {
+        bail!("conflict/precondition: handoff commit is not the story worktree HEAD")
+    }
+    if git_output(&worktree, &["rev-parse", branch]).as_deref() != Some(input.commit) {
+        bail!("conflict/precondition: handoff branch does not point at the exact commit")
+    }
+    let ancestor = std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", base, input.commit])
+        .current_dir(&worktree)
+        .status()?;
+    if !ancestor.success() {
+        bail!("conflict/precondition: handoff commit does not descend from its pinned wave base")
+    }
+    if git_output(&worktree, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
+        bail!("conflict/precondition: story worktree is dirty at handoff")
+    }
+    let claimed = normalize_write_set(input.write_set)?;
+    let observed = diff_write_set(&worktree, base, input.commit)?;
+    if observed.is_empty() || claimed != observed {
+        bail!(
+            "validation/gate: observed write set does not equal the approved write set (approved={claimed:?}, observed={observed:?})"
+        )
+    }
+    let config = read_fleet_config(root)?;
+    let repository_id = repository["id"].as_str().unwrap_or("default");
+    let configured_fences = config
+        .repositories
+        .iter()
+        .find(|candidate| candidate.id == repository_id)
+        .map(|candidate| candidate.fences.as_slice())
+        .unwrap_or_default();
+    let mut fences = vec![".git".to_string(), ".flux/fleet/**".to_string()];
+    fences.extend(configured_fences.iter().cloned());
+    if let Some((path, fence)) = observed.iter().find_map(|path| {
+        fences
+            .iter()
+            .find(|fence| path_hits_fence(path, fence))
+            .map(|fence| (path, fence))
+    }) {
+        bail!("permission: observed path {path:?} crosses ledger fence {fence:?}")
+    }
+    let documentation_only = input.no_failing_test_reason.is_some();
+    if documentation_only {
+        let reason = input.no_failing_test_reason.unwrap_or_default();
+        if reason.trim().is_empty() {
+            bail!("input/schema: documentation-only handoff needs a no-failing-test reason")
+        }
+        if observed.iter().any(|path| {
+            !(path.starts_with("docs/")
+                || path.ends_with(".md")
+                || path.ends_with(".mdx")
+                || path == "README"
+                || path == "README.md"
+                || path == "CHANGELOG.md")
+        }) {
+            bail!("validation/gate: behavioral work cannot use the documentation-only handoff path")
+        }
+        if input.failing_before || !input.passing_after {
+            bail!("input/schema: documentation-only evidence uses --passing-after and omits --failing-before")
+        }
+    } else if !input.failing_before || !input.passing_after {
+        bail!("input/schema: behavioral handoff requires failing-before and passing-after evidence")
+    }
+
+    let integration_worktree = PathBuf::from(
+        repository["integration"]["worktree"]
+            .as_str()
+            .context("validation/gate: repository has no integration worktree")?,
+    );
+    let before = if documentation_only {
+        Value::Null
+    } else {
+        let evidence = run_typed_argv(&integration_worktree, input.test_argv)?;
+        if evidence["success"].as_bool() != Some(false) {
+            bail!(
+                "validation/gate: failing-before validation unexpectedly passed on the pinned base"
+            )
+        }
+        evidence
+    };
+    let after = run_typed_argv(&worktree, input.test_argv)?;
+    if after["success"].as_bool() != Some(true) {
+        bail!("validation/gate: passing-after validation failed at the returned commit")
+    }
+    if git_output(&worktree, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
+        bail!("validation/gate: targeted validation left the story worktree dirty")
+    }
+
+    let matching_workers = state
+        .agents
+        .iter()
+        .filter(|(_, agent)| agent["board_ref"].as_str() == Some(input.item))
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let worker = match input.worker {
+        Some(worker) if matching_workers.iter().any(|candidate| candidate == worker) => {
+            worker.to_string()
+        }
+        Some(_) => bail!("conflict/precondition: handoff worker does not own this story"),
+        None if matching_workers.len() == 1 => matching_workers[0].clone(),
+        None => bail!("conflict/precondition: handoff worker identity is missing or ambiguous"),
+    };
+    let assigned_session = state.agents[&worker]["session"]
+        .as_str()
+        .context("validation/gate: story worker has no durable session")?;
+    let session = input.session.unwrap_or(assigned_session);
+    if session != assigned_session {
+        bail!("conflict/precondition: handoff session does not match the assigned worker session")
+    }
+    let handoff = json!({
+        "schema": "flux.fleet-handoff/v1",
+        "board_ref": input.item,
+        "worker": worker,
+        "session": session,
+        "worktree": display_path(&worktree),
+        "branch": branch,
+        "commit": input.commit,
+        "write_set": observed,
+        "test_argv": input.test_argv,
+        "failing_before": before,
+        "passing_after": after,
+        "documentation_only": documentation_only,
+        "no_failing_test_reason": input.no_failing_test_reason,
+        "summary": input.summary,
+        "status": "accepted",
+    });
+    let mut updated_wave = wave;
+    let story =
+        &mut updated_wave["topology"]["repositories"][repository_index]["stories"][story_index];
+    if !story["handoffs"].is_array() {
+        story["handoffs"] = json!([]);
+    }
+    story["handoffs"]
+        .as_array_mut()
+        .unwrap()
+        .push(handoff.clone());
+    story["handoff"] = handoff.clone();
+    story["status"] = json!("handoff-accepted");
+    state.waves.insert(input.wave.to_string(), updated_wave);
+    if let Some(agent) = state.agents.get_mut(&worker) {
+        agent["status"] = json!("handoff-accepted");
+        agent["commit"] = json!(input.commit);
+    }
+    state.revision += 1;
+    persist_fleet_mutation(
+        command,
+        root,
+        &state,
+        "story.handoff.accepted",
+        handoff.clone(),
+    )?;
+    Ok((
+        format!("{} handoff accepted at {}", input.item, input.commit),
+        handoff,
+        vec![],
+        state.revision,
+    ))
+}
+
+fn fleet_rework(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    input: ReworkInput<'_>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    if input.reviewer.trim().is_empty() {
+        bail!("input/schema: rework reviewer cannot be empty")
+    }
+    if input.paths.is_empty() && input.command_outputs.is_empty() && input.invariants.is_empty() {
+        bail!("input/schema: rework requires at least one structured finding")
+    }
+    let mut findings = Vec::new();
+    for finding in input.paths {
+        let mut parts = finding.splitn(3, ':');
+        let path = parts.next().unwrap_or_default();
+        let line = parts
+            .next()
+            .context("input/schema: path finding must be PATH:LINE:DETAIL")?
+            .parse::<usize>()
+            .context("input/schema: path finding line must be a positive integer")?;
+        let detail = parts
+            .next()
+            .context("input/schema: path finding must be PATH:LINE:DETAIL")?;
+        if line == 0 || detail.trim().is_empty() {
+            bail!("input/schema: path finding line/detail cannot be empty")
+        }
+        let path = normalize_write_set(&[path.to_string()])?
+            .pop()
+            .expect("one normalized path");
+        findings.push(json!({"kind":"path-line", "path":path, "line":line, "detail":detail}));
+    }
+    for output in input.command_outputs {
+        if output.trim().is_empty() {
+            bail!("input/schema: command-output finding cannot be empty")
+        }
+        findings.push(json!({"kind":"command-output", "detail":redact(output)}));
+    }
+    for invariant in input.invariants {
+        if invariant.trim().is_empty() {
+            bail!("input/schema: invariant finding cannot be empty")
+        }
+        findings.push(json!({"kind":"invariant", "detail":invariant}));
+    }
+    let mut wave = state
+        .waves
+        .get(input.wave)
+        .cloned()
+        .with_context(|| format!("not-found: wave {}", input.wave))?;
+    let (repository_index, story_index) = wave_story_indices(&wave, input.item)?;
+    let story = &mut wave["topology"]["repositories"][repository_index]["stories"][story_index];
+    let handoff = story["handoff"].clone();
+    if handoff["status"].as_str() != Some("accepted") {
+        bail!("conflict/precondition: rework requires an accepted handoff")
+    }
+    if handoff["commit"].as_str() != Some(input.reviewed_commit) {
+        bail!("conflict/precondition: findings do not review the current exact handoff commit")
+    }
+    let worker = handoff["worker"]
+        .as_str()
+        .context("validation/gate: accepted handoff has no worker")?
+        .to_string();
+    let session = handoff["session"]
+        .as_str()
+        .context("validation/gate: accepted handoff has no session")?
+        .to_string();
+    let attempts = story["rework_attempts"].as_u64().unwrap_or(0) as usize;
+    state.revision += 1;
+    let delivery_id = format!("rework-{}-{}", state.revision, attempts + 1);
+    let parked = attempts >= state.max_rework;
+    let result = json!({
+        "schema":"flux.fleet-rework/v1", "id":delivery_id, "wave":input.wave,
+        "board_ref":input.item, "reviewer":input.reviewer,
+        "reviewed_commit":input.reviewed_commit, "worker":worker, "session":session,
+        "attempt": if parked {attempts} else {attempts + 1}, "max_attempts":state.max_rework,
+        "findings":findings, "decision":if parked {"PARK"} else {"REWORK"},
+        "ack":if parked {"not-dispatched"} else {"delivered"},
+    });
+    if !story["reviews"].is_array() {
+        story["reviews"] = json!([]);
+    }
+    story["reviews"]
+        .as_array_mut()
+        .unwrap()
+        .push(result.clone());
+    if parked {
+        story["status"] = json!("parked");
+        wave["status"] = json!("parked");
+    } else {
+        story["rework_attempts"] = json!(attempts + 1);
+        story["status"] = json!("rework-delivered");
+    }
+    state.waves.insert(input.wave.to_string(), wave);
+    if let Some(agent) = state.agents.get_mut(&worker) {
+        agent["status"] = json!(if parked { "parked" } else { "rework" });
+        agent["session"] = json!(session);
+    }
+    persist_fleet_mutation(
+        command,
+        root,
+        &state,
+        if parked {
+            "story.parked"
+        } else {
+            "story.rework.delivered"
+        },
+        result.clone(),
+    )?;
+    Ok((
+        format!(
+            "{} {}",
+            input.item,
+            if parked { "parked" } else { "rework delivered" }
+        ),
+        result,
+        vec![],
+        state.revision,
+    ))
+}
+
+fn integration_order(root: &Path, selected: &[String]) -> Result<Vec<String>> {
+    let config = read_fleet_config(root)?;
+    let stories = if config.repositories.is_empty() {
+        read_stories(root)?
+            .into_iter()
+            .map(|mut story| {
+                story.dependencies = story
+                    .dependencies
+                    .into_iter()
+                    .map(|id| format!("default/{id}"))
+                    .collect();
+                story.id = format!("default/{}", story.id);
+                story
+            })
+            .collect::<Vec<_>>()
+    } else {
+        workspace_stories(root)?
+    };
+    let selected_set = selected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let by_id = stories
+        .iter()
+        .map(|story| (story.id.as_str(), story))
+        .collect::<BTreeMap<_, _>>();
+    fn visit<'a>(
+        id: &'a str,
+        selected: &BTreeSet<&'a str>,
+        by_id: &BTreeMap<&'a str, &'a Story>,
+        visited: &mut BTreeSet<&'a str>,
+        order: &mut Vec<String>,
+    ) {
+        if !visited.insert(id) {
+            return;
+        }
+        if let Some(story) = by_id.get(id) {
+            for dependency in &story.dependencies {
+                if selected.contains(dependency.as_str()) {
+                    visit(dependency, selected, by_id, visited, order);
+                }
+            }
+        }
+        order.push(id.to_string());
+    }
+    let mut visited = BTreeSet::new();
+    let mut order = Vec::new();
+    for item in selected {
+        visit(item, &selected_set, &by_id, &mut visited, &mut order);
+    }
+    Ok(order)
+}
+
+fn integrate_wave(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let mut wave = state
+        .waves
+        .get(wave_id)
+        .cloned()
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    if wave["status"].as_str().is_some_and(|status| {
+        matches!(
+            status,
+            "integrating" | "green" | "red" | "conflict" | "applied"
+        )
+    }) {
+        bail!("conflict/precondition: wave {wave_id} has already entered integration")
+    }
+    let items = wave["items"]
+        .as_array()
+        .context("validation/gate: wave has no item list")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if items.is_empty() || items.len() > 10 {
+        bail!("validation/gate: integration requires 1..=10 stories")
+    }
+    let order = integration_order(root, &items)?;
+    let mut seen_workers = BTreeSet::new();
+    let mut seen_paths = BTreeMap::<String, String>::new();
+    for item in &items {
+        let (repository_index, story_index) = wave_story_indices(&wave, item)?;
+        let story = &wave["topology"]["repositories"][repository_index]["stories"][story_index];
+        let handoff = &story["handoff"];
+        if handoff["status"].as_str() != Some("accepted") {
+            bail!("conflict/precondition: {item} has no accepted handoff")
+        }
+        let worker = handoff["worker"]
+            .as_str()
+            .context("validation/gate: handoff missing worker")?;
+        if !seen_workers.insert(worker.to_string()) {
+            bail!("conflict/precondition: worker {worker} owns more than one story in the wave")
+        }
+        for path in handoff["write_set"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if let Some(other) = seen_paths.insert(path.to_string(), item.clone()) {
+                bail!("conflict/precondition: unsafe write-set overlap on {path:?} between {other} and {item}")
+            }
+        }
+    }
+    wave["status"] = json!("integrating");
+    wave["integration_order"] = json!(order);
+    state.waves.insert(wave_id.to_string(), wave.clone());
+    state.revision += 1;
+    persist_fleet_mutation(
+        command,
+        root,
+        &state,
+        "wave.integration.started",
+        json!({"wave":wave_id,"order":order}),
+    )?;
+
+    let repository_count = wave["topology"]["repositories"]
+        .as_array()
+        .map_or(0, Vec::len);
+    for repository_index in 0..repository_count {
+        let repository_id = wave["topology"]["repositories"][repository_index]["id"]
+            .as_str()
+            .unwrap_or("default")
+            .to_string();
+        let integration_worktree = PathBuf::from(
+            wave["topology"]["repositories"][repository_index]["integration"]["worktree"]
+                .as_str()
+                .context("validation/gate: integration worktree missing")?,
+        );
+        let base = wave["topology"]["repositories"][repository_index]["base_commit"]
+            .as_str()
+            .context("validation/gate: integration base missing")?
+            .to_string();
+        if git_output(&integration_worktree, &["rev-parse", "HEAD"]).as_deref()
+            != Some(base.as_str())
+            || git_output(&integration_worktree, &["status", "--porcelain"])
+                .is_some_and(|s| !s.is_empty())
+        {
+            bail!("conflict/precondition: integration worktree for {repository_id} is not clean at its pinned base")
+        }
+        let repo_items = order
+            .iter()
+            .filter(|item| {
+                item.split_once('/').map(|(repo, _)| repo) == Some(repository_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in repo_items {
+            let (item_repository, story_index) = wave_story_indices(&wave, &item)?;
+            let commit = wave["topology"]["repositories"][item_repository]["stories"][story_index]
+                ["handoff"]["commit"]
+                .as_str()
+                .context("validation/gate: handoff commit missing")?
+                .to_string();
+            if !command.dry_run {
+                let output = std::process::Command::new("git")
+                    .args(["cherry-pick", &commit])
+                    .current_dir(&integration_worktree)
+                    .output()?;
+                if !output.status.success() {
+                    let conflicts = git_output(
+                        &integration_worktree,
+                        &["diff", "--name-only", "--diff-filter=U"],
+                    )
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                    let candidate = git_output(&integration_worktree, &["rev-parse", "HEAD"]);
+                    wave["status"] = json!("conflict");
+                    wave["apply_eligible"] = json!(false);
+                    wave["conflict"] = json!({"story":item,"commit":commit,"files":conflicts,"stderr":clipped_redacted(&output.stderr),"candidate":candidate});
+                    state.waves.insert(wave_id.to_string(), wave.clone());
+                    state.revision += 1;
+                    persist_fleet_mutation(
+                        command,
+                        root,
+                        &state,
+                        "wave.integration.conflict",
+                        wave["conflict"].clone(),
+                    )?;
+                    bail!("validation/gate: integration conflict in {item}; candidate history and conflict evidence were preserved")
+                }
+            }
+        }
+        let candidate = if command.dry_run {
+            base.clone()
+        } else {
+            git_output(&integration_worktree, &["rev-parse", "HEAD"])
+                .context("validation/gate: integration candidate missing")?
+        };
+        let gate_argv = wave["topology"]["repositories"][repository_index]["final_gate"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if gate_argv.is_empty() {
+            wave["status"] = json!("red");
+            wave["apply_eligible"] = json!(false);
+            wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"red","runs":0,"reason":"missing final gate argv","candidate":candidate});
+            state.waves.insert(wave_id.to_string(), wave.clone());
+            state.revision += 1;
+            persist_fleet_mutation(
+                command,
+                root,
+                &state,
+                "wave.gate.red",
+                json!({"wave":wave_id,"repository":repository_id,"reason":"missing final gate argv"}),
+            )?;
+            bail!("validation/gate: repository {repository_id} has no runnable final gate")
+        }
+        let gate = if command.dry_run {
+            json!({"argv":gate_argv,"success":true,"exit_code":Value::Null,"stdout":"","stderr":"","preview":true})
+        } else {
+            run_typed_argv(&integration_worktree, &gate_argv)?
+        };
+        let green = gate["success"].as_bool() == Some(true);
+        wave["topology"]["repositories"][repository_index]["candidate"] = json!(candidate);
+        wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":if green {"green"} else {"red"},"runs":1,"evidence":gate,"candidate":candidate});
+        if !green {
+            wave["status"] = json!("red");
+            wave["apply_eligible"] = json!(false);
+            state.waves.insert(wave_id.to_string(), wave.clone());
+            state.revision += 1;
+            persist_fleet_mutation(
+                command,
+                root,
+                &state,
+                "wave.gate.red",
+                json!({"wave":wave_id,"repository":repository_id,"candidate":candidate,"gate":wave["topology"]["repositories"][repository_index]["gate"]}),
+            )?;
+            bail!("validation/gate: final gate failed for {repository_id}; exact candidate {candidate} was preserved")
+        }
+    }
+    wave["status"] = json!("green");
+    wave["apply_eligible"] = json!(true);
+    state.waves.insert(wave_id.to_string(), wave.clone());
+    state.revision += 1;
+    let data = json!({"wave":wave_id,"status":"green","apply_eligible":true,"topology":wave["topology"],"pushed":false});
+    persist_fleet_mutation(command, root, &state, "wave.gate.green", data.clone())?;
+    Ok((
+        format!("{wave_id} is green and eligible for explicit local apply"),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
 fn apply_wave(
     command: &FleetCommand,
     root: &Path,
@@ -4593,27 +5930,86 @@ fn apply_wave(
         .cloned()
         .with_context(|| format!("not-found: wave {wave}"))?;
     if !record["apply_eligible"].as_bool().unwrap_or(false)
-        || record["gate"]["status"].as_str() != Some("green")
+        || record["status"].as_str() != Some("green")
     {
         bail!("conflict/precondition: wave {wave} has no recorded green final gate");
     }
-    let candidate = record["candidate"]
-        .as_str()
-        .context("validation/gate: green wave has no candidate branch")?;
-    if git_output(root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
-        bail!("conflict/precondition: repository is dirty; apply refuses to modify it");
-    }
-    if !command.dry_run {
-        let status = std::process::Command::new("git")
-            .args(["merge", "--no-ff", candidate])
-            .current_dir(root)
-            .status()?;
-        if !status.success() {
-            bail!("validation/gate: local merge of {candidate} failed; candidate history was preserved");
+    let repositories = record["topology"]["repositories"]
+        .as_array()
+        .context("validation/gate: green wave has no repository topology")?;
+    let mut targets = Vec::new();
+    for repository in repositories {
+        let repository_id = repository["id"].as_str().unwrap_or("default");
+        if repository["gate"]["status"].as_str() != Some("green")
+            || repository["gate"]["runs"].as_u64() != Some(1)
+        {
+            bail!("validation/gate: repository {repository_id} lacks exactly one recorded green final gate")
         }
+        let source = PathBuf::from(
+            repository["source_root"]
+                .as_str()
+                .context("validation/gate: source root missing")?,
+        );
+        let canonical_ref = repository["canonical_ref"]
+            .as_str()
+            .context("validation/gate: canonical ref missing")?;
+        let base = repository["base_commit"]
+            .as_str()
+            .context("validation/gate: base commit missing")?;
+        let candidate = repository["candidate"]
+            .as_str()
+            .context("validation/gate: candidate commit missing")?;
+        let branch = repository["integration"]["branch"]
+            .as_str()
+            .context("validation/gate: candidate branch missing")?;
+        if git_output(&source, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty())
+        {
+            bail!("conflict/precondition: repository {repository_id} is dirty; apply refuses to modify it")
+        }
+        if git_output(&source, &["rev-parse", canonical_ref]).as_deref() != Some(base)
+            || git_output(&source, &["rev-parse", "HEAD"]).as_deref() != Some(base)
+        {
+            bail!("conflict/precondition: repository {repository_id} moved from its pinned base; rebase a new wave")
+        }
+        if git_output(&source, &["rev-parse", branch]).as_deref() != Some(candidate) {
+            bail!("conflict/precondition: repository {repository_id} candidate branch moved after its green gate")
+        }
+        let ancestor = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", base, candidate])
+            .current_dir(&source)
+            .status()?;
+        if !ancestor.success() {
+            bail!("validation/gate: candidate {candidate} does not descend from repository {repository_id} base")
+        }
+        targets.push((
+            repository_id.to_string(),
+            source,
+            branch.to_string(),
+            candidate.to_string(),
+        ));
+    }
+    let mut merged = Vec::new();
+    if !command.dry_run {
+        for (repository_id, source, branch, candidate) in &targets {
+            let output = std::process::Command::new("git")
+                .args(["merge", "--no-ff", "--no-edit", branch])
+                .current_dir(source)
+                .output()?;
+            if !output.status.success() {
+                bail!("validation/gate: local merge for {repository_id} failed; candidate {candidate} was preserved: {}", clipped_redacted(&output.stderr));
+            }
+            merged.push(json!({"repository":repository_id,"candidate":candidate,"head":git_output(source,&["rev-parse","HEAD"])}));
+        }
+    } else {
+        merged.extend(targets.iter().map(|(repository, _, _, candidate)| json!({"repository":repository,"candidate":candidate,"preview":true})));
     }
     state.revision += 1;
-    let data = json!({"wave":wave,"candidate":candidate,"merged_locally":!command.dry_run,"pushed":false,"released":false,"deployed":false});
+    let mut updated = record;
+    updated["status"] = json!(if command.dry_run { "green" } else { "applied" });
+    updated["apply_eligible"] = json!(command.dry_run);
+    updated["applied"] = json!(merged);
+    state.waves.insert(wave.to_string(), updated);
+    let data = json!({"wave":wave,"repositories":merged,"merged_locally":!command.dry_run,"pushed":false,"released":false,"deployed":false});
     persist_fleet_mutation(command, root, &state, "wave.applied", data.clone())?;
     Ok((
         format!("{wave} applied locally; nothing was pushed"),

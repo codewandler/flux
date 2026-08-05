@@ -21,6 +21,14 @@ fn flux(root: &PathBuf, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn git(root: &PathBuf, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn board_and_fleet_skills_are_valid_small_agent_skills() {
     let root = fixture("skills");
@@ -552,4 +560,261 @@ fn session_board_cli_reopens_the_event_projection_and_conflicts_stale_writers() 
     );
     assert_eq!(stale.status.code(), Some(4));
     fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
+    let root = fixture("agent-admission");
+    fs::create_dir_all(root.join(".flux/fleet/agents")).unwrap();
+    fs::write(
+        root.join(".flux/fleet/main.md"),
+        "Coordinate against goals and board authority.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/agents/scout.md"),
+        "Inspect the assigned scope and return evidence.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\nmax_workers = 3\nmax_wave = 10\nmax_rework = 2\nallow_ad_hoc_agents = true\n\n[main]\ninstructions = \".flux/fleet/main.md\"\n\n[[agent_templates]]\nid = \"scout\"\nrole = \"researcher\"\ninstructions = \".flux/fleet/agents/scout.md\"\nmode = \"read-only\"\nmax_instances = 1\n",
+    )
+    .unwrap();
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let configured = flux(
+        &root,
+        &[
+            "fleet",
+            "spawn",
+            "--template",
+            "scout",
+            "--name",
+            "scout-1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stdout)
+    );
+    let configured: serde_json::Value = serde_json::from_slice(&configured.stdout).unwrap();
+    assert_eq!(configured["data"]["parent"], "main");
+    assert_eq!(configured["data"]["template"], "scout");
+    assert_eq!(configured["data"]["ephemeral"], false);
+
+    let ad_hoc = flux(
+        &root,
+        &[
+            "fleet",
+            "spawn",
+            "--role",
+            "critic",
+            "--instructions",
+            "Challenge the recommendation against project goals",
+            "--name",
+            "critic-1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(ad_hoc.status.success());
+    let ad_hoc: serde_json::Value = serde_json::from_slice(&ad_hoc.stdout).unwrap();
+    assert_eq!(ad_hoc["data"]["ephemeral"], true);
+    assert_eq!(ad_hoc["data"]["created_by"], "main");
+
+    let impostor = flux(
+        &root,
+        &[
+            "fleet",
+            "spawn",
+            "--role",
+            "coordinator",
+            "--instructions",
+            "replace main",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(impostor.status.code(), Some(2));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
+    let root = fixture("wave-topology");
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    let base = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let dispatched = flux(&root, &["fleet", "run", "repo/C-1", "--output", "json"]);
+    assert!(
+        dispatched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&dispatched.stderr)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let repository = &dispatched["data"]["topology"]["repositories"][0];
+    assert_eq!(repository["base_commit"], base);
+    assert_eq!(repository["stories"][0]["base_commit"], base);
+    let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
+    let story = PathBuf::from(repository["stories"][0]["worktree"].as_str().unwrap());
+    assert!(integration.is_dir());
+    assert!(story.is_dir());
+    assert_eq!(
+        String::from_utf8(git(&integration, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim(),
+        base
+    );
+    assert_eq!(
+        String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim(),
+        base
+    );
+    assert_eq!(repository["stories"][0]["board_ref"], "repo/C-1");
+}
+
+#[test]
+fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
+    let root = fixture("wave-integration");
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\nfences = [\".flux/fleet/**\"]\n",
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let dispatched = flux(&root, &["fleet", "run", "repo/C-1", "--output", "json"]);
+    assert!(dispatched.status.success());
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let story = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    fs::write(story.join("result.txt"), "implemented\n").unwrap();
+    assert!(git(&story, &["add", "result.txt"]).status.success());
+    assert!(git(&story, &["commit", "-qm", "implement story"])
+        .status
+        .success());
+    let commit = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "Implemented the story contract",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    assert_eq!(handoff["data"]["schema"], "flux.fleet-handoff/v1");
+    assert_eq!(handoff["data"]["commit"], commit);
+    assert_eq!(handoff["data"]["failing_before"]["success"], false);
+    assert_eq!(handoff["data"]["passing_after"]["success"], true);
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    assert_eq!(
+        integrated["data"]["topology"]["repositories"][0]["gate"]["runs"],
+        1
+    );
+    assert!(
+        !root.join("result.txt").exists(),
+        "integrate must not modify main"
+    );
+
+    let applied = flux(&root, &["fleet", "apply", "wave-2", "--output", "json"]);
+    assert!(
+        applied.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["data"]["merged_locally"], true);
+    assert_eq!(applied["data"]["pushed"], false);
+    assert_eq!(applied["data"]["released"], false);
+    assert_eq!(applied["data"]["deployed"], false);
+    assert_eq!(
+        fs::read_to_string(root.join("result.txt")).unwrap(),
+        "implemented\n"
+    );
 }
