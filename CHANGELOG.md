@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-08-05
+
 ### Added
 
 - **Boards and the local coding fleet are now first-class agent automation surfaces** (Decision
