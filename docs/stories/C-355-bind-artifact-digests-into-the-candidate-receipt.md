@@ -38,7 +38,7 @@ artifact and binds the immutable raw ZIP bytes that the publishing run must cons
       `size_in_bytes`, and exact `digest` spelling `sha256:<64 lowercase hex>`. IDs and
       names are unique; records use one deterministic order/encoding; missing, expired, duplicate,
       malformed or extra artifacts make recording and verification fail closed.
-- [x] The narrow `flux-release-promoter` job creates `release-candidates/<tag>` only after the cut PR
+- [x] The narrow host-owned promotion job creates `release-candidates/<tag>` only after the cut PR
       has merged, verifies the ref equals the returned merged canonical-main SHA, and dispatches the
       candidate run from that ref. Receipt recording paginates and selects artifacts from that exact
       repository + run after all producer jobs are successful and uploads are final. It obtains

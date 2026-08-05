@@ -4,7 +4,7 @@
 # app per package; 20 nested-workspace packages would collide with the core release series).
 #
 # AUTHORITY (C-354). Publication happens on a push of an exact `plugins-v<X.Y.Z>` tag and nowhere
-# else. The three publication authorities are three jobs in the tag-only `release` environment, and
+# else. The three publication authorities remain three distinct jobs, and
 # each secret is named in exactly one step:
 #
 #   * `build` (5 targets) and `assemble` (index generation) are secret-free and hold no environment.
@@ -13,20 +13,20 @@
 #   * `publish-host-kit` holds `CARGO_REGISTRY_TOKEN`, on the `cargo publish` step only.
 #
 # The tag itself is created by `release-control`, a narrow job that runs from a `workflow_run` of
-# the required `ci` aggregate on protected `main`. It mints the `flux-release-promoter` installation
-# token, checks that the green run's head SHA is still canonical `main`, that the lockstep version is
+# the required `ci` aggregate on canonical `main`. It receives `RELEASE_TOKEN` only on the tag-control
+# step, checks that the green run's head SHA is still canonical `main`, that the lockstep version is
 # exact and that the tag is absent — and then creates that one tag. It signs nothing and publishes
 # nothing. See scripts/plugin-tag-control.sh.
 #
 # `workflow_dispatch` is retained as a BUILD/VALIDATION path only. It has no `publish` input, cannot
-# reach `release` or `release-control`, cannot mint a token, create a tag, sign, create a Release or
+# reach any authority-bearing step, cannot create a tag, sign, create a Release or
 # publish a crate; it stops after uploading its secret-free artifacts. This replaces the historical
 # branch-dispatched publication in which one job chose the version, signed the index, created the
 # Release and published the crate.
 #
 # Secrets: MINISIGN_SECRET_KEY — the contents of a PASSWORDLESS minisign secret key
 # (`minisign -G -W`); its public half is embedded in the flux binary (D-47). It is a `release`
-# environment secret, so a dry run cannot see it at all.
+# repository secret, so a dry run cannot see it at all.
 
 name: release-plugins
 
@@ -55,13 +55,12 @@ env:
   CARGO_TARGET_DIR: target
 
 jobs:
-  # The only job that may act as `flux-release-promoter`, and the only effect it can have is the
+  # The only plugin-control job that receives the repository PAT, and the only effect it can have is the
   # creation of one absent plugin tag at a validated canonical-main SHA.
   release-control:
     name: "release-control · create the absent plugin tag"
     if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.name == 'ci' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
     runs-on: ubuntu-latest
-    environment: release-control
     permissions:
       contents: read
     steps:
@@ -70,19 +69,11 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
 
-      # The only step in this workflow that may read the promotion App's private key.
-      - name: Mint the flux-release-promoter installation token
-        id: promoter
-        env:
-          PROMOTION_APP_ID: ${{ vars.PROMOTION_APP_ID }}
-          PROMOTION_APP_PRIVATE_KEY: ${{ secrets.PROMOTION_APP_PRIVATE_KEY }}
-        run: scripts/mint-promotion-token.sh
-
       - name: Create the absent plugin tag at canonical main
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
-          PROMOTION_TOKEN: ${{ steps.promoter.outputs.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           CI_RUN_NAME: ${{ github.event.workflow_run.name }}
           CI_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           CI_RUN_EVENT: ${{ github.event.workflow_run.event }}
@@ -296,7 +287,6 @@ jobs:
       - assemble
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/plugins-v') }}
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: read
     steps:
@@ -316,7 +306,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY}" ]; then
-            echo "::error::MINISIGN_SECRET_KEY is not set on the release environment — cannot publish an unsigned pack"
+            echo "::error::MINISIGN_SECRET_KEY is not configured as an Actions secret — cannot publish an unsigned pack"
             exit 1
           fi
           umask 077
@@ -342,7 +332,6 @@ jobs:
       - sign
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/plugins-v') }}
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: read
     steps:
@@ -368,7 +357,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
-            echo "::error::RELEASE_TOKEN is not set on the release environment"
+            echo "::error::RELEASE_TOKEN is not configured as a repository Actions secret"
             exit 1
           fi
           test -s dist/plugins-index.json.minisig || { echo "::error::unsigned index"; exit 1; }
@@ -392,7 +381,6 @@ jobs:
       - publish-github-release
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/plugins-v') }}
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: read
     steps:
@@ -411,7 +399,7 @@ jobs:
         run: |
           set -uo pipefail
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is not set on the release environment"
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured as an Actions secret"
             exit 1
           fi
 

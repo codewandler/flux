@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host-owned C-516 promotion: cut PR -> merged main -> candidate -> App tag -> public/latest audit.
+# Host-owned C-516/C-559 promotion: cut PR -> merged main -> candidate -> PAT tag -> public/latest audit.
 set -euo pipefail
 
 fail() { echo "error: $*" >&2; exit 1; }
@@ -10,8 +10,9 @@ fail() { echo "error: $*" >&2; exit 1; }
 [[ "${GITHUB_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || fail "GITHUB_SHA must be a full lowercase SHA"
 [[ "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "invalid GITHUB_REPOSITORY"
 [ -n "${GITHUB_TOKEN:-}" ] || fail "GITHUB_TOKEN is required for read-only Actions operations"
-[ -n "${PROMOTION_TOKEN:-}" ] || fail "PROMOTION_TOKEN from flux-release-promoter is required"
-[ -z "${RELEASE_TOKEN:-}" ] || fail "RELEASE_TOKEN must not be present in the promotion job"
+[ -n "${RELEASE_TOKEN:-}" ] || fail "RELEASE_TOKEN is required for host-owned release promotion"
+[ -z "${PROMOTION_TOKEN:-}" ] || fail "PROMOTION_TOKEN must not be present in the promotion job"
+[ "$RELEASE_TOKEN" != "$GITHUB_TOKEN" ] || fail "RELEASE_TOKEN must be separate from GITHUB_TOKEN"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 
@@ -55,16 +56,24 @@ mapfile -t local_tags < <(git tag --points-at "$CUT_SHA" --list 'v*')
 
 GITHUB_SERVER_URL=${GITHUB_SERVER_URL:-https://github.com}
 PUSH_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git
-AUTH_BASIC=$(printf 'x-access-token:%s' "$PROMOTION_TOKEN" | base64 | tr -d '\n')
-git_with_promoter() {
+AUTH_BASIC=$(printf 'x-access-token:%s' "$RELEASE_TOKEN" | base64 | tr -d '\n')
+git_with_release_token() {
   GIT_CONFIG_COUNT=2 \
   GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader" \
   GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH_BASIC" \
   GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null git "$@"
 }
-app_gh() { GH_TOKEN=$PROMOTION_TOKEN gh "$@"; }
+release_gh() { GH_TOKEN=$RELEASE_TOKEN gh "$@"; }
 actions_gh() { GH_TOKEN=$GITHUB_TOKEN gh "$@"; }
-remote_sha() { git_with_promoter ls-remote "$PUSH_URL" "$1" | awk 'NR == 1 {print $1}'; }
+remote_sha() { git_with_release_token ls-remote "$PUSH_URL" "$1" | awk 'NR == 1 {print $1}'; }
+
+# Authenticate and prove repository mutation authority before the first remote mutation. Checking
+# the repository's permission projection is read-only and catches an expired, revoked or read-only
+# PAT before a cut branch, pull request, candidate or tag can be created.
+RELEASE_CAN_PUSH=$(release_gh api "repos/$GITHUB_REPOSITORY" --jq '.permissions.push // false') \
+  || fail "RELEASE_TOKEN is unusable for $GITHUB_REPOSITORY"
+[ "$RELEASE_CAN_PUSH" = true ] \
+  || fail "RELEASE_TOKEN lacks repository write authority for $GITHUB_REPOSITORY"
 
 POLL_INTERVAL_SECONDS=${PROMOTION_POLL_INTERVAL_SECONDS:-5}
 POLL_ATTEMPTS=${PROMOTION_POLL_ATTEMPTS:-120}
@@ -114,9 +123,6 @@ candidate_staged=0
 merged_sha_for_resume=
 cleanup_notice() {
   status=$?
-  # The installation token dies with the job in any case; revoking it makes that immediate, so a
-  # leaked log line or a paused runner cannot extend promotion authority past this script.
-  app_gh api -X DELETE /installation/token >/dev/null 2>&1 || true
   if [ "$status" -ne 0 ] && [ "$candidate_staged" -eq 1 ]; then
     echo "::error::promotion failed; $CANDIDATE_REF remains at $merged_sha_for_resume" >&2
     printf 'Resume exactly: EXPECTED_RELEASE_SHA=%q PROMOTION_RESUME_TAG=%q PROMOTION_RESUME_SHA=%q scripts/promote-release-flow.sh\n' \
@@ -132,18 +138,18 @@ REMOTE_MAIN=$(remote_sha refs/heads/main)
 [ -z "$(remote_sha "$TAG_REF^{}")" ] || fail "$TAG_REF already exists; use the printed resume command"
 
 echo "Staging deterministic cut $CUT_SHA on $CUT_BRANCH"
-git_with_promoter push "$PUSH_URL" "$CUT_SHA:$CUT_REF"
-PR_URL=$(app_gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CUT_BRANCH" \
+git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"
+PR_URL=$(release_gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CUT_BRANCH" \
   --title "release: cut $TAG" \
-  --body "Automated deterministic release cut for $TAG. The flux-release-promoter will wait for the exact head's required ci aggregate before merging.")
+  --body "Automated deterministic release cut for $TAG. The host controller will wait for the exact head's required ci aggregate before merging.")
 PR_NUMBER=${PR_URL##*/}
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || fail "could not resolve release PR number from $PR_URL"
-[ "$(app_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)" = "$CUT_SHA" ] || fail "release PR head differs from cut SHA"
+[ "$(release_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)" = "$CUT_SHA" ] || fail "release PR head differs from cut SHA"
 wait_for_ci || fail "required ci aggregate did not succeed for exact PR head $CUT_SHA"
 
-app_gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge --delete-branch=false
+release_gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge --delete-branch=false
 for ((attempt=1; attempt<=POLL_ATTEMPTS; attempt++)); do
-  pr=$(app_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,headRefOid,mergeCommit) || fail "could not read merged release PR"
+  pr=$(release_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,headRefOid,mergeCommit) || fail "could not read merged release PR"
   [ "$(jq -r .state <<<"$pr")" != MERGED ] || break
   [ "$attempt" -eq "$POLL_ATTEMPTS" ] || sleep "$POLL_INTERVAL_SECONDS"
 done
@@ -152,13 +158,13 @@ done
 MERGED_SHA=$(jq -r '.mergeCommit.oid' <<<"$pr")
 [[ "$MERGED_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "GitHub returned no full merge SHA"
 [ "$MERGED_SHA" != "$CUT_SHA" ] && [ "$MERGED_SHA" != "$SOURCE_SHA" ] || fail "merge result is not a new canonical commit"
-[ "$(app_gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$MERGED_SHA" ] || fail "merged SHA is not canonical main"
+[ "$(release_gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$MERGED_SHA" ] || fail "merged SHA is not canonical main"
 git fetch --no-tags origin "$MERGED_SHA"
 [ "$(git rev-parse "$CUT_SHA^{tree}")" = "$(git rev-parse "$MERGED_SHA^{tree}")" ] || fail "merged main does not contain the exact cut diff"
 
 merged_sha_for_resume=$MERGED_SHA
 echo "Staging merged canonical-main SHA $MERGED_SHA at $CANDIDATE_REF"
-git_with_promoter push "$PUSH_URL" "$MERGED_SHA:$CANDIDATE_REF"
+git_with_release_token push "$PUSH_URL" "$MERGED_SHA:$CANDIDATE_REF"
 candidate_staged=1
 # C-355: the candidate ref IS the promotion source, so read it back rather than assuming the push
 # landed what we asked for. Everything downstream is bound to this SHA.
@@ -188,10 +194,21 @@ rm -f "$receipt_dir/release-candidate.txt"; rmdir "$receipt_dir"
 
 RELEASE_BASELINE=$(latest_run_id release.yml)
 CRATES_BASELINE=$(latest_run_id crates-io.yml)
-tag_object=$(app_gh api -X POST "repos/$GITHUB_REPOSITORY/git/tags" \
-  -f tag="$TAG" -f message="Flux $VERSION" -f object="$MERGED_SHA" -f type=commit --jq .sha)
-[[ "$tag_object" =~ ^[0-9a-f]{40}$ ]] || fail "GitHub did not create an annotated tag object"
-app_gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$TAG_REF" -f sha="$tag_object" >/dev/null
+tag_object=$(
+  {
+    printf 'object %s\n' "$MERGED_SHA"
+    printf 'type commit\n'
+    printf 'tag %s\n' "$TAG"
+    printf 'tagger flux release flow <release@codewandler.invalid> %s +0000\n\n' "$(date +%s)"
+    printf 'Flux %s\n' "$VERSION"
+  } | git mktag
+) || fail "could not create the annotated tag object"
+[[ "$tag_object" =~ ^[0-9a-f]{40}$ ]] || fail "git did not create an annotated tag object"
+# A PAT-authenticated git push creates the tag event. GITHUB_TOKEN ref creation would suppress both
+# tag-triggered workflows, and an API-only ref write would not prove this exact push path.
+git_with_release_token push "$PUSH_URL" "$tag_object:$TAG_REF"
+[ "$(remote_sha "$TAG_REF")" = "$tag_object" ] || fail "$TAG_REF does not point at the new tag object"
+[ "$(remote_sha "$TAG_REF^{}")" = "$MERGED_SHA" ] || fail "$TAG_REF does not peel to merged main"
 
 RELEASE_RUN=$(wait_for_exact_run release.yml "$RELEASE_BASELINE") || fail "no unique new exact release.yml tag run"
 CRATES_RUN=$(wait_for_exact_run crates-io.yml "$CRATES_BASELINE") || fail "no unique new exact crates-io.yml tag run"
@@ -204,7 +221,7 @@ done
 
 EXPECTED_RELEASE_SHA=$MERGED_SHA scripts/verify-github-release.sh --repo "$GITHUB_REPOSITORY" "$TAG"
 scripts/check-release-tags.sh --repo "$GITHUB_REPOSITORY"
-git_with_promoter push --force-with-lease="$CANDIDATE_REF:$MERGED_SHA" "$PUSH_URL" ":$CANDIDATE_REF"
+git_with_release_token push --force-with-lease="$CANDIDATE_REF:$MERGED_SHA" "$PUSH_URL" ":$CANDIDATE_REF"
 candidate_staged=0
-git_with_promoter push --force-with-lease="$CUT_REF:$CUT_SHA" "$PUSH_URL" ":$CUT_REF"
+git_with_release_token push --force-with-lease="$CUT_REF:$CUT_SHA" "$PUSH_URL" ":$CUT_REF"
 echo "Release $TAG promoted from merged main $MERGED_SHA and passed public/latest audit"

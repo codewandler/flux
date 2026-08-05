@@ -2,7 +2,7 @@
 #
 # A push to the dedicated `release` branch is the deliberate release action. The Flux program cuts
 # locally in a credential-free job; a separate narrow controller merges that exact cut into
-# protected `main` through a normal pull request, stages the merged SHA as a candidate, and creates
+# canonical `main` through a normal pull request, stages the merged SHA as a candidate, and creates
 # the annotated tag. Manual dispatch remains dry by default and never promotes, even when
 # `apply: true` is selected.
 #
@@ -13,16 +13,12 @@
 #     selected provider key at STEP scope and NOTHING else: no environment, no GitHub write
 #     permission, no promotion key, no publication credential. It cannot move a ref if it tries.
 #     Its product is a git bundle — the cut commit and its annotated tag as bytes.
-#   * `release-control` is the only job with promotion authority. It runs in the `release-control`
-#     environment, passes `PROMOTION_APP_PRIVATE_KEY` to exactly one token-mint step (with the
-#     non-secret `PROMOTION_APP_ID` repository variable), and hands the resulting short-lived
-#     `flux-release-promoter` installation token to exactly one step: the promotion helper. That
-#     token pushes the cut branch, opens the normal PR to `main`, merges it after the exact head's
-#     required `ci`, creates the candidate ref, dispatches its workflow and creates the final tag.
-#     It never pushes to `main` directly and never force-pushes it.
-#   * `RELEASE_TOKEN` does not appear in this workflow. It is a GitHub Release credential held by
-#     the tag-only `release` environment in release.yml and release-plugins.yml, and it is not a
-#     promotion identity.
+#   * `release-control` is the only job with promotion authority. Exactly one step receives the
+#     existing repository `RELEASE_TOKEN`; that host helper pushes the cut branch, opens the normal
+#     PR to `main`, merges it after the exact head's required `ci`, creates the candidate ref and the
+#     final annotated tag, and performs cleanup. It never pushes to `main` directly or force-pushes
+#     a tag. The ambient `GITHUB_TOKEN` has `contents: read` and is used only to dispatch and observe
+#     the exact candidate/tag workflow runs.
 #   * The Flux program cannot reach source. `examples/release.flux` calls no `bash`, no `proc.run`,
 #     no `write`/`edit`; its only writing op addresses exactly the three release changelogs and its
 #     only process-capable ops have fixed argv for `scripts/check-crate-versions.sh` and
@@ -250,17 +246,16 @@ jobs:
           echo "::error::${{ steps.creds.outputs.credential_name || 'The selected provider credential' }} is required for an automatic release. Smoke and flow were skipped; no commit or tag was pushed."
           exit 1
 
-  # The irreversible half, and the only job in this repository that may act as `flux-release-promoter`.
+  # The irreversible half, and the only core-release job that receives the repository PAT.
   # It runs no model, builds nothing, signs nothing and publishes nothing.
   release-control:
     name: "release-control · merge the cut and promote"
     needs: cut
     if: ${{ github.event_name == 'push' && needs.cut.outputs.promote == 'true' }}
     runs-on: ubuntu-latest
-    environment: release-control
     permissions:
       # Repository contents stay read-only for the ambient GITHUB_TOKEN: every ref this job moves is
-      # moved by the App installation token, which GitHub also lets trigger the tag workflows.
+      # moved by the step-scoped RELEASE_TOKEN, whose tag push triggers the tag workflows.
       contents: read
       # Dispatching and watching the exact candidate run is the one thing the ambient token does.
       actions: write
@@ -276,24 +271,14 @@ jobs:
           name: release-cut-bundle
           path: ${{ runner.temp }}/cut
 
-      # The only step in this repository that may read the promotion App's private key. It exchanges
-      # the key for a short-lived, repository-scoped installation token, masks it, and exposes it as
-      # a step output — never as a job env, a job output, an artifact or a reusable secret.
-      - name: Mint the flux-release-promoter installation token
-        id: promoter
-        env:
-          PROMOTION_APP_ID: ${{ vars.PROMOTION_APP_ID }}
-          PROMOTION_APP_PRIVATE_KEY: ${{ secrets.PROMOTION_APP_PRIVATE_KEY }}
-        run: scripts/mint-promotion-token.sh
-
       # The helper stages the exact cut commit on release-cuts/vX.Y.Z, opens the normal PR to main,
       # waits for that exact head's required `ci`, merges it, and takes the candidate and eventual
-      # tag SHA only from the resulting canonical main commit. It refuses to run if RELEASE_TOKEN is
-      # present, and revokes the installation token when it exits.
+      # tag SHA only from the resulting canonical main commit. The PAT is step-scoped; missing or
+      # unusable authority fails before the first remote mutation.
       - name: Promote the merged cut to a public release
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-          PROMOTION_TOKEN: ${{ steps.promoter.outputs.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           RELEASE_CUT_BUNDLE: ${{ runner.temp }}/cut/release-cut.bundle
         run: scripts/promote-release-flow.sh

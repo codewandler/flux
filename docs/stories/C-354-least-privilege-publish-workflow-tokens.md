@@ -11,6 +11,11 @@ note: "historical C-354 boundary implemented; App/environment clauses superseded
 
 # Scope promotion and publication tokens to the jobs that consume them
 
+> **Active placement is superseded by C-559.** The checked Acceptance below records C-354's
+> historical App/Environment implementation. The invariant that remains active is job/step
+> isolation: the existing repository `RELEASE_TOKEN` now appears only in core promotion, plugin tag
+> control and GitHub Release steps, with no App or GitHub Environment dependency.
+
 ## Goal
 
 Make every release authority explicit and non-composable: model/build jobs cannot see a write token;
@@ -87,6 +92,12 @@ Cargo publication use distinct tag-triggered jobs inside `release`.
 
 ## Progress
 
+- 2026-08-05 — C-559 implemented the supersession. `release-flow.yml` passes `RELEASE_TOKEN` only
+  to `scripts/promote-release-flow.sh`; `release-plugins.yml` passes it only to tag control and
+  GitHub Release creation; all other publication credentials remain on their consuming steps.
+  App-token mint/revoke code and every release-workflow Environment key are gone. Parsed fixtures
+  now reject token exposure to model/build work, `GITHUB_TOKEN` tag creation, missing PAT tag
+  triggering, combined publication authority and restored App/Environment settings.
 - 2026-08-05 — C-559 supersedes the checked App-token and GitHub Environment placement clauses at
   the user's direction. They remain below as the historical C-354 implementation record. The active
   contract keeps the same job/step isolation but uses the existing repository `RELEASE_TOKEN` only

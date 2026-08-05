@@ -6,7 +6,7 @@
 # release pipeline is a statement about the workflow/job/step graph, not about which strings appear
 # in a file. This check therefore PARSES the four release workflows (aliases resolved) and reasons
 # over the parsed structure: workflow/job/step nesting, `on`, `if` expressions, inherited
-# permissions, `environment`, `needs`, `uses`, action inputs and `env`.
+# permissions, `needs`, `uses`, action inputs and `env`.
 #
 # It is deliberately not a grep. A grep cannot tell a `MINISIGN_SECRET_KEY` in a signing step from
 # the same text hoisted into a job `env` where six unrelated steps can read it, and it cannot tell a
@@ -17,14 +17,13 @@
 #
 #   * Every release workflow declares workflow-level `contents: read` and grants no other write.
 #     Any additional write permission is declared on the one job that consumes it.
-#   * Each long-lived secret is bound to exactly one (workflow, job, step) in AUTHORIZED below.
-#     Anywhere else — workflow `env`, job `env`, a second step, a `run` interpolation — is a
-#     violation, including in a step that would "obviously" be fine.
-#   * Control authority (the `flux-release-promoter` App key) lives only in `release-control`
-#     jobs; publication authority (`RELEASE_TOKEN`, `MINISIGN_SECRET_KEY`,
-#     `CARGO_REGISTRY_TOKEN`) only in tag-triggered `release` jobs. No job holds two of them, and
-#     no job holds one of them together with a model credential or a GitHub write permission it
-#     does not consume.
+#   * Each long-lived secret is bound to the explicit (workflow, job, step) consumers in AUTHORIZED
+#     below. Anywhere else — workflow `env`, job `env`, another step, or a `run` interpolation — is
+#     a violation, including in a step that would "obviously" be fine.
+#   * `RELEASE_TOKEN` may appear only in the isolated core promotion, plugin tag-control and GitHub
+#     Release steps. Signing and Cargo publication keep their own secrets. No job holds two release
+#     authorities, and no job holds one beside a model credential or unrelated GitHub write scope.
+#   * No release workflow may depend on a GitHub App variable/key, token mint, or Environment.
 #   * Publication jobs are reachable only from an exact version tag: their `if` must carry the
 #     tag-derived conjunct, and the value it reads must not be derivable from a dispatch input.
 #
@@ -58,14 +57,14 @@ def note(list, message) = list << message
 
 RELEASE_WORKFLOWS = %w[release.yml release-flow.yml release-plugins.yml crates-io.yml].freeze
 MODEL_SECRETS = %w[ANTHROPIC_API_KEY OPENROUTER_API_KEY].freeze
-CONTROL_SECRETS = %w[PROMOTION_APP_PRIVATE_KEY].freeze
 PUBLICATION_SECRETS = %w[RELEASE_TOKEN MINISIGN_SECRET_KEY CARGO_REGISTRY_TOKEN].freeze
-LONG_LIVED = (MODEL_SECRETS + CONTROL_SECRETS + PUBLICATION_SECRETS).freeze
+LONG_LIVED = (MODEL_SECRETS + PUBLICATION_SECRETS).freeze
+REMOVED_SETTINGS = %w[PROMOTION_APP_ID PROMOTION_APP_PRIVATE_KEY mint-promotion-token.sh].freeze
 # GITHUB_TOKEN is minted per job and bounded by that job's `permissions:` block, which this check
 # already constrains. It is not a long-lived credential and is not part of the placement table.
 AMBIENT = %w[GITHUB_TOKEN].freeze
 
-# The single authorized consumer of every long-lived credential: workflow -> job -> step name.
+# Every authorized consumer of a long-lived credential: workflow -> job -> step name.
 AUTHORIZED = {
   'release-flow.yml' => {
     'cut' => {
@@ -74,7 +73,7 @@ AUTHORIZED = {
       'Run examples/release.flux' => MODEL_SECRETS,
     },
     'release-control' => {
-      'Mint the flux-release-promoter installation token' => CONTROL_SECRETS,
+      'Promote the merged cut to a public release' => %w[RELEASE_TOKEN],
     },
   },
   'release.yml' => {
@@ -84,7 +83,7 @@ AUTHORIZED = {
   },
   'release-plugins.yml' => {
     'release-control' => {
-      'Mint the flux-release-promoter installation token' => CONTROL_SECRETS,
+      'Create the absent plugin tag at canonical main' => %w[RELEASE_TOKEN],
     },
     'sign' => {
       'Sign the index (minisign)' => %w[MINISIGN_SECRET_KEY],
@@ -103,8 +102,8 @@ AUTHORIZED = {
   },
 }.freeze
 
-# A GitHub Release credential publishes a Release. It never moves a ref, dispatches a run, or mints
-# another credential — so the step that holds it may not contain the verbs that would.
+# A GitHub Release step publishes a Release. It never moves a ref, dispatches a run, or mints
+# another credential — so those two consumers may not contain the verbs that would.
 FORBIDDEN_IN_RELEASE_TOKEN_STEP = {
   'a ref push' => /git\s+push|git\s+update-ref/,
   'a ref API write' => %r{/git/refs|/git/tags|git/ref/},
@@ -221,7 +220,7 @@ end
 documents.each do |name, doc|
   next if RELEASE_WORKFLOWS.include?(name)
 
-  escaped = secret_names(doc) & (PUBLICATION_SECRETS + CONTROL_SECRETS)
+  escaped = secret_names(doc) & (PUBLICATION_SECRETS + %w[PROMOTION_APP_PRIVATE_KEY])
   unless escaped.empty?
     note(violations,
          "#{name}: an undeclared workflow references release authority #{escaped.join(', ')}; " \
@@ -237,6 +236,11 @@ documents.each do |name, doc|
   next unless doc.is_a?(Hash)
 
   authorized_jobs = AUTHORIZED.fetch(name, {})
+
+  rendered = doc.to_s
+  REMOVED_SETTINGS.each do |setting|
+    note(violations, "#{name}: removed release setting `#{setting}` was reintroduced") if rendered.include?(setting)
+  end
 
   # --- 2. Workflow-level authority is read-only, and holds no credential. ---
   workflow_permissions = doc['permissions']
@@ -266,14 +270,19 @@ documents.each do |name, doc|
     environment = environment['name'] if environment.is_a?(Hash)
     steps = job['steps'] || []
 
+    if environment
+      note(violations,
+           "#{name}: job `#{job_name}` depends on removed GitHub Environment `#{environment}`")
+    end
+
     # --- 3. Job-level env never holds a long-lived credential. ---
     leaked = secret_names(job['env']) & LONG_LIVED
     unless leaked.empty?
       note(violations,
            "#{name}: job `#{job_name}` env exposes #{leaked.join(', ')} to every step in the job")
     end
-    # An App installation token is a credential the moment it is minted; a job env or job output
-    # spreads it exactly as a repository secret would.
+    # A derived token is a credential the moment it is minted; a job env or job output spreads it
+    # exactly as a repository secret would.
     if secret_names(job['outputs']).any? || job['outputs'].to_s.include?('outputs.token')
       note(violations, "#{name}: job `#{job_name}` publishes a credential as a job output")
     end
@@ -306,11 +315,24 @@ documents.each do |name, doc|
 
       note(violations,
            "#{name}: job `#{job_name}` step `#{label}` references #{stray.join(', ')} outside its " \
-           'single authorized step')
+           'authorized step')
+    end
+
+    authorized_jobs.fetch(job_name, {}).each do |label, expected|
+      step = steps.find { |candidate| candidate.is_a?(Hash) && candidate['name'] == label }
+      unless step
+        note(violations, "#{name}: job `#{job_name}` is missing authorized step `#{label}`")
+        next
+      end
+      scoped = (secret_names(step['env']) + secret_names(step['with'])).uniq & LONG_LIVED
+      missing = expected - scoped
+      unless missing.empty?
+        note(violations,
+             "#{name}: job `#{job_name}` step `#{label}` is missing #{missing.join(', ')}")
+      end
     end
 
     used.uniq!
-    control = used & CONTROL_SECRETS
     publication = used & PUBLICATION_SECRETS
     model = used & MODEL_SECRETS
 
@@ -320,47 +342,20 @@ documents.each do |name, doc|
            "#{name}: job `#{job_name}` combines publication authority #{publication.join(' + ')}; " \
            'signing, GitHub Release and Cargo publication are distinct jobs')
     end
-    unless control.empty? || publication.empty?
-      note(violations,
-           "#{name}: job `#{job_name}` holds both promotion authority and publication authority")
-    end
     unless model.empty?
-      unless (control + publication).empty?
+      unless publication.empty?
         note(violations,
              "#{name}: job `#{job_name}` runs a model credential beside release authority " \
-             "#{(control + publication).join(', ')}")
+             "#{publication.join(', ')}")
       end
       unless job_writes.empty?
         note(violations,
              "#{name}: job `#{job_name}` runs a model credential with GitHub write permission " \
              "#{job_writes.join(', ')}")
       end
-      if environment
-        note(violations,
-             "#{name}: job `#{job_name}` runs a model credential inside protected environment `#{environment}`")
-      end
     end
 
-    # --- 5. Each authority names the environment that gates it. ---
-    unless control.empty?
-      unless environment == 'release-control'
-        note(violations,
-             "#{name}: job `#{job_name}` mints the promotion App token outside the `release-control` " \
-             "environment (found #{environment.inspect})")
-      end
-    end
-    unless publication.empty?
-      unless environment == 'release'
-        note(violations,
-             "#{name}: job `#{job_name}` publishes with #{publication.join(', ')} outside the " \
-             "`release` environment (found #{environment.inspect})")
-      end
-    end
-    if environment == 'release-control' && !publication.empty?
-      note(violations, "#{name}: job `#{job_name}` mixes `release-control` with publication authority")
-    end
-
-    # --- 6. The GitHub Release credential publishes, and does nothing else. ---
+    # --- 5. Each RELEASE_TOKEN consumer is bound to its one host-owned purpose. ---
     next unless publication.include?('RELEASE_TOKEN')
 
     steps.each_with_index do |step, index|
@@ -370,6 +365,20 @@ documents.each do |name, doc|
       next unless (secret_names(step['env']) + secret_names(step['with'])).include?('RELEASE_TOKEN')
 
       body = [step['run'], step['with']].map(&:to_s).join("\n")
+      purpose = [name, job_name, label]
+      if purpose == ['release-flow.yml', 'release-control', 'Promote the merged cut to a public release']
+        unless body.strip == 'scripts/promote-release-flow.sh'
+          note(violations, "#{name}: core promotion PAT step must run only scripts/promote-release-flow.sh")
+        end
+        next
+      end
+      if purpose == ['release-plugins.yml', 'release-control', 'Create the absent plugin tag at canonical main']
+        unless body.strip == 'scripts/plugin-tag-control.sh'
+          note(violations, "#{name}: plugin tag PAT step must run only scripts/plugin-tag-control.sh")
+        end
+        next
+      end
+
       FORBIDDEN_IN_RELEASE_TOKEN_STEP.each do |what, pattern|
         next if pattern.source.empty?
         next unless body.match?(pattern)
@@ -382,7 +391,7 @@ documents.each do |name, doc|
   end
 end
 
-# --- 7. Trigger and reachability policy, per workflow. ---
+# --- 6. Trigger and reachability policy, per workflow. ---
 def require_conjunct(violations, name, job_name, job, needle)
   return if conjuncts(job).include?(normalize_expression(needle))
 
@@ -424,11 +433,6 @@ if release.is_a?(Hash)
       violations << 'release.yml: job `attest` must hold exactly `id-token: write` and ' \
                     "`attestations: write` (found #{granted.inspect})"
     end
-    environment = attest['environment']
-    environment = environment['name'] if environment.is_a?(Hash)
-    unless environment == 'release'
-      violations << 'release.yml: job `attest` must run in the tag-only `release` environment'
-    end
     require_conjunct(violations, 'release.yml', 'attest', attest, "needs.plan.outputs.publishing == 'true'")
   else
     violations << 'release.yml: attestation must be a separate tag-triggered job named `attest`'
@@ -436,11 +440,6 @@ if release.is_a?(Hash)
 
   publish = jobs['publish-github-release']
   if publish.is_a?(Hash)
-    environment = publish['environment']
-    environment = environment['name'] if environment.is_a?(Hash)
-    unless environment == 'release'
-      violations << 'release.yml: job `publish-github-release` must run in the `release` environment'
-    end
     require_conjunct(violations, 'release.yml', 'publish-github-release', publish,
                      "needs.plan.outputs.publishing == 'true'")
     unless Array(publish['needs']).include?('attest')
@@ -453,18 +452,9 @@ end
 
 flow = documents['release-flow.yml']
 if flow.is_a?(Hash)
-  if secret_names(flow).include?('RELEASE_TOKEN')
-    violations << 'release-flow.yml: RELEASE_TOKEN is a publication credential and must not appear ' \
-                  'in the promotion workflow at all'
-  end
   jobs = flow['jobs'] || {}
   control = jobs['release-control']
   if control.is_a?(Hash)
-    environment = control['environment']
-    environment = environment['name'] if environment.is_a?(Hash)
-    unless environment == 'release-control'
-      violations << 'release-flow.yml: job `release-control` must run in the `release-control` environment'
-    end
     require_conjunct(violations, 'release-flow.yml', 'release-control', control,
                      "github.event_name == 'push'")
   else
@@ -499,7 +489,7 @@ if plugins.is_a?(Hash)
       violations << 'release-plugins.yml: the controller must observe exactly the required `ci` workflow'
     end
     unless Array(run_trigger['branches']) == ['main']
-      violations << 'release-plugins.yml: the controller must observe only protected `main`'
+      violations << 'release-plugins.yml: the controller must observe only canonical `main`'
     end
   else
     violations << 'release-plugins.yml: automatic plugin tag creation must come from a `workflow_run` of `ci`'
@@ -508,11 +498,6 @@ if plugins.is_a?(Hash)
   jobs = plugins['jobs'] || {}
   control = jobs['release-control']
   if control.is_a?(Hash)
-    environment = control['environment']
-    environment = environment['name'] if environment.is_a?(Hash)
-    unless environment == 'release-control'
-      violations << 'release-plugins.yml: job `release-control` must run in the `release-control` environment'
-    end
     [
       "github.event_name == 'workflow_run'",
       "github.event.workflow_run.name == 'ci'",
@@ -561,11 +546,6 @@ if crates.is_a?(Hash)
   jobs = crates['jobs'] || {}
   publish = jobs['publish']
   if publish.is_a?(Hash)
-    environment = publish['environment']
-    environment = environment['name'] if environment.is_a?(Hash)
-    unless environment == 'release'
-      violations << 'crates-io.yml: job `publish` must run in the `release` environment'
-    end
     unless Array(publish['needs']).include?('validate')
       violations << 'crates-io.yml: publication must follow the secret-free validation job'
     end
@@ -574,9 +554,6 @@ if crates.is_a?(Hash)
   end
   validate = jobs['validate']
   if validate.is_a?(Hash)
-    if validate['environment']
-      violations << 'crates-io.yml: job `validate` must stay outside the publication environment'
-    end
     leaked = secret_names(validate) & LONG_LIVED
     unless leaked.empty?
       violations << "crates-io.yml: job `validate` reads #{leaked.join(', ')}; validation is secret-free"
@@ -587,7 +564,7 @@ if crates.is_a?(Hash)
 end
 
 if violations.empty?
-  puts "PASS release authority: #{RELEASE_WORKFLOWS.length} workflows, every credential bound to one step"
+  puts "PASS release authority: #{RELEASE_WORKFLOWS.length} workflows, every credential occurrence bound to an explicit step"
   exit 0
 end
 
@@ -639,28 +616,41 @@ when 'model-and-write-token'
   doc = load(dest, 'release-flow.yml')
   doc['jobs']['cut']['permissions'] = { 'contents' => 'write' }
   store(dest, 'release-flow.yml', doc)
-when 'mixed-control-and-release'
+when 'reintroduced-environment'
   doc = load(dest, 'release-flow.yml')
-  doc['jobs']['release-control']['environment'] = 'release'
+  doc['jobs']['release-control']['environment'] = 'release-control'
   store(dest, 'release-flow.yml', doc)
-when 'release-token-promotion'
+when 'release-token-in-model-step'
   doc = load(dest, 'release-flow.yml')
-  promote = step(doc, 'release-control', 'Promote the merged cut to a public release')
-  (promote['env'] ||= {})['RELEASE_TOKEN'] = '${{ secrets.RELEASE_TOKEN }}'
+  flow = step(doc, 'cut', 'Run examples/release.flux')
+  (flow['env'] ||= {})['RELEASE_TOKEN'] = '${{ secrets.RELEASE_TOKEN }}'
   store(dest, 'release-flow.yml', doc)
 when 'app-token-publication'
   doc = load(dest, 'release.yml')
   create = step(doc, 'publish-github-release', 'Create GitHub Release')
   create['env']['PROMOTION_APP_PRIVATE_KEY'] = '${{ secrets.PROMOTION_APP_PRIVATE_KEY }}'
   store(dest, 'release.yml', doc)
-when 'missing-environment'
-  doc = load(dest, 'crates-io.yml')
-  doc['jobs']['publish'].delete('environment')
-  store(dest, 'crates-io.yml', doc)
+when 'reintroduced-app-variable'
+  doc = load(dest, 'release-plugins.yml')
+  control = step(doc, 'release-control', 'Create the absent plugin tag at canonical main')
+  control['env']['PROMOTION_APP_ID'] = '${{ vars.PROMOTION_APP_ID }}'
+  store(dest, 'release-plugins.yml', doc)
+when 'missing-plugin-pat'
+  doc = load(dest, 'release-plugins.yml')
+  control = step(doc, 'release-control', 'Create the absent plugin tag at canonical main')
+  control['env'].delete('RELEASE_TOKEN')
+  store(dest, 'release-plugins.yml', doc)
+when 'github-token-plugin-tag'
+  doc = load(dest, 'release-plugins.yml')
+  control = step(doc, 'release-control', 'Create the absent plugin tag at canonical main')
+  control['env'].delete('RELEASE_TOKEN')
+  control['run'] = 'git push origin HEAD:refs/tags/plugins-v1.2.3'
+  store(dest, 'release-plugins.yml', doc)
 when 'combined-authority'
   doc = load(dest, 'release-plugins.yml')
   publish = step(doc, 'publish-host-kit', 'Publish codewandler-flux-host-kit to crates.io')
   publish['env']['MINISIGN_SECRET_KEY'] = '${{ secrets.MINISIGN_SECRET_KEY }}'
+  publish['env']['RELEASE_TOKEN'] = '${{ secrets.RELEASE_TOKEN }}'
   store(dest, 'release-plugins.yml', doc)
 when 'secret-outside-authorized-step'
   doc = load(dest, 'release.yml')
@@ -749,17 +739,19 @@ if [ "$MODE" = "self-test" ]; then
     exit 1
   }
 
-  # One fixture per violation class named by C-354's Acceptance. Each is a structural edit to the
+  # One fixture per violation class named by C-354/C-559 Acceptance. Each is a structural edit to the
   # parsed workflow — the same edit a well-meaning refactor makes by hand.
   fixtures="
 workflow-secret-scope
 job-secret-scope
 inherited-write-permission
 model-and-write-token
-mixed-control-and-release
-release-token-promotion
+reintroduced-environment
+release-token-in-model-step
 app-token-publication
-missing-environment
+reintroduced-app-variable
+missing-plugin-pat
+github-token-plugin-tag
 combined-authority
 secret-outside-authorized-step
 release-token-moves-a-ref

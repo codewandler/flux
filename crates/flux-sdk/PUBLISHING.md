@@ -152,14 +152,14 @@ skipped, so a failed run is re-runnable).
 
 ### Normal path: merge `main` into `release`
 
-The deliberate release action is merging a pull request from `main` into the protected `release`
-branch. Direct pushes to `release` are not the normal path; branch protection should require the PR
-and its checks. Open the release PR with:
+The deliberate release action is merging a pull request from `main` into the `release` branch.
+Direct pushes to `release` are not the normal path. No branch protection, ruleset, GitHub App or
+GitHub Environment is required or claimed by this release path. Open the release PR with:
 
 ```sh
 gh pr create --base release --head main \
   --title "release: promote main" \
-  --body "Merge main into the protected release trigger branch."
+  --body "Merge main into the release trigger branch."
 ```
 
 Merging that PR is the whole release action; its resulting push to `release` starts the workflow.
@@ -174,8 +174,9 @@ posture for CI. That job holds no GitHub write token at all (C-354): it hands th
 controller as a git bundle (`scripts/bundle-release-cut.sh`) carrying exactly the cut commit and its
 annotated tag, with the trigger commit as the bundle's prerequisite.
 
-The separate `release-control` job is the only one with promotion authority. It mints a short-lived
-`flux-release-promoter` installation token (`scripts/mint-promotion-token.sh`) and then:
+The separate `release-control` job is the only one with core promotion authority. Its single host
+step receives the existing repository `RELEASE_TOKEN`, verifies that the PAT is usable before the
+first remote mutation, and then:
 
 1. imports and verifies the cut bundle, and re-derives every identity from the imported objects;
 2. pushes the cut to `refs/heads/release-cuts/vX.Y.Z`, opens the normal pull request to `main`, waits
@@ -187,7 +188,7 @@ The separate `release-control` job is the only one with promotion authority. It 
    cargo-dist targets;
 5. verifies the candidate's version/SHA/run receipt, including the
    `mandatory-full-v1` gate marker and gated commit SHA;
-6. creates the annotated tag at that merged SHA through the App API; and
+6. creates and pushes the annotated tag at that merged SHA with the PAT, so both tag workflows run; and
 7. waits for both tag workflows, verifies the public GitHub Release, runs the fleet/latest audit, and
    only then deletes the candidate ref.
 
@@ -239,7 +240,7 @@ If any full-gate command fails, the candidate run creates no receipt. The promot
 waiting with `--exit-status`, so it retains the candidate ref for diagnosis and leaves both `main`
 and the tag untouched.
 
-Three Actions secrets are required for the default path, with one optional provider override:
+Four Actions secrets are required for the default path, with one optional provider override:
 
 - **`ANTHROPIC_API_KEY`** — used only by the default direct-Haiku `FLUX_SMOKE_MODEL` live smoke and
   release-scribe turn. A manual preview without the selected provider key skips, but a push to
@@ -248,45 +249,42 @@ Three Actions secrets are required for the default path, with one optional provi
 - **`OPENROUTER_API_KEY`** *(optional)* — selected only when a manual dispatch explicitly overrides
   the model with an `openrouter/*` model. The workflow passes provider credentials only to the
   credential probe, live smoke, and Flux flow steps.
-- **`PROMOTION_APP_PRIVATE_KEY`** — the `flux-release-promoter` GitHub App's private key, held by the
-  **`release-control`** environment. It is read by exactly one step
-  (`scripts/mint-promotion-token.sh`) of exactly one job, together with the non-secret
-  `PROMOTION_APP_ID` repository variable. The resulting installation token is short-lived,
-  repository-scoped, revoked when promotion exits, and is the identity the tag-creation ruleset
-  bypasses. It is the only credential that may move a ref.
-- **`RELEASE_TOKEN`** — a fine-grained GitHub PAT scoped to this repository with **Contents: write**,
-  held by the tag-only **`release`** environment. It creates or refreshes a GitHub Release and does
-  nothing else: it is absent from `release-flow.yml`, and it never moves `main`, a candidate ref or a
-  tag, dispatches a workflow, or mints another credential. A separately authenticated credential is
-  required for refs because pushes made with `GITHUB_TOKEN` do not start the tag-triggered workflows.
-- **`MINISIGN_SECRET_KEY`** — the plugin pack signing key, held by the **`release`** environment and
-  named only in the minisign step of `release-plugins.yml`'s `sign` job.
+- **`RELEASE_TOKEN`** — the existing fine-grained GitHub PAT scoped to this repository with Contents
+  and Pull requests write authority. It is named only on four host-owned steps: core promotion,
+  plugin tag control, core GitHub Release creation and plugin GitHub Release creation. The promotion
+  helper uses it for the cut ref, pull request and merge, merged-main candidate, annotated-tag push
+  and exact cleanup; plugin tag control uses it for the one absent exact plugin tag. It never enters
+  model, build, signing or Cargo publication work. The ambient `GITHUB_TOKEN` dispatches/observes
+  Actions only and never creates a tag, because its ref events would not start tag workflows.
+- **`MINISIGN_SECRET_KEY`** — the plugin pack signing key, named only in the minisign step of
+  `release-plugins.yml`'s `sign` job.
 - **`CARGO_REGISTRY_TOKEN`** — a crates.io API token from an account that can publish the
-  `codewandler-flux-*` names, held by the **`release`** environment. It may be a selected
-  organization Actions secret. It appears only in the `scripts/publish-crates-io.sh` step of
+  `codewandler-flux-*` names. It may be a selected organization Actions secret. It appears only in
+  the `scripts/publish-crates-io.sh` step of
   `crates-io.yml` and in the host-kit publish step of `release-plugins.yml`. Without it those steps
   fail before publishing.
 
 ### Release authority (C-354)
 
 GitHub permissions are job-scoped while secrets can be step-scoped, so the release pipeline is
-partitioned by job, and each long-lived credential is named in exactly one step:
+partitioned by job, and each long-lived credential occurrence is named on an explicit consuming step:
 
 | Authority | Where it lives | What it can do |
 | --- | --- | --- |
-| model / build / assembly | no environment, no write permission, no long-lived secret | compute and check artifacts |
-| promotion | `release-control`, `PROMOTION_APP_PRIVATE_KEY` → installation token | cut branch, PR, merge, candidate ref, candidate dispatch, one tag |
-| attestation | `release`, `id-token: write` + `attestations: write` | attest the already-checked asset set |
-| GitHub Release | `release`, `RELEASE_TOKEN` | create/upload one Release |
-| plugin signing | `release`, `MINISIGN_SECRET_KEY` | sign `plugins-index.json` |
-| crates.io | `release`, `CARGO_REGISTRY_TOKEN` | publish the closure / host-kit |
+| model / build / assembly | no GitHub write permission and no release secret | compute and check artifacts |
+| promotion | `release-control`, step-scoped `RELEASE_TOKEN` | cut branch, PR, merge, candidate ref, one tag and exact cleanup |
+| candidate dispatch / Actions observation | `release-control`, ambient `GITHUB_TOKEN` with `actions: write`, `contents: read` | dispatch and observe the exact runs; no repository mutation |
+| attestation | separate job, `id-token: write` + `attestations: write` | attest the already-checked asset set |
+| GitHub Release | separate job, step-scoped `RELEASE_TOKEN` | create/upload one Release |
+| plugin signing | separate job, step-scoped `MINISIGN_SECRET_KEY` | sign `plugins-index.json` |
+| crates.io | separate job, step-scoped `CARGO_REGISTRY_TOKEN` | publish the closure / host-kit |
 
 `scripts/check-release-authority.sh` parses all four release workflows and fails if any of these
 composes with another, escapes into a workflow/job `env`, or becomes reachable from a manual event.
 
 `workflow_dispatch` on `release-flow.yml` is deliberately **not** another publish button. Its
 default `apply: false` is a read-only preview; `apply: true` cuts only inside the ephemeral runner as
-a rehearsal. Neither manual mode produces a cut bundle, so neither can enter `release-control`.
+a rehearsal. Neither manual mode produces a cut bundle, so neither can enter the promotion job.
 
 `crates-io.yml` has no `workflow_dispatch` at all: publication happens on an exact `vX.Y.Z` tag push.
 Resuming a partial publish means re-running that same run, which keeps the event, ref and commit
@@ -295,7 +293,7 @@ identical; the script is idempotent and skips what is already live.
 `release-plugins.yml` publishes only on an exact `plugins-v<X.Y.Z>` tag push. That tag is created by
 its own `release-control` job from a green `ci` run whose head is still canonical `main`
 (`scripts/plugin-tag-control.sh`). Its retained `workflow_dispatch` builds and validates the pack and
-stops there — it has no `publish` input and can reach neither environment.
+stops there — it has no `publish` input and can reach no authority-bearing step.
 
 ### Manual build-once path
 
@@ -343,7 +341,7 @@ scripts/release-candidate.sh fetch "$receipt_dir/release-candidate.txt" \
 # Only the verified commit may now reach main — through a normal pull request, never a direct
 # push (C-353/C-354) — and only that merged canonical-main SHA may carry the public tag.
 gh pr create --base main --head "$candidate" --title "release: cut $tag"
-# ...merge it through branch protection, then tag the resulting canonical main commit:
+# ...merge it normally, then tag the resulting canonical main commit:
 git push origin "$tag"
 
 # Wait for release.yml and crates-io.yml to finish, then:
@@ -353,9 +351,8 @@ git push origin --delete "$candidate"
 
 The credential used for the candidate and tag pushes on this manual path is the operator's own
 maintainer credential, not `GITHUB_TOKEN` — a ref pushed with `GITHUB_TOKEN` does not start the
-tag-triggered workflows. It is **not** `RELEASE_TOKEN`: since C-354 that secret exists only inside
-the `release` environment, for the GitHub Release step, and is not a ref-moving identity. `main`
-still advances through a normal pull request, never a direct push.
+tag-triggered workflows. The automated path instead uses the Actions `RELEASE_TOKEN` for those
+host-owned mutations. `main` still advances through a normal pull request, never a direct push.
 
 If no successful, unexpired candidate exists at the tag's exact SHA, the binary workflow emits a
 prominent warning and performs the legacy full build. It never searches by version alone. A malformed

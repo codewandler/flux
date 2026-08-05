@@ -78,6 +78,13 @@
 
 ### Improved
 
+- **Releases no longer depend on repository settings that were never configured.** The release
+  pipeline uses the existing release credential only in its isolated host-controlled mutation and
+  GitHub Release steps. Model and build work still cannot see it, tags are pushed with the separate
+  credential so their workflows run, and missing or unusable authority now fails before promotion
+  changes repository state. No dedicated GitHub App, release Environment, ruleset or branch
+  protection setup is required or claimed.
+
 - **Remote execution now keeps compatible tools available instead of hiding their whole group.**
   Each tool declares whether it works on the selected execution system, belongs on the local control
   plane, or is native-only. Native-only tools stay hidden and are refused if called directly, while

@@ -85,6 +85,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The v0.56.0 release path now runs from the repository's existing Actions secrets without a
+  dedicated GitHub App, release Environments, rulesets or branch protection** (C-559; supersedes the
+  C-353 configuration proposal and the matching C-354/C-516 identity clauses). Model, smoke, scribe,
+  build, receipt and verification work remains mutation-credential-free. `RELEASE_TOKEN` is scoped
+  to the isolated core promotion, plugin tag-control and GitHub Release steps; it preflights before
+  mutation and performs PAT-authenticated tag pushes so both tag workflows run. The ambient
+  `GITHUB_TOKEN` is limited to exact candidate dispatch and Actions observation. Parsed adversarial
+  fixtures reject secret scope drift, model/build exposure, ambient-token tag creation, missing PAT
+  tag triggering, combined publication authority and any restored App/Environment dependency.
+
 - **Operation execution placement is now explicit per operation** (C-478). The runtime distinguishes
   local control-plane work, selected-execution-system effects, and native-system-only effects. Remote
   catalogs retain compatible members of mixed packs, hide native-only operations, and repeat the
@@ -96,18 +106,19 @@ All notable changes to this project are documented in this file. The format is b
   path applies it to every code row, including blank and list-nested rows, so terminal, ANSI, export,
   and monochrome rendering identify code blocks consistently without relying on color.
 
-- **Every release authority is now scoped to the single job and step that consumes it** (C-354). All
+- **Every release authority is now scoped to the explicit job and step that consumes it** (C-354,
+  as superseded by C-559). All
   four release workflows declare workflow-level `contents: read`; any other GitHub write permission
   is granted on the one job that needs it, and no workflow- or job-level `env` carries a provider
-  key, `PROMOTION_APP_PRIVATE_KEY`, an App installation token, `RELEASE_TOKEN`,
-  `MINISIGN_SECRET_KEY` or `CARGO_REGISTRY_TOKEN`. Pre-tag promotion uses only the dedicated App
-  inside `release-control`; signing, GitHub Release publication and Cargo publication are distinct
-  tag-triggered jobs inside `release`, so no job combines those authorities. Plugin and crates.io
+  key, `RELEASE_TOKEN`, `MINISIGN_SECRET_KEY` or `CARGO_REGISTRY_TOKEN`. Pre-tag promotion and
+  plugin tag control receive the existing `RELEASE_TOKEN` only on their host-owned steps; signing,
+  GitHub Release publication and Cargo publication remain distinct tag-triggered jobs, so no job
+  combines those authorities. Plugin and crates.io
   publication accept only an exact tag push — the retained plugin `workflow_dispatch` is
   structurally a build/validation path that cannot mint a token, create a tag, sign or publish, and
   `crates-io.yml` drops `workflow_dispatch` entirely. `scripts/check-release-authority.sh` enforces
-  this by parsing the workflow/job/step graph — permissions, `on`, `if`, `environment`, `needs`,
-  `uses`, action inputs and `env` — rather than by matching text, with 21 structural fixtures.
+  this by parsing the workflow/job/step graph — permissions, `on`, `if`, `needs`, `uses`, action
+  inputs and `env` — rather than by matching text, with 23 structural fixtures.
 
 - **The release-candidate receipt now binds the artifact bytes the publishing run must consume**
   (C-355). Receipt `flux-release-candidate-v3` records each of the seven expected `artifacts-*`

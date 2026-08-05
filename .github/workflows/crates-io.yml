@@ -9,12 +9,12 @@
 #     idempotent and skips what is already live), which keeps the event, the ref and the commit
 #     exactly as they were.
 #   * `validate` is secret-free: checkout, toolchain and the tag/workspace version agreement.
-#   * `publish` is a separate job in the tag-only `release` environment, and `CARGO_REGISTRY_TOKEN`
+#   * `publish` is a separate job, and `CARGO_REGISTRY_TOKEN`
 #     is named only in the `env:` of the single step that runs `scripts/publish-crates-io.sh`. It
 #     is not a workflow env, not a job env, and unreadable by the validation job.
 #
 # REQUIRED SECRET: `CARGO_REGISTRY_TOKEN` — a crates.io API token (https://crates.io/settings/tokens)
-# from an account that can publish the `codewandler-flux-*` names, held by the `release` environment.
+# from an account that can publish the `codewandler-flux-*` names, configured as an Actions secret.
 # Without it the publish step fails fast with a clear message and nothing is published.
 #
 # Idempotent: a crate@version already on crates.io is skipped. The publish order lives in
@@ -74,8 +74,7 @@ jobs:
     name: publish the closure to crates.io
     needs: validate
     runs-on: ubuntu-22.04
-    # Tag-only publication credentials live here, never in a workflow or job environment.
-    environment: release
+    # Tag-only publication credentials live on their consuming step, never in a workflow or job env.
     permissions:
       contents: read
     steps:
@@ -93,7 +92,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo '::error::CARGO_REGISTRY_TOKEN is not set on the release environment (a crates.io token that can publish the codewandler-flux-* crates).'
+            echo '::error::CARGO_REGISTRY_TOKEN is not configured as an Actions secret (a crates.io token that can publish the codewandler-flux-* crates).'
             exit 1
           fi
           bash scripts/publish-crates-io.sh

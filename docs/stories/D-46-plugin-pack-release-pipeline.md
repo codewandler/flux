@@ -85,13 +85,12 @@ without pulling the excluded `plugins/` workspace into the core cargo-dist relea
 - The pack version is the plugins workspace's lockstep `workspace.package.version`; the workflow
   should verify the `version` input matches it (or bump-check) to keep manifest `version` fields,
   tag, and index agreeing.
-- Historical key custody used a repository Actions secret. C-353/C-354 supersede that placement:
-  `MINISIGN_SECRET_KEY` belongs only to the tag-only `release` environment and is exposed only to its
-  signing step. Secret re-entry is a later external maintainer action; automation never reads or
-  extracts the value. The public key remains in flux-cli under D-47.
-- A matching `plugins-v*` tag is created once only by `flux-release-promoter`; manual or administrator
-  tag creation is refused by the creation ruleset, and the no-bypass immutability ruleset then refuses
-  every update or deletion. The former hand-push/red-X rationale is historical, not authorization.
+- C-559 supersedes C-353/C-354's App/Environment placement. `MINISIGN_SECRET_KEY` remains exposed
+  only to its signing step as an Actions secret; automation never reads or extracts the value. The
+  public key remains in flux-cli under D-47.
+- A matching `plugins-v*` tag is pushed once by the narrow host-owned tag-control step using
+  `RELEASE_TOKEN`, after a green `ci` run whose SHA is still canonical `main`. The helper has no tag
+  update or recreation path; no live App, ruleset or branch protection is required or claimed.
 - `scripts/smoke-plugins.sh` may run env-gated as a post-release validation step — optional, not a
   gate.
 - Do not use this story's checked branch-publication Acceptance as implementation guidance after

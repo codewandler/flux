@@ -458,20 +458,20 @@ fn the_release_branch_is_the_automatic_apply_trigger() {
 }
 
 /// The cut reaches protected main only through a normal green PR. The resulting new canonical SHA,
-/// not the local cut/tag or release-branch SHA, is then the candidate and one-time App tag target.
+/// not the local cut/tag or release-branch SHA, is then the candidate and one-time PAT tag target.
 #[test]
 fn the_release_workflow_prepares_an_exact_sha_candidate_before_pushing_the_tag() {
     let code = release_flow_workflow_code();
     let stages = [
-        "app_gh pr create",
+        "release_gh pr create",
         "wait_for_ci || fail",
-        "app_gh pr merge",
+        "release_gh pr merge",
         "git/ref/heads/main",
         "merged main does not contain the exact cut diff",
         "\"$MERGED_SHA:$CANDIDATE_REF\"",
         "scripts/release-candidate.sh verify",
-        "git/tags",
-        "git/refs",
+        "git mktag",
+        "git_with_release_token push \"$PUSH_URL\" \"$tag_object:$TAG_REF\"",
         "wait_for_exact_run release.yml",
         "wait_for_exact_run crates-io.yml",
         "scripts/verify-github-release.sh --repo \"$GITHUB_REPOSITORY\" \"$TAG\"",
@@ -487,11 +487,11 @@ fn the_release_workflow_prepares_an_exact_sha_candidate_before_pushing_the_tag()
         .collect::<Vec<_>>();
     assert!(
         indexes.windows(2).all(|pair| pair[0] < pair[1]),
-        "PR, merged-main candidate, App tag, exact runs, public/latest audit and cleanup must remain ordered: {indexes:?}"
+        "PR, merged-main candidate, PAT tag, exact runs, public/latest audit and cleanup must remain ordered: {indexes:?}"
     );
     assert!(!code.contains("HEAD:main") && !code.contains("--admin"));
-    assert!(code.contains("PROMOTION_TOKEN from flux-release-promoter"));
-    assert!(code.contains("[ -z \"${RELEASE_TOKEN:-}\" ]"));
+    assert!(code.contains("[ -n \"${RELEASE_TOKEN:-}\" ]"));
+    assert!(code.contains("[ -z \"${PROMOTION_TOKEN:-}\" ]"));
     assert!(
         code.contains("git rev-list -n1") && code.contains("^{}"),
         "the promotion path must resolve the annotated tag to its commit and use that exact SHA as \
@@ -716,41 +716,57 @@ fn release_flow_installs_the_locked_docs_toolchain_before_running_flux() {
     );
 }
 
+/// C-559 deliberately removes the unconfigured App and GitHub Environments from the release path.
+/// Keep this as a whole-inventory assertion: a future release workflow must not quietly restore a
+/// settings dependency that canonical `main` cannot satisfy.
+#[test]
+fn release_workflows_require_no_app_or_environment_settings() {
+    for name in [
+        "release.yml",
+        "release-flow.yml",
+        "release-plugins.yml",
+        "crates-io.yml",
+    ] {
+        let workflow = workflow_code(name);
+        for forbidden in [
+            "PROMOTION_APP_ID",
+            "PROMOTION_APP_PRIVATE_KEY",
+            "scripts/mint-promotion-token.sh",
+            "environment: release-control",
+            "environment: release",
+        ] {
+            assert!(
+                !workflow.contains(forbidden),
+                "{name} still depends on removed release setting `{forbidden}`"
+            );
+        }
+    }
+    assert!(
+        !repo_root().join("scripts/mint-promotion-token.sh").exists(),
+        "App-token minting must be removed with the App settings"
+    );
+}
+
 /// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`, so the
 /// promotion path needs a separately configured credential; otherwise a green auto-cut silently
-/// publishes nothing. C-354 makes that credential the dedicated `flux-release-promoter` App rather
-/// than the publication PAT: the App's installation token is short-lived, repository-scoped, and is
-/// the one identity the tag-creation ruleset bypasses. `RELEASE_TOKEN` creates GitHub Releases from
-/// the tag-only `release` environment and is not a promotion identity at all.
+/// publishes nothing. C-559 uses the existing repository `RELEASE_TOKEN` only on the host-owned
+/// promotion step and keeps the ambient token limited to Actions dispatch and observation.
 #[test]
-fn promotion_uses_the_dedicated_app_and_never_the_publication_token() {
+fn promotion_uses_the_step_scoped_release_token_outside_the_model_job() {
     let workflow = workflow_code("release-flow.yml");
-    assert!(
-        !workflow.contains("secrets.RELEASE_TOKEN"),
-        "RELEASE_TOKEN must not appear in release-flow.yml: it publishes a GitHub Release and must \
-         never be able to move main, a candidate ref or a tag"
-    );
-    assert!(
-        workflow.contains("secrets.PROMOTION_APP_PRIVATE_KEY")
-            && workflow.contains("vars.PROMOTION_APP_ID")
-            && workflow.contains("scripts/mint-promotion-token.sh"),
-        "release-flow.yml must mint the flux-release-promoter installation token from the App key \
-         and the non-secret App ID"
-    );
-    assert!(
-        workflow.contains("environment: release-control"),
-        "the promotion job must run in the release-control environment, which is the only place the \
-         App key exists"
+    assert_eq!(
+        workflow.matches("secrets.RELEASE_TOKEN").count(),
+        1,
+        "release-flow.yml must pass RELEASE_TOKEN to exactly the host-owned promotion step"
     );
     assert!(
         workflow.contains("actions: write") && workflow.contains("contents: read"),
         "the controller needs Actions write to dispatch/watch the candidate, while repository \
-         contents stay read-only because only the App token moves refs"
+         contents stay read-only because only the step-scoped PAT moves refs"
     );
     assert!(
         !workflow.contains("contents: write"),
-        "do not give GITHUB_TOKEN contents write: the App installation token is the narrowly \
-         scoped, trigger-capable credential for the cut branch and the tag"
+        "do not give GITHUB_TOKEN contents write: RELEASE_TOKEN is the trigger-capable credential"
     );
 
     // The model half of the workflow must not be able to reach the promotion identity, which is a
@@ -759,14 +775,32 @@ fn promotion_uses_the_dedicated_app_and_never_the_publication_token() {
         .split("\n  release-control:")
         .next()
         .expect("release-flow.yml must contain a release-control job");
-    for credential in [
-        "PROMOTION_APP_PRIVATE_KEY",
-        "PROMOTION_TOKEN",
-        "RELEASE_TOKEN",
-    ] {
+    for credential in ["PROMOTION_TOKEN", "RELEASE_TOKEN"] {
         assert!(
             !cut_job.contains(credential),
             "the model/smoke/scribe/cut job must not reference {credential}"
         );
     }
+
+    let promoter = non_comment_source(repo_root().join("scripts/promote-release-flow.sh"));
+    for required in [
+        "RELEASE_CAN_PUSH=$(release_gh api",
+        "git_with_release_token push \"$PUSH_URL\" \"$CUT_SHA:$CUT_REF\"",
+        "release_gh pr create",
+        "release_gh pr merge",
+        "git_with_release_token push \"$PUSH_URL\" \"$MERGED_SHA:$CANDIDATE_REF\"",
+        "git_with_release_token push \"$PUSH_URL\" \"$tag_object:$TAG_REF\"",
+    ] {
+        assert!(
+            promoter.contains(required),
+            "promotion helper is missing RELEASE_TOKEN boundary `{required}`"
+        );
+    }
+    assert!(
+        promoter.contains("actions_gh workflow run")
+            && !promoter.contains("actions_gh pr create")
+            && !promoter.contains("actions_gh pr merge")
+            && !promoter.contains("actions_gh api -X"),
+        "ambient GITHUB_TOKEN may dispatch/observe Actions, never mutate refs or pull requests"
+    );
 }

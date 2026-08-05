@@ -11,6 +11,10 @@ note: "superseded for v0.56.0 by user-directed C-559 — do not provision the Ap
 
 # Protect `main` and gate release secrets behind protected environments
 
+> **Superseded for v0.56.0 by C-559.** The Goal and unchecked Acceptance below preserve the original
+> hardening proposal; they are not active release requirements. Do not provision its App, variables,
+> environments, rulesets or branch protection for this release.
+
 ## Goal
 
 Make repository and publication gates load-bearing without an administrator escape hatch. Give
@@ -115,6 +119,10 @@ publication credentials, and keep reversible configuration separate from externa
 
 ## Progress
 
+- 2026-08-05 — C-559 implemented the active replacement: step-scoped `RELEASE_TOKEN` owns only
+  core promotion, plugin tag control and GitHub Release mutation; the App mint/revoke path and all
+  release workflow Environment dependencies are removed and rejected by fixtures. No live external
+  configuration from this story is required or claimed.
 - 2026-08-05 — superseded by C-559 at the user's direction. The repository has none of the App,
   variable, environment or ruleset configuration this contract requested; it must not be provisioned
   for v0.56.0. C-559 preserves step-isolated host mutation with the existing `RELEASE_TOKEN` and

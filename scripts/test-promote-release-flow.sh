@@ -9,8 +9,8 @@ check_policy() {
   ruby - "$1" <<'RUBY'
 path = ARGV.fetch(0)
 code = File.read(path)
-abort "promotion does not reject publication credentials" unless
-  code.include?('[ -z "${RELEASE_TOKEN:-}" ]') && code.include?("PROMOTION_TOKEN from flux-release-promoter")
+abort "promotion does not require the step-scoped RELEASE_TOKEN" unless
+  code.include?('[ -n "${RELEASE_TOKEN:-}" ]') && code.include?('[ -z "${PROMOTION_TOKEN:-}" ]')
 abort "direct main push returned" if code.match?(/(?:HEAD|CUT_SHA|MERGED_SHA):(?:refs\/heads\/)?main/)
 abort "force push to main returned" if code.match?(/push[^\n]*--force[^\n]*(?<!-)\bmain\b/)
 abort "direct git tag push returned" if code.match?(/push[^\n]*TAG_REF:\$TAG_REF/)
@@ -19,15 +19,15 @@ abort "administrator merge bypass returned" if code.include?("--admin")
 # would let anything that can write that artifact choose the commit this job promotes.
 abort "the imported cut is not verified before use" unless
   code.include?('git bundle verify "$RELEASE_CUT_BUNDLE"')
-abort "the installation token is not revoked when promotion exits" unless
-  code.include?("api -X DELETE /installation/token")
 
 required = {
   bundle: 'git bundle verify "$RELEASE_CUT_BUNDLE"',
   cut_branch: 'CUT_BRANCH=release-cuts/$TAG',
-  pr: 'app_gh pr create',
+  pat_preflight: 'RELEASE_CAN_PUSH=$(release_gh api',
+  cut_push: 'git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"',
+  pr: 'release_gh pr create',
   exact_ci: 'wait_for_ci || fail',
-  merge: 'app_gh pr merge',
+  merge: 'release_gh pr merge',
   canonical_main: 'git/ref/heads/main',
   exact_tree: 'merged main does not contain the exact cut diff',
   candidate: '"$MERGED_SHA:$CANDIDATE_REF"',
@@ -35,8 +35,8 @@ required = {
   receipt: 'scripts/release-candidate.sh verify',
   release_baseline: 'RELEASE_BASELINE=$(latest_run_id release.yml)',
   crates_baseline: 'CRATES_BASELINE=$(latest_run_id crates-io.yml)',
-  tag_object: 'git/tags',
-  tag_ref: 'git/refs',
+  tag_object: 'git mktag',
+  tag_ref: 'git_with_release_token push "$PUSH_URL" "$tag_object:$TAG_REF"',
   release_run: 'wait_for_exact_run release.yml',
   crates_run: 'wait_for_exact_run crates-io.yml',
   live: 'scripts/verify-github-release.sh --repo "$GITHUB_REPOSITORY" "$TAG"',
@@ -48,7 +48,7 @@ indexes = required.transform_values do |needle|
   abort "missing promotion boundary #{needle}" unless index
   index
 end
-order = %i[bundle cut_branch pr exact_ci merge canonical_main exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
+order = %i[bundle cut_branch pat_preflight cut_push pr exact_ci merge canonical_main exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
 order.each_cons(2) do |left, right|
   abort "promotion order regressed: #{left} must precede #{right}" unless indexes.fetch(left) < indexes.fetch(right)
 end
@@ -58,9 +58,19 @@ abort "run matching lost the database-ID snapshot" unless code.include?('.databa
   abort "run matching lost #{field}" unless code.include?(field)
 end
 abort "ambiguous run matches no longer fail" unless code.include?('ambiguous new $workflow runs')
-abort "tag is not created once through the App API" unless code.include?('-X POST "repos/$GITHUB_REPOSITORY/git/tags"')
+abort "tag is not created by a PAT-authenticated git push" unless
+  code.include?('git_with_release_token push "$PUSH_URL" "$tag_object:$TAG_REF"')
 abort "candidate cleanup is not an exact lease" unless code.include?('--force-with-lease="$CANDIDATE_REF:$MERGED_SHA"')
 abort "failure no longer retains an exact resume command" unless code.include?('Resume exactly: EXPECTED_RELEASE_SHA=%q')
+
+actions_calls = code.lines.map(&:strip).select { |line| line.start_with?('actions_gh ') }
+allowed_actions = [
+  /^actions_gh api .*check-runs/,
+  /^actions_gh workflow run /,
+  /^actions_gh run (list|watch|download|view) /,
+]
+bad_actions = actions_calls.reject { |line| allowed_actions.any? { |pattern| line.match?(pattern) } }
+abort "ambient GITHUB_TOKEN escaped Actions dispatch/observation: #{bad_actions.inspect}" unless bad_actions.empty?
 RUBY
 }
 
@@ -72,9 +82,11 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/flux-promoter-policy.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 for needle in \
   'git bundle verify "$RELEASE_CUT_BUNDLE"' \
-  'app_gh pr create' \
+  'RELEASE_CAN_PUSH=$(release_gh api' \
+  'git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"' \
+  'release_gh pr create' \
   'wait_for_ci || fail' \
-  'app_gh pr merge' \
+  'release_gh pr merge' \
   'git/ref/heads/main' \
   '"$MERGED_SHA:$CANDIDATE_REF"' \
   'scripts/release-candidate.sh verify' \
@@ -97,8 +109,8 @@ done
 for injection in \
   'git push origin HEAD:main' \
   'git_with_promoter push --force "$PUSH_URL" "$MERGED_SHA:main"' \
-  'app_gh pr merge "$PR_NUMBER" --admin' \
-  'git_with_promoter push "$PUSH_URL" "$TAG_REF:$TAG_REF"'
+  'release_gh pr merge "$PR_NUMBER" --admin' \
+  'git_with_release_token push "$PUSH_URL" "$TAG_REF:$TAG_REF"'
 do
   cp "$PROMOTER" "$tmp/mutant"
   printf '\n%s\n' "$injection" >>"$tmp/mutant"

@@ -632,7 +632,6 @@ jobs:
       - host
     if: ${{ needs.plan.outputs.publishing == 'true' }}
     runs-on: "ubuntu-22.04"
-    environment: release
     permissions:
       contents: read
       attestations: write
@@ -659,7 +658,6 @@ jobs:
       - attest
     if: ${{ needs.plan.outputs.publishing == 'true' }}
     runs-on: "ubuntu-22.04"
-    environment: release
     permissions:
       contents: read
     steps:
@@ -674,8 +672,8 @@ jobs:
       - name: Create GitHub Release
         env:
           # Scoped release token: a fine-grained PAT (this repo only, Contents: write) held by the
-          # `release` environment, so the release object is created even when the org restricts the
-          # default GITHUB_TOKEN or GitHub App integration from creating releases.
+          # repository Actions secret, so the release object is created even when the org restricts
+          # the default GITHUB_TOKEN from creating releases.
           # NOTE: release.yml is cargo-dist-generated — re-apply this override after `dist generate`.
           GH_TOKEN: "${{ secrets.RELEASE_TOKEN }}"
           RELEASE_COMMIT: "${{ github.sha }}"
@@ -683,7 +681,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
-            echo "::error::RELEASE_TOKEN is not set on the release environment. Configure a fine-grained PAT for this repo with Contents: write; GITHUB_TOKEN has produced HTTP 403 on release creation."
+            echo "::error::RELEASE_TOKEN is not configured as a repository Actions secret. Configure a fine-grained PAT for this repo with Contents and Pull requests write access."
             exit 1
           fi
           # Title and body come from the checked manifest that is already a release asset, so the
