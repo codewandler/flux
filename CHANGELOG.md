@@ -8,6 +8,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Autonomy is now a named posture rather than an absence of safety** (C-463).
+  `flux_runtime::AutonomyPosture` names four choices — `supervised`, `bounded-autonomy`,
+  `exploratory` and `refusing` — and each one selects its approval stance, sandbox floor and budget
+  together as a single coherent value, instead of leaving them to three independently settable
+  flags. That coupling is the point: a posture that set approval without also setting confinement
+  would be C-444's bug with a nicer name. Selectable as `--posture` on the CLI and
+  `ClientBuilder::posture()` in the SDK. `--yes` and `auto_approve` are unchanged and map onto
+  `bounded-autonomy`; contradictory combinations are refused rather than silently resolved. The set
+  is a fixed four with no builder — deliberately not an extensible preset generator. Authorization,
+  guarded IO and evidence recording are invariant across all four, asserted by tests that drive the
+  same ungranted operation and the same workspace escape through every posture, including those
+  whose approver allows everything. Each posture documents what it does *not* protect against, and
+  no surface presents an autonomous posture as degraded.
+
 - **`flux review` now shows live progress while its built-in review flow runs** (C-530). The CLI can
   render an interactive reviewer tree, append-only summaries, or no progress via
   `--progress auto|tree|plain|off`; progress stays on stderr so Markdown and JSON reports remain clean

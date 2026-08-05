@@ -17,6 +17,16 @@
 
 ### New
 
+- **You can now name how much autonomy an agent runs with, in one choice.** `--posture supervised`
+  asks you before each effect. `--posture bounded-autonomy` never asks and instead constrains the
+  run with policy, a fail-closed sandbox and budgets — the posture unattended runs already used.
+  `--posture exploratory` suits research and long investigations where being interrupted is itself
+  the problem, leaning on hard isolation and full evidence instead. `--posture refusing` denies
+  everything. Each posture sets its approval, confinement and budget together, so you cannot end up
+  with approvals switched off and confinement left open. The documentation states plainly what each
+  one relies on and what it does not protect you against. `--yes` keeps working and means
+  `bounded-autonomy`.
+
 - **Streaming JSON output now identifies which call each tool event belongs to.** Tool call and tool
   result lines carry a new `dispatch` field holding the same identifier on both ends of one call, so
   a script consuming the stream can pair a result with its call directly instead of guessing by tool
