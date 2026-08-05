@@ -29,6 +29,85 @@ fn git(root: &PathBuf, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn one_story_wave(name: &str) -> (PathBuf, PathBuf) {
+    let root = fixture(name);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let dispatched = flux(&root, &["fleet", "run", "repo/C-1", "--output", "json"]);
+    assert!(dispatched.status.success());
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let story = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    (root, story)
+}
+
+fn commit_result(story: &PathBuf, value: &str) -> String {
+    fs::write(story.join("result.txt"), format!("{value}\n")).unwrap();
+    assert!(git(story, &["add", "result.txt"]).status.success());
+    assert!(git(story, &["commit", "-qm", value]).status.success());
+    String::from_utf8(git(story, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn submit_result_handoff(root: &PathBuf, commit: &str) -> serde_json::Value {
+    let handoff = flux(
+        root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            commit,
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "Implemented the reviewed contract",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stdout)
+    );
+    serde_json::from_slice(&handoff.stdout).unwrap()
+}
+
 #[test]
 fn board_and_fleet_skills_are_valid_small_agent_skills() {
     let root = fixture("skills");
@@ -75,6 +154,74 @@ fn machine_schema_uses_the_versioned_envelope_and_clean_stdout() {
         .unwrap()
         .iter()
         .any(|op| op["name"] == "stats"));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn generic_json_call_can_reach_real_board_and_fleet_mutations() {
+    let root = fixture("json-call");
+    fs::write(
+        root.join("docs/stories/README.md"),
+        "# Board\n\n<!-- BEGIN track:board -->\n<!-- END track:board -->\n",
+    )
+    .unwrap();
+    let board_request = root.join("board-request.json");
+    fs::write(
+        &board_request,
+        r#"{"schema":"flux.cli/v1","request_id":"board-create","args":["--kind","story","--id","C-1","--title","Created through call"]}"#,
+    )
+    .unwrap();
+    let created = flux(
+        &root,
+        &[
+            "board",
+            "call",
+            "create",
+            "--request",
+            board_request.to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created["request_id"], "board-create");
+    assert_eq!(created["data"]["id"], "C-1");
+    assert!(root
+        .join("docs/stories/C-1-created-through-call.md")
+        .is_file());
+
+    let fleet_request = root.join("fleet-request.json");
+    fs::write(
+        &fleet_request,
+        r#"{"schema":"flux.cli/v1","request_id":"goal-set","args":["set","project","flux","Replace helper scripts"]}"#,
+    )
+    .unwrap();
+    let goal = flux(
+        &root,
+        &[
+            "fleet",
+            "call",
+            "goal",
+            "--request",
+            fleet_request.to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        goal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&goal.stdout)
+    );
+    let goal: serde_json::Value = serde_json::from_slice(&goal.stdout).unwrap();
+    assert_eq!(goal["request_id"], "goal-set");
+    assert_eq!(goal["data"]["goal"]["scope"], "project");
+    assert_eq!(goal["data"]["goal"]["statement"], "Replace helper scripts");
     fs::remove_dir_all(root).ok();
 }
 
@@ -816,5 +963,102 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     assert_eq!(
         fs::read_to_string(root.join("result.txt")).unwrap(),
         "implemented\n"
+    );
+}
+
+#[test]
+fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
+    let (root, story) = one_story_wave("rework-budget");
+    let mut commit = commit_result(&story, "attempt one");
+    let first_handoff = submit_result_handoff(&root, &commit);
+    let session = first_handoff["data"]["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for attempt in 1..=2 {
+        let key = format!("rework-{attempt}");
+        let reviewed = commit.clone();
+        let rework = flux(
+            &root,
+            &[
+                "fleet",
+                "rework",
+                "wave-2",
+                "repo/C-1",
+                "--reviewer",
+                "fresh-reviewer",
+                "--reviewed-commit",
+                &reviewed,
+                "--path",
+                "result.txt:1:Clarify the result",
+                "--idempotency-key",
+                &key,
+                "--output",
+                "json",
+            ],
+        );
+        assert!(rework.status.success());
+        let replay = flux(
+            &root,
+            &[
+                "fleet",
+                "rework",
+                "wave-2",
+                "repo/C-1",
+                "--reviewer",
+                "fresh-reviewer",
+                "--reviewed-commit",
+                &reviewed,
+                "--path",
+                "result.txt:1:Clarify the result",
+                "--idempotency-key",
+                &key,
+                "--output",
+                "json",
+            ],
+        );
+        assert_eq!(
+            rework.stdout, replay.stdout,
+            "replay must not consume a round"
+        );
+        let rework: serde_json::Value = serde_json::from_slice(&rework.stdout).unwrap();
+        assert_eq!(rework["data"]["decision"], "REWORK");
+        assert_eq!(rework["data"]["ack"], "delivered");
+        assert_eq!(rework["data"]["attempt"], attempt);
+        assert_eq!(rework["data"]["session"], session);
+
+        commit = commit_result(&story, &format!("attempt {} fixed", attempt));
+        let next_handoff = submit_result_handoff(&root, &commit);
+        assert_eq!(next_handoff["data"]["session"], session);
+    }
+
+    let parked = flux(
+        &root,
+        &[
+            "fleet",
+            "rework",
+            "wave-2",
+            "repo/C-1",
+            "--reviewer",
+            "fresh-reviewer",
+            "--reviewed-commit",
+            &commit,
+            "--invariant",
+            "The contract is still ambiguous",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(parked.status.success());
+    let parked: serde_json::Value = serde_json::from_slice(&parked.stdout).unwrap();
+    assert_eq!(parked["data"]["decision"], "PARK");
+    assert_eq!(parked["data"]["ack"], "not-dispatched");
+    assert_eq!(parked["data"]["attempt"], 2);
+    assert_eq!(parked["data"]["session"], session);
+    let integration = flux(&root, &["fleet", "integrate", "wave-2"]);
+    assert!(
+        !integration.status.success(),
+        "parked work cannot integrate"
     );
 }

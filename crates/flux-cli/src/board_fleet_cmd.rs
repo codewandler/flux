@@ -829,6 +829,7 @@ pub(super) fn run_board(command: BoardCommand) -> Result<()> {
 
 fn run_board_checked(command: BoardCommand) -> Result<()> {
     let request = load_request(command.request.as_deref())?;
+    let envelope_request_id = request_id_from(request.as_ref())?;
     if command.scope == BoardScopeArg::Session {
         validate_board_common(&command, request.as_ref())?;
         return run_session_board_checked(&command, request);
@@ -858,6 +859,7 @@ fn run_board_checked(command: BoardCommand) -> Result<()> {
             stored.data,
             stored.warnings,
             Some(&stored.revision),
+            envelope_request_id.as_deref(),
         );
     }
     check_revision(command.if_revision.as_deref(), &revision)?;
@@ -880,7 +882,14 @@ fn run_board_checked(command: BoardCommand) -> Result<()> {
                     revision: next_revision.clone(),
                 },
             )?;
-            emit(command.output, &human, data, warnings, Some(&next_revision))
+            emit(
+                command.output,
+                &human,
+                data,
+                warnings,
+                Some(&next_revision),
+                envelope_request_id.as_deref(),
+            )
         }
         Err(error) => Err(error),
     }
@@ -889,6 +898,7 @@ fn run_board_checked(command: BoardCommand) -> Result<()> {
 fn run_session_board_checked(command: &BoardCommand, request: Option<Value>) -> Result<()> {
     use flux_datasource::board::{BoardBackend, BoardContract, BoardId, BoardProfile, BoardScope};
 
+    let envelope_request_id = request_id_from(request.as_ref())?;
     let events = std::sync::Arc::new(open_event_store()?);
     let requested = command
         .session
@@ -955,6 +965,7 @@ fn run_session_board_checked(command: &BoardCommand, request: Option<Value>) -> 
         data,
         warnings,
         Some(&revision.to_string()),
+        envelope_request_id.as_deref(),
     )
 }
 
@@ -1631,6 +1642,7 @@ pub(super) fn run_fleet(command: FleetCommand) -> Result<()> {
 
 fn run_fleet_checked(command: FleetCommand) -> Result<()> {
     let request = load_request(command.request.as_deref())?;
+    let envelope_request_id = request_id_from(request.as_ref())?;
     let root = confined_root(&command.root)?;
     validate_fleet_common(&command, request.as_ref())?;
     let mut state = read_fleet_state(&root)?;
@@ -1646,6 +1658,7 @@ fn run_fleet_checked(command: FleetCommand) -> Result<()> {
                 stored.data.clone(),
                 stored.warnings.clone(),
                 Some(&stored.revision),
+                envelope_request_id.as_deref(),
             );
         }
     }
@@ -1675,6 +1688,7 @@ fn run_fleet_checked(command: FleetCommand) -> Result<()> {
                 data,
                 warnings,
                 Some(&revision.to_string()),
+                envelope_request_id.as_deref(),
             )
         }
         Err(error) => Err(error),
@@ -2365,7 +2379,16 @@ fn validate_common_options(
 fn request_fingerprint<T: std::fmt::Debug>(action: &T, request: Option<&Value>) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     format!("{action:?}").hash(&mut hasher);
-    request.map(Value::to_string).hash(&mut hasher);
+    request
+        .map(|request| {
+            let mut payload = request.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("schema");
+                object.remove("request_id");
+            }
+            payload.to_string()
+        })
+        .hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -2459,6 +2482,50 @@ fn fleet_operations() -> &'static [&'static str] {
 }
 
 fn family_schema(family: &str, operations: &[&str]) -> Value {
+    let read_only = if family == "board" {
+        &[
+            "list", "show", "items", "get", "query", "next", "check", "graph", "stats", "schema",
+            "skill",
+        ][..]
+    } else {
+        &[
+            "doctor",
+            "refresh",
+            "validate",
+            "status",
+            "schedule",
+            "events",
+            "logs",
+            "agents",
+            "worktrees",
+            "inspect",
+            "dashboard",
+            "schema",
+            "skill",
+        ][..]
+    };
+    let request = json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema",
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "schema":{"const":CLI_SCHEMA},
+            "request_id":{"type":"string","minLength":1,"maxLength":128},
+            "args":{"type":"array","items":{"type":"string"}}
+        },
+        "required":["args"]
+    });
+    let response = json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema",
+        "type":"object",
+        "required":["schema","ok","request_id","revision","data","warnings","error"],
+        "properties":{
+            "schema":{"const":CLI_SCHEMA}, "ok":{"type":"boolean"},
+            "request_id":{"type":["string","null"]}, "revision":{"type":["string","null"]},
+            "data":{}, "warnings":{"type":"array","items":{"type":"string"}},
+            "error":{"type":["object","null"]}
+        }
+    });
     json!({
         "family": family,
         "version": env!("CARGO_PKG_VERSION"),
@@ -2470,7 +2537,21 @@ fn family_schema(family: &str, operations: &[&str]) -> Value {
             {"code": 4, "class": "conflict/precondition"}, {"code": 5, "class": "permission"},
             {"code": 6, "class": "transient-worker"}, {"code": 7, "class": "validation/gate"}
         ],
-        "operations": operations.iter().map(|name| json!({"name": name, "request": {"type": "object"}, "response": {"type": "object"}})).collect::<Vec<_>>()
+        "call": {"request":request,"response":response,"example":{"schema":CLI_SCHEMA,"request_id":"caller-correlation-id","args":["--help"]}},
+        "operations": operations.iter().map(|name| json!({
+            "name": name,
+            "mutation": !read_only.contains(name),
+            "supports": {
+                "json": true,
+                "ndjson": *name == "events",
+                "dry_run": !read_only.contains(name),
+                "idempotency_key": !read_only.contains(name),
+                "if_revision": !read_only.contains(name)
+            },
+            "call_request": {"$ref":"#/call/request"},
+            "response": {"$ref":"#/call/response"},
+            "help": format!("flux {family} {name} --help")
+        })).collect::<Vec<_>>()
     })
 }
 
@@ -2496,6 +2577,7 @@ fn emit(
     data: Value,
     warnings: Vec<String>,
     revision: Option<&str>,
+    request_id: Option<&str>,
 ) -> Result<()> {
     match output {
         AgentOutput::Human => {
@@ -2509,7 +2591,7 @@ fn emit(
         AgentOutput::Json => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "schema": CLI_SCHEMA, "ok": true, "request_id": Value::Null,
+                "schema": CLI_SCHEMA, "ok": true, "request_id": request_id,
                 "revision": revision, "data": data, "warnings": warnings, "error": Value::Null
             }))?
         ),
@@ -2518,7 +2600,7 @@ fn emit(
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
-                        "schema": CLI_SCHEMA, "ok": true, "request_id": Value::Null,
+                        "schema": CLI_SCHEMA, "ok": true, "request_id": request_id,
                         "revision": revision, "data": data, "warnings": warnings, "error": Value::Null
                     }))?
                 );
@@ -2575,6 +2657,19 @@ fn load_request(path: Option<&str>) -> Result<Option<Value>> {
         bail!("input/schema: request must be a JSON object");
     }
     Ok(Some(value))
+}
+
+fn request_id_from(request: Option<&Value>) -> Result<Option<String>> {
+    let Some(value) = request.and_then(|request| request.get("request_id")) else {
+        return Ok(None);
+    };
+    let id = value
+        .as_str()
+        .context("input/schema: request_id must be a string")?;
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        bail!("input/schema: request_id must be 1..=128 printable characters")
+    }
+    Ok(Some(id.to_string()))
 }
 
 fn confined_root(root: &Path) -> Result<PathBuf> {
@@ -3303,33 +3398,113 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_history(root: &Path, since: Option<&str>) -> Result<Value> {
-    let mut args = vec![
-        "log",
-        "--date=short",
-        "--pretty=format:%ad",
-        "--",
-        "docs/stories",
-    ];
-    let since_arg;
-    if let Some(since) = since {
-        since_arg = format!("--since={since}");
-        args.insert(1, &since_arg);
+    if since.is_some_and(|date| {
+        date.len() != 10
+            || date
+                .chars()
+                .enumerate()
+                .any(|(index, character)| match index {
+                    4 | 7 => character != '-',
+                    _ => !character.is_ascii_digit(),
+                })
+    }) {
+        bail!("input/schema: --since must use YYYY-MM-DD")
     }
     let output = std::process::Command::new("git")
-        .args(&args)
+        .args([
+            "log",
+            "--date=short",
+            "--pretty=format:%H%x09%ad",
+            "--",
+            "docs/stories",
+        ])
         .current_dir(root)
         .output();
-    let mut days = BTreeMap::<String, usize>::new();
+    let mut days = BTreeMap::<String, (usize, String)>::new();
     if let Ok(output) = output {
         if output.status.success() {
-            for date in String::from_utf8_lossy(&output.stdout).lines() {
-                *days.entry(date.into()).or_default() += 1;
+            // `git log` is newest-first. The first SHA seen for a date is therefore that day's
+            // canonical end-of-day snapshot; every row still contributes to the commit count.
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some((commit, date)) = line.split_once('\t') {
+                    let entry = days
+                        .entry(date.to_string())
+                        .or_insert_with(|| (0, commit.to_string()));
+                    entry.0 += 1;
+                }
             }
         }
     }
-    Ok(
-        json!({"schema": "flux.board-history/v1", "days": days.into_iter().map(|(date, commits)| json!({"date": date, "commits": commits, "scope_added": Value::Null, "scope_removed": Value::Null, "completed": Value::Null})).collect::<Vec<_>>() }),
-    )
+    let mut previous = BTreeMap::<String, String>::new();
+    let mut result = Vec::new();
+    for (date, (commits, commit)) in days {
+        let current = story_snapshot_at(root, &commit)?;
+        let scope_added = current
+            .keys()
+            .filter(|id| !previous.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let scope_removed = previous
+            .keys()
+            .filter(|id| !current.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let completed = current
+            .iter()
+            .filter(|(id, status)| {
+                status.as_str() == "done" && previous.get(*id).is_none_or(|before| before != "done")
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if since.is_none_or(|minimum| date.as_str() >= minimum) {
+            result.push(json!({
+                "date": date, "commit": commit, "commits": commits,
+                "scope_added": scope_added.len(), "scope_added_items": scope_added,
+                "scope_removed": scope_removed.len(), "scope_removed_items": scope_removed,
+                "completed": completed.len(), "completed_items": completed,
+                "stories": current.len(),
+            }));
+        }
+        previous = current;
+    }
+    Ok(json!({"schema": "flux.board-history/v1", "since": since, "days": result}))
+}
+
+fn story_snapshot_at(root: &Path, commit: &str) -> Result<BTreeMap<String, String>> {
+    let output = std::process::Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", commit, "--", "docs/stories"])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        bail!("validation/gate: cannot inspect board history at {commit}")
+    }
+    let mut snapshot = BTreeMap::new();
+    for path in String::from_utf8_lossy(&output.stdout).lines() {
+        if !path.ends_with(".md") || path.ends_with("/README.md") {
+            continue;
+        }
+        let object = format!("{commit}:{path}");
+        let output = std::process::Command::new("git")
+            .args(["show", &object])
+            .current_dir(root)
+            .output()?;
+        if !output.status.success() {
+            bail!("validation/gate: cannot read historical board item {object}")
+        }
+        let body = String::from_utf8_lossy(&output.stdout);
+        let frontmatter = parse_frontmatter(&body);
+        let Some(id) = frontmatter.get("id") else {
+            continue;
+        };
+        snapshot.insert(
+            id.clone(),
+            frontmatter
+                .get("status")
+                .cloned()
+                .unwrap_or_else(|| "backlog".into()),
+        );
+    }
+    Ok(snapshot)
 }
 
 fn stats_human(data: &Value) -> String {
@@ -4169,7 +4344,188 @@ fn board_call(
     operation: &str,
     request: Option<Value>,
 ) -> Result<(String, Value, Vec<String>, Option<String>)> {
-    match operation{"stats"=>{let data=stats(command,root,request.as_ref().and_then(|v|v.get("history")).and_then(Value::as_bool).unwrap_or(false),None)?;Ok((stats_human(&data),data,vec![],None))},"render"=>{let (h,d,w)=render_track(root,command.dry_run)?;Ok((h,d,w,changed_revision(root,command.dry_run)?))},"check"=>check_board(root),"schema"=>Ok((String::new(),family_schema("board",board_operations()),vec![],None)),other=>bail!("input/schema: board call operation {other:?} is not available through call yet; inspect `flux board schema`")}
+    match operation {
+        "stats"
+            if request
+                .as_ref()
+                .is_some_and(|value| value.get("args").is_none()) =>
+        {
+            let data = stats(
+                command,
+                root,
+                request
+                    .as_ref()
+                    .and_then(|value| value.get("history"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                request
+                    .as_ref()
+                    .and_then(|value| value.get("since"))
+                    .and_then(Value::as_str),
+            )?;
+            Ok((stats_human(&data), data, vec![], None))
+        }
+        "render" if request.is_none() => {
+            let (human, data, warnings) = render_track(root, command.dry_run)?;
+            Ok((
+                human,
+                data,
+                warnings,
+                changed_revision(root, command.dry_run)?,
+            ))
+        }
+        "check" if request.is_none() => check_board(root),
+        "schema" => Ok((
+            String::new(),
+            family_schema("board", board_operations()),
+            vec![],
+            None,
+        )),
+        "call" => bail!("input/schema: board call cannot recursively invoke call"),
+        other if board_operations().contains(&other) => {
+            let mut prefix = vec![
+                "board".to_string(),
+                "--root".to_string(),
+                display_path(root),
+                "--scope".to_string(),
+                match command.scope {
+                    BoardScopeArg::Session => "session",
+                    BoardScopeArg::Repository => "repository",
+                    BoardScopeArg::Workspace => "workspace",
+                }
+                .to_string(),
+                "--profile".to_string(),
+                match command.profile {
+                    BoardProfileArg::General => "general",
+                    BoardProfileArg::Planning => "planning",
+                    BoardProfileArg::Execution => "execution",
+                }
+                .to_string(),
+            ];
+            if let Some(board) = command.board.as_ref() {
+                prefix.extend(["--board".to_string(), board.clone()]);
+            }
+            if let Some(session) = command.session.as_ref() {
+                prefix.extend(["--session".to_string(), session.clone()]);
+            }
+            call_via_cli(
+                prefix,
+                other,
+                request.as_ref(),
+                command.dry_run,
+                command.if_revision.as_deref(),
+            )
+        }
+        other => bail!(
+            "input/schema: unknown board call operation {other:?}; inspect `flux board schema`"
+        ),
+    }
+}
+
+struct CliCallResult {
+    human: String,
+    data: Value,
+    warnings: Vec<String>,
+    revision: Option<String>,
+}
+
+fn call_via_cli(
+    mut prefix: Vec<String>,
+    operation: &str,
+    request: Option<&Value>,
+    dry_run: bool,
+    if_revision: Option<&str>,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    let args = call_request_args(request)?;
+    prefix.extend(["--output".to_string(), "json".to_string()]);
+    if dry_run {
+        prefix.push("--dry-run".to_string());
+    }
+    if let Some(revision) = if_revision {
+        prefix.extend(["--if-revision".to_string(), revision.to_string()]);
+    }
+    prefix.push(operation.to_string());
+    prefix.extend(args);
+    let result = invoke_flux_cli(&prefix)?;
+    Ok((result.human, result.data, result.warnings, result.revision))
+}
+
+fn call_request_args(request: Option<&Value>) -> Result<Vec<String>> {
+    let Some(request) = request else {
+        return Ok(Vec::new());
+    };
+    let object = request
+        .as_object()
+        .context("input/schema: call request must be an object")?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "schema" | "request_id" | "args"))
+    {
+        bail!(
+            "input/schema: call request has unknown field {key:?}; use the versioned `args` array"
+        )
+    }
+    if let Some(schema) = object.get("schema") {
+        if schema.as_str() != Some(CLI_SCHEMA) {
+            bail!("input/schema: call request schema must be {CLI_SCHEMA:?}")
+        }
+    }
+    object
+        .get("args")
+        .map(|args| {
+            args.as_array()
+                .context("input/schema: call request args must be an array")?
+                .iter()
+                .map(|argument| {
+                    argument
+                        .as_str()
+                        .map(str::to_string)
+                        .context("input/schema: every call request arg must be a string")
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn invoke_flux_cli(args: &[String]) -> Result<CliCallResult> {
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(args)
+        .output()
+        .context("transient-worker: could not invoke installed Flux CLI")?;
+    let envelope: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "validation/gate: nested Flux CLI returned invalid JSON: {}",
+            clipped_redacted(&output.stderr)
+        )
+    })?;
+    if !output.status.success() || envelope["ok"].as_bool() != Some(true) {
+        let class = envelope["error"]["class"]
+            .as_str()
+            .unwrap_or("validation/gate");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .unwrap_or("nested Flux CLI operation failed");
+        bail!("{class}: {message}")
+    }
+    let data = envelope["data"].clone();
+    let warnings = envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Ok(CliCallResult {
+        human: if data.is_string() {
+            data.as_str().unwrap_or_default().to_string()
+        } else {
+            serde_json::to_string_pretty(&data)?
+        },
+        data,
+        warnings,
+        revision: envelope["revision"].as_str().map(str::to_string),
+    })
 }
 
 fn read_fleet_state(root: &Path) -> Result<FleetState> {
@@ -5308,13 +5664,17 @@ fn path_hits_fence(path: &str, fence: &str) -> bool {
 
 fn clipped_redacted(bytes: &[u8]) -> String {
     const MAX: usize = 16 * 1024;
-    let text = String::from_utf8_lossy(&bytes);
-    let text = if text.len() > MAX {
-        &text[..MAX]
-    } else {
-        &text
-    };
-    redact(text)
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= MAX {
+        return redact(&text);
+    }
+    let end = text
+        .char_indices()
+        .take_while(|(index, _)| *index <= MAX)
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    redact(&text[..end.min(text.len())])
 }
 
 fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
@@ -5595,6 +5955,9 @@ fn fleet_rework(
         .get(input.wave)
         .cloned()
         .with_context(|| format!("not-found: wave {}", input.wave))?;
+    if wave["status"].as_str() != Some("accepted") {
+        bail!("conflict/precondition: rework is only available while a wave is accepted")
+    }
     let (repository_index, story_index) = wave_story_indices(&wave, input.item)?;
     let story = &mut wave["topology"]["repositories"][repository_index]["stories"][story_index];
     let handoff = story["handoff"].clone();
@@ -5727,13 +6090,8 @@ fn integrate_wave(
         .get(wave_id)
         .cloned()
         .with_context(|| format!("not-found: wave {wave_id}"))?;
-    if wave["status"].as_str().is_some_and(|status| {
-        matches!(
-            status,
-            "integrating" | "green" | "red" | "conflict" | "applied"
-        )
-    }) {
-        bail!("conflict/precondition: wave {wave_id} has already entered integration")
+    if wave["status"].as_str() != Some("accepted") {
+        bail!("conflict/precondition: wave {wave_id} is not accepted for integration")
     }
     let items = wave["items"]
         .as_array()
@@ -5752,7 +6110,9 @@ fn integrate_wave(
         let (repository_index, story_index) = wave_story_indices(&wave, item)?;
         let story = &wave["topology"]["repositories"][repository_index]["stories"][story_index];
         let handoff = &story["handoff"];
-        if handoff["status"].as_str() != Some("accepted") {
+        if story["status"].as_str() != Some("handoff-accepted")
+            || handoff["status"].as_str() != Some("accepted")
+        {
             bail!("conflict/precondition: {item} has no accepted handoff")
         }
         let worker = handoff["worker"]
@@ -6019,13 +6379,49 @@ fn apply_wave(
     ))
 }
 fn fleet_call(
-    _command: &FleetCommand,
+    command: &FleetCommand,
     root: &Path,
     state: FleetState,
     operation: &str,
-    _request: Option<Value>,
+    request: Option<Value>,
 ) -> Result<(String, Value, Vec<String>, u64)> {
-    match operation{"status"=>{let data=json!({"state":state,"sources":fleet_sources(root)?});Ok((fleet_status_human(&data),data,vec![],state.revision))},"schedule"=>{let data=fleet_schedule(root)?;Ok((schedule_human(&data),data,vec![],state.revision))},"schema"=>Ok((String::new(),family_schema("fleet",fleet_operations()),vec![],state.revision)),other=>bail!("input/schema: fleet call operation {other:?} is not available through call yet; inspect `flux fleet schema`")}
+    match operation {
+        "status" if request.is_none() => {
+            let data = json!({"state":state,"sources":fleet_sources(root)?});
+            Ok((fleet_status_human(&data), data, vec![], state.revision))
+        }
+        "schedule" if request.is_none() => {
+            let data = fleet_schedule(root)?;
+            Ok((schedule_human(&data), data, vec![], state.revision))
+        }
+        "schema" => Ok((
+            String::new(),
+            family_schema("fleet", fleet_operations()),
+            vec![],
+            state.revision,
+        )),
+        "call" => bail!("input/schema: fleet call cannot recursively invoke call"),
+        other if fleet_operations().contains(&other) => {
+            let (human, data, warnings, revision) = call_via_cli(
+                vec![
+                    "fleet".to_string(),
+                    "--root".to_string(),
+                    display_path(root),
+                ],
+                other,
+                request.as_ref(),
+                command.dry_run,
+                command.if_revision.as_deref(),
+            )?;
+            let revision = revision
+                .and_then(|revision| revision.parse::<u64>().ok())
+                .unwrap_or(read_fleet_state(root)?.revision);
+            Ok((human, data, warnings, revision))
+        }
+        other => bail!(
+            "input/schema: unknown fleet call operation {other:?}; inspect `flux fleet schema`"
+        ),
+    }
 }
 
 fn redact(value: &str) -> String {
