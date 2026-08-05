@@ -3,11 +3,11 @@ id: C-563
 title: "An operator can start, talk to and watch a Fleet from the public guide"
 pillar: Core
 status: ready
-priority: 2
+priority: 4
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [docs, website]
-depends_on: [C-560]
+depends_on: [C-561]
 note: "public-doc gap — commands exist, but the first working main-agent conversation and watch loop are not taught as one journey"
 ---
 

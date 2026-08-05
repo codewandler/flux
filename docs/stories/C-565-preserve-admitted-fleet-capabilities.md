@@ -3,11 +3,11 @@ id: C-565
 title: "Every continued Fleet turn preserves its admitted capability ceiling"
 pillar: Core
 status: ready
-priority: 4
+priority: 1
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-cli, flux-capabilities, flux-runtime]
-depends_on: [C-560]
+depends_on: [C-566]
 note: "dogfood defect — continued writer turns exposed a different operation set than the admitted template"
 ---
 

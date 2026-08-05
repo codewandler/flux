@@ -3,7 +3,7 @@ id: C-564
 title: "Nested Fleet tasks cannot steal a worker's continuation session"
 pillar: Core
 status: ready
-priority: 3
+priority: 5
 epic: fleet-loop
 design: docs/designs/fleet-agent-payload-budgets.md
 areas: [flux-cli, flux-events, flux-flow]

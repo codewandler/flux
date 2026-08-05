@@ -3,7 +3,7 @@ id: C-562
 title: "Fleet status stays small and tells the operational truth"
 pillar: Core
 status: ready
-priority: 1
+priority: 3
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-cli]

@@ -3,11 +3,11 @@ id: C-561
 title: "A failed Fleet worker can resume its exact durable turn"
 pillar: Core
 status: ready
-priority: 0
+priority: 2
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-cli, flux-runtime]
-depends_on: [C-560]
+depends_on: [C-565]
 note: "dogfood stop-line — resume currently routes through the availability check that rejects failed workers"
 ---
 
