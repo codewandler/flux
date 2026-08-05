@@ -33,7 +33,7 @@ already has.
       id. A failing-first TestBackend test feeds `call(id1, read a)`, `call(id2, read b)`,
       `result(id1)` and asserts card *a* resolves while card *b* stays `◌ running` — today the LIFO
       name scan resolves *b*.
-- [ ] stream-json emits the id as a new field (additive) with a release-note line.
+- [x] stream-json emits the id as a new field (additive) with a release-note line.
 - [x] The whatif `RerunRecordingSink` FIFO pairing hazard is either fixed by the id or explicitly
       re-scoped in its comments.
 - [x] Breaking signature change on published crates is recorded as a workspace MINOR decision.
@@ -90,6 +90,18 @@ already has.
   Bonus fix riding the same id: `flux-orchestrate`'s live sub-agent reporter paired
   `SpawnActivityEvent::ToolResult` to its call by popping a per-op-name stack (LIFO) — the same
   cross-attachment one layer down, in the fleet pane. It now keys on the dispatch id.
+
+- 2026-08-05 — integrated into wave `flux-wave-20260805-0829`. The release-note line landed in both
+  ledgers (`CHANGELOG.md` Fixed, `WHATS-NEW.md` New for the additive `dispatch` field), so that box
+  is now ticked; the gate box is ticked from the wave's single full-gate run.
+
+  **Version decision, refined against live tag state.** The MINOR obligation stands, but the target
+  is not 0.56.0. At integration, `v0.56.0` already exists as a *local-only* tag on the local-only
+  `release-cut-0.56.0` branch, cut from `dc07e60e` — a commit that does not contain this wave. The
+  newest tag on `origin` is `v0.55.0`. So this breaking change cannot ship as 0.56.0 unless that
+  unpushed cut is re-taken to include the wave; otherwise it forces 0.57.0. No version is bumped
+  here — the wave ships the code, and the release owner picks between re-cutting 0.56.0 and cutting
+  0.57.0 with full knowledge that the published-crate trait signatures changed.
 
 ## Notes
 

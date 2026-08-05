@@ -57,6 +57,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Every release authority is now scoped to the single job and step that consumes it** (C-354). All
+  four release workflows declare workflow-level `contents: read`; any other GitHub write permission
+  is granted on the one job that needs it, and no workflow- or job-level `env` carries a provider
+  key, `PROMOTION_APP_PRIVATE_KEY`, an App installation token, `RELEASE_TOKEN`,
+  `MINISIGN_SECRET_KEY` or `CARGO_REGISTRY_TOKEN`. Pre-tag promotion uses only the dedicated App
+  inside `release-control`; signing, GitHub Release publication and Cargo publication are distinct
+  tag-triggered jobs inside `release`, so no job combines those authorities. Plugin and crates.io
+  publication accept only an exact tag push — the retained plugin `workflow_dispatch` is
+  structurally a build/validation path that cannot mint a token, create a tag, sign or publish, and
+  `crates-io.yml` drops `workflow_dispatch` entirely. `scripts/check-release-authority.sh` enforces
+  this by parsing the workflow/job/step graph — permissions, `on`, `if`, `environment`, `needs`,
+  `uses`, action inputs and `env` — rather than by matching text, with 21 structural fixtures.
+
+- **The release-candidate receipt now binds the artifact bytes the publishing run must consume**
+  (C-355). Receipt `flux-release-candidate-v3` records each of the seven expected `artifacts-*`
+  uploads by API-reported name, immutable database id, size and exact `sha256:<64 lowercase hex>`
+  digest in one deterministic encoding; missing, expired, duplicate, malformed or extra artifacts
+  fail closed, and v2 is not accepted as a compatibility substitute. Promotion downloads each
+  archive by its receipt-bound id, hashes the raw response bytes and compares identity, size and
+  digest before opening it, then extracts into a fresh per-record namespace that rejects absolute
+  paths, `..` traversal, drive/UNC forms, control characters in names, symlinks and other
+  special members, duplicate members and cross-archive collisions. `merge-multiple: true` is no
+  longer the trust boundary.
+
 - **Core release promotion now binds preview, protected-main integration and public closure into one
   gate** (C-516). `release_plan` reads fully framed commit messages and treats a non-empty
   `[Unreleased]` `Action needed` section as the pre-1.0 breaking signal, correcting the current
@@ -193,6 +217,28 @@ All notable changes to this project are documented in this file. The format is b
   pairs carry reciprocal pointer notes, and `docs/designs/` states its convention in a README.
 
 ### Fixed
+
+- **Tool results can no longer attach to the wrong transcript card** (C-531). `run_call` mints a
+  process-unique `DispatchId` per call and stamps it on both the call and its result, so
+  `FlowSink::{tool_call, tool_result}` and `AgentSink::{tool_call, tool_timing, tool_result}` now
+  carry the pairing the durable log already had. The TUI resolves `finish_tool`/`time_tool` on that
+  id instead of scanning backwards for the newest same-name card, which cross-attached results as
+  soon as C-528 admitted concurrent same-name `read`/`grep`/`glob` batches. The same
+  name-keyed-collection bug is fixed one layer down in the whatif `RerunRecordingSink` (FIFO by op
+  name) and in `flux-orchestrate`'s `TextCollector` (LIFO by op name, the fleet pane's version of
+  the same cross-attachment). `progress_tool` still matches by name and documents why: a
+  `tool.progress` observation is raised below the interpreter that mints the id, and its only
+  producer is `AccessKind::Process`, which the parallel batch scheduler never admits. This is a
+  breaking signature change on published crates and obliges a workspace MINOR bump.
+
+- **A masked host audio socket now fails by name instead of reading zero** (D-235). The sandbox
+  masks `/run` with a tmpfs, so argv alone can never reach a PulseAudio/PipeWire socket at
+  `/run/user/<uid>/pulse`; the companion `[sandbox] writable` grant is now documented as required
+  rather than optional, in the design, the sidecar docs and the website. Flux also refuses a
+  configured writable path under `/run` that does not exist instead of creating it: an empty
+  directory bound over the mask applies successfully and still reaches nothing, which turned a
+  mistyped uid into a silent zero level. The `/run` tmpfs mask and its invariant are unchanged, and
+  no environment passthrough was added.
 
 - **Tool transcript output is safer and easier to inspect** (C-533, C-534, C-536, C-539). Live,
   completed, and resumed tool text now consumes escape sequences and drops terminal control bytes
