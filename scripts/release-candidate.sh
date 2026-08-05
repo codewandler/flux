@@ -1,71 +1,30 @@
 #!/usr/bin/env bash
-# Create or verify the immutable-run receipt used by the build-once release workflow (C-73).
+# Create or verify the immutable-run receipt used by the build-once release workflow (C-73, C-355).
+#
+# The receipt is `flux-release-candidate-v3`. Alongside the version, the lowercase 40-hex commit and
+# the immutable run ID, it binds each of the seven expected `artifacts-*` uploads by its
+# API-reported name, immutable database ID, size and SHA-256 digest — so the tag run promotes an
+# exact set of bytes rather than whatever `artifacts-*` happens to match at promotion time.
+#
+# The format, its canonical encoding and the consumer's raw-ZIP checks all live in
+# scripts/candidate_artifacts.py; this wrapper is the stable entry point the workflows and
+# scripts/cut-release.sh call. Fixtures: scripts/test_candidate_artifacts.py.
+#
+#   scripts/release-candidate.sh write  <receipt> <X.Y.Z> <40-hex-sha> <run-id> [--artifacts FILE]
+#   scripts/release-candidate.sh verify <receipt> <X.Y.Z> <40-hex-sha> <run-id>
+#   scripts/release-candidate.sh fetch  <receipt> <dest> --run-id <run-id> [--source DIR]
+#
 set -euo pipefail
 
-usage() {
-  echo "usage: scripts/release-candidate.sh <write|verify> <receipt> <X.Y.Z> <40-hex-sha> <run-id>" >&2
-  exit 2
-}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
-err() {
-  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-    echo "::error::$*" >&2
-  else
-    echo "error: $*" >&2
-  fi
-}
-
-[ "$#" -eq 5 ] || usage
-COMMAND=$1
-RECEIPT=$2
-VERSION=$3
-COMMIT=$4
-RUN_ID=$5
-
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  err "candidate version must be plain X.Y.Z, got: $VERSION"
-  exit 1
-fi
-if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-  err "candidate commit must be a full lowercase 40-hex SHA"
-  exit 1
-fi
-if ! [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-  err "candidate workflow run ID must be a positive integer"
-  exit 1
-fi
-
-printf -v EXPECTED '%s\n' \
-  'schema=flux-release-candidate-v2' \
-  "version=$VERSION" \
-  "tag=v$VERSION" \
-  "commit=$COMMIT" \
-  'gate=mandatory-full-v1' \
-  "gate_commit=$COMMIT" \
-  "run_id=$RUN_ID"
-
-case "$COMMAND" in
-  write)
-    if [ -L "$RECEIPT" ]; then
-      err "refusing to write candidate receipt through a symlink: $RECEIPT"
-      exit 1
-    fi
-    umask 022
-    printf '%s' "$EXPECTED" >"$RECEIPT"
-    ;;
-  verify)
-    if [ ! -f "$RECEIPT" ] || [ -L "$RECEIPT" ]; then
-      err "candidate receipt is missing or is not a regular file: $RECEIPT"
-      exit 1
-    fi
-    ACTUAL=$(cat "$RECEIPT")
-    EXPECTED=${EXPECTED%$'\n'}
-    if [ "$ACTUAL" != "$EXPECTED" ]; then
-      err "candidate receipt does not match version $VERSION, commit $COMMIT, and run $RUN_ID"
-      exit 1
-    fi
-    ;;
+case "${1:-}" in
+  write|verify|fetch|names) ;;
   *)
-    usage
+    echo "usage: scripts/release-candidate.sh <write|verify> <receipt> <X.Y.Z> <40-hex-sha> <run-id>" >&2
+    echo "       scripts/release-candidate.sh fetch <receipt> <dest> --run-id <run-id>" >&2
+    exit 2
     ;;
 esac
+
+exec "$ROOT/scripts/run-python3.sh" "$ROOT/scripts/candidate_artifacts.py" "$@"

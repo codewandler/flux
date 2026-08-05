@@ -72,34 +72,97 @@ expect_fail env PATH="$TMP/gate-bin:$PATH" MOCK_GATE_ROOT="$TMP/gate-root" MOCK_
 expect_fail env PATH="$TMP/gate-bin:$PATH" MOCK_GATE_ROOT="$TMP/gate-root" MOCK_GATE_SHA="$SHA" \
   MOCK_GATE_LOG="$TMP/gate.log" MOCK_GATE_FAIL='test --workspace' "$FULL_GATE" "$SHA"
 
-"$HELPER" write "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
+# C-355: the producer closure the candidate run must have uploaded, given here in a deliberately
+# NON-canonical order so the receipt's canonical ordering is proved rather than inherited from the
+# input. The expected text below is written out by hand — deriving it from the writer would only
+# prove the writer agrees with itself.
+ARTIFACTS="$TMP/artifacts.json"
+cat >"$ARTIFACTS" <<'INVENTORY'
+{"artifacts": [
+  {"id": 4007, "name": "artifacts-build-global", "size_in_bytes": 700,
+   "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+   "expired": false, "workflow_run": {"id": 123456789}},
+  {"id": 4001, "name": "artifacts-plan-dist-manifest", "size_in_bytes": 100,
+   "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+   "expired": false, "workflow_run": {"id": 123456789}},
+  {"id": 4005, "name": "artifacts-build-local-x86_64-unknown-linux-gnu", "size_in_bytes": 500,
+   "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+   "expired": false, "workflow_run": {"id": 123456789}},
+  {"id": 4002, "name": "artifacts-build-local-aarch64-apple-darwin", "size_in_bytes": 200,
+   "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+   "expired": false, "workflow_run": {"id": 123456789}},
+  {"id": 4006, "name": "artifacts-build-local-x86_64-pc-windows-msvc", "size_in_bytes": 600,
+   "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+   "expired": false, "workflow_run": {"id": 123456789}},
+  {"id": 4003, "name": "artifacts-build-local-aarch64-unknown-linux-gnu", "size_in_bytes": 300,
+   "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+   "expired": false, "workflow_run": {"id": 123456789}},
+  {"id": 4004, "name": "artifacts-build-local-x86_64-apple-darwin", "size_in_bytes": 400,
+   "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+   "expired": false, "workflow_run": {"id": 123456789}},
+  {"id": 4099, "name": "release-candidate-receipt", "size_in_bytes": 42,
+   "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+   "expired": false, "workflow_run": {"id": 123456789}}
+]}
+INVENTORY
+
+"$HELPER" write "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID" --artifacts "$ARTIFACTS"
 "$HELPER" verify "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
 
-expected='schema=flux-release-candidate-v2
+expected='schema=flux-release-candidate-v3
 version=1.2.3
 tag=v1.2.3
 commit=0123456789abcdef0123456789abcdef01234567
 gate=mandatory-full-v1
 gate_commit=0123456789abcdef0123456789abcdef01234567
-run_id=123456789'
+run_id=123456789
+artifact name=artifacts-plan-dist-manifest id=4001 size=100 digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
+artifact name=artifacts-build-local-aarch64-apple-darwin id=4002 size=200 digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
+artifact name=artifacts-build-local-aarch64-unknown-linux-gnu id=4003 size=300 digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
+artifact name=artifacts-build-local-x86_64-apple-darwin id=4004 size=400 digest=sha256:4444444444444444444444444444444444444444444444444444444444444444
+artifact name=artifacts-build-local-x86_64-unknown-linux-gnu id=4005 size=500 digest=sha256:5555555555555555555555555555555555555555555555555555555555555555
+artifact name=artifacts-build-local-x86_64-pc-windows-msvc id=4006 size=600 digest=sha256:6666666666666666666666666666666666666666666666666666666666666666
+artifact name=artifacts-build-global id=4007 size=700 digest=sha256:7777777777777777777777777777777777777777777777777777777777777777'
 actual=$(cat "$RECEIPT")
-[ "$actual" = "$expected" ] || fail "receipt is not deterministic"
+[ "$actual" = "$expected" ] || fail "receipt is not the deterministic v3 encoding"
 
-expect_fail "$HELPER" write "$RECEIPT" v1.2.3 "$SHA" "$RUN_ID"
-expect_fail "$HELPER" write "$RECEIPT" 1.2 "$SHA" "$RUN_ID"
-expect_fail "$HELPER" write "$RECEIPT" "$VERSION" "${SHA%?}" "$RUN_ID"
-expect_fail "$HELPER" write "$RECEIPT" "$VERSION" "$SHA" run-1
+expect_fail "$HELPER" write "$RECEIPT" v1.2.3 "$SHA" "$RUN_ID" --artifacts "$ARTIFACTS"
+expect_fail "$HELPER" write "$RECEIPT" 1.2 "$SHA" "$RUN_ID" --artifacts "$ARTIFACTS"
+expect_fail "$HELPER" write "$RECEIPT" "$VERSION" "${SHA%?}" "$RUN_ID" --artifacts "$ARTIFACTS"
+expect_fail "$HELPER" write "$RECEIPT" "$VERSION" "$SHA" run-1 --artifacts "$ARTIFACTS"
 expect_fail "$ROOT/scripts/cut-release.sh" patch --no-gate
 ln -s "$RECEIPT" "$TMP/receipt-link"
-expect_fail "$HELPER" write "$TMP/receipt-link" "$VERSION" "$SHA" "$RUN_ID"
+expect_fail "$HELPER" write "$TMP/receipt-link" "$VERSION" "$SHA" "$RUN_ID" --artifacts "$ARTIFACTS"
 
-"$HELPER" write "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
+# A run missing one of the seven, or carrying an eighth, cannot produce a receipt at all.
+jq 'del(.artifacts[0])' "$ARTIFACTS" >"$TMP/missing.json"
+expect_fail "$HELPER" write "$TMP/short.txt" "$VERSION" "$SHA" "$RUN_ID" --artifacts "$TMP/missing.json"
+jq '.artifacts += [{"id":4100,"name":"artifacts-build-local-extra","size_in_bytes":9,
+  "digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "expired":false,"workflow_run":{"id":123456789}}]' "$ARTIFACTS" >"$TMP/extra.json"
+expect_fail "$HELPER" write "$TMP/extra.txt" "$VERSION" "$SHA" "$RUN_ID" --artifacts "$TMP/extra.json"
+
+"$HELPER" write "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID" --artifacts "$ARTIFACTS"
 expect_fail "$HELPER" verify "$RECEIPT" 1.2.4 "$SHA" "$RUN_ID"
 expect_fail "$HELPER" verify "$RECEIPT" "$VERSION" a123456789abcdef0123456789abcdef01234567 "$RUN_ID"
 expect_fail "$HELPER" verify "$RECEIPT" "$VERSION" "$SHA" 987654321
 
 printf '\nextra=untrusted\n' >>"$RECEIPT"
 expect_fail "$HELPER" verify "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID"
+
+# v2 is not a compatibility substitute: discovery and every consumer require v3.
+cat >"$TMP/v2.txt" <<'V2'
+schema=flux-release-candidate-v2
+version=1.2.3
+tag=v1.2.3
+commit=0123456789abcdef0123456789abcdef01234567
+gate=mandatory-full-v1
+gate_commit=0123456789abcdef0123456789abcdef01234567
+run_id=123456789
+V2
+expect_fail "$HELPER" verify "$TMP/v2.txt" "$VERSION" "$SHA" "$RUN_ID"
+
+"$HELPER" write "$RECEIPT" "$VERSION" "$SHA" "$RUN_ID" --artifacts "$ARTIFACTS"
 
 # Drive the GitHub lookup through a fake CLI. Run 42 is successful but its receipt expired; run 41
 # is complete, proving the finder considers provenance completeness instead of selecting by SHA alone.
@@ -108,6 +171,31 @@ cat >"$MOCK_GH" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$GH_MOCK_LOG"
+
+# The finder asks for `.artifacts[]` with --paginate, so artifact answers are line-delimited JSON.
+emit_closure() {
+  receipt_live=$1
+  shift
+  skip=""; rename=""; extra=""
+  for option in "$@"; do
+    case "$option" in
+      skip=*) skip=${option#skip=} ;;
+      rename=*) rename=${option#rename=} ;;
+      extra=*) extra=${option#extra=} ;;
+    esac
+  done
+  printf '{"name":"release-candidate-receipt","expired":%s}\n' \
+    "$([ "$receipt_live" = true ] && echo false || echo true)"
+  for name in $MOCK_EXPECTED_NAMES; do
+    [ "$name" != "$skip" ] || continue
+    case "$rename" in
+      "$name":*) name=${rename#*:} ;;
+    esac
+    printf '{"name":"%s","expired":false}\n' "$name"
+  done
+  [ -z "$extra" ] || printf '{"name":"%s","expired":false}\n' "$extra"
+}
+
 case "$*" in
   *'/actions/workflows/release.yml/runs'*)
     if [ "${MOCK_SCENARIO:-valid}" = "api-error" ]; then
@@ -122,14 +210,25 @@ case "$*" in
     fi
     ;;
   *'/runs/42/artifacts'*)
-    echo '{"artifacts":[{"name":"release-candidate-receipt","expired":true},{"name":"artifacts-build-global","expired":false},{"name":"artifacts-build-local-linux","expired":false}]}'
+    # The complete closure, but the receipt has expired: nothing to promote.
+    emit_closure false
     ;;
   *'/runs/41/artifacts'*)
-    if [ "${MOCK_SCENARIO:-valid}" = "partial" ]; then
-      echo '{"artifacts":[{"name":"release-candidate-receipt","expired":false},{"name":"artifacts-build-global","expired":false},{"name":"artifacts-build-local-linux-x64","expired":false}]}'
-    else
-      echo '{"artifacts":[{"name":"release-candidate-receipt","expired":false},{"name":"artifacts-build-global","expired":false},{"name":"artifacts-build-local-linux-x64","expired":false},{"name":"artifacts-build-local-linux-arm64","expired":false},{"name":"artifacts-build-local-macos-x64","expired":false},{"name":"artifacts-build-local-macos-arm64","expired":false},{"name":"artifacts-build-local-windows-x64","expired":false}]}'
-    fi
+    case "${MOCK_SCENARIO:-valid}" in
+      partial)
+        # Four of the five targets. The old ">= 5 build-local" rule was the thing that let a
+        # not-quite-complete run look promotable.
+        emit_closure true skip=artifacts-build-local-x86_64-pc-windows-msvc
+        ;;
+      renamed)
+        # Exactly seven `artifacts-*` uploads, but one is not a member of the closure.
+        emit_closure true rename=artifacts-build-global:artifacts-build-universal
+        ;;
+      surplus)
+        emit_closure true extra=artifacts-build-local-extra
+        ;;
+      *) emit_closure true ;;
+    esac
     ;;
   *) exit 1 ;;
 esac
@@ -137,6 +236,7 @@ MOCK
 chmod +x "$MOCK_GH"
 
 : >"$TMP/gh.log"
+export MOCK_EXPECTED_NAMES="$("$HELPER" names | tr '\n' ' ')"
 selected=$(GH_CLI="$MOCK_GH" GH_MOCK_LOG="$TMP/gh.log" MOCK_SCENARIO=valid \
   "$FINDER" codewandler/flux "$SHA")
 [ "$selected" = 41 ] || fail "finder did not skip the expired candidate"
@@ -147,9 +247,12 @@ grep -Fq 'status=success' "$TMP/gh.log" || fail "finder omitted successful-run f
 selected=$(GH_CLI="$MOCK_GH" GH_MOCK_LOG="$TMP/gh.log" MOCK_SCENARIO=none \
   "$FINDER" codewandler/flux "$SHA")
 [ -z "$selected" ] || fail "finder selected a nonexistent candidate"
-selected=$(GH_CLI="$MOCK_GH" GH_MOCK_LOG="$TMP/gh.log" MOCK_SCENARIO=partial \
-  "$FINDER" codewandler/flux "$SHA")
-[ -z "$selected" ] || fail "finder selected an incomplete candidate"
+for scenario in partial renamed surplus; do
+  selected=$(GH_CLI="$MOCK_GH" GH_MOCK_LOG="$TMP/gh.log" MOCK_SCENARIO="$scenario" \
+    "$FINDER" codewandler/flux "$SHA")
+  [ -z "$selected" ] || fail "finder selected a candidate whose closure is $scenario"
+done
+grep -Fq -- '--paginate' "$TMP/gh.log" || fail "finder does not paginate the artifact inventory"
 expect_fail env GH_CLI="$MOCK_GH" GH_MOCK_LOG="$TMP/gh.log" MOCK_SCENARIO=api-error \
   "$FINDER" codewandler/flux "$SHA"
 expect_fail "$FINDER" not-a-repo "$SHA"

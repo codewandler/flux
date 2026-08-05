@@ -87,6 +87,12 @@ jobs:
         run: |
           scripts/test-embedded-docs-gates.sh
           scripts/test-release-candidate.sh
+          # C-355: receipt v3 and the raw-ZIP trust boundary, including every corruption class the
+          # promotion consumer must refuse before it writes a single extracted byte.
+          scripts/run-python3.sh scripts/test_candidate_artifacts.py
+          # C-354: the promotion ordering fixtures existed but were never run by CI, so a
+          # regression in the irreversible half was only ever caught by reading the script.
+          scripts/test-promote-release-flow.sh
 
       - name: Install Rust toolchain
         # Pinned, not `stable`: every Rust release ships new clippy lints that `-D warnings`
@@ -425,6 +431,20 @@ jobs:
         run: |
           ./scripts/check-release-integrity.sh --self-test
           ./scripts/check-release-integrity.sh
+
+      # C-354: permissions are job-scoped and secrets can be step-scoped, so least privilege for a
+      # release pipeline is a property of the parsed workflow/job/step graph. This parses all four
+      # release workflows and rejects any credential that escapes its single authorized step.
+      - name: Release authority is scoped to the job and step that consume it
+        run: |
+          ./scripts/check-release-authority.sh --self-test
+          ./scripts/check-release-authority.sh
+
+      - name: Promotion helpers fail closed
+        run: |
+          ./scripts/bundle-release-cut.sh --self-test
+          ./scripts/mint-promotion-token.sh --self-test
+          ./scripts/plugin-tag-control.sh --self-test
 
   no-direct-io:
     name: model-facing tool crates do not reach IO behind flux-system

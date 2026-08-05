@@ -12,10 +12,18 @@ code = File.read(path)
 abort "promotion does not reject publication credentials" unless
   code.include?('[ -z "${RELEASE_TOKEN:-}" ]') && code.include?("PROMOTION_TOKEN from flux-release-promoter")
 abort "direct main push returned" if code.match?(/(?:HEAD|CUT_SHA|MERGED_SHA):(?:refs\/heads\/)?main/)
+abort "force push to main returned" if code.match?(/push[^\n]*--force[^\n]*(?<!-)\bmain\b/)
 abort "direct git tag push returned" if code.match?(/push[^\n]*TAG_REF:\$TAG_REF/)
 abort "administrator merge bypass returned" if code.include?("--admin")
+# C-354: the cut is made by a credential-free job, so it arrives as a bundle. An unverified import
+# would let anything that can write that artifact choose the commit this job promotes.
+abort "the imported cut is not verified before use" unless
+  code.include?('git bundle verify "$RELEASE_CUT_BUNDLE"')
+abort "the installation token is not revoked when promotion exits" unless
+  code.include?("api -X DELETE /installation/token")
 
 required = {
+  bundle: 'git bundle verify "$RELEASE_CUT_BUNDLE"',
   cut_branch: 'CUT_BRANCH=release-cuts/$TAG',
   pr: 'app_gh pr create',
   exact_ci: 'wait_for_ci || fail',
@@ -23,6 +31,8 @@ required = {
   canonical_main: 'git/ref/heads/main',
   exact_tree: 'merged main does not contain the exact cut diff',
   candidate: '"$MERGED_SHA:$CANDIDATE_REF"',
+  candidate_readback: 'does not point at the merged canonical-main SHA',
+  receipt: 'scripts/release-candidate.sh verify',
   release_baseline: 'RELEASE_BASELINE=$(latest_run_id release.yml)',
   crates_baseline: 'CRATES_BASELINE=$(latest_run_id crates-io.yml)',
   tag_object: 'git/tags',
@@ -38,7 +48,7 @@ indexes = required.transform_values do |needle|
   abort "missing promotion boundary #{needle}" unless index
   index
 end
-order = %i[cut_branch pr exact_ci merge canonical_main exact_tree candidate release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
+order = %i[bundle cut_branch pr exact_ci merge canonical_main exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
 order.each_cons(2) do |left, right|
   abort "promotion order regressed: #{left} must precede #{right}" unless indexes.fetch(left) < indexes.fetch(right)
 end
@@ -61,11 +71,13 @@ check_policy "$PROMOTER"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/flux-promoter-policy.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 for needle in \
+  'git bundle verify "$RELEASE_CUT_BUNDLE"' \
   'app_gh pr create' \
   'wait_for_ci || fail' \
   'app_gh pr merge' \
   'git/ref/heads/main' \
   '"$MERGED_SHA:$CANDIDATE_REF"' \
+  'scripts/release-candidate.sh verify' \
   'RELEASE_BASELINE=$(latest_run_id release.yml)' \
   'CRATES_BASELINE=$(latest_run_id crates-io.yml)' \
   'wait_for_exact_run release.yml' \
@@ -84,6 +96,7 @@ done
 # Explicit negative identities and recovery regressions.
 for injection in \
   'git push origin HEAD:main' \
+  'git_with_promoter push --force "$PUSH_URL" "$MERGED_SHA:main"' \
   'app_gh pr merge "$PR_NUMBER" --admin' \
   'git_with_promoter push "$PUSH_URL" "$TAG_REF:$TAG_REF"'
 do

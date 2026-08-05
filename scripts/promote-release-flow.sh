@@ -17,6 +17,21 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
 
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
+
+# C-354: the cut is made by a credential-free job and arrives here as a git bundle, because the job
+# that can push must not run a model. The bundle's prerequisite is the trigger commit this checkout
+# already has, so an import can only add the one cut commit and its annotated tag — every identity
+# below is still re-derived from the imported objects and checked against live GitHub state.
+if [ -n "${RELEASE_CUT_BUNDLE:-}" ]; then
+  [ -f "$RELEASE_CUT_BUNDLE" ] || fail "release cut bundle $RELEASE_CUT_BUNDLE is missing"
+  git bundle verify "$RELEASE_CUT_BUNDLE" >/dev/null || fail "release cut bundle failed verification"
+  git fetch --no-tags --quiet "$RELEASE_CUT_BUNDLE" refs/heads/release-cut:refs/heads/release-cut \
+    || fail "could not import the release cut branch"
+  git fetch --quiet "$RELEASE_CUT_BUNDLE" 'refs/tags/v*:refs/tags/v*' \
+    || fail "could not import the release cut tag"
+  git checkout --quiet --detach refs/heads/release-cut || fail "could not check out the imported cut"
+fi
+
 [ -z "$(git status --porcelain)" ] || fail "release cut left a dirty working tree"
 
 VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
@@ -99,6 +114,9 @@ candidate_staged=0
 merged_sha_for_resume=
 cleanup_notice() {
   status=$?
+  # The installation token dies with the job in any case; revoking it makes that immediate, so a
+  # leaked log line or a paused runner cannot extend promotion authority past this script.
+  app_gh api -X DELETE /installation/token >/dev/null 2>&1 || true
   if [ "$status" -ne 0 ] && [ "$candidate_staged" -eq 1 ]; then
     echo "::error::promotion failed; $CANDIDATE_REF remains at $merged_sha_for_resume" >&2
     printf 'Resume exactly: EXPECTED_RELEASE_SHA=%q PROMOTION_RESUME_TAG=%q PROMOTION_RESUME_SHA=%q scripts/promote-release-flow.sh\n' \
@@ -142,6 +160,10 @@ merged_sha_for_resume=$MERGED_SHA
 echo "Staging merged canonical-main SHA $MERGED_SHA at $CANDIDATE_REF"
 git_with_promoter push "$PUSH_URL" "$MERGED_SHA:$CANDIDATE_REF"
 candidate_staged=1
+# C-355: the candidate ref IS the promotion source, so read it back rather than assuming the push
+# landed what we asked for. Everything downstream is bound to this SHA.
+[ "$(remote_sha "$CANDIDATE_REF")" = "$MERGED_SHA" ] \
+  || fail "$CANDIDATE_REF does not point at the merged canonical-main SHA $MERGED_SHA"
 
 CANDIDATE_BASELINE=$(latest_run_id release.yml)
 actions_gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$CANDIDATE_BRANCH" -f "version=$VERSION"
