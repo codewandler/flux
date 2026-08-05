@@ -56,6 +56,8 @@ runtime can hold a turn mid-flight while a human decides, without losing state o
   ages out was not really paused.
 - ⚠ Open: per-run or global when sub-agents are in flight. A parent that pauses while its children
   continue is worse than no pause.
+- C-570 is deliberately different: the worker reaches a loop-declared safe checkpoint, reports and
+  yields cooperatively. This story remains operator-initiated pause at a boundary nobody declared.
 
 ## Progress
 

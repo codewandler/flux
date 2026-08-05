@@ -4,6 +4,7 @@ title: "Project truthful usage attribution and cost"
 pillar: Core
 status: backlog
 epic: usage-observatory
+depends_on: [C-519, C-575]
 note: "Keep provider, model, timestamp and price provenance explicit; never double-count Flux call and turn totals"
 ---
 
@@ -34,6 +35,8 @@ data obey one non-duplicating selection rule.
       `mixed_cost_provenance_survives_aggregation` proves unknown cost never renders or serializes as
       `$0` and historical estimates retain their pricing basis.
 - [ ] C-519's `flux usage` parity remains green after the projection is adopted.
+- [ ] Native causal receipt ids/coverage survive normalization for C-577 bills; foreign harness rows
+      remain truthfully partial instead of being discarded or assigned guessed story ownership.
 
 ## Progress
 
@@ -41,6 +44,6 @@ data obey one non-duplicating selection rule.
 
 ## Notes
 
-- Depends on [C-519](C-519-shared-cross-harness-usage-timeline.md).
+- Depends on [C-519](C-519-shared-cross-harness-usage-timeline.md) and C-575's native receipt schema.
 - Reuse the selection and pricing semantics cited by [C-518](C-518-usage-observatory-epic.md) in
   `crates/flux-events/src/projection.rs`; do not create a competing accounting system.

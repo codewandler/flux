@@ -6,6 +6,7 @@ status: backlog
 epic: board-fleet-tui
 design: docs/designs/board-fleet-tui.md
 areas: [flux-tui, flux-cli, flux-orchestrate]
+depends_on: [C-570]
 note: "follow-up UI — conversational main surface plus attention rail; CLI remains automation API"
 ---
 
@@ -22,6 +23,8 @@ worker and decision attention visible but secondary.
       durable connection state.
 - [ ] A responsive attention rail summarizes workers, open decisions, blocked work and red gates with
       keyboard/mouse navigation and a narrow-terminal fallback.
+- [ ] Worker phase/attention comes from C-570's acknowledged report projection; raw model prose and
+      host-observed tool activity may be shown separately but never impersonate worker status.
 - [ ] Sending requirements, choosing a suggested decision and acknowledged follow-ups use the same
       typed fleet operations and display accepted/delivered/completed state.
 - [ ] Restart reconstructs the view from durable events without terminal scraping.

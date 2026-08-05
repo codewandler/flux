@@ -127,6 +127,18 @@ existing worker from its snapshot. Status and receipts expose only a bounded
 `flux.fleet-capability-set/v1` digest manifest and counts, never the full operation catalogue,
 paths, prompt or instruction body.
 
+Worker admission also resolves one explicit versioned agent-loop binding under
+[agent-loop-harnesses.md](agent-loop-harnesses.md). General agents may resolve an omitted selector to
+the adaptive preset, but Fleet writer/reviewer/decision roles must name a policy-selected profile.
+The binding's profile, revision, source digest and entry point are snapshotted beside capabilities;
+continuation cannot drift to an edited file or backend default. Task kind is explicit dispatch
+metadata and may be mapped by any Board backend without making Board a datasource or loop runner.
+
+Host-observed `SpawnActivity` remains telemetry. A worker-authored progress/yield record uses C-570's
+bounded acknowledged channel and cannot mutate Board or Fleet state. C-542/C-571 budget envelopes are
+reserved from Fleet through assignment and agent scopes and settled from typed usage; exhaustion is
+an inspectable resumable terminal rather than an unstructured failed answer.
+
 `.flux/fleet.toml` declares main instructions/model, named reusable agent templates, whether ad-hoc
 agents are allowed, repository ids/paths, canonical refs, planning-board bindings, gates, ledger
 fences, concurrency and schedule groupings. The coordinator may instantiate a template or admit an
@@ -144,6 +156,11 @@ rounds; dependency-ordered child-commit integration; and one unskippable full ga
 integration tree. Red preserves the candidate and cannot transition planning items to done. Green
 leaves local `fleet/<wave>` branches. Only `flux fleet apply` revalidates and merges them, without
 pushing.
+
+The writer workhorse reports `handoff_ready`, after which the host starts a distinct fresh read-only
+reviewer under its own reviewer loop. That loop composes the shipped strict-review flow and returns
+typed PASS/REWORK/PARK. REWORK enters the original writer's explicit repair entry point; C-245's
+two-round host ceiling remains authoritative. The writer never reviews itself.
 
 Open decisions block only their linked work; other ready items continue. Human mode surfaces the
 structured choices and recommendation. Auto mode creates a fresh adversarial decision agent with
@@ -172,6 +189,10 @@ Board wave: C-547 (machine CLI contract), A-134 (registry/profile core), L-130 (
 
 Fleet wave: C-244 (typed handoff), C-245 (same-session rework), C-242 (integration and explicit
 apply), A-117 (durable supervisor and fleet CLI), C-551 (inspection, reporting and roadmap parity).
+
+Fleet dogfood hardening: C-569 (resolved loop binding), C-567 (workhorse task-kind policy), C-570
+(progress/yield), C-572 (review/repair loops), C-542/C-571 (local and hierarchical budgets), then
+C-565's five-writer proof.
 
 Generic task-agent backends and Codex/Claude/Hermes/Pi CLI harness adapters, authenticated remote
 A2A fleet members, a polished board/fleet TUI, vendor boards, containers, automatic publication and

@@ -23,6 +23,9 @@ boundary the observatory can use without depending on `flux-cli` or inventing an
 - [ ] The shared record carries source harness, session, raw model, event or bucket time plus its
       precision, all available `Usage` tiers, call count, and source cost facts; absence stays explicit
       rather than becoming a zero or fabricated value.
+- [ ] Flux-native records may link C-575 causal resource receipts (request/result/BoardRef plus
+      physical resource coverage). Foreign harnesses that expose only token history remain valid
+      partial records and are never assigned invented CPU/network ownership.
 - [ ] Existing Codex, Claude Code, and opencode acquisition delegates to the current adapters. No
       parser is copied into the shared model or `flux-tui`, and the shared crate remains below both
       `flux-cli` and `flux-tui` in the repository layer map.
@@ -43,5 +46,6 @@ boundary the observatory can use without depending on `flux-cli` or inventing an
 
 - First child of [C-518](C-518-usage-observatory-epic.md); C-520 consumes this record and adds truthful
   provider/model attribution and pricing semantics.
+- C-574's result bills are a richer native input, not a replacement for cross-harness discovery.
 - Existing source seams are summarized in the epic: `crates/flux-cli/src/usage.rs`,
   `crates/flux-capabilities/src/harness/mod.rs`, and `crates/flux-events/src/kind.rs`.

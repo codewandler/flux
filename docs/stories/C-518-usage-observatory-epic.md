@@ -25,6 +25,11 @@ coarser compatibility total (`crates/flux-events/src/kind.rs:92-112`). The epic 
 read-only usage timeline/projection from those proven inputs and gives it a replay clock and TUI;
 it must not copy the private CLI folds into `flux-tui` or sum call and turn totals together.
 
+C-574 adds the separate causal resource-accounting foundation for “what did this result/story use?”
+including CPU/network/byte/gate dimensions and BoardRef attribution. The Observatory consumes those
+native receipts when present while retaining partial token-only foreign-harness history; it does not
+reimplement the ledger or pretend missing causal/resource data exists.
+
 ## Experience
 
 The primary wide layout is an observability cockpit, not an animated table:
@@ -157,3 +162,5 @@ stories consume them rather than re-deriving accounting inside widgets.
   safety envelope.
 - **Non-goals for this epic:** cloud sync, organization billing, invoice reconciliation, prompt or
   answer replay, arbitrary external telemetry backends, and editing pricing from inside the TUI.
+- **Result bills live in C-574.** This epic visualizes their native facts alongside foreign harness
+  usage but does not own causal Board attribution or shared-overhead allocation.

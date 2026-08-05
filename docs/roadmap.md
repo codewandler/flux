@@ -836,7 +836,7 @@ write boundary in [zendesk-triage.md](zendesk-triage.md), is the contract the re
 the `zendesk.*` operation names are the only part expected to move.
 Design: [zendesk-automation.md](designs/zendesk-automation.md).
 
-### Native fleet — board wave to reviewed local integration (epic) — 🔄 **IN PROGRESS (C-239; fleet wave ready after board foundation)**
+### Native fleet — board wave to reviewed local integration (epic) — 🔄 **V1 SHIPPED; DOGFOOD HARDENING IN PROGRESS (C-239 done; C-561…C-573 active tail)**
 
 Decision 0010 turns the delivered fleet primitives into a supported `flux fleet` product over local
 native sub-agents. The host enforces one writer/worktree per story, typed write-set fences,
@@ -849,13 +849,54 @@ reports and roadmap scriptless parity. Claude and Codex call the same versioned 
 bootstrap from `flux fleet skill`; direct foreign-process and remote code workers remain later.
 Design: [native-board-fleet-cli](designs/native-board-fleet-cli.md).
 
-### Task-agent backends and CLI harness adapters (epic) — ⏸ **BACKLOG (C-552, C-553; after native fleet V1)**
+### Explicit agent-loop harnesses — workhorse, review, progress and budgets (epic) — 🔄 **IN PROGRESS (C-568; C-569 first)**
+
+Every agent start resolves behavior independently of model/backend/membership. The ordinary Flux
+default becomes the recorded `builtin:adaptive@1` binding; roles and tasks resolve their own allowed
+profile and never inherit a parent's loop or conversation implicitly. Fleet roles have no ambient
+adaptive fallback: C-569 establishes the common versioned binding, C-567 maps explicit assignment
+kinds to a native implementation workhorse, C-570 adds acknowledged progress and cooperative yield,
+and C-572 composes a fresh read-only reviewer loop plus same-writer repair over the existing typed
+PASS/REWORK/PARK and two-round host rules.
+
+C-575 supplies immutable physical-usage receipts, C-542 supplies one time/call/token
+target-versus-limit vocabulary, and C-571 reserves and settles them across Fleet, wave, assignment,
+agent and loop scopes, with C-130 later adding monetary and rolling
+per-principal caps. C-573 closes the feedback loop: freshness-labelled total/per-wave/per-worker
+cost, call, token, wall/available-CPU and verified-quality metrics may tune only pre-authorized
+model/effort, concurrency and reservations at safe boundaries. Hard caps, capability fences,
+review/gates and admitted model/provider ladders cannot be widened by the controller. C-543/C-544
+remain the selector/authoring UI over this binding; A-140/A-141 remain operator pause rather than
+worker yield. C-583 exposes the manual capacity actuator first: one admitted agent per Fleet worker,
+revisioned desired capacity inside `max_workers`, assignment-bound scale-up and safe drain-down via
+one operation/CLI service. Nested `task` children remain a separate bounded agent resource, not
+workers inside workers. Design: [agent-loop-harnesses](designs/agent-loop-harnesses.md).
+
+### Resource accounting — a realistic bill for every result (epic) — ⏸ **BACKLOG (C-574; C-575 first)**
+
+Accounting is independent of whether execution has a hard budget. C-575 records immutable causal
+resource spans for model calls/tokens, wall and available process CPU/RSS, guarded network
+DNS/connect/TLS/TTFB/transfer and bytes, tool/process/artifact resources, capacity/queue occupancy and
+targeted/review/gate validation. Every dimension says reported, measured, estimated, unsupported or
+unattributable; missing data and unknown price are never zero.
+
+C-576 binds those spans to exact request/result, BoardRef assignment, worker and wave and separates
+exclusive, inclusive and explicitly allocated shared overhead. C-577 links a compact immutable bill
+as Board evidence and rolls the same receipts up by story, epic-at-revision, worker, wave, repository
+and Fleet. Provider-reported charges, pricing-table/subscription equivalents and operator-rated CPU/
+network costs remain separate with coverage. C-519/C-520's cross-harness token/cost timeline consumes
+the native receipts when present while preserving truthful partial foreign history. Design:
+[resource-accounting](designs/resource-accounting.md).
+
+### Task-agent backends and CLI harness adapters (epic) — ⏸ **BACKLOG (C-552, C-553; after C-542/C-569/C-570/C-575 contracts)**
 
 Fleet membership does not imply one execution transport. C-552 introduces a generic lifecycle and
 receipt port that keeps identity/admission/BoardRef/mode/fences separate from how a task runs. C-553
 then binds installed Codex, Claude, Hermes and Pi CLIs through argv-only local adapters with durable
-session and acknowledgement mapping. Native Flux sub-agents remain the V1 baseline; the adapters do
-not become alternate coordinators and cannot bypass handoff or publication fences. Design:
+session and acknowledgement mapping. Backends advertise arbitrary Flux-loop versus named-profile,
+progress/yield and budget support and refuse unsupported behavior rather than invoking their own
+defaults. Native Flux sub-agents remain the reference; adapters do not become alternate coordinators
+and cannot bypass handoff or publication fences. Design:
 [task-agent-backends](designs/task-agent-backends.md).
 
 ### Authenticated remote fleet membership and A2A workers (epic) — ⏸ **BACKLOG (C-554, C-555; after C-552)**
@@ -866,12 +907,13 @@ backend over A2A and verifies remote artifacts inside a local isolation boundary
 Network identity alone never grants a BoardRef or worker authority. Design:
 [remote-fleet-membership](designs/remote-fleet-membership.md).
 
-### Board and fleet operations TUI (epic) — ⏸ **BACKLOG (C-556, C-557; after native fleet V1)**
+### Board and fleet operations TUI (epic) — ⏸ **BACKLOG (C-556, C-557; after C-570/C-571 projections)**
 
 The CLI stays the automation API, while the human UI centers the one main coordinator conversation.
 C-556 builds the responsive conversational shell and attention rail. C-557 adds read-only worker
 channel/activity peeks plus native board, decision, dependency and exact-statistics views. The TUI
-projects typed durable state and must be materially more useful than embedding compact CLI output.
+projects typed durable loop/progress/budget/controller state and must be materially more useful than
+embedding compact CLI output.
 Design: [board-fleet-tui](designs/board-fleet-tui.md).
 
 ### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**

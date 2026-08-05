@@ -7,7 +7,7 @@ priority: 1
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-cli, flux-capabilities, flux-runtime]
-depends_on: [C-566, C-567]
+depends_on: [C-566, C-567, C-572]
 note: "dogfood defect — continued writer turns exposed a different operation set than the admitted template"
 ---
 
@@ -30,8 +30,8 @@ rework and resume so continuation neither loses required tools nor widens author
       embedding prompts, secrets or the full operation catalogue.
 - [x] Template reload, restart, rework and resume behavior is explicit and tested; an existing
       worker does not silently adopt a wider edited template.
-- [ ] The three-repository, five-writer dogfood run completes with every writer retaining the
-      capabilities its story requires.
+- [ ] The three-repository, five-writer dogfood run completes under the admitted workhorse/reviewer
+      loop bindings with every writer retaining the capabilities its story requires.
 
 ## Notes
 
@@ -54,5 +54,5 @@ rework and resume so continuation neither loses required tools nor widens author
   `task_tool_forwards_the_contexts_active_cap_scope_to_the_spawner`, proving a nested task inherits
   the active parent scope and cannot add an operation the parent lacks. Missing writer and
   read-only capabilities fail at admission with sorted exact names.
-- The final three-repository, five-writer dogfood acceptance remains open until the gated binary is
-  installed and used for the scheduled cross-repository wave.
+- The final three-repository, five-writer dogfood acceptance remains open until C-569/C-567/C-572's
+  explicit workhorse/reviewer loops are installed and used for the scheduled cross-repository wave.
