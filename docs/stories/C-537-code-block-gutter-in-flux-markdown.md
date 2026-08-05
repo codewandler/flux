@@ -3,6 +3,7 @@ id: C-537
 title: "Code-block gutter in flux-markdown"
 pillar: Core
 status: ready
+priority: 36
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
 areas: [flux-markdown]

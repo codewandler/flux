@@ -3,6 +3,7 @@ id: C-532
 title: "Carry both faces of a ToolResult to surfaces; yank copies canonical content"
 pillar: Core
 status: ready
+priority: 35
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
 areas: [flux-lang, flux-tui, flux-cli]
