@@ -808,6 +808,9 @@ fn resolve_existing_path(raw: &str, base: &Path) -> Option<PathBuf> {
 /// Validate the writable set before backend argv construction and materialize explicitly configured
 /// output roots. Automatic roots such as absent cargo/rustup caches stay best-effort; configured
 /// roots are a contract and therefore either exist (created as directories) or fail clearly.
+///
+/// One exception, from D-235: a configured root under the masked `/run` is never created. See
+/// [`refuse_manufactured_run_grant`].
 fn prepare_writable_paths(policy: &SpawnPolicy) -> Result<()> {
     if !policy.unconfined
         && policy
@@ -832,6 +835,7 @@ fn prepare_writable_paths(policy: &SpawnPolicy) -> Result<()> {
         match std::fs::metadata(path) {
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                refuse_manufactured_run_grant(path)?;
                 std::fs::create_dir_all(path).map_err(|create_err| {
                     Error::Config(format!(
                         "create configured sandbox writable directory {path:?}: {create_err}"
@@ -846,6 +850,37 @@ fn prepare_writable_paths(policy: &SpawnPolicy) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse to *create* a configured writable root under `/run` (D-235).
+///
+/// Creating a missing configured root is right for an output directory and wrong here. `/run` is
+/// runtime state owned by the system and by whatever is currently running; nothing under it is
+/// flux's to bring into existence. It is also the one path in the writable set that is
+/// unconditionally masked by a tmpfs, so the bind that a `[sandbox] writable` entry emits is doing
+/// something qualitatively different from every other entry: it is re-exposing a host runtime
+/// directory — in practice, one holding a **socket** — back through the mask.
+///
+/// That makes a typo uniquely expensive. `[sandbox] writable = ["/run/user/1001/pulse"]` on a host
+/// where the operator is uid 1000 would otherwise have flux create an empty `…/1001/pulse` and bind
+/// it over the tmpfs. The sandboxed process then finds a directory, finds no socket in it, and
+/// connects to nothing — and because a media sidecar's evidence for "no audio server" is a level
+/// probe reading zero, the operator's config looks applied and the failure looks like the room.
+/// Refusing by name keeps the failure at startup, where it is legible.
+///
+/// An existing `/run` path is untouched: granting a socket directory that is really there is the
+/// supported recipe, not the hazard.
+fn refuse_manufactured_run_grant(path: &Path) -> Result<()> {
+    if !crate::normalize_lexically(path).starts_with("/run") {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "configured sandbox writable path {path:?} does not exist, and flux will not create it: \
+         the sandbox masks `/run` with a tmpfs, so an empty directory bound there would be applied \
+         successfully and still reach nothing — a host socket such as \
+         `/run/user/<uid>/pulse` cannot be manufactured. Check the path (a wrong uid is the common \
+         cause) and grant the directory that actually holds the socket"
+    )))
 }
 
 fn writable_path_is_root(path: &Path) -> bool {
@@ -2657,6 +2692,95 @@ mod tests {
         assert!(
             !windowed_contains(&out, &["--bind-try", &output, &output]),
             "configured paths must fail loudly if they disappear before exec: {out:?}"
+        );
+    }
+
+    /// D-235 — the property that makes `[sandbox] writable` the right mechanism for a **socket**
+    /// and not merely for a directory of files.
+    ///
+    /// `--tmpfs /run` must be emitted *before* the configured bind, because bwrap applies mount
+    /// operations in argv order and resolves bind *sources* in the original namespace. In that
+    /// order the bind punches the host directory back through the mask and the socket inode — with
+    /// it, `connect(2)` — comes back. In the reverse order the tmpfs would wipe the bind and the
+    /// operator's config line would do exactly nothing, silently. The grant must also be
+    /// read-write: `connect(2)` on an `AF_UNIX` socket takes `MAY_WRITE` on the socket inode, so a
+    /// `--ro-bind` would leave the path visible and still refuse the connection.
+    #[test]
+    fn a_configured_run_grant_is_bound_read_write_after_the_run_mask() {
+        let (_dir, ws) = temp_workspace();
+        let cwd = ws.root().to_path_buf();
+        let pulse = PathBuf::from("/run/user/1000/pulse");
+        let mut policy = policy_for(&cwd, vec![cwd.clone(), pulse.clone()], true, false);
+        policy.configured_writable = vec![pulse.clone()];
+        let out = bubblewrap_argv(Path::new("/usr/bin/bwrap"), &[], &policy);
+
+        let pulse_s = pulse.to_string_lossy().into_owned();
+        assert!(
+            windowed_contains(&out, &["--bind", &pulse_s, &pulse_s]),
+            "a configured /run grant is a read-write bind, which is what `connect(2)` on an \
+             AF_UNIX socket requires: {out:?}"
+        );
+        assert!(
+            !windowed_contains(&out, &["--ro-bind", &pulse_s, &pulse_s]),
+            "a read-only bind would make the socket visible and unconnectable: {out:?}"
+        );
+
+        let mask = out
+            .windows(2)
+            .position(|w| w == ["--tmpfs".to_string(), "/run".to_string()])
+            .expect("the /run tmpfs mask is unconditional");
+        let grant = out
+            .windows(3)
+            .position(|w| w == ["--bind".to_string(), pulse_s.clone(), pulse_s.clone()])
+            .expect("the configured grant is bound");
+        assert!(
+            mask < grant,
+            "the grant must come after the mask or the tmpfs erases it: mask at {mask}, grant at \
+             {grant} in {out:?}"
+        );
+    }
+
+    /// D-235 — the sharp edge behind the documentation gap. `prepare_writable_paths` creates a
+    /// configured writable directory that does not exist, which is right for an output root and
+    /// wrong for `/run`: `/run` is runtime state owned by the system, nothing under it is flux's to
+    /// create, and creating it converts a mistyped uid into an *empty* directory bound over the
+    /// mask. The sidecar then finds a directory and no socket, and the only evidence left is a zero
+    /// level — the exact silent failure this story exists to remove. Refuse it by name instead.
+    #[test]
+    fn a_configured_run_grant_that_does_not_exist_is_refused_rather_than_created() {
+        let (_dir, ws) = temp_workspace();
+        let missing = PathBuf::from("/run/flux-d235-not-a-real-runtime-dir");
+        assert!(
+            !missing.exists(),
+            "precondition: {missing:?} must not exist"
+        );
+        let sandbox = Sandbox {
+            settings: SandboxSettings {
+                mode: SandboxMode::On,
+                network: true,
+                extra_writable: vec![missing.clone()],
+            },
+            backend: Backend::Bubblewrap {
+                bwrap: PathBuf::from("/usr/bin/bwrap"),
+            },
+        };
+        let policy = workspace_policy(&ws, sandbox.settings());
+        let err = sandbox
+            .wrap_argv(&["true".to_string()], &policy)
+            .expect_err("a /run grant that names nothing must not be manufactured")
+            .to_string();
+        assert!(
+            err.contains("/run/flux-d235-not-a-real-runtime-dir"),
+            "the refusal names the path: {err}"
+        );
+        assert!(
+            err.contains("/run") && err.contains("tmpfs"),
+            "and explains that /run is masked, so an empty directory bound there is silence rather \
+             than a working grant: {err}"
+        );
+        assert!(
+            !missing.exists(),
+            "and nothing was created under /run: {missing:?}"
         );
     }
 

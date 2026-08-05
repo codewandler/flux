@@ -183,6 +183,20 @@ pub struct Ready {
     /// older or naive sidecar fail loudly instead of quietly.
     #[serde(default)]
     pub owns_device_routing: bool,
+    /// Why routing ownership could not be taken, when the sidecar knows (D-235).
+    ///
+    /// `owns_device_routing: false` on its own says only "no audio"; it does not distinguish a
+    /// sidecar that never tried from one that tried and found nothing at the address it was given.
+    /// The distinction matters because the most likely cause is not in the sidecar at all: flux's
+    /// sandbox masks `/run` with a tmpfs, so the host's PulseAudio/PipeWire socket at
+    /// `/run/user/<uid>/pulse` is absent unless the operator granted it back with
+    /// `[sandbox] writable`. Argv can name that socket perfectly and still reach nothing.
+    ///
+    /// Optional because it is a diagnostic, not a control: absent means the sidecar had nothing to
+    /// add, and flux still refuses to publish. It exists so the refusal an operator reads can name
+    /// the masked socket instead of leaving a zero level as the only evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_error: Option<String>,
 }
 
 /// A published track's measured signal.
@@ -402,6 +416,7 @@ mod tests {
             Some(SidecarLine::Ready(Ready {
                 ready: MEDIA_PROTOCOL.into(),
                 owns_device_routing: true,
+                routing_error: None,
             }))
         );
         // An omitted claim is not a claim: the default is the refusing one.
@@ -410,6 +425,20 @@ mod tests {
             Some(SidecarLine::Ready(Ready {
                 ready: MEDIA_PROTOCOL.into(),
                 owns_device_routing: false,
+                routing_error: None,
+            }))
+        );
+        // D-235: a refusing claim may carry its reason, and the reason survives the wire.
+        assert_eq!(
+            SidecarLine::parse(
+                "{\"ready\":\"flux.room-media.v1\",\"routing_error\":\"/run/user/1000/pulse/native \
+                 is masked\"}"
+            )
+            .unwrap(),
+            Some(SidecarLine::Ready(Ready {
+                ready: MEDIA_PROTOCOL.into(),
+                owns_device_routing: false,
+                routing_error: Some("/run/user/1000/pulse/native is masked".into()),
             }))
         );
         assert_eq!(
