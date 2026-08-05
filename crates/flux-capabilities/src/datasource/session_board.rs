@@ -34,6 +34,18 @@ pub struct SessionBoardItem {
     /// Explicit dependencies, expressed as stable board refs.
     #[serde(default)]
     pub dependencies: Vec<String>,
+    /// Current holder, shared by every profile and used by execution claim/reassignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    /// Execution runner address recorded for durable resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    /// Execution task handle recorded for durable resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Re-open count; execution retry edges are the only mutations that increment it.
+    #[serde(default)]
+    pub attempts: u64,
     /// Durable chronological comments.
     #[serde(default)]
     pub comments: Vec<String>,
@@ -178,6 +190,10 @@ impl SessionBoard {
                     description,
                     priority,
                     dependencies: Vec::new(),
+                    assignee: None,
+                    runner: None,
+                    task_id: None,
+                    attempts: 0,
                     comments: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -249,10 +265,135 @@ impl SessionBoard {
                         snapshot.profile, item.state
                     )));
                 }
+                if snapshot.profile == BoardProfile::Execution
+                    && matches!(
+                        (item.state.as_str(), to.as_str()),
+                        ("failed" | "blocked", "ready")
+                    )
+                {
+                    item.attempts += 1;
+                    item.runner = None;
+                    item.task_id = None;
+                }
                 item.state = to;
                 Ok(())
             },
         )
+    }
+
+    /// Claim an execution item. Repeating the current holder is idempotent; another holder
+    /// conflicts and cannot change the event projection.
+    pub fn claim(
+        &self,
+        expected_revision: u64,
+        request_id: Option<&str>,
+        id: &ItemId,
+        assignee: String,
+    ) -> Result<SessionBoardSnapshot> {
+        if self.contract.profile != BoardProfile::Execution {
+            return Err(Error::Config(format!(
+                "profile {:?} does not support claim",
+                self.contract.profile
+            )));
+        }
+        if assignee.trim().is_empty() {
+            return Err(Error::Config("session board assignee is empty".into()));
+        }
+        let id = id.clone();
+        self.mutate(expected_revision, request_id, "claim", move |snapshot| {
+            let item = snapshot
+                .items
+                .get_mut(&id)
+                .ok_or_else(|| Error::Config(format!("unknown board item `{id}`")))?;
+            if item.state == "claimed" {
+                return match item.assignee.as_deref() {
+                    Some(holder) if holder == assignee => Ok(()),
+                    Some(holder) => Err(Error::Config(format!(
+                        "board item `{id}` is already claimed by `{holder}`"
+                    ))),
+                    None => {
+                        item.assignee = Some(assignee);
+                        Ok(())
+                    }
+                };
+            }
+            if !valid_transition(BoardProfile::Execution, &item.state, "claimed") {
+                return Err(Error::Config(format!(
+                    "execution profile refuses transition {} -> claimed",
+                    item.state
+                )));
+            }
+            item.state = "claimed".into();
+            item.assignee = Some(assignee);
+            Ok(())
+        })
+    }
+
+    /// Record the concrete runner/task pair without moving the state machine.
+    pub fn record_dispatch(
+        &self,
+        expected_revision: u64,
+        request_id: Option<&str>,
+        id: &ItemId,
+        runner: String,
+        task_id: String,
+    ) -> Result<SessionBoardSnapshot> {
+        if self.contract.profile != BoardProfile::Execution {
+            return Err(Error::Config(format!(
+                "profile {:?} does not support record_dispatch",
+                self.contract.profile
+            )));
+        }
+        if runner.trim().is_empty() || task_id.trim().is_empty() {
+            return Err(Error::Config(
+                "session board dispatch runner/task_id is empty".into(),
+            ));
+        }
+        let id = id.clone();
+        self.mutate(
+            expected_revision,
+            request_id,
+            "record_dispatch",
+            move |snapshot| {
+                let item = snapshot
+                    .items
+                    .get_mut(&id)
+                    .ok_or_else(|| Error::Config(format!("unknown board item `{id}`")))?;
+                item.runner = Some(runner);
+                item.task_id = Some(task_id);
+                Ok(())
+            },
+        )
+    }
+
+    /// Forcibly move an execution item to another holder and clear the old run identity.
+    pub fn reassign(
+        &self,
+        expected_revision: u64,
+        request_id: Option<&str>,
+        id: &ItemId,
+        assignee: String,
+    ) -> Result<SessionBoardSnapshot> {
+        if self.contract.profile != BoardProfile::Execution {
+            return Err(Error::Config(format!(
+                "profile {:?} does not support reassign",
+                self.contract.profile
+            )));
+        }
+        if assignee.trim().is_empty() {
+            return Err(Error::Config("session board assignee is empty".into()));
+        }
+        let id = id.clone();
+        self.mutate(expected_revision, request_id, "reassign", move |snapshot| {
+            let item = snapshot
+                .items
+                .get_mut(&id)
+                .ok_or_else(|| Error::Config(format!("unknown board item `{id}`")))?;
+            item.assignee = Some(assignee);
+            item.runner = None;
+            item.task_id = None;
+            Ok(())
+        })
     }
 
     /// Append one comment.
@@ -292,12 +433,13 @@ impl SessionBoard {
             request_id,
             "record_evidence",
             move |snapshot| {
-                snapshot
+                let item = snapshot
                     .items
                     .get_mut(&id)
-                    .ok_or_else(|| Error::Config(format!("unknown board item `{id}`")))?
-                    .evidence
-                    .push(evidence);
+                    .ok_or_else(|| Error::Config(format!("unknown board item `{id}`")))?;
+                if !item.evidence.contains(&evidence) {
+                    item.evidence.push(evidence);
+                }
                 Ok(())
             },
         )
@@ -558,5 +700,127 @@ mod tests {
             child_board.snapshot().unwrap().items[&ItemId::new("S-1").unwrap()].comments,
             ["child only"]
         );
+    }
+
+    #[test]
+    fn every_profile_uses_its_closed_machine_and_session_retention_owns_the_board() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        for (profile, path) in [
+            (BoardProfile::General, vec!["in-progress", "done"]),
+            (BoardProfile::Planning, vec!["ready", "in-progress", "done"]),
+            (
+                BoardProfile::Execution,
+                vec!["in-progress", "review", "done"],
+            ),
+        ] {
+            let session = events.create_session("test/model").unwrap();
+            let mut contract = contract(&session);
+            contract.id =
+                BoardId::new(format!("profile-{profile:?}").to_ascii_lowercase()).unwrap();
+            contract.profile = profile;
+            let board = SessionBoard::open(events.clone(), &session, contract.clone()).unwrap();
+            let id = ItemId::new("S-1").unwrap();
+            let mut snapshot = board
+                .create(
+                    0,
+                    Some("create"),
+                    id.clone(),
+                    "One".into(),
+                    String::new(),
+                    None,
+                )
+                .unwrap();
+            if profile == BoardProfile::Execution {
+                snapshot = board
+                    .claim(snapshot.revision, Some("claim"), &id, "worker-one".into())
+                    .unwrap();
+                assert_eq!(snapshot.items[&id].state, "claimed");
+                assert_eq!(snapshot.items[&id].assignee.as_deref(), Some("worker-one"));
+                assert!(board
+                    .claim(
+                        snapshot.revision,
+                        Some("claim-other"),
+                        &id,
+                        "worker-two".into(),
+                    )
+                    .is_err());
+                snapshot = board
+                    .record_dispatch(
+                        snapshot.revision,
+                        Some("dispatch"),
+                        &id,
+                        "local://worker-one".into(),
+                        "task-1".into(),
+                    )
+                    .unwrap();
+                snapshot = board
+                    .reassign(
+                        snapshot.revision,
+                        Some("reassign"),
+                        &id,
+                        "worker-two".into(),
+                    )
+                    .unwrap();
+                assert_eq!(snapshot.items[&id].assignee.as_deref(), Some("worker-two"));
+                assert_eq!(snapshot.items[&id].runner, None);
+                assert_eq!(snapshot.items[&id].task_id, None);
+            }
+            for state in path {
+                snapshot = board
+                    .transition(snapshot.revision, Some(&format!("to-{state}")), &id, state)
+                    .unwrap();
+            }
+            assert_eq!(snapshot.items[&id].state, "done");
+            assert!(
+                board
+                    .transition(snapshot.revision, Some("reopen"), &id, "ready")
+                    .is_err(),
+                "done must be terminal for {profile:?}"
+            );
+            if profile == BoardProfile::Planning {
+                // Planning's ninth operation is available and persists through the same stream.
+                let second = ItemId::new("S-2").unwrap();
+                let created = board
+                    .create(
+                        snapshot.revision,
+                        Some("create-two"),
+                        second.clone(),
+                        "Two".into(),
+                        String::new(),
+                        Some(2),
+                    )
+                    .unwrap();
+                let updated = board
+                    .update(
+                        created.revision,
+                        Some("update-two"),
+                        &second,
+                        Some("Two updated".into()),
+                        Some(1),
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(updated.items[&second].priority, Some(1));
+            } else {
+                assert!(board
+                    .update(
+                        snapshot.revision,
+                        Some("invalid-update"),
+                        &id,
+                        None,
+                        None,
+                        None,
+                    )
+                    .is_err());
+            }
+
+            assert_eq!(events.prune_older_than(0).unwrap(), 0);
+            assert!(SessionBoard::open(events.clone(), &session, contract).is_ok());
+        }
+
+        let count = events.list(100).unwrap().len();
+        assert!(count >= 3);
+        assert_eq!(events.prune_older_than(i64::MAX).unwrap(), count);
+        assert!(events.list(100).unwrap().is_empty());
     }
 }

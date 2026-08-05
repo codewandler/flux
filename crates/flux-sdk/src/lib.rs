@@ -2357,6 +2357,62 @@ mod tests {
     }
 
     #[test]
+    fn client_builder_board_installation_is_atomic_and_source_labelled() {
+        use flux_datasource::board::{
+            BoardBackend, BoardContract, BoardId, BoardProfile, BoardScope,
+        };
+
+        let contract = |id: &str, source: &str| BoardContract {
+            id: BoardId::new(id).unwrap(),
+            scope: BoardScope::Repository {
+                repository_id: "repo".into(),
+            },
+            profile: BoardProfile::Execution,
+            backend: BoardBackend::Memory,
+            source: source.into(),
+        };
+        let first: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let second: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let builder = Client::builder()
+            .try_with_board(contract("product", "program.flux:4"), first)
+            .expect("the first board installs as one prepared surface");
+        let error = builder
+            .try_with_board(contract("product", "program.flux:12"), second)
+            .err()
+            .expect("a duplicate binding must fail the all-in-one installation")
+            .to_string();
+        assert!(error.contains("duplicate board `product`"), "{error}");
+        assert!(error.contains("program.flux:4"), "{error}");
+        assert!(error.contains("program.flux:12"), "{error}");
+
+        let board: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let collision = flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "product.list",
+                "collides with one generated board operation",
+                serde_json::json!({"type": "object"}),
+            ),
+            |_params| async { Ok(serde_json::Value::Null) },
+        );
+        let error = Client::builder()
+            .try_with_board(contract("product", "program.flux:4"), board)
+            .unwrap()
+            .register_op_from("consumer-pack", collision)
+            .build(Box::new(NeverMock), ".")
+            .err()
+            .expect("a generated board op cannot be partly shadowed")
+            .to_string();
+        assert!(
+            error.contains("duplicate operation `product.list`"),
+            "{error}"
+        );
+        assert!(error.contains("consumer-pack"), "{error}");
+    }
+
+    #[test]
     fn client_builder_rejects_custom_operation_shadowing_a_builtin() {
         let shadow = flux_runtime::tool_fn(
             flux_spec::ToolSpec::read_only(

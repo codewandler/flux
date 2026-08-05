@@ -234,4 +234,35 @@ mod tests {
         assert!(!BoardProfile::Planning.supports("claim"));
         assert!(BoardProfile::Execution.supports("record_dispatch"));
     }
+
+    #[test]
+    fn same_item_id_on_two_boards_stays_distinct_and_profile_mismatches_refuse() {
+        use flux_datasource::board::{BoardRef, ItemId};
+
+        let planning = BoardRef::new(
+            BoardId::new("planning").unwrap(),
+            ItemId::new("C-1").unwrap(),
+        );
+        let execution = BoardRef::new(
+            BoardId::new("execution").unwrap(),
+            ItemId::new("C-1").unwrap(),
+        );
+        assert_ne!(planning, execution);
+        assert_eq!(planning.permission_subject(), "board:planning/item/C-1");
+        assert_eq!(execution.permission_subject(), "board:execution/item/C-1");
+
+        let mut registry = BoardRegistry::new();
+        registry
+            .register(contract("planning", BoardProfile::Planning))
+            .unwrap();
+        registry
+            .register(contract("execution", BoardProfile::Execution))
+            .unwrap();
+        let error = registry
+            .resolve(Some(&BoardId::new("planning").unwrap()), "claim")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not support `claim`"), "{error}");
+        assert!(error.contains("update"), "{error}");
+    }
 }

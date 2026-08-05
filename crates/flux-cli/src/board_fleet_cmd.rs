@@ -2797,6 +2797,7 @@ fn validate_board_common(command: &BoardCommand, request: Option<&Value>) -> Res
         mutating,
         command.dry_run,
         command.idempotency_key.as_deref(),
+        command.if_revision.as_deref(),
     )
 }
 
@@ -2809,6 +2810,7 @@ fn validate_fleet_common(command: &FleetCommand, request: Option<&Value>) -> Res
         mutating,
         command.dry_run,
         command.idempotency_key.as_deref(),
+        command.if_revision.as_deref(),
     )
 }
 
@@ -2816,6 +2818,7 @@ fn validate_common_options(
     mutating: bool,
     dry_run: bool,
     idempotency_key: Option<&str>,
+    if_revision: Option<&str>,
 ) -> Result<()> {
     if dry_run && !mutating {
         bail!("input/schema: --dry-run is only valid for a mutating operation")
@@ -2829,6 +2832,17 @@ fn validate_common_options(
         }
         if dry_run {
             bail!("input/schema: --idempotency-key cannot be combined with --dry-run because a preview is not recorded")
+        }
+    }
+    if let Some(revision) = if_revision {
+        if !mutating {
+            bail!("input/schema: --if-revision is only valid for a mutating operation")
+        }
+        if revision.trim().is_empty()
+            || revision.len() > 256
+            || revision.chars().any(char::is_control)
+        {
+            bail!("input/schema: --if-revision must be 1..=256 printable characters")
         }
     }
     Ok(())
@@ -3018,7 +3032,7 @@ fn board_skill() -> String {
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it plans against company/project/repository goals and the board. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message worker-1 \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply wave-1 --if-revision REV --output json\n```\n\nKeep one writer/worktree per story, at most ten stories per wave, two same-session rework rounds, and one final gate. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it plans against company/project/repository goals and the board. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. Keep one writer/worktree per story, at most ten stories per wave, two same-session rework rounds, and one final gate. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -3037,6 +3051,15 @@ fn emit(
     revision: Option<&str>,
     request_id: Option<&str>,
 ) -> Result<()> {
+    // Redaction is the last shared boundary before every renderer. Individual producers still
+    // redact before persistence, but keeping this guard here prevents a new command from leaking a
+    // credential/path simply because its author remembered JSON and forgot human or NDJSON output.
+    let human = redact(human);
+    let data = redact_value(data);
+    let warnings = warnings
+        .into_iter()
+        .map(|warning| redact(&warning))
+        .collect::<Vec<_>>();
     match output {
         AgentOutput::Human => {
             if !human.is_empty() {
@@ -5752,12 +5775,23 @@ fn repository_root(workspace: &Path, repository: &FleetRepository) -> Result<Pat
 
 fn member_root(workspace: &Path, member: &str) -> Result<PathBuf> {
     let config = read_fleet_config(workspace)?;
-    let repository = config
+    let repositories = config
         .repositories
         .iter()
-        .find(|repository| repository.id == member || repository.board == member)
-        .with_context(|| format!("not-found: workspace board member {member}"))?;
-    repository_root(workspace, repository)
+        .filter(|repository| repository.id == member || repository.board == member)
+        .collect::<Vec<_>>();
+    match repositories.as_slice() {
+        [repository] => repository_root(workspace, repository),
+        [] => bail!("not-found: workspace board member {member}"),
+        candidates => bail!(
+            "conflict/precondition: workspace board selector {member:?} is ambiguous; candidates: {}",
+            candidates
+                .iter()
+                .map(|repository| repository.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn workspace_stories(workspace: &Path) -> Result<Vec<Story>> {
@@ -5765,6 +5799,14 @@ fn workspace_stories(workspace: &Path) -> Result<Vec<Story>> {
     let mut result = Vec::new();
     for repository in &config.repositories {
         let root = repository_root(workspace, repository)?;
+        if !root.join("docs/stories").is_dir() {
+            bail!(
+                "not-found: repository {} board {} has no docs/stories directory under {}",
+                repository.id,
+                repository.board,
+                root.display()
+            )
+        }
         for mut story in read_stories(&root)? {
             story.dependencies = story
                 .dependencies

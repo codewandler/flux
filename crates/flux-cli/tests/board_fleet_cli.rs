@@ -24,6 +24,50 @@ fn flux(root: &PathBuf, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for character in line.chars() {
+        match (quote, character) {
+            (Some(expected), found) if expected == found => quote = None,
+            (Some(_), found) => word.push(found),
+            (None, '"' | '\'') => quote = Some(character),
+            (None, found) if found.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            (None, found) => word.push(found),
+        }
+    }
+    assert!(
+        quote.is_none(),
+        "unterminated quote in skill example: {line}"
+    );
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+fn skill_examples(markdown: &str) -> Vec<Vec<String>> {
+    let mut fenced = false;
+    let mut examples = Vec::new();
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced && line.trim_start().starts_with("flux ") {
+            let mut words = shell_words(line.trim());
+            assert_eq!(words.remove(0), "flux");
+            examples.push(words);
+        }
+    }
+    examples
+}
+
 fn git(root: &PathBuf, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .current_dir(root)
@@ -145,6 +189,180 @@ fn board_and_fleet_skills_are_valid_small_agent_skills() {
 }
 
 #[test]
+fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
+    let board_root = fixture("board-skill-examples");
+    fs::write(
+        board_root.join("docs/stories/C-1-ready.md"),
+        "---\nid: C-1\ntitle: Ready\nstatus: ready\npriority: 1\n---\n\n# Ready\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    let board_skill = flux(&board_root, &["board", "skill"]);
+    assert!(board_skill.status.success());
+    let board_skill = String::from_utf8(board_skill.stdout).unwrap();
+    let shown = flux(&board_root, &["board", "show", "--output", "json"]);
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let board_revision = shown["revision"].as_str().unwrap().to_string();
+    for (index, mut example) in skill_examples(&board_skill).into_iter().enumerate() {
+        for argument in &mut example {
+            if argument == "REV" {
+                *argument = board_revision.clone();
+            } else if argument == "KEY" {
+                *argument = format!("board-skill-{index}");
+            }
+        }
+        let args = example.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = flux(&board_root, &args);
+        assert!(
+            output.status.success(),
+            "{example:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(board_root).ok();
+
+    let fleet_root = fixture("fleet-skill-examples");
+    fs::write(fleet_root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        fleet_root.join("docs/stories/C-1-ready.md"),
+        "---\nid: C-1\ntitle: Ready\nstatus: ready\npriority: 1\n---\n\n# Ready\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fleet_root.join(".flux/fleet/agents")).unwrap();
+    fs::write(
+        fleet_root.join(".flux/fleet/main.md"),
+        "Coordinate the offline fixture.\n",
+    )
+    .unwrap();
+    fs::write(
+        fleet_root.join(".flux/fleet/agents/story-worker.md"),
+        "Implement the assigned fixture story.\n",
+    )
+    .unwrap();
+    fs::write(
+        fleet_root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\nmax_instances = 1\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+    )
+    .unwrap();
+    assert!(git(&fleet_root, &["init", "-q"]).status.success());
+    assert!(
+        git(&fleet_root, &["config", "user.email", "fleet@example.test"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&fleet_root, &["config", "user.name", "Flux Fleet Test"])
+            .status
+            .success()
+    );
+    assert!(git(&fleet_root, &["add", "."]).status.success());
+    assert!(git(&fleet_root, &["commit", "-qm", "fixture"])
+        .status
+        .success());
+    assert!(flux(&fleet_root, &["fleet", "start"]).status.success());
+    let fleet_skill = flux(&fleet_root, &["fleet", "skill"]);
+    assert!(fleet_skill.status.success());
+    let fleet_skill = String::from_utf8(fleet_skill.stdout).unwrap();
+    let mut wave = String::new();
+    let mut worker = String::new();
+    let mut story_worktree = PathBuf::new();
+    let mut fleet_revision = String::new();
+    for (index, mut example) in skill_examples(&fleet_skill).into_iter().enumerate() {
+        if example.get(1).map(String::as_str) == Some("apply") {
+            fs::remove_file(story_worktree.join("flux-mock.txt")).ok();
+            fs::remove_file(fleet_root.join("flux-mock.txt")).ok();
+            fs::write(story_worktree.join("result.txt"), "skill example\n").unwrap();
+            assert!(git(&story_worktree, &["add", "result.txt"])
+                .status
+                .success());
+            assert!(git(
+                &story_worktree,
+                &["commit", "-qm", "complete skill fixture"]
+            )
+            .status
+            .success());
+            let commit = String::from_utf8(git(&story_worktree, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+            let handoff = flux(
+                &fleet_root,
+                &[
+                    "fleet",
+                    "handoff",
+                    &wave,
+                    "repo/C-1",
+                    "--commit",
+                    &commit,
+                    "--write-set",
+                    "result.txt",
+                    "--test-arg",
+                    "test",
+                    "--test-arg",
+                    "-f",
+                    "--test-arg",
+                    "result.txt",
+                    "--failing-before",
+                    "--passing-after",
+                    "--summary",
+                    "skill fixture complete",
+                    "--output",
+                    "json",
+                ],
+            );
+            assert!(
+                handoff.status.success(),
+                "{}",
+                String::from_utf8_lossy(&handoff.stdout)
+            );
+            let integrated = flux(
+                &fleet_root,
+                &["fleet", "integrate", &wave, "--output", "json"],
+            );
+            assert!(
+                integrated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&integrated.stdout)
+            );
+            let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+            fleet_revision = integrated["revision"].as_str().unwrap().to_string();
+        }
+        for argument in &mut example {
+            match argument.as_str() {
+                "KEY" => *argument = format!("fleet-skill-{index}"),
+                "WORKER" => *argument = worker.clone(),
+                "WAVE" => *argument = wave.clone(),
+                "REV" => *argument = fleet_revision.clone(),
+                _ => {}
+            }
+        }
+        let args = example.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = flux(&fleet_root, &args);
+        assert!(
+            output.status.success(),
+            "{example:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if example.get(1).map(String::as_str) == Some("run") {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            wave = value["data"]["wave"].as_str().unwrap().to_string();
+            let story = &value["data"]["topology"]["repositories"][0]["stories"][0];
+            story_worktree = PathBuf::from(story["worktree"].as_str().unwrap());
+            worker = value["data"]["receipts"][0]["agent"]
+                .as_str()
+                .unwrap_or_else(|| story["worker"].as_str().unwrap_or(""))
+                .to_string();
+            if worker.is_empty() {
+                worker = format!("{wave}-worker-1");
+            }
+        }
+    }
+    assert!(fleet_root.join("result.txt").is_file());
+    fs::remove_dir_all(fleet_root).ok();
+}
+
+#[test]
 fn machine_schema_uses_the_versioned_envelope_and_clean_stdout() {
     let root = fixture("schema");
     let output = flux(&root, &["board", "schema", "--output", "json"]);
@@ -167,6 +385,114 @@ fn machine_schema_uses_the_versioned_envelope_and_clean_stdout() {
         .unwrap()
         .iter()
         .any(|op| op["name"] == "stats"));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn public_schema_catalogue_matches_every_installed_board_and_fleet_command() {
+    let root = fixture("schema-catalogue");
+    for family in ["board", "fleet"] {
+        let schema = flux(&root, &[family, "schema", "--output", "json"]);
+        assert!(schema.status.success(), "{family}");
+        let schema: serde_json::Value = serde_json::from_slice(&schema.stdout).unwrap();
+        let declared = schema["data"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|operation| operation["name"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let help = flux(&root, &[family, "--help"]);
+        assert!(help.status.success(), "{family}");
+        let help = String::from_utf8(help.stdout).unwrap();
+        let mut in_commands = false;
+        let mut installed = std::collections::BTreeSet::new();
+        for line in help.lines() {
+            match line.trim() {
+                "Commands:" => {
+                    in_commands = true;
+                    continue;
+                }
+                "Options:" => break,
+                _ => {}
+            }
+            if in_commands {
+                if let Some(command) = line.split_whitespace().next() {
+                    if command != "help" {
+                        installed.insert(command.to_string());
+                    }
+                }
+            }
+        }
+        assert_eq!(declared, installed, "{family} schema drifted from clap");
+        for operation in declared {
+            let output = flux(&root, &[family, &operation, "--help"]);
+            assert!(output.status.success(), "{family} {operation}");
+        }
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn machine_failures_pin_exit_classes_and_never_leak_diagnostics() {
+    let root = fixture("failure-envelopes");
+    fs::write(
+        root.join("docs/stories/C-1-ready-without-priority.md"),
+        "---\nid: C-1\ntitle: Needs priority\nstatus: ready\n---\n\n# Needs priority\n",
+    )
+    .unwrap();
+
+    let cases: &[(&[&str], i32, &str)] = &[
+        (
+            &["board", "show", "--if-revision", "old", "--output", "json"],
+            2,
+            "input/schema",
+        ),
+        (
+            &["board", "get", "C-404", "--output", "json"],
+            3,
+            "not-found",
+        ),
+        (
+            &["board", "transition", "C-1", "done", "--output", "json"],
+            4,
+            "conflict/precondition",
+        ),
+        (
+            &["board", "check", "--output", "json"],
+            7,
+            "validation/gate",
+        ),
+    ];
+    for (args, exit, class) in cases {
+        let output = flux(&root, args);
+        assert_eq!(output.status.code(), Some(*exit), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: machine stderr leaked");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema"], "flux.cli/v1", "{args:?}");
+        assert_eq!(value["ok"], false, "{args:?}");
+        assert_eq!(value["error"]["class"], *class, "{args:?}");
+        assert_eq!(value["error"]["code"], *exit, "{args:?}");
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sensitive_board_content_is_redacted_at_every_output_renderer() {
+    let root = fixture("output-redaction");
+    fs::write(
+        root.join("docs/stories/C-1-secret.md"),
+        "---\nid: C-1\ntitle: Secret\nstatus: backlog\nnote: token=supersecret\n---\n\n# Secret\n",
+    )
+    .unwrap();
+
+    for mode in ["human", "json", "ndjson"] {
+        let output = flux(&root, &["board", "get", "C-1", "--output", mode]);
+        assert!(output.status.success(), "{mode}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("supersecret"), "{mode}: {stdout}");
+        assert!(stdout.contains("[redacted]"), "{mode}: {stdout}");
+    }
     fs::remove_dir_all(root).ok();
 }
 
@@ -424,6 +750,86 @@ fn workspace_board_federates_namespaced_items_and_routes_member_writes() {
         .unwrap()
         .contains("status: in-progress"));
     assert!(!workspace.join("docs/stories/C-1-web.md").exists());
+    fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn workspace_board_refuses_missing_cycles_absent_members_and_ambiguous_selectors() {
+    let workspace = fixture("workspace-refusals");
+    let api = workspace.join("members/api");
+    let web = workspace.join("members/web");
+    fs::create_dir_all(api.join("docs/stories")).unwrap();
+    fs::create_dir_all(web.join("docs/stories")).unwrap();
+    fs::create_dir_all(workspace.join("members/absent")).unwrap();
+    fs::create_dir_all(workspace.join(".flux")).unwrap();
+    fs::write(
+        workspace.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"shared\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"shared\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        api.join("docs/stories/C-1-api.md"),
+        "---\nid: C-1\ntitle: API\nstatus: ready\npriority: 1\ndepends_on: [web/C-404]\n---\n\n# API\n",
+    )
+    .unwrap();
+    fs::write(
+        web.join("docs/stories/C-1-web.md"),
+        "---\nid: C-1\ntitle: Web\nstatus: ready\npriority: 2\n---\n\n# Web\n",
+    )
+    .unwrap();
+
+    let missing = flux(
+        &workspace,
+        &["board", "--scope", "workspace", "items", "--output", "json"],
+    );
+    assert_eq!(missing.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("web/C-404"));
+
+    fs::write(
+        api.join("docs/stories/C-1-api.md"),
+        "---\nid: C-1\ntitle: API\nstatus: ready\npriority: 1\ndepends_on: [web/C-1]\n---\n\n# API\n",
+    )
+    .unwrap();
+    fs::write(
+        web.join("docs/stories/C-1-web.md"),
+        "---\nid: C-1\ntitle: Web\nstatus: ready\npriority: 2\ndepends_on: [api/C-1]\n---\n\n# Web\n",
+    )
+    .unwrap();
+    let cycle = flux(&workspace, &["fleet", "schedule", "--output", "json"]);
+    assert_eq!(cycle.status.code(), Some(7));
+    let cycle_text = String::from_utf8_lossy(&cycle.stdout);
+    assert!(cycle_text.contains("api/C-1"), "{cycle_text}");
+    assert!(cycle_text.contains("web/C-1"), "{cycle_text}");
+    assert!(
+        cycle_text.contains("-&gt;") || cycle_text.contains("->"),
+        "{cycle_text}"
+    );
+
+    let ambiguous = flux(
+        &workspace,
+        &[
+            "board",
+            "--scope",
+            "workspace",
+            "--board",
+            "shared",
+            "start",
+            "C-1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(ambiguous.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&ambiguous.stdout).contains("api, web"));
+
+    fs::write(
+        workspace.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"absent\"\nroot = \"members/absent\"\nboard = \"missing\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n",
+    )
+    .unwrap();
+    let absent = flux(&workspace, &["fleet", "schedule", "--output", "json"]);
+    assert_eq!(absent.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&absent.stdout).contains("docs/stories"));
     fs::remove_dir_all(workspace).ok();
 }
 
@@ -1201,6 +1607,142 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
 }
 
 #[test]
+fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate() {
+    let root = fixture("combined-only-red");
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    for (id, title, priority) in [("C-1", "One", 1), ("C-2", "Two", 2)] {
+        fs::write(
+            root.join(format!("docs/stories/{id}-story.md")),
+            format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: ready\npriority: {priority}\n---\n\n# {title}\n\n## Acceptance\n\n- [ ] ship\n"
+            ),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"sh\", \"-c\", \"test ! -f one.txt || test ! -f two.txt\"]\n",
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    let base = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "repo/C-2",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(dispatched.status.success());
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let stories = dispatched["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap();
+    for (index, filename) in ["one.txt", "two.txt"].iter().enumerate() {
+        let story = PathBuf::from(stories[index]["worktree"].as_str().unwrap());
+        fs::write(story.join(filename), format!("story {}\n", index + 1)).unwrap();
+        assert!(git(&story, &["add", filename]).status.success());
+        assert!(git(&story, &["commit", "-qm", &format!("add {filename}")])
+            .status
+            .success());
+        let commit = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let item = format!("repo/C-{}", index + 1);
+        let handoff = flux(
+            &root,
+            &[
+                "fleet",
+                "handoff",
+                "wave-2",
+                &item,
+                "--commit",
+                &commit,
+                "--write-set",
+                filename,
+                "--test-arg",
+                "test",
+                "--test-arg",
+                "-f",
+                "--test-arg",
+                filename,
+                "--failing-before",
+                "--passing-after",
+                "--summary",
+                "targeted child change",
+                "--output",
+                "json",
+            ],
+        );
+        assert!(
+            handoff.status.success(),
+            "{}",
+            String::from_utf8_lossy(&handoff.stdout)
+        );
+    }
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert_eq!(integrated.status.code(), Some(7));
+    let error: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(error["error"]["class"], "validation/gate");
+    assert_eq!(
+        String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim(),
+        base,
+        "a red integration must not touch the source checkout"
+    );
+    let inspected = flux(
+        &root,
+        &[
+            "fleet",
+            "inspect",
+            "integration",
+            "wave-2",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(inspected.status.success());
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    let repository = &inspected["data"]["data"]["repositories"][0];
+    assert_eq!(inspected["data"]["data"]["status"], "red");
+    assert_eq!(repository["gate"]["runs"], 1);
+    assert_eq!(repository["gate"]["status"], "red");
+    let candidate = repository["candidate"].as_str().unwrap();
+    assert!(!candidate.is_empty());
+    let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
+    assert!(integration.join("one.txt").is_file());
+    assert!(integration.join("two.txt").is_file());
+
+    let retry = flux(&root, &["fleet", "integrate", "wave-2"]);
+    assert!(
+        !retry.status.success(),
+        "a red wave cannot spend a second gate run"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
     let (root, story) = one_story_wave("rework-budget");
     let mut commit = commit_result(&story, "attempt one");
@@ -1295,6 +1837,81 @@ fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
         !integration.status.success(),
         "parked work cannot integrate"
     );
+}
+
+#[test]
+fn scriptless_inspection_and_report_surfaces_are_bounded_and_deterministic() {
+    let (root, _story) = one_story_wave("scriptless-inspection");
+
+    for (view, target) in [
+        ("snapshot", None),
+        ("wave", Some("wave-2")),
+        ("worker", Some("wave-2-worker-1")),
+        ("result", Some("repo/C-1")),
+        ("activity", None),
+        ("worktree", None),
+        ("integration", Some("wave-2")),
+        ("source", Some("repo")),
+        ("search", Some("wave")),
+        ("story", Some("repo/C-1")),
+        ("pull-request", Some("wave-2")),
+    ] {
+        let mut args = vec!["fleet", "inspect", view];
+        if let Some(target) = target {
+            args.push(target);
+        }
+        args.extend(["--limit", "7", "--output", "json"]);
+        let first = flux(&root, &args);
+        let second = flux(&root, &args);
+        assert!(
+            first.status.success(),
+            "{view}: {}",
+            String::from_utf8_lossy(&first.stdout)
+        );
+        assert_eq!(first.stdout, second.stdout, "{view} changed between reads");
+        let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+        assert_eq!(value["data"]["bounded"], true, "{view}");
+        assert_eq!(value["data"]["limit"], 7, "{view}");
+    }
+
+    for args in [
+        vec!["fleet", "status", "--output", "json"],
+        vec!["fleet", "schedule", "--output", "json"],
+        vec!["fleet", "worktrees", "--output", "json"],
+        vec!["fleet", "events", "--limit", "7", "--output", "json"],
+        vec!["fleet", "logs", "--limit", "7", "--output", "json"],
+        vec!["fleet", "agents", "--output", "json"],
+        vec!["fleet", "dashboard", "--output", "json"],
+    ] {
+        let output = flux(&root, &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema"], "flux.cli/v1", "{args:?}");
+    }
+
+    let stats = flux(&root, &["board", "stats", "--history", "--output", "json"]);
+    assert!(stats.status.success());
+    let cube: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(cube["data"]["schema"], "flux.board-stats/v1");
+    assert!(cube["data"]["history"]["days"].is_array());
+    for (format, marker) in [
+        ("json", "flux.board-stats/v1"),
+        ("tsv", "dimension\tdone"),
+        ("html", "<!doctype html>"),
+        ("svg", "<svg"),
+    ] {
+        let output = flux(&root, &["board", "report", "--format", format]);
+        assert!(output.status.success(), "{format}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(marker),
+            "{format}"
+        );
+    }
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]
