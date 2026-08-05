@@ -2,8 +2,7 @@
 id: C-551
 title: "The roadmap can retire every fleet coordination helper in favor of Flux CLI"
 pillar: Core
-status: ready
-priority: 50
+status: done
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-cli, flux-tui, examples, docs]
@@ -19,29 +18,29 @@ custom schedule, worker-control, context, activity, progress or visualization sc
 
 ## Acceptance
 
-- [ ] `fleet worktrees`, redacted `events --follow`, `logs`, `agents`, `dashboard` and bounded
+- [x] `fleet worktrees`, redacted `events --follow`, `logs`, `agents`, `dashboard` and bounded
       `inspect snapshot|wave|worker|result|activity|worktree|integration|source|search|story|
       pull-request` have deterministic human and JSON fixtures with explicit upper bounds.
-- [ ] `board stats --history` and `board report --format json|tsv|html|svg` replace the roadmap
+- [x] `board stats --history` and `board report --format json|tsv|html|svg` replace the roadmap
       progress collector and visualization with the same current/history facts and stable ordering:
       epic/story/optional-task/criterion/implementation ratios, state histogram, document counts,
       canonical commits, program stories, tranche lanes, waves and groups, plus daily scope-added,
       scope-removed and completed deltas. Renderers consume the JSON metric cube directly.
-- [ ] A side-by-side harness covers every mapping recorded in Decision 0010: refresh, validate,
+- [x] A side-by-side harness covers every mapping recorded in Decision 0010: refresh, validate,
       status, schedule, worktrees, start/stop, dispatch, follow-up, maintenance task, coordinator note,
       child status, activity, context, progress and report. Differences are either zero or an
       explicitly accepted schema improvement.
-- [ ] Redaction corpus tests cover credentials, `.env`, key files, model commentary, commands, diffs
+- [x] Redaction corpus tests cover credentials, `.env`, key files, model commentary, commands, diffs
       and JSON fields before persistence and rendering.
-- [ ] Bounded inspection remains responsive while a worker is busy and does not read unbounded
+- [x] Bounded inspection remains responsive while a worker is busy and does not read unbounded
       terminal history, repository files or diffs.
-- [ ] The roadmap dogfood fixture uses only declarative Flux configuration plus repository-specific
+- [x] The roadmap dogfood fixture uses only declarative Flux configuration plus repository-specific
       gate executables. Static acceptance rejects references to its retired coordinator scripts,
       Track Python generator and private fleet socket client.
-- [ ] `flux fleet skill` includes the safe dispatch/status/message/resume/apply loop and points to
+- [x] `flux fleet skill` includes the safe dispatch/status/message/resume/apply loop and points to
       `fleet schema`/`inspect` for detail; every example executes against the dogfood fixture.
-- [ ] Website docs, `WHATS-NEW.md` and changelog describe the scriptless path and explicit limits.
-- [ ] Full repository gate, embedded-docs check and roadmap side-by-side parity gate are green before
+- [x] Website docs, `WHATS-NEW.md` and changelog describe the scriptless path and explicit limits.
+- [x] Full repository gate, embedded-docs check and roadmap side-by-side parity gate are green before
       any helper is deleted.
 
 ## Notes

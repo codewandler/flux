@@ -2,8 +2,7 @@
 id: A-134
 title: "One BoardRegistry and explicit BoardRef across SDK, model tools and fleet"
 pillar: Agent
-status: ready
-priority: 41
+status: done
 epic: first-class-board
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-datasource, flux-capabilities, flux-sdk, flux-orchestrate]
@@ -19,25 +18,25 @@ preserving the delivered execution-board contract.
 
 ## Acceptance
 
-- [ ] Public contract types define stable `BoardId`, `BoardRef`, `BoardScope`, `BoardProfile`,
+- [x] Public contract types define stable `BoardId`, `BoardRef`, `BoardScope`, `BoardProfile`,
       `BoardBackend`, common item fields and planning-document references without adding IO at L0.
-- [ ] A registry binds several source-labelled boards, resolves operations by id/profile and rejects
+- [x] A registry binds several source-labelled boards, resolves operations by id/profile and rejects
       duplicate ids, invalid ids and scope/backend mismatches before a turn starts.
-- [ ] General, planning and execution profiles pin their exact state machines. All expose the common
+- [x] General, planning and execution profiles pin their exact state machines. All expose the common
       eight operations; planning adds metadata update; execution adds claim, dispatch recording and
       reassignment, retaining its existing eleven-operation surface.
-- [ ] One shared contract harness runs unmodified for every backend implementing a given profile.
+- [x] One shared contract harness runs unmodified for every backend implementing a given profile.
       A backend cannot silently omit an operation or accept another profile's transition.
-- [ ] Planning document contracts cover vision/roadmap singletons and stable decision/design
+- [x] Planning document contracts cover vision/roadmap singletons and stable decision/design
       collections separately from queue items.
-- [ ] `ClientBuilder::try_with_board` installs board ops, group, ambient signal and permission
+- [x] `ClientBuilder::try_with_board` installs board ops, group, ambient signal and permission
       resolver as one unit. Multiple registrations and built-in collisions return source-labelled
       build errors; no partial surface remains.
-- [ ] Fleet ledger calls carry a concrete `BoardRef`. Legacy omitted selectors work only with one
+- [x] Fleet ledger calls carry a concrete `BoardRef`. Legacy omitted selectors work only with one
       compatible board and otherwise fail with every candidate listed.
-- [ ] Permission subjects are `board:<binding>/item/<id>` and federated writes retain the resolved
+- [x] Permission subjects are `board:<binding>/item/<id>` and federated writes retain the resolved
       member subject. Wildcards remain segment-scoped.
-- [ ] Failing-first SDK tests cover two boards with the same item id, ambiguous dispatch, profile
+- [x] Failing-first SDK tests cover two boards with the same item id, ambiguous dispatch, profile
       transition refusal and atomic registration. Targeted tests pass; the board wave owns the gate.
 
 ## Notes

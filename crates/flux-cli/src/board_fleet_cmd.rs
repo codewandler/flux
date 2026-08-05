@@ -4160,10 +4160,7 @@ fn complete_story(
     let changelog_path = root.join("CHANGELOG.md");
     let prior_changelog = fs::read_to_string(&changelog_path).ok();
     let updated_changelog = changelog.map(|entry| {
-        format!(
-            "{}\n- {entry}\n",
-            prior_changelog.as_deref().unwrap_or("# Changelog\n")
-        )
+        add_unreleased_changelog_entry(prior_changelog.as_deref().unwrap_or("# Changelog\n"), entry)
     });
     if command.dry_run {
         return Ok((
@@ -4199,6 +4196,41 @@ fn complete_story(
         vec![],
         changed_revision(root, false)?,
     ))
+}
+
+fn add_unreleased_changelog_entry(changelog: &str, entry: &str) -> String {
+    let bullet = format!("- {entry}");
+    if changelog.lines().any(|line| line == bullet) {
+        return changelog.to_string();
+    }
+
+    const UNRELEASED: &str = "## [Unreleased]";
+    const ADDED: &str = "### Added";
+    let mut updated = changelog.to_string();
+    if let Some(unreleased) = updated.find(UNRELEASED) {
+        let section_start = unreleased + UNRELEASED.len();
+        let section_end = updated[section_start..]
+            .find("\n## ")
+            .map(|offset| section_start + offset)
+            .unwrap_or(updated.len());
+        if let Some(added_offset) = updated[section_start..section_end].find(ADDED) {
+            let insert = section_start + added_offset + ADDED.len();
+            updated.insert_str(insert, &format!("\n\n{bullet}"));
+        } else {
+            updated.insert_str(section_start, &format!("\n\n{ADDED}\n\n{bullet}"));
+        }
+        return updated;
+    }
+
+    let prefix_end = updated
+        .find('\n')
+        .map(|index| index + 1)
+        .unwrap_or(updated.len());
+    updated.insert_str(
+        prefix_end,
+        &format!("\n{UNRELEASED}\n\n{ADDED}\n\n{bullet}\n"),
+    );
+    updated
 }
 
 fn transition(
@@ -8180,5 +8212,18 @@ mod tests {
         assert_eq!(value["command"], "[redacted]");
         assert_eq!(value["diff"], "[redacted]");
         assert_eq!(value["safe"], "reviewed commit abc123");
+    }
+
+    #[test]
+    fn completion_changelog_entries_stay_in_unreleased_added() {
+        let original = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Existing.\n\n## [1.0.0]\n";
+        let updated = add_unreleased_changelog_entry(original, "Board shipped.");
+        let added = updated.find("- Board shipped.").unwrap();
+        let released = updated.find("## [1.0.0]").unwrap();
+        assert!(added < released, "{updated}");
+        assert_eq!(
+            add_unreleased_changelog_entry(&updated, "Board shipped."),
+            updated
+        );
     }
 }

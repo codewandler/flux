@@ -2,8 +2,7 @@
 id: C-242
 title: "`fleet.integrate` and explicit `fleet.apply` — one final gate, no automatic publication"
 pillar: Core
-status: ready
-priority: 48
+status: done
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-tools, flux-runtime, flux-cli]
@@ -19,23 +18,23 @@ tree and make both publication-on-red and implicit publication impossible.
 
 ## Acceptance
 
-- [ ] Failing-first tests cover a combined-only failure and a green wave. The gate runs exactly once
+- [x] Failing-first tests cover a combined-only failure and a green wave. The gate runs exactly once
       after the last accepted commit; missing/unrunnable gate is red, never pass.
-- [ ] Inputs are capped at ten and carry `BoardRef`, writer/worktree identity, exact commit,
+- [x] Inputs are capped at ten and carry `BoardRef`, writer/worktree identity, exact commit,
       dependency order, typed write set and targeted evidence. Duplicate stories/writers and unsafe
       overlap refuse before integration.
-- [ ] Each repository wave pins one canonical base and owns one integration branch/worktree; every
+- [x] Each repository wave pins one canonical base and owns one integration branch/worktree; every
       story branch/worktree inherits that base. Accepted child commits integrate in dependency
       order, targeted checks stay in children and the full gate runs only on the assembled wave tree.
-- [ ] Conflicts name story and files, append recoverable evidence and preserve the candidate history;
+- [x] Conflicts name story and files, append recoverable evidence and preserve the candidate history;
       no reset, rewrite, competing writer, partial done state or automatic retry occurs.
-- [ ] Red records the exact candidate SHA and leaves planning items non-done. Green records a local
+- [x] Red records the exact candidate SHA and leaves planning items non-done. Green records a local
       `fleet/<wave>` branch eligible for apply. Neither state pushes or opens a pull request.
-- [ ] `flux fleet apply WAVE` requires the recorded green gate, revalidates base/revisions/cleanliness,
+- [x] `flux fleet apply WAVE` requires the recorded green gate, revalidates base/revisions/cleanliness,
       merges locally in repository order and records the result. It never pushes, releases or deploys.
-- [ ] Human/JSON outputs expose candidate, gate evidence, conflicts and apply eligibility under
+- [x] Human/JSON outputs expose candidate, gate evidence, conflicts and apply eligibility under
       C-547's typed errors and idempotency semantics.
-- [ ] Accurate effects/access/intents and concrete permission subjects are pinned. Targeted tests
+- [x] Accurate effects/access/intents and concrete permission subjects are pinned. Targeted tests
       pass; A-117's integrated fleet wave owns the full gate.
 
 ## Notes

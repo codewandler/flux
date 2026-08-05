@@ -2,7 +2,7 @@
 id: C-239
 title: "The native fleet runs the planning-to-integration loop through Flux CLI (epic)"
 pillar: Core
-status: in-progress
+status: done
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-cli, flux-orchestrate, flux-runtime, flux-tui]
@@ -19,21 +19,21 @@ evidence, rework budget, integration, gating and the publication fence.
 
 ## Acceptance
 
-- [ ] A bare `flux fleet run` chooses a dependency-satisfied wave of at most ten concrete planning
+- [x] A bare `flux fleet run` chooses a dependency-satisfied wave of at most ten concrete planning
       `BoardRef`s; explicit items use the same validation.
-- [ ] Every story has one persistent native Flux writer session and one isolated worktree. Typed
+- [x] Every story has one persistent native Flux writer session and one isolated worktree. Typed
       write sets overlap only through serialization; fenced ledger paths are never delegated.
-- [ ] Behavioral handoff proves a test-only failure and targeted success; a fresh reviewer returns
+- [x] Behavioral handoff proves a test-only failure and targeted success; a fresh reviewer returns
       PASS/REWORK/PARK; two reworks return to the same session and the third parks.
-- [ ] Repository commits integrate in dependency order and one unskippable full gate runs on the
+- [x] Repository commits integrate in dependency order and one unskippable full gate runs on the
       final tree. Red preserves the exact candidate; green leaves local `fleet/<wave>` branches.
-- [ ] Only `flux fleet apply` revalidates and merges a green candidate. Fleet never pushes,
+- [x] Only `flux fleet apply` revalidates and merges a green candidate. Fleet never pushes,
       publishes, releases, deploys or deletes worktrees automatically.
-- [ ] The durable supervisor supports start/stop/run/task/message/cancel/resume/apply/status/schedule/
+- [x] The durable supervisor supports start/stop/run/task/message/cancel/resume/apply/status/schedule/
       events/logs/note/agents/worktrees/inspect/dashboard/schema/call and renders `flux fleet skill`.
-- [ ] The roadmap parity journey retires its worker, schedule, activity, context, progress and
+- [x] The roadmap parity journey retires its worker, schedule, activity, context, progress and
       worktree coordination helpers only after side-by-side tests are green.
-- [ ] Offline headline proof: two local fixture repositories, two independent items plus one
+- [x] Offline headline proof: two local fixture repositories, two independent items plus one
       dependency, one rework and one parked result survive coordinator restart with no network.
 
 ## Progress
