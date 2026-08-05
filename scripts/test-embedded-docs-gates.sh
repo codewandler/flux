@@ -75,7 +75,7 @@ fi
 # cutter. The cutter regenerates, verifies, includes the archive in its path-limited commit, and only
 # then creates the release commit.
 assert_before "$RELEASE_FLOW" 'uses: actions/setup-node@' 'working-directory: website'
-assert_before "$RELEASE_FLOW" 'working-directory: website' 'name: Run examples/release.flux'
+assert_before "$RELEASE_FLOW" 'working-directory: website' 'name: Run the credential-free release flow'
 assert_before "$CUT" 'scripts/build-embedded-docs.sh >/dev/null' 'scripts/build-embedded-docs.sh --check >/dev/null'
 assert_before "$CUT" 'scripts/build-embedded-docs.sh --check >/dev/null' 'git commit --only "${COMMIT_PATHS[@]}"'
 grep -Fq 'COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip)' "$CUT" \
