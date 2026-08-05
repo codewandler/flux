@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.56.0] - 2026-08-05
+
 ### New
 
 - **Flux now has one durable board-and-fleet workflow for AI-assisted development.** `flux board`
