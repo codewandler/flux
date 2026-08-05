@@ -87,7 +87,10 @@ working with the sidecar absent.
   2. That the PipeWire null-sink + `move-source-output` recipe survives being driven by a *spawned*
      sidecar with a **cleared environment**. flux clears `DISPLAY`/`XDG_RUNTIME_DIR`/`PULSE_SERVER`; the
      seam therefore requires argv to carry anything the sidecar needs about the host audio server. That
-     is documented and not exercised.
+     is documented and not exercised. ⚠ **Corrected by [D-235](D-235-argv-alone-does-not-reach-the-audio-server.md):
+     argv is necessary and *not sufficient*.** The sandbox masks `/run` with a tmpfs, so the socket argv
+     names is absent unless the operator also grants
+     `[sandbox] writable = ["/run/user/<uid>/pulse"]`. See the design's runbook step 8.
   3. That Chrome runs at all inside flux's bubblewrap confinement. `spawn_interactive` is `Sandboxed`,
      and Chrome's content sandbox needs a nested user namespace — the reason tier-3 browsing has an
      explicit exemption. Untested against a live call; may need `FLUX_SANDBOX=off`.
@@ -105,7 +108,11 @@ working with the sidecar absent.
 - The virtual-device approach is Linux-specific. The seam must keep that inside the sidecar so the port
   stays portable. **Held**: the control protocol has no device/sink/source/audio-server field, pinned on
   the rendered wire by `protocol.rs::the_protocol_never_names_a_capture_device` rather than by a comment.
-  Host specifics ride in the sidecar's argv, which flux passes through and never interprets.
+  Host specifics ride in the sidecar's argv, which flux passes through and never interprets. ⚠ That is
+  necessary but **not sufficient** for a host socket under `/run`: the sandbox's `/run` tmpfs masks it, so
+  the operator must additionally re-bind the directory with `[sandbox] writable`
+  ([D-235](D-235-argv-alone-does-not-reach-the-audio-server.md), which also pins the no-grant diagnostic
+  so the failure names the socket instead of reading as a zero level).
 - D-204 expected the media events to arrive as new `RoomEvent` variants. They did not: they are
   `media::MediaEvent` on a separate stream from a separate port, so a text consumer's `match` never grows
   a browser-shaped arm and `RoomEvent` stays free of the feature. `rooms/mod.rs` records the change where

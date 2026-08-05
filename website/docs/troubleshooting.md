@@ -250,6 +250,33 @@ into) to `[sandbox] writable` is *not* the fix — instead file it as a gap; the
 list is what needs extending. As a workaround, a static `/etc/resolv.conf` (not a symlink into
 `/run`) resolves fine because the whole filesystem is visible read-only.
 
+## A room-media sidecar joins, publishes, and carries no audio
+
+The sidecar starts, the handshake completes, publishing reports success, and the level probe reads
+zero. Nothing errors. The cause is usually not the sidecar or the room — it is the same `/run` mask
+as above. The PulseAudio/PipeWire socket lives at `/run/user/<uid>/pulse/native`, the sandbox
+replaces `/run` with a tmpfs, and **no argv value can name a path the confinement removed**. Passing
+`--audio-server unix:/run/user/1000/pulse/native` is necessary and not sufficient.
+
+Grant the socket's directory back — this is required, not optional, whenever the sandbox is on:
+
+```toml
+[sandbox]
+enabled = true
+writable = ["/run/user/1000/pulse"]   # `id -u` gives the uid
+```
+
+Unlike the resolver case above, `[sandbox] writable` *is* the supported fix here: the audio socket is
+your own runtime state, not a distro path flux should be re-binding for you. `writable` emits a
+read-write bind, which is what `connect(2)` on a unix socket needs, and it is applied after the mask.
+
+Two things make this diagnosable rather than silent. A `writable` path under `/run` that does not
+exist is refused at startup instead of being created — a wrong uid is the common typo, and an empty
+directory bound over the mask would look applied and still reach nothing. And a sidecar that reports
+`routing_error` in its handshake has that reason quoted verbatim in flux's refusal to publish, so the
+error names the masked socket. See
+[Reaching a host socket on purpose](./security/os-sandbox.md#reaching-a-host-socket-on-purpose).
+
 ## Related docs
 
 - [Providers and models](./agent/providers.md) — credential sources and model routing.

@@ -2,7 +2,7 @@
 id: D-235
 title: "Argv alone does not reach the host audio server — the sandbox masks the socket"
 pillar: Agent
-status: ready
+status: done
 priority: 3
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -43,17 +43,48 @@ elsewhere" is not a defence — the guarantee is fine, the *discoverability* is 
 
 ## Acceptance
 
-- [ ] The argv-only claim is corrected wherever it is stated: D-208's Notes, the sidecar's own docs, and
+- [x] The argv-only claim is corrected wherever it is stated: D-208's Notes, the sidecar's own docs, and
       any website page that describes bringing real audio to a room.
-- [ ] The companion grant is documented as part of the same recipe, with a concrete example, and stated
+- [x] The companion grant is documented as part of the same recipe, with a concrete example, and stated
       as **required**, not optional.
-- [ ] ⚠ A failing-first test pinning the composition, not just the prose: with argv correct and the
+- [x] ⚠ A failing-first test pinning the composition, not just the prose: with argv correct and the
       socket path **not** in `[sandbox] writable`, the sidecar's audio path fails in a way that names
       the masked socket rather than reporting a zero level. A diagnosable failure is the deliverable;
       silence is the bug.
-- [ ] ⚠ **No env passthrough is added to `flux-system`.** The env-clearing at the seam is deliberate and
+- [x] ⚠ **No env passthrough is added to `flux-system`.** The env-clearing at the seam is deliberate and
       correct; this story documents and diagnoses, it does not loosen the sandbox.
-- [ ] The `/run` tmpfs mask and the `:2563` invariant are unchanged.
+- [x] The `/run` tmpfs mask and the `:2563` invariant are unchanged.
+
+## Result
+
+**`[sandbox] writable` is the right mechanism for a unix socket, and the asymmetry in the Notes
+resolves in its favour** — but for a reason the key's name does not advertise, so it is now written
+down rather than inferred. `writable` emits a read-write bwrap `--bind`, and read-write is not an
+over-grant for a socket, it is the *minimum*: `connect(2)` on an `AF_UNIX` socket takes `MAY_WRITE`
+on the socket inode, so a `--ro-bind` would leave the socket visible and unconnectable. In
+bubblewrap there is no separate "reachable" grant to look for — reachability **is** the bind. The
+second half is ordering: `--tmpfs /run` is emitted before the configured binds
+(`sandbox.rs`), and bwrap applies mount ops in argv order while resolving bind *sources* in the
+original namespace, so the grant punches the host directory back through the mask. Reversed, the
+config line would be silently inert. Both properties are now pinned by
+`a_configured_run_grant_is_bound_read_write_after_the_run_mask`.
+
+**One genuine defect was found behind the documentation gap**, and it is the shape the Notes warned
+about — a config line that looks applied and does not work. `prepare_writable_paths` *creates* a
+configured writable path that does not exist. That is right for an output root and wrong for `/run`:
+a mistyped uid (`/run/user/1001/pulse` on a uid-1000 host) had flux create an empty directory and
+bind it over the mask, after which the sandboxed process finds a directory, finds no socket, and the
+only evidence is a level probe reading zero. A `/run` path that does not exist is now refused at
+startup by name, and nothing is created under `/run`.
+
+The diagnostic half is `Ready::routing_error`: the sidecar's own explanation for
+`owns_device_routing: false`, preserved through the handshake and quoted verbatim in
+`publish_audio`'s refusal. When the sidecar says nothing, the refusal now names the `/run` mask and
+the `[sandbox] writable` grant itself, so the operator is never left with only a zero level.
+
+No environment entry was added or changed — `crates/flux-system/src/lib.rs` is untouched — and the
+`sandbox.rs` diff contains **zero deletions**: the `/run` tmpfs mask and the "host IPC directory
+must stay hidden behind the /run tmpfs" assertion are byte-identical, only shifted by added code.
 
 ## Notes
 
@@ -64,6 +95,23 @@ elsewhere" is not a defence — the guarantee is fine, the *discoverability* is 
   socket at all, or whether a socket needs its own bind. If `writable` does not actually suffice, that
   is a bigger finding than the documentation gap and should be said out loud rather than papered over
   with a config line that does not work.
+## Progress
+
+**2026-08-05** — Implemented. `Ready::routing_error` added to the media protocol and surfaced in
+`SidecarMediaPeer::publish_audio`'s refusal; `/run` grants that name nothing are refused at startup
+instead of created; the argv-only claim corrected in `sidecar.rs`'s module header, D-208's Notes and
+"what no test can tell you", the design's preflight runbook (new required step 8),
+`website/docs/security/os-sandbox.md` (new "Reaching a host socket on purpose"),
+`website/docs/troubleshooting.md` (new silent-audio section) and `website/docs/reference/config.md`.
+Failing-first evidence captured for both halves before implementing.
+
+⚠ **The `sidecar.js` half of this story's sibling stories could not be done here.**
+`crates/flux-channels/assets/room-media/sidecar.js` does not exist on `main` and has never existed
+there; it lives only on the unmerged `impl/D-232` branch. The sidecar-side preflight that *produces*
+`routing_error` is therefore D-232's to land. What is landed here is the flux-side half: the protocol
+field, its preservation, the refusal text, the startup refusal, and the documentation. A sidecar that
+does not send `routing_error` still gets a refusal naming the mask and the grant.
+
 - Surfaced by [D-232](D-232-the-media-sidecar-harness.md)'s implementor while answering its Risk 1;
   its own answer contradicted D-208's story text, which is what prompted this. D-232 was instructed not
   to add env passthrough and did not.
