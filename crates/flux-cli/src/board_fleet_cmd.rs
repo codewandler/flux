@@ -1121,7 +1121,13 @@ fn run_board_checked(mut command: BoardCommand) -> Result<()> {
     }
     let root = if command.scope() == BoardScopeArg::Workspace {
         match command.board.as_deref() {
-            Some(member) => member_root(&workspace_root, member)?,
+            Some(member) => {
+                let root = member_root(&workspace_root, member)?;
+                if board_action_mutates(&command.action) {
+                    require_canonical_member_checkout(&workspace_root, member, &root)?;
+                }
+                root
+            }
             None => workspace_root.clone(),
         }
     } else {
@@ -1170,6 +1176,33 @@ fn run_board_checked(mut command: BoardCommand) -> Result<()> {
         }
         Err(error) => Err(error),
     }
+}
+
+fn require_canonical_member_checkout(workspace: &Path, selector: &str, root: &Path) -> Result<()> {
+    let config = read_board_workspace_config(workspace)?;
+    let member = config
+        .members
+        .iter()
+        .find(|member| member.id == selector || member.board == selector)
+        .with_context(|| format!("not-found: workspace board member {selector}"))?;
+    let head = git_output(root, &["rev-parse", "HEAD"]);
+    let canonical = git_output(root, &["rev-parse", &member.canonical_ref]);
+    if let (Some(head), Some(canonical)) = (head, canonical) {
+        if head != canonical {
+            bail!(
+                "conflict/precondition: workspace member {} checkout is not at configured canonical ref {}",
+                member.id,
+                member.canonical_ref
+            )
+        }
+        if git_output(root, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
+            bail!(
+                "conflict/precondition: workspace member {} checkout is dirty",
+                member.id
+            )
+        }
+    }
+    Ok(())
 }
 
 fn run_session_board_checked(command: &BoardCommand, request: Option<Value>) -> Result<()> {
@@ -3376,55 +3409,53 @@ fn read_stories(root: &Path) -> Result<Vec<Story>> {
     let mut stories = Vec::new();
     for path in paths {
         let body = fs::read_to_string(&path)?;
-        let fm = parse_frontmatter(&body);
-        if fm.is_empty() {
-            continue;
+        let file = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if let Some(story) = story_from_body(file, body) {
+            stories.push(story);
         }
-        let Some(id) = fm.get("id").cloned() else {
-            continue;
-        };
-        let Some(title) = fm.get("title").cloned() else {
-            continue;
-        };
-        let Some(raw_status) = fm.get("status") else {
-            continue;
-        };
-        let status = normalize_status(raw_status);
-        if !STATUSES.contains(&status.as_str()) {
-            continue;
-        }
-        stories.push(Story {
-            id,
-            title,
-            status,
-            file: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            pillar: fm
-                .get("pillar")
-                .filter(|value| !value.trim().is_empty())
-                .cloned(),
-            epic: fm
-                .get("epic")
-                .filter(|value| !value.trim().is_empty())
-                .cloned(),
-            design: fm
-                .get("design")
-                .filter(|value| !value.trim().is_empty())
-                .cloned(),
-            areas: parse_list(fm.get("areas")),
-            note: fm
-                .get("note")
-                .filter(|value| !value.trim().is_empty())
-                .cloned(),
-            priority: fm.get("priority").and_then(|v| first_integer(v)),
-            dependencies: parse_list(fm.get("depends_on").or_else(|| fm.get("dependencies"))),
-            body,
-        });
     }
     Ok(stories)
+}
+
+fn story_from_body(file: String, body: String) -> Option<Story> {
+    let fm = parse_frontmatter(&body);
+    let id = fm.get("id")?.clone();
+    let title = fm.get("title")?.clone();
+    let raw_status = fm.get("status")?;
+    let status = normalize_status(raw_status);
+    if !STATUSES.contains(&status.as_str()) {
+        return None;
+    }
+    Some(Story {
+        id,
+        title,
+        status,
+        file,
+        pillar: fm
+            .get("pillar")
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+        epic: fm
+            .get("epic")
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+        design: fm
+            .get("design")
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+        areas: parse_list(fm.get("areas")),
+        note: fm
+            .get("note")
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+        priority: fm.get("priority").and_then(|value| first_integer(value)),
+        dependencies: parse_list(fm.get("depends_on").or_else(|| fm.get("dependencies"))),
+        body,
+    })
 }
 
 fn parse_frontmatter(text: &str) -> BTreeMap<String, String> {
@@ -3961,7 +3992,7 @@ fn stats(command: &BoardCommand, root: &Path, history: bool, since: Option<&str>
         let mut total = 0usize;
         for member in &config.members {
             let member_root = board_member_root(root, member)?;
-            let member_stories = read_stories(&member_root)?;
+            let member_stories = read_workspace_member_stories(root, member)?;
             let done = member_stories
                 .iter()
                 .filter(|story| story.status == "done")
@@ -4305,7 +4336,10 @@ fn scoped_board_revision(command: &BoardCommand, root: &Path) -> Result<String> 
     for member in &config.members {
         member.id.hash(&mut hasher);
         member.canonical_ref.hash(&mut hasher);
-        board_revision(&board_member_root(root, member)?)?.hash(&mut hasher);
+        for story in read_workspace_member_stories(root, member)? {
+            story.file.hash(&mut hasher);
+            story.body.hash(&mut hasher);
+        }
     }
     Ok(format!("{:016x}", hasher.finish()))
 }
@@ -6067,6 +6101,18 @@ fn read_board_workspace_config(root: &Path) -> Result<BoardWorkspaceConfig> {
                 member.id
             )
         }
+        if member.canonical_ref.starts_with('-')
+            || member.canonical_ref.contains("..")
+            || member.canonical_ref.chars().any(|character| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '/' | '-' | '_' | '.')
+            })
+        {
+            bail!(
+                "input/schema: workspace member {} has an unsafe canonical_ref {:?}",
+                member.id,
+                member.canonical_ref
+            )
+        }
         let canonical = board_member_root(root, member)?;
         for (other_id, other) in &roots {
             if canonical.starts_with(other) || other.starts_with(&canonical) {
@@ -6131,6 +6177,64 @@ fn board_member_root(workspace: &Path, member: &WorkspaceMember) -> Result<PathB
             path.display()
         )
     })
+}
+
+fn read_workspace_member_stories(workspace: &Path, member: &WorkspaceMember) -> Result<Vec<Story>> {
+    let root = board_member_root(workspace, member)?;
+    let verified = format!("{}^{{commit}}", member.canonical_ref);
+    if git_output(&root, &["rev-parse", "--verify", &verified]).is_none() {
+        return read_stories(&root);
+    }
+    let listing = guarded_git(
+        &root,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &member.canonical_ref,
+            "--",
+            "docs/stories",
+        ],
+    )?;
+    if listing.exit_code != 0 {
+        bail!(
+            "validation/gate: cannot read workspace member {} stories at {}",
+            member.id,
+            member.canonical_ref
+        )
+    }
+    let mut paths = listing
+        .stdout
+        .lines()
+        .filter(|path| {
+            path.ends_with(".md")
+                && !path.ends_with("/README.md")
+                && !path.ends_with("/_TEMPLATE.md")
+        })
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    let mut stories = Vec::new();
+    for path in paths {
+        let object = format!("{}:{path}", member.canonical_ref);
+        let output = guarded_git(&root, &["show", &object])?;
+        if output.exit_code != 0 {
+            bail!(
+                "validation/gate: cannot read workspace member {} item {} at {}",
+                member.id,
+                path,
+                member.canonical_ref
+            )
+        }
+        let file = Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if let Some(story) = story_from_body(file, output.stdout) {
+            stories.push(story);
+        }
+    }
+    Ok(stories)
 }
 
 fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
@@ -6328,7 +6432,7 @@ fn workspace_stories(workspace: &Path) -> Result<Vec<Story>> {
                 root.display()
             )
         }
-        for mut story in read_stories(&root)? {
+        for mut story in read_workspace_member_stories(workspace, member)? {
             story.dependencies = story
                 .dependencies
                 .into_iter()
