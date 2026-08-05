@@ -390,12 +390,28 @@ pub enum IntentBehavior {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IntentTarget {
-    Path { path: String },
-    Url { url: String },
-    Process { command: String },
-    Browser { url: String },
-    Operation { name: String, effects: Vec<Effect> },
-    Gate { name: String },
+    Path {
+        path: String,
+    },
+    Url {
+        url: String,
+    },
+    Process {
+        command: String,
+    },
+    Browser {
+        url: String,
+    },
+    Operation {
+        name: String,
+        effects: Vec<Effect>,
+        /// Analyzer-derived semantic consequences such as money movement or external sends.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        semantic_effects: Vec<FlowEffect>,
+    },
+    Gate {
+        name: String,
+    },
 }
 
 /// The role the target plays.
@@ -452,18 +468,38 @@ impl Intent {
             (IntentBehavior::BrowserNavigate, IntentTarget::Browser { url }) => {
                 format!("browser.navigate → {url}")
             }
-            (IntentBehavior::Operation, IntentTarget::Operation { name, effects }) => {
-                if effects.is_empty() {
+            (
+                IntentBehavior::Operation,
+                IntentTarget::Operation {
+                    name,
+                    effects,
+                    semantic_effects,
+                },
+            ) => {
+                if effects.is_empty() && semantic_effects.is_empty() {
                     format!("operation {name}")
                 } else {
-                    format!(
-                        "operation {name} ({})",
-                        effects
-                            .iter()
-                            .map(|effect| format!("{:?}", effect))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
+                    let mut details = Vec::new();
+                    if !effects.is_empty() {
+                        details.push(
+                            effects
+                                .iter()
+                                .map(|effect| format!("{effect:?}"))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                    }
+                    if !semantic_effects.is_empty() {
+                        details.push(format!(
+                            "semantic: {}",
+                            semantic_effects
+                                .iter()
+                                .map(|effect| effect.tag())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    format!("operation {name} ({})", details.join("; "))
                 }
             }
             (IntentBehavior::Unknown, IntentTarget::Operation { name, .. }) => {
@@ -501,9 +537,14 @@ impl IntentSet {
             (IntentBehavior::FilesystemWrite, _) => true,
             (IntentBehavior::NetworkConnect, _) => true,
             (IntentBehavior::BrowserNavigate, _) => true,
-            (IntentBehavior::Operation, IntentTarget::Operation { effects, .. }) => {
-                Self::is_operation_mutating(effects).unwrap_or(true)
-            }
+            (
+                IntentBehavior::Operation,
+                IntentTarget::Operation {
+                    effects,
+                    semantic_effects,
+                    ..
+                },
+            ) => Self::is_operation_mutating(effects, semantic_effects),
             _ => false,
         })
     }
@@ -512,24 +553,27 @@ impl IntentSet {
     /// * empty known set is pure
     /// * Read/FileSystem/Network-only effects are non-consequential (Network only with Read)
     /// * any other effect combination is mutating
-    fn is_operation_mutating(effects: &[Effect]) -> Option<bool> {
-        if effects.is_empty() {
-            return Some(false);
-        }
-
+    fn is_operation_mutating(effects: &[Effect], semantic_effects: &[FlowEffect]) -> bool {
         let mut read = false;
         let mut network = false;
 
-        for effect in effects {
+        for effect in effects.iter().copied().chain(
+            semantic_effects
+                .iter()
+                .filter_map(|effect| effect.lower().0),
+        ) {
             match effect {
                 Effect::Read => read = true,
                 Effect::Filesystem => {}
                 Effect::Network => network = true,
-                _ => return Some(true),
+                _ => return true,
             }
         }
 
-        Some(if network { !read } else { false })
+        semantic_effects
+            .iter()
+            .any(|effect| effect.is_consequential())
+            || (network && !read)
     }
 
     /// True if any process-execution intent targets a command matching a destructive heuristic
@@ -739,6 +783,7 @@ mod tests {
             target: IntentTarget::Operation {
                 name: "mismatch".into(),
                 effects: vec![Effect::Process],
+                semantic_effects: Vec::new(),
             },
             role: IntentRole::Operation,
             certainty: IntentCertainty::Certain,
@@ -798,6 +843,7 @@ mod tests {
             target: IntentTarget::Operation {
                 name: "api.ping".into(),
                 effects: vec![Effect::Network],
+                semantic_effects: Vec::new(),
             },
             role: IntentRole::Operation,
             certainty: IntentCertainty::Certain,
@@ -813,10 +859,53 @@ mod tests {
             target: IntentTarget::Operation {
                 name: "api.fetch".into(),
                 effects: vec![Effect::Read, Effect::Network],
+                semantic_effects: Vec::new(),
             },
             role: IntentRole::Operation,
             certainty: IntentCertainty::Certain,
         });
         assert!(!set.is_mutating());
+    }
+
+    #[test]
+    fn operation_semantic_money_is_visible_and_mutating_without_a_host_effect() {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::Operation,
+            target: IntentTarget::Operation {
+                name: "payments.charge".into(),
+                effects: Vec::new(),
+                semantic_effects: vec![FlowEffect::Money],
+            },
+            role: IntentRole::Operation,
+            certainty: IntentCertainty::Certain,
+        });
+        assert!(set.is_mutating());
+        assert_eq!(
+            set.intents[0].approval_subject(),
+            "operation payments.charge (semantic: money)"
+        );
+    }
+
+    #[test]
+    fn old_operation_intent_payload_defaults_semantic_effects() {
+        let intent: Intent = serde_json::from_value(serde_json::json!({
+            "behavior": "operation",
+            "target": {
+                "type": "operation",
+                "name": "files.read",
+                "effects": ["read", "filesystem"]
+            },
+            "role": "operation",
+            "certainty": "certain"
+        }))
+        .unwrap();
+        let IntentTarget::Operation {
+            semantic_effects, ..
+        } = intent.target
+        else {
+            panic!("operation target changed shape");
+        };
+        assert!(semantic_effects.is_empty());
     }
 }

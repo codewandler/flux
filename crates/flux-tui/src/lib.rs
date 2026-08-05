@@ -7675,6 +7675,7 @@ mod tests {
                                 flux_spec::Effect::Process,
                                 flux_spec::Effect::LocalSystem,
                             ],
+                            semantic_effects: Vec::new(),
                         },
                         role: flux_spec::IntentRole::Operation,
                         certainty: flux_spec::IntentCertainty::Certain,
@@ -7684,6 +7685,7 @@ mod tests {
                         target: flux_spec::IntentTarget::Operation {
                             name: "task.ghost".into(),
                             effects: Vec::new(),
+                            semantic_effects: Vec::new(),
                         },
                         role: flux_spec::IntentRole::Operation,
                         certainty: flux_spec::IntentCertainty::Potential,

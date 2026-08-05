@@ -722,6 +722,7 @@ mod tests {
                         target: IntentTarget::Operation {
                             name: "mutating_task".into(),
                             effects: vec![Effect::Process, Effect::LocalSystem],
+                            semantic_effects: Vec::new(),
                         },
                         role: IntentRole::Operation,
                         certainty: IntentCertainty::Certain,
@@ -731,6 +732,7 @@ mod tests {
                         target: IntentTarget::Operation {
                             name: "ghost".into(),
                             effects: Vec::new(),
+                            semantic_effects: Vec::new(),
                         },
                         role: IntentRole::Operation,
                         certainty: IntentCertainty::Potential,

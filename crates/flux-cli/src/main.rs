@@ -3802,6 +3802,7 @@ mod tests {
                         target: flux_spec::IntentTarget::Operation {
                             name: "sync_task".into(),
                             effects: vec![flux_spec::Effect::Filesystem, flux_spec::Effect::Write],
+                            semantic_effects: vec![flux_spec::FlowEffect::WriteFile],
                         },
                         role: flux_spec::IntentRole::Operation,
                         certainty: flux_spec::IntentCertainty::Certain,
@@ -3811,6 +3812,7 @@ mod tests {
                         target: flux_spec::IntentTarget::Operation {
                             name: "mystery_task".into(),
                             effects: Vec::new(),
+                            semantic_effects: Vec::new(),
                         },
                         role: flux_spec::IntentRole::Operation,
                         certainty: flux_spec::IntentCertainty::Potential,
@@ -3850,7 +3852,7 @@ mod tests {
         );
         assert!(prompt.contains("process.exec → $ cargo test"), "{prompt}");
         assert!(
-            prompt.contains("operation sync_task (Filesystem, Write)"),
+            prompt.contains("operation sync_task (Filesystem, Write; semantic: write_file)"),
             "{prompt}"
         );
         assert!(

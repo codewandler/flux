@@ -2019,6 +2019,7 @@ fn collect_confirm_intents(
                 target: IntentTarget::Operation {
                     name: annotation.operation.clone(),
                     effects: annotation.host_effects.clone(),
+                    semantic_effects: annotation.effects.clone(),
                 },
                 role: IntentRole::Operation,
                 certainty: IntentCertainty::Certain,
@@ -2029,6 +2030,7 @@ fn collect_confirm_intents(
                 target: IntentTarget::Operation {
                     name: annotation.operation.clone(),
                     effects: Vec::new(),
+                    semantic_effects: Vec::new(),
                 },
                 role: IntentRole::Operation,
                 certainty: IntentCertainty::Potential,
@@ -6422,6 +6424,11 @@ mod tests {
                     &["path"],
                     vec![flux_spec::Effect::Read, flux_spec::Effect::Filesystem],
                 ),
+                "charge_card" => {
+                    let mut signature = self.signature(name, &[], Vec::new());
+                    signature.semantic_effects = vec![crate::ast::FlowEffect::Money];
+                    signature
+                }
                 "bash" => self.signature(name, &["command"], vec![flux_spec::Effect::Process]),
                 _ => return None,
             })
@@ -6455,13 +6462,18 @@ mod tests {
             self.intents.lock().unwrap().clone()
         }
     }
-    fn expected_known_intent(name: &str, effects: Vec<flux_spec::Effect>) -> flux_spec::IntentSet {
+    fn expected_known_intent(
+        name: &str,
+        effects: Vec<flux_spec::Effect>,
+        semantic_effects: Vec<crate::ast::FlowEffect>,
+    ) -> flux_spec::IntentSet {
         let mut intents = flux_spec::IntentSet::new();
         intents.push(flux_spec::Intent {
             behavior: flux_spec::IntentBehavior::Operation,
             target: flux_spec::IntentTarget::Operation {
                 name: name.into(),
                 effects,
+                semantic_effects,
             },
             role: flux_spec::IntentRole::Operation,
             certainty: flux_spec::IntentCertainty::Certain,
@@ -6476,6 +6488,7 @@ mod tests {
             target: flux_spec::IntentTarget::Operation {
                 name: name.into(),
                 effects: Vec::new(),
+                semantic_effects: Vec::new(),
             },
             role: flux_spec::IntentRole::Operation,
             certainty: flux_spec::IntentCertainty::Potential,
@@ -9219,6 +9232,7 @@ mod tests {
             vec![expected_known_intent(
                 "mutating_task",
                 vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                vec![],
             )]
         );
     }
@@ -9262,9 +9276,33 @@ mod tests {
             host.recorded_intents(),
             vec![expected_known_intent(
                 "mutating_task",
-                vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem]
+                vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                vec![],
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn confirm_preserves_semantic_effects_in_the_approval_intent() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "charge card".into(),
+                risk: Some("critical".into()),
+                body: vec![call("charge_card", vec![])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .expect("semantic-effect confirm body should execute");
+
+        let expected =
+            expected_known_intent("charge_card", vec![], vec![crate::ast::FlowEffect::Money]);
+        assert!(expected.is_mutating(), "money intent must fail closed");
+        assert_eq!(host.recorded_intents(), vec![expected]);
     }
 
     /// A confirm nested under `race` must keep the branch `.body` path so its nested descendants
@@ -9300,6 +9338,7 @@ mod tests {
             vec![expected_known_intent(
                 "mutating_task",
                 vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                vec![],
             )]
         );
     }
@@ -9337,7 +9376,8 @@ mod tests {
             host.recorded_intents(),
             vec![expected_known_intent(
                 "write_file",
-                vec![flux_spec::Effect::Write]
+                vec![flux_spec::Effect::Write],
+                vec![crate::ast::FlowEffect::WriteFile],
             )]
         );
     }

@@ -2820,6 +2820,7 @@ mod tests {
                 target: flux_spec::IntentTarget::Operation {
                     name: "effect_write".into(),
                     effects: vec![flux_spec::Effect::Write, flux_spec::Effect::Filesystem],
+                    semantic_effects: vec![flux_spec::FlowEffect::WriteFile],
                 },
                 role: flux_spec::IntentRole::Operation,
                 certainty: flux_spec::IntentCertainty::Certain,

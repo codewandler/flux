@@ -39,8 +39,11 @@ label-only contract is the intended seam, record that decision and document it a
 ## Progress
 - Completed and verified with runtime tests, renderer tests, and flow adapter tests:
   - confirm intent capture from bodyful, nested, and unknown calls
-  - conservative operation mutability and unknown-fail-closed classification
+  - host and semantic effect preservation, conservative operation mutability, and
+    unknown-fail-closed classification
   - host contract docs and request-approval validation
+  - `codewandler-flux-spec` 1.3.0 → 1.4.0, because the new public intent vocabulary is an
+    additive change on the crate's independent SemVer line
 
 ## Notes
 
