@@ -37,3 +37,8 @@ cannot grow with whole repository files, repeated tool history or unbounded repa
 - [ ] The operator-facing diagnostics expose which budget was approached or exceeded without
       persisting repository contents, secrets or an unbounded payload. Any implementation work that
       does not fit this story is filed as an explicitly linked follow-up before the research closes.
+
+
+## Evidence
+
+- 2026-08-05 Fleet research at fleet revision 18. Evidence: execute_agent_turn_with_runtime resumes with --continue; staged adaptive exploration sends state.messages.clone() on every round, then appends assistant output and repair prompts; round 7 and repair attempt 6 follow directly from zero-based explore_calls; ModelCallMetrics measures message_bytes separately from system and tool-schema bytes; Fleet parses child stream lines into an unbounded Vec<Value>. Leading inference: repeated full adaptive-history replay is the primary source of the 1,231,783 message bytes, with continued-session retention a likely fixed prefix; 28 operation schemas cannot explain that metric. Proposed hermetic fixture: six scripted roughly 200 KiB tool results followed by a seventh explore request, with 28 lightweight operations and resume enabled. Candidate budgets for design review: 64 KiB per model-history tool result, 256 KiB per NDJSON event, 512 KiB continued history, and 1 MiB total provider request. The receipt-amplification path remains unproven and needs the next bounded source pass.
