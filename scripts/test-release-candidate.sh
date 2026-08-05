@@ -312,8 +312,9 @@ grep -Fq 'run: scripts/promote-release-flow.sh' "$FLOW_WORKFLOW" \
   || fail "release-flow does not hand the irreversible half to the host promotion helper"
 grep -Fq "if: success() && github.event_name == 'push'" "$FLOW_WORKFLOW" \
   || fail "manual release-flow dispatches are not structurally excluded from promotion"
-grep -Fq 'gh pr create --base release --head main' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
-  || fail "publishing runbook does not make a protected main-to-release PR the normal path"
+grep -Fq 'gh pr create --base release --head "$source"' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
+  && grep -Fq 'gh pr update-branch "${pr##*/}"' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
+  || fail "publishing runbook does not freeze and update the protected main-to-release PR"
 if grep -Fq 'git push origin release' "$ROOT/crates/flux-sdk/PUBLISHING.md"; then
   fail "publishing runbook still presents a direct release-branch push as the normal path"
 fi
