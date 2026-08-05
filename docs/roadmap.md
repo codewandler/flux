@@ -111,6 +111,17 @@ session store, C-549 Track-compatible repository planning and C-550 federated cr
 scheduling. `flux board skill` renders the concise installed guide. Design:
 [native-board-fleet-cli](designs/native-board-fleet-cli.md).
 
+### Batched operation inputs — fewer calls for repeatable observations (epic) — ⏸ **BACKLOG (C-584…C-586)**
+
+C-528 can overlap several independent native calls, but it cannot remove redundant call/result
+envelopes when one operation could safely consume several inputs. C-585 makes `git_diff.path` a
+bounded string-or-array and executes one fixed Git argv with exact per-path authority. C-586 mines
+content-free structural aggregates from an explicitly selected Flux EventStore, joins repetition to
+the live schemas and semantics, and files atomic follow-ups only where an array preserves behavior.
+Repeated use of an already-batched operation is a surfacing finding, not another schema change;
+mutations remain excluded without explicit atomicity and partial-failure design. Design:
+[batched-operation-inputs](designs/batched-operation-inputs.md).
+
 ### Flux syntax simplification — one way to write each thing (epic) — 🔄 **PROPOSED (L-102; L-103…L-112 filed, none started)**
 
 The canonical dialect the formatter emits is already the language we want — but it is one of

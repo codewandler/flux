@@ -314,6 +314,12 @@ _`flux docs` already serves the documentation bundled with the running binary, a
 - [C-361 — Add a coverage-guided fuzz lane with a persistent corpus](C-361-add-a-coverage-guided-fuzz-lane.md) · Core · no fuzz/ dir, no cargo-fuzz, no arbitrary, no seed corpora — the 'adversarial corpus' is a seeded deterministic generator over committed fixtures and keeps nothing it finds
 - [C-362 — Add a sanitizer lane over the unsafe-adjacent seams](C-362-add-a-sanitizer-lane.md) · Core · no -Zsanitizer flags anywhere in the repo; ASan/TSan/MSan is the other limb of ASURE-01 that no addition has touched
 
+### Batched inputs for repeatable observation operations
+_An agent often asks the same read-only operation about several independent inputs. If the operation_
+- [C-584 — Batched operation inputs — fewer calls for repeatable observations (epic)](C-584-batched-operation-inputs-epic.md) · Core · EPIC — let measured read-only operations accept bounded arrays when one call preserves semantics; never batch writes by schema accident
+- [C-585 — Let git_diff inspect multiple paths in one operation call](C-585-git-diff-accepts-multiple-paths.md) · Core · make path a bounded string-or-array and invoke one fixed git diff argv with exact per-path permission subjects
+- [C-586 — Mine Flux operation history for safe array-input candidates](C-586-mine-operation-history-for-batchable-inputs.md) · Improve · content-free SQLite census of repeated call shapes, live schemas and operation semantics; distinguish missing batching from unused batching
+
 ### The board and fleet operations TUI
 _The CLI is the automation API, but a human supervising autopilot needs a calm view of the main_
 - [C-556 — The fleet TUI is centered on the one main coordinator conversation](C-556-fleet-main-agent-tui-shell.md) · Core · follow-up UI — conversational main surface plus attention rail; CLI remains automation API
