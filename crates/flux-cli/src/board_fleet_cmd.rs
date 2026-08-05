@@ -5350,7 +5350,10 @@ fn scoped_board_revision(command: &BoardCommand, root: &Path) -> Result<String> 
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     board_revision(root)?.hash(&mut hasher);
-    fs::read_to_string(root.join(".flux/board.toml"))?.hash(&mut hasher);
+    guarded_system(root)?
+        .read_optional_text(".flux/board.toml")?
+        .context("not-found: Board workspace configuration .flux/board.toml")?
+        .hash(&mut hasher);
     let config = read_board_workspace_config(root)?;
     for member in &config.members {
         member.id.hash(&mut hasher);
@@ -9514,7 +9517,6 @@ fn prepare_wave_worktrees(
             }));
         }
         if !command.dry_run {
-            fs::create_dir_all(repository_dir.join("stories"))?;
             add_git_worktree(
                 &repository_root,
                 &integration_path,
