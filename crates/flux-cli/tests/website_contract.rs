@@ -791,6 +791,9 @@ const NON_PUBLIC_ENV: &[&str] = &[
     // environment first, so it is not something an operator (or a model) can hand in. Raising it by
     // hand only ever shrinks the budget, so it is not a knob worth documenting as one.
     "FLUX_FLEET_DEPTH",
+    // The Fleet supervisor sets this only on its managed child to keep one source NDJSON line below
+    // the supervisor/parser transport bounds. It is not inherited as operator configuration.
+    "FLUX_STREAM_JSON_LINE_LIMIT_BYTES",
     "FLUX_SANDBOXED",
     "FLUX_SECRET",
     "FLUX_SYSTEM_ENV_TRUTHY_PROBE",

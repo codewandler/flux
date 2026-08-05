@@ -1,4 +1,4 @@
-//! The authority envelope around `examples/release.flux` (C-251).
+//! The authority envelope around the release programs (C-251).
 //!
 //! An unattended agent with write authority in a release pipeline is the highest-risk shape in this
 //! repo, and crates.io is yank-only. So the release flow's authority is narrow **by construction**,
@@ -13,8 +13,9 @@
 //! 3. **Write authority is three files.** `changelog_insert` resolves its target through
 //!    `flux-system`'s canonicalizing IO boundary and refuses anything else — including via `.`, `..`,
 //!    and an absolute spelling of an out-of-scope path.
-//! 4. **The scribe has no tools at all.** `tools: []` in the role file, so the model that drafts the
-//!    prose has no write op to attempt in the first place.
+//! 4. **The automatic cut has no model at all.** `examples/release-cut.flux` is the workflow entry
+//!    point and contains no `task`, provider, network or changelog-writing op. The older optional
+//!    release-note drafting example remains tool-less and is not reachable from release CI.
 //!
 //! What this file does NOT claim: that a `flux flow run` today installs a *path-scoped policy floor*.
 //! It cannot — `flux-cli` composes `[[policy.grants]]` **additively** on top of
@@ -69,16 +70,21 @@ where
     code.lines().position(predicate)
 }
 
-/// Every operation `examples/release.flux` calls. Collected from the serialized AST rather than a
-/// hand-written match, so a new node kind cannot hide a call from this check.
-fn ops_called_by_release_flux() -> BTreeSet<String> {
-    let src = std::fs::read_to_string(repo_root().join("examples/release.flux"))
-        .expect("read examples/release.flux");
-    let ast = match flux_flow::program::Module::parse_str(&src).expect("release.flux parses") {
+/// Every operation one checked-in release program calls. Collected from the serialized AST rather
+/// than a hand-written match, so a new node kind cannot hide a call from this check.
+fn ops_called_by_release_program(name: &str) -> BTreeSet<String> {
+    let path = repo_root().join("examples").join(name);
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let ast = match flux_flow::program::Module::parse_str(&src)
+        .unwrap_or_else(|e| panic!("{name} parses: {e}"))
+    {
         flux_flow::program::Module::Flow(ast) => ast,
-        flux_flow::program::Module::Program(p) => {
-            p.flows.first().cloned().expect("release.flux has a flow")
-        }
+        flux_flow::program::Module::Program(p) => p
+            .flows
+            .first()
+            .cloned()
+            .expect("release program has a flow"),
     };
     let mut found = BTreeSet::new();
     collect_ops(
@@ -86,6 +92,14 @@ fn ops_called_by_release_flux() -> BTreeSet<String> {
         &mut found,
     );
     found
+}
+
+fn ops_called_by_release_flux() -> BTreeSet<String> {
+    ops_called_by_release_program("release.flux")
+}
+
+fn ops_called_by_automatic_release_flux() -> BTreeSet<String> {
+    ops_called_by_release_program("release-cut.flux")
 }
 
 fn collect_ops(value: &Value, out: &mut BTreeSet<String>) {
@@ -146,6 +160,19 @@ fn the_release_program_calls_only_its_permitted_ops() {
         "examples/release.flux calls op(s) outside its authority ceiling: {extra:?}\n\
          Adding an op to a release flow widens what an unattended run with commit and tag authority \
          can do. If the addition is intended, add it to PERMITTED_OPS with the reason it is safe."
+    );
+}
+
+#[test]
+fn the_automatic_release_program_is_exactly_host_only() {
+    let called = ops_called_by_automatic_release_flux();
+    let expected = ["release_cut", "release_plan", "release_verify_versions"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        called, expected,
+        "examples/release-cut.flux is the unattended entry point: it may derive, validate and cut, but never call a model, network op or general write/process tool"
     );
 }
 
@@ -452,7 +479,7 @@ fn the_release_branch_is_the_automatic_apply_trigger() {
             && code.contains("push"));
     assert!(
         push_applies,
-        "the release-branch path must run examples/release.flux with apply=true; a push-triggered \
+        "the release-branch path must run the deterministic release cut with apply=true; a push-triggered \
          preview creates no commit or tag and therefore releases nothing"
     );
 }
@@ -632,37 +659,34 @@ fn the_tag_run_consumes_the_candidate_bytes_through_the_receipt() {
     );
 }
 
-/// The release gate must not depend on an OpenRouter account balance. The direct Anthropic key is
-/// the stable default, while an explicit OpenRouter model remains supported and must select its own
-/// credential rather than silently borrowing the default provider's key.
+/// Release availability is a repository property, not a model-account property. The automatic cut
+/// must call only the host-only program and must not accept or interpolate any provider credential.
 #[test]
-fn release_flow_defaults_to_direct_anthropic_and_selects_the_model_credential() {
+fn release_flow_is_credential_free_and_calls_only_the_host_cut() {
     let code = workflow_code("release-flow.yml");
     assert!(
-        code.contains("anthropic/claude-haiku-4-5"),
-        "release-flow.yml must default to the direct Anthropic Haiku model"
+        code.contains("flux flow run examples/release-cut.flux"),
+        "release-flow.yml must run the deterministic host-only release program"
     );
-    assert!(
-        !code.contains("default: \"openrouter/anthropic/claude-haiku-4.5\"")
-            && !code.contains("inputs.model || 'openrouter/anthropic/claude-haiku-4.5'"),
-        "the automatic release must not depend on OpenRouter account credits by default"
-    );
-    for required in [
-        "secrets.ANTHROPIC_API_KEY",
-        "secrets.OPENROUTER_API_KEY",
-        "anthropic/*",
-        "openrouter/*",
+    for forbidden in [
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "FLUX_SMOKE_MODEL",
+        "scripts/smoke-live.sh",
+        "inputs.model",
+        "-m $RELEASE_MODEL",
+        "examples/release.flux",
     ] {
         assert!(
-            code.contains(required),
-            "release-flow.yml must select provider credentials explicitly; missing `{required}`"
+            !code.contains(forbidden),
+            "release-flow.yml must not depend on model/provider surface `{forbidden}`"
         );
     }
 }
 
-/// Unattended agentic and served surfaces fail closed when no OS sandbox backend exists. Hosted
-/// Ubuntu runners do not provide bubblewrap by default, so the release workflow must provision and
-/// prove it before either the live smoke or the Flux-authored cut runs.
+/// The deterministic Flux-Lang cut still runs fixed process operations through guarded System.
+/// Hosted Ubuntu lacks bubblewrap by default, so prove the backend before entering the host flow.
 #[test]
 fn release_flow_proves_a_sandbox_backend_before_running_flux() {
     let code = workflow_code("release-flow.yml");
@@ -675,24 +699,22 @@ fn release_flow_proves_a_sandbox_backend_before_running_flux() {
     let backend_probe = code_line_index(&code, |line| {
         line.contains("bwrap") && line.contains("--ro-bind") && line.contains("/ / ")
     });
-    let smoke = code_line_index(&code, |line| line.contains("./scripts/smoke-live.sh"));
     let flow = code_line_index(&code, |line| {
-        line.contains("flux flow run examples/release.flux")
+        line.contains("flux flow run examples/release-cut.flux")
     });
     assert!(
-        matches!((backend, user_namespace, backend_probe, smoke, flow),
-            (Some(backend), Some(userns), Some(probe), Some(smoke), Some(flow))
-                if backend < userns && userns < probe && probe < smoke && smoke < flow),
+        matches!((backend, user_namespace, backend_probe, flow),
+            (Some(backend), Some(userns), Some(probe), Some(flow))
+                if backend < userns && userns < probe && probe < flow),
         "release-flow.yml must install bubblewrap, enable the hosted Ubuntu user-namespace \
-         primitive, and self-test the backend before the live smoke and Flux flow; found \
-         install={backend:?}, userns={user_namespace:?}, probe={backend_probe:?}, smoke={smoke:?}, \
-         flow={flow:?}"
+         primitive, and self-test the backend before the deterministic Flux flow; found \
+         install={backend:?}, userns={user_namespace:?}, probe={backend_probe:?}, flow={flow:?}"
     );
 }
 
 /// `cut-release.sh` regenerates the embedded documentation snapshot, which invokes the website's
 /// local Docusaurus binary. Hosted runners start without `website/node_modules`, so the automatic
-/// release must install the locked website toolchain before it enters the Flux-authored cut.
+/// release must install the locked website toolchain before it enters the deterministic cut.
 #[test]
 fn release_flow_installs_the_locked_docs_toolchain_before_running_flux() {
     let code = workflow_code("release-flow.yml");
@@ -704,14 +726,14 @@ fn release_flow_installs_the_locked_docs_toolchain_before_running_flux() {
     let install_directory =
         code_line_index(&code, |line| line.trim() == "working-directory: website");
     let flow = code_line_index(&code, |line| {
-        line.contains("flux flow run examples/release.flux")
+        line.contains("flux flow run examples/release-cut.flux")
     });
     assert!(
         matches!((node, lockfile, install, install_directory, flow),
             (Some(node), Some(lockfile), Some(install), Some(directory), Some(flow))
                 if node < lockfile && lockfile < install && install < directory && directory < flow),
         "release-flow.yml must provision pinned Node and install website/package-lock.json before \
-         the Flux cut can regenerate embedded docs; found node={node:?}, lockfile={lockfile:?}, \
+         the deterministic cut can regenerate embedded docs; found node={node:?}, lockfile={lockfile:?}, \
          install={install:?}, directory={install_directory:?}, flow={flow:?}"
     );
 }
@@ -752,7 +774,7 @@ fn release_workflows_require_no_app_or_environment_settings() {
 /// publishes nothing. C-559 uses the existing repository `RELEASE_TOKEN` only on the host-owned
 /// promotion step and keeps the ambient token limited to Actions dispatch and observation.
 #[test]
-fn promotion_uses_the_step_scoped_release_token_outside_the_model_job() {
+fn promotion_uses_the_step_scoped_release_token_outside_the_cut_job() {
     let workflow = workflow_code("release-flow.yml");
     assert_eq!(
         workflow.matches("secrets.RELEASE_TOKEN").count(),
@@ -769,7 +791,7 @@ fn promotion_uses_the_step_scoped_release_token_outside_the_model_job() {
         "do not give GITHUB_TOKEN contents write: RELEASE_TOKEN is the trigger-capable credential"
     );
 
-    // The model half of the workflow must not be able to reach the promotion identity, which is a
+    // The deterministic cut half must not be able to reach the promotion identity, which is a
     // statement about the job boundary rather than about the file.
     let cut_job = workflow
         .split("\n  release-control:")
@@ -778,7 +800,7 @@ fn promotion_uses_the_step_scoped_release_token_outside_the_model_job() {
     for credential in ["PROMOTION_TOKEN", "RELEASE_TOKEN"] {
         assert!(
             !cut_job.contains(credential),
-            "the model/smoke/scribe/cut job must not reference {credential}"
+            "the deterministic plan/cut job must not reference {credential}"
         );
     }
 

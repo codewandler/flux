@@ -1,14 +1,16 @@
-# examples/release.flux — cut a flux release, as a Flux-Lang program (C-251).
+# examples/release.flux — optional model-assisted release-note rehearsal (C-251).
 #
-# The division of labour this program exists to enforce: the MODEL writes prose, the HOST decides the
-# version. crates.io is yank-only, so a model that reads a diff and calls a breaking change "patch"
-# has published it permanently across 30 crate names. The signal is already mechanical — this repo
-# marks breaking commits with a conventional-commit `!` — so `release_plan` derives the bump with a
-# regex and nothing here ever reads a version back out of a model reply.
+# This is an explicit manual surface for previewing model-drafted release notes. It is not called by
+# `.github/workflows/release-flow.yml` and is not part of the automatic release path. Automatic cuts
+# use `examples/release-cut.flux`, consume already-reviewed `[Unreleased]` notes, and require no
+# model or provider credential.
 #
-# The program stops at a LOCAL annotated tag. Pushing, the GitHub release and crates.io stay with the
-# existing tag-triggered workflows (BUILD-ONCE candidate → promote), so a bug in this program cannot
-# publish anything.
+# This optional program still keeps the irreversible version decision in the host. crates.io is
+# yank-only, so `release_plan` derives the bump from repository evidence and nothing here ever reads
+# a version back out of a model reply.
+#
+# The program stops at a LOCAL annotated tag. Pushing, the GitHub release and crates.io stay outside
+# this manual example, so a bug in it cannot publish anything.
 #
 # Its authority is narrow by construction rather than by prompt: the only process-capable ops it calls
 # are `release_verify_versions` and `release_cut`, whose argv is fixed to the two named scripts, and
@@ -18,8 +20,7 @@
 # Run with: flux flow run examples/release.flux --arg apply=false --yes
 # `apply=false` is the safe local/manual default: it derives the version, renders both changelog
 # sections and the diff it would apply, and mutates nothing — no file, no commit, no tag. The
-# release-branch workflow supplies `apply=true`; its host-owned step promotes the resulting local cut
-# only after the exact-SHA candidate and receipt are green.
+# `apply=true` is a local rehearsal. The release-branch workflow never invokes this file.
 
 flow release(apply: Bool) -> String
 goal "Cut a flux release: the host derives the version from the commit titles, a scribe drafts both changelogs, the host inserts that prose, and the run stops at a local annotated tag."

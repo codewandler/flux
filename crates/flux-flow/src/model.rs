@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use flux_core::{Chunk, ContentBlock, Result, StopReason, Usage};
+use flux_core::{Chunk, ContentBlock, Message, Result, StopReason, ToolResultContent, Usage};
 use flux_provider::{
     with_retry_observer, Effort, Provider, Request, RetryEvent, RetryObserver, RetryReason,
 };
@@ -36,6 +36,49 @@ impl Default for StageOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MessageLayerMetrics {
+    message_count: usize,
+    tool_result_count: usize,
+    tool_result_bytes: usize,
+    tool_use_bytes: usize,
+    text_bytes: usize,
+}
+
+fn message_layer_metrics(messages: &[Message]) -> MessageLayerMetrics {
+    let mut metrics = MessageLayerMetrics {
+        message_count: messages.len(),
+        ..MessageLayerMetrics::default()
+    };
+
+    for message in messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text } => metrics.text_bytes += text.len(),
+                ContentBlock::ToolUse { input, .. } => {
+                    metrics.tool_use_bytes += serde_json::to_vec(input)
+                        .map(|input| input.len())
+                        .unwrap_or_default();
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    metrics.tool_result_count += 1;
+                    metrics.tool_result_bytes += content
+                        .iter()
+                        .map(|item| match item {
+                            ToolResultContent::Text { text } => text.len(),
+                            ToolResultContent::Image { source } => serde_json::to_vec(source)
+                                .map(|value| value.len())
+                                .unwrap_or_default(),
+                        })
+                        .sum::<usize>();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    metrics
+}
 /// Redacted measurements captured at the provider-stream boundary for one model call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ModelCallMetrics {
@@ -44,10 +87,15 @@ pub(crate) struct ModelCallMetrics {
     pub chunks: u64,
     pub system_bytes: usize,
     pub message_bytes: usize,
+    pub message_count: usize,
+    pub tool_result_count: usize,
+    pub tool_result_bytes: usize,
+    pub tool_use_bytes: usize,
+    pub text_bytes: usize,
     pub operations: usize,
     pub schema_bytes: usize,
-    /// Backed-off connect retries this call spent (C-181). Counted at the provider seam, so it is
-    /// populated on the failure path too — where no stream ever exists to carry it.
+    /// Provider retries after the initial request. This is populated on the failure path too,
+    /// where no stream ever exists to carry it.
     pub retries: u32,
     /// Forced OAuth token refreshes (at most one per call).
     pub oauth_refreshes: u32,
@@ -160,6 +208,7 @@ pub(crate) async fn stream_blocks<'a, 'b>(
 ) -> (Result<StreamedCall>, Usage, ModelCallMetrics) {
     let started = Instant::now();
     let mut usage = Usage::default();
+    let message_layers = message_layer_metrics(&request.messages);
     let mut metrics = ModelCallMetrics {
         system_bytes: request
             .system_text()
@@ -168,6 +217,11 @@ pub(crate) async fn stream_blocks<'a, 'b>(
         message_bytes: serde_json::to_vec(&request.messages)
             .map(|value| value.len())
             .unwrap_or_default(),
+        message_count: message_layers.message_count,
+        tool_result_count: message_layers.tool_result_count,
+        tool_result_bytes: message_layers.tool_result_bytes,
+        tool_use_bytes: message_layers.tool_use_bytes,
+        text_bytes: message_layers.text_bytes,
         operations: request.tools.len(),
         schema_bytes: request
             .tools
@@ -226,4 +280,51 @@ pub(crate) async fn stream_blocks<'a, 'b>(
 
 fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+#[cfg(test)]
+mod tests {
+    use super::{message_layer_metrics, MessageLayerMetrics};
+    use flux_core::{ContentBlock, Message};
+    use serde_json::json;
+
+    #[test]
+    fn message_layer_metrics_count_payload_categories_independently() {
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-1",
+                        "content": [{"type": "text", "text": "answer"}]
+                    }
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "lookup",
+                        "input": {"q": "rust"}
+                    }
+                ]
+            }
+        ]))
+        .expect("messages should deserialize");
+        assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
+
+        assert_eq!(
+            message_layer_metrics(&messages),
+            MessageLayerMetrics {
+                message_count: 2,
+                tool_result_count: 1,
+                tool_result_bytes: 6,
+                tool_use_bytes: 12,
+                text_bytes: 5,
+            }
+        );
+    }
 }

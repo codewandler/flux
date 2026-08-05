@@ -164,15 +164,16 @@ gh pr create --base release --head main \
 
 Merging that PR is the whole release action; its resulting push to `release` starts the workflow.
 
-`.github/workflows/release-flow.yml` runs the live smoke, asks the tool-less release scribe for the
-two changelog sections, has the host derive and cut the version, and creates a local release commit
-plus annotated tag. The automatic cut delegates its full repository gate to the candidate workflow;
-that is the only path allowed to pass `--no-gate` to `cut-release.sh`. Before running Flux unattended, the workflow installs bubblewrap, enables the
-user-namespace primitive restricted by the hosted Ubuntu AppArmor default, and self-tests the
-backend; agentic and served smoke legs remain confined instead of weakening the fail-closed sandbox
-posture for CI. That job holds no GitHub write token at all (C-354): it hands the cut to the
-controller as a git bundle (`scripts/bundle-release-cut.sh`) carrying exactly the cut commit and its
-annotated tag, with the trigger commit as the bundle's prerequisite.
+`.github/workflows/release-flow.yml` runs the credential-free `examples/release-cut.flux`. Release
+notes are already-reviewed repository source under the two `[Unreleased]` sections; no prose is
+generated during a release. The host derives and validates the version, then creates a local release
+commit plus annotated tag. The automatic cut delegates its full repository gate to the candidate
+workflow; that is the only path allowed to pass `--no-gate` to `cut-release.sh`. Before running Flux
+unattended, the workflow installs bubblewrap, enables the user-namespace primitive restricted by the
+hosted Ubuntu AppArmor default, and self-tests the backend used by the fixed release operations. The
+cut job holds no provider credential and no GitHub write token at all (C-354): it hands the cut to
+the controller as a git bundle (`scripts/bundle-release-cut.sh`) carrying exactly the cut commit and
+its annotated tag, with the trigger commit as the bundle's prerequisite.
 
 The separate `release-control` job is the only one with core promotion authority. Its single host
 step receives the existing repository `RELEASE_TOKEN`, verifies that the PAT is usable before the
@@ -240,21 +241,14 @@ If any full-gate command fails, the candidate run creates no receipt. The promot
 waiting with `--exit-status`, so it retains the candidate ref for diagnosis and leaves both `main`
 and the tag untouched.
 
-Four Actions secrets are required for the default path, with one optional provider override:
+Three Actions secrets are required for publication. The automatic cut itself requires none:
 
-- **`ANTHROPIC_API_KEY`** — used only by the default direct-Haiku `FLUX_SMOKE_MODEL` live smoke and
-  release-scribe turn. A manual preview without the selected provider key skips, but a push to
-  `release` fails loudly without cutting or pushing anything. The direct provider is the default so
-  release availability does not also depend on an OpenRouter account balance.
-- **`OPENROUTER_API_KEY`** *(optional)* — selected only when a manual dispatch explicitly overrides
-  the model with an `openrouter/*` model. The workflow passes provider credentials only to the
-  credential probe, live smoke, and Flux flow steps.
 - **`RELEASE_TOKEN`** — the existing fine-grained GitHub PAT scoped to this repository with Contents
   and Pull requests write authority. It is named only on four host-owned steps: core promotion,
   plugin tag control, core GitHub Release creation and plugin GitHub Release creation. The promotion
   helper uses it for the cut ref, pull request and merge, merged-main candidate, annotated-tag push
   and exact cleanup; plugin tag control uses it for the one absent exact plugin tag. It never enters
-  model, build, signing or Cargo publication work. The ambient `GITHUB_TOKEN` dispatches/observes
+  cut, build, signing or Cargo publication work. The ambient `GITHUB_TOKEN` dispatches/observes
   Actions only and never creates a tag, because its ref events would not start tag workflows.
 - **`MINISIGN_SECRET_KEY`** — the plugin pack signing key, named only in the minisign step of
   `release-plugins.yml`'s `sign` job.
@@ -271,7 +265,7 @@ partitioned by job, and each long-lived credential occurrence is named on an exp
 
 | Authority | Where it lives | What it can do |
 | --- | --- | --- |
-| model / build / assembly | no GitHub write permission and no release secret | compute and check artifacts |
+| plan / cut / assembly | no GitHub write permission, provider credential or release secret | derive, validate and assemble artifacts |
 | promotion | `release-control`, step-scoped `RELEASE_TOKEN` | cut branch, PR, merge, candidate ref, one tag and exact cleanup |
 | candidate dispatch / Actions observation | `release-control`, ambient `GITHUB_TOKEN` with `actions: write`, `contents: read` | dispatch and observe the exact runs; no repository mutation |
 | attestation | separate job, `id-token: write` + `attestations: write` | attest the already-checked asset set |

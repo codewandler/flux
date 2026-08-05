@@ -2,10 +2,11 @@
 #
 # bundle-release-cut.sh — hand the local release cut to the promotion job as bytes (C-354).
 #
-# The job that runs the model and `scripts/cut-release.sh` holds no GitHub write token, so it cannot
-# push the commit it just made. The job that CAN push holds the promotion App's identity and must
-# not run a model. The cut therefore crosses that boundary as a git bundle: exactly the cut commit
-# and its annotated tag, with the trigger SHA recorded as the bundle's prerequisite.
+# The deterministic job that runs the host-only release plan and `scripts/cut-release.sh` holds no
+# GitHub write token, so it cannot push the commit it just made. The job that CAN push holds the
+# step-scoped promotion credential and runs no build or release-plan code. The cut therefore crosses
+# that boundary as a git bundle: exactly the cut commit and its annotated tag, with the trigger SHA
+# recorded as the bundle's prerequisite.
 #
 # A bundle is the right shape for this handoff because it is self-describing and verifiable. The
 # receiving job re-derives every identity from the imported objects and checks them against live

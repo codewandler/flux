@@ -1,87 +1,68 @@
 ---
 id: C-251
-title: "Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version"
+title: "Cutting a release should be a push — a deterministic Flux-Lang host cut"
 pillar: Core
 status: in-progress
 priority: 10
 areas: [flux-cli, flux-tools, ci]
-note: "flux automating its own release is the most honest dogfood there is; the load-bearing decision is that the MODEL writes prose and the HOST does version math, because a wrong version on crates.io is irreversible"
+note: "the automatic release is a deterministic repository operation: reviewed notes and host-derived versioning, with no model provider or account dependency"
 ---
 
-# Cutting a release should be a push — a Flux-Lang program curates the changelogs, the host decides the version
+# Cutting a release should be a push — a deterministic Flux-Lang host cut
 
 ## Goal
-Today a release is a human sequence: pre-validate the gate, run `scripts/smoke-live.sh` with a real
-key, hand-write `CHANGELOG.md` and `WHATS-NEW.md` entries, decide the version, run
-`scripts/cut-release.sh`, push main, run the candidate workflow, verify its SHA, push the tag. It is
-well documented and still error-prone — the failure archive includes phantom versions from a re-run
-after a rolled changelog, a global `sed` that bumped an unrelated external crate, and a backfilled
-tag that hijacked `/releases/latest`.
+Make **merging main into `release` the whole release action.** Release notes are ordinary reviewed
+repository source under the two `[Unreleased]` sections. The automatic workflow runs a deterministic
+host-only Flux-Lang program that derives the next version from fully framed commit records and the
+customer migration signal, validates the independently versioned protocol crates, performs the
+transactional cut, and hands immutable bytes to the existing candidate/tag publication controller.
+It never selects or calls a model and never receives a provider credential.
 
-Make **merging main into `release` the whole release action.** CI then: runs the smoke test against a
-cheap model over OpenRouter, hands the diff to a flux agent that drafts and polishes the two
-changelogs in the house voice, has the **host** derive the next version mechanically, cuts, tags, and
-lets the existing tag-triggered workflows publish. Expressed as a `.flux` program, because the loop is
-exactly what Flux-Lang is for — and because flux automating its own release is the most honest dogfood
-available.
+## The load-bearing decision: repository evidence decides the release
 
-## The load-bearing decision: the model writes prose, the host decides the version
+The irreversible decisions remain mechanical and host-owned:
 
-The request was for the agent to "figure out the next version". **This story deliberately does not do
-that**, and the reason is the same principle the fleet-loop epic is built on — *the model reasons, the
-host enforces*:
-
-- **A wrong version is irreversible.** crates.io is yank-only. A model that reads a diff and says
-  "patch" when a trait gained a method without a default body has published a breaking change under a
-  compatible version number, to 30 crate names, permanently.
+- **A wrong version is irreversible.** crates.io is yank-only. Version derivation therefore cannot
+  depend on generated prose, provider availability, or a model judgement.
 - **The signal is already mechanical.** flux's rule is *breaking → MINOR (while 0.y), additive and
   fixes → patch*, and the repo already marks breaking commits with a conventional-commit `!`
   (`refactor(events,sdk,cli)!:`, `feat(capabilities,tools)!:`). Deriving the bump from commit titles is
   a regex, not a judgement.
 - **The protocol line has a second, independent rule** that `scripts/check-crate-versions.sh` already
   enforces: the `codewandler-flux-{spec,secret,policy,evidence,datasource,plugin-protocol,host-kit}`
-  crates version *the wire*, on their own 1.x line. When that script fails, the flow must **stop**,
-  not guess — a model cannot be trusted to reason about wire compatibility, and this is precisely the
-  check that catches it.
-
-So the model's job is the part it is genuinely good at and the host is bad at: reading a diff and
-writing prose a human would want to read, in two different voices — engineer-facing `CHANGELOG.md`
-(with `path:line` and *why*) and customer-facing `WHATS-NEW.md` (plain language, no story IDs, no
-crate names). The model may also **explain** the version and **disagree in writing**, which fails the
-run loudly rather than silently changing the number.
+  crates version *the wire*, on their own 1.x line. When that script fails, the flow must **stop**
+  before any cut artifact exists.
+- **Release notes are reviewed inputs.** `CHANGELOG.md` and `WHATS-NEW.md` travel through normal code
+  review with the changes they describe. The cut rolls them and regenerates the tested website mirror;
+  CI does not synthesize prose at release time.
 
 ## Acceptance
 - [ ] Merging `main` → `release` produces a tag and a GitHub release with no human step, or fails
-      loudly with the reason. **Failing-first test**: the program's offline journey — a fixture repo
-      with a known commit log, a stub model, and no network — produces the expected version, the
-      expected two changelog sections, and a tag; and produces **no tag** when the gate is red.
-- [x] The version is derived by the host from commit titles (`!` / `BREAKING`), never from model
-      output. A test pins: a log containing `feat(x)!:` yields `minor`; a log of only `fix:`/`docs:`
-      yields `patch`; and a model reply asking for a different bump does **not** change it.
+      loudly with the reason. A hosted tag, public Release and publication verification are the final
+      evidence for this item.
+- [x] The version is derived by the host from complete commit messages (`!` / `BREAKING`) and the
+      checked customer `Action needed` signal, never from generated prose or provider output.
 - [x] `scripts/check-crate-versions.sh` failing **halts the flow before any tag exists**, with the
       protocol-line crate named. Pinned by a test.
-- [x] The model's prose is inserted under `[Unreleased]` deterministically by the host, and
-      `website/docs/whats-new.md` is regenerated in the **same commit** — the mirror is a tested input
-      (`website_customer_changelog_is_in_sync`), so a bare `WHATS-NEW.md` edit is a red gate.
-- [x] The program runs under a **narrow, runtime-enforced authority ceiling by construction**: its
-      op set exposes no general write or process tool; `changelog_insert` canonicalizes and permits
-      exactly `CHANGELOG.md`, `WHATS-NEW.md`, and `website/docs/whats-new.md`; the two process-capable
-      release ops use fixed argv for the named scripts; and the scribe has `tools: []`. Attempts to
-      write elsewhere are refused by the operation implementation, not by prompt or by the decorative
-      `.flux/policies/release.toml`. Pinned by `release_authority.rs` against the shipped AST, path
-      boundary, permission subjects, and role.
-- [x] The smoke test is wired in CI against the configured cheap direct Anthropic model
-      (`FLUX_SMOKE_MODEL`), and its failure blocks the cut. An explicit `openrouter/*` override
-      selects its own credential. Optional legs whose credential is absent SKIP; an automatic
-      release with no selected-provider credential fails loudly rather than finishing green after
-      doing nothing. The source wiring is complete; live hosted proof remains pending and is tracked
-      below.
+- [x] The already-reviewed `[Unreleased]` sections are rolled by the transactional host script, and
+      `website/docs/whats-new.md` is regenerated in the **same commit**. A stale mirror is a red gate.
+- [x] The unattended program has a **narrow authority ceiling by construction**: its exact op set is
+      pure expression/formatting plus `release_plan`, `release_verify_versions`, and `release_cut`.
+      It exposes no `task`, provider, network, general process, changelog-writing, or general file
+      operation. Pinned by `release_authority.rs` against the shipped AST.
+- [x] `.github/workflows/release-flow.yml` accepts no model selector, references no provider secret,
+      and does not call live-provider smoke. The exact candidate still runs the shared full repository
+      gate, including the offline protocol-shape smoke, before a receipt or tag can exist.
 - [x] The flow is idempotent and re-runnable: a second run on an already-released SHA is a no-op, and
       a failed run leaves **no** partially-rolled changelog (the C-147 transactionality property that
       `cut-release.sh` already has must not be lost by wrapping it).
 - [x] Standard gate green in both workspaces.
 
-## First draft of the `.flux` part
+## Historical model-authored draft (superseded 2026-08-05)
+
+The draft below records the original design discussion. It is not the automatic release contract and
+is not reachable from `.github/workflows/release-flow.yml`; `examples/release-cut.flux` is the shipped
+credential-free entry point.
 
 Text syntax, per `crates/flux-lang/docs/syntax.md`. **This is a draft, not a specification** — the op
 names marked `⚠` need checking against the live catalog before implementation, and the file-writing
@@ -181,6 +162,16 @@ workflows and runs the public Release verifier before reporting success. Keeping
 half outside the model-authored program means a bug in the program cannot publish directly.
 
 ## Progress
+- 2026-08-05 — **Provider credentials were removed from the automatic release contract.** Release
+  run `31025539856` failed twice solely because Anthropic reported an exhausted credit balance;
+  explicit OpenRouter run `31026403780` then failed with a 402 balance error, and the free-router
+  run `31027236827` failed because no endpoint matched the account data policy. None created a
+  candidate, tag or GitHub Release. `examples/release-cut.flux` is now the automatic entry point:
+  it reuses the reviewed `[Unreleased]` notes and calls only the deterministic host plan, protocol
+  validation and transactional cut. The workflow has no model input, provider secret or live-model
+  smoke. Structural policy rejects Anthropic, OpenRouter or OpenAI credentials in every release
+  workflow. Acceptance item 1 remains open until the resulting hosted cut publishes and verifies
+  the real release.
 - 2026-08-03 — Deduplicated the expensive release gate without weakening promotion. The unattended
   cut may request `--no-gate` only under the host-owned GitHub Actions push context for
   `refs/heads/release`; manual cuts and workflow rehearsals retain the transactional default gate.
@@ -315,25 +306,20 @@ half outside the model-authored program means a bug in the program cannot publis
 ## Notes
 - **Trigger:** a push to `release`, not to `main`. Merging main → release is the deliberate act; an
   ordinary main push must not cut. This was the user's own framing and it is the safer one.
-- **Model + key:** direct `anthropic/claude-haiku-4-5` with `ANTHROPIC_API_KEY` is the default. A
-  manual `openrouter/*` override selects `OPENROUTER_API_KEY`. The first hosted rehearsal proved the
-  distinction matters: OpenRouter returned 402 with no account credits, while its zero-cost models
-  were unavailable under the account's privacy policy. The direct provider avoids coupling release
-  availability to either condition without weakening that policy.
-- **Why this is a good flux story rather than a shell script:** every hard part is something flux
-  already claims to do — a narrow runtime op set whose canonical path boundary means a model-driven
-  run structurally cannot touch source, fixed-argv process seams through `flux_system`, and an
-  auditable action batch. If flux cannot safely automate its own release, the claim that it can
-  safely automate someone else's work is weaker.
+- **No model key:** the automatic release accepts no model selector and receives no Anthropic,
+  OpenRouter or OpenAI credential. `scripts/smoke-live.sh` remains an operator-invoked diagnostic,
+  not a release gate.
+- **Why this remains a Flux-Lang story:** the release program is an auditable deterministic
+  composition over narrow host operations. Flux executes its own release contract without turning
+  release availability into a model-provider dependency.
 - **Ops this needs that now exist:** C-238 landed `git_branch`/`git_merge`/`git_revert`, so the
   merge-and-revert half is expressible; `gate_check`, `git_snapshot` and `git_tag` already exist in
   the eval pack. The gap is the changelog-insertion seam (⚠ above) — a deterministic anchored insert
   is probably a small op or a script, and should **not** be the model writing the file, because then
   the model's output becomes the file content rather than its input.
 - **No approval prompt exists in CI.** `--yes` makes the run non-interactive, but it does not define
-  the ceiling: the model-facing program has only the fixed release op set above, while the separately
-  authenticated promotion helper is host-owned and receives `RELEASE_TOKEN` only for its guarded ref
-  operations. An unattended agent in a release pipeline is exactly the shape that must fail closed.
+  the ceiling: the automatic program's exact host op set does, while the separately authenticated
+  promotion helper receives `RELEASE_TOKEN` only for its guarded ref operations.
 - **Failure archive worth reading first** (all real, all in this repo's history): a gate flake *after*
   the changelog roll minted a phantom version section; `cut-release.sh`'s global `sed` bumped an
   external crate that happened to share flux's version string; a backfilled tag hijacked

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# smoke-live.sh — the live-provider smoke gate. Run this before every release/tag.
+# smoke-live.sh — optional live-provider diagnostic; automatic releases do not call it.
 #
 # It exercises the real-provider message-shape paths that the offline `mock` provider CANNOT
 # validate: the mock doesn't enforce alternating user/assistant roles or tool_use/tool_result
