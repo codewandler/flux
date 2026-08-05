@@ -5,6 +5,13 @@ pub(super) fn verbose() -> bool {
     flux_system::env_truthy("FLUX_VERBOSE")
 }
 
+/// Whether the stderr progress surface is silenced (set by `flow run -q/--quiet`, which exports
+/// `FLUX_QUIET`). Quiet never touches errors, warnings, approval prompts, sandbox disclosures, or
+/// stdout — it only removes progress rendering.
+pub(super) fn quiet() -> bool {
+    flux_system::env_truthy("FLUX_QUIET")
+}
+
 pub(super) fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() > n {
         let head: String = s.chars().take(n).collect();
@@ -508,6 +515,9 @@ pub(super) struct CliSink {
     pub(super) live: flux_markdown::render::LiveRenderer,
     /// Show tool output in full (no truncation) — from `-v`/`FLUX_VERBOSE`.
     pub(super) verbose: bool,
+    /// Silence the progress surface (spinner, op lines, phase markers, fleet lines, the turn-end
+    /// rule) — from `flow run -q`/`FLUX_QUIET`. Error results still print.
+    pub(super) quiet: bool,
     pub(super) width: usize,
     pub(super) stderr_tty: bool,
     pub(super) steps: usize,
@@ -585,6 +595,7 @@ impl CliSink {
                 stdout_tty,
             ),
             verbose: verbose(),
+            quiet: quiet(),
             width,
             stderr_tty: std::io::stderr().is_terminal(),
             steps: 0,
@@ -746,11 +757,18 @@ impl AgentSink for CliSink {
         let _ = self.live.push(t, &mut out);
     }
     fn thinking_delta(&mut self, t: &str) {
+        if self.quiet {
+            return;
+        }
         // Stream extended-thinking tokens dimmed on stderr so reasoning is observable in the REPL.
         eprint!("{}", style::dim(t));
         std::io::stderr().flush().ok();
     }
     fn planning(&mut self, active: bool) {
+        if self.quiet {
+            self.turn_start.get_or_insert_with(std::time::Instant::now);
+            return;
+        }
         // Fill an otherwise-silent provider wait with a phase-aware spinner. The intent/exploration
         // observation replaces it once the typed model stage completes.
         if active {
@@ -788,7 +806,9 @@ impl AgentSink for CliSink {
         } else {
             base_label
         };
-        if self.use_spinner() {
+        if self.quiet {
+            // Bookkeeping only: the label is kept so an error result can still name its op.
+        } else if self.use_spinner() {
             // Tool lines keep the braille glyph — their labels are long and a bar would crowd them.
             self.start_spinner(label.clone(), None);
         } else {
@@ -810,6 +830,14 @@ impl AgentSink for CliSink {
             .pending
             .take()
             .unwrap_or_else(|| (String::new(), std::time::Instant::now()));
+        if self.quiet {
+            if !result.is_error {
+                self.pending_timing = None;
+                return;
+            }
+            // Failures stay visible: the suppressed call line is reprinted so the ✗ has its op.
+            eprintln!("\n{} {label}", style::blue("→"));
+        }
         // If a spinner ran, its line is cleared — reprint the call line so it stays in the scrollback.
         if self.stop_spinner() {
             eprintln!("\n{} {label}", style::blue("→"));
@@ -831,6 +859,46 @@ impl AgentSink for CliSink {
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.commit();
+        if self.quiet {
+            // Quiet keeps only the non-progress arms: usage/phase folding (state, not output), the
+            // destructive-op approval warning, budget crossings, cancellation, and halts.
+            // Everything else in the chain below is progress rendering.
+            if o.kind == "model.call" {
+                if let Some(usage) = o
+                    .data
+                    .get("usage")
+                    .and_then(|value| serde_json::from_value::<Usage>(value.clone()).ok())
+                {
+                    self.turn_cache.add(&usage);
+                }
+            } else if o.kind == flux_evidence::KIND_DESTRUCTIVE {
+                eprintln!(
+                    "{}",
+                    style::yellow("⚠ destructive operation — approval required")
+                );
+            } else if o.kind == flux_evidence::KIND_BUDGET_PROJECTION {
+                // C-542's crossings are a warning and a stop, not progress: suppressing them would
+                // end a quiet run at a hard limit with nothing on stderr saying why. Rendered
+                // exactly as the loud arm below renders it.
+                if let Some((line, stop)) = budget_crossing_line(&o.data) {
+                    eprintln!(
+                        "{}",
+                        if stop {
+                            style::red(&line)
+                        } else {
+                            style::yellow(&line)
+                        }
+                    );
+                }
+            } else if o.kind == "loop.phase" {
+                self.record_phase(o);
+            } else if o.kind == "turn.cancelled" {
+                eprintln!("{}", style::dim("⊘ turn cancelled"));
+            } else if o.kind == "flow.halt" {
+                self.render_halt(o);
+            }
+            return;
+        }
         // `action_batch.proposed` / `approval.requested` are deliberately unrendered here: sink
         // events are drained only when the turn future yields, which during an approval is AFTER
         // the prompt line is already open — printing them would garble it. The approval prompt
@@ -950,6 +1018,11 @@ impl AgentSink for CliSink {
     fn turn_end(&mut self, usage: Option<Usage>) {
         self.commit();
         self.stop_spinner();
+        if self.quiet {
+            // No rule under quiet — `flux usage` still has the spend; only reset turn state.
+            self.turn_cache = flux_core::CacheEfficiency::default();
+            return;
+        }
         let elapsed = self
             .turn_start
             .map(|t| style::fmt_elapsed(t.elapsed()))

@@ -1191,6 +1191,12 @@ pub(super) enum FlowAction {
         /// Auto-approve every tool call (programs deny destructive ops without it).
         #[arg(long)]
         yes: bool,
+        /// Silence the stderr progress surface: the session line, per-op dispatch/result lines,
+        /// spinners, and the turn-end rule. Errors, warnings, approval prompts, sandbox
+        /// disclosures, halt reports, and the flow result on stdout are unaffected. Also enabled
+        /// by `FLUX_QUIET`. Complements `flux review --progress off`.
+        #[arg(short = 'q', long)]
+        quiet: bool,
         /// Opt into resumable mode (L-25): a halt (a failed top-level statement, or the L-24
         /// reified `await` pause) prints a structured halt report — a ✓/✗/· marked statement tree,
         /// a machine-readable failure summary, and the session id — and exits non-zero, instead of
