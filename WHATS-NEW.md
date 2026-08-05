@@ -64,6 +64,16 @@
 
 ### Improved
 
+- **Remote execution now keeps compatible tools available instead of hiding their whole group.**
+  Each tool declares whether it works on the selected execution system, belongs on the local control
+  plane, or is native-only. Native-only tools stay hidden and are refused if called directly, while
+  compatible tools in the same group remain usable; `/tools` explains why an unavailable tool was
+  excluded.
+
+- **Fenced code blocks are easier to recognize in every Markdown view.** Each row now has a `▎ `
+  gutter in the terminal, exported output, and monochrome displays, including blank rows and code
+  nested inside lists.
+
 - **Tool cards now keep hostile terminal bytes inert and make diffs much easier to read.** Escape
   sequences and control bytes are stripped before live or historical tool output reaches the TUI;
   patch and Git diff output gets hunk/add/delete styling, long wrapped rows stay inside their card,
@@ -118,6 +128,11 @@
   footer, docs overview, and README instead of hiding behind the playground.
 
 ### Fixed
+
+- **Long-term quota exhaustion now returns immediately instead of wasting retry time.** When a
+  provider explicitly says that usage or credits are exhausted, Flux preserves the reset or limit
+  message and returns control after the first response. Ordinary short-lived rate limits continue
+  to retry.
 
 - **The terminal UI no longer includes a dependency version with a known soundness defect.** Its
   rendering and input stack was updated together without changing the TUI's behavior.
