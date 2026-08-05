@@ -68,9 +68,21 @@ A project can also carry `.flux/config.toml`, `.flux/flows/`, `.flux/agents/`, `
 and definitions are not copied into `~/.flux`, and flux does not walk upward to find a parent
 repository.
 
+Board and fleet workflows add project/workspace-owned state:
+
+| Path | What it is |
+|---|---|
+| `docs/stories/` plus planning documents | a Track repository board; story files remain authoritative and only the marked index region is generated |
+| configured board `root` | Markdown execution-board item files; session boards instead use the selected `events.db` |
+| `.flux/fleet.toml` | fleet repositories, board bindings, gates, templates, limits and fences |
+| `.flux/fleet/state.json` | folded durable worker, wave, handoff, review and gate state |
+| `.flux/fleet/events.ndjson` | append-only redacted fleet activity and coordinator notes |
+| `.flux/fleet/worktrees/` | default local integration/story worktrees; configuration may select another root |
+
 `flux --store <dir> …` relocates that invocation's `events.db` and `flow.db`; it exports the same
 choice as `FLUX_STORE_DIR` to child flux processes. It does not relocate credentials, endpoints,
-plugins, project files, or the global store read by `flux usage`.
+plugins, repository/workspace boards, `.flux/fleet*`, project files, or the global store read by
+`flux usage`.
 
 Do not delete an open SQLite database to troubleshoot it. The safest clean-room test is a new store:
 
@@ -82,6 +94,20 @@ If you intentionally reset persistent history, stop every flux process and back 
 together with any `-wal` and `-shm` sidecars first. Removing `events.db` loses sessions and memory;
 removing `flow.db` separately loses flow-engine state. See
 [Storage & persistence](./reference/storage.md) for relocation, retention, and backend details.
+
+For fleet recovery, inspect before deleting or recreating anything:
+
+```bash
+flux fleet validate --output json
+flux fleet status --output json
+flux fleet worktrees --output json
+flux fleet inspect activity --limit 100 --output json
+flux fleet resume --output json
+```
+
+The ledger can reconstruct supervisor state, but it cannot recover uncommitted source from a deleted
+worker worktree. Preserve active worktrees and their Git refs until the wave is applied, cancelled,
+or deliberately abandoned.
 
 ## The server refuses to start
 

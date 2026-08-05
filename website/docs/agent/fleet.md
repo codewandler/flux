@@ -5,6 +5,11 @@ description: "Continue to the complete AI-assisted development guide for boards,
 
 # Work boards and the fleet
 
+:::info Availability
+Native `flux board` and `flux fleet` landed after v0.55.0. Source installs from current `main`
+include them; packaged-release users need v0.56.0 or newer.
+:::
+
 The board and fleet documentation has moved into one task-oriented section:
 
 - [AI-assisted development](../coding/overview.md) explains how vision, roadmap, decisions,

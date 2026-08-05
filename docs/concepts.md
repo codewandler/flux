@@ -224,7 +224,7 @@ Datasource Definitions belong to the connector package (what a vendor exposes is
 who runs it), tenant bindings and the governed read seam belong to Exchange, and the wire
 vocabulary, the registry and the Flux-Lang declaration surface belong to flux. The work board is
 deliberately **not** a datasource — it mutates, so it is its own first-class write-capable surface
-with its own declaration and `board:` subject namespace as that direction lands.
+with its own declaration, registry, native CLI and `board:` subject namespace.
 
 The two meet cleanly, and this is deliberate: **a datasource is read through operations.** Retrieval
 (`search`, `get`, `list`, …) is just more read-only operations in the same catalog, so knowledge

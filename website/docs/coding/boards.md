@@ -10,6 +10,11 @@ owns the documents that explain why the work exists. It is separate from a
 [datasource](../agent/datasources.md): a datasource is a read surface over knowledge or a system of
 record; a board creates, transitions, comments on, and records evidence against work.
 
+:::info Availability
+Native `flux board` landed after v0.55.0. It is available in source installs from current `main`;
+packaged-release users need v0.56.0 or newer.
+:::
+
 ## Identity and authority
 
 Every operation resolves through a board binding. Every item reference carries both halves:
@@ -127,14 +132,17 @@ flux board sync --dry-run --output json
 ### Daily story work
 
 ```sh
-flux board ls --output json
+flux board list --output json # `ls` is an alias
+flux board show --output json
 flux board items --output json
 flux board query --status ready --area flux-cli --output json
 flux board next --limit 1 --output json
 flux board get C-549 --output json
+flux board graph --output json
 
 flux board create --kind story --id C-552 --title "Example" --dry-run --output json
 flux board update C-552 --priority 51 --if-revision REV --idempotency-key prioritize-C-552 --output json
+flux board transition C-552 in-progress --dry-run --output json
 flux board start C-552 --if-revision REV --idempotency-key start-C-552 --output json
 flux board block C-552 --reason "waiting on API" --output json
 flux board unblock C-552 --output json
@@ -178,6 +186,7 @@ twice. Reusing the key for different input is a conflict.
 The ergonomic commands and the complete escape hatch share one schema:
 
 ```sh
+flux board skill
 flux board schema --output json
 flux board call stats --request request.json --output json
 ```
@@ -186,6 +195,20 @@ flux board call stats --request request.json --output json
 `{"schema":"flux.cli/v1","request_id":"stats-1","args":["--history"]}`. The response echoes the
 request id. This `args` escape hatch reaches the same validated command implementation; it never
 invokes a shell.
+
+## Dependency graph and portable board documents
+
+`graph` returns deterministic item and dependency nodes for schedulers and visualizers. `export`
+writes the selected board as a versioned JSON document; `import` accepts that same document through
+the destination board's normal validation, revision, idempotency and authorization checks. Import
+is not a filesystem-level replacement, so preview it before writing:
+
+```sh
+flux board graph --output json
+flux board export -o board.json --output json
+flux board import board.json --dry-run --output json
+flux board import board.json --if-revision REV --idempotency-key import-board --output json
+```
 
 ## Exact statistics and reports
 

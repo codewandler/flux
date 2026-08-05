@@ -48,8 +48,8 @@ For data the same split holds. A **datasource** is a named, declared, **read-onl
 *operations do; datasources know* — with one declared access mode, indexed or live. flux owns the
 published wire vocabulary, the one registry across both modes, and the Flux-Lang declaration
 surface; which vendor entities exist belongs to the connector package, and tenant bindings belong to
-Exchange. The work board is not a datasource — it mutates — and is becoming a first-class flux
-concept with its own declaration rather than a `datasource` kind.
+Exchange. The work board is not a datasource — it mutates — and is a first-class flux concept with
+its own declaration, registry, CLI and `board:` authority namespace rather than a `datasource` kind.
 
 ```bash
 flux run "add a test for the parser"
