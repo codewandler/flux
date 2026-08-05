@@ -3605,6 +3605,7 @@ async fn event_loop<B, S>(
 ) -> anyhow::Result<()>
 where
     B: Backend,
+    B::Error: Send + Sync + 'static,
     S: futures_util::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
 {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};

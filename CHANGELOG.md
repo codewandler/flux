@@ -232,6 +232,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The TUI dependency graph no longer carries the unsound `lru 0.12.5` release** (C-205).
+  Ratatui, crossterm, ansi-to-tui, the first-party Markdown parity oracles and the maintained
+  tui-textarea successor now resolve as one ratatui 0.30 generation with `lru 0.18.2`. The
+  `RUSTSEC-2026-0002` exceptions were removed from both advisory gates after root and plugin scans
+  passed without them.
+
 - **Tool results can no longer attach to the wrong transcript card** (C-531). `run_call` mints a
   process-unique `DispatchId` per call and stamps it on both the call and its result, so
   `FlowSink::{tool_call, tool_result}` and `AgentSink::{tool_call, tool_timing, tool_result}` now

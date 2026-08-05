@@ -2,7 +2,7 @@
 id: C-205
 title: "Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore"
 pillar: Core
-status: ready
+status: done
 priority: 5
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -21,20 +21,34 @@ follow-up. Do the bump and remove the ignore, so the advisory gate carries one f
 exception.
 
 ## Acceptance
-- [ ] `cargo update -p lru --precise <>=0.16.3>` (or a manifest bump if a direct dependent pins a
+- [x] `cargo update -p lru --precise <>=0.16.3>` (or a manifest bump if a direct dependent pins a
       lower major) moves `lru` to `>= 0.16.3` in `Cargo.lock`; confirm nothing else regresses in the
       resolve.
-- [ ] The `RUSTSEC-2026-0002` entry is removed from `deny.toml`'s `[advisories].ignore` **and** from
+- [x] The `RUSTSEC-2026-0002` entry is removed from `deny.toml`'s `[advisories].ignore` **and** from
       the `cargo audit --ignore …` list in `.github/workflows/security-audit.yml` — the two must stay
       in sync (C-188 made them mirror each other).
-- [ ] `cargo deny check` and `cargo audit --deny warnings` are green on both the root and `plugins/`
+- [x] `cargo deny check` and `cargo audit --deny warnings` are green on both the root and `plugins/`
       lockfiles with the ignore gone — proving the bump actually cleared the advisory rather than
       moving it.
-- [ ] Full Rust gate green (`cargo build/test/clippy -D warnings/fmt`, `cargo test -p flux-codegate`)
+- [x] Full Rust gate green (`cargo build/test/clippy -D warnings/fmt`, `cargo test -p flux-codegate`)
       — a transitive bump can change behavior; the workspace tests must still pass.
-- [ ] `cargo-deny`'s `unused-ignored-advisory` no longer has anything to warn about for this id.
+- [x] `cargo-deny`'s `unused-ignored-advisory` no longer has anything to warn about for this id.
 
 ## Progress
+- 2026-08-05 — implementation started from dispatched `origin/main` commit
+  `6e20eeb4c5e892feed527de6c2ef22ceb333ead5`; the pre-change graph still resolves
+  `lru 0.12.5` exclusively through `ratatui 0.29.0`.
+- 2026-08-05 — the first ratatui 0.30 resolve exposed one stale premise in the unblock note:
+  `tui-textarea 0.7.0` also pins ratatui 0.29. The maintained `tui-textarea-2` successor preserves
+  the `tui_textarea` library API and tracks ratatui 0.30, so the coordinated stack lift includes it.
+- 2026-08-05 — resolved the stack to ratatui 0.30.2, crossterm 0.29.0, ansi-to-tui 8.0.1,
+  tui-textarea-2 0.12.1 and `lru 0.18.2`; the old ratatui/lru generation is absent. Root and plugin
+  `cargo deny check` plus strict `cargo audit` scans passed without the lru exception. Markdown
+  parity tests and all 299 flux-tui unit/integration tests passed after adding ratatui 0.30's
+  explicit backend error bounds.
+- 2026-08-05 — the full repository gate passed: workspace build and tests, clippy across all
+  targets with warnings denied, rustfmt check, and all 51 flux-codegate tests. Story complete.
+
 - 2026-07-29 — filed from C-188's adjacent finding during impl-coord integration. The other three
   C-188 ignores (paste / ttf-parser / rustybuzz, all unmaintained proc-macro or trusted-font render
   path) have no clean drop-in fix and are correctly left ignored; this one does.

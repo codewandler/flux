@@ -119,6 +119,9 @@
 
 ### Fixed
 
+- **The terminal UI no longer includes a dependency version with a known soundness defect.** Its
+  rendering and input stack was updated together without changing the TUI's behavior.
+
 - **A tool's result, timing and progress always land on the tool card that started it.** When
   several same-named reads or searches run at once, a result that arrived out of order could resolve
   whichever card was newest, leaving the real one spinning and the finished one showing another

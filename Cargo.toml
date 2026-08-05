@@ -147,13 +147,10 @@ eventsource-stream = "0.2"
 # so precedence is declared once at the arg instead of hand-rolled in each handler.
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-# Held at 0.29/0.28 (range reqs so `task deps:upgrade` skips them): markdown-ratatui
-# (codewandler/markdown, git-pinned below in flux-markdown) requires ratatui ^0.29 — bumping here
-# would split ratatui into two incompatible versions at the flux-markdown seam. crossterm must
-# match ratatui's backend, and flux-tui's ansi-to-tui 7 tracks ratatui 0.29. Lift all three
-# together once codewandler/markdown moves to ratatui 0.30.
-ratatui = ">=0.29, <0.30"
-crossterm = ">=0.28, <0.29"
+# Keep ratatui and crossterm on the same backend generation. The first-party markdown renderer
+# pinned by flux-markdown and flux-tui's ansi-to-tui dependency both target ratatui 0.30.
+ratatui = "0.30"
+crossterm = "0.29"
 toml = "1.1"
 cargo_metadata = "0.23.1"
 syn = { version = "3", features = ["full", "visit"] }
