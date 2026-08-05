@@ -127,6 +127,20 @@ pub mod datasource {
     };
 }
 
+/// **Scoped boards.** Pure identities live below the IO boundary; [`ClientBuilder::try_with_board`]
+/// installs one validated execution binding and its complete tool/evidence/permission surface.
+pub mod board {
+    pub use flux_capabilities::{
+        BoardBinding, BoardRegistry, SessionBoard, SessionBoardItem, SessionBoardSnapshot,
+        WorkBoard, WorkBoardSurface,
+    };
+    pub use flux_datasource::board::{
+        BoardBackend, BoardContract, BoardContractError, BoardId, BoardItemCore, BoardProfile,
+        BoardRef, BoardScope, GeneralState, ItemId, PlanningDocumentKind, PlanningDocumentRef,
+        PlanningState,
+    };
+}
+
 /// Build a typed, closure-backed stage operation. `I` and `O` are independent contracts: both JSON
 /// Schemas are derived and registered, the Flux analyzer infers `O` at call sites, and execution
 /// still traverses the ordinary authorization/approval dispatcher. The safe default is a low-risk,
@@ -469,6 +483,8 @@ pub struct ClientBuilder {
     ops: Vec<(String, Arc<dyn Tool>)>,
     packs: Vec<RegistryPack>,
     live_surfaces: Vec<flux_capabilities::LiveDatasourceSurface>,
+    board_surfaces: Vec<flux_capabilities::WorkBoardSurface>,
+    boards: flux_capabilities::BoardRegistry,
     sub_agents: Option<SubAgents>,
     sub_agent_adaptive_policy: Option<AdaptiveLoopPolicy>,
     // D-178: `None` ⇒ derive from the storage's durability at `build` (on for durable stores).
@@ -489,6 +505,8 @@ impl Default for ClientBuilder {
             ops: Vec::new(),
             packs: Vec::new(),
             live_surfaces: Vec::new(),
+            board_surfaces: Vec::new(),
+            boards: flux_capabilities::BoardRegistry::new(),
             // Unset ⇒ no `task` tool, no spawner (children off by default).
             sub_agents: None,
             auto_resurrect: None,
@@ -516,6 +534,8 @@ impl ClientBuilder {
             ops: Vec::new(),
             packs: Vec::new(),
             live_surfaces: Vec::new(),
+            board_surfaces: Vec::new(),
+            boards: flux_capabilities::BoardRegistry::new(),
             sub_agents: None,
             sub_agent_adaptive_policy: None,
             auto_resurrect: None,
@@ -699,6 +719,26 @@ impl ClientBuilder {
         self.packs
             .push(Box::new(move |registry| registry.try_extend(prepared)));
         self.live_surfaces.push(surface);
+        Ok(self)
+    }
+
+    /// Install one explicitly scoped execution board as an atomic SDK surface.
+    ///
+    /// Scope, profile and backend are validated independently before the builder is returned.
+    /// Duplicate bindings fail with both source labels. The operation pack, evidence group and
+    /// ambient signal are retained together, so later setters cannot leave a partial board.
+    pub fn try_with_board(
+        mut self,
+        contract: flux_datasource::board::BoardContract,
+        backend: Arc<dyn flux_capabilities::WorkBoard>,
+    ) -> Result<Self> {
+        let domain = contract.id.as_str().to_string();
+        self.boards.register_execution(contract, backend.clone())?;
+        let mut prepared = ToolRegistry::new();
+        let surface = flux_capabilities::try_register_work_board(&mut prepared, &domain, backend)?;
+        self.packs
+            .push(Box::new(move |registry| registry.try_extend(prepared)));
+        self.board_surfaces.push(surface);
         Ok(self)
     }
     /// Attach a subprocess plugin's operations (feature `plugins`) as policy-gated tools. Load them
@@ -1042,6 +1082,25 @@ impl ClientBuilder {
                 if existing != &surface.group {
                     return Err(flux_core::Error::Other(format!(
                         "live datasource group `{}` conflicts with an existing group declaration",
+                        surface.group.name
+                    )));
+                }
+            } else {
+                spec.groups.push(surface.group);
+            }
+            if !spec.ambient_signals.contains(&surface.ambient_signal) {
+                spec.ambient_signals.push(surface.ambient_signal);
+            }
+        }
+        for surface in self.board_surfaces {
+            if let Some(existing) = spec
+                .groups
+                .iter()
+                .find(|group| group.name == surface.group.name)
+            {
+                if existing != &surface.group {
+                    return Err(flux_core::Error::Other(format!(
+                        "board group `{}` conflicts with an existing group declaration",
                         surface.group.name
                     )));
                 }

@@ -528,7 +528,7 @@ impl SqliteEvents {
         stream: &str,
         ev: NewEvent,
         ts: i64,
-        expected_head: Option<i64>,
+        expected_head: Option<(i64, bool)>,
     ) -> Result<Option<StoredEvent>> {
         let conn = self.conn.lock().unwrap();
         if let Some(id) = &ev.id {
@@ -537,12 +537,15 @@ impl SqliteEvents {
             }
         }
         let tx = begin_write(&conn, self.contention_warn_threshold)?;
-        if let Some(expected) = expected_head {
+        if let Some((expected, whole_stream)) = expected_head {
+            let sql = if whole_stream {
+                "SELECT COALESCE(MAX(stream_seq), -1) FROM events WHERE stream = ?1"
+            } else {
+                "SELECT COALESCE(MAX(stream_seq), -1) FROM events \
+                 WHERE stream = ?1 AND kind IN ('message', 'compacted')"
+            };
             let head: i64 = tx
-                .prepare_cached(
-                    "SELECT COALESCE(MAX(stream_seq), -1) FROM events \
-                     WHERE stream = ?1 AND kind IN ('message', 'compacted')",
-                )
+                .prepare_cached(sql)
                 .map_err(map_sql)?
                 .query_row([stream], |r| r.get(0))
                 .map_err(map_sql)?;
@@ -995,7 +998,16 @@ impl EventBackend for SqliteEvents {
         ev: NewEvent,
         expected_seq: i64,
     ) -> Result<Option<StoredEvent>> {
-        self.append_guarded(stream, ev, now_ms(), Some(expected_seq))
+        self.append_guarded(stream, ev, now_ms(), Some((expected_seq, false)))
+    }
+
+    fn append_if_stream_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>> {
+        self.append_guarded(stream, ev, now_ms(), Some((expected_seq, true)))
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

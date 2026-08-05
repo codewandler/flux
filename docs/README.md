@@ -34,6 +34,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | Latest repository architecture review | [designs/architecture-review-2026-07-14/review.md](designs/architecture-review-2026-07-14/review.md) — ranked findings, evidence, and linked remediation stories |
 | Security / readiness reviews and their triage state | [reviews/README.md](reviews/README.md) — `single/` passes, `aggregate/` claim ledgers, `archive/` handled passes |
 | Using the CLI / TUI / SDK / server | [usage.md](usage.md) |
+| AI-assisted coding with scoped boards, Track stories, local sub-agents and fleet | [website overview](../website/docs/coding/overview.md), [boards](../website/docs/coding/boards.md), [fleet](../website/docs/coding/fleet.md) |
 | Choosing a model/provider | [model.md](model.md) |
 | The self-hosted agent loop | [agent-loop.md](agent-loop.md) |
 | Agent-to-agent (A2A) | [a2a.md](a2a.md) |

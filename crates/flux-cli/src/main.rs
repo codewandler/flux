@@ -3,6 +3,7 @@
 //! Product surface for adaptive agent turns, authored Flux-Lang flows and apps, replay, plugins,
 //! authentication, and developer tooling. Every effect enters through the shared guarded runtime.
 
+mod board_fleet_cmd;
 mod catalog_cmd;
 /// The C-208 metadata-coherence gate over the production op catalog. Test-only: it assembles the
 /// registry `build_agent_with` assembles and walks every `ToolSpec`, so it must live inside the
@@ -46,6 +47,7 @@ use a2a_cmd::*;
 use app_cmd::*;
 use args::*;
 use auth_cmd::*;
+use board_fleet_cmd::*;
 use catalog_cmd::*;
 use context_cmd::*;
 use dispatch::*;

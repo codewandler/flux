@@ -17,6 +17,17 @@
 
 ### New
 
+- **Flux now has one durable board-and-fleet workflow for AI-assisted development.** `flux board`
+  manages a session checklist, one repository's Track stories, or a cross-repository workspace,
+  including vision, roadmap, decisions, designs, exact progress statistics, and current/history
+  reports. `flux fleet` schedules bounded local sub-agents into isolated worktrees, preserves their
+  commits and test/review evidence across restart, and provides stable status, message, activity,
+  log, worktree, and integration inspection. Claude, Codex, and scripts use the same clean JSON API;
+  `flux board skill` and `flux fleet skill` print short installed-version guides. A green wave stays
+  local until you explicitly run `flux fleet apply`, and neither command pushes, releases, deploys,
+  or removes worktrees for you. The new **Coding / AI-assisted development** docs section explains
+  the whole model and every backend.
+
 - **You can now name how much autonomy an agent runs with, in one choice.** `--posture supervised`
   asks you before each effect. `--posture bounded-autonomy` never asks and instead constrains the
   run with policy, a fail-closed sandbox and budgets — the posture unattended runs already used.

@@ -285,7 +285,7 @@ impl EphemeralEvents {
         stream: &str,
         ev: NewEvent,
         ts: i64,
-        expected_head: Option<i64>,
+        expected_head: Option<(i64, bool)>,
     ) -> Result<Option<StoredEvent>> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(id) = &ev.id {
@@ -293,8 +293,13 @@ impl EphemeralEvents {
                 return Ok(Some(existing)); // idempotent retry: the event is already stored
             }
         }
-        if let Some(expected) = expected_head {
-            if inner.conversation_head(stream) != expected {
+        if let Some((expected, whole_stream)) = expected_head {
+            let actual = if whole_stream {
+                inner.head_seq(stream)
+            } else {
+                inner.conversation_head(stream)
+            };
+            if actual != expected {
                 return Ok(None);
             }
         }
@@ -510,7 +515,16 @@ impl EventBackend for EphemeralEvents {
         ev: NewEvent,
         expected_seq: i64,
     ) -> Result<Option<StoredEvent>> {
-        self.append_guarded(stream, ev, now_ms(), Some(expected_seq))
+        self.append_guarded(stream, ev, now_ms(), Some((expected_seq, false)))
+    }
+
+    fn append_if_stream_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>> {
+        self.append_guarded(stream, ev, now_ms(), Some((expected_seq, true)))
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

@@ -31,10 +31,11 @@ pub use datasource::{
     register_datasource_ops, reindex, try_register_datasource_ops,
     try_register_datasource_ops_with_history, try_register_live_datasource,
     try_register_work_board, validate_board_contract, validate_live_contract, work_board_tools,
-    BoardLedger, ChunkOptions, DatasourceBackend, DatasourceHostCaps, Embedder, EmbeddingUsage,
-    HarnessHistory, HarnessIngestReport, HarnessSelector, LiveAccess, LiveDatasource,
-    LiveDatasourceSurface, MarkdownBoard, MemoryBackend, MemoryBoard, MemoryVectorStore,
-    SemanticIndex, SqliteBackend, VectorStore, WorkBoard, WorkBoardSurface, HARNESS_MESSAGE_ENTITY,
+    BoardBinding, BoardLedger, BoardRegistry, ChunkOptions, DatasourceBackend, DatasourceHostCaps,
+    Embedder, EmbeddingUsage, HarnessHistory, HarnessIngestReport, HarnessSelector, LiveAccess,
+    LiveDatasource, LiveDatasourceSurface, MarkdownBoard, MemoryBackend, MemoryBoard,
+    MemoryVectorStore, SemanticIndex, SessionBoard, SessionBoardItem, SessionBoardSnapshot,
+    SqliteBackend, VectorStore, WorkBoard, WorkBoardSurface, HARNESS_MESSAGE_ENTITY,
     HARNESS_SESSION_ENTITY, HARNESS_SESSION_REL, HARNESS_SOURCE, MAX_LIVE_SESSION_ENVELOPES,
 };
 pub use endpoint::{

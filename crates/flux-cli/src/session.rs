@@ -319,6 +319,21 @@ pub(super) async fn run_fork(
     flux_events::SessionLog::open(&events, &fork_sid)
         .and_then(|mut log| log.rewrite(history))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Session boards are app-defined facts in the same stream. A fork inherits their recorded
+    // prefix just like conversation state, then child mutations append only to the child stream.
+    for event in events
+        .load_by_kind(&sid, "custom")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        if matches!(
+            &event.kind,
+            flux_events::EventKind::Custom { name, .. } if name.starts_with("board.session.")
+        ) {
+            events
+                .append(&fork_sid, flux_events::NewEvent::new(event.kind))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
     drop(events);
 
     let (engine, _session, model_spec, _spawner) =

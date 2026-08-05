@@ -485,6 +485,10 @@ pub(super) enum Commands {
         #[arg(long)]
         watch: bool,
     },
+    /// Manage scoped planning/execution boards. JSON is the stable agent API.
+    Board(BoardCommand),
+    /// Coordinate durable local Flux sub-agents without implicitly publishing changes.
+    Fleet(FleetCommand),
     /// Run a multi-agent program with its event-trigger channels (cron / webhook / Slack).
     App {
         #[command(subcommand)]

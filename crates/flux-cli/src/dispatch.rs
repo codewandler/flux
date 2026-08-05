@@ -164,6 +164,8 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         // reachable from a model, and each runs in the foreground on argv the operator typed —
         // there is no autonomous execution here for the profile to bound.
         Commands::Render { .. }
+        | Commands::Board(..)
+        | Commands::Fleet(..)
         | Commands::Loop { .. }
         | Commands::Sessions { .. }
         | Commands::Wakeups { .. }
@@ -760,6 +762,8 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 report,
                 watch,
             }) => run_eval_cmd(adapter, tasks, members, limit, trials, report, watch, model).await,
+            Some(Commands::Board(command)) => run_board(command),
+            Some(Commands::Fleet(command)) => run_fleet(command),
             Some(Commands::App {
                 action:
                     AppAction::Run {

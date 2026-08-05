@@ -13,8 +13,9 @@ use crate::ast::{
 };
 use crate::lower_cst::LowerError;
 use crate::program::{
-    AgentDecl, AgentLoopDecl, ChannelDecl, CompositeLimits, CompositeOpDecl, CompositeOpMeta,
-    DatasourceDecl, JourneyDecl, Module, PermissionDecl, Program, TriggerDecl,
+    AgentDecl, AgentLoopDecl, BoardDecl, BoardKindDecl, BoardProfileDecl, BoardScopeDecl,
+    ChannelDecl, CompositeLimits, CompositeOpDecl, CompositeOpMeta, DatasourceDecl, JourneyDecl,
+    Module, PermissionDecl, Program, TriggerDecl,
 };
 use crate::syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 use flux_spec::{Effect, Idempotency, Risk};
@@ -106,6 +107,10 @@ pub(crate) fn lower_module(root: &SyntaxNode) -> DecodeResult<Module> {
                         program
                             .datasources
                             .push(lower_datasource(rest, &declaration)?);
+                        saw_module_decl = true;
+                    }
+                    "board" => {
+                        program.boards.push(lower_board(rest, &declaration)?);
                         saw_module_decl = true;
                     }
                     "trigger" => {
@@ -1837,6 +1842,139 @@ fn lower_datasource(rest: &str, declaration: &SyntaxNode) -> DecodeResult<Dataso
         kind: kind.unwrap_or(name),
         path,
         settings: settings_value(settings),
+    })
+}
+
+fn lower_board(rest: &str, declaration: &SyntaxNode) -> DecodeResult<BoardDecl> {
+    let name = parse_decl_name(rest, "board", declaration)?;
+    let mut scope = None;
+    let mut profile = None;
+    let mut kind = None;
+    let mut root = None;
+    let mut session = None;
+    let mut members = Vec::new();
+    let mut document_roots = serde_json::Map::new();
+    for (node, key, value) in declaration_attrs(declaration)? {
+        match key.as_str() {
+            "scope" => {
+                let value = parse_string_setting(&value, &node, "scope")?;
+                scope = Some(match value.as_str() {
+                    "session" => BoardScopeDecl::Session,
+                    "repository" => BoardScopeDecl::Repository,
+                    "workspace" => BoardScopeDecl::Workspace,
+                    _ => {
+                        return Err(error(
+                            &node,
+                            "unknown board scope; expected session|repository|workspace",
+                        ))
+                    }
+                });
+            }
+            "profile" => {
+                let value = parse_string_setting(&value, &node, "profile")?;
+                profile = Some(match value.as_str() {
+                    "general" => BoardProfileDecl::General,
+                    "planning" => BoardProfileDecl::Planning,
+                    "execution" => BoardProfileDecl::Execution,
+                    _ => {
+                        return Err(error(
+                            &node,
+                            "unknown board profile; expected general|planning|execution",
+                        ))
+                    }
+                });
+            }
+            "kind" => {
+                let value = parse_string_setting(&value, &node, "kind")?;
+                if value.starts_with("board:") {
+                    return Err(error(&node, format!("legacy datasource-style kind `{value}` is not a board backend; use `kind {}`", value.trim_start_matches("board:"))));
+                }
+                kind =
+                    Some(match value.as_str() {
+                        "session" => BoardKindDecl::Session,
+                        "track" => BoardKindDecl::Track,
+                        "markdown" => BoardKindDecl::Markdown,
+                        "memory" => BoardKindDecl::Memory,
+                        "federated" => BoardKindDecl::Federated,
+                        _ => return Err(error(
+                            &node,
+                            "unknown board kind; expected session|track|markdown|memory|federated",
+                        )),
+                    });
+            }
+            "root" => root = Some(parse_string_setting(&value, &node, "root")?),
+            "session" => session = Some(parse_string_setting(&value, &node, "session")?),
+            "members" => {
+                members = string_list(&parse_setting_exact(&value, &node)?, "members", &node)?
+            }
+            "vision" | "roadmap" | "decisions" | "designs" => {
+                document_roots.insert(key, parse_setting_exact(&value, &node)?);
+            }
+            other => return Err(error(&node, format!("unknown board attribute `{other}`"))),
+        }
+    }
+    let scope = scope.ok_or_else(|| error(declaration, "a `board` needs an explicit `scope`"))?;
+    let profile =
+        profile.ok_or_else(|| error(declaration, "a `board` needs an explicit `profile`"))?;
+    let kind = kind.ok_or_else(|| error(declaration, "a `board` needs an explicit `kind`"))?;
+    let compatible = matches!(kind, BoardKindDecl::Memory)
+        || matches!(
+            (scope, kind),
+            (BoardScopeDecl::Session, BoardKindDecl::Session)
+                | (
+                    BoardScopeDecl::Repository,
+                    BoardKindDecl::Track | BoardKindDecl::Markdown
+                )
+                | (BoardScopeDecl::Workspace, BoardKindDecl::Federated)
+        );
+    if !compatible {
+        return Err(error(
+            declaration,
+            format!("board scope {scope:?} is incompatible with kind {kind:?}"),
+        ));
+    }
+    match scope {
+        BoardScopeDecl::Session if root.is_some() || !members.is_empty() => {
+            return Err(error(
+                declaration,
+                "a session board cannot declare root or members",
+            ));
+        }
+        BoardScopeDecl::Repository if root.is_none() => {
+            return Err(error(
+                declaration,
+                "a repository board needs a confined `root`",
+            ));
+        }
+        BoardScopeDecl::Repository if session.is_some() || !members.is_empty() => {
+            return Err(error(
+                declaration,
+                "a repository board cannot declare session or members",
+            ));
+        }
+        BoardScopeDecl::Workspace if root.is_none() || members.is_empty() => {
+            return Err(error(
+                declaration,
+                "a workspace board needs `root` and at least one `members` binding",
+            ));
+        }
+        BoardScopeDecl::Workspace if session.is_some() => {
+            return Err(error(
+                declaration,
+                "a workspace board cannot declare session",
+            ));
+        }
+        _ => {}
+    }
+    Ok(BoardDecl {
+        name,
+        scope,
+        profile,
+        kind,
+        root,
+        session,
+        members,
+        document_roots,
     })
 }
 

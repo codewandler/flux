@@ -140,7 +140,7 @@ impl PgEvents {
         stream: &str,
         ev: NewEvent,
         ts: i64,
-        expected_head: Option<i64>,
+        expected_head: Option<(i64, bool)>,
     ) -> Result<Option<StoredEvent>> {
         let pool = self.handle.pool().clone();
         let stream = stream.to_string();
@@ -163,15 +163,18 @@ impl PgEvents {
                 .execute(&mut *tx)
                 .await
                 .map_err(map_sql)?;
-            if let Some(expected) = expected_head {
-                let head: i64 = sqlx::query_scalar(
+            if let Some((expected, whole_stream)) = expected_head {
+                let sql = if whole_stream {
+                    "SELECT COALESCE(MAX(stream_seq), -1) FROM events WHERE stream = $1"
+                } else {
                     "SELECT COALESCE(MAX(stream_seq), -1) FROM events \
-                     WHERE stream = $1 AND kind IN ('message', 'compacted')",
-                )
-                .bind(stream.clone())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(map_sql)?;
+                     WHERE stream = $1 AND kind IN ('message', 'compacted')"
+                };
+                let head: i64 = sqlx::query_scalar(sql)
+                    .bind(stream.clone())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(map_sql)?;
                 if head != expected {
                     tx.rollback().await.map_err(map_sql)?; // nothing was written
                     return Ok(None);
@@ -803,7 +806,16 @@ impl EventBackend for PgEvents {
         ev: NewEvent,
         expected_seq: i64,
     ) -> Result<Option<StoredEvent>> {
-        self.append_guarded(stream, ev, now_ms(), Some(expected_seq))
+        self.append_guarded(stream, ev, now_ms(), Some((expected_seq, false)))
+    }
+
+    fn append_if_stream_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>> {
+        self.append_guarded(stream, ev, now_ms(), Some((expected_seq, true)))
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

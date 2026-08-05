@@ -96,6 +96,73 @@ pub struct DatasourceDecl {
     pub settings: serde_json::Value,
 }
 
+/// The authority/lifetime axis of a first-class board declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardScopeDecl {
+    /// Board belongs to the current durable session.
+    Session,
+    /// Board is authoritative under one confined repository root.
+    Repository,
+    /// Board federates explicitly named repository members.
+    Workspace,
+}
+
+/// The operation/state-machine axis of a first-class board declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardProfileDecl {
+    /// Lightweight coordination.
+    General,
+    /// Product planning and planning documents.
+    Planning,
+    /// Worker dispatch, review and retry.
+    Execution,
+}
+
+/// Closed built-in backend set for first-class boards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardKindDecl {
+    /// Session-event backend.
+    Session,
+    /// Track YAML-frontmatter repository backend.
+    Track,
+    /// Existing TOML-frontmatter execution backend.
+    Markdown,
+    /// In-process demonstration/test backend.
+    Memory,
+    /// Cross-repository index backend.
+    Federated,
+}
+
+/// A first-class board binding. Scope, profile and kind are all required and never inferred from
+/// one another. Optional roots/member ids are backend-specific closed settings interpreted by the
+/// host after this pure-data layer validates their shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct BoardDecl {
+    /// Stable operation binding.
+    pub name: String,
+    /// Authority/lifetime boundary.
+    pub scope: BoardScopeDecl,
+    /// Operation and transition set.
+    pub profile: BoardProfileDecl,
+    /// Storage adapter.
+    pub kind: BoardKindDecl,
+    /// Confined repository/workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// Explicit session selector when outside a live session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Named member board bindings for federation.
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Explicit planning-document roots (`vision`, `roadmap`, `decisions`, `designs`).
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub document_roots: serde_json::Map<String, serde_json::Value>,
+}
+
 /// A trigger: an event→action binding. `on` is an event label (sharing the space with `Node::Await`);
 /// when it fires the named `run` journey/flow executes, optionally as a specific `agent`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
@@ -221,6 +288,9 @@ pub struct Program {
     pub channels: Vec<ChannelDecl>,
     #[serde(default)]
     pub datasources: Vec<DatasourceDecl>,
+    /// Explicit board bindings. They never enter the datasource registry.
+    #[serde(default)]
+    pub boards: Vec<BoardDecl>,
     #[serde(default)]
     pub triggers: Vec<TriggerDecl>,
     #[serde(default)]
@@ -385,6 +455,41 @@ journey handle
         assert_eq!(p.channels[0].kind, "cli");
         assert_eq!(p.triggers[0].on, "user_input");
         assert!(p.flow_named("handle").is_some(), "journey resolves by name");
+    }
+
+    #[test]
+    fn board_declaration_keeps_scope_profile_and_kind_independent() {
+        let source = r#"board product
+  scope "repository"
+  profile "planning"
+  kind "track"
+  root "."
+  vision "docs/VISION.md"
+  roadmap "docs/ROADMAP.md"
+  decisions "docs/decisions"
+  designs "docs/designs"
+"#;
+        let Module::Program(program) = Module::parse_str(source).unwrap() else {
+            panic!("a board declaration makes this a program")
+        };
+        let board = &program.boards[0];
+        assert_eq!(board.name, "product");
+        assert_eq!(board.scope, BoardScopeDecl::Repository);
+        assert_eq!(board.profile, BoardProfileDecl::Planning);
+        assert_eq!(board.kind, BoardKindDecl::Track);
+        assert_eq!(board.document_roots.len(), 4);
+    }
+
+    #[test]
+    fn board_declaration_requires_every_axis_and_valid_combination() {
+        let missing = Module::parse_str("board product\n  scope \"repository\"\n").unwrap_err();
+        assert!(missing.to_string().contains("profile"), "{missing}");
+
+        let mismatch = Module::parse_str(
+            "board product\n  scope \"workspace\"\n  profile \"planning\"\n  kind \"track\"\n  root \".\"\n  members [repo]\n",
+        )
+        .unwrap_err();
+        assert!(mismatch.to_string().contains("incompatible"), "{mismatch}");
     }
 
     /// C-232: an **agent-bound** trigger parses with an empty `run` and is valid — `run` is simply

@@ -32,6 +32,7 @@
 //! live handle.
 
 mod board;
+mod board_registry;
 mod harness_history;
 mod host_caps;
 mod ingest;
@@ -41,6 +42,7 @@ mod memory;
 mod memory_board;
 mod ops;
 mod semantic;
+mod session_board;
 mod sqlite;
 mod text;
 mod vector;
@@ -58,6 +60,7 @@ pub use board::{
     try_register_work_board, validate_board_contract, work_board_tools, BoardLedger, WorkBoard,
     WorkBoardSurface,
 };
+pub use board_registry::{BoardBinding, BoardRegistry};
 pub use harness_history::{
     ingest_harness_history, HarnessHistory, HarnessIngestReport, HarnessSelector,
     HARNESS_MESSAGE_ENTITY, HARNESS_SESSION_ENTITY, HARNESS_SESSION_REL, HARNESS_SOURCE,
@@ -79,6 +82,7 @@ pub use ops::{
     try_register_datasource_ops, try_register_datasource_ops_with_history,
 };
 pub use semantic::SemanticIndex;
+pub use session_board::{SessionBoard, SessionBoardItem, SessionBoardSnapshot};
 pub use sqlite::SqliteBackend;
 
 #[cfg(feature = "postgres")]

@@ -8,6 +8,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Boards and the local coding fleet are now first-class agent automation surfaces** (Decision
+  0010; C-547, A-134, L-130, C-548–C-551, C-242, C-244, C-245, A-117). `flux board` exposes
+  session, repository and workspace scopes; general, planning and execution profiles; Track,
+  session, Markdown, memory and federated backends; vision, roadmap, decision and design documents;
+  deterministic Track rendering; and the exact current/history metric cube. `flux fleet` exposes
+  durable local sub-agent scheduling, acknowledged control, bounded inspection, handoff/rework/gate
+  records and explicit local-only apply. Both families share the `flux.cli/v1` JSON/NDJSON contract,
+  optimistic revisions, idempotent mutations, dry runs, schemas and concise rendered Agent Skills.
+  `BoardId`, `BoardRef`, independent scope/profile/backend contracts and `BoardRegistry` are public
+  through the datasource/capability/SDK seams, and Flux-Lang has a first-class closed `board`
+  declaration. The new Coding / AI-assisted development documentation ties the complete workflow
+  together for humans, Claude and Codex. Neither fleet run nor apply pushes, publishes, releases,
+  deploys or automatically deletes worktrees.
+
 - **Autonomy is now a named posture rather than an absence of safety** (C-463).
   `flux_runtime::AutonomyPosture` names four choices — `supervised`, `bounded-autonomy`,
   `exploratory` and `refusing` — and each one selects its approval stance, sandbox floor and budget

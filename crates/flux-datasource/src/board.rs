@@ -21,6 +21,377 @@ use serde::{Deserialize, Serialize};
 
 use crate::live::{FilterKey, Reference};
 
+/// A stable board binding identifier. It is deliberately smaller than a path or backend locator:
+/// scope, profile and backend are independent fields on [`BoardContract`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct BoardId(String);
+
+impl BoardId {
+    /// Validate and construct an identifier suitable for CLI names and authority subjects.
+    pub fn new(value: impl Into<String>) -> Result<Self, BoardContractError> {
+        let value = value.into();
+        let valid = !value.is_empty()
+            && value.len() <= 64
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+        if !valid {
+            return Err(BoardContractError::InvalidBoardId(value));
+        }
+        Ok(Self(value))
+    }
+
+    /// The validated wire spelling.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BoardId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BoardId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A stable item id within one board. The slash is excluded so `BOARD/ITEM` remains unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ItemId(String);
+
+impl ItemId {
+    /// Validate and construct an item id.
+    pub fn new(value: impl Into<String>) -> Result<Self, BoardContractError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 128
+            || value.chars().any(|ch| ch.is_control() || ch == '/')
+        {
+            return Err(BoardContractError::InvalidItemId(value));
+        }
+        Ok(Self(value))
+    }
+
+    /// The validated wire spelling.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ItemId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ItemId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An unambiguous item address. Different boards may legitimately contain the same [`ItemId`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BoardRef {
+    /// Registered board binding.
+    pub board: BoardId,
+    /// Item identity local to that binding.
+    pub item: ItemId,
+}
+
+impl BoardRef {
+    /// Construct an address from already-validated halves.
+    pub fn new(board: BoardId, item: ItemId) -> Self {
+        Self { board, item }
+    }
+
+    /// Parse the CLI spelling `BOARD/ITEM`.
+    pub fn parse(value: &str) -> Result<Self, BoardContractError> {
+        let (board, item) = value
+            .split_once('/')
+            .ok_or_else(|| BoardContractError::InvalidBoardRef(value.to_string()))?;
+        Ok(Self::new(BoardId::new(board)?, ItemId::new(item)?))
+    }
+
+    /// Concrete, segment-scoped permission subject for this item.
+    pub fn permission_subject(&self) -> String {
+        format!("board:{}/item/{}", self.board, self.item)
+    }
+}
+
+impl fmt::Display for BoardRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.board, self.item)
+    }
+}
+
+/// Board lifetime and authority boundary. It never implies a profile or backend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum BoardScope {
+    /// State belongs to exactly one durable Flux session.
+    Session { session_id: String },
+    /// State is authoritative in one repository.
+    Repository { repository_id: String },
+    /// A cross-repository index whose writes route to concrete members.
+    Workspace { workspace_id: String },
+}
+
+/// The operation set and state machine a board promises. It is independent of scope and backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardProfile {
+    /// Lightweight open/in-progress/blocked/done coordination.
+    General,
+    /// Product planning with priority and planning documents.
+    Planning,
+    /// Worker dispatch/review/retry state using the existing [`State`] machine.
+    Execution,
+}
+
+impl BoardProfile {
+    /// The exact operation catalog for this profile.
+    pub const fn operations(self) -> &'static [&'static str] {
+        const GENERAL: &[&str] = &[
+            "list",
+            "get",
+            "query",
+            "create",
+            "transition",
+            "comment",
+            "comments",
+            "record_evidence",
+        ];
+        const PLANNING: &[&str] = &[
+            "list",
+            "get",
+            "query",
+            "create",
+            "transition",
+            "comment",
+            "comments",
+            "record_evidence",
+            "update",
+        ];
+        const EXECUTION: &[&str] = &[
+            "list",
+            "get",
+            "query",
+            "create",
+            "transition",
+            "comment",
+            "comments",
+            "record_evidence",
+            "claim",
+            "record_dispatch",
+            "reassign",
+        ];
+        match self {
+            Self::General => GENERAL,
+            Self::Planning => PLANNING,
+            Self::Execution => EXECUTION,
+        }
+    }
+
+    /// Whether this profile exposes an operation.
+    pub fn supports(self, operation: &str) -> bool {
+        self.operations().contains(&operation)
+    }
+}
+
+/// Storage adapter identity. It never implies lifetime or purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardBackend {
+    /// Typed events in the owning Flux session store.
+    Session,
+    /// Track-compatible YAML-frontmatter story files.
+    Track,
+    /// Existing TOML-frontmatter execution items under `board/items`.
+    Markdown,
+    /// Process-local test/demonstration backend.
+    Memory,
+    /// Workspace index over concrete member boards.
+    Federated,
+}
+
+/// One board registration contract, with all independent axes explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardContract {
+    /// Stable binding.
+    pub id: BoardId,
+    /// Lifetime/authority boundary.
+    pub scope: BoardScope,
+    /// Operation and transition profile.
+    pub profile: BoardProfile,
+    /// Storage adapter.
+    pub backend: BoardBackend,
+    /// Auditable configuration source label.
+    pub source: String,
+}
+
+impl BoardContract {
+    /// Validate combinations without performing IO.
+    pub fn validate(&self) -> Result<(), BoardContractError> {
+        let compatible = matches!(self.backend, BoardBackend::Memory)
+            || matches!(
+                (&self.scope, self.backend),
+                (BoardScope::Session { .. }, BoardBackend::Session)
+                    | (BoardScope::Repository { .. }, BoardBackend::Track)
+                    | (BoardScope::Repository { .. }, BoardBackend::Markdown)
+                    | (BoardScope::Workspace { .. }, BoardBackend::Federated)
+            );
+        if !compatible {
+            return Err(BoardContractError::ScopeBackendMismatch {
+                scope: self.scope.clone(),
+                backend: self.backend,
+            });
+        }
+        if self.source.trim().is_empty() {
+            return Err(BoardContractError::EmptySource);
+        }
+        Ok(())
+    }
+}
+
+/// State values for the general profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneralState {
+    /// Available but not being executed.
+    Open,
+    /// Work is active.
+    InProgress,
+    /// Waiting on a dependency or decision.
+    Blocked,
+    /// Terminal completion.
+    Done,
+}
+
+/// State values for the planning profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanningState {
+    /// Authored but not scheduled.
+    Backlog,
+    /// Authorized and ordered.
+    Ready,
+    /// Active implementation.
+    InProgress,
+    /// Waiting on an external prerequisite.
+    Blocked,
+    /// Terminal completion.
+    Done,
+}
+
+/// Common fields shared by every profile and backend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardItemCore {
+    /// Stable item identity.
+    pub id: ItemId,
+    /// Human title.
+    pub title: String,
+    /// Optional current owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    /// Explicit cross-board dependency addresses.
+    #[serde(default)]
+    pub dependencies: Vec<BoardRef>,
+    /// Weak links to code, documents, commits and reviews.
+    #[serde(default)]
+    pub references: Vec<Reference>,
+    /// Durable chronological comments.
+    #[serde(default)]
+    pub comments: Vec<String>,
+    /// Host-observed evidence rather than a worker's prose claim.
+    #[serde(default)]
+    pub evidence: Vec<Reference>,
+}
+
+/// Planning document identity. Documents reference items but are never themselves queue items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningDocumentKind {
+    /// Revisioned singleton.
+    Vision,
+    /// Revisioned singleton.
+    Roadmap,
+    /// Stable proposed/accepted/superseded record.
+    Decision,
+    /// Stable linked design record.
+    Design,
+}
+
+/// A stable planning-document address within one board.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PlanningDocumentRef {
+    /// Owning board.
+    pub board: BoardId,
+    /// Document family.
+    pub kind: PlanningDocumentKind,
+    /// Stable collection id; absent for vision/roadmap singletons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// Pure board contract validation failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoardContractError {
+    /// Binding contains unsupported characters or length.
+    InvalidBoardId(String),
+    /// Item id is empty, contains `/`, controls, or is too long.
+    InvalidItemId(String),
+    /// Address is not the unambiguous `BOARD/ITEM` spelling.
+    InvalidBoardRef(String),
+    /// Backend cannot implement the named authority scope.
+    ScopeBackendMismatch {
+        /// Requested scope.
+        scope: BoardScope,
+        /// Requested backend.
+        backend: BoardBackend,
+    },
+    /// Registrations need a source-labelled diagnostic.
+    EmptySource,
+}
+
+impl fmt::Display for BoardContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBoardId(value) => write!(formatter, "invalid board id `{value}`"),
+            Self::InvalidItemId(value) => write!(formatter, "invalid item id `{value}`"),
+            Self::InvalidBoardRef(value) => {
+                write!(
+                    formatter,
+                    "invalid board ref `{value}` (expected BOARD/ITEM)"
+                )
+            }
+            Self::ScopeBackendMismatch { scope, backend } => {
+                write!(
+                    formatter,
+                    "board scope {scope:?} is incompatible with backend {backend:?}"
+                )
+            }
+            Self::EmptySource => formatter.write_str("board registration source is empty"),
+        }
+    }
+}
+
+impl std::error::Error for BoardContractError {}
+
 /// Where one work item sits in the board's state machine.
 ///
 /// The variants are the closed set; the legal edges between them are [`State::allowed_next`].

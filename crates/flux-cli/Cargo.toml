@@ -58,6 +58,7 @@ serde_json.workspace = true
 jsonschema.workspace = true
 schemars.workspace = true
 serde_norway.workspace = true
+toml.workspace = true
 rusqlite.workspace = true
 chrono.workspace = true
 reedline = "0.49.0"
