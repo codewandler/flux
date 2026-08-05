@@ -5,6 +5,9 @@
 [C-239](../stories/C-239-fleet-loop-epic.md) · **CLI contract:**
 [C-547](../stories/C-547-versioned-board-fleet-agent-cli-contract.md)
 
+The corrective independent workspace configuration and real roadmap cutover are specified in
+[native-workspace-board-cutover.md](native-workspace-board-cutover.md) under Decision 0013/C-588.
+
 ## Outcome
 
 `flux board` and `flux fleet` are the supported automation API for a human, Claude or Codex. A

@@ -860,6 +860,12 @@ reports and roadmap scriptless parity. Claude and Codex call the same versioned 
 bootstrap from `flux fleet skill`; direct foreign-process and remote code workers remain later.
 Design: [native-board-fleet-cli](designs/native-board-fleet-cli.md).
 
+C-588 is the corrective adoption boundary after the real roadmap exposed that C-550/C-551 had left
+workspace Board configuration coupled to Fleet, program metrics empty, accepted decisions open, and
+the TSV/helper/README/AGENTS scheduling path intact. It introduces independent default workspace
+Board configuration, replaces the legacy lane vocabulary with milestone lanes, and removes that
+glue only after the four-repository installed-CLI fixture passes.
+
 ### Explicit agent-loop harnesses — workhorse, review, progress and budgets (epic) — 🔄 **IN PROGRESS (C-568; C-569 first)**
 
 Every agent start resolves behavior independently of model/backend/membership. The ordinary Flux
