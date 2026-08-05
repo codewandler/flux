@@ -7,7 +7,7 @@ priority: 1
 epic: fleet-loop
 design: docs/designs/native-board-fleet-cli.md
 areas: [flux-cli, flux-capabilities, flux-runtime]
-depends_on: [C-566]
+depends_on: [C-566, C-567]
 note: "dogfood defect — continued writer turns exposed a different operation set than the admitted template"
 ---
 
