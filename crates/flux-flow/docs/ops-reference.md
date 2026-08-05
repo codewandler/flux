@@ -220,11 +220,11 @@ operator configuration that does not exist yet.
 
 ## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch` / `.query` / `.comments` / `.reassign` / `.record_evidence`)
 
-A `WorkBoard` (A-113) is the write-capable sibling of a live datasource: a typed item state machine
-behind a swappable backend. A program binds one with a `board:<backend>` datasource declaration
-(A-131) and the host generates eleven operations under the declaration's name — so `datasource board`
+A `WorkBoard` (A-113) is a typed item state machine behind a swappable backend, separate from the
+read-only datasource catalogue. A program binds one with a first-class `board` declaration and the
+host generates eleven operations under the declaration's name — so `board board`
 yields `board.list` … `board.record_evidence`. Seven of them write, and each reports a concrete
-`<domain>/item/<id>` permission subject (`<domain>/item/new` for `create`); `transition` validates
+`board:<domain>/item/<id>` permission subject (`board:<domain>/item/new` for `create`); `transition` validates
 the edge before writing, so an illegal edge errors and performs no write. `record_dispatch` (A-130)
 binds an item to the worker running it — the `runner` address and the worker-minted `task_id` — which
 is what makes the board a run registry rather than only a task list; it writes those two fields and
@@ -251,7 +251,7 @@ unblocked exactly when every id in its `depends_on` is `done`; no dependencies i
 unblocked, and an absent dependency never resolves. `list`'s filter vocabulary is unchanged.
 `comments` (C-236) is the read half of `comment` — the item's notes as a JSON array, oldest first.
 
-Backends: `board:markdown` (durable, file-per-item) and `board:memory` (in-process). See
+Backends: `markdown` (durable, file-per-item) and `memory` (in-process). See
 [`fleet-coordinator.md`](../../../docs/designs/fleet-coordinator.md).
 
 ## Orchestration ops (the `flux-app` host only)

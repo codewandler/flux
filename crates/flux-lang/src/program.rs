@@ -289,7 +289,7 @@ pub struct Program {
     #[serde(default)]
     pub datasources: Vec<DatasourceDecl>,
     /// Explicit board bindings. They never enter the datasource registry.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boards: Vec<BoardDecl>,
     #[serde(default)]
     pub triggers: Vec<TriggerDecl>,

@@ -1127,19 +1127,19 @@
 
 - **Hand work to other flux agents, and pick it back up after a restart.** A program can now declare
   a **work board** — a list of tasks with real states (ready, claimed, in progress, blocked, review,
-  done, failed) — and hand items out to remote flux workers without waiting for them. Declaring one
-  takes three lines: a `datasource` named `board`, a `kind` of `"board:markdown"`, and the `path` the
-  items live under.
+  done, failed) — and hand items out to remote flux workers without waiting for them. Boards now use
+  a first-class `board` declaration with explicit scope, profile, backend kind, and root; the former
+  datasource-shaped spelling has been retired.
 
   That gives your program operations to list, read, create, claim, move, comment on and dispatch
-  board items. `board:markdown` keeps one file per item on disk, so **the board survives the process
+  board items. The `markdown` board backend keeps one file per item on disk, so **the board survives the process
   that wrote it** — which is the point. When work is handed to a worker, the worker's address and the
   task handle are written back onto the item itself, so a coordinator that is restarted can read the
   board and find every run that was in flight, then poll or cancel it. There is no second place where
   run state lives and no state file to reconcile: restart, re-read the board, carry on.
 
-  `board:memory` is also available for a single run and for tests, but it cannot outlive its process,
-  so anything relying on recovery wants `board:markdown`.
+  The `memory` backend is also available for a single run and for tests, but it cannot outlive its
+  process, so anything relying on recovery wants `markdown`.
 
   Handing out work is gated like any other outbound request: a worker on a private or loopback
   address is refused unless you allow it, each dispatch is approved against **that specific worker's

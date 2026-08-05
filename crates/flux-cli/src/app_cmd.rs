@@ -726,13 +726,12 @@ pub(super) async fn run_app(
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops read.
-    // A-131: a `datasource` declaration resolves to either the shared knowledge index or a
-    // write-capable `WorkBoard` (`kind = "board:<backend>"`), so the coordinator Program can name
-    // the board it works. The boards are registered below, once the integration registry exists.
-    let ProgramDatasources {
-        knowledge: backend,
-        boards,
-    } = build_datasources(&program.datasources, &program_dir, &system).await?;
+    let ProgramDatasources { knowledge: backend } =
+        build_datasources(&program.datasources, &program_dir, &system).await?;
+    // Boards are a separate first-class declaration and registry. Backend adapters—including
+    // future Jira/Trello providers—extend this seam without entering the datasource catalogue.
+    let ProgramBoards { execution: boards } =
+        build_program_boards(&program.boards, &program_dir, &system)?;
     let mut extra_tools: Vec<(String, Arc<dyn flux_runtime::Tool>)> =
         flux_capabilities::datasource_tools(backend.clone())
             .into_iter()

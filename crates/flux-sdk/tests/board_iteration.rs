@@ -3,7 +3,7 @@
 //! Before this story, board ops returned human text with no `output_schema`, and `board.list`
 //! (`render_compact`) omitted `runner`/`task_id`/`depends_on`/`repo`, so `each`/`match` had nothing
 //! typed to bind. These journeys parse real Flux-Lang source and run it through the real executor
-//! (`FlowClient`), the same path a `datasource board` Program takes.
+//! (`FlowClient`), the same path a first-class `board` Program declaration takes.
 //!
 //! It lives in `flux-sdk` for the same reason `fleet_board_recovery.rs` does: the `WorkBoard` port
 //! is L5 (`flux-capabilities`), the flow surface is the SDK, and only here can a test drive both.

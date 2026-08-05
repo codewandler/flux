@@ -17,14 +17,18 @@ vision · roadmap · decisions · designs
        planning board (authoritative stories)
                   │  BoardRef = board/item
                   ▼
-       fleet supervisor (durable event log)
+       fleet main coordinator (durable intake + goals)
+                     │
+                     ▼
+          repository wave worktree
           │          │          │
           ▼          ▼          ▼
       sub-agent  sub-agent  sub-agent
+       story      story      story
       worktree   worktree   worktree
           └──────────┬──────────┘
                      ▼
-          review → rework → final gate
+       handoff → review/rework → integrate → final gate
                      │
                      ▼
        local candidate → explicit apply
@@ -76,8 +80,14 @@ statistics, and the complete CLI workflow.
 
 ## What the fleet adds
 
-The fleet is a local durable supervisor over Flux sub-agents. It selects dependency-satisfied board
-items, prepares isolated worktrees, preserves one writer per story, verifies failing-before and
+Every fleet has exactly one durable `main` coordinator. Requirements and agent follow-ups enter its
+intake; it owns the active schedule and plans against revisioned values/company/workspace/project/
+repository goals. It can admit a reusable configured agent template or create an ephemeral agent
+with temporary instructions and limits. Neither configuration nor process discovery silently grants
+fleet membership.
+
+The fleet selects dependency-satisfied board items, pins one integration worktree per repository
+wave, prepares one inheriting story worktree/writer per item, verifies failing-before and
 passing-after evidence, obtains a fresh read-only review, allows at most two rework deliveries to
 the same session, integrates accepted commits, and runs one final repository gate.
 
@@ -99,10 +109,12 @@ flux board next --limit 3 --output json
 
 # Validate configuration and see the exact wave the supervisor would select.
 flux fleet validate --output json
+flux fleet goal list --output json
 flux fleet schedule --output json
 
-# Start durable supervision, then dispatch explicit work or the top eligible wave.
+# Route a new requirement through main, then dispatch explicit work or the top eligible wave.
 flux fleet start --idempotency-key start-session --output json
+flux fleet ingest "Implement the next dependency-satisfied story" --source user --output json
 flux fleet run api/C-41 web/C-12 --idempotency-key wave-aug-05 --output json
 
 # Stay responsive while workers run.
@@ -130,4 +142,3 @@ evidence; the host-observed commit, write set, test results, review, and final g
 The backend is an implementation detail after the contract is chosen. A Track board and a session
 board with the planning profile present the same planning state machine; a Markdown execution board
 does not acquire planning states just because it is also stored in files.
-

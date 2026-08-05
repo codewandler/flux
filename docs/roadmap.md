@@ -848,6 +848,32 @@ A-117 the durable supervisor and complete CLI, and C-551 bounded inspection, boa
 reports and roadmap scriptless parity. Claude and Codex call the same versioned JSON CLI and can
 bootstrap from `flux fleet skill`; direct foreign-process and remote code workers remain later.
 Design: [native-board-fleet-cli](designs/native-board-fleet-cli.md).
+
+### Task-agent backends and CLI harness adapters (epic) — ⏸ **BACKLOG (C-552, C-553; after native fleet V1)**
+
+Fleet membership does not imply one execution transport. C-552 introduces a generic lifecycle and
+receipt port that keeps identity/admission/BoardRef/mode/fences separate from how a task runs. C-553
+then binds installed Codex, Claude, Hermes and Pi CLIs through argv-only local adapters with durable
+session and acknowledgement mapping. Native Flux sub-agents remain the V1 baseline; the adapters do
+not become alternate coordinators and cannot bypass handoff or publication fences. Design:
+[task-agent-backends](designs/task-agent-backends.md).
+
+### Authenticated remote fleet membership and A2A workers (epic) — ⏸ **BACKLOG (C-554, C-555; after C-552)**
+
+Remote discovery is not membership. C-554 adds main-coordinator invitations, authenticated
+hello/capability exchange, explicit admission and expiring leases. C-555 implements the generic task
+backend over A2A and verifies remote artifacts inside a local isolation boundary before integration.
+Network identity alone never grants a BoardRef or worker authority. Design:
+[remote-fleet-membership](designs/remote-fleet-membership.md).
+
+### Board and fleet operations TUI (epic) — ⏸ **BACKLOG (C-556, C-557; after native fleet V1)**
+
+The CLI stays the automation API, while the human UI centers the one main coordinator conversation.
+C-556 builds the responsive conversational shell and attention rail. C-557 adds read-only worker
+channel/activity peeks plus native board, decision, dependency and exact-statistics views. The TUI
+projects typed durable state and must be materially more useful than embedding compact CLI output.
+Design: [board-fleet-tui](designs/board-fleet-tui.md).
+
 ### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**
 
 Three stories filed separately turned out to be one failure at three depths, and grouping them said

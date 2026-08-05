@@ -24,6 +24,9 @@ tree and make both publication-on-red and implicit publication impossible.
 - [ ] Inputs are capped at ten and carry `BoardRef`, writer/worktree identity, exact commit,
       dependency order, typed write set and targeted evidence. Duplicate stories/writers and unsafe
       overlap refuse before integration.
+- [ ] Each repository wave pins one canonical base and owns one integration branch/worktree; every
+      story branch/worktree inherits that base. Accepted child commits integrate in dependency
+      order, targeted checks stay in children and the full gate runs only on the assembled wave tree.
 - [ ] Conflicts name story and files, append recoverable evidence and preserve the candidate history;
       no reset, rewrite, competing writer, partial done state or automatic retry occurs.
 - [ ] Red records the exact candidate SHA and leaves planning items non-done. Green records a local

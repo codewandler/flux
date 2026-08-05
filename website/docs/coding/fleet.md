@@ -31,6 +31,23 @@ schema = "flux.fleet/v1"
 max_workers = 3
 max_wave = 10
 max_rework = 2
+decision_mode = "human" # or "auto"
+allow_ad_hoc_agents = true
+worktree_root = ".flux/fleet/worktrees"
+
+[main]
+instructions = ".flux/fleet/main.md"
+model = "codex/gpt-5.6-sol"
+
+[[agent_templates]]
+id = "story-worker"
+role = "writer"
+instructions = ".flux/fleet/agents/story-worker.md"
+model = "codex/gpt-5.6-sol"
+mode = "write"
+capabilities = ["read", "edit", "git"]
+fences = [".flux/fleet/**"]
+max_instances = 3
 
 [[repositories]]
 id = "api"
@@ -47,9 +64,56 @@ board = "product"
 gate = ["npm", "test"]
 ```
 
-Validation rejects duplicate ids, overlapping roots, missing boards, invalid refs, dependency
-cycles, a wave over ten, and unsupported fields. Refresh and other read commands report dirty,
-stale, or diverged checkouts without fetching or modifying them.
+Instruction paths are confined under the fleet root. Validation rejects duplicate/reserved ids,
+another coordinator role, invalid instance limits, overlapping roots, missing boards, invalid refs,
+dependency cycles, a wave over ten, and unsupported fields. Refresh and other read commands report
+dirty, stale, or diverged checkouts without fetching or modifying them.
+
+## One main coordinator, goals, and intake
+
+Every fleet has exactly one reserved `main` coordinator. It is the only agent that owns requirement
+intake, the active roadmap and scheduling. All user tasks and worker follow-ups route through it;
+worker records carry `parent: main` and no template or ad-hoc request may use the coordinator role.
+
+The main agent plans against revisioned context rather than an untracked system prompt:
+
+```sh
+flux fleet goal set values engineering "Prefer evidence and reversible changes" --output json
+flux fleet goal set company product "Make Flux the agent automation substrate" --output json
+flux fleet goal set project flux "Replace repository helper scripts" --output json
+flux fleet goal list --output json
+flux fleet ingest "Add a cross-repository board" --source user --output json
+flux fleet ingest "Reviewer found a stale gate" --source agent --from reviewer-2 --output json
+```
+
+Reusable roles are admitted from templates. The coordinator can also create a temporary specialist
+on the fly; both receive the same durable registration, capability/mode/fence validation, limits and
+lease, and neither path can create a second main agent:
+
+```sh
+flux fleet spawn --template story-worker --item api/C-41 --name writer-C-41 --output json
+flux fleet spawn --role critic --instructions "Challenge D-12 against project goals" \
+  --mode read-only --name critic-D-12 --output json
+```
+
+Configuration makes an agent available for admission; it does not silently register a live member.
+Future CLI-harness and remote A2A task backends use this same admission record without changing who
+owns the roadmap.
+
+## Decisions without stopping autopilot
+
+`flux fleet decisions` aggregates open board decisions. Human mode prints each question, structured
+options/trade-offs and recommendation so the operator usually only needs to pick. Linked stories
+stay blocked, while unrelated eligible work continues.
+
+```sh
+flux fleet decisions --output json
+flux fleet decisions --auto --output json
+```
+
+Auto mode admits a fresh adversarial decision agent. It sees the applicable values/company/project
+goals, must challenge the proposing agent's recommendation, and records a rationale. It does not
+reuse the proposer context or turn every worker into a coordinator.
 
 ## Schedule and dispatch
 
@@ -68,9 +132,21 @@ flux fleet run --idempotency-key next-wave --output json
 flux fleet run api/C-41 web/C-12 --idempotency-key aug-05-wave --output json
 ```
 
-One wave contains at most ten stories. Each writing story gets exactly one writer, one fresh
-isolated worktree, one persistent Flux session, and one story-sized commit. Overlapping or uncertain
-write sets serialize. Read-only maintenance tasks are the default and need no story worktree:
+One wave contains at most ten stories. For each repository, `run` pins the canonical commit and
+creates one integration branch/worktree. Every writing story receives one child branch/worktree
+from that exact base, one writer, one persistent Flux session and story-sized commits:
+
+```text
+canonical base
+└── wave integration worktree
+    ├── story C-41 worktree
+    └── story C-42 worktree
+```
+
+Targeted/cheap checks run in story children. Accepted exact commits integrate into the wave in
+dependency order; the configured full gate runs once only after the assembled tree is final.
+Overlapping or uncertain write sets serialize or refuse before integration. Read-only maintenance
+tasks are the default and need no story worktree:
 
 ```sh
 flux fleet task api "audit the next ready contract" --mode read-only --output json
@@ -96,6 +172,15 @@ with the approved write set; a worker cannot widen its own fence by claiming it 
 Malformed or contradictory handoffs are refusals. Cancellation or a crash leaves the worktree,
 commit, event log, and evidence intact for inspection and resume.
 
+The ergonomic command is fully typed; `--test-arg` is repeated so no shell string is parsed:
+
+```sh
+flux fleet handoff wave-7 api/C-41 --commit FULL_SHA \
+  --write-set crates/api/src/lib.rs --write-set crates/api/tests/contract.rs \
+  --test-arg cargo --test-arg test --test-arg=-p --test-arg api \
+  --failing-before --passing-after --summary "Implemented the accepted contract" --output json
+```
+
 ## Review and bounded rework
 
 A fresh read-only reviewer inspects the exact handoff commit. Findings are structured path/line,
@@ -104,6 +189,12 @@ the same persistent worker session, preserving its context.
 
 The host allows two rework deliveries. A third request parks the item with unresolved findings; a
 board transition, cancellation, restart, or new CLI call cannot reset the counter.
+
+```sh
+flux fleet rework wave-7 api/C-41 --reviewer reviewer-2 --reviewed-commit FULL_SHA \
+  --path 'crates/api/src/lib.rs:91:Preserve the prior error class' \
+  --invariant 'No partial board evidence on refusal' --output json
+```
 
 `message` uses the same acknowledged steering channel:
 
@@ -132,6 +223,7 @@ A green gate records a local `fleet/<wave>` branch as apply-eligible. Nothing is
 ```sh
 flux fleet status --output json
 flux fleet inspect integration wave-7 --output json
+flux fleet integrate wave-7 --if-revision 17 --idempotency-key integrate-wave-7 --output json
 flux fleet apply wave-7 --if-revision 18 --idempotency-key apply-wave-7 --output json
 ```
 
@@ -205,3 +297,16 @@ An AI coordinator can keep only this compact loop in context:
 
 `flux fleet skill` renders that loop as a concise Agent Skill for Claude, Codex, and other harnesses.
 
+## Deliberate follow-ups
+
+V1 workers are native local Flux sub-agents. Three later epics preserve clean boundaries:
+
+- a generic task-agent backend plus local Codex, Claude, Hermes and Pi CLI adapters;
+- authenticated invitation/hello/admission/lease for remote A2A members, followed by an A2A task
+  backend; and
+- a polished TUI centered on the main coordinator conversation, with read-only worker-channel peeks
+  and native board, decision and statistics views.
+
+Those transports and views reuse the same BoardRefs, admission records, evidence, decisions and
+publication fence. They are not hidden capabilities of the local V1 and are not required to call
+the board/fleet CLI from Claude or Codex today.

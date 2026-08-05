@@ -16,6 +16,9 @@ fn fixture(name: &str) -> PathBuf {
 fn flux(root: &PathBuf, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_flux"))
         .current_dir(root)
+        // These fixtures exercise planning/control semantics, not process confinement. Pin the
+        // posture so unattended child Flux invocations never inherit a developer/CI ambient mode.
+        .env("FLUX_SANDBOX", "off")
         .args(args)
         .output()
         .unwrap()
@@ -53,7 +56,17 @@ fn one_story_wave(name: &str) -> (PathBuf, PathBuf) {
     assert!(git(&root, &["add", "."]).status.success());
     assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
     assert!(flux(&root, &["fleet", "start"]).status.success());
-    let dispatched = flux(&root, &["fleet", "run", "repo/C-1", "--output", "json"]);
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
     assert!(dispatched.status.success());
     let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
     let story = PathBuf::from(
@@ -158,6 +171,47 @@ fn machine_schema_uses_the_versioned_envelope_and_clean_stdout() {
 }
 
 #[test]
+fn board_check_resolves_repo_story_relative_and_slug_design_links() {
+    let root = fixture("design-links");
+    fs::create_dir_all(root.join("docs/designs")).unwrap();
+    fs::create_dir_all(root.join("docs/archive/designs")).unwrap();
+    fs::write(root.join("docs/designs/direct.md"), "# Direct\n").unwrap();
+    fs::write(root.join("docs/designs/relative.md"), "# Relative\n").unwrap();
+    fs::write(root.join("docs/designs/shorthand.md"), "# Shorthand\n").unwrap();
+    fs::write(
+        root.join("docs/archive/designs/archived.md"),
+        "# Archived\n",
+    )
+    .unwrap();
+    for (id, design) in [
+        ("C-1", "docs/designs/direct.md"),
+        ("C-2", "../designs/relative.md"),
+        ("C-3", "shorthand"),
+        ("C-4", "docs/archive/designs/archived.md"),
+    ] {
+        fs::write(
+            root.join(format!("docs/stories/{id}-design-link.md")),
+            format!(
+                "---\nid: {id}\ntitle: Design link {id}\nstatus: backlog\ndesign: {design}\n---\n\n# Design link {id}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let output = flux(&root, &["board", "check", "--output", "json"]);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"]["valid"], true);
+    assert_eq!(value["data"]["stories"], 4);
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn generic_json_call_can_reach_real_board_and_fleet_mutations() {
     let root = fixture("json-call");
     fs::write(
@@ -223,6 +277,154 @@ fn generic_json_call_can_reach_real_board_and_fleet_mutations() {
     assert_eq!(goal["data"]["goal"]["scope"], "project");
     assert_eq!(goal["data"]["goal"]["statement"], "Replace helper scripts");
     fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn board_export_import_round_trips_authored_resources_without_clobbering() {
+    let source = fixture("export-source");
+    fs::write(
+        source.join("docs/stories/C-7-round-trip.md"),
+        "---\nid: C-7\ntitle: Round trip\nstatus: ready\npriority: 7\ndesign: docs/designs/round-trip.md\n---\n\n# Round trip\n\n## Goal\n\nPreserve this authored body.\n\n## Acceptance\n\n- [ ] imported\n",
+    )
+    .unwrap();
+    fs::create_dir_all(source.join("docs/designs")).unwrap();
+    fs::create_dir_all(source.join("docs/decisions")).unwrap();
+    fs::write(source.join("docs/VISION.md"), "# Vision\n\nKeep it.\n").unwrap();
+    fs::write(source.join("docs/ROADMAP.md"), "# Roadmap\n\nShip it.\n").unwrap();
+    fs::write(
+        source.join("docs/designs/round-trip.md"),
+        "# Round-trip design\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("docs/decisions/D-1.md"),
+        "---\nid: D-1\nstatus: decided\n---\n\n# Decision\n",
+    )
+    .unwrap();
+    let export = flux(&source, &["board", "export", "-o", "export.json"]);
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+
+    let target = fixture("import-target");
+    let initialized = flux(&target, &["board", "init", "--scaffold"]);
+    assert!(initialized.status.success());
+    fs::copy(source.join("export.json"), target.join("export.json")).unwrap();
+    let imported = flux(
+        &target,
+        &["board", "import", "export.json", "--output", "json"],
+    );
+    assert!(
+        imported.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&imported.stdout),
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let imported: serde_json::Value = serde_json::from_slice(&imported.stdout).unwrap();
+    assert_eq!(imported["data"]["items"], 1);
+    assert_eq!(imported["data"]["resources"], 5);
+    for relative in [
+        "docs/stories/C-7-round-trip.md",
+        "docs/VISION.md",
+        "docs/ROADMAP.md",
+        "docs/designs/round-trip.md",
+        "docs/decisions/D-1.md",
+    ] {
+        assert_eq!(
+            fs::read(source.join(relative)).unwrap(),
+            fs::read(target.join(relative)).unwrap(),
+            "{relative} did not round trip exactly"
+        );
+    }
+    let board = fs::read_to_string(target.join("docs/stories/README.md")).unwrap();
+    assert!(board.contains("C-7"), "{board}");
+    let replay = flux(&target, &["board", "import", "export.json"]);
+    assert!(
+        !replay.status.success(),
+        "create-only import must not clobber"
+    );
+    fs::remove_dir_all(source).ok();
+    fs::remove_dir_all(target).ok();
+}
+
+#[test]
+fn workspace_board_federates_namespaced_items_and_routes_member_writes() {
+    let workspace = fixture("workspace-board");
+    let api = workspace.join("members/api");
+    let web = workspace.join("members/web");
+    fs::create_dir_all(api.join("docs/stories")).unwrap();
+    fs::create_dir_all(web.join("docs/stories")).unwrap();
+    fs::write(
+        api.join("docs/stories/C-1-api.md"),
+        "---\nid: C-1\ntitle: API contract\nstatus: done\n---\n\n# API contract\n",
+    )
+    .unwrap();
+    fs::write(
+        web.join("docs/stories/C-1-web.md"),
+        "---\nid: C-1\ntitle: Web client\nstatus: ready\npriority: 1\ndepends_on: [api/C-1]\n---\n\n# Web client\n",
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join(".flux")).unwrap();
+    fs::write(
+        workspace.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"product-api\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"product-web\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n",
+    )
+    .unwrap();
+    let items = flux(
+        &workspace,
+        &["board", "--scope", "workspace", "items", "--output", "json"],
+    );
+    assert!(
+        items.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&items.stdout),
+        String::from_utf8_lossy(&items.stderr)
+    );
+    let items: serde_json::Value = serde_json::from_slice(&items.stdout).unwrap();
+    assert_eq!(items["data"]["items"][0]["id"], "api/C-1");
+    assert_eq!(items["data"]["items"][1]["id"], "web/C-1");
+    let next = flux(
+        &workspace,
+        &["board", "--scope", "workspace", "next", "--output", "json"],
+    );
+    let next: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
+    assert_eq!(next["data"]["items"][0]["id"], "web/C-1");
+
+    let ambiguous = flux(
+        &workspace,
+        &["board", "--scope", "workspace", "start", "C-1"],
+    );
+    assert!(
+        !ambiguous.status.success(),
+        "workspace writes require a member"
+    );
+    let started = flux(
+        &workspace,
+        &[
+            "board",
+            "--scope",
+            "workspace",
+            "--board",
+            "web",
+            "start",
+            "C-1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        started.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(fs::read_to_string(web.join("docs/stories/C-1-web.md"))
+        .unwrap()
+        .contains("status: in-progress"));
+    assert!(!workspace.join("docs/stories/C-1-web.md").exists());
+    fs::remove_dir_all(workspace).ok();
 }
 
 #[test]
@@ -517,6 +719,10 @@ fn open_decisions_block_only_linked_work_and_fleet_prompts_for_a_human() {
             "sqlite",
             "--option",
             "postgres",
+            "--tradeoff",
+            "sqlite=zero-ops local storage",
+            "--tradeoff",
+            "postgres=shared service with operational cost",
             "--recommended",
             "sqlite",
             "--output",
@@ -540,6 +746,14 @@ fn open_decisions_block_only_linked_work_and_fleet_prompts_for_a_human() {
     assert_eq!(prompts["data"]["attention_required"], true);
     assert_eq!(prompts["data"]["decisions"][0]["ref"], "workspace/D-1");
     assert_eq!(prompts["data"]["decisions"][0]["recommended"], "sqlite");
+    assert_eq!(
+        prompts["data"]["decisions"][0]["suggestions"][0]["tradeoff"],
+        "zero-ops local storage"
+    );
+    assert_eq!(
+        prompts["data"]["decisions"][0]["suggestions"][0]["recommended"],
+        true
+    );
 
     let auto = flux(
         &root,
@@ -820,7 +1034,17 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
         .to_string();
     assert!(flux(&root, &["fleet", "start"]).status.success());
 
-    let dispatched = flux(&root, &["fleet", "run", "repo/C-1", "--output", "json"]);
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
     assert!(
         dispatched.status.success(),
         "stdout={} stderr={}",
@@ -875,7 +1099,17 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     assert!(git(&root, &["add", "."]).status.success());
     assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
     assert!(flux(&root, &["fleet", "start"]).status.success());
-    let dispatched = flux(&root, &["fleet", "run", "repo/C-1", "--output", "json"]);
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
     assert!(dispatched.status.success());
     let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
     let story = PathBuf::from(
@@ -1061,4 +1295,231 @@ fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
         !integration.status.success(),
         "parked work cannot integrate"
     );
+}
+
+#[test]
+fn fleet_delivers_to_a_real_durable_main_agent_session() {
+    let root = fixture("durable-main-turn");
+    fs::create_dir_all(root.join(".flux/fleet")).unwrap();
+    fs::write(
+        root.join(".flux/fleet/main.md"),
+        "Act as the only main coordinator and acknowledge the request.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n",
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let first = flux(
+        &root,
+        &[
+            "fleet",
+            "message",
+            "main",
+            "Inspect the durable intake",
+            "--wait",
+            "completed",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["data"]["receipt"]["ack"], "completed");
+    assert_eq!(first["data"]["receipt"]["session"], "s_1");
+    assert!(first["data"]["receipt"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "turn_start")
+        .unwrap()
+        .get("input")
+        .is_none());
+
+    let second = flux(
+        &root,
+        &[
+            "fleet",
+            "message",
+            "main",
+            "Continue in the same coordinator session",
+            "--wait",
+            "delivered",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["data"]["requested_ack"], "delivered");
+    assert_eq!(second["data"]["receipt"]["ack"], "completed");
+    assert_eq!(second["data"]["receipt"]["session"], "s_1");
+    assert!(root
+        .join(".git/flux-fleet/sessions/main/events.db")
+        .is_file());
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
+    let root = fixture("real-story-agent");
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/stories/C-2-story.md"),
+        "---\nid: C-2\ntitle: Second story\nstatus: ready\npriority: 2\n---\n\n# Second story\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux/fleet/agents")).unwrap();
+    fs::write(
+        root.join(".flux/fleet/agents/story-worker.md"),
+        "Work only in the assigned story worktree and report evidence.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\nmax_instances = 3\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let run = flux(
+        &root,
+        &["fleet", "run", "repo/C-1", "repo/C-2", "--output", "json"],
+    );
+    assert!(
+        run.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let run: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(run["data"]["ack"], "completed");
+    assert_eq!(run["data"]["receipts"][0]["session"], "s_1");
+    assert_eq!(run["data"]["receipts"].as_array().unwrap().len(), 2);
+    let stories = run["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap();
+    for story in stories {
+        let story_worktree = PathBuf::from(story["worktree"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(story_worktree.join("flux-mock.txt")).unwrap(),
+            "created by flux mock\n"
+        );
+    }
+
+    let first_worktree = PathBuf::from(stories[0]["worktree"].as_str().unwrap());
+    fs::remove_file(first_worktree.join("flux-mock.txt")).unwrap();
+    fs::write(first_worktree.join("result.txt"), "first implementation\n").unwrap();
+    assert!(git(&first_worktree, &["add", "result.txt"])
+        .status
+        .success());
+    assert!(
+        git(&first_worktree, &["commit", "-qm", "implement first story"])
+            .status
+            .success()
+    );
+    let first_commit = String::from_utf8(git(&first_worktree, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &first_commit,
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "implemented first story",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    assert_eq!(handoff["data"]["session"], "s_1");
+    let rework = flux(
+        &root,
+        &[
+            "fleet",
+            "rework",
+            "wave-2",
+            "repo/C-1",
+            "--reviewer",
+            "fresh-reviewer",
+            "--reviewed-commit",
+            &first_commit,
+            "--path",
+            "result.txt:1:Clarify the implementation",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        rework.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&rework.stdout),
+        String::from_utf8_lossy(&rework.stderr)
+    );
+    let rework: serde_json::Value = serde_json::from_slice(&rework.stdout).unwrap();
+    assert_eq!(rework["data"]["ack"], "completed");
+    assert_eq!(rework["data"]["turn_receipt"]["session"], "s_1");
+    assert!(
+        git(&root, &["status", "--short"]).stdout.is_empty(),
+        "the source checkout remains untouched"
+    );
+    fs::remove_dir_all(root).ok();
 }

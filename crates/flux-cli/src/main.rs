@@ -2117,10 +2117,6 @@ mod tests {
             !bound.knowledge.is_empty(),
             "the markdown note was ingested"
         );
-        assert!(
-            bound.boards.is_empty(),
-            "a knowledge kind declares no board"
-        );
 
         let bad = vec![DatasourceDecl {
             name: "x".into(),

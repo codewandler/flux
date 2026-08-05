@@ -1082,7 +1082,7 @@ pub trait Spawner: Send + Sync {
 /// other, and both already depend on this crate.
 #[async_trait]
 pub trait DispatchLedger: Send + Sync {
-    /// The permission subject one item's record occupies — e.g. `board/item/PROJ-42`.
+    /// The permission subject one item's record occupies — e.g. `board:product/item/PROJ-42`.
     ///
     /// Synchronous and infallible because it runs on the **gating** path, before execution: an op
     /// declaring a write must be able to name what it writes. Implementations must return a
@@ -1780,6 +1780,20 @@ impl AuthorityRequirement {
         )
     }
 
+    pub fn board_read(subject: impl Into<String>) -> Self {
+        Self::new(
+            "board.read",
+            ResourceRef::named(ResourceKind::Board, subject),
+        )
+    }
+
+    pub fn board_write(subject: impl Into<String>) -> Self {
+        Self::new(
+            "board.write",
+            ResourceRef::named(ResourceKind::Board, subject),
+        )
+    }
+
     pub fn network_fetch(subject: impl Into<String>) -> Self {
         Self::new(
             "network.fetch",
@@ -1838,7 +1852,12 @@ impl AuthorityRequirement {
     pub fn is_mutating(&self) -> bool {
         !matches!(
             self.action.0.as_str(),
-            "workspace.read" | "datasource.read" | "host.read" | "secret.read" | "model.invoke"
+            "workspace.read"
+                | "datasource.read"
+                | "board.read"
+                | "host.read"
+                | "secret.read"
+                | "model.invoke"
         )
     }
 

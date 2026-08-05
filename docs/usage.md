@@ -55,6 +55,15 @@ flux run --show-loop "summarize README.md into SUMMARY.txt"
 flux run --loop loops/support.flux "triage this request"
 ```
 
+Board and local-fleet automation use their own versioned JSON commands:
+
+```bash
+flux board schema --output json
+flux fleet schema --output json
+```
+
+See the public board and fleet guides for the complete operation catalog and safe dispatch loop.
+
 ## Interactive session (REPL)
 
 ```bash

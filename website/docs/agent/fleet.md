@@ -24,3 +24,13 @@ flux fleet skill
 flux board schema --output json
 flux fleet schema --output json
 ```
+
+An execution board bound as `board` generates the complete operation set: `board.list`,
+`board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
+`board.record_dispatch`, `board.query`, `board.comments`, `board.reassign`, and
+`board.record_evidence`. New backends implement this board contract; they do not become datasource
+kinds.
+
+Each `board.query` row has a stable shape: `id`, `title`, `state`, `assignee`, `runner`, `task_id`,
+`depends_on`, `repo`, and `attempts`. Optional values are explicit `null`s rather than omitted
+fields, so authored flows can branch on the same schema for every backend.

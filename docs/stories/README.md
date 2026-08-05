@@ -307,6 +307,11 @@ _flux's central claim is that **the LLM is not the runtime** — authored contro
 - [C-361 — Add a coverage-guided fuzz lane with a persistent corpus](C-361-add-a-coverage-guided-fuzz-lane.md) · Core · no fuzz/ dir, no cargo-fuzz, no arbitrary, no seed corpora — the 'adversarial corpus' is a seeded deterministic generator over committed fixtures and keeps nothing it finds
 - [C-362 — Add a sanitizer lane over the unsafe-adjacent seams](C-362-add-a-sanitizer-lane.md) · Core · no -Zsanitizer flags anywhere in the repo; ASan/TSan/MSan is the other limb of ASURE-01 that no addition has touched
 
+### The board and fleet operations TUI
+_The CLI is the automation API, but a human supervising autopilot needs a calm view of the main_
+- [C-556 — The fleet TUI is centered on the one main coordinator conversation](C-556-fleet-main-agent-tui-shell.md) · Core · follow-up UI — conversational main surface plus attention rail; CLI remains automation API
+- [C-557 — Polished TUI views expose worker channels, board decisions and exact stats](C-557-board-fleet-observability-tui.md) · Core · follow-up UI — read-only peeks and native visualizations, not embedded CLI output
+
 ### Connector-backed storage — one registry, two safe facades
 _The hosted connectors platform needs ordinary customer storage and credential storage to be_
 - [D-221 — Connector-backed storage — one registry, safe object and credential facades](D-221-connector-backed-storage-facade-epic.md) · Core · EPIC — account-scoped named stores with per-capability defaults; platform-managed S3 for objects, Vault/1Password for credentials, and connector declarations driving both without exposing secrets
@@ -440,6 +445,11 @@ _Running an agent on your own machine means your machine is what it touches. Som
 ### Remote Approvals
 - [C-127 — Remote approvals — the approval gate over Slack / webhook (epic)](C-127-remote-approvals-epic.md) · Core · EPIC — pluggable approver transport for headless/serve agents: approval requests post to Slack (Block Kit buttons) or a signed webhook, timeout = deny, decision lands in the audit trail; complements quorum approval (C-96) — that changes how many approvers, this changes where they are
 
+### Authenticated remote fleet membership and task workers
+_An A2A endpoint being discoverable does not make it a trusted fleet worker. Remote membership needs_
+- [C-554 — Remote agents join a fleet only through authenticated admission and leases](C-554-remote-fleet-admission-and-leases.md) · Core · follow-up remote boundary — invite, authenticated hello/capabilities, coordinator admission, expiry
+- [C-555 — An admitted A2A agent executes through the generic task-agent backend](C-555-a2a-task-agent-backend.md) · Core · follow-up remote execution — membership is C-554; exact artifacts still cross host verification
+
 ### Pause and resume a live run
 _Watching an agent work is only half of control. The other half is being able to say *stop* — to read_
 - [A-141 — What pause means for an effect already in flight — and saying it honestly](A-141-what-pause-means-for-an-effect-in-flight.md) · Agent · the story that makes pause trustworthy or not. A pause pressed while an HTTP request is in flight, a subprocess is running or a model is streaming cannot un-send any of it. ⚠ A pause that reports stopped while effects continue is WORSE than no pause — it invites the operator to relax at the wrong moment
@@ -470,6 +480,11 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 
 ### Taint Flow Policy
 - [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
+
+### Task-agent backends and CLI harness adapters
+_Fleet membership and task execution are separate concerns. The V1 fleet can admit and coordinate_
+- [C-552 — One TaskAgentBackend separates agent execution from fleet membership](C-552-task-agent-backend-contract.md) · Core · follow-up after local V1 — lifecycle/steering/receipts are generic; fleet remains backend-agnostic
+- [C-553 — Codex, Claude, Hermes and Pi run through typed local task-agent adapters](C-553-cli-agent-harness-adapters.md) · Core · follow-up adapters — local harness CLIs are task backends, not special fleet coordinators
 
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_

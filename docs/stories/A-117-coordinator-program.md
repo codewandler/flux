@@ -19,6 +19,15 @@ to local execution boards and exposes every lifecycle action through `flux fleet
 
 ## Acceptance
 
+- [ ] Every fleet has exactly one durable reserved `main` coordinator. All user requirements, tasks
+      and agent follow-ups enter its acknowledged intake; workers cannot register another
+      coordinator or mutate the roadmap directly.
+- [ ] The coordinator plans against revisioned goals scoped to values, company, workspace, project
+      and repository. Human decision mode prompts with options/recommendation; auto mode admits a
+      fresh adversarial decision agent that challenges the recommendation against those goals.
+- [ ] `.flux/fleet.toml` supports reusable main/worker instruction files and named templates. The
+      coordinator may also admit ephemeral agents with temporary instructions/model/mode/
+      capabilities/fences, subject to the same closed validation, leases and worker limits.
 - [ ] Public commands cover `init`, `doctor`, `refresh`, `validate`, `start`, `stop`, `run`, `task`,
       `message`, `cancel`, `resume`, `apply`, `status`, `schedule`, `events`, `logs`, `note`, `agents`,
       `worktrees`, `inspect`, `dashboard`, `schema`, `call` and `skill`; every command supports the

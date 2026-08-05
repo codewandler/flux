@@ -73,7 +73,7 @@ A planning board has four document families:
 
 - `vision` is a revisioned singleton: the durable destination and principles.
 - `roadmap` is a revisioned singleton: sequencing, milestones, and program direction.
-- `decision` is a stable collection with `proposed`, `accepted`, and `superseded` lifecycle states.
+- `decision` is a stable collection with `open`, `decided`, and `superseded` lifecycle states.
 - `design` is a stable linked collection explaining a technical approach.
 
 They may link stories and epics, but they never receive a story status and never appear in `next`.
@@ -84,9 +84,19 @@ flux board vision set --file docs/VISION.md --dry-run --output json
 flux board roadmap show --output json
 flux board decision list --output json
 flux board decision show 0010 --output json
-flux board decision accept 0010 --if-revision REV --idempotency-key accept-0010 --output json
+flux board decision open D-12 --title "Choose storage" --question "Which store?" \
+  --option SQLite --option Postgres --tradeoff "SQLite=local and simple" \
+  --tradeoff "Postgres=shared service" --recommended SQLite --blocks C-552 --output json
+flux board decision decide D-12 --outcome "SQLite" --rationale "Matches local V1" \
+  --if-revision REV --idempotency-key decide-D-12 --output json
 flux board design show native-board-fleet-cli --output json
+flux board design link native-board-fleet-cli C-552 --output json
 ```
+
+An open decision is an explicit human-attention queue, not a reason to stop the whole project. It
+records the question, structured options/trade-offs, recommendation, and linked stories. Only those
+stories become blocked; unrelated ready work remains eligible. Deciding records outcome/rationale
+and restores each linked story's prior state and priority.
 
 Before changing a story, an AI coding agent should read the vision, roadmap, applicable accepted
 decisions, the story's Goal and Acceptance, and its linked design. `flux board skill` gives the same
@@ -149,7 +159,7 @@ Human rendering is for terminals. JSON is the agent API:
 {
   "schema": "flux.cli/v1",
   "ok": true,
-  "request_id": null,
+  "request_id": "caller-correlation-id",
   "revision": "9d7d…",
   "data": {},
   "warnings": [],
@@ -169,8 +179,13 @@ The ergonomic commands and the complete escape hatch share one schema:
 
 ```sh
 flux board schema --output json
-flux board call default stats --request request.json --output json
+flux board call stats --request request.json --output json
 ```
+
+`request.json` is a closed versioned call request such as
+`{"schema":"flux.cli/v1","request_id":"stats-1","args":["--history"]}`. The response echoes the
+request id. This `args` escape hatch reaches the same validated command implementation; it never
+invokes a shell.
 
 ## Exact statistics and reports
 
@@ -185,10 +200,11 @@ Every ratio uses `{done, remaining, total, percent}` for:
 - Acceptance criteria;
 - headline implementation.
 
-The cube also includes the profile-state histogram; vision/roadmap presence; decisions by lifecycle;
-design count; canonical commit facts; and, for a federated program, program stories, tranche lanes,
-waves, groups, members, and aggregates. `--history` adds daily `scope_added`, `scope_removed`, and
-`completed` deltas.
+The cube also includes the profile-state histogram; vision/roadmap presence; open/decided/
+superseded decisions; total and story-linked designs; canonical commit facts; and, for a federated
+program, program stories, tranche lanes, waves, groups, members, and aggregates. `--history`
+reconstructs canonical end-of-day Git snapshots and adds concrete `scope_added`, `scope_removed`,
+and `completed` counts plus item ids.
 
 An absent dimension is explicit, never fabricated as zero:
 
@@ -215,15 +231,11 @@ Every axis is required. Backend-specific fields are closed and invalid combinati
 spanned errors:
 
 ```flux
-board product
+board execution
   scope "repository"
-  profile "planning"
-  kind "track"
-  root "."
-  vision "docs/VISION.md"
-  roadmap "docs/ROADMAP.md"
-  decisions "docs/decisions"
-  designs "docs/designs"
+  profile "execution"
+  kind "markdown"
+  root "./board"
 ```
 
 The old `datasource kind "board:…"` compatibility spelling is not a second registry. Migrate it to
@@ -241,4 +253,3 @@ contracts.
 | `federated` | workspace + planning | member BoardRefs; optional workspace documents |
 
 Next: [Fleet and sub-agents](./fleet.md).
-

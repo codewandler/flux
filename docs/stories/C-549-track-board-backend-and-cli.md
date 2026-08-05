@@ -32,6 +32,9 @@ files, Goal and Acceptance contracts and generated-board format.
 - [ ] `vision show|set` and `roadmap show|set` manage revisioned singleton documents;
       `decision list|show|create|update|accept|supersede` manages stable decision records; `design`
       manages linked design documents. None appears in the ready queue or receives a story status.
+- [ ] Decisions expose `open`, `decided` and `superseded`; open records carry a question, structured
+      options/trade-offs, recommendation and linked blocked stories. Deciding restores only those
+      stories while unrelated ready work remains schedulable.
 - [ ] Story ids allocate without races; create never clobbers; design links an existing document;
       epic and done are recoverable multi-file change sets; every mutation supports dry-run and
       optimistic revision.

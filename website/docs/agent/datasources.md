@@ -205,59 +205,50 @@ A **work board** is not a datasource — it mutates, and a datasource is read-on
 is a write-capable work registry with a
 typed item state machine—`ready`, `claimed`, `in_progress`, `review`, `done`, `blocked`,
 `failed`—behind a swappable backend. The full spine, and which transitions are legal, is in
-[Work boards and the fleet](./fleet.md#the-item-lifecycle). Indexed knowledge and live read domains
+[Boards](../coding/boards.md#profile-general-planning-or-execution). Indexed knowledge and live read domains
 cannot express work that is claimed, moved, retried, and commented on, which is what a coordinator
 agent needs in order to hand tasks out and reconcile them after a crash.
 
-Flux-Lang currently places boards in the program's `datasource` declaration slot, distinguished by a
-`board:` kind:
+Flux-Lang gives boards their own declaration and registry:
 
 ```flux
-datasource board
-  kind "board:markdown"
-  path "./board"
+board product
+  scope "repository"
+  profile "execution"
+  kind "markdown"
+  root "./board"
 ```
 
-The declaration's **name** becomes the operation prefix, so this one generates `board.list`,
-`board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
+The declaration's **name** becomes the operation prefix. A binding named `board` generates
+`board.list`, `board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
 `board.record_dispatch`, `board.query`, `board.comments`, `board.reassign`, and
-`board.record_evidence`. Board kinds live in their own `board:` namespace on purpose: `markdown`
-already means *a directory of docs to index*, so a board that happens to be backed by markdown files
-needs a name that cannot be confused with it. A knowledge kind is never promoted to a board, a board
-kind is never ingested as knowledge, and a `board:` kind naming a backend that does not exist is an
-error rather than a fall-through.
+`board.record_evidence`. A knowledge datasource is never promoted to a board, and a board never
+enters the datasource catalogue. The retired `datasource ... kind "board:*"` spelling fails with an
+exact first-class replacement instead of opening a second registry.
 
 Available backends:
 
 | Kind | Storage | Use |
 |---|---|---|
-| `board:markdown` | one markdown file per item under `path`, with a derived index | durable — survives a restart, so a coordinator can re-derive its runs |
-| `board:memory` | in-process | a single run, and tests |
+| `markdown` | one markdown file per item under `root`, with a derived index | durable — survives a restart, so a coordinator can re-derive its runs |
+| `memory` | in-process | a single run, and tests |
 
-`path` is resolved relative to the **program file's** directory, exactly like a knowledge
-datasource's, and the board inherits the session's guarded filesystem root rather than opening one of
-its own.
+`root` is resolved relative to the **program file's** directory, and the board inherits the
+session's guarded filesystem root rather than opening one of its own.
 
-`board:memory` cannot outlive the process that created it, so a Program relying on crash recovery
-wants `board:markdown`.
-
-:::note Direction
-Because a board mutates, it is leaving the datasource vocabulary: the direction is a first-class
-`board` declaration with its own `board:` permission namespace, retiring the `kind "board:*"`
-spelling, with the fixed operation surface listed above staying identical across every backend. What this
-page documents is the current shipped behavior — the `datasource` declaration slot above remains
-the way to bind a board today.
-:::
+`memory` cannot outlive the process that created it, so a Program relying on crash recovery wants
+`markdown`. Later Jira/Trello adapters attach to the same board registry without becoming
+datasource kinds.
 
 The machine-oriented reads are `board.query`, which returns a page as typed JSON rows (every field
 present, absent optionals as `null`) so a flow can `each` over items and `match` on their state, and
 `board.comments`, which returns one item's notes as an array. `board.query` also accepts a
 `depends_on` filter that keeps only items whose dependencies are all `done`. `board.list` and
 `board.get` render prose for reading. See
-[Work boards and the fleet](./fleet.md#reading-the-board-as-data).
+[Boards](../coding/boards.md#the-stable-agent-api).
 
 The seven mutating operations are gated like any other write: each reports a concrete
-`<name>/item/<id>` approval subject—`<name>/item/new` for `create`, since no id exists yet—so a grant
+`board:<name>/item/<id>` approval subject—`board:<name>/item/new` for `create`, since no id exists yet—so a grant
 scoped to one item can never move another. `transition` validates the edge against the state machine
 *before* writing, so an illegal move is a clean error and leaves the item byte-identical.
 

@@ -171,80 +171,119 @@ pub(super) async fn build_doc_index(
     backend
 }
 
-/// The `kind` prefix that names a **board** declaration (A-131).
-///
-/// Naming this was a real decision, not a detail. `markdown` is already taken by the *knowledge*
-/// ingester, and a board backed by markdown files (A-114) is a different port entirely — so board
-/// kinds live in their own namespace: `board:memory` today, `board:markdown` / `board:jira` /
-/// `board:gitlab` as those backends land. Two properties follow, and both are the point:
-///
-/// * `kind = "markdown"` keeps meaning exactly what it has always meant. A knowledge declaration is
-///   never silently promoted to a board, and a board declaration is never silently ingested as
-///   knowledge — the prefix, not a lookup table, decides which port is bound.
-/// * A kind *under* this prefix that names no backend is a hard error, never a fall-through. The
-///   failure mode this closes is a user pointing `kind = "markdown"` at a board file store and
-///   getting a silently wrong, read-only knowledge index instead of a diagnostic.
+/// Legacy board-shaped datasource kinds are recognized only for a migration diagnostic. They never
+/// enter the datasource or board registry.
 const BOARD_KIND_PREFIX: &str = "board:";
 
-/// The board backends bindable from a `datasource` declaration today, for the error message that
-/// names them. `MemoryBoard` is the offline backend A-113 shipped with the port; `MarkdownBoard`
-/// (A-114) is the file-backed one; the issue-tracker-backed ones arrive with their own stories.
-const BOARD_BACKENDS: &str = "markdown | memory";
-
-/// What a Program's `datasource` declarations resolve to: one shared knowledge backend, plus the
-/// work boards declared alongside it.
+/// What a Program's `datasource` declarations resolve to: one shared knowledge backend.
 pub(super) struct ProgramDatasources {
     /// The shared index every `markdown` / `openapi` declaration ingested into, and the backend the
     /// retrieval ops (`search`/`get`/`list`/…) dispatch against.
     pub(super) knowledge: Arc<dyn flux_capabilities::DatasourceBackend>,
-    /// `(domain, backend)` per declared board, in declaration order. The caller installs each with
-    /// [`flux_capabilities::try_register_work_board`], which *derives* the generated op set from the
-    /// port — so an operation added to `WorkBoard` surfaces here with no change to this module.
-    pub(super) boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)>,
 }
 
-/// Resolve one `board:<backend>` declaration into a [`WorkBoard`](flux_capabilities::WorkBoard).
-///
-/// An unrecognized backend names itself and the ones that exist. It is deliberately NOT tolerant:
-/// falling back to the knowledge ingester here would reintroduce exactly the silent, wrong behaviour
-/// [`BOARD_KIND_PREFIX`] exists to prevent.
-///
-/// `root` is the already-resolved, program-relative directory the file-backed backends live under;
-/// `memory` ignores it. `MarkdownBoard` is built with
-/// [`rooted_in`](flux_capabilities::MarkdownBoard::rooted_in) rather than `new`, so the board
-/// **inherits the session's guarded `System`** instead of minting a fresh `Workspace` at an
-/// arbitrary root — a board is a write surface, so it must not be able to widen the sandbox it was
-/// handed.
-fn build_work_board(
-    name: &str,
-    backend: &str,
-    root: &str,
-    system: &System,
-) -> Result<Arc<dyn flux_capabilities::WorkBoard>> {
-    match backend {
-        "memory" => Ok(Arc::new(flux_capabilities::MemoryBoard::new())),
-        "markdown" => Ok(Arc::new(
-            flux_capabilities::MarkdownBoard::rooted_in(system, root).map_err(|e| {
-                anyhow::anyhow!("datasource `{name}` (board:markdown) at `{root}`: {e}")
-            })?,
-        )),
-        "" => Err(anyhow::anyhow!(
-            "datasource `{name}` declares a board but names no backend — write \
-             `kind = \"{BOARD_KIND_PREFIX}markdown\"` (available: {BOARD_BACKENDS})"
-        )),
-        other => Err(anyhow::anyhow!(
-            "datasource `{name}`: unknown board backend `{other}` (available: {BOARD_BACKENDS})"
-        )),
+/// First-class authored boards after typed registry validation. Execution adapters use the shipped
+/// `WorkBoard` port today; future Jira/Trello adapters extend this board seam rather than the
+/// datasource catalogue.
+pub(super) struct ProgramBoards {
+    pub(super) execution: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)>,
+}
+
+fn program_relative_path(program_dir: &std::path::Path, raw: &str) -> String {
+    let path = std::path::Path::new(raw);
+    if path.is_absolute() {
+        raw.to_string()
+    } else {
+        program_dir.join(path).to_string_lossy().into_owned()
     }
+}
+
+/// Resolve first-class `board <name>` declarations through the board registry.
+pub(super) fn build_program_boards(
+    declarations: &[flux_lang::program::BoardDecl],
+    program_dir: &std::path::Path,
+    system: &System,
+) -> Result<ProgramBoards> {
+    use flux_datasource::board::{BoardBackend, BoardContract, BoardId, BoardProfile, BoardScope};
+    use flux_lang::program::{BoardKindDecl, BoardProfileDecl, BoardScopeDecl};
+
+    let mut registry = flux_capabilities::BoardRegistry::new();
+    let mut execution = Vec::new();
+    for declaration in declarations {
+        let scope = match declaration.scope {
+            BoardScopeDecl::Session => BoardScope::Session {
+                session_id: declaration
+                    .session
+                    .clone()
+                    .unwrap_or_else(|| "current".into()),
+            },
+            BoardScopeDecl::Repository => BoardScope::Repository {
+                repository_id: program_relative_path(
+                    program_dir,
+                    declaration.root.as_deref().unwrap_or("."),
+                ),
+            },
+            BoardScopeDecl::Workspace => BoardScope::Workspace {
+                workspace_id: program_relative_path(
+                    program_dir,
+                    declaration.root.as_deref().unwrap_or("."),
+                ),
+            },
+        };
+        let profile = match declaration.profile {
+            BoardProfileDecl::General => BoardProfile::General,
+            BoardProfileDecl::Planning => BoardProfile::Planning,
+            BoardProfileDecl::Execution => BoardProfile::Execution,
+        };
+        let backend = match declaration.kind {
+            BoardKindDecl::Session => BoardBackend::Session,
+            BoardKindDecl::Track => BoardBackend::Track,
+            BoardKindDecl::Markdown => BoardBackend::Markdown,
+            BoardKindDecl::Memory => BoardBackend::Memory,
+            BoardKindDecl::Federated => BoardBackend::Federated,
+        };
+        let contract = BoardContract {
+            id: BoardId::new(&declaration.name)
+                .map_err(|error| anyhow::anyhow!("board `{}`: {error}", declaration.name))?,
+            scope,
+            profile,
+            backend,
+            source: format!("Flux-Lang board `{}`", declaration.name),
+        };
+        let board: Arc<dyn flux_capabilities::WorkBoard> = match declaration.kind {
+            BoardKindDecl::Memory => Arc::new(flux_capabilities::MemoryBoard::new()),
+            BoardKindDecl::Markdown => {
+                let root =
+                    program_relative_path(program_dir, declaration.root.as_deref().unwrap_or("."));
+                Arc::new(
+                    flux_capabilities::MarkdownBoard::rooted_in(system, &root).map_err(
+                        |error| {
+                            anyhow::anyhow!(
+                                "board `{}` (markdown) at `{root}`: {error}",
+                                declaration.name
+                            )
+                        },
+                    )?,
+                )
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "board `{}` backend {other:?} has no authored-program adapter yet",
+                    declaration.name
+                ))
+            }
+        };
+        registry.register_execution(contract, Arc::clone(&board))?;
+        execution.push((declaration.name.clone(), board));
+    }
+    Ok(ProgramBoards { execution })
 }
 
 /// Build a program's declared [`datasource`](flux_lang::program::DatasourceDecl)s — the
 /// `flux app run` counterpart of [`build_doc_index`]'s implicit workspace index.
 ///
-/// The `kind` dispatch is **total**, which is the whole safety property here: a knowledge kind
-/// ingests under its own name by the matching ingester (`markdown` walks a docs directory; `openapi`
-/// reads a JSON spec file), a `board:<backend>` kind binds a write-capable [`WorkBoard`] instead,
-/// and anything else is a clean error. Nothing falls through to a default.
+/// The `kind` dispatch is total: a knowledge kind ingests through its matching adapter, retired
+/// board-shaped kinds return a migration error, and anything else is a clean error.
 pub(super) async fn build_datasources(
     decls: &[flux_lang::program::DatasourceDecl],
     program_dir: &std::path::Path,
@@ -253,35 +292,27 @@ pub(super) async fn build_datasources(
     // A datasource path is relative to the PROGRAM FILE's directory (absolute paths pass through), so
     // `path "./docs"` means "beside the .flux file" regardless of the launch cwd. `program_dir` is a
     // read-only root of `system`, so the resulting absolute path is walkable/readable.
-    fn resolve_ds_path(program_dir: &std::path::Path, raw: &str) -> String {
-        let p = std::path::Path::new(raw);
-        if p.is_absolute() {
-            raw.to_string()
-        } else {
-            program_dir.join(p).to_string_lossy().into_owned()
-        }
-    }
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
-    let mut boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)> = Vec::new();
     for d in decls {
         match d.kind.as_str() {
-            // A board, not a knowledge source. `board` on its own is the shape a bare
-            // `datasource board { … }` lowers to (native text defaults `kind` to the decl name), so
-            // it is routed here to get the "names no backend" diagnostic rather than the generic
-            // unknown-kind one.
             kind if kind == "board" || kind.starts_with(BOARD_KIND_PREFIX) => {
-                let backend = kind.strip_prefix(BOARD_KIND_PREFIX).unwrap_or("").trim();
-                // A board's `path` is program-relative exactly like a knowledge datasource's, so
-                // `path "./board"` means "beside the .flux file" whatever the launch cwd is.
-                let root = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
-                boards.push((
-                    d.name.clone(),
-                    build_work_board(&d.name, backend, &root, system)?,
+                let replacement = kind.strip_prefix(BOARD_KIND_PREFIX).unwrap_or("BACKEND");
+                return Err(anyhow::anyhow!(
+                    "datasource `{}` uses the retired board-as-datasource syntax; replace it with:\n\
+                     board {}\n  scope \"repository\"\n  profile \"execution\"\n  kind {:?}\n  root {:?}",
+                    d.name,
+                    d.name,
+                    if replacement.is_empty() {
+                        "BACKEND"
+                    } else {
+                        replacement
+                    },
+                    d.path.as_deref().unwrap_or(".")
                 ));
             }
             "markdown" => {
-                let base = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
+                let base = program_relative_path(program_dir, d.path.as_deref().unwrap_or("."));
                 let docs = walk_docs(system, &base, 1000, 200_000).await;
                 flux_capabilities::ingest_markdown(&*backend, &d.name, &docs)
                     .map_err(|e| anyhow::anyhow!("datasource `{}` (markdown): {e}", d.name))?;
@@ -290,7 +321,7 @@ pub(super) async fn build_datasources(
                 let raw = d.path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("datasource `{}` (openapi) needs a `path`", d.name)
                 })?;
-                let path = resolve_ds_path(program_dir, raw);
+                let path = program_relative_path(program_dir, raw);
                 let text = system
                     .read_file(&path)
                     .await
@@ -303,17 +334,13 @@ pub(super) async fn build_datasources(
             }
             other => {
                 return Err(anyhow::anyhow!(
-                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi | \
-                     {BOARD_KIND_PREFIX}<backend>)",
+                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi)",
                     d.name
                 ))
             }
         }
     }
-    Ok(ProgramDatasources {
-        knowledge: backend,
-        boards,
-    })
+    Ok(ProgramDatasources { knowledge: backend })
 }
 
 /// Wrap a keyword backend in the semantic (embeddings) backend when built with `--features embeddings`
@@ -2845,7 +2872,9 @@ mod execution_environment_conformance {
 mod fleet_and_board_wiring {
     use super::*;
 
-    use flux_lang::program::DatasourceDecl;
+    use flux_lang::program::{
+        BoardDecl, BoardKindDecl, BoardProfileDecl, BoardScopeDecl, DatasourceDecl,
+    };
     use flux_system::Workspace;
 
     /// A throwaway workspace root. `build_datasources` needs a guarded [`System`] even for a
@@ -2872,33 +2901,42 @@ mod fleet_and_board_wiring {
         }]
     }
 
-    /// A-131 Acceptance 4, the named failing-first test: a Program declaring a board must resolve to
-    /// a `WorkBoard`-backed set of generated ops. Before this story `build_datasources` knew only
-    /// `markdown` and `openapi`, so a board declaration errored as an unknown kind and a board could
-    /// not be named from configuration at all.
+    fn board_decl(name: &str, kind: BoardKindDecl, root: Option<&str>) -> Vec<BoardDecl> {
+        vec![BoardDecl {
+            name: name.into(),
+            scope: BoardScopeDecl::Repository,
+            profile: BoardProfileDecl::Execution,
+            kind,
+            root: root.map(str::to_string),
+            session: None,
+            members: Vec::new(),
+            document_roots: serde_json::Map::new(),
+        }]
+    }
+
+    /// A first-class board resolves through the board registry and never enters the datasource
+    /// catalogue.
     #[tokio::test]
     async fn a_declared_board_binds_a_work_board_instead_of_erroring() {
         let root = temp_root("board-binds");
         let system = System::new(Workspace::new(&root).unwrap());
 
-        let bound = build_datasources(&decl("board", "board:memory"), &root, &system).await;
+        let bound = build_program_boards(
+            &board_decl("board", BoardKindDecl::Memory, Some(".")),
+            &root,
+            &system,
+        );
         assert!(
             bound.is_ok(),
-            "a `board:memory` datasource must bind a WorkBoard, got: {:?}",
+            "a first-class memory board must bind a WorkBoard, got: {:?}",
             bound.as_ref().err().map(ToString::to_string)
         );
         let bound = bound.unwrap();
 
-        // Not ingested as knowledge — the failure mode the board kind namespace exists to prevent.
-        assert!(
-            bound.knowledge.is_empty(),
-            "a board declaration must not be ingested into the knowledge index"
-        );
-
-        // ...and it resolves to a `WorkBoard`-backed set of GENERATED ops, under the decl's name as
+        // It resolves to a `WorkBoard`-backed set of GENERATED ops, under the decl's name as
         // the domain. The expected set is read off the port's own registration rather than listed
         // here, so a board operation added to `WorkBoard` (A-130) is covered without editing this.
-        let [(domain, board)] = <[_; 1]>::try_from(bound.boards).ok().expect("one board");
+        let [(domain, board)] = <[_; 1]>::try_from(bound.execution).ok().expect("one board");
         assert_eq!(domain, "board");
         let mut registry = ToolRegistry::new();
         let surface = flux_capabilities::try_register_work_board(&mut registry, &domain, board)
@@ -2996,12 +3034,9 @@ mod fleet_and_board_wiring {
         );
     }
 
-    /// A-131 Acceptance 5: the wrong board kind fails **loudly**. `markdown` stays the knowledge
-    /// ingester (it is not silently promoted to a board), a bare `board` names no backend, and a
-    /// board backend that does not exist yet is an error rather than a fall-through to knowledge
-    /// ingestion — which is the silent, wrong behaviour this story closes.
+    /// The retired board-as-datasource spelling fails with an exact first-class replacement.
     #[tokio::test]
-    async fn an_unnameable_board_backend_is_a_loud_error() {
+    async fn board_shaped_datasources_are_migration_errors() {
         let root = temp_root("board-loud");
         let system = System::new(Workspace::new(&root).unwrap());
 
@@ -3009,23 +3044,19 @@ mod fleet_and_board_wiring {
             let bound = build_datasources(&decl("board", kind), &root, &system).await;
             assert!(
                 bound.is_err(),
-                "a board kind naming no backend (`{kind}`) must error, not fall through to \
-                 knowledge ingestion"
+                "a retired board datasource (`{kind}`) must not enter either registry"
             );
             let text = bound.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(text.contains("retired board-as-datasource"), "{text}");
             assert!(
-                text.contains("board"),
-                "the error must name the board kind, got: {text}"
+                text.contains("board board\n  scope \"repository\""),
+                "{text}"
             );
         }
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// `board:markdown` must bind the **durable** backend (A-114), not fall back to the in-process
-    /// one. Failing-first before `build_work_board` gained its `markdown` arm: the declaration was an
-    /// "unknown board backend" error, so no durable board could be named from a Program at all — and
-    /// without one, the design's "restart, sweep, re-derive" claim is untestable, because
-    /// `MemoryBoard`'s storage *is* the process it is supposed to survive.
+    /// A first-class Markdown board binds the durable adapter, not the in-process one.
     ///
     /// Durability is asserted the only way that actually proves it: write through the bound board,
     /// then read the bytes back off the filesystem.
@@ -3036,14 +3067,19 @@ mod fleet_and_board_wiring {
         std::fs::create_dir_all(&board_dir).unwrap();
         let system = System::new(Workspace::new(&root).unwrap());
 
-        let mut decls = decl("board", "board:markdown");
-        decls[0].path = Some("./board".into());
-        let bound = build_datasources(&decls, &root, &system)
-            .await
-            .expect("`board:markdown` must bind a durable board");
-        assert_eq!(bound.boards.len(), 1, "one declared board binds one board");
+        let bound = build_program_boards(
+            &board_decl("board", BoardKindDecl::Markdown, Some("./board")),
+            &root,
+            &system,
+        )
+        .expect("a first-class Markdown board must bind a durable board");
+        assert_eq!(
+            bound.execution.len(),
+            1,
+            "one declared board binds one board"
+        );
 
-        let (domain, board) = &bound.boards[0];
+        let (domain, board) = &bound.execution[0];
         assert_eq!(domain, "board");
 
         // The board is program-relative and rooted under the declared `path`, so a write lands
@@ -3066,8 +3102,7 @@ mod fleet_and_board_wiring {
             .unwrap_or(0);
         assert!(
             on_disk > 0,
-            "a durable board must leave the item on disk under the program-relative root; \
-             `board:memory` would leave nothing and the recovery story would be unprovable"
+            "a durable board must leave the item on disk under the program-relative root"
         );
         assert!(!item.id.is_empty(), "the created item has an id");
 
@@ -3125,7 +3160,7 @@ mod fleet_and_board_wiring {
                 "item": "item-0001",
             }));
         assert!(
-            subjects.iter().any(|s| s == "board/item/item-0001"),
+            subjects.iter().any(|s| s == "board:board/item/item-0001"),
             "the board item must be a concrete subject, got: {subjects:?}"
         );
         assert!(

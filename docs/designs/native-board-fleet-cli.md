@@ -29,8 +29,9 @@ General boards use `open|in_progress|blocked|done`. Planning boards use
 Execution boards retain the shipped WorkBoard state and runner/task/attempt fields.
 
 A planning board also has a document catalogue. `vision` and `roadmap` are revisioned singletons;
-`decision` is a stable collection whose records are `proposed|accepted|superseded`; `design` is a
-stable linked collection. These documents can reference stories and epics but are not queue items
+`decision` is a stable collection whose records are `open|decided|superseded`; `design` is a stable
+linked collection. An open decision carries its question, options/trade-offs, recommendation and
+the exact items it blocks. These documents can reference stories and epics but are not queue items
 and never receive a work status. Repository boards normally bind them under `docs/`; a workspace
 board may own program-level vision, roadmap and decisions while federating member stories.
 
@@ -97,18 +98,35 @@ canonical snapshots and reports `scope_added`, `scope_removed` and `completed` d
 dimension is `{schema: "absent", done: null, remaining: null, total: null, percent: null}`. HTML/SVG/
 TSV reports are pure renderings of this JSON, never independent calculations.
 
-`.flux/fleet.toml` declares repository ids/paths, canonical refs, planning-board bindings, gates,
-ledger fences, concurrency and schedule groupings. A workspace fleet run selects the highest-priority
-dependency-satisfied wave unless the caller supplies explicit `BoardRef`s. The durable wave manifest
-pins source commits, proposed and observed write sets, worktrees, sessions, attempts, evidence,
-reviews, gates and local candidate branches.
+Every fleet has exactly one reserved durable `main` coordinator. All user requirements, tasks and
+agent follow-ups enter through its intake; only it maintains the active roadmap/schedule. It plans
+against revisioned goals scoped to values, company, workspace, project and repository. Worker
+membership is explicit: `main` admits a worker and records parent, role, session, transport,
+capabilities, mode, fences and lease. Merely appearing in configuration or on a transport is not
+admission.
 
-The host, not a prompt, enforces: at most ten stories per wave; one writer/worktree per story;
-disjoint or serialized write sets; a test-only failing commit before behavior implementation; a
-targeted pass before handoff; fresh read-only review; two same-session rework rounds; dependency-
-ordered integration; and one unskippable full gate on each final repository tree. Red preserves the
-candidate and cannot transition planning items to done. Green leaves local `fleet/<wave>` branches.
-Only `flux fleet apply` revalidates and merges them, without pushing.
+`.flux/fleet.toml` declares main instructions/model, named reusable agent templates, whether ad-hoc
+agents are allowed, repository ids/paths, canonical refs, planning-board bindings, gates, ledger
+fences, concurrency and schedule groupings. The coordinator may instantiate a template or admit an
+ephemeral agent with temporary instructions/model/mode/capabilities/fences at dispatch time; both
+paths obey the same limits and can never create a second coordinator. A workspace fleet run selects
+the highest-priority dependency-satisfied wave unless the caller supplies explicit `BoardRef`s.
+The durable wave manifest pins source commits, proposed and observed write sets, worktrees,
+sessions, attempts, evidence, reviews, gates and local candidate branches.
+
+The host, not a prompt, enforces: at most ten stories per wave; one pinned integration
+branch/worktree per repository wave; one child branch/worktree and writer per story, inheriting the
+same pinned base; disjoint or serialized write sets; a test-only failing commit before behavior
+implementation; a targeted pass before handoff; fresh read-only review; two same-session rework
+rounds; dependency-ordered child-commit integration; and one unskippable full gate on each assembled
+integration tree. Red preserves the candidate and cannot transition planning items to done. Green
+leaves local `fleet/<wave>` branches. Only `flux fleet apply` revalidates and merges them, without
+pushing.
+
+Open decisions block only their linked work; other ready items continue. Human mode surfaces the
+structured choices and recommendation. Auto mode creates a fresh adversarial decision agent with
+the applicable values/company/project context, requires it to challenge the recommendation, and
+records its chosen outcome and rationale.
 
 Control commands provide durable acknowledgement levels: `accepted` after journalling, `delivered`
 after the persistent agent session acknowledges steering, and `completed` at a terminal turn. Status
@@ -133,5 +151,6 @@ Board wave: C-547 (machine CLI contract), A-134 (registry/profile core), L-130 (
 Fleet wave: C-244 (typed handoff), C-245 (same-session rework), C-242 (integration and explicit
 apply), A-117 (durable supervisor and fleet CLI), C-551 (inspection, reporting and roadmap parity).
 
-Direct Claude/Codex process workers, remote A2A code workers, vendor boards, containers, automatic
-publication and automatic worktree deletion are not V1 dependencies.
+Generic task-agent backends and Codex/Claude/Hermes/Pi CLI harness adapters, authenticated remote
+A2A fleet members, a polished board/fleet TUI, vendor boards, containers, automatic publication and
+automatic worktree deletion are separately contracted follow-up epics rather than V1 dependencies.
