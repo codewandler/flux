@@ -33,7 +33,7 @@ and [Safety & approvals](./safety.md).
 | `flux system serve …` | serve one canonical workspace as an authenticated TLS [remote execution system](../topologies.md#local-runtime-remote-system) |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
-| `flux board …` | inspect and mutate session, repository, or federated [boards](../coding/boards.md); JSON is the stable automation API |
+| `flux board …` | inspect and mutate session, repository, or workspace [boards](../coding/boards.md); JSON is the stable automation API |
 | `flux fleet …` | schedule and inspect bounded local agents through the durable [fleet](../coding/fleet.md) workflow |
 | `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
 | `flux flow run <name\|file>` | execute a saved flow by name or an existing Flux-Lang file (files win) |

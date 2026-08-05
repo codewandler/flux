@@ -10,6 +10,13 @@ Flux treats AI-assisted development as a durable engineering workflow, not a lon
 bounded local Flux sub-agents against that work. Repository files, commits, tests, reviews, and the
 final gate remain the evidence.
 
+:::info Availability
+These pages document the current `main` branch. Native `flux board` and `flux fleet` landed after
+v0.55.0 and are included in source installs from `main`; packaged-release users need v0.56.0 or
+newer. Confirm an installation with `flux board schema --output json` and
+`flux fleet schema --output json`.
+:::
+
 ```text
 vision · roadmap · decisions · designs
                   │

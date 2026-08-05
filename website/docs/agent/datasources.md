@@ -230,15 +230,20 @@ Available backends:
 
 | Kind | Storage | Use |
 |---|---|---|
+| `session` | the owning session event stream | temporary general, planning, or execution work that survives continue/replay/fork |
+| `track` | YAML-frontmatter stories plus authored planning documents | repository planning without converting an existing Track board |
 | `markdown` | one markdown file per item under `root`, with a derived index | durable — survives a restart, so a coordinator can re-derive its runs |
 | `memory` | in-process | a single run, and tests |
+| `federated` | references to named member boards plus optional workspace documents | one dependency-aware planning view across repositories without copying their stories |
 
 `root` is resolved relative to the **program file's** directory, and the board inherits the
 session's guarded filesystem root rather than opening one of its own.
 
-`memory` cannot outlive the process that created it, so a Program relying on crash recovery wants
-`markdown`. Later Jira/Trello adapters attach to the same board registry without becoming
-datasource kinds.
+The valid durable combinations are session scope + `session`, repository scope + `track` or
+`markdown`, and workspace scope + `federated`; `memory` is deliberately scope-neutral for tests and
+demos. `memory` cannot outlive the process that created it, so a Program relying on crash recovery
+chooses a durable backend. Later Jira/Trello adapters attach to the same board registry without
+becoming datasource kinds.
 
 The machine-oriented reads are `board.query`, which returns a page as typed JSON rows (every field
 present, absent optionals as `null`) so a flow can `each` over items and `match` on their state, and

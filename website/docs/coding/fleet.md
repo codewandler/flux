@@ -9,6 +9,11 @@ The Flux fleet is a durable supervisor connecting planning [`BoardRef`s](./board
 local Flux sub-agent sessions. It replaces coordinator socket clients, terminal scraping, Python
 board generators, status collectors, and hand-built progress reports with one versioned CLI.
 
+:::info Availability
+Native `flux fleet` landed after v0.55.0. It is available in source installs from current `main`;
+packaged-release users need v0.56.0 or newer.
+:::
+
 The fleet is local in V1. It does not require remote A2A workers, containers, automatic publication,
 or automatic worktree deletion.
 
@@ -268,6 +273,7 @@ flux fleet inspect source api --limit 100 --output json
 flux fleet inspect search C-41 --limit 100 --output json
 flux fleet inspect story api/C-41 --limit 100 --output json
 flux fleet inspect pull-request wave-7 --limit 100 --output json
+flux fleet note "Candidate preserved while CI is unavailable" --output json
 flux fleet dashboard --output json
 ```
 
@@ -282,6 +288,25 @@ flux board stats --history --output json
 flux board report --format html -o progress.html
 flux board report --format svg -o progress.svg
 ```
+
+`note` appends redacted coordinator context to the same durable event stream. It is for facts that
+must survive a restart but are not a worker instruction; use acknowledged `message` for steering.
+
+## The stable agent API
+
+Fleet uses the same `flux.cli/v1` envelope, revision preconditions, idempotency keys and closed
+request format as board. `schema` is the complete installed-version contract, while `call` is the
+automation escape hatch into the same validated implementation:
+
+```sh
+flux fleet skill
+flux fleet schema --output json
+flux fleet call status --request status-request.json --output json
+```
+
+For `call`, the request document supplies only the operation arguments, for example
+`{"schema":"flux.cli/v1","request_id":"status-1","args":[]}`. It never invokes a shell or bypasses
+fleet state validation.
 
 ## Safe agent operating loop
 
