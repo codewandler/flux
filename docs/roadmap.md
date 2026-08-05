@@ -834,18 +834,18 @@ Design: [zendesk-automation.md](designs/zendesk-automation.md).
 
 0.36.0 shipped a fleet *coordinator* — a Program declares a board and hands items to remote agents
 over A2A with `runner`/`task_id` written back — but not the loop the `track` plugin actually runs:
-select a wave of independent items, give each an isolated worker that implements and gates and commits
-on a scratch branch, review the returned diff **as evidence**, two rework rounds to the *same* worker,
-park after that, integrate serially with a full gate after **every** merge and revert on red, then
-write the ledger. The load-bearing decision is where that contract lives: **the model reasons, the
-host enforces.** A `WaveCoordinator` owns the irreversible, order-sensitive actions — isolation, gate,
-merge, revert, ledger — and the model owns only wave selection and diff review. The point is not
-tidiness: it means fenced ledger, gate-after-every-merge, never-implement, revert-on-red and
-park-after-two hold *even when the model is wrong or lazy*, because they are host behaviour rather
-than instructions a prompt can lose. `fleet.integrate` is the sharpest instance — it gates and merges
-or does neither, so the most-violated rule in the loop becomes unskippable; and gating per merge is
-what attributes the failure of two stories that each compile alone but not together, which is exactly
-the case that produces no git conflict. Coordination *prose* deliberately stays out of flux: the
+select a wave of independent items, give each an isolated worker that implements and runs targeted
+checks and commits on a scratch branch, review the returned diff **as evidence**, two rework rounds
+to the *same* worker, park after that, integrate serially on one wave branch, run the full gate once
+on the combined tree, publish only on green, then write the ledger. The load-bearing decision is
+where that contract lives: **the model reasons, the host enforces.** A `WaveCoordinator` owns the
+irreversible, order-sensitive actions — isolation, ordered integration, wave gate, publication fence
+and ledger — and the model owns only wave selection and diff review. The point is not tidiness: it
+means fenced ledger, one writer/worktree per story, targeted checks before handoff, one wave-boundary
+gate, never-publish-red and park-after-two hold *even when the model is wrong or lazy*, because they
+are host behaviour rather than instructions a prompt can lose. `fleet.integrate` is the sharpest
+instance — it can assemble an ordered candidate but cannot publish it or write completion bookkeeping
+without one successful configured full gate. Coordination *prose* deliberately stays out of flux: the
 wave-selection and review heuristics are content, and they live in a reference `coordinator.flux` and
 its guidance. Sequenced so the data path lands before anything reasons over it — **F1** makes the
 board readable (`board.query` with a real `output_schema`; today `render_compact` drops `runner`,

@@ -47,6 +47,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The fleet delivery contract now validates one integrated wave instead of every child merge.**
+  A named wave has at most one writer and isolated worktree per story, targeted checks at story
+  handoff, dependency-ordered integration on one branch, and one unskippable full repository gate
+  on the final combined tree. Overlapping write sets are serialized, child branches do not open
+  competing pull requests, and a red gate preserves the failed candidate while publishing nothing.
+  The still-backlog C-242 contract and its design were corrected before implementation; no runtime
+  behaviour changed.
+
+- **Flux-Lang's authoring-ergonomics roadmap now has implementation contracts for L-131 through
+  L-140.** The wave covers structural type aliases and nested records, typed task outputs and repair
+  branches, constructors and multiline values, settled fan-out, collecting loops, structured agent
+  context, and first-class `Option`/`Result` foundations. This release adds the reviewed contracts,
+  not those language features.
+
 - **Embedded public documentation freshness is now a mandatory PR and publication gate** (C-515).
   The unfiltered pull-request workflow and exact-SHA release candidate both install the pinned
   website dependencies and verify `public-docs.zip`; website publication checks before upload or
