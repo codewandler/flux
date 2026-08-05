@@ -17,9 +17,32 @@ packaged-release users need v0.56.0 or newer.
 The fleet is local in V1. It does not require remote A2A workers, containers, automatic publication,
 or automatic worktree deletion.
 
+## Domain model and ownership
+
+Fleet executes work selected by the [Board domain model](./boards.md#domain-model). It does not own
+epics, story status, milestones or the program schedule.
+
+| Entity | Meaning | Durable authority |
+|---|---|---|
+| Fleet | One local execution supervisor rooted at a workspace. | Fleet config plus runtime journal |
+| Main coordinator | The single reserved agent that accepts requirements and orchestrates dispatch. It selects from the Board; it does not replace Board authority. | Fleet runtime state |
+| Worker | One admitted sub-agent with one role, capability ceiling, persistent session and bounded assignment. In the normal story path, worker and sub-agent are 1:1. | Fleet admission/runtime state |
+| Configured wave | Board-owned repository-local dispatch template. It has no worker, worktree or runtime lifecycle. | `.flux/board.toml` |
+| Dispatched wave instance | One pinned execution of selected BoardRefs, with integration bases, workers, receipts, reviews, gate and apply status. | `.flux/fleet/state.json` and events |
+| Handoff | Typed candidate result for one story: exact commit, write set and test evidence. It is not completion. | Fleet runtime state/events |
+| Review | Fresh read-only assessment of the exact candidate commit and story contract. A result is PASS, REWORK or PARK. | Fleet runtime state/events |
+| Gate | Repository command run against the assembled wave candidate. Green makes the wave apply-eligible; it does not publish it. | Fleet receipt/runtime state |
+| Apply | Explicit local integration of a green candidate into the configured checkout. | Git plus Fleet runtime state |
+| Release/deploy | Separate publication boundary after apply. Fleet never implies either from a green gate. | Release/deployment system |
+
+The word “wave” should therefore be qualified when it matters: a **configured wave** is planning
+configuration; a **dispatched wave instance** is mutable execution state.
+
 ## Configure the workspace
 
-`flux fleet init` creates a closed `.flux/fleet.toml` scaffold and durable `.flux/fleet/` state.
+Configure the cross-repository program in `.flux/board.toml` first; see the
+[workspace Board example](./boards.md#workspace). `flux board check --output json` works without
+Fleet. `flux fleet init` then creates a closed execution-policy scaffold and durable runtime state.
 Limits default to three concurrent workers, ten stories per wave, and two rework deliveries.
 
 ```sh
@@ -28,8 +51,9 @@ flux fleet doctor --output json
 flux fleet validate --output json
 ```
 
-A workspace declares repository identity, root, canonical ref, planning board, final gate, write
-fences, concurrency, and tranche/wave grouping. A representative configuration is:
+Fleet configuration declares execution identity, repository roots, canonical refs, final gates,
+write fences, concurrency and worker admission. Milestones, program lanes and configured waves do
+not belong here. A representative execution configuration is:
 
 ```toml
 schema = "flux.fleet/v1"
@@ -71,8 +95,23 @@ gate = ["npm", "test"]
 
 Instruction paths are confined under the fleet root. Validation rejects duplicate/reserved ids,
 another coordinator role, invalid instance limits, overlapping roots, missing boards, invalid refs,
-dependency cycles, a wave over ten, and unsupported fields. Refresh and other read commands report
+and unsupported fields. Board validation separately rejects program dependency cycles,
+cross-repository configured waves, or a wave over ten. Refresh and other read commands report
 dirty, stale, or diverged checkouts without fetching or modifying them.
+
+### Configuration is not state
+
+The durable files have disjoint write ownership:
+
+| Path | Contains | Mutated by runtime operations? |
+|---|---|---|
+| `.flux/board.toml` | Board members, documents, active milestone, program lanes, configured waves | No |
+| `.flux/fleet.toml` | Worker templates, models, capabilities, gates, fences, concurrency, worktree policy | No |
+| `.flux/fleet/state.json` | Coordinator/workers and dispatched wave instances | Yes |
+| `.flux/fleet/events.ndjson` | Append-only lifecycle receipts and evidence | Yes |
+
+Read surfaces may join these sources in one response. Fleet state stores BoardRefs and the minimum
+pinned dispatch snapshot needed for reproducibility; it is not a copied or mutable program schedule.
 
 ## Capabilities are an admission ceiling
 
@@ -92,7 +131,7 @@ widens an existing worker. Admit a new worker explicitly when the required autho
 ## One main coordinator, goals, and intake
 
 Every fleet has exactly one reserved `main` coordinator. It is the only agent that owns requirement
-intake, the active roadmap and scheduling. All user tasks and worker follow-ups route through it;
+intake and execution orchestration. The Board owns roadmap and scheduling truth. All user tasks and worker follow-ups route through it;
 worker records carry `parent: main` and no template or ad-hoc request may use the coordinator role.
 
 The main agent plans against revisioned context rather than an untracked system prompt:
@@ -137,8 +176,10 @@ reuse the proposer context or turn every worker into a coordinator.
 
 ## Schedule and dispatch
 
-The default scheduler selects the highest-priority dependency-satisfied wave. Explicit `BOARD/ITEM`
-arguments go through the same checks.
+The scheduler reads the Board's active-milestone projection and configured waves. It preserves
+program order, combines story/program dependencies, and never falls back to an unrelated ready
+story when the workspace has a program catalogue. Explicit `BOARD/ITEM` arguments go through the
+same authority and readiness checks.
 
 ```sh
 flux fleet refresh --output json
@@ -152,7 +193,8 @@ flux fleet run --idempotency-key next-wave --output json
 flux fleet run api/C-41 web/C-12 --idempotency-key aug-05-wave --output json
 ```
 
-One wave contains at most ten stories. For each repository, `run` pins the canonical commit and
+One configured wave contains at most ten stories. Dispatch creates a distinct wave instance. For
+each repository, `run` pins the canonical commit and
 creates one integration branch/worktree. Every writing story receives one child branch/worktree
 from that exact base, one writer, one persistent Flux session and story-sized commits:
 

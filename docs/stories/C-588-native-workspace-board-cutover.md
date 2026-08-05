@@ -37,6 +37,10 @@ of Fleet, then prove the actual Flux family can be operated with Flux alone.
       program dependencies, preserve stable program/wave order and never admit an unrelated ready
       story when a program catalogue exists. Fleet reads the Board config rather than owning tranche,
       wave or group schedule fields.
+- [ ] `.flux/board.toml` planning configuration, `.flux/fleet.toml` execution configuration and
+      `.flux/fleet/state.json`/events runtime state have disjoint schemas and write ownership. Board
+      and Fleet operations never mutate either config file; dispatched state stores BoardRefs and a
+      pinned dispatch snapshot, not a copied program schedule.
 - [ ] Accepted/decided/superseded roadmap decision documents normalize correctly; only a genuinely
       open structured decision creates `attention_required` or blocks its linked work.
 - [ ] The metric/report schema replaces `tranche_lanes` with truthful `milestone_lanes`, computes
@@ -53,3 +57,8 @@ of Fleet, then prove the actual Flux family can be operated with Flux alone.
 ## Progress
 
 - 2026-08-05 — filed after direct operator audit of the supposedly complete native cutover.
+- 2026-08-05 — implemented the independent workspace schema/default discovery, milestone/program
+  projection, configured waves, decision normalization and truthful workspace metrics. Removed
+  program schedule fields from Fleet configuration and configuration limits from serialized Fleet
+  state; the 27-test Board/Fleet CLI suite is green. Real four-repository migration and final
+  documentation/embedded gates remain.

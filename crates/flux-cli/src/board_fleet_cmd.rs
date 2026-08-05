@@ -258,8 +258,8 @@ pub(super) struct BoardCommand {
     #[arg(long, global = true)]
     board: Option<String>,
     /// Board lifetime/authority scope; independent of profile and backend.
-    #[arg(long, value_enum, default_value_t, global = true)]
-    scope: BoardScopeArg,
+    #[arg(long, value_enum, global = true)]
+    scope: Option<BoardScopeArg>,
     /// Operation/state-machine profile; independent of scope and backend.
     #[arg(long, value_enum, default_value_t, global = true)]
     profile: BoardProfileArg,
@@ -849,9 +849,6 @@ struct FleetState {
     schema: String,
     revision: u64,
     running: bool,
-    max_workers: usize,
-    max_wave: usize,
-    max_rework: usize,
     #[serde(default)]
     main_agent: MainAgentState,
     #[serde(default)]
@@ -926,12 +923,66 @@ struct FleetConfig {
     worktree_root: PathBuf,
     #[serde(default)]
     repositories: Vec<FleetRepository>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardWorkspaceConfig {
+    schema: String,
+    id: String,
+    #[serde(default, rename = "default")]
+    is_default: bool,
+    active_milestone: String,
     #[serde(default)]
-    tranches: Vec<ScheduleGroup>,
+    vision: Option<PathBuf>,
     #[serde(default)]
-    waves: Vec<ScheduleGroup>,
+    roadmap: Option<PathBuf>,
     #[serde(default)]
-    groups: Vec<ScheduleGroup>,
+    decisions: Option<PathBuf>,
+    #[serde(default)]
+    designs: Option<PathBuf>,
+    #[serde(default)]
+    members: Vec<WorkspaceMember>,
+    #[serde(default)]
+    program: Vec<ProgramLane>,
+    #[serde(default)]
+    waves: Vec<ProgramWave>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceMember {
+    id: String,
+    root: PathBuf,
+    #[serde(default = "default_board_binding")]
+    board: String,
+    #[serde(default = "default_canonical_ref")]
+    canonical_ref: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgramLane {
+    id: String,
+    item: String,
+    milestone: String,
+    order: i64,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgramWave {
+    id: String,
+    state: String,
+    repository: String,
+    #[serde(default)]
+    items: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -986,18 +1037,6 @@ struct FleetRepository {
     concurrency: Option<usize>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ScheduleGroup {
-    id: String,
-    #[serde(default)]
-    items: Vec<String>,
-    #[serde(default)]
-    active: bool,
-    #[serde(default)]
-    depends_on: Vec<String>,
-}
-
 const fn default_max_workers() -> usize {
     3
 }
@@ -1029,9 +1068,6 @@ impl Default for FleetState {
             schema: "flux.fleet-state/v1".into(),
             revision: 0,
             running: false,
-            max_workers: 3,
-            max_wave: 10,
-            max_rework: 2,
             main_agent: MainAgentState::default(),
             goals: BTreeMap::new(),
             intake: BTreeMap::new(),
@@ -1059,22 +1095,31 @@ pub(super) fn run_board(command: BoardCommand) -> Result<()> {
     }
 }
 
-fn run_board_checked(command: BoardCommand) -> Result<()> {
+impl BoardCommand {
+    fn scope(&self) -> BoardScopeArg {
+        self.scope.unwrap_or_default()
+    }
+}
+
+fn run_board_checked(mut command: BoardCommand) -> Result<()> {
     let request = load_request(command.request.as_deref())?;
     let envelope_request_id = request_id_from(request.as_ref())?;
-    if command.scope == BoardScopeArg::Session {
+    let workspace_root = confined_root(&command.root)?;
+    if command.scope.is_none() {
+        command.scope = Some(default_board_scope(&workspace_root)?);
+    }
+    if command.scope() == BoardScopeArg::Session {
         validate_board_common(&command, request.as_ref())?;
         return run_session_board_checked(&command, request);
     }
-    let workspace_root = confined_root(&command.root)?;
     validate_board_common(&command, request.as_ref())?;
-    if command.scope == BoardScopeArg::Workspace
+    if command.scope() == BoardScopeArg::Workspace
         && board_action_requires_member(&command.action)
         && command.board.is_none()
     {
         bail!("input/schema: a workspace mutation must select its authoritative member with --board MEMBER")
     }
-    let root = if command.scope == BoardScopeArg::Workspace {
+    let root = if command.scope() == BoardScopeArg::Workspace {
         match command.board.as_deref() {
             Some(member) => member_root(&workspace_root, member)?,
             None => workspace_root.clone(),
@@ -1600,7 +1645,11 @@ fn run_board_action(
     request: Option<Value>,
     revision: &str,
 ) -> Result<(String, Value, Vec<String>, Option<String>)> {
-    let board_id = command.board.as_deref().unwrap_or("default");
+    let board_id = if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
+        read_board_workspace_config(root)?.id
+    } else {
+        command.board.as_deref().unwrap_or("default").to_string()
+    };
     match &command.action {
         BoardAction::Skill => {
             let skill = board_skill();
@@ -1629,7 +1678,7 @@ fn run_board_action(
             }
             let data = json!({
                 "board": board_id,
-                "scope": command.scope,
+                "scope": command.scope(),
                 "profile": command.profile,
                 "backend": "track",
                 "root": display_path(root),
@@ -1645,13 +1694,14 @@ fn run_board_action(
         }
         BoardAction::List => {
             let data = json!({"boards": [{
-                "id": board_id, "scope": command.scope, "profile": command.profile,
+                "id": board_id, "scope": command.scope(), "profile": command.profile,
                 "backend": "track", "root": display_path(root), "revision": revision
             }]});
             Ok((
                 format!(
                     "{board_id}\ttrack\t{:?}\t{:?}",
-                    command.scope, command.profile
+                    command.scope(),
+                    command.profile
                 ),
                 data,
                 vec![],
@@ -1661,9 +1711,9 @@ fn run_board_action(
         BoardAction::Show => {
             let stories = read_board_items(command, root)?;
             let data = json!({
-                "id": board_id, "scope": command.scope, "profile": command.profile,
+                "id": board_id, "scope": command.scope(), "profile": command.profile,
                 "backend": "track", "root": display_path(root), "revision": revision,
-                "items": stories.len(), "documents": document_counts(root)
+                "items": stories.len(), "documents": document_counts(command, root)
             });
             Ok((
                 format!(
@@ -1693,6 +1743,15 @@ fn run_board_action(
             text.as_deref(),
         ),
         BoardAction::Next { limit, area } => {
+            if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
+                let mut stories = active_program_projection(root)?;
+                stories.retain(|story| {
+                    area.as_deref()
+                        .is_none_or(|area| story.areas.iter().any(|value| value == area))
+                });
+                stories.truncate(*limit);
+                return item_result_preserving_order(stories);
+            }
             let all = read_board_items(command, root)?;
             let states = all
                 .iter()
@@ -1789,7 +1848,7 @@ fn run_board_action(
             append_story_section(command, root, id, "Evidence", evidence)
         }
         BoardAction::Check => {
-            if command.scope == BoardScopeArg::Workspace && command.board.is_none() {
+            if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
                 check_workspace_board(root)
             } else {
                 check_board(root)
@@ -1836,7 +1895,7 @@ fn run_board_action(
         BoardAction::Export { out } => {
             let data = json!({
                 "schema": "flux.board-export/v1", "board": board_id,
-                "scope": command.scope, "profile": command.profile,
+                "scope": command.scope(), "profile": command.profile,
                 "items": export_items(command, root)?, "documents": export_documents(root)?
             });
             let body = serde_json::to_string_pretty(&data)?;
@@ -1961,28 +2020,34 @@ fn run_fleet_action(
             max_rework,
         } => {
             validate_fleet_limits(*max_workers, *max_wave, *max_rework)?;
-            state.max_workers = *max_workers;
-            state.max_wave = *max_wave;
-            state.max_rework = *max_rework;
             state.revision += 1;
             if !command.dry_run {
                 let system = guarded_system(root)?;
                 if system.read_optional_text(".flux/fleet.toml")?.is_none() {
                     system.write_file_atomic(".flux/fleet.toml", &format!("schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\nmax_rework = {max_rework}\ndecision_mode = \"human\" # or \"auto\" for an independent adversarial decision agent\nallow_ad_hoc_agents = true\nworktree_root = \".flux/fleet/worktrees\"\n\n# [main]\n# instructions = \".flux/fleet/main.md\"\n# model = \"codex/gpt-5.6-sol\"\n\n# [[agent_templates]]\n# id = \"story-worker\"\n# role = \"writer\"\n# instructions = \".flux/fleet/agents/story-worker.md\"\n# mode = \"write\"\n# capabilities = [\"read\", \"edit\", \"git\", \"shell\"]\n# fences = [\".git/**\", \".flux/fleet/**\"]\n# max_instances = {max_workers}\n\n# [[repositories]]\n# id = \"repo\"\n# root = \".\"\n# board = \"default\"\n# canonical_ref = \"origin/main\"\n# gate = [\"cargo\", \"test\", \"--workspace\"]\n"))?;
                 }
+                let config = read_fleet_config(root)?;
                 write_fleet_state(root, &state)?;
                 append_fleet_event(
                     root,
                     "fleet.initialized",
-                    json!({"max_workers": max_workers, "max_wave": max_wave, "max_rework": max_rework}),
+                    json!({"max_workers": config.max_workers, "max_wave": config.max_wave, "max_rework": config.max_rework}),
                 )?;
             }
-            Ok((
-                "fleet initialized".into(),
-                serde_json::to_value(&state)?,
-                vec![],
-                state.revision,
-            ))
+            let (configured_workers, configured_wave, configured_rework) =
+                if root.join(".flux/fleet.toml").is_file() {
+                    let config = read_fleet_config(root)?;
+                    (config.max_workers, config.max_wave, config.max_rework)
+                } else {
+                    (*max_workers, *max_wave, *max_rework)
+                };
+            let mut data = serde_json::to_value(&state)?;
+            data["config"] = json!({
+                "max_workers": configured_workers,
+                "max_wave": configured_wave,
+                "max_rework": configured_rework
+            });
+            Ok(("fleet initialized".into(), data, vec![], state.revision))
         }
         FleetAction::Doctor | FleetAction::Validate => {
             let config = root.join(".flux/fleet.toml");
@@ -1990,11 +2055,13 @@ fn run_fleet_action(
             if !config.exists() {
                 errors.push("missing .flux/fleet.toml".to_string());
             }
-            validate_fleet_limits(state.max_workers, state.max_wave, state.max_rework)?;
-            if config.exists() {
-                read_fleet_config(root)?;
-            }
-            let data = json!({"valid": errors.is_empty(), "errors": errors, "state": state});
+            let limits = if config.exists() {
+                let config = read_fleet_config(root)?;
+                json!({"max_workers":config.max_workers,"max_wave":config.max_wave,"max_rework":config.max_rework})
+            } else {
+                Value::Null
+            };
+            let data = json!({"valid": errors.is_empty(), "errors": errors, "config":limits, "state": state});
             if !data["valid"].as_bool().unwrap_or(false) {
                 bail!("validation/gate: missing .flux/fleet.toml (run `flux fleet init`)");
             }
@@ -2248,15 +2315,16 @@ fn run_fleet_action(
             if !state.running {
                 bail!("conflict/precondition: fleet supervisor is stopped; run `flux fleet start`");
             }
-            if items.len() > state.max_wave {
+            let config = read_fleet_config(root)?;
+            if items.len() > config.max_wave {
                 bail!(
                     "validation/gate: wave has {} items, maximum is {}",
                     items.len(),
-                    state.max_wave
+                    config.max_wave
                 );
             }
             let selected = if items.is_empty() {
-                select_ready_items(root, state.max_wave)?
+                select_ready_items(root, config.max_wave)?
             } else {
                 validate_board_refs(items)?;
                 items.clone()
@@ -2264,7 +2332,6 @@ fn run_fleet_action(
             if selected.is_empty() {
                 bail!("not-found: no dependency-satisfied ready items");
             }
-            let config = read_fleet_config(root)?;
             let template = config
                 .agent_templates
                 .iter()
@@ -2405,13 +2472,13 @@ fn run_fleet_action(
                     root,
                     &state,
                     "wave.agent-turns.delivered",
-                    json!({"wave":wave,"agents":specs.iter().map(|spec|spec.id.as_str()).collect::<Vec<_>>(),"max_workers":state.max_workers}),
+                    json!({"wave":wave,"agents":specs.iter().map(|spec|spec.id.as_str()).collect::<Vec<_>>(),"max_workers":config.max_workers}),
                 )?;
 
                 let runtime = tokio::runtime::Handle::current();
                 let goals = scoped_goals(&state);
                 let mut outcomes = Vec::new();
-                for batch in specs.chunks(state.max_workers) {
+                for batch in specs.chunks(config.max_workers) {
                     let batch_outcomes = std::thread::scope(|scope| {
                         let handles = batch
                             .iter()
@@ -3149,11 +3216,11 @@ fn family_schema(family: &str, operations: &[&str]) -> Value {
 }
 
 fn board_skill() -> String {
-    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it plans against company/project/repository goals and the board. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. Keep one writer/worktree per story, at most ten stories per wave, two same-session rework rounds, and one final gate. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -3476,6 +3543,12 @@ fn sort_ready(stories: &mut [Story]) {
 
 fn item_result(mut stories: Vec<Story>) -> Result<(String, Value, Vec<String>, Option<String>)> {
     stories.sort_by(|a, b| natural_cmp(&a.id, &b.id));
+    item_result_preserving_order(stories)
+}
+
+fn item_result_preserving_order(
+    stories: Vec<Story>,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
     let human = stories
         .iter()
         .map(|s| format!("{}\t{}\t{}", s.id, s.status, s.title))
@@ -3485,7 +3558,7 @@ fn item_result(mut stories: Vec<Story>) -> Result<(String, Value, Vec<String>, O
 }
 
 fn read_board_items(command: &BoardCommand, root: &Path) -> Result<Vec<Story>> {
-    if command.scope == BoardScopeArg::Workspace && command.board.is_none() {
+    if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
         workspace_stories(root)
     } else {
         read_stories(root)
@@ -3880,14 +3953,14 @@ fn stats(command: &BoardCommand, root: &Path, history: bool, since: Option<&str>
                 .all(|s| s.status == "done")
         })
         .count();
-    let workspace = command.scope == BoardScopeArg::Workspace && command.board.is_none();
-    let documents = document_counts(root);
+    let workspace = command.scope() == BoardScopeArg::Workspace && command.board.is_none();
+    let documents = document_counts(command, root);
     let (commits, members) = if workspace {
-        let config = read_fleet_config(root)?;
+        let config = read_board_workspace_config(root)?;
         let mut members = BTreeMap::new();
         let mut total = 0usize;
-        for repository in &config.repositories {
-            let member_root = repository_root(root, repository)?;
+        for member in &config.members {
+            let member_root = board_member_root(root, member)?;
             let member_stories = read_stories(&member_root)?;
             let done = member_stories
                 .iter()
@@ -3896,7 +3969,7 @@ fn stats(command: &BoardCommand, root: &Path, history: bool, since: Option<&str>
             let member_commits = canonical_commits(&member_root);
             total += member_commits["total"].as_u64().unwrap_or(0) as usize;
             members.insert(
-                repository.id.clone(),
+                member.id.clone(),
                 json!({"stories": ratio(done, member_stories.len()), "canonical_commits": member_commits}),
             );
         }
@@ -3922,19 +3995,53 @@ fn stats(command: &BoardCommand, root: &Path, history: bool, since: Option<&str>
     } else {
         absent_ratio()
     };
-    let (program_stories, tranche_lanes, waves, program_groups) = if workspace {
-        let config = read_fleet_config(root)?;
+    let (program_stories, milestone_lanes, waves) = if workspace {
+        let config = read_board_workspace_config(root)?;
+        let states = stories
+            .iter()
+            .map(|story| (story.id.clone(), story.status.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let active_lanes = config
+            .program
+            .iter()
+            .filter(|lane| lane.milestone == config.active_milestone)
+            .collect::<Vec<_>>();
         (
-            ratio(stories_done, stories.len()),
             ratio(
-                config.tranches.iter().filter(|group| !group.active).count(),
-                config.tranches.len(),
+                config
+                    .program
+                    .iter()
+                    .filter(|lane| {
+                        states.get(lane.item.as_str()).map(String::as_str) == Some("done")
+                    })
+                    .count(),
+                config.program.len(),
             ),
-            ratio(0, config.waves.len()),
-            ratio(0, config.groups.len()),
+            ratio(
+                active_lanes
+                    .iter()
+                    .filter(|lane| {
+                        states.get(lane.item.as_str()).map(String::as_str) == Some("done")
+                    })
+                    .count(),
+                active_lanes.len(),
+            ),
+            ratio(
+                config
+                    .waves
+                    .iter()
+                    .filter(|wave| {
+                        !wave.items.is_empty()
+                            && wave.items.iter().all(|item| {
+                                states.get(item.as_str()).map(String::as_str) == Some("done")
+                            })
+                    })
+                    .count(),
+                config.waves.len(),
+            ),
         )
     } else {
-        (Value::Null, Value::Null, Value::Null, Value::Null)
+        (Value::Null, Value::Null, Value::Null)
     };
     Ok(json!({
         "schema": "flux.board-stats/v1", "epics": ratio(epic_done, epics.len()),
@@ -3942,8 +4049,8 @@ fn stats(command: &BoardCommand, root: &Path, history: bool, since: Option<&str>
         "criteria": ratio(criteria_done, criteria_total), "acceptance_criteria": ratio(criteria_done, criteria_total),
         "implementation": ratio(stories_done, stories.len()), "status": status,
         "documents": documents, "canonical_commits": commits, "history": history_value,
-        "program_stories": program_stories, "tranche_lanes": tranche_lanes,
-        "waves": waves, "program_groups": program_groups, "members": members
+        "program_stories": program_stories, "milestone_lanes": milestone_lanes,
+        "waves": waves, "members": members
     }))
 }
 
@@ -3972,7 +4079,7 @@ fn checkbox_counts(text: &str, heading: &str) -> (usize, usize, usize) {
     (done, total - done, total)
 }
 
-fn document_counts(root: &Path) -> Value {
+fn document_counts(command: &BoardCommand, root: &Path) -> Value {
     let count_md = |path: PathBuf| {
         fs::read_dir(path)
             .ok()
@@ -3982,21 +4089,49 @@ fn document_counts(root: &Path) -> Value {
             .filter(|e| e.path().extension().and_then(|v| v.to_str()) == Some("md"))
             .count()
     };
+    let workspace_config = (command.scope() == BoardScopeArg::Workspace && command.board.is_none())
+        .then(|| read_board_workspace_config(root).ok())
+        .flatten();
     let mut decision_status = BTreeMap::<String, usize>::new();
-    for dir in [root.join("docs/decisions"), root.join("decisions")] {
+    let decision_dirs = workspace_config
+        .as_ref()
+        .and_then(|config| config.decisions.as_ref())
+        .map_or_else(
+            || vec![root.join("docs/decisions"), root.join("decisions")],
+            |path| vec![root.join(path)],
+        );
+    for dir in decision_dirs {
         for decision in decision_records(&dir).unwrap_or_default() {
             let status = decision["status"].as_str().unwrap_or("open").to_string();
             *decision_status.entry(status).or_default() += 1;
         }
     }
     let decisions = decision_status.values().sum::<usize>();
-    let designs = count_md(root.join("docs/designs"));
-    let linked_designs = read_stories(root)
-        .unwrap_or_default()
-        .iter()
-        .filter(|story| story.design.is_some())
-        .count();
-    json!({"vision": {"present": singleton_path(root, "vision").is_file() || root.join("VISION.md").is_file()}, "roadmap": {"present": singleton_path(root, "roadmap").is_file() || root.join("ROADMAP.md").is_file()}, "decisions": {"total": decisions, "open": decision_status.get("open").copied().unwrap_or(0), "decided": decision_status.get("decided").copied().unwrap_or(0), "by_status": decision_status}, "designs": {"total": designs, "linked_stories": linked_designs}})
+    let designs = count_md(
+        workspace_config
+            .as_ref()
+            .and_then(|config| config.designs.as_ref())
+            .map_or_else(|| root.join("docs/designs"), |path| root.join(path)),
+    );
+    let linked_designs = if workspace_config.is_some() {
+        workspace_stories(root).unwrap_or_default()
+    } else {
+        read_stories(root).unwrap_or_default()
+    }
+    .iter()
+    .filter(|story| story.design.is_some())
+    .count();
+    let configured_doc = |configured: Option<&Path>, fallback: &str| {
+        configured
+            .map(|path| root.join(path).is_file())
+            .unwrap_or_else(|| {
+                singleton_path(root, fallback).is_file()
+                    || root
+                        .join(format!("{}.md", fallback.to_ascii_uppercase()))
+                        .is_file()
+            })
+    };
+    json!({"vision": {"present": configured_doc(workspace_config.as_ref().and_then(|config| config.vision.as_deref()), "vision")}, "roadmap": {"present": configured_doc(workspace_config.as_ref().and_then(|config| config.roadmap.as_deref()), "roadmap")}, "decisions": {"total": decisions, "open": decision_status.get("open").copied().unwrap_or(0), "decided": decision_status.get("decided").copied().unwrap_or(0), "by_status": decision_status}, "designs": {"total": designs, "linked_stories": linked_designs}})
 }
 
 fn singleton_path(root: &Path, name: &str) -> PathBuf {
@@ -4160,15 +4295,17 @@ fn board_revision(root: &Path) -> Result<String> {
 }
 
 fn scoped_board_revision(command: &BoardCommand, root: &Path) -> Result<String> {
-    if command.scope != BoardScopeArg::Workspace {
+    if command.scope() != BoardScopeArg::Workspace {
         return board_revision(root);
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     board_revision(root)?.hash(&mut hasher);
-    let config = read_fleet_config(root)?;
-    for repository in &config.repositories {
-        repository.id.hash(&mut hasher);
-        board_revision(&repository_root(root, repository)?)?.hash(&mut hasher);
+    fs::read_to_string(root.join(".flux/board.toml"))?.hash(&mut hasher);
+    let config = read_board_workspace_config(root)?;
+    for member in &config.members {
+        member.id.hash(&mut hasher);
+        member.canonical_ref.hash(&mut hasher);
+        board_revision(&board_member_root(root, member)?)?.hash(&mut hasher);
     }
     Ok(format!("{:016x}", hasher.finish()))
 }
@@ -4660,19 +4797,19 @@ fn check_workspace_board(root: &Path) -> Result<(String, Value, Vec<String>, Opt
         .iter()
         .map(|story| story.id.clone())
         .collect::<BTreeSet<_>>();
-    let config = read_fleet_config(root)?;
+    let config = read_board_workspace_config(root)?;
     let mut members = BTreeMap::new();
     let mut warnings = Vec::new();
-    for repository in &config.repositories {
-        let member_root = repository_root(root, repository)?;
+    for member in &config.members {
+        let member_root = board_member_root(root, member)?;
         let (_, data, member_warnings, _) =
             check_board_with_known_dependencies(&member_root, Some(&known_dependencies))?;
         warnings.extend(
             member_warnings
                 .into_iter()
-                .map(|warning| format!("{}: {warning}", repository.id)),
+                .map(|warning| format!("{}: {warning}", member.id)),
         );
-        members.insert(repository.id.clone(), data);
+        members.insert(member.id.clone(), data);
     }
     Ok((
         format!(
@@ -4741,9 +4878,24 @@ fn singleton_doc(
     name: &str,
     action: &SingletonDocAction,
 ) -> Result<(String, Value, Vec<String>, Option<String>)> {
-    let path = root
-        .join("docs")
-        .join(format!("{}.md", name.to_ascii_uppercase()));
+    let path = if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
+        let config = read_board_workspace_config(root)?;
+        let configured = match name {
+            "vision" => config.vision,
+            "roadmap" => config.roadmap,
+            _ => None,
+        };
+        configured.map_or_else(
+            || {
+                root.join("docs")
+                    .join(format!("{}.md", name.to_ascii_uppercase()))
+            },
+            |path| root.join(path),
+        )
+    } else {
+        root.join("docs")
+            .join(format!("{}.md", name.to_ascii_uppercase()))
+    };
     match action {
         SingletonDocAction::Show => {
             let content = fs::read_to_string(&path)
@@ -4783,7 +4935,14 @@ fn decision_doc(
     root: &Path,
     action: &DecisionAction,
 ) -> Result<(String, Value, Vec<String>, Option<String>)> {
-    let dir = if root.join("decisions").is_dir() {
+    let configured = if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
+        read_board_workspace_config(root)?.decisions
+    } else {
+        None
+    };
+    let dir = if let Some(configured) = configured {
+        root.join(configured)
+    } else if root.join("decisions").is_dir() {
         root.join("decisions")
     } else {
         root.join("docs/decisions")
@@ -4841,7 +5000,13 @@ fn design_doc(
     root: &Path,
     action: &DesignAction,
 ) -> Result<(String, Value, Vec<String>, Option<String>)> {
-    let dir = root.join("docs/designs");
+    let dir = if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
+        read_board_workspace_config(root)?
+            .designs
+            .map_or_else(|| root.join("docs/designs"), |path| root.join(path))
+    } else {
+        root.join("docs/designs")
+    };
     match action {
         DesignAction::List => list_documents(&dir, "design"),
         DesignAction::Show { id } => show_document(&dir, id, "design"),
@@ -4941,10 +5106,16 @@ fn decision_records(dir: &Path) -> Result<Vec<Value>> {
         let options = parse_list(frontmatter.get("options"));
         let recommended = frontmatter.get("recommended");
         let suggestions = decision_suggestions(&body, &options, recommended.map(String::as_str));
+        let status = frontmatter
+            .get("status")
+            .map(String::as_str)
+            .or_else(|| markdown_metadata_value(&body, "Status"))
+            .map(normalize_decision_status)
+            .unwrap_or("unknown");
         decisions.push(json!({
             "id": id,
             "title": title,
-            "status": frontmatter.get("status").map(String::as_str).unwrap_or("open"),
+            "status": status,
             "outcome": frontmatter.get("outcome"),
             "rationale": frontmatter.get("rationale"),
             "superseded_by": frontmatter.get("superseded_by"),
@@ -4963,6 +5134,26 @@ fn decision_records(dir: &Path) -> Result<Vec<Value>> {
         )
     });
     Ok(decisions)
+}
+
+fn markdown_metadata_value<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("**{name}:**");
+    body.lines().find_map(|line| {
+        let line = line.trim();
+        let value = line.strip_prefix(&marker)?.trim();
+        value
+            .split(|character: char| character.is_whitespace() || character == '·')
+            .find(|part| !part.is_empty())
+    })
+}
+
+fn normalize_decision_status(status: &str) -> &str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "accepted" | "decided" | "closed" => "decided",
+        "open" | "proposed" => "open",
+        "superseded" => "superseded",
+        _ => "unknown",
+    }
 }
 
 fn decision_suggestions(body: &str, options: &[String], recommended: Option<&str>) -> Vec<Value> {
@@ -5388,7 +5579,7 @@ fn import_board(
     root: &Path,
     value: &Value,
 ) -> Result<(String, Value, Vec<String>, Option<String>)> {
-    if command.scope != BoardScopeArg::Repository {
+    if command.scope() != BoardScopeArg::Repository {
         bail!("input/schema: board import currently requires repository scope")
     }
     let document = closed_object(
@@ -5643,7 +5834,7 @@ fn board_call(
                 "--root".to_string(),
                 display_path(root),
                 "--scope".to_string(),
-                match command.scope {
+                match command.scope() {
                     BoardScopeArg::Session => "session",
                     BoardScopeArg::Repository => "repository",
                     BoardScopeArg::Workspace => "workspace",
@@ -5812,6 +6003,136 @@ fn validate_fleet_state(state: &FleetState) -> Result<()> {
     Ok(())
 }
 
+fn default_board_scope(root: &Path) -> Result<BoardScopeArg> {
+    if !root.join(".flux/board.toml").is_file() {
+        return Ok(BoardScopeArg::Repository);
+    }
+    let config = read_board_workspace_config(root)?;
+    Ok(if config.is_default {
+        BoardScopeArg::Workspace
+    } else {
+        BoardScopeArg::Repository
+    })
+}
+
+fn read_board_workspace_config(root: &Path) -> Result<BoardWorkspaceConfig> {
+    let path = root.join(".flux/board.toml");
+    let text = guarded_system(root)?
+        .read_optional_text(".flux/board.toml")?
+        .with_context(|| {
+            format!(
+                "not-found: Board workspace configuration {}",
+                path.display()
+            )
+        })?;
+    let config: BoardWorkspaceConfig = toml::from_str(&text)
+        .with_context(|| format!("input/schema: invalid {}", path.display()))?;
+    if config.schema != "flux.board-workspace/v1" {
+        bail!(
+            "input/schema: Board workspace schema must be `flux.board-workspace/v1`, got {:?}",
+            config.schema
+        )
+    }
+    flux_datasource::board::BoardId::new(&config.id)
+        .map_err(|error| anyhow::anyhow!("input/schema: workspace Board {error}"))?;
+    if config.active_milestone.trim().is_empty() {
+        bail!("input/schema: active_milestone cannot be empty")
+    }
+    for (path, label, directory) in [
+        (config.vision.as_ref(), "vision", false),
+        (config.roadmap.as_ref(), "roadmap", false),
+        (config.decisions.as_ref(), "decisions", true),
+        (config.designs.as_ref(), "designs", true),
+    ] {
+        if let Some(path) = path {
+            confined_board_document(root, path, label, directory)?;
+        }
+    }
+    let mut ids = BTreeSet::new();
+    let mut roots: Vec<(String, PathBuf)> = Vec::new();
+    for member in &config.members {
+        flux_datasource::board::BoardId::new(&member.id)
+            .map_err(|error| anyhow::anyhow!("input/schema: workspace member {error}"))?;
+        flux_datasource::board::BoardId::new(&member.board)
+            .map_err(|error| anyhow::anyhow!("input/schema: member board {error}"))?;
+        if !ids.insert(member.id.clone()) {
+            bail!(
+                "conflict/precondition: duplicate workspace member id {:?}",
+                member.id
+            )
+        }
+        if member.canonical_ref.trim().is_empty() {
+            bail!(
+                "input/schema: workspace member {} has an empty canonical_ref",
+                member.id
+            )
+        }
+        let canonical = board_member_root(root, member)?;
+        for (other_id, other) in &roots {
+            if canonical.starts_with(other) || other.starts_with(&canonical) {
+                bail!(
+                    "conflict/precondition: workspace member roots overlap: {} and {}",
+                    other_id,
+                    member.id
+                )
+            }
+        }
+        roots.push((member.id.clone(), canonical));
+    }
+    if config.members.is_empty() {
+        bail!("validation/gate: workspace Board must declare at least one member")
+    }
+    Ok(config)
+}
+
+fn confined_board_document(
+    root: &Path,
+    path: &Path,
+    label: &str,
+    directory: bool,
+) -> Result<PathBuf> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("permission: workspace Board {label} path must stay under its root")
+    }
+    let candidate = root.join(path);
+    let canonical = candidate.canonicalize().with_context(|| {
+        format!(
+            "not-found: workspace Board {label} at {}",
+            candidate.display()
+        )
+    })?;
+    if !canonical.starts_with(root)
+        || (directory && !canonical.is_dir())
+        || (!directory && !canonical.is_file())
+    {
+        bail!(
+            "permission: workspace Board {label} must be a {} confined under {}",
+            if directory { "directory" } else { "file" },
+            root.display()
+        )
+    }
+    Ok(canonical)
+}
+
+fn board_member_root(workspace: &Path, member: &WorkspaceMember) -> Result<PathBuf> {
+    let path = if member.root.is_absolute() {
+        member.root.clone()
+    } else {
+        workspace.join(&member.root)
+    };
+    path.canonicalize().with_context(|| {
+        format!(
+            "not-found: workspace member {} root {}",
+            member.id,
+            path.display()
+        )
+    })
+}
+
 fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
     let path = root.join(".flux/fleet.toml");
     let text = guarded_system(root)?
@@ -5918,9 +6239,6 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
             )
         })?;
     }
-    validate_schedule_groups(&config.tranches, "tranche", usize::MAX)?;
-    validate_schedule_groups(&config.waves, "wave", 10)?;
-    validate_schedule_groups(&config.groups, "group", usize::MAX)?;
     Ok(config)
 }
 
@@ -5942,27 +6260,6 @@ fn confined_config_file(root: &Path, path: &Path, label: &str) -> Result<PathBuf
     Ok(canonical)
 }
 
-fn validate_schedule_groups(groups: &[ScheduleGroup], kind: &str, cap: usize) -> Result<()> {
-    let mut ids = BTreeSet::new();
-    for group in groups {
-        if !ids.insert(&group.id) {
-            bail!("conflict/precondition: duplicate {kind} id {:?}", group.id)
-        }
-        if group.items.len() > cap {
-            bail!(
-                "validation/gate: {kind} {} has {} items, maximum is {cap}",
-                group.id,
-                group.items.len()
-            )
-        }
-    }
-    let active = groups.iter().filter(|group| group.active).count();
-    if kind == "tranche" && active > 1 {
-        bail!("validation/gate: exactly zero or one tranche may be active, found {active}")
-    }
-    Ok(())
-}
-
 fn repository_root(workspace: &Path, repository: &FleetRepository) -> Result<PathBuf> {
     let path = if repository.root.is_absolute() {
         repository.root.clone()
@@ -5978,21 +6275,40 @@ fn repository_root(workspace: &Path, repository: &FleetRepository) -> Result<Pat
     })
 }
 
-fn member_root(workspace: &Path, member: &str) -> Result<PathBuf> {
-    let config = read_fleet_config(workspace)?;
-    let repositories = config
+fn fleet_local_namespace(root: &Path, config: Option<&FleetConfig>) -> String {
+    let Some(config) = config else {
+        return "default".into();
+    };
+    let matches = config
         .repositories
         .iter()
-        .filter(|repository| repository.id == member || repository.board == member)
+        .filter(|repository| {
+            repository_root(root, repository)
+                .ok()
+                .is_some_and(|candidate| candidate == root)
+        })
         .collect::<Vec<_>>();
-    match repositories.as_slice() {
-        [repository] => repository_root(workspace, repository),
+    match matches.as_slice() {
+        [repository] => repository.id.clone(),
+        _ => "default".into(),
+    }
+}
+
+fn member_root(workspace: &Path, member: &str) -> Result<PathBuf> {
+    let config = read_board_workspace_config(workspace)?;
+    let members = config
+        .members
+        .iter()
+        .filter(|candidate| candidate.id == member || candidate.board == member)
+        .collect::<Vec<_>>();
+    match members.as_slice() {
+        [member] => board_member_root(workspace, member),
         [] => bail!("not-found: workspace board member {member}"),
         candidates => bail!(
             "conflict/precondition: workspace board selector {member:?} is ambiguous; candidates: {}",
             candidates
                 .iter()
-                .map(|repository| repository.id.as_str())
+                .map(|member| member.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -6000,15 +6316,15 @@ fn member_root(workspace: &Path, member: &str) -> Result<PathBuf> {
 }
 
 fn workspace_stories(workspace: &Path) -> Result<Vec<Story>> {
-    let config = read_fleet_config(workspace)?;
+    let config = read_board_workspace_config(workspace)?;
     let mut result = Vec::new();
-    for repository in &config.repositories {
-        let root = repository_root(workspace, repository)?;
+    for member in &config.members {
+        let root = board_member_root(workspace, member)?;
         if !root.join("docs/stories").is_dir() {
             bail!(
-                "not-found: repository {} board {} has no docs/stories directory under {}",
-                repository.id,
-                repository.board,
+                "not-found: workspace member {} board {} has no docs/stories directory under {}",
+                member.id,
+                member.board,
                 root.display()
             )
         }
@@ -6020,17 +6336,18 @@ fn workspace_stories(workspace: &Path) -> Result<Vec<Story>> {
                     if dependency.contains('/') {
                         dependency
                     } else {
-                        format!("{}/{}", repository.id, dependency)
+                        format!("{}/{}", member.id, dependency)
                     }
                 })
                 .collect();
-            story.id = format!("{}/{}", repository.id, story.id);
-            story.file = format!("{}/docs/stories/{}", repository.id, story.file);
+            story.id = format!("{}/{}", member.id, story.id);
+            story.file = format!("{}/docs/stories/{}", member.id, story.file);
             result.push(story);
         }
     }
     result.sort_by(|a, b| a.id.cmp(&b.id));
     validate_workspace_dependencies(&result)?;
+    validate_board_program(&config, &result)?;
     Ok(result)
 }
 
@@ -6085,6 +6402,272 @@ fn validate_workspace_dependencies(stories: &[Story]) -> Result<()> {
         visit(id, &by_id, &mut Vec::new(), &mut visited)?;
     }
     Ok(())
+}
+
+fn split_program_ref<'a>(value: &'a str, members: &BTreeSet<&str>) -> Result<(&'a str, &'a str)> {
+    let Some((member, item)) = value.split_once('/') else {
+        bail!("input/schema: program item {value:?} must be MEMBER/ITEM")
+    };
+    if item.is_empty() || !members.contains(member) {
+        bail!("validation/gate: program item {value:?} names an unknown member or empty item")
+    }
+    Ok((member, item))
+}
+
+fn validate_board_program(config: &BoardWorkspaceConfig, stories: &[Story]) -> Result<()> {
+    let members = config
+        .members
+        .iter()
+        .map(|member| member.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let story_ids = stories
+        .iter()
+        .map(|story| story.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut lane_ids = BTreeSet::new();
+    let mut lane_items = BTreeSet::new();
+    let mut lane_orders = BTreeSet::new();
+    let mut milestone_order = Vec::<&str>::new();
+    let mut lane_by_item = BTreeMap::<&str, &ProgramLane>::new();
+    for lane in &config.program {
+        if lane.id.trim().is_empty() || !lane_ids.insert(lane.id.as_str()) {
+            bail!(
+                "conflict/precondition: duplicate or empty program lane id {:?}",
+                lane.id
+            )
+        }
+        split_program_ref(&lane.item, &members)?;
+        if !story_ids.contains(lane.item.as_str()) {
+            bail!(
+                "validation/gate: program lane {} references missing item {}",
+                lane.id,
+                lane.item
+            )
+        }
+        if !lane_items.insert(lane.item.as_str()) {
+            bail!(
+                "conflict/precondition: program item {} appears more than once",
+                lane.item
+            )
+        }
+        if lane.milestone.trim().is_empty() {
+            bail!(
+                "input/schema: program lane {} has an empty milestone",
+                lane.id
+            )
+        }
+        if !lane_orders.insert((lane.milestone.as_str(), lane.order)) {
+            bail!(
+                "conflict/precondition: duplicate program order {} in milestone {}",
+                lane.order,
+                lane.milestone
+            )
+        }
+        if !milestone_order.contains(&lane.milestone.as_str()) {
+            milestone_order.push(&lane.milestone);
+        }
+        lane_by_item.insert(&lane.item, lane);
+    }
+    if !config.program.is_empty()
+        && !config
+            .program
+            .iter()
+            .any(|lane| lane.milestone == config.active_milestone)
+    {
+        bail!(
+            "validation/gate: active milestone {:?} has no program lanes",
+            config.active_milestone
+        )
+    }
+    let milestone_rank = milestone_order
+        .iter()
+        .enumerate()
+        .map(|(index, milestone)| (*milestone, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut combined = stories.to_vec();
+    let story_index = combined
+        .iter()
+        .enumerate()
+        .map(|(index, story)| (story.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    for lane in &config.program {
+        for dependency in &lane.depends_on {
+            split_program_ref(dependency, &members)?;
+            if !story_ids.contains(dependency.as_str()) {
+                bail!(
+                    "validation/gate: program lane {} depends on missing item {}",
+                    lane.id,
+                    dependency
+                )
+            }
+            if let Some(dependency_lane) = lane_by_item.get(dependency.as_str()) {
+                if milestone_rank[dependency_lane.milestone.as_str()]
+                    > milestone_rank[lane.milestone.as_str()]
+                {
+                    bail!(
+                        "validation/gate: program lane {} in milestone {} depends on later milestone {} item {}",
+                        lane.id,
+                        lane.milestone,
+                        dependency_lane.milestone,
+                        dependency
+                    )
+                }
+            }
+            let story = &mut combined[story_index[&lane.item]];
+            if !story.dependencies.contains(dependency) {
+                story.dependencies.push(dependency.clone());
+            }
+        }
+    }
+    validate_workspace_dependencies(&combined)?;
+
+    let mut wave_ids = BTreeSet::new();
+    let mut wave_items = BTreeSet::new();
+    for wave in &config.waves {
+        if wave.id.trim().is_empty() || !wave_ids.insert(wave.id.as_str()) {
+            bail!(
+                "conflict/precondition: duplicate or empty program wave id {:?}",
+                wave.id
+            )
+        }
+        if !matches!(wave.state.as_str(), "queued" | "active" | "done") {
+            bail!(
+                "input/schema: program wave {} state must be queued, active or done",
+                wave.id
+            )
+        }
+        if !members.contains(wave.repository.as_str()) {
+            bail!(
+                "validation/gate: program wave {} names unknown repository {}",
+                wave.id,
+                wave.repository
+            )
+        }
+        if wave.items.len() > 10 {
+            bail!(
+                "validation/gate: program wave {} has {} items, maximum is 10",
+                wave.id,
+                wave.items.len()
+            )
+        }
+        for item in &wave.items {
+            let (repository, _) = split_program_ref(item, &members)?;
+            if repository != wave.repository {
+                bail!(
+                    "validation/gate: program wave {} mixes repository {} item {}",
+                    wave.id,
+                    repository,
+                    item
+                )
+            }
+            if !lane_items.contains(item.as_str()) {
+                bail!(
+                    "validation/gate: program wave {} contains unscheduled item {}",
+                    wave.id,
+                    item
+                )
+            }
+            if !wave_items.insert(item.as_str()) {
+                bail!("conflict/precondition: program wave item {item} appears more than once")
+            }
+        }
+    }
+    for wave in &config.waves {
+        for dependency in &wave.depends_on {
+            if !wave_ids.contains(dependency.as_str()) {
+                bail!(
+                    "validation/gate: program wave {} depends on missing wave {}",
+                    wave.id,
+                    dependency
+                )
+            }
+        }
+    }
+    fn visit_wave<'a>(
+        id: &'a str,
+        waves: &BTreeMap<&'a str, &'a ProgramWave>,
+        visiting: &mut Vec<&'a str>,
+        visited: &mut BTreeSet<&'a str>,
+    ) -> Result<()> {
+        if let Some(position) = visiting.iter().position(|candidate| *candidate == id) {
+            let mut cycle = visiting[position..].to_vec();
+            cycle.push(id);
+            bail!(
+                "validation/gate: program wave cycle: {}",
+                cycle.join(" -> ")
+            )
+        }
+        if !visited.insert(id) {
+            return Ok(());
+        }
+        visiting.push(id);
+        if let Some(wave) = waves.get(id) {
+            for dependency in &wave.depends_on {
+                visit_wave(dependency, waves, visiting, visited)?;
+            }
+        }
+        visiting.pop();
+        Ok(())
+    }
+    let waves = config
+        .waves
+        .iter()
+        .map(|wave| (wave.id.as_str(), wave))
+        .collect::<BTreeMap<_, _>>();
+    let mut visited = BTreeSet::new();
+    for id in waves.keys().copied() {
+        visit_wave(id, &waves, &mut Vec::new(), &mut visited)?;
+    }
+    Ok(())
+}
+
+fn active_program_projection(root: &Path) -> Result<Vec<Story>> {
+    let config = read_board_workspace_config(root)?;
+    let stories = workspace_stories(root)?;
+    if config.program.is_empty() {
+        let states = stories
+            .iter()
+            .map(|story| (story.id.clone(), story.status.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut ready = stories
+            .into_iter()
+            .filter(|story| {
+                story.status == "ready"
+                    && story.dependencies.iter().all(|dependency| {
+                        states.get(dependency).map(String::as_str) == Some("done")
+                    })
+            })
+            .collect::<Vec<_>>();
+        sort_ready(&mut ready);
+        return Ok(ready);
+    }
+    let by_id = stories
+        .into_iter()
+        .map(|story| (story.id.clone(), story))
+        .collect::<BTreeMap<_, _>>();
+    let states = by_id
+        .iter()
+        .map(|(id, story)| (id.as_str(), story.status.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut lanes = config
+        .program
+        .iter()
+        .filter(|lane| lane.milestone == config.active_milestone)
+        .collect::<Vec<_>>();
+    lanes.sort_by_key(|lane| lane.order);
+    Ok(lanes
+        .into_iter()
+        .filter_map(|lane| {
+            let story = by_id.get(&lane.item)?;
+            let eligible = story.status == "ready"
+                && story
+                    .dependencies
+                    .iter()
+                    .chain(lane.depends_on.iter())
+                    .all(|dependency| states.get(dependency.as_str()).copied() == Some("done"));
+            eligible.then(|| story.clone())
+        })
+        .collect())
 }
 fn write_fleet_state(root: &Path, state: &FleetState) -> Result<()> {
     let desired = serde_json::to_string_pretty(state)?;
@@ -7336,18 +7919,19 @@ fn fleet_inspect(
         }
         InspectView::Story => {
             let target = target_required()?;
-            let stories =
-                if read_fleet_config(root).is_ok_and(|config| !config.repositories.is_empty()) {
-                    workspace_stories(root)?
-                } else {
-                    read_stories(root)?
-                        .into_iter()
-                        .map(|mut story| {
-                            story.id = format!("default/{}", story.id);
-                            story
-                        })
-                        .collect()
-                };
+            let stories = if root.join(".flux/board.toml").is_file() {
+                workspace_stories(root)?
+            } else {
+                let config = read_fleet_config(root).ok();
+                let namespace = fleet_local_namespace(root, config.as_ref());
+                read_stories(root)?
+                    .into_iter()
+                    .map(|mut story| {
+                        story.id = format!("{namespace}/{}", story.id);
+                        story
+                    })
+                    .collect()
+            };
             let story = stories
                 .into_iter()
                 .find(|story| story.id == target)
@@ -7400,6 +7984,7 @@ fn fleet_sources(root: &Path) -> Result<Value> {
     Ok(json!({
         "root": display_path(root),
         "config": true,
+        "limits": {"max_workers": config.max_workers, "max_wave": config.max_wave, "max_rework": config.max_rework},
         "main": {"instructions": config.main.instructions, "model": config.main.model},
         "allow_ad_hoc_agents": config.allow_ad_hoc_agents,
         "worktree_root": config.worktree_root,
@@ -7414,8 +7999,15 @@ fn fleet_sources(root: &Path) -> Result<Value> {
 }
 
 fn open_decisions(root: &Path) -> Result<Value> {
-    fn collect(root: &Path, namespace: &str, out: &mut Vec<Value>) -> Result<()> {
-        let dir = if root.join("decisions").is_dir() {
+    fn collect(
+        root: &Path,
+        configured: Option<&Path>,
+        namespace: &str,
+        out: &mut Vec<Value>,
+    ) -> Result<()> {
+        let dir = if let Some(configured) = configured {
+            root.join(configured)
+        } else if root.join("decisions").is_dir() {
             root.join("decisions")
         } else {
             root.join("docs/decisions")
@@ -7434,17 +8026,24 @@ fn open_decisions(root: &Path) -> Result<Value> {
     }
 
     let mut decisions = Vec::new();
-    collect(root, "workspace", &mut decisions)?;
-    let config_path = root.join(".flux/fleet.toml");
-    if config_path.is_file() {
-        let config = read_fleet_config(root)?;
-        for repository in &config.repositories {
+    if root.join(".flux/board.toml").is_file() {
+        let config = read_board_workspace_config(root)?;
+        collect(
+            root,
+            config.decisions.as_deref(),
+            "workspace",
+            &mut decisions,
+        )?;
+        for member in &config.members {
             collect(
-                &repository_root(root, repository)?,
-                &repository.id,
+                &board_member_root(root, member)?,
+                None,
+                &member.id,
                 &mut decisions,
             )?;
         }
+    } else {
+        collect(root, None, "workspace", &mut decisions)?;
     }
     decisions.sort_by(|a, b| {
         a["ref"]
@@ -7456,77 +8055,132 @@ fn open_decisions(root: &Path) -> Result<Value> {
 }
 
 fn fleet_schedule(root: &Path) -> Result<Value> {
-    let config = read_fleet_config(root).ok();
-    let stories = if config
-        .as_ref()
-        .is_some_and(|value| !value.repositories.is_empty())
-    {
-        workspace_stories(root)?
+    let fleet_config = read_fleet_config(root).ok();
+    let board_config = if root.join(".flux/board.toml").is_file() {
+        Some(read_board_workspace_config(root)?)
     } else {
-        read_stories(root).unwrap_or_default()
+        None
     };
-    let states = stories
-        .iter()
-        .map(|story| (story.id.clone(), story.status.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut ready = stories
-        .into_iter()
-        .filter(|story| {
-            story.status == "ready"
-                && story.dependencies.iter().all(|dependency| {
-                    states
-                        .get(dependency)
-                        .is_some_and(|status| status == "done")
+    let max_wave = fleet_config.as_ref().map_or(10, |value| value.max_wave);
+    let (active_milestone, program_items, program, waves) = if let Some(config) = &board_config {
+        let stories = workspace_stories(root)?;
+        let states = stories
+            .iter()
+            .map(|story| (story.id.clone(), story.status.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let ready_refs = active_program_projection(root)?
+            .into_iter()
+            .map(|story| story.id)
+            .collect::<Vec<_>>();
+        let ready_set = ready_refs
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let program = config
+            .program
+            .iter()
+            .filter(|lane| lane.milestone == config.active_milestone)
+            .map(|lane| {
+                json!({
+                    "id": lane.id,
+                    "item": lane.item,
+                    "order": lane.order,
+                    "depends_on": lane.depends_on,
+                    "outcome": lane.outcome,
+                    "status": states.get(lane.item.as_str()),
+                    "eligible": ready_set.contains(lane.item.as_str())
                 })
-        })
-        .collect::<Vec<_>>();
-    sort_ready(&mut ready);
-    let max_wave = config.as_ref().map_or(10, |value| value.max_wave);
-    let ready_refs = ready
-        .into_iter()
-        .take(max_wave)
-        .map(|story| {
-            if story.id.contains('/') {
-                story.id
-            } else {
-                format!("default/{}", story.id)
-            }
-        })
-        .collect::<Vec<_>>();
-    let waves = if let Some(config) = &config {
-        if config.waves.is_empty() {
-            vec![json!({"id": "ready", "items": ready_refs})]
+            })
+            .collect::<Vec<_>>();
+        let completed_waves = config
+            .waves
+            .iter()
+            .filter(|wave| {
+                wave.state == "done"
+                    || (!wave.items.is_empty()
+                        && wave.items.iter().all(|item| {
+                            states.get(item.as_str()).map(String::as_str) == Some("done")
+                        }))
+            })
+            .map(|wave| wave.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let waves = if config.waves.is_empty() && config.program.is_empty() {
+            vec![json!({"id": "ready", "state": "active", "items": ready_refs})]
         } else {
-            let ready_set = ready_refs.iter().collect::<BTreeSet<_>>();
             config
                 .waves
                 .iter()
                 .map(|wave| {
-                    let eligible = wave
-                        .items
+                    let dependencies_done = wave
+                        .depends_on
                         .iter()
-                        .filter(|item| ready_set.contains(item))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    json!({"id": wave.id, "items": wave.items, "eligible": eligible, "depends_on": wave.depends_on})
+                        .all(|dependency| completed_waves.contains(dependency.as_str()));
+                    let eligible = if dependencies_done && wave.state != "done" {
+                        wave.items
+                            .iter()
+                            .filter(|item| ready_set.contains(item.as_str()))
+                            .take(max_wave)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    json!({
+                        "id": wave.id,
+                        "state": wave.state,
+                        "repository": wave.repository,
+                        "items": wave.items,
+                        "eligible": eligible,
+                        "depends_on": wave.depends_on,
+                        "dependencies_done": dependencies_done
+                    })
                 })
                 .collect()
-        }
+        };
+        (
+            Some(config.active_milestone.clone()),
+            ready_refs,
+            program,
+            waves,
+        )
     } else {
-        vec![json!({"id": "ready", "items": ready_refs})]
-    };
-    let active_tranche = config.as_ref().and_then(|config| {
-        config
-            .tranches
+        let stories = read_stories(root).unwrap_or_default();
+        let states = stories
             .iter()
-            .find(|tranche| tranche.active)
-            .map(|tranche| tranche.id.clone())
-    });
+            .map(|story| (story.id.clone(), story.status.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut ready = stories
+            .into_iter()
+            .filter(|story| {
+                story.status == "ready"
+                    && story.dependencies.iter().all(|dependency| {
+                        states.get(dependency).map(String::as_str) == Some("done")
+                    })
+            })
+            .collect::<Vec<_>>();
+        sort_ready(&mut ready);
+        let ready_refs = ready
+            .into_iter()
+            .take(max_wave)
+            .map(|story| {
+                format!(
+                    "{}/{}",
+                    fleet_local_namespace(root, fleet_config.as_ref()),
+                    story.id
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            None,
+            ready_refs.clone(),
+            Vec::new(),
+            vec![json!({"id": "ready", "state": "active", "items": ready_refs})],
+        )
+    };
     let human_decisions = open_decisions(root)?;
     Ok(json!({
-        "schema": "flux.fleet-schedule/v1", "active_tranche": active_tranche,
-        "waves": waves, "tranches": config.as_ref().map(|value| &value.tranches),
-        "groups": config.as_ref().map(|value| &value.groups), "max_wave": max_wave,
+        "schema": "flux.fleet-schedule/v1", "active_milestone": active_milestone,
+        "program_items": program_items, "program": program, "waves": waves, "max_wave": max_wave,
         "human_decisions": human_decisions,
         "attention_required": !human_decisions.as_array().is_none_or(Vec::is_empty)
     }))
@@ -7571,6 +8225,15 @@ fn validate_board_refs(items: &[String]) -> Result<()> {
     Ok(())
 }
 fn select_ready_items(root: &Path, limit: usize) -> Result<Vec<String>> {
+    if root.join(".flux/board.toml").is_file() {
+        return Ok(active_program_projection(root)?
+            .into_iter()
+            .take(limit)
+            .map(|story| story.id)
+            .collect());
+    }
+    let config = read_fleet_config(root).ok();
+    let namespace = fleet_local_namespace(root, config.as_ref());
     let mut stories = read_stories(root)
         .unwrap_or_default()
         .into_iter()
@@ -7580,7 +8243,7 @@ fn select_ready_items(root: &Path, limit: usize) -> Result<Vec<String>> {
     Ok(stories
         .into_iter()
         .take(limit)
-        .map(|s| format!("default/{}", s.id))
+        .map(|s| format!("{namespace}/{}", s.id))
         .collect())
 }
 fn fleet_worktrees(root: &Path) -> Result<Value> {
@@ -7627,21 +8290,22 @@ fn prepare_wave_worktrees(
             wave_root.display()
         )
     }
-    let authoritative = if config.repositories.is_empty() {
+    let authoritative = if root.join(".flux/board.toml").is_file() {
+        workspace_stories(root)?
+    } else {
+        let namespace = fleet_local_namespace(root, Some(&config));
         read_stories(root)?
             .into_iter()
             .map(|mut story| {
-                story.id = format!("default/{}", story.id);
+                story.id = format!("{namespace}/{}", story.id);
                 story.dependencies = story
                     .dependencies
                     .into_iter()
-                    .map(|dependency| format!("default/{dependency}"))
+                    .map(|dependency| format!("{namespace}/{dependency}"))
                     .collect();
                 story
             })
             .collect::<Vec<_>>()
-    } else {
-        workspace_stories(root)?
     };
     let states = authoritative
         .iter()
@@ -8169,6 +8833,7 @@ fn fleet_rework(
     mut state: FleetState,
     input: ReworkInput<'_>,
 ) -> Result<(String, Value, Vec<String>, u64)> {
+    let max_rework = read_fleet_config(root)?.max_rework;
     if input.reviewer.trim().is_empty() {
         bail!("input/schema: rework reviewer cannot be empty")
     }
@@ -8238,12 +8903,12 @@ fn fleet_rework(
     let attempts = story["rework_attempts"].as_u64().unwrap_or(0) as usize;
     state.revision += 1;
     let delivery_id = format!("rework-{}-{}", state.revision, attempts + 1);
-    let parked = attempts >= state.max_rework;
+    let parked = attempts >= max_rework;
     let mut result = json!({
         "schema":"flux.fleet-rework/v1", "id":delivery_id, "wave":input.wave,
         "board_ref":input.item, "reviewer":input.reviewer,
         "reviewed_commit":input.reviewed_commit, "worker":worker, "session":session,
-        "attempt": if parked {attempts} else {attempts + 1}, "max_attempts":state.max_rework,
+        "attempt": if parked {attempts} else {attempts + 1}, "max_attempts":max_rework,
         "findings":findings, "decision":if parked {"PARK"} else {"REWORK"},
         "ack":if parked {"not-dispatched"} else {"delivered"},
     });
@@ -8331,22 +8996,23 @@ fn fleet_rework(
 }
 
 fn integration_order(root: &Path, selected: &[String]) -> Result<Vec<String>> {
-    let config = read_fleet_config(root)?;
-    let stories = if config.repositories.is_empty() {
+    let stories = if root.join(".flux/board.toml").is_file() {
+        workspace_stories(root)?
+    } else {
+        let config = read_fleet_config(root).ok();
+        let namespace = fleet_local_namespace(root, config.as_ref());
         read_stories(root)?
             .into_iter()
             .map(|mut story| {
                 story.dependencies = story
                     .dependencies
                     .into_iter()
-                    .map(|id| format!("default/{id}"))
+                    .map(|id| format!("{namespace}/{id}"))
                     .collect();
-                story.id = format!("default/{}", story.id);
+                story.id = format!("{namespace}/{}", story.id);
                 story
             })
             .collect::<Vec<_>>()
-    } else {
-        workspace_stories(root)?
     };
     let selected_set = selected.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let by_id = stories

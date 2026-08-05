@@ -95,14 +95,15 @@ names missing items without rewriting authored prose.
 `{done, remaining, total, percent}`. Planning boards report epics, stories, optional tasks,
 acceptance criteria and headline implementation plus the profile-state histogram; documents report
 vision/roadmap presence, decisions by lifecycle and designs. Git-backed boards add canonical commit
-totals. Federated scheduled boards add program stories, tranche lanes, waves and program groups and
+totals. Federated scheduled boards add program stories, active milestone lanes and configured waves and
 return both per-member and aggregate values. `--history --since YYYY-MM-DD` reconstructs daily
 canonical snapshots and reports `scope_added`, `scope_removed` and `completed` deltas. A missing
 dimension is `{schema: "absent", done: null, remaining: null, total: null, percent: null}`. HTML/SVG/
 TSV reports are pure renderings of this JSON, never independent calculations.
 
 Every fleet has exactly one reserved durable `main` coordinator. All user requirements, tasks and
-agent follow-ups enter through its intake; only it maintains the active roadmap/schedule. It plans
+agent follow-ups enter through its intake; it orchestrates execution against the Board-owned active
+roadmap/schedule. It plans
 against revisioned goals scoped to values, company, workspace, project and repository. Worker
 membership is explicit: `main` admits a worker and records parent, role, session, transport,
 capabilities, mode, fences and lease. Merely appearing in configuration or on a transport is not
@@ -142,12 +143,16 @@ bounded acknowledged channel and cannot mutate Board or Fleet state. C-542/C-571
 reserved from Fleet through assignment and agent scopes and settled from typed usage; exhaustion is
 an inspectable resumable terminal rather than an unstructured failed answer.
 
-`.flux/fleet.toml` declares main instructions/model, named reusable agent templates, whether ad-hoc
-agents are allowed, repository ids/paths, canonical refs, planning-board bindings, gates, ledger
-fences, concurrency and schedule groupings. The coordinator may instantiate a template or admit an
+`.flux/board.toml` independently declares workspace members, document roots, the active milestone,
+ordered program lanes and configured waves. `.flux/fleet.toml` declares main instructions/model,
+named reusable agent templates, whether ad-hoc agents are allowed, repository ids/paths, canonical
+refs, planning-board bindings, gates, ledger fences and concurrency. Neither configuration file is
+runtime state; dispatched wave instances live only in the Fleet state/event journal. The
+coordinator may instantiate a template or admit an
 ephemeral agent with temporary instructions/model/mode/capabilities/fences at dispatch time; both
 paths obey the same limits and can never create a second coordinator. A workspace fleet run selects
-the highest-priority dependency-satisfied wave unless the caller supplies explicit `BoardRef`s.
+from the Board's ordered, active-milestone, dependency-satisfied projection unless the caller
+supplies explicit `BoardRef`s.
 The durable wave manifest pins source commits, proposed and observed write sets, worktrees,
 sessions, attempts, evidence, reviews, gates and local candidate branches.
 

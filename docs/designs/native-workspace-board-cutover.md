@@ -81,6 +81,23 @@ optimistic writes notice program/member changes.
 When a program catalogue exists, neither surface falls back to unrelated repository-ready work.
 Wave dependencies and the ten-item/repository-local constraints are validated before scheduling.
 
+## Configuration and runtime state boundary
+
+The three durable surfaces have disjoint authority:
+
+- `.flux/board.toml` is immutable-by-operation planning configuration: members, program lanes,
+  milestones, waves and document roots.
+- `.flux/fleet.toml` is immutable-by-operation execution configuration: worker templates, models,
+  capabilities, gates, fences, concurrency and worktree policy.
+- `.flux/fleet/state.json` and `.flux/fleet/events.ndjson` are mutable runtime state: coordinator and
+  worker lifecycle, dispatched wave instances, receipts, handoffs, reviews and apply progress.
+
+Board/Fleet read operations may join these sources into one response, but no runtime operation
+rewrites either TOML file. Runtime state records stable BoardRefs and the minimum pinned snapshot
+needed to reproduce a dispatch; it does not copy the program catalogue or become a second schedule.
+Likewise, configured waves are templates in Board configuration, while dispatched wave instances
+and their lifecycle belong only to Fleet state.
+
 ## Documents, statistics and history
 
 Workspace document roots are explicit. The legacy roadmap decision form `**Status:** accepted` maps

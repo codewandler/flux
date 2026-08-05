@@ -727,14 +727,11 @@ fn workspace_board_federates_namespaced_items_and_routes_member_writes() {
     .unwrap();
     fs::create_dir_all(workspace.join(".flux")).unwrap();
     fs::write(
-        workspace.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"product-api\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"product-web\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n",
+        workspace.join(".flux/board.toml"),
+        "schema = \"flux.board-workspace/v1\"\nid = \"product\"\ndefault = true\nactive_milestone = \"current\"\n\n[[members]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"product-api\"\ncanonical_ref = \"HEAD\"\n\n[[members]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"product-web\"\ncanonical_ref = \"HEAD\"\n\n[[program]]\nid = \"web-client\"\nitem = \"web/C-1\"\nmilestone = \"current\"\norder = 1\ndepends_on = [\"api/C-1\"]\n",
     )
     .unwrap();
-    let items = flux(
-        &workspace,
-        &["board", "--scope", "workspace", "items", "--output", "json"],
-    );
+    let items = flux(&workspace, &["board", "items", "--output", "json"]);
     assert!(
         items.status.success(),
         "stdout={} stderr={}",
@@ -744,10 +741,7 @@ fn workspace_board_federates_namespaced_items_and_routes_member_writes() {
     let items: serde_json::Value = serde_json::from_slice(&items.stdout).unwrap();
     assert_eq!(items["data"]["items"][0]["id"], "api/C-1");
     assert_eq!(items["data"]["items"][1]["id"], "web/C-1");
-    let next = flux(
-        &workspace,
-        &["board", "--scope", "workspace", "next", "--output", "json"],
-    );
+    let next = flux(&workspace, &["board", "next", "--output", "json"]);
     let next: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
     assert_eq!(next["data"]["items"][0]["id"], "web/C-1");
 
@@ -803,6 +797,106 @@ fn workspace_board_federates_namespaced_items_and_routes_member_writes() {
 }
 
 #[test]
+fn native_workspace_board_owns_program_while_fleet_config_and_state_stay_separate() {
+    let workspace = fixture("native-program");
+    let api = workspace.join("members/api");
+    let web = workspace.join("members/web");
+    fs::create_dir_all(api.join("docs/stories")).unwrap();
+    fs::create_dir_all(web.join("docs/stories")).unwrap();
+    fs::create_dir_all(workspace.join("decisions")).unwrap();
+    fs::create_dir_all(workspace.join(".flux")).unwrap();
+    fs::write(
+        api.join("docs/stories/C-1-api.md"),
+        "---\nid: C-1\ntitle: API\nstatus: ready\npriority: 99\n---\n\n# API\n",
+    )
+    .unwrap();
+    fs::write(
+        api.join("docs/stories/C-2-unscheduled.md"),
+        "---\nid: C-2\ntitle: Unscheduled\nstatus: ready\npriority: 1\n---\n\n# Unscheduled\n",
+    )
+    .unwrap();
+    fs::write(
+        web.join("docs/stories/C-1-web.md"),
+        "---\nid: C-1\ntitle: Web\nstatus: ready\npriority: 1\n---\n\n# Web\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("decisions/0001-accepted.md"),
+        "# Accepted architecture\n\n**Status:** accepted\n",
+    )
+    .unwrap();
+    let board_config = "schema = \"flux.board-workspace/v1\"\nid = \"program\"\ndefault = true\nactive_milestone = \"m1\"\ndecisions = \"decisions\"\n\n[[members]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"api\"\ncanonical_ref = \"HEAD\"\n\n[[members]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"web\"\ncanonical_ref = \"HEAD\"\n\n[[program]]\nid = \"web-first\"\nitem = \"web/C-1\"\nmilestone = \"m1\"\norder = 1\n\n[[program]]\nid = \"api-second\"\nitem = \"api/C-1\"\nmilestone = \"m1\"\norder = 2\n\n[[waves]]\nid = \"web-wave\"\nstate = \"active\"\nrepository = \"web\"\nitems = [\"web/C-1\"]\n\n[[waves]]\nid = \"api-wave\"\nstate = \"active\"\nrepository = \"api\"\nitems = [\"api/C-1\"]\n";
+    let fleet_config = "schema = \"flux.fleet/v1\"\nmax_workers = 2\nmax_wave = 10\nmax_rework = 2\n\n[[repositories]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"api\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"web\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n";
+    fs::write(workspace.join(".flux/board.toml"), board_config).unwrap();
+    fs::write(workspace.join(".flux/fleet.toml"), fleet_config).unwrap();
+
+    let next = flux(
+        &workspace,
+        &["board", "next", "--limit", "10", "--output", "json"],
+    );
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stdout)
+    );
+    let next: serde_json::Value = serde_json::from_slice(&next.stdout).unwrap();
+    assert_eq!(next["data"]["items"][0]["id"], "web/C-1");
+    assert_eq!(next["data"]["items"][1]["id"], "api/C-1");
+    assert_eq!(next["data"]["items"].as_array().unwrap().len(), 2);
+
+    let schedule = flux(&workspace, &["fleet", "schedule", "--output", "json"]);
+    assert!(
+        schedule.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&schedule.stdout),
+        String::from_utf8_lossy(&schedule.stderr)
+    );
+    let schedule: serde_json::Value = serde_json::from_slice(&schedule.stdout).unwrap();
+    assert_eq!(schedule["data"]["active_milestone"], "m1");
+    assert_eq!(
+        schedule["data"]["program_items"].as_array().unwrap().len(),
+        2
+    );
+    assert!(schedule["data"].get("active_tranche").is_none());
+    assert!(schedule["data"].get("tranches").is_none());
+    assert_eq!(schedule["data"]["attention_required"], false);
+
+    let stats = flux(&workspace, &["board", "stats", "--output", "json"]);
+    assert!(
+        stats.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stats.stdout)
+    );
+    let stats: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(stats["data"]["milestone_lanes"]["total"], 2);
+    assert!(stats["data"].get("tranche_lanes").is_none());
+
+    let started = flux(&workspace, &["fleet", "start", "--output", "json"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join(".flux/board.toml")).unwrap(),
+        board_config
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join(".flux/fleet.toml")).unwrap(),
+        fleet_config
+    );
+    assert!(workspace.join(".flux/fleet/state.json").is_file());
+    let runtime_state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(workspace.join(".flux/fleet/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(runtime_state.get("max_workers").is_none());
+    assert!(runtime_state.get("max_wave").is_none());
+    assert!(runtime_state.get("max_rework").is_none());
+    fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
 fn workspace_board_refuses_missing_cycles_absent_members_and_ambiguous_selectors() {
     let workspace = fixture("workspace-refusals");
     let api = workspace.join("members/api");
@@ -812,8 +906,8 @@ fn workspace_board_refuses_missing_cycles_absent_members_and_ambiguous_selectors
     fs::create_dir_all(workspace.join("members/absent")).unwrap();
     fs::create_dir_all(workspace.join(".flux")).unwrap();
     fs::write(
-        workspace.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"shared\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"shared\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n",
+        workspace.join(".flux/board.toml"),
+        "schema = \"flux.board-workspace/v1\"\nid = \"workspace\"\ndefault = true\nactive_milestone = \"current\"\n\n[[members]]\nid = \"api\"\nroot = \"members/api\"\nboard = \"shared\"\ncanonical_ref = \"HEAD\"\n\n[[members]]\nid = \"web\"\nroot = \"members/web\"\nboard = \"shared\"\ncanonical_ref = \"HEAD\"\n\n[[program]]\nid = \"api\"\nitem = \"api/C-1\"\nmilestone = \"current\"\norder = 1\n\n[[program]]\nid = \"web\"\nitem = \"web/C-1\"\nmilestone = \"current\"\norder = 2\n",
     )
     .unwrap();
     fs::write(
@@ -872,8 +966,8 @@ fn workspace_board_refuses_missing_cycles_absent_members_and_ambiguous_selectors
     assert!(String::from_utf8_lossy(&ambiguous.stdout).contains("api, web"));
 
     fs::write(
-        workspace.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"absent\"\nroot = \"members/absent\"\nboard = \"missing\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n",
+        workspace.join(".flux/board.toml"),
+        "schema = \"flux.board-workspace/v1\"\nid = \"workspace\"\ndefault = true\nactive_milestone = \"current\"\n\n[[members]]\nid = \"absent\"\nroot = \"members/absent\"\nboard = \"missing\"\ncanonical_ref = \"HEAD\"\n",
     )
     .unwrap();
     let absent = flux(&workspace, &["fleet", "schedule", "--output", "json"]);
