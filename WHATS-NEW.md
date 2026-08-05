@@ -78,6 +78,12 @@
 
 ### Improved
 
+- **Fleet workers now begin as fresh, assignment-scoped writers.** Each story worker sees its own
+  exact story, pinned branch and worktree plus the configured writer instructions. It no longer
+  inherits the main agent's conversation, workspace-wide goals, another worker's history or an
+  unrelated assignment, and unrelated repository roots are not mounted into its process. Follow-up
+  and rework still continue the same worker when explicitly addressed to it.
+
 - **Releases no longer depend on repository settings that were never configured.** The release
   pipeline uses the existing release credential only in its isolated host-controlled mutation and
   GitHub Release steps. Model and build work still cannot see it, tags are pushed with the separate

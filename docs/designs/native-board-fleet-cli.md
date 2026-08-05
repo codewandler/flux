@@ -105,6 +105,17 @@ membership is explicit: `main` admits a worker and records parent, role, session
 capabilities, mode, fences and lease. Merely appearing in configuration or on a transport is not
 admission.
 
+A story worker's first model turn is assignment-only. It starts in a worker-specific durable store
+without continuation and receives the configured writer contract plus its exact BoardRef, pinned
+base, branch and isolated worktree. The main conversation, intake bodies, Fleet-wide revisioned goal
+set, other workers and other assignments are not copied into that prompt. Only a later message or
+rework addressed to the exact worker may continue its store. Its assigned worktree is the complete
+automatic repository scope; sibling repository roots are not mounted into a story-worker process.
+Turn receipts expose a bounded
+`flux.fleet-context-origin/v1` manifest containing the BoardRef, fresh/continue mode and digests of
+the assignment and worker contract; prompt bodies and conversation content are never part of that
+manifest.
+
 `.flux/fleet.toml` declares main instructions/model, named reusable agent templates, whether ad-hoc
 agents are allowed, repository ids/paths, canonical refs, planning-board bindings, gates, ledger
 fences, concurrency and schedule groupings. The coordinator may instantiate a template or admit an

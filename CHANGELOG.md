@@ -85,6 +85,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Fleet story workers now start with assignment-only context** (C-566). A new writer gets a fresh
+  worker-specific store plus its configured writer contract, exact BoardRef, pinned base, branch and
+  isolated worktree; the main conversation, intake text, Fleet-wide goal set and other assignments
+  are not copied into its prompt, and sibling repository roots are not mounted automatically. Only
+  a turn addressed to that worker can continue its session.
+  Receipts carry a bounded context-origin manifest with assignment/contract digests instead of
+  prompt content.
+
 - **Automatic Flux releases no longer depend on a model provider account** (C-251). The release
   workflow now runs the host-only `examples/release-cut.flux`, consumes the reviewed
   `[Unreleased]` notes already in the repository, and preserves the exact version, protocol,

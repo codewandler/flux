@@ -2098,6 +2098,19 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     assert_eq!(run["data"]["ack"], "completed");
     assert_eq!(run["data"]["receipts"][0]["session"], "s_1");
     assert_eq!(run["data"]["receipts"].as_array().unwrap().len(), 2);
+    let receipts = run["data"]["receipts"].as_array().unwrap();
+    assert_eq!(receipts[0]["context_origin"]["kind"], "story-assignment");
+    assert_eq!(receipts[0]["context_origin"]["board_ref"], "repo/C-1");
+    assert_eq!(receipts[1]["context_origin"]["board_ref"], "repo/C-2");
+    assert_eq!(receipts[0]["context_origin"]["session_mode"], "fresh");
+    assert_eq!(receipts[1]["context_origin"]["session_mode"], "fresh");
+    assert_ne!(receipts[0]["store"], receipts[1]["store"]);
+    for receipt in receipts {
+        let context = serde_json::to_string(&receipt["context_origin"]).unwrap();
+        assert!(!context.contains("Work only in the assigned story worktree"));
+        assert!(!context.contains("flux-mock"));
+        assert!(context.len() < 512, "context origin was {context}");
+    }
     let stories = run["data"]["topology"]["repositories"][0]["stories"]
         .as_array()
         .unwrap();
@@ -2108,6 +2121,36 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
             "created by flux mock\n"
         );
     }
+
+    let first_agent = receipts[0]["agent"].as_str().unwrap();
+    let continued = flux(
+        &root,
+        &[
+            "fleet",
+            "message",
+            first_agent,
+            "Continue only this exact story",
+            "--wait",
+            "completed",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        continued.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&continued.stdout),
+        String::from_utf8_lossy(&continued.stderr)
+    );
+    let continued: serde_json::Value = serde_json::from_slice(&continued.stdout).unwrap();
+    assert_eq!(continued["data"]["receipt"]["agent"], first_agent);
+    assert_eq!(continued["data"]["receipt"]["session"], "s_1");
+    assert_eq!(
+        continued["data"]["receipt"]["context_origin"]["session_mode"],
+        "continue"
+    );
+    assert_eq!(continued["data"]["receipt"]["store"], receipts[0]["store"]);
+    assert_ne!(continued["data"]["receipt"]["store"], receipts[1]["store"]);
 
     let first_worktree = PathBuf::from(stories[0]["worktree"].as_str().unwrap());
     fs::remove_file(first_worktree.join("flux-mock.txt")).unwrap();
