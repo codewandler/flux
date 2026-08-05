@@ -38,6 +38,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- Concurrent `fleet.isolate` calls now serialize Git's shared worktree-administration mutation
+  while retaining disjoint checkout allocation, preventing partially written `.git/worktrees`
+  metadata from breaking a parallel Board/Fleet wave.
 - Release checksum verification accepts cargo-dist sidecars with trailing blank lines while still
   requiring one exact lowercase digest/filename record and at least one newline terminator.
 - Candidate artifact preparation now verifies and reuses the controller's successful exact cut-CI
