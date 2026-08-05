@@ -241,7 +241,8 @@ candidate_staged=1
   || fail "$CANDIDATE_REF does not point at the merged canonical-main SHA $MERGED_SHA"
 
 CANDIDATE_BASELINE=$(latest_run_id release.yml)
-actions_gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$CANDIDATE_BRANCH" -f "version=$VERSION"
+actions_gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$CANDIDATE_BRANCH" \
+  -f "version=$VERSION" -f "gate_run=$CI_RUN"
 # Candidate dispatch is selected with the same exact-ref/SHA/baseline logic as the tag runs.
 for ((attempt=1; attempt<=POLL_ATTEMPTS; attempt++)); do
   runs=$(actions_gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml --event workflow_dispatch \

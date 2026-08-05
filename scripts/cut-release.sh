@@ -222,9 +222,17 @@ echo "   tag=v$NEW"
 echo '   sha=$(git rev-list -n1 "$tag^{}")'
 echo '   candidate="release-candidates/$tag"'
 echo '   repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)'
+echo '   gate_baseline=$(gh run list --workflow ci.yml --limit 100 --json databaseId --jq '\''([.[].databaseId] | max) // 0'\'')'
 echo '   baseline=$(gh run list --workflow release.yml --limit 100 --json databaseId --jq '\''([.[].databaseId] | max) // 0'\'')'
 echo '   git push origin "HEAD:refs/heads/$candidate"'
-echo "   gh workflow run release.yml --ref \"\$candidate\" -f version=$NEW"
+echo '   gh workflow run ci.yml --ref "$candidate"'
+echo '   gate_run='
+echo '   until [ -n "$gate_run" ]; do'
+echo '     gate_run=$(gh run list --workflow ci.yml --event workflow_dispatch --branch "$candidate" --commit "$sha" --limit 20 --json databaseId,event,headBranch,headSha --jq ".[] | select(.databaseId > $gate_baseline and .event == \"workflow_dispatch\" and .headBranch == \"$candidate\" and .headSha == \"$sha\") | .databaseId" | sort -n | head -1)'
+echo '     [ -n "$gate_run" ] || sleep 5'
+echo '   done'
+echo '   gh run watch "$gate_run" --exit-status'
+echo "   gh workflow run release.yml --ref \"\$candidate\" -f version=$NEW -f gate_run=\"\$gate_run\""
 echo '   # Wait for a NEW run with the exact event, ref, and SHA (an older retry is not this dispatch).'
 echo '   run_id='
 echo '   until [ -n "$run_id" ]; do'

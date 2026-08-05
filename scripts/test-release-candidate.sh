@@ -6,6 +6,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 HELPER="$ROOT/scripts/release-candidate.sh"
 FINDER="$ROOT/scripts/find-release-candidate.sh"
 WORKFLOW="$ROOT/.github/workflows/release.yml"
+CI_WORKFLOW="$ROOT/.github/workflows/ci.yml"
 FLOW_WORKFLOW="$ROOT/.github/workflows/release-flow.yml"
 PROMOTER="$ROOT/scripts/promote-release-flow.sh"
 FULL_GATE="$ROOT/scripts/release-full-gate.sh"
@@ -335,17 +336,25 @@ grep -Fq 'COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/
 grep -Fq 'promotes those artifacts without recompiling' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
   || fail "publishing runbook does not document build-once promotion"
 
-grep -Fq 'scripts/build-embedded-docs.sh --check' "$WORKFLOW" \
-  || fail "candidate workflow does not prove embedded docs at the exact checked-out SHA"
-grep -Fq 'scripts/release-full-gate.sh "$GITHUB_SHA"' "$WORKFLOW" \
-  || fail "candidate workflow does not gate its exact checked-out SHA"
-embedded_gate_line=$(grep -nF 'scripts/build-embedded-docs.sh --check' "$WORKFLOW" | cut -d: -f1)
-gate_line=$(grep -nF 'scripts/release-full-gate.sh "$GITHUB_SHA"' "$WORKFLOW" | cut -d: -f1)
+grep -Fq 'scripts/build-embedded-docs.sh --check' "$CI_WORKFLOW" \
+  || fail "exact cut CI does not prove embedded docs"
+grep -Fq 'gate_run:' "$WORKFLOW" \
+  || fail "candidate workflow does not require an exact CI run"
+grep -Fq '.path == ".github/workflows/ci.yml"' "$WORKFLOW" \
+  || fail "candidate workflow does not bind the gate to ci.yml"
+grep -Fq '.head_sha == $sha' "$WORKFLOW" \
+  || fail "candidate workflow does not bind the gate to the exact cut SHA"
+grep -Fq 'gate_branch=$GITHUB_REF_NAME' "$WORKFLOW" \
+  || fail "manual candidates do not bind CI to their exact candidate branch"
+grep -Fq 'gate_branch="release-cuts/v$CANDIDATE_VERSION"' "$WORKFLOW" \
+  || fail "automatic candidates do not bind CI to their exact cut branch"
+grep -Fq '.conclusion == "success"' "$WORKFLOW" \
+  || fail "candidate workflow does not require successful cut CI"
+gate_line=$(grep -nF 'Verify the successful exact cut CI' "$WORKFLOW" | cut -d: -f1)
 receipt_line=$(grep -nF 'scripts/release-candidate.sh write release-candidate.txt' "$WORKFLOW" | cut -d: -f1)
-[ -n "$embedded_gate_line" ] && [ -n "$gate_line" ] && [ -n "$receipt_line" ] \
-  && [ "$embedded_gate_line" -lt "$gate_line" ] && [ "$gate_line" -lt "$receipt_line" ] \
-  || fail "candidate receipt can be written before the mandatory full gate"
+[ -n "$gate_line" ] && [ -n "$receipt_line" ] && [ "$gate_line" -lt "$receipt_line" ] \
+  || fail "candidate receipt can be written before exact cut CI is verified"
 grep -Fq 'FLUX_RELEASE_CANDIDATE_OWNS_GATE' "$FLOW_WORKFLOW" \
-  || fail "automatic flow does not delegate the one full gate to its exact-SHA candidate"
+  || fail "automatic flow does not delegate release-gate ownership"
 
 echo "release-candidate receipt and workflow tests passed"

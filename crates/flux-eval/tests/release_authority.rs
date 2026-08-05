@@ -564,9 +564,9 @@ fn release_yml_accepts_only_the_exact_versioned_candidate_ref() {
     );
 }
 
-/// The unattended cut creates the exact candidate commit, but the candidate workflow owns the one
-/// mandatory full gate for that commit. A receipt may be written only after that gate succeeds;
-/// promotion already verifies the receipt before either public ref moves.
+/// The unattended cut receives one complete exact-SHA CI run. The candidate workflow verifies that
+/// immutable run instead of rebuilding and retesting the workspace, and may write a receipt only
+/// after that verification; promotion verifies the receipt before either public ref moves.
 #[test]
 fn automated_release_gates_the_exact_candidate_once_before_promotion() {
     let flow = workflow_code("release-flow.yml");
@@ -578,7 +578,7 @@ fn automated_release_gates_the_exact_candidate_once_before_promotion() {
 
     assert!(
         flow.contains("FLUX_RELEASE_CANDIDATE_OWNS_GATE"),
-        "the automatic release must explicitly delegate its gate to the exact-SHA candidate"
+        "the automatic release must explicitly delegate release-gate verification"
     );
     assert!(
         cut.contains("--no-gate")
@@ -592,20 +592,20 @@ fn automated_release_gates_the_exact_candidate_once_before_promotion() {
         line.contains("Validate release-candidate request")
     });
     let gate = code_line_index(&release, |line| {
-        line.contains("scripts/release-full-gate.sh")
+        line.contains("Verify the successful exact cut CI")
     });
     let receipt = code_line_index(&release, |line| {
         line.contains("scripts/release-candidate.sh write release-candidate.txt")
     });
     assert!(
         matches!((validate, gate, receipt), (Some(v), Some(g), Some(r)) if v < g && g < r),
-        "release.yml must validate the candidate ref, run the full gate, and only then write its receipt; indexes: validate={validate:?}, gate={gate:?}, receipt={receipt:?}"
+        "release.yml must validate the candidate ref, verify exact cut CI, and only then write its receipt; indexes: validate={validate:?}, gate={gate:?}, receipt={receipt:?}"
     );
     assert!(
         receipt_helper.contains(r#"GATE = "mandatory-full-v1""#)
             && receipt_helper.contains(r#"f"gate={GATE}""#)
             && receipt_helper.contains(r#"f"gate_commit={commit}""#),
-        "the immutable candidate receipt must say which exact SHA earned the mandatory full gate"
+        "the immutable candidate receipt must bind the candidate admitted by the exact cut-CI gate"
     );
     assert!(
         receipt_helper.contains(r#"SCHEMA = "flux-release-candidate-v3""#),
