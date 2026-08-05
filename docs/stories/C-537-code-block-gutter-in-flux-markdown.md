@@ -30,6 +30,15 @@ V-8 from `docs/designs/tui-ux-ui-epic.md`, the one surviving item C-341 did not 
 
 - 2026-08-05 — filed from the tool-output review (folded in as the prior review's unshipped
   survivor).
+- 2026-08-05 — **scope finding**: this is not the one-liner the prior review assumed. The L-02
+  parity suite (`crates/flux-markdown/tests/parity.rs`) asserts *exact per-line parity* against the
+  old `markdown-terminal`/`markdown-ratatui` oracles for the snippet suite (`fenced_code`,
+  `code_no_lang`) **and the whole committed corpus** (`tests/corpus/*.md`, which is full of fenced
+  blocks). A gutter is a deliberate divergence and needs the suite's tier-2 "documented
+  divergence" treatment (see `nested_list_fix_over_oracle`) — snippet cases asserted against
+  correct expected output, and a decision for the corpus tier (screen fenced blocks out, or
+  post-process the oracle's code insets). Do not land the layout change without reworking the
+  parity harness in the same pass.
 
 ## Notes
 

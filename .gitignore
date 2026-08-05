@@ -1,5 +1,7 @@
 /target
 /target-*/
+# C-517: build ownership locks are persistent siblings of the target by design.
+/*.flux-build.lock
 **/*.rs.bk
 # `.flux/` is local scaffolding (session state, seeded self-improvement roles, …) and stays
 # gitignored — EXCEPT a few checked-in artifacts that ship with the repo (they are part of

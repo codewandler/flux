@@ -49,6 +49,11 @@
 
 ### Improved
 
+- **Tool cards now keep hostile terminal bytes inert and make diffs much easier to read.** Escape
+  sequences and control bytes are stripped before live or historical tool output reaches the TUI;
+  patch and Git diff output gets hunk/add/delete styling, long wrapped rows stay inside their card,
+  and the CLI and TUI share one explicit truncation policy without changing `-v` full-output mode.
+
 - **Release downloads now close as one exact, auditable set.** The release controller derives
   migration versions from complete change records and the customer-facing action-needed section,
   merges the deterministic cut through protected `main`, and verifies all 28 expected downloads,

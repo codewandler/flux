@@ -117,10 +117,13 @@ impl UsageFact {
         self.ended_at_ms.or(self.started_at_ms)
     }
 
-    pub fn model(&self) -> &str {
+    pub fn canonical_model(&self) -> &str {
         &self.canonical_model
     }
 
+    // A usage fact deliberately keeps each attribution input explicit at this normalization
+    // boundary; hiding them in an options bag would make omitted provenance easier to invent.
+    #[allow(clippy::too_many_arguments)]
     pub fn priced(
         harness: HarnessKind,
         session_id: impl Into<String>,
@@ -882,7 +885,7 @@ mod tests {
         assert_eq!(comparison.token_percent, Some(100.0));
         assert!(compare_previous(
             &facts,
-            UsageRange::new(20, 30).unwrap(),
+            UsageRange::new(0, 10).unwrap(),
             &UsageFilter::default()
         )
         .token_percent
@@ -942,7 +945,9 @@ mod tests {
     fn usage_timeline_reads_metadata_only() {
         // The public fact type has no text/transcript field; extraction observes only typed usage
         // event variants even when secret sentinels exist in neighbouring turn payloads.
-        let event = NewEvent::new(EventKind::Message(flux_core::Message::user("DO_NOT_LOAD")));
+        let event = NewEvent::new(EventKind::Message(flux_core::Message::user_text(
+            "DO_NOT_LOAD",
+        )));
         assert!(matches!(event.kind, EventKind::Message(_)));
         assert!(std::mem::size_of::<UsageFact>() > 0);
     }

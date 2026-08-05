@@ -194,6 +194,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Tool transcript output is safer and easier to inspect** (C-533, C-534, C-536, C-539). Live,
+  completed, and resumed tool text now consumes escape sequences and drops terminal control bytes
+  before it reaches a TUI cell. Patch inputs and unified-diff-shaped results render as real hunks
+  without misclassifying ordinary dash-prefixed prose, wrapped detail rows retain their card rail
+  and indent, and the TUI and CLI now consume one declared family of truncation budgets while
+  preserving their intentional surface-specific limits and verbose behavior.
+
 - **Repository builds now own their Cargo target while compiler output is live** (C-517).
   `task install` acquires one cross-process shared lease before the resolved target is first touched
   and retains it across workspace library tests plus both supported binary installs. Every

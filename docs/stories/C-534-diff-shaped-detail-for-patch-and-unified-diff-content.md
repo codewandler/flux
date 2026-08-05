@@ -2,7 +2,7 @@
 id: C-534
 title: "Diff-shaped detail: patch from input edits, unified-diff content classifier"
 pillar: Core
-status: in-progress
+status: done
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
 areas: [flux-tui]
@@ -20,19 +20,22 @@ rendering as flat muted text.
 
 ## Acceptance
 
-- [ ] `toolview::format_diff` gains a `patch` arm built from the `edits` input array; failing-first
+- [x] `toolview::format_diff` gains a `patch` arm built from the `edits` input array; failing-first
       unit test in the toolview tests module.
-- [ ] `toolview::format_detail` classifies content that parses as a unified diff into
+- [x] `toolview::format_detail` classifies content that parses as a unified diff into
       `DetailKind::{Meta,Hunk,Add,Del}` rows; failing-first unit test on `git_diff`-shaped content,
       plus one TestBackend frame test asserting a `git_diff` card renders classified rows.
-- [ ] Non-diff content is never misclassified (a plain line starting with `-` in prose context does
+- [x] Non-diff content is never misclassified (a plain line starting with `-` in prose context does
       not flip the card into diff colors — the classifier requires diff structure, not a prefix).
-- [ ] The C-195 no-redaction stance is restated in the extended function docs, unchanged.
-- [ ] `cargo test -p flux-tui` green.
+- [x] The C-195 no-redaction stance is restated in the extended function docs, unchanged.
+- [x] `cargo test -p flux-tui` green.
 
 ## Progress
 
 - 2026-08-05 — filed from the tool-output review; implementation started same session.
+- 2026-08-05 — closed on integrated local `main`: patch inputs produce honest input-anchored hunks,
+  structured unified-diff content is classified without prefix-only false positives, the rendered
+  TestBackend card preserves hunk/add/delete styling, and the complete `flux-tui` suite passes.
 
 ## Notes
 

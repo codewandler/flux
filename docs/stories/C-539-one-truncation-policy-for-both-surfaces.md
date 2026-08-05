@@ -2,7 +2,7 @@
 id: C-539
 title: "One truncation policy module for both surfaces"
 pillar: Core
-status: in-progress
+status: done
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
 areas: [flux-tui, flux-cli]
@@ -19,18 +19,22 @@ the numbers and per-tool semantics are declared side by side and cannot drift si
 
 ## Acceptance
 
-- [ ] A `toolview` policy module declares the per-surface budgets (TUI detail cap; CLI preview
+- [x] A `toolview` policy module declares the per-surface budgets (TUI detail cap; CLI preview
       line/char caps) with the rationale for any intentional difference.
-- [ ] `crates/flux-tui/src/lib.rs` (`MAX_DETAIL`) and `crates/flux-cli/src/rendering.rs`
+- [x] `crates/flux-tui/src/lib.rs` (`MAX_DETAIL`) and `crates/flux-cli/src/rendering.rs`
       (`tool_preview` caps) consume the shared declaration; no local literals remain.
-- [ ] A drift-pinning test on each side fails if a surface stops consuming the shared policy.
-- [ ] `-v`/verbose behavior unchanged on both surfaces.
-- [ ] `cargo test -p flux-tui` and `cargo test -p flux-cli --lib` green.
+- [x] A drift-pinning test on each side fails if a surface stops consuming the shared policy.
+- [x] `-v`/verbose behavior unchanged on both surfaces.
+- [x] `cargo test -p flux-tui` and `cargo test -p flux-cli --bins` green (the CLI package has no
+      library target).
 
 ## Progress
 
 - 2026-08-05 — filed from the tool-output review; implementation started same session (batched with
   C-534, which edits the same module).
+- 2026-08-05 — closed on integrated local `main`: shared constants now own both surfaces' caps and
+  per-tool heads, existing verbose/cap regressions consume those constants, and both package suites
+  pass.
 
 ## Notes
 

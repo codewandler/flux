@@ -201,8 +201,9 @@ fn resolve_theme(name: Option<&str>) -> (String, Theme) {
 /// Streaming cursor block appended to an in-progress assistant message.
 const CURSOR: &str = "▍";
 /// Max expanded-detail lines per tool card. Lifted entirely under verbose (`flux tui -v` /
-/// `FLUX_VERBOSE`), whose promise is tool output in full, no truncation.
-const MAX_DETAIL: usize = 30;
+/// `FLUX_VERBOSE`), whose promise is tool output in full, no truncation. The number lives in
+/// [`toolview::budget`] beside the CLI's caps (C-539) so the surfaces cannot drift silently.
+const MAX_DETAIL: usize = toolview::budget::TUI_DETAIL_LINES;
 
 /// How many in-flight output lines a running tool card keeps (C-158). Deliberately small and NOT
 /// lifted by verbose: this is a "still moving, here's roughly where" signal on a card that has no
@@ -9606,6 +9607,61 @@ mod tests {
         );
     }
 
+    /// C-534: a `git_diff` card's expanded detail renders as a classified diff — hunk headers,
+    /// add/del tinting — via the content-shape classifier, although `git_diff` has no
+    /// `format_diff` arm. Pinned by style since monochrome carries this one through the theme.
+    #[test]
+    fn git_diff_card_renders_classified_diff_rows() {
+        let mut state = ChatState::new("opus".into());
+        state.expand_tools = true;
+        state.push(Entry::Tool(ToolEntry::new(
+            "git_diff".into(),
+            serde_json::json!({}),
+        )));
+        state.finish_tool(
+            "git_diff",
+            "diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,2 @@\n-old\n+new"
+                .into(),
+            false,
+        );
+        let rows = state.transcript_lines(80);
+        let style_of = |needle: &str| {
+            rows.iter()
+                .find(|line| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.content.as_ref().trim() == needle)
+                })
+                .and_then(|line| line.spans.last())
+                .map(|span| span.style)
+                .unwrap_or_else(|| panic!("row {needle:?} not found"))
+        };
+        let theme = state.theme;
+        assert_eq!(
+            style_of("+new").fg,
+            theme.ok_style().fg,
+            "add row tinted ok"
+        );
+        assert_eq!(
+            style_of("-old").fg,
+            theme.err_style().fg,
+            "del row tinted err"
+        );
+        assert_eq!(
+            style_of("@@ -1,2 +1,2 @@").fg,
+            theme.accent_style().fg,
+            "hunk header tinted accent"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let frame = screen(&terminal);
+        assert!(frame.contains("@@ -1,2 +1,2 @@"), "hunk rendered: {frame}");
+        assert!(
+            frame.contains("-old") && frame.contains("+new"),
+            "diff rows rendered: {frame}"
+        );
+    }
+
     /// C-536: a wrapped transcript row keeps its left edge — continuation rows repeat the gutter
     /// rail and the logical line's leading indent instead of dissolving to column 0.
     #[test]
@@ -9635,6 +9691,31 @@ mod tests {
             assert!(
                 row.starts_with("│    x"),
                 "continuation keeps the left edge: {row:?} in {texts:?}"
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(30, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let frame_rows: Vec<String> = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .filter_map(|x| terminal.backend().buffer().cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect()
+            })
+            .collect();
+        let frame_wrapped: Vec<&String> = frame_rows
+            .iter()
+            .filter(|row| row.contains("xxx"))
+            .collect();
+        assert!(
+            frame_wrapped.len() >= 2,
+            "frame contains wrapped detail: {frame_rows:?}"
+        );
+        for row in &frame_wrapped[1..] {
+            assert!(
+                row.starts_with("│    x"),
+                "frame continuation keeps its rail: {row:?}"
             );
         }
     }

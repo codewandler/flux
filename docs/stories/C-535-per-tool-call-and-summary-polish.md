@@ -2,7 +2,7 @@
 id: C-535
 title: "Per-tool call/summary polish: web.fetch, proc.run, task, grep/glob rows"
 pillar: Core
-status: ready
+status: in-progress
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
 areas: [flux-tui]
@@ -32,6 +32,9 @@ scannable.
 ## Progress
 
 - 2026-08-05 — filed from the tool-output review.
+- 2026-08-05 — implementation started during local-main integration. The `proc.run` argv header and
+  `web.fetch` size digest are implemented with unit coverage; task-result and grep/glob detail-row
+  classification remain before closure.
 
 ## Notes
 

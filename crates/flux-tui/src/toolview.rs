@@ -74,6 +74,20 @@ pub fn format_call(name: &str, input: &Value) -> Call {
             (None, Some(t)) => t,
             _ => String::new(),
         },
+        // C-535: argv-only — show the argv, and no `$`, which is the bash spelling and implies a
+        // shell this op deliberately does not have.
+        "proc.run" => {
+            let mut argv = s("program").unwrap_or_default();
+            if let Some(args) = input.get("args").and_then(Value::as_array) {
+                for a in args.iter().filter_map(Value::as_str) {
+                    if !argv.is_empty() {
+                        argv.push(' ');
+                    }
+                    argv.push_str(a);
+                }
+            }
+            argv
+        }
         _ => fallback_arg(input),
     };
     Call {
@@ -143,6 +157,21 @@ pub fn format_result(name: &str, content: &str, is_error: bool) -> Option<String
                 ))
             }
         }
+        // C-535: a size digest — the raw first body line is a poor summary, and the full body is
+        // one expand away.
+        "web.fetch" if !content.is_empty() => {
+            let lines = content.lines().count();
+            let bytes = content.len();
+            let size = if bytes < 1024 {
+                format!("{bytes} B")
+            } else {
+                format!("{:.1} KB", bytes as f64 / 1024.0)
+            };
+            Some(format!(
+                "{lines} line{} · {size}",
+                if lines == 1 { "" } else { "s" }
+            ))
+        }
         _ => None,
     }
 }
@@ -206,6 +235,7 @@ pub fn format_diff(name: &str, input: &Value) -> Option<Vec<DiffLine>> {
     let (old, new) = match name {
         "edit" => (s("old_string")?.to_string(), s("new_string")?.to_string()),
         "write" => (String::new(), s("content")?.to_string()),
+        "patch" => return patch_diff(input),
         _ => return None,
     };
     let mut out = Vec::new();
@@ -259,9 +289,72 @@ pub fn format_diff(name: &str, input: &Value) -> Option<Vec<DiffLine>> {
     Some(out)
 }
 
+/// C-534: a `patch` call's input-anchored hunk view — one `@@` header per edit naming its op and
+/// original-line range, `+` rows for inserted/replacement text. The original file is not in the
+/// args, only line anchors, so there are no `-` rows: the header states what each edit displaces,
+/// which is exactly what the input pledges and all that is knowable before execution (the tool's
+/// *result* carries the true unified diff, classified by [`classify_unified_diff`] once it lands).
+/// **C-195 applies here unchanged** (see [`format_diff`]): the input is rendered verbatim — this
+/// feeds the approval sheet, and scrubbing a preview would hide the pending write from the one
+/// person able to deny it.
+fn patch_diff(input: &Value) -> Option<Vec<DiffLine>> {
+    let edits = input.get("edits")?.as_array()?;
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    if let Some(p) = input.get("path").and_then(Value::as_str) {
+        out.push(DiffLine::plain_row(
+            DetailKind::Meta,
+            None,
+            None,
+            format!("@ {p}"),
+        ));
+    }
+    let total = edits.len();
+    for (i, edit) in edits.iter().enumerate() {
+        let op = edit.get("op").and_then(Value::as_str).unwrap_or("?");
+        let line = edit.get("line").and_then(Value::as_u64).unwrap_or(0);
+        let end = edit.get("end_line").and_then(Value::as_u64).unwrap_or(line);
+        let (verb, ranged) = match op {
+            "insert_before" => ("insert before", false),
+            "insert_after" => ("insert after", false),
+            "replace_range" => ("replace", true),
+            "delete_range" => ("delete", true),
+            other => (other, false),
+        };
+        let anchor = if ranged && end > line {
+            format!("lines {line}-{end}")
+        } else {
+            format!("line {line}")
+        };
+        out.push(DiffLine::plain_row(
+            DetailKind::Hunk,
+            None,
+            None,
+            format!("@@ edit {}/{total} · {verb} {anchor} @@", i + 1),
+        ));
+        for l in edit
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .lines()
+        {
+            out.push(DiffLine::plain_row(
+                DetailKind::Add,
+                None,
+                None,
+                format!("+ {l}"),
+            ));
+        }
+    }
+    Some(out)
+}
+
 /// Expanded detail for a tool call, as color-free `(kind, text)` lines. `edit` becomes a unified
 /// `-old`/`+new` diff and `write` a `+`-prefixed new-file preview — both read from the *input*, which
-/// is exact and available before the result — while everything else shows the raw result `content`.
+/// is exact and available before the result — while everything else shows the raw result `content`,
+/// classified as a unified diff when it is one (C-534, [`classify_unified_diff`]).
 /// The caller caps the line count and applies color per [`DetailKind`].
 pub fn format_detail(
     name: &str,
@@ -297,8 +390,60 @@ pub fn format_detail(
             }
             out
         }
-        _ => plain(content),
+        _ => classify_unified_diff(content).unwrap_or_else(|| plain(content)),
     }
+}
+
+/// C-534: classify result content that is itself a unified diff — `git_diff` output, a `bash git
+/// diff`, a `patch` result view — into diff row kinds, keyed on content *shape* rather than op
+/// name. Requires diff structure (a `@@ -a[,b] +c[,d] @@` hunk header somewhere), not merely
+/// `+`/`-` line prefixes, so prose bullets are never misclassified. Returns `None` for anything
+/// that is not a unified diff. Content is classified, never altered.
+fn classify_unified_diff(content: &str) -> Option<Vec<(DetailKind, String)>> {
+    fn is_hunk_header(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("@@ -") else {
+            return false;
+        };
+        rest.contains(" +") && rest.contains(" @@")
+    }
+    if !content.lines().any(is_hunk_header) {
+        return None;
+    }
+    let meta_prefixes = [
+        "diff --git ",
+        "index ",
+        "--- ",
+        "+++ ",
+        "new file mode",
+        "deleted file mode",
+        "old mode",
+        "new mode",
+        "rename from ",
+        "rename to ",
+        "similarity index",
+        "Binary files ",
+        "\\ No newline",
+    ];
+    Some(
+        content
+            .trim_end()
+            .lines()
+            .map(|l| {
+                let kind = if is_hunk_header(l) {
+                    DetailKind::Hunk
+                } else if meta_prefixes.iter().any(|p| l.starts_with(p)) {
+                    DetailKind::Meta
+                } else if l.starts_with('+') {
+                    DetailKind::Add
+                } else if l.starts_with('-') {
+                    DetailKind::Del
+                } else {
+                    DetailKind::Plain
+                };
+                (kind, l.to_string())
+            })
+            .collect(),
+    )
 }
 
 fn plain(content: &str) -> Vec<(DetailKind, String)> {
@@ -307,6 +452,26 @@ fn plain(content: &str) -> Vec<(DetailKind, String)> {
         .lines()
         .map(|l| (DetailKind::Plain, l.to_string()))
         .collect()
+}
+
+/// C-539: the one place both surfaces' tool-output elision budgets are declared. The numbers may
+/// differ per surface **on purpose** — the CLI cannot expand a finished card, so it shows more up
+/// front, while the TUI's expanded detail is one keypress (and `-v`) away from a full view — but
+/// they are declared side by side so a change to one is made in sight of the other, instead of
+/// drifting as private literals.
+pub mod budget {
+    /// TUI: expanded-detail row cap per card (lifted by `-v`/`FLUX_VERBOSE`).
+    pub const TUI_DETAIL_LINES: usize = 30;
+    /// CLI: preview line cap in `tool_preview` (lifted by `-v`).
+    pub const CLI_PREVIEW_LINES: usize = 40;
+    /// CLI: per-line character cap in previews (lifted by `-v`).
+    pub const CLI_PREVIEW_LINE_CHARS: usize = 500;
+    /// CLI: head lines shown for a `read`/`read_many` digest.
+    pub const CLI_READ_HEAD_LINES: usize = 3;
+    /// CLI: head matches shown for a `grep` digest.
+    pub const CLI_GREP_HEAD_LINES: usize = 3;
+    /// CLI: head paths shown for a `glob` digest.
+    pub const CLI_GLOB_HEAD_LINES: usize = 5;
 }
 
 #[cfg(test)]
@@ -503,5 +668,105 @@ mod tests {
         let d = format_detail("bash", &json!({"command": "ls"}), "a.rs\nb.rs", false);
         assert_eq!(d.len(), 2);
         assert!(d.iter().all(|(k, _)| *k == DetailKind::Plain));
+    }
+
+    /// C-534: a `patch` call gets an input-anchored hunk view — one `@@` header per edit naming
+    /// its op and original-line range, `+` rows for the new text. The original file is not in the
+    /// args, so there are no `-` rows; the header states what the edit displaces.
+    #[test]
+    fn patch_input_renders_an_input_anchored_hunk_view() {
+        let d = format_diff(
+            "patch",
+            &json!({"path": "src/a.rs", "edits": [
+                {"op": "replace_range", "line": 10, "end_line": 12, "text": "new a\nnew b"},
+                {"op": "delete_range", "line": 30, "end_line": 31},
+                {"op": "insert_after", "line": 40, "text": "tail"},
+            ]}),
+        )
+        .expect("patch gets a diff view");
+        let text = |rows: &[DiffLine]| -> Vec<String> {
+            rows.iter()
+                .map(|r| r.spans.iter().map(|(_, s)| s.as_str()).collect())
+                .collect()
+        };
+        let rows = text(&d);
+        assert_eq!(d[0].kind, DetailKind::Meta);
+        assert_eq!(rows[0], "@ src/a.rs");
+        assert!(rows[1].contains("edit 1/3") && rows[1].contains("replace lines 10-12"));
+        assert_eq!(d[1].kind, DetailKind::Hunk);
+        assert_eq!(rows[2], "+ new a");
+        assert_eq!(d[2].kind, DetailKind::Add);
+        assert_eq!(rows[3], "+ new b");
+        assert!(rows[4].contains("edit 2/3") && rows[4].contains("delete lines 30-31"));
+        assert!(rows[5].contains("edit 3/3") && rows[5].contains("insert after line 40"));
+        assert_eq!(rows[6], "+ tail");
+    }
+
+    /// C-534: result content that is itself a unified diff — `git_diff` output, a `bash git diff`
+    /// — is classified into diff row kinds instead of rendering flat.
+    #[test]
+    fn unified_diff_content_is_classified() {
+        let content = "diff --git a/foo.rs b/foo.rs\nindex 1111111..2222222 100644\n\
+                       --- a/foo.rs\n+++ b/foo.rs\n@@ -1,3 +1,3 @@ fn head()\n context\n\
+                       -old line\n+new line";
+        let d = format_detail("git_diff", &json!({}), content, false);
+        let kinds: Vec<DetailKind> = d.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DetailKind::Meta,
+                DetailKind::Meta,
+                DetailKind::Meta,
+                DetailKind::Meta,
+                DetailKind::Hunk,
+                DetailKind::Plain,
+                DetailKind::Del,
+                DetailKind::Add,
+            ],
+            "rows: {d:?}"
+        );
+    }
+
+    /// C-535: `proc.run` is argv-only — the header shows the argv, not a `k=v` dump (and no `$`,
+    /// which is the bash spelling and implies a shell this op deliberately does not have).
+    #[test]
+    fn proc_run_shows_the_argv() {
+        assert_eq!(
+            format_call(
+                "proc.run",
+                &json!({"program": "rg", "args": ["--files", "-g", "*.rs"]})
+            )
+            .arg,
+            "rg --files -g *.rs"
+        );
+        assert_eq!(format_call("proc.run", &json!({"program": "ls"})).arg, "ls");
+    }
+
+    /// C-535: `web.fetch` collapses to a size digest — the raw first body line is a poor summary
+    /// and the full body is one expand away.
+    #[test]
+    fn web_fetch_summarizes_size_not_first_body_line() {
+        let body = "# Title\n\nSome readable text.\nMore.";
+        assert_eq!(
+            format_result("web.fetch", body, false).as_deref(),
+            Some(format!("4 lines · {} B", body.len()).as_str())
+        );
+        assert_eq!(format_result("web.fetch", "   ", false), None);
+    }
+
+    /// C-534: the classifier requires diff *structure* (a hunk header), not merely `+`/`-`
+    /// prefixes — prose bullets and option listings stay plain.
+    #[test]
+    fn prose_with_dash_bullets_is_not_a_diff() {
+        let d = format_detail(
+            "bash",
+            &json!({}),
+            "- bullet one\n- bullet two\n+ a plus-prefixed line",
+            false,
+        );
+        assert!(
+            d.iter().all(|(k, _)| *k == DetailKind::Plain),
+            "rows: {d:?}"
+        );
     }
 }

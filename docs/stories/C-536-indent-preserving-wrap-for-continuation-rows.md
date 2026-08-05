@@ -2,7 +2,7 @@
 id: C-536
 title: "Indent-preserving wrap for transcript continuation rows"
 pillar: Core
-status: in-progress
+status: done
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
 areas: [flux-tui]
@@ -19,18 +19,21 @@ its card instead of dissolving to column 0.
 
 ## Acceptance
 
-- [ ] Failing-first narrow-width TestBackend frame test: a long bash detail line's continuation rows
+- [x] Failing-first narrow-width TestBackend frame test: a long bash detail line's continuation rows
       start with the gutter + card indent (today they start at column 0).
-- [ ] `wrap_styled_lines` derives a hanging prefix per logical line (leading gutter span + leading
+- [x] `wrap_styled_lines` derives a hanging prefix per logical line (leading gutter span + leading
       whitespace) and budgets continuation rows at `width - prefix`, guarding degenerate
       `prefix ≥ width`.
-- [ ] C-109 running-badge pairing is unaffected (header rows are width-fitted and never wrap) and
+- [x] C-109 running-badge pairing is unaffected (header rows are width-fitted and never wrap) and
       `entry_rows` spans remain exact — existing frame tests stay green.
-- [ ] `cargo test -p flux-tui` green.
+- [x] `cargo test -p flux-tui` green.
 
 ## Progress
 
 - 2026-08-05 — filed from the tool-output review; implementation started same session.
+- 2026-08-05 — closed on integrated local `main`: continuation rows clone the styled rail/indent
+  prefix with a degenerate-width guard; the narrow TestBackend regression and complete package suite
+  pass without disturbing running-card pairing.
 
 ## Notes
 
