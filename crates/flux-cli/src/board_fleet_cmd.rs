@@ -1131,8 +1131,15 @@ impl FleetTuiSource {
     }
 
     fn all_decisions(&self) -> Result<Vec<Value>> {
-        fn collect(root: &Path, namespace: &str, output: &mut Vec<Value>) -> Result<()> {
-            let directory = if root.join("decisions").is_dir() {
+        fn collect(
+            root: &Path,
+            configured: Option<&Path>,
+            namespace: &str,
+            output: &mut Vec<Value>,
+        ) -> Result<()> {
+            let directory = if let Some(configured) = configured {
+                root.join(configured)
+            } else if root.join("decisions").is_dir() {
                 root.join("decisions")
             } else {
                 root.join("docs/decisions")
@@ -1147,14 +1154,24 @@ impl FleetTuiSource {
         }
 
         let mut decisions = Vec::new();
-        collect(&self.root, "workspace", &mut decisions)?;
-        let config = read_fleet_config(&self.root)?;
-        for repository in &config.repositories {
+        if self.root.join(".flux/board.toml").is_file() {
+            let config = read_board_workspace_config(&self.root)?;
             collect(
-                &repository_root(&self.root, repository)?,
-                &repository.id,
+                &self.root,
+                config.decisions.as_deref(),
+                "workspace",
                 &mut decisions,
             )?;
+            for member in &config.members {
+                collect(
+                    &board_member_root(&self.root, member)?,
+                    None,
+                    &member.id,
+                    &mut decisions,
+                )?;
+            }
+        } else {
+            collect(&self.root, None, "workspace", &mut decisions)?;
         }
         decisions.sort_by(|left, right| {
             left["ref"]
@@ -1166,24 +1183,19 @@ impl FleetTuiSource {
     }
 
     fn stories(&self) -> Result<Vec<Story>> {
-        let config = read_fleet_config(&self.root)?;
-        if config.repositories.is_empty() {
-            read_stories(&self.root)
-        } else {
+        if self.root.join(".flux/board.toml").is_file() {
             workspace_stories(&self.root)
+        } else {
+            read_stories(&self.root)
         }
     }
 
     fn board_command(&self, action: BoardAction) -> Result<BoardCommand> {
-        let workspace = !read_fleet_config(&self.root)?.repositories.is_empty();
+        let scope = default_board_scope(&self.root)?;
         Ok(BoardCommand {
             root: self.root.clone(),
             board: None,
-            scope: if workspace {
-                BoardScopeArg::Workspace
-            } else {
-                BoardScopeArg::Repository
-            },
+            scope: Some(scope),
             profile: BoardProfileArg::Planning,
             output: AgentOutput::Human,
             request: None,
@@ -1199,14 +1211,14 @@ impl FleetTuiSource {
         if namespace == "workspace" {
             return Ok(self.root.clone());
         }
-        let config = read_fleet_config(&self.root)?;
+        let config = read_board_workspace_config(&self.root)?;
         let matches = config
-            .repositories
+            .members
             .iter()
-            .filter(|repository| repository.id == namespace || repository.board == namespace)
+            .filter(|member| member.id == namespace || member.board == namespace)
             .collect::<Vec<_>>();
         match matches.as_slice() {
-            [repository] => repository_root(&self.root, repository),
+            [member] => board_member_root(&self.root, member),
             [] => bail!("not-found: Board/Fleet TUI decision namespace {namespace}"),
             _ => bail!("conflict/precondition: ambiguous decision namespace {namespace}"),
         }
@@ -1227,6 +1239,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         const MAX_DECISION_OPTIONS: usize = 20;
 
         let state = read_fleet_state(&self.root)?;
+        let config = read_fleet_config(&self.root)?;
         let stories = self.stories()?;
         let decisions = self.all_decisions()?;
         let stats_command = self.board_command(BoardAction::Stats {
@@ -1608,7 +1621,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                 status: wave["status"].as_str().unwrap_or("unknown").to_string(),
                 items: value_strings(&wave["items"])
                     .into_iter()
-                    .take(state.max_wave)
+                    .take(config.max_wave)
                     .collect(),
             });
         let goals = state
@@ -1646,7 +1659,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             goals,
             active_wave,
             capacity: FleetCapacityView {
-                configured: state.max_workers,
+                configured: config.max_workers,
                 desired: None,
                 active,
                 draining: None,
@@ -1814,7 +1827,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         let command = BoardCommand {
             root: root.clone(),
             board: None,
-            scope: BoardScopeArg::Repository,
+            scope: Some(BoardScopeArg::Repository),
             profile: BoardProfileArg::Planning,
             output: AgentOutput::Human,
             request: None,
