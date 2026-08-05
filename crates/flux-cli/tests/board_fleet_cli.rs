@@ -274,7 +274,7 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
     .unwrap();
     fs::write(
         fleet_root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\nmax_instances = 1\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 1\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
     )
     .unwrap();
     assert!(git(&fleet_root, &["init", "-q"]).status.success());
@@ -1394,7 +1394,7 @@ fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nmax_workers = 3\nmax_wave = 10\nmax_rework = 2\nallow_ad_hoc_agents = true\n\n[main]\ninstructions = \".flux/fleet/main.md\"\n\n[[agent_templates]]\nid = \"scout\"\nrole = \"researcher\"\ninstructions = \".flux/fleet/agents/scout.md\"\nmode = \"read-only\"\nmax_instances = 1\n",
+        "schema = \"flux.fleet/v1\"\nmax_workers = 3\nmax_wave = 10\nmax_rework = 2\nallow_ad_hoc_agents = true\n\n[main]\ninstructions = \".flux/fleet/main.md\"\n\n[[agent_templates]]\nid = \"scout\"\nrole = \"researcher\"\ninstructions = \".flux/fleet/agents/scout.md\"\nmode = \"read-only\"\ncapabilities = [\"read\"]\nmax_instances = 1\n",
     )
     .unwrap();
     assert!(flux(&root, &["fleet", "start"]).status.success());
@@ -1456,6 +1456,32 @@ fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
         ],
     );
     assert_eq!(impostor.status.code(), Some(2));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn fleet_rejects_a_template_with_exact_missing_capability_names_before_launch() {
+    let root = fixture("missing-worker-capabilities");
+    fs::create_dir_all(root.join(".flux/fleet/agents")).unwrap();
+    fs::write(
+        root.join(".flux/fleet/agents/story-worker.md"),
+        "Implement only the assigned story.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        "schema = \"flux.fleet/v1\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\"]\nmax_instances = 1\n",
+    )
+    .unwrap();
+
+    let rejected = flux(&root, &["fleet", "validate", "--output", "json"]);
+    assert_eq!(rejected.status.code(), Some(7));
+    let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejected["error"]["class"], "validation/gate");
+    assert!(rejected["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("missing required capabilities: git"));
     fs::remove_dir_all(root).ok();
 }
 
@@ -2070,7 +2096,7 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\nmax_instances = 3\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 3\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -2110,6 +2136,25 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
         assert!(!context.contains("Work only in the assigned story worktree"));
         assert!(!context.contains("flux-mock"));
         assert!(context.len() < 512, "context origin was {context}");
+        let capability_set = serde_json::to_string(&receipt["capability_set"]).unwrap();
+        assert_eq!(
+            receipt["capability_set"]["schema"],
+            "flux.fleet-capability-set/v1"
+        );
+        assert_eq!(
+            receipt["capability_set"]["digest_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(!capability_set.contains("operations"));
+        assert!(!capability_set.contains("Work only"));
+        assert!(!capability_set.contains(&root.display().to_string()));
+        assert!(
+            capability_set.len() < 512,
+            "capability manifest was {capability_set}"
+        );
     }
     let stories = run["data"]["topology"]["repositories"][0]["stories"]
         .as_array()
@@ -2123,6 +2168,24 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     }
 
     let first_agent = receipts[0]["agent"].as_str().unwrap();
+    let first_capability_set = receipts[0]["capability_set"].clone();
+    let first_worker_contract = receipts[0]["context_origin"]["worker_contract_sha256"].clone();
+    let original_config = fs::read_to_string(root.join(".flux/fleet.toml")).unwrap();
+    let original_instructions =
+        fs::read_to_string(root.join(".flux/fleet/agents/story-worker.md")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        original_config.replace(
+            "capabilities = [\"read\", \"edit\", \"git\", \"shell\"]",
+            "capabilities = [\"read\", \"edit\", \"git\", \"shell\", \"task\"]",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/agents/story-worker.md"),
+        "A widened replacement template that existing workers must never load.\n",
+    )
+    .unwrap();
     let continued = flux(
         &root,
         &[
@@ -2151,6 +2214,48 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     );
     assert_eq!(continued["data"]["receipt"]["store"], receipts[0]["store"]);
     assert_ne!(continued["data"]["receipt"]["store"], receipts[1]["store"]);
+    assert_eq!(
+        continued["data"]["receipt"]["capability_set"],
+        first_capability_set
+    );
+    assert_eq!(
+        continued["data"]["receipt"]["context_origin"]["worker_contract_sha256"],
+        first_worker_contract
+    );
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let admitted = &status["data"]["state"]["agents"][first_agent];
+    assert_eq!(
+        admitted["capabilities"],
+        serde_json::json!(["edit", "git", "read", "shell"])
+    );
+    assert_eq!(admitted["mode"], "write");
+    assert_eq!(admitted["writable_root"], stories[0]["worktree"]);
+    assert_eq!(admitted["read_roots"], serde_json::json!([]));
+    assert_eq!(admitted["capability_set"], first_capability_set);
+    assert_eq!(
+        admitted["instructions"],
+        "Work only in the assigned story worktree and report evidence.\n"
+    );
+
+    let resumed = flux(&root, &["fleet", "resume", first_agent, "--output", "json"]);
+    assert!(
+        resumed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(resumed["data"]["receipt"]["session"], "s_1");
+    assert_eq!(
+        resumed["data"]["receipt"]["capability_set"],
+        first_capability_set
+    );
+    assert_eq!(
+        resumed["data"]["receipt"]["context_origin"]["session_mode"],
+        "continue"
+    );
 
     let first_worktree = PathBuf::from(stories[0]["worktree"].as_str().unwrap());
     fs::remove_file(first_worktree.join("flux-mock.txt")).unwrap();
@@ -2226,6 +2331,16 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     let rework: serde_json::Value = serde_json::from_slice(&rework.stdout).unwrap();
     assert_eq!(rework["data"]["ack"], "completed");
     assert_eq!(rework["data"]["turn_receipt"]["session"], "s_1");
+    assert_eq!(
+        rework["data"]["turn_receipt"]["capability_set"],
+        first_capability_set
+    );
+    fs::write(root.join(".flux/fleet.toml"), original_config).unwrap();
+    fs::write(
+        root.join(".flux/fleet/agents/story-worker.md"),
+        original_instructions,
+    )
+    .unwrap();
     assert!(
         git(&root, &["status", "--short"]).stdout.is_empty(),
         "the source checkout remains untouched"

@@ -377,6 +377,10 @@ pub(super) async fn run_stream_json(flags: AgentFlags, prompt: Vec<String>) -> R
         bail!("provide a prompt, e.g. `flux run --stream-json \"summarize the README\"`");
     }
     let (agent, session_id, model_spec, _spawner) = build_agent(&flags).await?;
+    validate_admitted_operation_ceiling(&agent, &flags)?;
+    let _operation_ceiling = flags
+        .operation_ceiling
+        .then(|| agent.executor.push_cap_scope(&flags.admitted_operations));
     let redactor = agent.executor.context().redactor.clone();
     let pricing = flux_credentials::load_pricing_table();
     let mut sink = StreamJsonSink::new(session_id.clone(), redactor).with_cost(model_spec, pricing);
@@ -445,6 +449,10 @@ pub(super) async fn run_stream_json_conversation(
         }
     };
     let (agent, session_id, model_spec, _spawner) = build_agent(&flags).await?;
+    validate_admitted_operation_ceiling(&agent, &flags)?;
+    let _operation_ceiling = flags
+        .operation_ceiling
+        .then(|| agent.executor.push_cap_scope(&flags.admitted_operations));
     let redactor = agent.executor.context().redactor.clone();
 
     let steering = Arc::new(SteeringQueue::default());
@@ -523,6 +531,27 @@ pub(super) async fn run_stream_json_conversation(
     }
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
     reader.abort();
+    Ok(())
+}
+
+fn validate_admitted_operation_ceiling(agent: &FlowEngine, flags: &AgentFlags) -> Result<()> {
+    if !flags.operation_ceiling {
+        return Ok(());
+    }
+    let mut missing = flags
+        .admitted_operations
+        .iter()
+        .filter(|operation| agent.executor.registry().get(operation).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    if !missing.is_empty() {
+        bail!(
+            "admitted capability operations are unavailable: {}",
+            missing.join(", ")
+        );
+    }
     Ok(())
 }
 

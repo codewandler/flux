@@ -237,6 +237,21 @@ pub(super) struct AgentFlags {
     #[arg(long)]
     pub(super) resume: bool,
 
+    /// Host-owned marker for an exact operation ceiling. Fleet supplies this only to admitted
+    /// worker subprocesses; ordinary CLI users should declare capabilities in authored programs.
+    #[arg(long = "operation-ceiling", hide = true)]
+    pub(super) operation_ceiling: bool,
+
+    /// One operation in the host-owned ceiling. Repeated and meaningful only with
+    /// `--operation-ceiling`; the empty set deliberately exposes no model-facing operations.
+    #[arg(
+        long = "operation",
+        value_name = "NAME",
+        hide = true,
+        requires = "operation_ceiling"
+    )]
+    pub(super) admitted_operations: Vec<String>,
+
     /// Dev mode: enables hot-reload (`flux_reload` tool) and other developer tools.
     #[arg(long)]
     pub(super) dev: bool,

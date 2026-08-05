@@ -85,6 +85,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Every Fleet worker turn now retains its admitted capability ceiling** (C-565). Template or
+  ad-hoc admission normalizes named capability bundles into an exact host-enforced operation set
+  plus mode, writable/read roots and fences. Missing required capabilities fail before a model
+  turn; message, restart, resume and rework reconstruct the stored contract instead of reloading a
+  possibly wider template. Nested tasks can narrow but not widen the active scope. Durable state
+  and receipts expose a bounded capability-set digest and counts without storing the full operation
+  catalogue, paths or prompt body.
+
 - **Fleet story workers now start with assignment-only context** (C-566). A new writer gets a fresh
   worker-specific store plus its configured writer contract, exact BoardRef, pinned base, branch and
   isolated worktree; the main conversation, intake text, Fleet-wide goal set and other assignments

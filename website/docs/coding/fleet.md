@@ -50,7 +50,7 @@ role = "writer"
 instructions = ".flux/fleet/agents/story-worker.md"
 model = "codex/gpt-5.6-sol"
 mode = "write"
-capabilities = ["read", "edit", "git"]
+capabilities = ["read", "edit", "git", "shell", "rust"]
 fences = [".flux/fleet/**"]
 max_instances = 3
 
@@ -73,6 +73,21 @@ Instruction paths are confined under the fleet root. Validation rejects duplicat
 another coordinator role, invalid instance limits, overlapping roots, missing boards, invalid refs,
 dependency cycles, a wave over ten, and unsupported fields. Refresh and other read commands report
 dirty, stale, or diverged checkouts without fetching or modifying them.
+
+## Capabilities are an admission ceiling
+
+Each template must declare the authority its workers need. A read-only template requires `read`; a
+writing template requires `read`, `edit`, and the safe story-sized `git` bundle. Add only the
+optional bundles the work requires: `shell` for arbitrary guarded processes, `rust`, `node`, `go`,
+`python`, or `make` for a native toolchain, and `task` for nested sub-agent delegation. Shell and
+toolchain processes still run inside bounded-autonomy's fail-closed workspace sandbox with the
+network closed. There is no implicit network capability.
+
+Fleet validates the declared names before dispatch, expands them to one exact host-owned operation
+set, and records a bounded `flux.fleet-capability-set/v1` digest in status and turn receipts. The
+same mode, operations, writable root, read roots, and fences survive message delivery, process
+restart, resume, and rework. Editing a template affects only workers admitted afterward; it never
+widens an existing worker. Admit a new worker explicitly when the required authority changes.
 
 ## One main coordinator, goals, and intake
 

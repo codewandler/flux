@@ -116,6 +116,17 @@ Turn receipts expose a bounded
 the assignment and worker contract; prompt bodies and conversation content are never part of that
 manifest.
 
+Worker admission also resolves one normalized capability ceiling. Read-only workers require
+`read`; writers require `read`, `edit` and the safe story-sized `git` bundle. Optional `shell`,
+language-toolchain and nested-`task` bundles are explicit. The host snapshots that operation set,
+mode, writable root, read roots and normalized fences into the durable registration, applies the
+same exact operation scope around every fresh or continued model turn, and refuses missing
+operations before the model runs. Nested tasks may intersect with that scope but cannot widen it.
+Template edits apply only to later admissions; message, restart, resume and rework reconstruct the
+existing worker from its snapshot. Status and receipts expose only a bounded
+`flux.fleet-capability-set/v1` digest manifest and counts, never the full operation catalogue,
+paths, prompt or instruction body.
+
 `.flux/fleet.toml` declares main instructions/model, named reusable agent templates, whether ad-hoc
 agents are allowed, repository ids/paths, canonical refs, planning-board bindings, gates, ledger
 fences, concurrency and schedule groupings. The coordinator may instantiate a template or admit an
